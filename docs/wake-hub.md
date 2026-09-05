@@ -5,7 +5,9 @@
 > (the bus), [#3467](https://github.com/alphaonedev/ai-memory-mcp/issues/3467)
 > (the hub), [#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)
 > (identity), [#3469](https://github.com/alphaonedev/ai-memory-mcp/issues/3469)
-> (this page: the bus sink).
+> (this page: the bus sink),
+> [#3504](https://github.com/alphaonedev/ai-memory-mcp/issues/3504) (snapshot
+> reuse + the refresher).
 
 ## What the wake plane is for
 
@@ -241,6 +243,122 @@ call and is exercised by the test suite, but nothing in `serve` hosts a hub in
 this build — `ai-memory wake-hub` runs the hub as its own process. When a
 `serve`-hosted hub lands, wiring it is one line at the same boot site.
 
+## Keeping the snapshot fresh: the refresher is not optional
+
+The hub REFUSES every hello once the snapshot it reads is older than 60 seconds
+(`identity::hub_cache::MAX_CACHE_AGE_SECS`). That is deliberate — a snapshot is
+the only thing standing between a revoked agent and a live session, so an
+un-refreshed one must expire into refusal rather than linger into authority —
+but it means a hub with no refresher admits nobody one minute after the last
+manual export.
+
+Ship the refresh as a job, not as a habit:
+
+| Platform | Unit |
+|---|---|
+| Linux | `packaging/systemd/ai-memory-wake-hub-refresh.service` + `.timer` |
+| macOS | `scripts/templates/dev.alphaone.ai-memory.wake-hub-refresh.plist` |
+
+Both run the same command every 30 seconds — half the refusal threshold, so a
+missed tick costs nothing, writing to the SAME path the hub reads:
+
+```bash
+# Linux (the $ALLOWLIST that ai-memory-wake-hub.service passes to --allowlist)
+ai-memory identity hub-cache \
+    --include-agent <each agent that may listen> \
+    --out /run/ai-memory/hub-allow.json
+
+# macOS (the path dev.alphaone.ai-memory.wake-hub.plist reads)
+ai-memory identity hub-cache \
+    --include-agent <each agent that may listen> \
+    --out ~/.ai-memory/hub-allow.json
+```
+
+**Write it where the hub reads it.** `/run/ai-memory/hub-allow.json` on Linux
+and `~/.ai-memory/hub-allow.json` on macOS are the paths the #3471 hub units
+name; a refresher pointed anywhere else leaves a hub reading a file nobody
+writes, which looks like a working install right up to the moment every hello
+is refused. On Linux the runtime directory is created `0700` by the hub unit
+(`RuntimeDirectory=ai-memory`, `RuntimeDirectoryPreserve=yes`) and both units
+run as the same `User=`, so the refresher needs only `ReadWritePaths=/run/ai-memory`.
+
+**After a reboot the snapshot is gone.** `/run` is a tmpfs, so the hub starts
+admitting nobody and stays that way until the refresher has run once — which is
+exactly what `OnBootSec=15s` (systemd) and `RunAtLoad` (launchd) are for. The
+first post-boot refresh is what lets the hub admit anyone at all.
+
+Three properties make that safe to run on a timer. It publishes ATOMICALLY: the
+snapshot goes to a temp file created in the SAME directory, set to mode 0600
+before a byte is written, then written, `fsync`ed and renamed into place over
+the old inode, so a hub reading concurrently
+sees the whole old snapshot or the whole new one and never a truncated file. It
+publishes NOTHING on failure: a store error, a record-stop or a failed audit
+leaves the previous snapshot alone, which then ages out and refuses — the
+fail-closed direction. And it can only ever NARROW: the snapshot is complete, so
+an agent omitted from the next refresh loses admission within the hub's
+one-second session revalidation, which is exactly how revocation works.
+
+The units are deliberately SEPARATE from `ai-memory-wake-hub.service`. The
+refresher opens the store; the hub must never. Keeping them in one unit would
+put a database handle inside the process whose whole security story is that it
+holds only public material.
+
+**Watch it with `--posture`.** `ai-memory wake-hub --posture` prints the
+snapshot's age and whether the hub still accepts it:
+
+```text
+  allowlist snapshot:    12 s old (ceiling 60 s)
+```
+
+`--posture --json` carries the same facts under `allowlist_snapshot`
+(`age_secs`, `max_age_secs`, `within_max_age`). Alert on `within_max_age`
+turning false, or on `age_secs` climbing: that is the refresher having stopped,
+and it is visible before the agents notice they can no longer join. An
+unreadable snapshot reports no age and `within_max_age: false` — a snapshot the
+hub cannot read is not a fresh one.
+
+### Why there is no in-process refresh loop
+
+`wake-hub` deliberately grew no `--refresh-from <store-url>` flag. The
+derivation reads the durable v97 identity root and writes to the
+`signed_events` audit spine, so an in-process loop would put a live store
+handle — and its credentials — inside the hub process. The hub's entire
+security posture is that it holds ONLY public material and opens NO database on
+either backend, which is what bounds a hub compromise to "wake hints stop
+flowing" instead of "the identity root is reachable". A timer that runs the
+existing, already-audited exporter buys the same automation without spending
+that property.
+
+## Reusing the parsed snapshot
+
+The hub re-checks identity on every hello AND once per second for every
+established session, so at the 256-connection ceiling it was parsing the
+snapshot JSON hundreds of times a second. It now reuses the PARSED snapshot
+while the file's identity (device, inode, mtime, size) is unchanged and the
+parse is younger than `wake_hub::limits::ALLOWLIST_CACHE_TTL` (2 seconds, 30x
+under the 60-second refusal threshold).
+
+Reuse changed the COST and nothing about the DECISION. Three properties hold on
+every single identity check, warm parse or not:
+
+* **The permission gate runs every time.** Each check opens the snapshot with
+  `O_NOFOLLOW` and re-proves through that descriptor that it is a regular file
+  owned by this uid at exactly mode 0600. A snapshot whose mode is widened,
+  whose owner changes, which is replaced by a symlink, or which is removed is
+  refused immediately.
+* **The age gate runs every time.** The snapshot's own `refreshed_at` is
+  re-tested against the clock on every check, so reuse can never extend a
+  snapshot's life past the 60-second ceiling. A stale file stays refused exactly
+  as it was before reuse landed.
+* **A replaced snapshot takes effect immediately.** A new inode, mtime or size
+  misses the reuse key and forces a re-read on the very next check, so a refresh
+  or a revocation still lands within the same one-second revalidation window it
+  always did.
+
+The permissions that are checked, the identity that reuse is keyed on, and the
+bytes that are parsed all come from ONE descriptor — there is no `stat`-then-open
+window for a swap to slip through.
+
 ## Operating the hub
 
 > Issue [#3471](https://github.com/alphaonedev/ai-memory-mcp/issues/3471) — the
@@ -248,8 +366,9 @@ this build — `ai-memory wake-hub` runs the hub as its own process. When a
 > units, and the `doctor` posture check.
 
 `ai-memory wake-hub --posture` resolves and prints the socket, directory mode,
-fd budget, drain deadline and identity verifier **without binding anything**,
-so it is safe to run against a host already serving a hub. `--allowlist` names
+fd budget, drain deadline, identity verifier and allowlist snapshot age
+**without binding anything**, so it is safe to run against a host already
+serving a hub. `--allowlist` names
 the derived public snapshot of enrolled agent keys the delegation verifier
 reads; the hub itself never opens the store. Full flag reference:
 `docs/CLI_REFERENCE.md`.

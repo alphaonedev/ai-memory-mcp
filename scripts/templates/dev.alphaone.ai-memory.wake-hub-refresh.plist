@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dev.alphaone.ai-memory.wake-hub-refresh.plist / macOS launchd template for
+  the wake-hub identity-snapshot refresher (issue #3504, follow-up to #3468).
+
+  (Flag names appear below without their leading dashes: an XML comment may
+  not contain a double hyphen. The real, copy-pasteable commands live in
+  docs/wake-hub.md; the ProgramArguments array below is authoritative.)
+
+  WHY THIS EXISTS
+
+  `ai-memory wake-hub` REFUSES every hello once the derived snapshot it reads
+  is older than 60 seconds (identity::hub_cache::MAX_CACHE_AGE_SECS). Without
+  a refresher the hub admits nobody one minute after the last manual export.
+  This job is what keeps it serving.
+
+  It is a SEPARATE job from the hub itself on purpose: this one opens the
+  store, and the hub process must never do that. The hub reads one 0600 file
+  of public material and nothing else.
+
+  Interval: 30 seconds, half the hub's refusal threshold. `ai-memory identity
+  hub-cache` publishes atomically (temp file plus rename in the same
+  directory, mode 0600 on the new inode) so the hub either reads the whole
+  previous snapshot or the whole new one, never a partial file. A run that
+  fails publishes nothing at all: the old snapshot then ages out and the hub
+  refuses hellos, which is the fail-closed direction.
+
+  Pre-flight:
+    1. Publish the snapshot once by hand (see docs/wake-hub.md) and confirm
+       the hub agrees, via `ai-memory wake-hub` with the posture flag, which
+       prints "allowlist snapshot: N s old (ceiling 60 s)".
+    2. Keep ~/.ai-memory owner-only (0700). The file names every agent
+       permitted to join the hub, so it is not public material even though its
+       CONTENTS are only public keys.
+    3. This path is the one dev.alphaone.ai-memory.wake-hub.plist passes to
+       the allowlist flag (#3471). Writing anywhere else gives you a hub
+       reading a file nobody writes.
+
+  Install (the directory is the one the HUB plist reads from, #3471):
+    mkdir -p ~/.ai-memory
+    chmod 700 ~/.ai-memory
+    cp scripts/templates/dev.alphaone.ai-memory.wake-hub-refresh.plist \
+       ~/Library/LaunchAgents/
+    sed -i.bak 's|REPLACE_DB|/Users/YOU/.claude/ai-memory.db|g' \
+       ~/Library/LaunchAgents/dev.alphaone.ai-memory.wake-hub-refresh.plist
+    sed -i.bak 's|REPLACE_AGENT_ID|ai:your-agent|g' \
+       ~/Library/LaunchAgents/dev.alphaone.ai-memory.wake-hub-refresh.plist
+    launchctl bootstrap "gui/$(id -u)" \
+       ~/Library/LaunchAgents/dev.alphaone.ai-memory.wake-hub-refresh.plist
+
+  Operations:
+    launchctl print "gui/$(id -u)/dev.alphaone.ai-memory.wake-hub-refresh"
+    tail -f ~/Library/Logs/ai-memory/wake-hub-refresh.log
+    launchctl bootout "gui/$(id -u)/dev.alphaone.ai-memory.wake-hub-refresh"
+
+  REVOKING an agent: drop its include-agent pair from ProgramArguments below
+  and reload the job. The next refresh omits its row, and the hub drops its
+  established session within one second (the per-session revalidation),
+  audited on the signed_events spine as identity.hub_revoke.
+
+  Linux operators: use packaging/systemd/ai-memory-wake-hub-refresh.service
+  and its companion .timer.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.alphaone.ai-memory.wake-hub-refresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/.local/bin/ai-memory</string>
+        <string>--db</string>
+        <string>REPLACE_DB</string>
+        <string>identity</string>
+        <string>hub-cache</string>
+        <!-- Repeat this pair per agent permitted to join. Omitting an agent
+             on the next refresh REVOKES it; that is the mechanism. Append a
+             daemon-producer flag only if this host's daemon pushes wakes. -->
+        <string>--include-agent</string>
+        <string>REPLACE_AGENT_ID</string>
+        <string>--out</string>
+        <string>/Users/YOU/.ai-memory/hub-allow.json</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/YOU</string>
+    </dict>
+
+    <!-- Half the hub's 60 s refusal threshold. launchd may coalesce timers, so
+         the effective interval can drift a little later than this; 30 s leaves
+         the headroom that absorbs it. -->
+    <key>StartInterval</key><integer>30</integer>
+
+    <!-- Publish once at load so the hub has a fresh snapshot immediately
+         rather than after the first interval. -->
+    <key>RunAtLoad</key><true/>
+
+    <!-- Deliberately NOT KeepAlive: this is a one-shot publisher, not a
+         daemon. A failed run must leave the previous snapshot to age out
+         (the hub then refuses hellos) rather than being restarted in a hot
+         loop against the store. -->
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/ai-memory/wake-hub-refresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/ai-memory/wake-hub-refresh.log</string>
+
+    <key>ProcessType</key><string>Background</string>
+    <key>Nice</key><integer>5</integer>
+</dict>
+</plist>
