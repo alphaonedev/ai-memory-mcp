@@ -48,6 +48,13 @@
 //! handler acts on and audits is the gate's RETURN VALUE, never a
 //! request-supplied field.
 //!
+//! **Supplied-token strength.** The BIND form takes a token the operator
+//! already holds, so the route must not accept one weaker than the token it
+//! would have MINTED: a one-byte string used to become a live bearer
+//! credential for the named agent. [`MIN_SUPPLIED_TOKEN_BYTES`] is the bar,
+//! [`SUPPLIED_TOKEN_FLOOR_BYTES`] the floor it may never be lowered past, and
+//! the refusal echoes nothing of the candidate and audits no digest.
+//!
 //! **No-log token transport.** The raw token is read from the request body as
 //! raw [`axum::body::Bytes`] and parsed HERE, so no extractor rejection can
 //! render any part of the body into an error string; a parse failure answers
@@ -174,6 +181,9 @@ pub const FIELD_EFFECTIVE: &str = "effective";
 /// live registry means there is no refresh window to wait out.
 pub const EFFECTIVE_IMMEDIATELY: &str = "immediately";
 
+/// Audit outcome token for a supplied token refused on strength.
+const OUTCOME_TOKEN_TOO_SHORT: &str = "supplied_token_too_short";
+
 /// Audit outcome token for a durable-store failure on either verb.
 const OUTCOME_STORE_ERROR: &str = "store_error";
 
@@ -184,6 +194,39 @@ const REDACTED: &str = "<redacted>";
 /// 256 bits: the token IS the credential, and it is compared by digest, so
 /// there is no reason to mint anything guessable.
 const MINTED_TOKEN_BYTES: usize = 32;
+
+/// Minimum LENGTH, in bytes, of an OPERATOR-SUPPLIED token on the bind form.
+///
+/// Without this, any non-empty trimmed string bound: `"a"` became a live
+/// bearer credential for the named agent, and on a fleet-reachable route that
+/// is a weak-secret enrolment surface — the mint form's 256 bits of CSPRNG
+/// entropy would be beside a door anyone could walk through with a one-byte
+/// guess. Set to the same 32 the MINTED form draws, so the two halves of one
+/// route cannot disagree about what a credential is worth. **16 is the floor**
+/// — pinned by a unit test, because a future "just for this integration"
+/// loosening below 128 bits is exactly how a strength check becomes theatre.
+///
+/// It is a LENGTH check, deliberately not an entropy estimate: a
+/// Shannon/charset heuristic on a 32-byte string is noise, and refusing a
+/// legitimate high-entropy token an operator already provisioned would push
+/// them back to the CLI or to a shorter one. Length is the property this
+/// surface can honestly enforce; the operator owns the generator.
+pub const MIN_SUPPLIED_TOKEN_BYTES: usize = 32;
+
+/// The absolute floor [`MIN_SUPPLIED_TOKEN_BYTES`] may never be lowered past.
+/// 128 bits is the smallest width anyone should call a bearer secret.
+pub const SUPPLIED_TOKEN_FLOOR_BYTES: usize = 16;
+
+/// The ONLY thing a too-short supplied token is answered with. Echoes NOTHING
+/// of the token — the refusal is about a credential the caller sent, and the
+/// same reasoning that keeps [`BODY_PARSE_REFUSAL`] contentless applies here
+/// verbatim. The response carries the minimum as a NUMBER so a client can act
+/// on it without parsing prose.
+pub const TOKEN_TOO_SHORT: &str = "token too short";
+
+/// Response field carrying [`MIN_SUPPLIED_TOKEN_BYTES`] on a
+/// [`TOKEN_TOO_SHORT`] refusal.
+pub const FIELD_MIN_TOKEN_BYTES: &str = "min_token_bytes";
 
 /// How many leading hex characters of `sha256(token)` identify a key in logs
 /// and audit rows. Enough to correlate two rows, far too few to attack the
@@ -423,6 +466,17 @@ pub const APPROVAL_SIGNATURE_HINT: &str = "approving a queued api-key action req
 #[must_use]
 pub fn key_fingerprint(token_sha256: &str) -> String {
     token_sha256.chars().take(FINGERPRINT_HEX_LEN).collect()
+}
+
+/// Whether an OPERATOR-SUPPLIED token is long enough to be a credential.
+///
+/// `token` is the ALREADY-TRIMMED value; the empty string is refused by the
+/// same rule rather than by a separate branch, so there is one answer to
+/// "why was my token rejected" instead of two. Pure, so the rule is pinned by
+/// a unit test rather than only by driving the route.
+#[must_use]
+pub fn supplied_token_meets_minimum(token: &str) -> bool {
+    token.len() >= MIN_SUPPLIED_TOKEN_BYTES
 }
 
 /// Mint a fresh bearer token from the platform CSPRNG — the same source
@@ -840,12 +894,27 @@ pub async fn mint_agent_api_key(
         return apply_approved(&app, &headers, &body, &caller, &agent_id, pending_id, false).await;
     }
 
-    // Operator-supplied token, or a fresh server-minted one.
+    // Operator-supplied token, or a fresh server-minted one. A supplied token
+    // must meet the same strength bar the minted one clears; the refusal
+    // carries the minimum and NOTHING of the token, and is audited without a
+    // digest (there is no binding to correlate, and hashing a rejected
+    // candidate would put a guess in the audit chain).
     let (raw_token, minted) = match parsed.token.as_deref().map(str::trim) {
-        Some("") => {
+        Some(t) if !supplied_token_meets_minimum(t) => {
+            audit(
+                &caller,
+                "refuse",
+                MINT_ENDPOINT,
+                &agent_id,
+                OUTCOME_TOKEN_TOO_SHORT,
+                None,
+            );
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": BODY_PARSE_REFUSAL})),
+                Json(json!({
+                    "error": TOKEN_TOO_SHORT,
+                    (FIELD_MIN_TOKEN_BYTES): MIN_SUPPLIED_TOKEN_BYTES,
+                })),
             )
                 .into_response();
         }
@@ -1325,6 +1394,28 @@ mod tests {
             a.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
+    }
+
+    #[test]
+    fn a_supplied_token_must_be_at_least_as_strong_as_a_minted_one() {
+        // The bar itself, and the floor it may never be lowered past. A
+        // future "just for this integration" loosening below 128 bits is
+        // exactly how a strength check becomes theatre.
+        assert!(
+            MIN_SUPPLIED_TOKEN_BYTES >= SUPPLIED_TOKEN_FLOOR_BYTES,
+            "the supplied-token minimum was lowered below the {SUPPLIED_TOKEN_FLOOR_BYTES}-byte floor"
+        );
+        assert!(!supplied_token_meets_minimum(""));
+        assert!(!supplied_token_meets_minimum("a"));
+        assert!(!supplied_token_meets_minimum(
+            &"x".repeat(MIN_SUPPLIED_TOKEN_BYTES - 1)
+        ));
+        assert!(supplied_token_meets_minimum(
+            &"x".repeat(MIN_SUPPLIED_TOKEN_BYTES)
+        ));
+        // The route's OWN mint must clear its own bar — otherwise the two
+        // halves of one endpoint would disagree about what a credential is.
+        assert!(supplied_token_meets_minimum(&mint_token()));
     }
 
     #[test]

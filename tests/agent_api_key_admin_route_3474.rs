@@ -36,8 +36,8 @@ use std::sync::{Arc, Mutex};
 
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::agent_api_key::{
-    MINT_RATE_LIMIT_PER_WINDOW, RATE_LIMITED, TRANSPORT_REFUSAL, approval_subject,
-    mark_credential_transport_confidential,
+    MIN_SUPPLIED_TOKEN_BYTES, MINT_RATE_LIMIT_PER_WINDOW, RATE_LIMITED, TOKEN_TOO_SHORT,
+    TRANSPORT_REFUSAL, approval_subject, mark_credential_transport_confidential,
 };
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -323,7 +323,9 @@ async fn admin_bind_of_an_operator_supplied_token_never_echoes_it_3474() {
     let _g = serial().await;
     let fx = fixture("bind", &[ADMIN]);
 
-    let supplied = "operator-supplied-token-3474";
+    // At least MIN_SUPPLIED_TOKEN_BYTES: the bind form must not accept a
+    // token weaker than the one it would have minted.
+    let supplied = "operator-supplied-token-3474-long-enough-to-be-a-credential";
     let (status, _, body) = call(
         &fx.router,
         mint_req(ADMIN, ALICE, &json!({ "token": supplied })),
@@ -739,6 +741,53 @@ async fn a_mint_over_a_non_confidential_transport_is_refused_3474() {
     // the refusal above is the control and not a broken route.
     let (status, body, _) = mint(&fx.router, ADMIN, ALICE).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// DENIED — a supplied token shorter than the bar is refused, echoing nothing
+/// of it, and binds nothing; ALLOWED — one of exactly the minimum length
+/// still binds, so the check is a floor and not an outage.
+#[tokio::test]
+async fn a_supplied_token_below_the_minimum_is_refused_and_binds_nothing_3474() {
+    const ADMIN: &str = "ai:key-admin-weak";
+    let _g = serial().await;
+    let fx = fixture("weak", &[ADMIN]);
+
+    let weak = "a".repeat(MIN_SUPPLIED_TOKEN_BYTES - 1);
+    let (status, _, body) = call(
+        &fx.router,
+        mint_req(ADMIN, ALICE, &json!({ "token": weak })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], TOKEN_TOO_SHORT);
+    assert_eq!(body["min_token_bytes"], MIN_SUPPLIED_TOKEN_BYTES);
+    assert!(
+        !body.to_string().contains(&weak),
+        "the refusal echoed the candidate token: {body}"
+    );
+    assert_eq!(
+        fx.registry.len(),
+        0,
+        "a refused weak token must not enrol anything"
+    );
+    assert!(
+        !token_authenticates(&fx.router, &weak).await,
+        "a refused weak token must not authenticate"
+    );
+
+    // ALLOWED — exactly at the bar. Without this the refusal above could be a
+    // broken route rather than a working floor.
+    let ok = "b".repeat(MIN_SUPPLIED_TOKEN_BYTES);
+    let (status, _, body) = call(&fx.router, mint_req(ADMIN, ALICE, &json!({ "token": ok }))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(token_authenticates(&fx.router, &ok).await);
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&api_key_sha256_hex(&ok))
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string())
+    );
 }
 
 /// DENIED — a malformed body is answered with a fixed string that echoes
