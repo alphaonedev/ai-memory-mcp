@@ -788,7 +788,31 @@ rate_burst = 2000              # fan-out is charged to the SENDER
 pending_max_agents = 1024      # coalesced offline state, bounded
 pending_max_ids = 64           # ids retained per offline agent, then `lagged`
 allowlist = "/run/user/1000/ai-memory/wake-hub-allow.json"   # #3468
+sink_socket = "/run/user/1000/ai-memory/wake-hub.sock"       # #3469
 ```
+
+**`sink_socket`** (#3469) is the client end, and the only key in this block
+that `ai-memory serve` reads. Set it and the daemon forwards a content-free
+wake to that hub every time a `memory_notify` commits, so a recipient learns it
+has mail in about a millisecond instead of on its next poll. Leave it unset —
+the default — and no forwarder is started, no socket is opened and no identity
+is loaded; recipients fall back to their backstop inbox poll, which remains the
+guarantee either way.
+
+Setting it also requires two things to be true, and the daemon says exactly
+which one is missing if not:
+
+1. this host has the daemon's enrolled keypair (`daemon.priv`) in the ai-memory
+   key directory — it is auto-generated on first start; and
+2. the hub's allowlist carries a row binding `wake-hub-producer` to that
+   daemon public key, published with `identity hub-cache`.
+
+The daemon issues its own short-lived `a2a-hub/join/v1` delegation for the
+reserved `wake-hub-producer` session under that enrolled key, minting a fresh
+in-memory session key per connection; no second private key exists and nothing
+is written to disk. A configured-but-unstartable forwarder is an ERROR log and
+no socket, never a silent skip — and it never takes `serve` down with it,
+because the wake is a hint and the durable inbox row is the record.
 
 **`allowlist`** (#3468) is the version-2 public snapshot produced by
 `identity hub-cache`: enrolled public keys, proven v97 binding authority and

@@ -157,6 +157,65 @@ unaddressable recipient, unencodable frame, hub queue or egress overflow,
 offline-coalesced, offline-unknown, hand-off channel full, hub down, and bus
 lag. A hub that silently stopped waking anyone must not look like a quiet fleet.
 
+## Turning it on: the operator ceremony
+
+Nothing pushes wakes until an operator asks for it. The default posture is no
+forwarder, no socket and no identity load.
+
+**1. Run the hub.** `ai-memory wake-hub --allowlist <allow.json>` in its own
+process (see `docs/CLI_REFERENCE.md`; `--posture` prints the resolved socket,
+directory mode and fd budget without binding anything).
+
+**2. Grant the producer name.** The daemon issues its wake sessions under the
+reserved principal `wake-hub-producer`, signed by the daemon's OWN enrolled
+`daemon` key — the same key it already signs links with. Publish an allowlist
+row binding that name to that public key:
+
+```bash
+ai-memory identity hub-cache --agent-id wake-hub-producer --out <allow.json>
+```
+
+This row is the single, revocable grant that says "this host's daemon may wake
+agents on this hub". Remove it (and refresh the snapshot) and the forwarder is
+refused within a second — the hub revalidates every established session once
+per second against the current snapshot.
+
+**3. Point the daemon at the hub.** In `config.toml`:
+
+```toml
+[wake_hub]
+sink_socket = "/run/user/1000/ai-memory/wake-hub.sock"
+```
+
+Restart `serve`. The startup log names the enrolled public key it will issue
+under, so you can check it against the row you published.
+
+If the sink is configured but the daemon has no enrolled key — or a
+public-only one — it REFUSES to start the forwarder, logs the exact
+remediation at ERROR, and keeps serving. It does not open a socket it could not
+authenticate on, and it does not take the durable substrate down over a hint it
+cannot push.
+
+### Why the daemon's own key, and not a key of its own
+
+`wake-hub-producer` is a reserved agent id: no wire caller can register or
+claim it. It deliberately has NO enrolled root of its own. Minting one would
+mean a second private key on the host, with its own enrolment ceremony, its own
+rotation and its own revocation story — a second identity root, which is
+exactly what "one identity root" forbids. Instead the daemon's already-enrolled,
+already-proven root is the sole authority, `wake-hub-producer` is a scoped NAME
+that root may speak under on the wake plane, and the allowlist row is the
+operator's explicit, revocable grant that says so. The per-connection session
+key is generated in memory and never written anywhere, so there is no
+credential file to steal and nothing to rotate.
+
+### The co-hosted shape
+
+`wake_sink::in_process::install_in_process(router)` is available as a library
+call and is exercised by the test suite, but nothing in `serve` hosts a hub in
+this build — `ai-memory wake-hub` runs the hub as its own process. When a
+`serve`-hosted hub lands, wiring it is one line at the same boot site.
+
 ## Operating the hub
 
 See `docs/CLI_REFERENCE.md` for `ai-memory wake-hub`, including `--posture`

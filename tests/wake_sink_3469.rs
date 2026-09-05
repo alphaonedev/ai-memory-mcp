@@ -468,3 +468,208 @@ async fn the_sqlite_sal_notify_funnel_reaches_the_hub_3469() {
     assert_eq!(meta.namespace, ai_memory::inbox_namespace(&recipient));
     assert_eq!(frame.from, WAKE_HUB_PRODUCER);
 }
+
+// ---------------------------------------------------------------------------
+// The boot decision: `[wake_hub].sink_socket` -> a live forwarder
+// ---------------------------------------------------------------------------
+
+/// Stage an owner-only key directory holding the daemon's enrolled keypair,
+/// the way a booted daemon's key directory looks.
+fn staged_key_dir(with_daemon_key: bool) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700");
+    if with_daemon_key {
+        let kp = ai_memory::identity::keypair::generate(
+            ai_memory::identity::keypair::DAEMON_KEYPAIR_LABEL,
+        )
+        .expect("generate daemon keypair");
+        ai_memory::identity::keypair::save(&kp, dir.path()).expect("save daemon keypair");
+    }
+    dir
+}
+
+fn load_daemon_key(key_dir: &std::path::Path) -> ed25519_dalek::VerifyingKey {
+    ai_memory::identity::keypair::load(ai_memory::identity::keypair::DAEMON_KEYPAIR_LABEL, key_dir)
+        .expect("load daemon keypair")
+        .public
+}
+
+/// Mint an `a2a-hub/join/v1` delegation the way `ai-memory identity delegate`
+/// does, so a test client presents the real thing to the real verifier.
+fn mint_delegation(
+    principal: &str,
+    hub_id: &str,
+    root: &SigningKey,
+    delegate: &SigningKey,
+) -> bytes::Bytes {
+    use ai_memory::identity::hub_delegation::{A2A_HUB_SCOPE, DelegationWire, sign_hub_delegation};
+    let now = chrono::Utc::now();
+    let mut wire = DelegationWire {
+        principal: principal.to_owned(),
+        scope: A2A_HUB_SCOPE.to_owned(),
+        delegate_key_id: delegate.verifying_key().to_bytes(),
+        hub_id: hub_id.to_owned(),
+        // Whole seconds: the verifier's clock is second-granular, so a
+        // sub-second `not_before` is briefly in its future (see
+        // `wake_sink::producer_identity`).
+        not_before: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        not_after: (now + chrono::Duration::seconds(600))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        signature: [0u8; 64],
+    };
+    wire.signature = sign_hub_delegation(root, &wire.as_delegation()).expect("sign delegation");
+    bytes::Bytes::from(wire.encode().expect("encode delegation"))
+}
+
+fn app_config_with_sink(socket: &std::path::Path, hub_id: &str) -> ai_memory::config::AppConfig {
+    ai_memory::config::AppConfig {
+        wake_hub: Some(ai_memory::config::WakeHubConfig {
+            sink_socket: Some(socket.to_path_buf()),
+            hub_id: Some(hub_id.to_owned()),
+            ..ai_memory::config::WakeHubConfig::default()
+        }),
+        ..ai_memory::config::AppConfig::default()
+    }
+}
+
+/// ALLOWED, the whole operational path: `[wake_hub].sink_socket` plus the
+/// daemon's enrolled key in the key directory produce a forwarder that joins a
+/// REAL hub through #3468's REAL `ScopedDelegationVerifier` — under a
+/// delegation the daemon's OWN enrolled root issued for the reserved producer
+/// name — and a substrate wake reaches the recipient's own session.
+///
+/// Nothing here is stubbed: real key files, real delegation minting, real
+/// signature verification, real socket, real hub.
+#[tokio::test]
+async fn the_boot_wired_forwarder_joins_a_real_hub_and_delivers_3469() {
+    use ai_memory::wake_hub::delegation_verifier::{
+        AllowlistCache, EnrolledRoot, RootBindAuthority, ScopedDelegationVerifier,
+    };
+
+    let recipient = uid("hana");
+    let key_dir = staged_key_dir(true);
+    let daemon_public = load_daemon_key(key_dir.path());
+
+    // The recipient is an ordinary enrolled agent with its own delegated key.
+    let recipient_root = SigningKey::from_bytes(&[51u8; 32]);
+    let recipient_delegate = SigningKey::from_bytes(&[52u8; 32]);
+
+    // The operator's grant: the reserved producer name is bound to the
+    // DAEMON's enrolled key. No second root exists anywhere in this test.
+    let mut allowlist = AllowlistCache::new();
+    allowlist.insert(
+        WAKE_HUB_PRODUCER,
+        EnrolledRoot {
+            pubkey: daemon_public,
+            authority: RootBindAuthority::PossessionProof,
+        },
+    );
+    allowlist.insert(
+        &recipient,
+        EnrolledRoot {
+            pubkey: recipient_root.verifying_key(),
+            authority: RootBindAuthority::PossessionProof,
+        },
+    );
+
+    let harness = Harness::start(
+        |_| {},
+        Arc::new(ScopedDelegationVerifier::new(allowlist)),
+        Arc::new(ai_memory::wake_hub::identity::SameUidAuthorizer::for_current_process()),
+    );
+
+    let mut client = harness.connect().await;
+    client.delegation = mint_delegation(
+        &recipient,
+        &harness.hub_id,
+        &recipient_root,
+        &recipient_delegate,
+    );
+    client.hello(&recipient, &recipient_delegate, &[]).await;
+    let admitted = client.expect_frame().await;
+    assert_eq!(
+        admitted.kind,
+        Kind::Welcome,
+        "the recipient must be admitted by the real delegation verifier; hub said {:?}",
+        ai_memory::wake_hub::frame::decode_error(&admitted.payload)
+    );
+
+    let cfg = app_config_with_sink(&harness.socket, &harness.hub_id);
+    let sink = ai_memory::wake_sink::boot::spawn_forwarder(&cfg, key_dir.path())
+        .expect("the boot decision must start a forwarder")
+        .expect("`sink_socket` is configured, so this is not the unconfigured posture");
+
+    sink.on_wake(&InboxEvent::AgentNotified {
+        seq: 3469,
+        recipient_agent_id: recipient.clone(),
+        correlation_id: "sha256:c".into(),
+        inbox_row_id: "row-boot".into(),
+        namespace: format!("_inbox/{recipient}"),
+        sender_agent_id: "ai:alice".into(),
+        content_digest: format!("sha256:{}", "77".repeat(32)),
+        notified_at: "2026-09-05T00:00:00Z".into(),
+    });
+
+    let frame = client.expect_frame().await;
+    assert_eq!(frame.kind, Kind::Wake);
+    assert_eq!(frame.to, recipient);
+    assert_eq!(
+        frame.from, WAKE_HUB_PRODUCER,
+        "the hub stamps the identity it authenticated, and the daemon joined as the \
+         reserved producer name under its own enrolled root"
+    );
+    let meta = WakeMeta::decode(&frame.payload).expect("meta");
+    assert_eq!(meta.inbox_row_id, "row-boot");
+    assert_eq!(meta.seq_high_watermark, 3469);
+    assert_eq!(sink.metrics().snapshot().delivered, 1);
+
+    harness.stop().await;
+}
+
+/// DENIED, the amendment's fail-closed regression at the socket level: the
+/// sink is CONFIGURED but the key directory holds no daemon credential, so the
+/// boot decision refuses, no forwarder starts, and the hub never sees a
+/// connection. A daemon in this state pushes nothing and says so.
+#[tokio::test]
+async fn a_configured_sink_without_credential_material_never_reaches_the_hub_3469() {
+    let harness = Harness::with_verifier(TestVerifier::new());
+    let empty_key_dir = staged_key_dir(false);
+    let cfg = app_config_with_sink(&harness.socket, &harness.hub_id);
+
+    let err = ai_memory::wake_sink::boot::spawn_forwarder(&cfg, empty_key_dir.path())
+        .expect_err("no enrolled daemon key, no forwarder");
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("wake sink:"), "{rendered}");
+    assert!(
+        rendered.contains(WAKE_HUB_PRODUCER),
+        "the refusal must name the principal an operator has to enrol: {rendered}"
+    );
+
+    // The installing twin refuses identically, and NOTHING was opened.
+    assert!(ai_memory::wake_sink::boot::install_with_key_dir(&cfg, empty_key_dir.path()).is_err());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        harness.metrics.snapshot(0).accepted,
+        0,
+        "a refused boot must not open a socket"
+    );
+
+    harness.stop().await;
+}
+
+/// The DEFAULT posture: no `sink_socket`, no forwarder, no error — a daemon
+/// that was never asked to push wakes must boot exactly as before.
+#[tokio::test]
+async fn the_default_posture_starts_no_forwarder_3469() {
+    let key_dir = staged_key_dir(true);
+    assert!(
+        ai_memory::wake_sink::boot::spawn_forwarder(
+            &ai_memory::config::AppConfig::default(),
+            key_dir.path()
+        )
+        .expect("an unconfigured sink is a valid posture, not a fault")
+        .is_none()
+    );
+}

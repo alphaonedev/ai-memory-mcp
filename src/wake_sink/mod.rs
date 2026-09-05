@@ -14,14 +14,19 @@
 //! wake HINT to a connected agent. This module is the wire between them, in
 //! the two deployment shapes the EPIC allows:
 //!
-//! * [`in_process`] — the hub is CO-HOSTED with the daemon. The encoded frame
+//! * [`in_process`] — the hub is CO-HOSTED with the daemon. Available as a
+//!   library call and exercised by the tests; there is no `serve`-hosted hub
+//!   in this build to wire it to, and inventing one is not this issue. The encoded frame
 //!   goes straight to [`crate::wake_hub::routing::Router::deliver`], the same
 //!   injection point a hub connection's own `route_wake` uses, so a substrate
 //!   wake and a peer-relayed one are indistinguishable downstream and obey the
 //!   same per-recipient queue, byte cap, egress budget and coalesced pending
 //!   set. `deliver` is a lock plus a `try_send` with no `.await`, which is what
 //!   makes it legal on the bus pump (`CONCURRENCY-20`, `CONCURRENCY-22`).
-//! * [`uds`] — the hub runs as a SEPARATE process. The daemon-side forwarder is
+//! * [`uds`] — the hub runs as a SEPARATE process. This is the shape `serve`
+//!   wires today ([`boot::install_from_config`], driven by
+//!   `[wake_hub].sink_socket`), because `ai-memory wake-hub` runs the hub as
+//!   its own process and nothing in `serve` hosts one. The daemon-side forwarder is
 //!   an ordinary hub client over the hub's Unix domain socket: the same
 //!   handshake, the same `u32`-big-endian framing and the same
 //!   [`crate::wake_hub::limits::MAX_FRAME_BYTES`] ceiling
@@ -80,7 +85,9 @@ use crate::inbox_wake::InboxEvent;
 use crate::wake_hub::frame::{Frame, FrameError, Kind, WakeMeta, is_topic};
 use crate::wake_hub::limits::{MAX_ID_BYTES, WAKE_DIGEST_BYTES};
 
+pub mod boot;
 pub mod in_process;
+pub mod producer_identity;
 pub mod uds;
 
 /// The longest a client of the wake plane may go between inbox polls.
