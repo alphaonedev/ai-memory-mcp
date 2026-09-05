@@ -476,17 +476,24 @@ leaves all three at their secure defaults:
   `AI_MEMORY_FED_PEER_FINGERPRINTS` above — this binds the peer's CLIENT
   cert to its claimed identity.
 
-## Federation lanes: sqlite-only on a PostgreSQL receiver (v1.0.0)
+## Federation lanes still sqlite-only on a PostgreSQL receiver
 
-The `/sync/push` receive funnel is fully trait-covered on a
-PostgreSQL-backed receiver for the core lanes — `memories[]`,
-`deletions[]`, `links[]`, and `signals[]` all round-trip through the
-`MemoryStore` trait with sqlite-twin parity. A fixed set of the
+The `/sync/push` receive funnel is trait-covered on a PostgreSQL-backed
+receiver for the core lanes — `memories[]`, `deletions[]`, `links[]`,
+`signals[]` and `action_transitions[]` all round-trip through the
+`MemoryStore` trait with sqlite-twin parity, and since
+[#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075) so do
+the governance-STANDARD lanes **`namespace_meta[]`** +
+**`namespace_meta_clears[]`**, gated by the SAME backend-blind
+`receive_auth::inbound_namespace_meta_authorized` verdict the sqlite
+funnel calls (Amendment E's unconditional global-`*` refusal included)
+and reported through `namespace_meta_applied` /
+`namespace_meta_cleared` / `namespace_meta_refused`. A fixed set of the
 remaining subcollections is **not yet** trait-covered for a verbatim
 inbound write against the postgres store, so on a postgres receiver
 those lanes are bucketed as **honest, sender-visible non-ack**
 (`unsupported_on_postgres` in the push response) rather than being
-applied. The affected subcollections are:
+applied. The still-affected subcollections are:
 
 - **`checkpoints`** — federated commit-checkpoint RESOLUTION, the
   separation-of-duties freeze anchor
@@ -497,9 +504,6 @@ applied. The affected subcollections are:
 - **`pendings`** + **`pending_decisions`** — the governance PENDING-action
   and pending-DECISION broadcast lanes
   ([#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478)).
-- **`namespace_meta`** + **`namespace_meta_clears`** — the
-  governance-STANDARD (namespace-standard rebind) lanes
-  ([#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479)).
 - **`archives`** + **`restores`** — the archive / restore fanout siblings
   ([#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447)).
 
@@ -512,21 +516,20 @@ not reachable-around by an inbound peer: the funnel returns before the
 sqlite-inline apply loops for these lanes run, and nothing on the
 postgres path calls the corresponding trait write. Because these lanes
 refuse-to-apply rather than write, no unverified inbound checkpoint
-resolution, pending execution, or namespace-standard rebind can land on
-a postgres receiver.
+resolution or pending execution can land on a postgres receiver.
 
 **Single-node deployments and sqlite-backed receivers are unaffected** —
 these lanes apply fully on a sqlite receiver and on the local MCP /
 epoch-apply-native paths, and the same governance and checkpoint
 operations remain fully reachable on a postgres daemon through its LOCAL
-surfaces (governed by local authz rather than peer scope). Full
-postgres-receiver replication of these lanes (a trait-covered
+surfaces (governed by local authz rather than peer scope).
+Postgres-receiver replication of the remaining lanes (a trait-covered
 `apply_remote_*` write per lane, routed through the existing
-backend-blind `receive_auth` verdicts) is tracked for **v1.1** under
+backend-blind `receive_auth` verdicts) continues under
 [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075).
-Operators needing multi-node federated replication of these
-subcollections today should pin a sqlite-backed receiver for the
-affected namespaces until v1.1.
+Operators needing multi-node federated replication of a subcollection
+still marked `unsupported_on_postgres` should pin a sqlite-backed
+receiver for the affected namespaces.
 
 ## Quorum + vector clocks
 

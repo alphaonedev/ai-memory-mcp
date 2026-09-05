@@ -80,6 +80,83 @@ async fn resolve_stored_namespace(
     app.store.namespace_by_id(&ns_probe_ctx, id).await
 }
 
+/// #3075 — the operator context the postgres federation-RECEIVE APPLY lanes use
+/// for their SAL writes.
+///
+/// ## Why `for_admin` (privacy bypass) and not `for_agent`
+///
+/// This is a PARITY requirement, not a convenience. The sqlite twin
+/// ([`super::federation_receive::sync_push`]) applies every one of these lanes
+/// through the RAW `db::*` free functions — `db::set_namespace_standard`,
+/// `db::clear_namespace_standard`, `db::archive_memory`, `db::restore_archived`,
+/// `db::upsert_pending_action` — none of which consult a caller identity at all.
+/// The federation authorization on those lanes is the PEER-SCOPE gate
+/// (`receive_auth::inbound_*_authorized`, #2447/#2478/#2479) plus the per-lane
+/// crypto attestation, NOT the local owner/tenant gate.
+///
+/// Several postgres trait methods DO carry a local caller-owns gate for their
+/// TENANT-facing surfaces (`clear_namespace_standard`'s #1777/#2545 owner gate,
+/// `archive_by_ids`' #3193 caller-owns gate, `archive_restore`'s #3271 twin).
+/// Routing a federated apply through a tenant-scoped context would make the pg
+/// receiver refuse rows the sqlite receiver applies — a SILENT cross-backend
+/// divergence in exactly the direction #2488 warns about (a lane confined on one
+/// funnel only), whose visible symptom is two peers answering `get_standard`
+/// with different governance. So the federated apply runs with the bypass and
+/// the peer-scope gate stays the sole authorization, byte-for-byte as on sqlite.
+///
+/// This adds NO reach a peer did not already have: every call site below runs
+/// AFTER the lane's `receive_auth` verdict, and `/sync/push` is a peer/operator
+/// surface (the #238 envelope gate + #29 signature + #30 nonce + #43 enrollment
+/// all precede this funnel), never a tenant-facing handler. The principal is the
+/// attested sender so the write is attributable in the audit trail.
+#[cfg(feature = "sal")]
+fn federation_apply_ctx(receive_principal: String) -> crate::store::CallerContext {
+    crate::store::CallerContext::for_admin(receive_principal)
+}
+
+/// #2479 / #3075 — postgres READER for the severed-out-of-scope-parent WARN.
+///
+/// The DECISION (unchanged-link short circuit, `namespace_allowed` verdict, WARN
+/// text) lives once in
+/// [`super::federation_receive::warn_on_severed_out_of_scope_parent_resolved`];
+/// this function only supplies the stored `parent_namespace` the sqlite twin
+/// reads through `db::get_namespace_meta_entry`. Observability-only and
+/// deliberately fail-OPEN on a read error, exactly as the sqlite twin is: the
+/// scope verdict has ALREADY been rendered by the caller and nothing downstream
+/// consults this result, so a storage fault costs the log line and nothing else.
+/// (`get_namespace_standard` returns `(standard_id, parent_namespace)`; only the
+/// parent is used.)
+#[cfg(feature = "sal")]
+async fn warn_on_severed_out_of_scope_parent_via_store(
+    app: &AppState,
+    sender_agent_id: &str,
+    lane: &str,
+    namespace: &str,
+    declared_parent: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+) {
+    let read_ctx = federation_apply_ctx(sender_agent_id.to_string());
+    let stored_parent = match app.store.get_namespace_standard(&read_ctx, namespace).await {
+        Ok(Some((_standard_id, parent))) => parent,
+        Ok(None) => return,
+        Err(e) => {
+            crate::handlers::federation_receive::warn_severed_parent_unreadable(
+                lane, namespace, peer_id, &e,
+            );
+            return;
+        }
+    };
+    crate::handlers::federation_receive::warn_on_severed_out_of_scope_parent_resolved(
+        lane,
+        namespace,
+        stored_parent.as_deref(),
+        declared_parent,
+        attest_cfg,
+        peer_id,
+    );
+}
+
 #[cfg(feature = "sal")]
 #[allow(clippy::too_many_lines)]
 pub(super) async fn sync_push_via_store(
@@ -943,40 +1020,27 @@ pub(super) async fn sync_push_via_store(
     // (`handlers::approvals` / `handlers::governance`), which are governed by
     // local authz rather than peer scope.
     //
-    // #2479 (CWE-284) — the same bucketing is what makes the federated
-    // GOVERNANCE-STANDARD lanes (`namespace_meta[]` + `namespace_meta_clears[]`)
-    // structurally unreachable on postgres. `sync_push` hands the whole request
-    // to this funnel and RETURNS before the sqlite `namespace_meta` loops run,
-    // and nothing in this funnel calls `MemoryStore::set_namespace_standard` /
-    // `clear_namespace_standard`. Pinned by an EXECUTABLE assertion (row state,
-    // not counters) in `tests/federation_ns_meta_scope_2479_pg.rs` rather than
-    // asserted in prose — the #2528 precedent.
+    // #2479 (CWE-284) / #3075 — the GOVERNANCE-STANDARD lanes
+    // (`namespace_meta[]` + `namespace_meta_clears[]`) are NO LONGER in this
+    // bucket. They now APPLY on a postgres receiver through the SAL trait
+    // (`MemoryStore::{set,clear}_namespace_standard`, both adapters), gated by
+    // the SAME backend-BLIND `receive_auth::inbound_namespace_meta_authorized`
+    // verdict the sqlite funnel calls — see the two loops after the
+    // `action_transitions` loop below. The verdict takes no connection and
+    // performs no probe (because `namespace_meta`'s PRIMARY KEY is the namespace
+    // itself), so the pg funnel calls it VERBATIM: there is no second
+    // implementation for the two backends to drift apart on, which is precisely
+    // why this family was the first of the #3075 set to migrate.
     //
-    // The claim is again about the FEDERATION lane ONLY. Those two trait methods
-    // ARE reachable on a postgres deployment through the LOCAL surfaces
-    // (`handlers::hook_subscribers::{set_namespace_standard,
-    // clear_namespace_standard}` and the MCP `memory_namespace_set_standard` /
-    // `_clear_standard` tools), which are governed by local authz rather than
-    // peer scope and are deliberately out of #2479's scope.
-    //
-    // Any future trait-covered federation of these subcollections MUST route
-    // through `receive_auth::inbound_namespace_meta_authorized` BEFORE the trait
-    // write. That verdict is backend-BLIND (it takes no connection and performs
-    // no probe, because `namespace_meta`'s PRIMARY KEY is the namespace itself),
-    // so the pg funnel can call it verbatim — there is no second implementation
-    // for the two backends to drift apart on.
-    //
-    // Any future trait-covered federation of these subcollections MUST route
-    // through `federation_receive::pending_namespaces_authorized` (or the shared
-    // `receive_auth` verdict it wraps) BEFORE approving — the #2488 lesson is
-    // that the two backends break in opposite directions when a lane is
-    // confined on one funnel only.
+    // Any future trait-covered federation of the REMAINING subcollections MUST
+    // route through `federation_receive::pending_namespaces_authorized` (or the
+    // shared `receive_auth` verdict it wraps) BEFORE approving — the #2488
+    // lesson is that the two backends break in opposite directions when a lane
+    // is confined on one funnel only.
     unsupported_on_postgres += body.archives.len()
         + body.restores.len()
         + body.pendings.len()
         + body.pending_decisions.len()
-        + body.namespace_meta.len()
-        + body.namespace_meta_clears.len()
         + body.checkpoints.len();
 
     // #1718 — signals round-trip via the SAL trait (`apply_remote_signal`:
@@ -1206,6 +1270,137 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
+    // ---- namespace_meta / namespace_meta_clears (#2479, #3075) ---------
+    //
+    // v0.6.2 (S35) sqlite-twin parity: apply the peer's governance-STANDARD
+    // rows through `MemoryStore::{set,clear}_namespace_standard` so a
+    // postgres-backed receiver converges on the originator's inheritance chain
+    // instead of reporting the whole lane `unsupported_on_postgres` (#3075).
+    //
+    // AUTHORIZATION IS THE SQLITE VERDICT, VERBATIM. Both loops call
+    // `receive_auth::inbound_namespace_meta_authorized`, which is backend-blind
+    // (no connection, no probe — `namespace_meta`'s PRIMARY KEY is the namespace
+    // itself, so there is no stored-vs-claimed split to resolve and the #2447
+    // relocate bypass has no subject here). That covers, in one shared
+    // function: the #2479 Amendment E UNCONDITIONAL refusal on the GLOBAL `*`
+    // standard for any peer that did not declare `**`, the row's own namespace,
+    // the declared `parent_namespace` it splices above that namespace, and the
+    // #2536 deep-descendant probe. A refusal increments the additive
+    // `namespace_meta_refused` counter AND `skipped` — identical to the sqlite
+    // twin, and deliberately not folded, because this funnel enqueues nothing to
+    // the push DLQ (#2498) so the sender is the only party that can retry.
+    let ns_gate_enrolled = attest_cfg.has_allowlist();
+    let mut namespace_meta_applied = 0usize;
+    let mut namespace_meta_cleared = 0usize;
+    let mut namespace_meta_refused = 0usize;
+    for entry in &body.namespace_meta {
+        if validate::validate_namespace(&entry.namespace).is_err()
+            || validate::validate_id(&entry.standard_id).is_err()
+        {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        if ns_gate_enrolled {
+            if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
+                crate::federation::receive_auth::LANE_NAMESPACE_META,
+                &entry.namespace,
+                entry.parent_namespace.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                namespace_meta_refused += 1;
+                skipped += 1;
+                continue;
+            }
+            // AFTER the verdict, never before: a refused entry severs nothing,
+            // so warning about it would be false (sqlite-twin ordering).
+            warn_on_severed_out_of_scope_parent_via_store(
+                &app,
+                &body.sender_agent_id,
+                crate::federation::receive_auth::LANE_NAMESPACE_META,
+                &entry.namespace,
+                entry.parent_namespace.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            )
+            .await;
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app
+            .store
+            .set_namespace_standard(
+                &apply_ctx,
+                &entry.namespace,
+                &entry.standard_id,
+                entry.parent_namespace.as_deref(),
+            )
+            .await
+        {
+            Ok(()) => namespace_meta_applied += 1,
+            Err(e) => {
+                tracing::warn!(
+                    "sync_push(store): set_namespace_standard failed for {}: {e}",
+                    entry.namespace
+                );
+                skipped += 1;
+            }
+        }
+    }
+    for ns in &body.namespace_meta_clears {
+        if validate::validate_namespace(ns).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        // The DESTRUCTIVE twin: `clear_namespace_standard` removes the standard
+        // AND the parent link in one statement, and because governance is
+        // allow-on-silence an absent policy resolves PERMISSIVE — so this lane
+        // DISARMS a namespace (and, by inheritance, its descendants). No
+        // `standard_id` rides this lane, hence no parent to gate: the namespace
+        // is the whole subject (sqlite-twin reasoning, verbatim).
+        if ns_gate_enrolled {
+            if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
+                crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
+                ns,
+                None,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                namespace_meta_refused += 1;
+                skipped += 1;
+                continue;
+            }
+            warn_on_severed_out_of_scope_parent_via_store(
+                &app,
+                &body.sender_agent_id,
+                crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
+                ns,
+                None,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            )
+            .await;
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app.store.clear_namespace_standard(&apply_ctx, ns).await {
+            Ok(true) => namespace_meta_cleared += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push(store): clear_namespace_standard failed for {ns}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+
     // #1566 / #1579 B1 — ack-after-commit: the response (the sender's
     // quorum ack) returns now; rows still needing a locally-computed
     // vector are embedded by this detached task.
@@ -1219,6 +1414,12 @@ pub(super) async fn sync_push_via_store(
             "links_applied": links_applied,
             "signals_applied": signals_applied,
             "action_transitions_applied": action_transitions_applied,
+            // #3075 — governance-STANDARD lane counters, sqlite-twin names.
+            "namespace_meta_applied": namespace_meta_applied,
+            "namespace_meta_cleared": namespace_meta_cleared,
+            // #2479 — additive; see the sqlite twin's declaration for why this
+            // is not folded into `skipped`.
+            "namespace_meta_refused": namespace_meta_refused,
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
@@ -1227,9 +1428,9 @@ pub(super) async fn sync_push_via_store(
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
             (field_names::STORAGE_BACKEND): "postgres",
-            "note": "pendings / archives / restores / namespace_meta / checkpoints are \
-                     sqlite-only in this funnel; memories / deletions / links / signals / \
-                     action_transitions round-trip via the SAL trait",
+            "note": "pendings / archives / restores / checkpoints are sqlite-only in this \
+                     funnel; memories / deletions / links / signals / action_transitions / \
+                     namespace_meta / namespace_meta_clears round-trip via the SAL trait",
         })),
     )
         .into_response()

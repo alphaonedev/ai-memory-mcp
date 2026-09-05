@@ -935,11 +935,16 @@ following should **not** treat v1.0.0 as sufficient:
   cleartext. The per-content X25519/ChaCha envelope (`AI_MEMORY_ENCRYPT_AT_REST`)
   is likewise per-node: catch-up decrypts and the receiver re-seals under its
   own key.
-- **Postgres federation gaps.** On the Postgres backend, archives / restores /
-  pendings / pending_decisions / namespace_meta / namespace_meta_clears /
-  checkpoints federation lanes report `unsupported_on_postgres` rather than
-  fully replicating (honest non-ack, never a silent drop). The sqlite/MCP-native
-  path is complete.
+- **Postgres federation gaps (narrowing under #3075).** On the Postgres
+  backend, the archives / restores / pendings / pending_decisions / checkpoints
+  federation lanes report `unsupported_on_postgres` rather than fully
+  replicating (honest non-ack, never a silent drop). The governance-STANDARD
+  lanes (namespace_meta / namespace_meta_clears) **no longer** sit in this set:
+  since #3075 they APPLY on a Postgres receiver through the SAL trait, gated by
+  the SAME backend-blind `receive_auth::inbound_namespace_meta_authorized`
+  verdict the sqlite receiver runs (#2479 Amendment E included), so the §7
+  separation-of-duties statement below is unchanged by that migration. The
+  sqlite/MCP-native path is complete on every lane.
 - **Scale envelope — ARCHITECTED, not MEASURED.** ~1000 agents, ≤ 50 peers
   per block — **not 1M**. PEER dimension MEASURED (#2921 bench,
   `docs/bench/capacity-envelope-2921.md`): full mesh converged at

@@ -1739,26 +1739,68 @@ fn warn_on_severed_out_of_scope_parent(
         Ok(Some(row)) => row.parent_namespace,
         Ok(None) => return,
         Err(e) => {
-            tracing::warn!(
-                target: ATTESTATION_TRACE_TARGET,
-                namespace = %namespace,
-                peer_id = %peer_id.unwrap_or(""),
-                error = %e,
-                "sync_push: could not read the existing namespace_meta row before a federated \
-                 {lane} entry, so a severed out-of-scope parent link would go unreported \
-                 (#2479 observability-only; the scope verdict itself is unaffected)"
-            );
+            warn_severed_parent_unreadable(lane, namespace, peer_id, &e);
             return;
         }
     };
+    warn_on_severed_out_of_scope_parent_resolved(
+        lane,
+        namespace,
+        stored_parent.as_deref(),
+        declared_parent,
+        attest_cfg,
+        peer_id,
+    );
+}
+
+/// #3075 — the "could not read the existing `namespace_meta` row" arm of the
+/// #2479 severed-parent WARN, factored out so the sqlite reader above and the
+/// postgres reader in [`super::federation_signing_check`] emit the SAME
+/// operator-facing line. Observability-only in BOTH backends: the scope verdict
+/// never depends on it (see the doc on the caller for why this arm is
+/// deliberately fail-OPEN).
+pub(super) fn warn_severed_parent_unreadable(
+    lane: &str,
+    namespace: &str,
+    peer_id: Option<&str>,
+    error: &dyn std::fmt::Display,
+) {
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        namespace = %namespace,
+        peer_id = %peer_id.unwrap_or(""),
+        error = %error,
+        "sync_push: could not read the existing namespace_meta row before a federated \
+         {lane} entry, so a severed out-of-scope parent link would go unreported \
+         (#2479 observability-only; the scope verdict itself is unaffected)"
+    );
+}
+
+/// #3075 — the #2479 severed-parent DECISION, fed a pre-resolved stored parent.
+///
+/// The stored `parent_namespace` is read per backend (`db::get_namespace_meta_entry`
+/// on sqlite, `MemoryStore::get_namespace_standard` on postgres); everything
+/// downstream of that read — the unchanged-link short circuit, the
+/// `namespace_allowed` verdict, and the WARN text itself — lives HERE exactly
+/// once, so the two federation funnels cannot drift on what counts as a severed
+/// out-of-scope inheritance link (the #2488 lesson applied to an
+/// observability-only surface).
+pub(super) fn warn_on_severed_out_of_scope_parent_resolved(
+    lane: &str,
+    namespace: &str,
+    stored_parent: Option<&str>,
+    declared_parent: Option<&str>,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+) {
     let Some(stored_parent) = stored_parent else {
         return;
     };
     // Unchanged link — nothing is severed.
-    if declared_parent == Some(stored_parent.as_str()) {
+    if declared_parent == Some(stored_parent) {
         return;
     }
-    if crate::federation::peer_attestation::namespace_allowed(peer_id, &stored_parent, attest_cfg) {
+    if crate::federation::peer_attestation::namespace_allowed(peer_id, stored_parent, attest_cfg) {
         return;
     }
     tracing::warn!(
