@@ -246,7 +246,7 @@ pub async fn list_memories(
 pub async fn search_memories(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
-    Query(p): Query<SearchQuery>,
+    Query(mut p): Query<SearchQuery>,
 ) -> impl IntoResponse {
     // #891: source_uri-only queries are valid (Gap 6 #889 reciprocal
     // queries). Reject only when BOTH q and source_uri are empty.
@@ -277,6 +277,20 @@ pub async fn search_memories(
             Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
         )
             .into_response();
+    }
+    // #3366 — reject before either backend can drop or bind a malformed bound.
+    // Canonical UTC text also makes valid offset spellings compare identically.
+    for (field, value) in [("since", &mut p.since), ("until", &mut p.until)] {
+        if let Some(value) = value {
+            if let Err(error) = validate::validate_rfc3339_timestamp(field, value) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": crate::errors::msg::invalid(field, error)})),
+                )
+                    .into_response();
+            }
+            *value = validate::canonical_rfc3339(value);
+        }
     }
     // #1579 B4 — negotiate the response format BEFORE doing any work
     // (json default | toon | toon_compact; invalid → 400 with the

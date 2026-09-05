@@ -30,6 +30,40 @@ use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
+/// v1.0.0 #3366 — refuse a non-RFC3339 `since`/`until` at both HTTP
+/// recall entries so a malformed bound is a 400, not a silent TEXT
+/// mis-filter. Shared by GET and POST.
+fn reject_malformed_created_at_bounds(req: &RecallRequest) -> Option<axum::response::Response> {
+    for (field, value) in [
+        ("since", req.since.as_deref()),
+        ("until", req.until.as_deref()),
+    ] {
+        if let Some(v) = value
+            && let Err(e) = validate::validate_rfc3339_timestamp(field, v)
+        {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": crate::errors::msg::invalid(field, e)})),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
+/// v1.0.0 #3366 — bind the fixed-width UTC form (micros + `Z`) so an
+/// RFC3339 offset is compared as an instant, not as TEXT bytes.
+fn canonicalize_created_at_bounds_in_place(req: &mut RecallRequest) {
+    if let Some(s) = req.since.take() {
+        req.since = Some(validate::canonical_rfc3339(&s));
+    }
+    if let Some(u) = req.until.take() {
+        req.until = Some(validate::canonical_rfc3339(&u));
+    }
+}
+
 /// v0.7.0 (issue #518) — when `session_default == true` AND the
 /// caller omitted a given filter axis, splice in the configured
 /// `[agents.defaults.recall_scope]` value IN-PLACE on the canonical
@@ -136,6 +170,10 @@ pub async fn recall_memories_get(
         )
             .into_response();
     }
+    // v1.0.0 #3366 — since/until TEXT bounds (same silent-mis-filter class).
+    if let Some(resp) = reject_malformed_created_at_bounds(&req) {
+        return resp;
+    }
     // #1579 B4 — negotiate the response format BEFORE doing any work.
     // `json` (default) keeps the legacy envelope; `toon` /
     // `toon_compact` reuse the MCP TOON encoder; anything else is a
@@ -148,6 +186,7 @@ pub async fn recall_memories_get(
     // when `session_default=true` AND the caller omitted the
     // matching filter axis. Resolution: explicit args win.
     let scope_tier = splice_recall_scope_into(&mut req, &app);
+    canonicalize_created_at_bounds_in_place(&mut req);
     let kinds = p.resolved_kinds();
     // v0.7.0 ship-hardening (2026-05-19): resolve the caller principal
     // from the X-Agent-Id header (synthesizes anonymous on miss) so
@@ -232,6 +271,10 @@ pub async fn recall_memories_post(
         )
             .into_response();
     }
+    // v1.0.0 #3366 — since/until TEXT bounds (same silent-mis-filter class).
+    if let Some(resp) = reject_malformed_created_at_bounds(&req) {
+        return resp;
+    }
     // #1579 B4 — same format negotiation as the GET path.
     let format = match crate::toon::WireFormat::parse_http(req.format.as_deref()) {
         Ok(f) => f,
@@ -239,6 +282,7 @@ pub async fn recall_memories_post(
     };
     // v0.7.0 (issue #518) — see GET handler for the resolution rule.
     let scope_tier = splice_recall_scope_into(&mut req, &app);
+    canonicalize_created_at_bounds_in_place(&mut req);
     let kinds = body.resolved_kinds();
     // See GET handler for the caller-resolution rationale.
     let caller_principal = match crate::handlers::parity::resolve_caller_agent_id(

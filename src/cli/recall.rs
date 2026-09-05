@@ -196,6 +196,13 @@ pub fn run(
     if let Some(ref v) = args.valid_at {
         validate::validate_valid_at(v)?;
     }
+    // v1.0.0 #3366 — --since/--until are TEXT bounds on created_at.
+    if let Some(ref v) = args.since {
+        validate::validate_rfc3339_timestamp("since", v)?;
+    }
+    if let Some(ref v) = args.until {
+        validate::validate_rfc3339_timestamp("until", v)?;
+    }
     let mut conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
 
@@ -321,6 +328,17 @@ pub(crate) fn run_with_embedder(
             })
         })
     });
+    for (field, value) in [
+        ("since", effective_since.as_deref()),
+        ("until", args.until.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate::validate_rfc3339_timestamp(field, value)?;
+        }
+    }
+    // v1.0.0 #3366 — bind micros+`Z` so an RFC3339 offset is an instant.
+    let effective_since = effective_since.map(|s| validate::canonical_rfc3339(&s));
+    let effective_until = args.until.as_deref().map(validate::canonical_rfc3339);
     let effective_limit_usize = if args.limit == 10
         && let Some(v) = scope.and_then(|s| s.limit)
     {
@@ -453,7 +471,7 @@ pub(crate) fn run_with_embedder(
                     effective_limit_usize.min(50),
                     args.tags.as_deref(),
                     effective_since.as_deref(),
-                    args.until.as_deref(),
+                    effective_until.as_deref(),
                     // v0.9 #1005 — coerce the concrete CLI-local index to
                     // the seam trait object at the pipeline boundary.
                     vector_index
@@ -498,7 +516,7 @@ pub(crate) fn run_with_embedder(
                     effective_limit_usize,
                     args.tags.as_deref(),
                     effective_since.as_deref(),
-                    args.until.as_deref(),
+                    effective_until.as_deref(),
                     resolved_ttl.short_extend_secs,
                     resolved_ttl.mid_extend_secs,
                     args.as_agent.as_deref(),
@@ -524,7 +542,7 @@ pub(crate) fn run_with_embedder(
             effective_limit_usize,
             args.tags.as_deref(),
             effective_since.as_deref(),
-            args.until.as_deref(),
+            effective_until.as_deref(),
             resolved_ttl.short_extend_secs,
             resolved_ttl.mid_extend_secs,
             args.as_agent.as_deref(),

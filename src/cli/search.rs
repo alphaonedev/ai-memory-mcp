@@ -65,6 +65,17 @@ pub fn run(
     // UNFILTERED results — wrong results, not fewer). Validated with the
     // other argument checks, before the DB is opened.
     let tier = Tier::parse_optional(args.tier.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    // #3366 — reject malformed bounds before opening the store.
+    for (field, value) in [
+        ("since", args.since.as_deref()),
+        ("until", args.until.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate::validate_rfc3339_timestamp(field, value)?;
+        }
+    }
+    let since = args.since.as_deref().map(validate::canonical_rfc3339);
+    let until = args.until.as_deref().map(validate::canonical_rfc3339);
     let conn = db::open(db_path)?;
     // v0.8.0 #1720 A3 — owner-keyed scope=private SQL caller. CLI is
     // single-tenant operator-as-actor: `resolve_read_visibility_caller`
@@ -78,8 +89,8 @@ pub fn run(
         tier.as_ref(),
         args.limit,
         None,
-        args.since.as_deref(),
-        args.until.as_deref(),
+        since.as_deref(),
+        until.as_deref(),
         args.tags.as_deref(),
         args.agent_id.as_deref(),
         args.as_agent.as_deref(),
@@ -149,6 +160,57 @@ mod tests {
             agent_id: None,
             as_agent: None,
             include_archived: false,
+        }
+    }
+
+    #[test]
+    fn search_malformed_bounds_refused_3366() {
+        for (since, until) in [(Some("garbage"), None), (None, Some("not-a-date"))] {
+            let mut env = TestEnv::fresh();
+            let db = env.db_path.clone();
+            let mut args = default_args();
+            args.since = since.map(str::to_string);
+            args.until = until.map(str::to_string);
+            let err = run(&db, &args, true, &mut env.output()).unwrap_err();
+            assert!(err.to_string().contains("RFC3339"));
+            assert!(env.stdout_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn search_offset_bounds_match_utc_3366() {
+        for (since, until) in [
+            ("2026-03-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00"),
+            ("2026-03-01T05:00:00+05:00", "2026-06-01T05:00:00+05:00"),
+        ] {
+            let mut env = TestEnv::fresh();
+            let db = env.db_path.clone();
+            seed_memory(&db, "test", "needle old", "needle");
+            seed_memory(&db, "test", "needle new", "needle");
+            seed_memory(&db, "test", "needle future", "needle");
+            let conn = db::open(&db).unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1 WHERE title = ?2",
+                rusqlite::params!["2026-01-01T00:00:00.000000Z", "needle old"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1 WHERE title = ?2",
+                rusqlite::params!["2026-03-01T02:00:00.000000Z", "needle new"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1 WHERE title = ?2",
+                rusqlite::params!["2026-06-01T02:00:00.000000Z", "needle future"],
+            )
+            .unwrap();
+            let mut args = default_args();
+            args.since = Some(since.to_string());
+            args.until = Some(until.to_string());
+            run(&db, &args, true, &mut env.output()).unwrap();
+            let value: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+            assert_eq!(value["count"], 1);
+            assert_eq!(value["results"][0]["title"], "needle new");
         }
     }
 
