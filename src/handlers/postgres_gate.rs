@@ -163,6 +163,14 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("POST", super::routes::KG_FIND_PATHS)
         | ("POST", super::routes::LINKS_VERIFY)
         | ("POST", super::routes::QUOTA_STATUS) => true,
+        // #3064 family F1 — the bare `/api/v1/find_paths` alias. `src/lib.rs`
+        // wires BOTH this path and `routes::KG_FIND_PATHS` to the SAME handler
+        // (`handlers::kg_find_paths`), which already dispatches through the SAL
+        // `MemoryStore::find_paths` on postgres and never `app.db.lock()`. The
+        // alias 501'd purely because it was missing from this allow-list, so a
+        // postgres operator hitting the legacy path got a refusal for a route
+        // that is byte-for-byte the supported one. No new SAL surface.
+        ("POST", super::routes::FIND_PATHS) => true,
         // Wave-3 continuation — entity registry.
         ("POST", super::routes::ENTITIES) | ("GET", super::routes::ENTITIES_BY_ALIAS) => true,
         // Wave-3 continuation — stats (basic count).

@@ -194,11 +194,15 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// 2026-08-29 (#3064 batch D): `memory_replay` LEFT this set —
 /// SAL `replay_transcript_union` + `fetch_transcript_content`
 /// (pg `memory_transcripts` / `memory_transcript_links` v22/v24).
+/// 2026-09-05 (#3064 lane L-PGP family F1): `/api/v1/find_paths` LEFT
+/// this set. It is a bare ALIAS: `src/lib.rs` routes it to the SAME
+/// handler as the already-pg-supported `/api/v1/kg/find_paths`
+/// (`handlers::kg_find_paths`, SAL `MemoryStore::find_paths`), so the
+/// 501 was an allow-list omission, not a missing SAL method.
 /// Opening ANY of these requires proving SAL dispatch first (see the
 /// module doc) and updating this list with justification.
 fn expected_fully_501_paths() -> BTreeSet<&'static str> {
     [
-        routes::FIND_PATHS,
         routes::SHARE,
         routes::MEMORY_ATOMISE,
         routes::MEMORY_CALIBRATE_CONFIDENCE,
@@ -259,8 +263,18 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // in-process `inbox_wake` broadcast bus, which BOTH SAL adapters
 // publish to from their `notify` impl. Never `app.db.lock()`, never
 // `app.store` either.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 67;
-const EXPECTED_FULLY_501_PATHS: usize = 17;
+// 2026-09-05 (#3064 lane L-PGP family F1) — bumped 66 -> 67 pg-supported /
+// 17 -> 16 fully-501: `POST /api/v1/find_paths`. The BINDING SAFETY INVARIANT
+// is met by construction rather than by a new port — `src/lib.rs` wires this
+// path and `routes::KG_FIND_PATHS` to the SAME `handlers::kg_find_paths`
+// handler, which takes the `StorageBackend::Postgres` branch into
+// `MemoryStore::find_paths` and never `app.db.lock()`. The alias was refused
+// only because it was absent from `postgres_endpoint_supported`, which made a
+// postgres daemon 501 a route whose supported twin it already serves.
+// Proof-of-dispatch: `tests/pg_parity_3064.rs::
+// f1_find_paths_alias_matches_kg_find_paths_on_both_backends`.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 68;
+const EXPECTED_FULLY_501_PATHS: usize = 16;
 const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 84;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
@@ -285,6 +299,9 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "ENTITIES_BY_ALIAS",
     "EXPAND_QUERY",
     "EXPORT",
+    // #3064 family F1 — the bare `/api/v1/find_paths` alias (same handler as
+    // the already-frozen `KG_FIND_PATHS`).
+    "FIND_PATHS",
     "FORGET",
     "GC",
     "HEALTH",
