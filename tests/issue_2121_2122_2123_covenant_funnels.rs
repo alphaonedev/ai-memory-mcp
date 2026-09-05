@@ -412,8 +412,14 @@ fn notify_refused_without_why_trace_param_allowed_with_it_2122() {
         "title": "ping",
         "payload": "verbatim caller payload",
     });
-    let err = ai_memory::mcp::handle_notify(&conn, &params, &ttl, Some("ai:alice"))
-        .expect_err("notify without why_trace must be refused under enforce");
+    let err = ai_memory::mcp::handle_notify(
+        &conn,
+        std::path::Path::new(":memory:"),
+        &params,
+        &ttl,
+        Some("ai:alice"),
+    )
+    .expect_err("notify without why_trace must be refused under enforce");
     assert!(err.contains("why_trace"), "got: {err}");
 
     // Caller-supplied why_trace param → allowed; the row carries it.
@@ -423,8 +429,14 @@ fn notify_refused_without_why_trace_param_allowed_with_it_2122() {
         "payload": "verbatim caller payload",
         "why_trace": "coordinating handoff with bob",
     });
-    let resp = ai_memory::mcp::handle_notify(&conn, &params_wt, &ttl, Some("ai:alice"))
-        .expect("why_trace param clears the gate");
+    let resp = ai_memory::mcp::handle_notify(
+        &conn,
+        std::path::Path::new(":memory:"),
+        &params_wt,
+        &ttl,
+        Some("ai:alice"),
+    )
+    .expect("why_trace param clears the gate");
     let id = resp["id"].as_str().expect("id");
     assert_eq!(
         why_trace_of(&conn, id).as_deref(),

@@ -48,7 +48,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 96 HTTP route registrations (82 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 98 HTTP route registrations (84 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -866,9 +866,16 @@ curl -X POST http://127.0.0.1:9077/api/v1/subscriptions \
 **Canonical event types** (`WEBHOOK_EVENT_TYPES` in
 `src/subscriptions.rs`): `memory_store`, `memory_promote`,
 `memory_delete`, `memory_link_created`, `memory_link_invalidated`,
-`memory_consolidated`, and the v0.7 addition `approval_requested`
+`memory_consolidated`, the v0.7 addition `approval_requested`
 (subscribe to it to feed a human-in-the-loop UI; the paired
-`approval_decided` event rides the K10 SSE stream).
+`approval_decided` event rides the K10 SSE stream), and the v1.0.0
+addition `agent_notified` (one per committed `memory_notify`; its
+details block carries the recipient, a correlation id and a `sha256:`
+digest of the body, never the body itself). `agent_notified` also fires
+on a separate in-process wake bus that backs
+`GET /api/v1/inbox/stream` — an agent that wants a low-latency push
+should hold that SSE stream rather than subscribe a webhook, which is
+operator egress and rides the shared dispatch semaphore.
 
 For the full event catalog, payload shapes, and the retry / backoff contract, see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.html) and the relevant [V0.7-EPIC](v0.7/V0.7-EPIC.html) tracks once they merge.
 
@@ -1438,7 +1445,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
-The HTTP daemon exposes **96 production `.route(...)` registrations / 82 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
+The HTTP daemon exposes **98 production `.route(...)` registrations / 84 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|

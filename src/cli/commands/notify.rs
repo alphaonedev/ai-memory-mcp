@@ -90,7 +90,7 @@ pub fn cmd_notify(
         params[db::META_KEY_WHY_TRACE] = json!(wt);
     }
 
-    let envelope = crate::mcp::handle_notify(&conn, &params, &resolved_ttl, None)
+    let envelope = crate::mcp::handle_notify(&conn, db_path, &params, &resolved_ttl, None)
         .map_err(|e| anyhow::anyhow!("notify: {e}"))?;
 
     if args.json {

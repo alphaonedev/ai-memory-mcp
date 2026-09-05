@@ -106,6 +106,8 @@ fn all_registered_paths() -> Vec<&'static str> {
         routes::HEALTH,
         routes::IMPORT,
         routes::INBOX,
+        // v1.0.0 #3465 — agent-facing inbox wake SSE stream.
+        routes::INBOX_STREAM,
         routes::KG_FIND_PATHS,
         routes::KG_INVALIDATE,
         routes::KG_QUERY,
@@ -251,9 +253,15 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // in-process challenge store), so there is no `app.db` scratch-read hazard;
 // refusing it on postgres would make key enrollment unreachable on that
 // backend.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 66;
+// 2026-09-05 (#3465) — bumped 66 -> 67 / 83 -> 84 (501 count unchanged):
+// `GET /api/v1/inbox/stream` is a NEW route AND pg-supported. It is
+// backend-blind: it reads NOTHING from either store — it fans out the
+// in-process `inbox_wake` broadcast bus, which BOTH SAL adapters
+// publish to from their `notify` impl. Never `app.db.lock()`, never
+// `app.store` either.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 67;
 const EXPECTED_FULLY_501_PATHS: usize = 17;
-const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 83;
+const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 84;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
 /// names the allow-list body references. A silent match-arm add/remove
@@ -282,6 +290,8 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "HEALTH",
     "IMPORT",
     "INBOX",
+    // v1.0.0 #3465 — agent-facing inbox wake SSE stream.
+    "INBOX_STREAM",
     "KG_FIND_PATHS",
     "KG_INVALIDATE",
     "KG_QUERY",

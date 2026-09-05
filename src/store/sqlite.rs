@@ -3673,7 +3673,27 @@ impl MemoryStore for SqliteStore {
             Err(quotas::QuotaCheckError::Sql(e)) => return Err(box_err(e)),
         }
         match db::insert(&conn, &mem) {
-            Ok(id) => Ok(id),
+            Ok(new_id) => {
+                // #3465 — the row is durable: wake the recipient on the
+                // in-process bus AND fan the `agent_notified` event to
+                // opted-in webhook subscribers, through the shared
+                // write-event funnel so this adapter cannot drift from the
+                // MCP twin on the event name or the envelope shape. Both
+                // are notify-class and infallible; the id is returned
+                // regardless.
+                crate::write_events::agent_notified(
+                    &conn,
+                    &self.path,
+                    &crate::write_events::AgentNotified {
+                        recipient_agent_id: target_agent,
+                        sender_agent_id: &ctx.agent_id,
+                        inbox_row_id: &new_id,
+                        namespace: &mem.namespace,
+                        content: payload,
+                    },
+                );
+                Ok(new_id)
+            }
             Err(e) => {
                 if let Err(refund_err) =
                     quotas::refund_op(&conn, &ctx.agent_id, &mem.namespace, quota_op)

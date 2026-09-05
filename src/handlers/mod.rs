@@ -119,6 +119,10 @@ pub mod governance;
 pub mod hook_subscribers;
 pub mod http;
 pub mod identity_binding;
+/// v1.0.0 #3465 — `GET /api/v1/inbox/stream`, the agent-facing SSE
+/// wake stream for `memory_notify` (identity-bound to the caller's own
+/// inbox, fed from the in-process wake bus, never the webhook lane).
+pub mod inbox_stream;
 /// #3343 — bounded projections for GET /api/v1/stats and /namespaces.
 pub mod inventory;
 pub mod kg;
@@ -170,6 +174,7 @@ pub use federation_sync_since::*;
 pub use governance::*;
 pub use hook_subscribers::*;
 pub use http::*;
+pub use inbox_stream::*;
 pub use kg::*;
 pub use links::*;
 pub use memories::*;

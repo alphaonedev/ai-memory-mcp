@@ -119,6 +119,13 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         return true;
     }
 
+    // v1.0.0 #3465 — inbox wake SSE stream. Backend-blind: it reads
+    // nothing from the store, it fans out the in-process
+    // `inbox_wake` broadcast bus, which both SAL adapters publish to.
+    if path == super::routes::INBOX_STREAM && method == Method::GET {
+        return true;
+    }
+
     match (method.as_str(), path) {
         // Wave-3 phase 3 — core CRUD (commit c049500).
         ("POST", super::routes::MEMORIES) | ("GET", super::routes::MEMORIES) => true,
@@ -542,6 +549,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("GET", super::routes::PENDING) => true,
         // Approvals SSE stream (path form not parameterised).
         ("GET", super::routes::APPROVALS_STREAM) => true,
+        // #3465 — inbox wake SSE stream (path form not parameterised).
+        ("GET", super::routes::INBOX_STREAM) => true,
         // Federation sync.
         ("POST", super::routes::SYNC_PUSH) => true,
         ("GET", super::routes::SYNC_SINCE) => true,

@@ -30649,7 +30649,26 @@ impl MemoryStore for PostgresStore {
             valid_from: None,
             valid_until: None,
         };
-        self.store(ctx, &mem).await
+        let new_id = self.store(ctx, &mem).await?;
+        // #3465 — the row is durable: wake the recipient on the
+        // in-process bus. Only the WAKE half fires here; the webhook
+        // half needs the `AppState`-scoped `_subscriptions/<agent>` SAL
+        // scan and therefore lives at the HTTP funnel
+        // (`write_events::agent_notified_webhook_postgres`), the same
+        // split `create_memory_postgres` and the bulk lane already
+        // have. Both halves derive the same correlation id from the row
+        // id, so the two lanes name the same wake. Publishing here (not
+        // only at the handler) means a direct `MemoryStore::notify`
+        // caller on postgres still wakes its recipient — parity with
+        // the sqlite adapter.
+        crate::write_events::agent_notified_wake(&crate::write_events::AgentNotified {
+            recipient_agent_id: target_agent,
+            sender_agent_id: &ctx.agent_id,
+            inbox_row_id: &new_id,
+            namespace: &mem.namespace,
+            content: payload,
+        });
+        Ok(new_id)
     }
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — full governance pipeline
