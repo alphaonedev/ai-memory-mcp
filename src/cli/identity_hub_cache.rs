@@ -95,6 +95,17 @@ pub fn run(db_path: &Path, args: &HubCacheArgs, out: &mut crate::cli::CliOutput<
             "agents": snapshot.agents.len(),
             "refreshed_at": snapshot.refreshed_at,
             "max_age_secs": crate::identity::hub_cache::MAX_CACHE_AGE_SECS,
+            // v1.0.0 #3505 — how much namespace-topic authority this snapshot
+            // grants, so an operator can SEE a widening (or a narrowing) in
+            // the same line that reports the publish, without opening the
+            // 0600 file. Totals only: the per-agent sets are inside the file.
+            "readable_namespaces": snapshot
+                .agents
+                .iter()
+                .map(|entry| entry.readable_namespaces.len())
+                .sum::<usize>(),
+            "max_readable_namespaces_per_agent":
+                crate::wake_hub::limits::MAX_READABLE_NAMESPACES,
         }))?
     )?;
     Ok(())

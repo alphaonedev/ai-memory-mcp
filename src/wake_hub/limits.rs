@@ -83,6 +83,26 @@ pub const MAX_TOPIC_BYTES: usize = 64;
 /// tries to exceed it gets `403`, never a silently-truncated subscription.
 pub const MAX_TOPICS_PER_SESSION: usize = 32;
 
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// hard ceiling on the PROVEN readable-namespace set the derived allowlist
+/// snapshot carries for ONE agent.
+///
+/// Tied to [`MAX_TOPICS_PER_SESSION`] on purpose: a session can never hold
+/// more subscriptions than that, so carrying more proven namespaces than a
+/// session could ever use buys nothing and only grows the snapshot every hello
+/// re-reads. The exporter REFUSES to publish a set larger than this rather
+/// than truncating one — a truncation would be silent, and which of an
+/// agent's namespaces survived would then depend on ordering, which is exactly
+/// the property #3504 refused to accept for "which key is trusted".
+pub const MAX_READABLE_NAMESPACES: usize = MAX_TOPICS_PER_SESSION;
+
+/// v1.0.0 #3505 — longest namespace a proven-read entry may carry, in bytes.
+///
+/// A topic is `#` + the namespace and is itself bounded by
+/// [`MAX_TOPIC_BYTES`], so a longer namespace could never be subscribed to;
+/// carrying one would be dead weight the hub must still parse.
+pub const MAX_READABLE_NAMESPACE_BYTES: usize = MAX_TOPIC_BYTES - 1;
+
 /// Length of the hub-issued handshake nonce, in bytes.
 pub const HELLO_NONCE_BYTES: usize = 32;
 

@@ -34,6 +34,24 @@
 //! Every failure returns a distinct [`DenyReason`] for the LOG; the wire sees
 //! one `401 unauthorized` regardless (`DenyReason::wire_reason`), so a peer
 //! cannot learn which step failed by probing.
+//!
+//! # Topics (#3505)
+//!
+//! [`HelloVerifier::verify_topics`] admits two shapes and nothing else:
+//!
+//! 1. `#_inbox/<agent-id>` for the authenticated principal — the
+//!    unconditional own-inbox proof #3468 shipped, unchanged.
+//! 2. `#<namespace>` for a namespace the CURRENT snapshot PROVES the
+//!    principal reads, by EXACT match against
+//!    [`AllowlistEntry::readable_namespaces`].
+//!
+//! The proof is derived out of band by the exporter, from the SAME predicate
+//! the store applies for namespace read scope
+//! ([`crate::visibility::namespace_read_scope_admits`]: #1921 subtree scopes,
+//! #3348 substrate exclusions), and carried in the public snapshot. The hub
+//! therefore still opens NO database at verify time, and it never infers a
+//! prefix — the derivation already expanded the subtree, so a topic is
+//! admitted only if the exporter named that exact namespace.
 
 use std::collections::HashMap;
 
@@ -200,6 +218,21 @@ pub trait RootKeyResolver: Send + Sync + 'static {
     ) -> Result<(), DenyReason> {
         Ok(())
     }
+
+    /// v1.0.0 #3505 — the namespaces the CURRENT snapshot proves `agent_id`
+    /// may read, as an EXACT set (the derivation already expanded the #1921
+    /// subtree, so the hub never infers a prefix).
+    ///
+    /// The default is the EMPTY set, which means own-inbox only. A resolver
+    /// that cannot answer therefore narrows rather than widens — an
+    /// implementation that forgets to override this can only refuse topics it
+    /// should have admitted, never admit one it should have refused.
+    ///
+    /// # Errors
+    /// Refuses a lookup fault. A fault is a refusal, never a default set.
+    fn readable_namespaces(&self, _agent_id: &str) -> Result<Vec<String>, DenyReason> {
+        Ok(Vec::new())
+    }
 }
 
 /// The hub's derived allowlist cache: agent id -> enrolled root key.
@@ -265,6 +298,16 @@ impl RootKeyResolver for AllowlistCache {
             return Err(DenyReason::DelegationInvalid);
         }
         Ok(())
+    }
+
+    fn readable_namespaces(&self, agent_id: &str) -> Result<Vec<String>, DenyReason> {
+        // An agent with no snapshot row has proved no namespace read scope, so
+        // the answer is the empty set — own-inbox only, the narrowest posture.
+        Ok(self
+            .entries
+            .get(agent_id)
+            .map(|entry| entry.readable_namespaces.clone())
+            .unwrap_or_default())
     }
 }
 
@@ -388,11 +431,42 @@ impl<R: RootKeyResolver> HelloVerifier for ScopedDelegationVerifier<R> {
 
     fn verify_topics(&self, agent_id: &str, topics: &[String]) -> Result<(), DenyReason> {
         // A namespace may contain private rows belonging to multiple agents.
-        // Only the principal's own inbox has an unconditional read-scope proof;
-        // never infer whole-namespace access from one readable row.
+        // Only the principal's own inbox has an UNCONDITIONAL read-scope
+        // proof; never infer whole-namespace access from one readable row.
         let own_inbox = format!("#_inbox/{agent_id}");
-        if topics.iter().any(|topic| topic != &own_inbox) {
-            return Err(DenyReason::TopicsRefused);
+        if topics.iter().all(|topic| *topic == own_inbox) {
+            // The overwhelmingly common case, and the one #3468 shipped. It
+            // costs no resolver lookup, so a fleet of own-inbox listeners pays
+            // exactly what it paid before #3505.
+            return Ok(());
+        }
+
+        // v1.0.0 #3505 — anything else must be a namespace the CURRENT
+        // snapshot proves this principal reads. The set is resolved ONCE, from
+        // the snapshot the hub already holds; the hub opens no database.
+        let proven = self.resolver.readable_namespaces(agent_id)?;
+        for topic in topics {
+            if *topic == own_inbox {
+                continue;
+            }
+            let Some(namespace) = topic.strip_prefix('#') else {
+                return Err(DenyReason::TopicsRefused);
+            };
+            // Defense in depth, INDEPENDENT of the exporter: a substrate
+            // namespace is another agent's mail or the substrate's own
+            // bookkeeping (#3348), and the ONLY substrate topic this chain
+            // ever admits is the own-inbox arm above. A snapshot that named
+            // one — through a bug, or through a compromised exporter — still
+            // cannot hand over `#_inbox/<someone-else>`.
+            if crate::visibility::is_substrate_namespace(namespace) {
+                return Err(DenyReason::TopicsRefused);
+            }
+            // EXACT match only. The derivation already expanded the #1921
+            // subtree, so the hub never infers a prefix — a prefix rule here
+            // would silently re-widen every scope the exporter narrowed.
+            if !proven.iter().any(|admitted| admitted == namespace) {
+                return Err(DenyReason::TopicsRefused);
+            }
         }
         Ok(())
     }
@@ -842,10 +916,75 @@ pub struct AllowlistEntry {
     /// Revoked delegated key ids, derived from durable revocation records.
     #[serde(default)]
     pub revoked_keys: Vec<String>,
+    /// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505)
+    /// — the namespaces the exporter PROVED this agent may read, expanded from
+    /// the store's own #1921 subtree scopes with #3348 substrate namespaces
+    /// excluded ([`crate::visibility::namespace_read_scope_admits`]).
+    ///
+    /// Carried in the snapshot so the hub can admit a namespace topic with NO
+    /// store lookup — the hub still never opens a database. Bounded by
+    /// [`super::limits::MAX_READABLE_NAMESPACES`]; a snapshot that exceeds it
+    /// is REFUSED whole.
+    ///
+    /// An entry that OMITS the field defaults to EMPTY, which means
+    /// own-inbox-only — the pre-#3505 posture. That default is the whole
+    /// forward-compatibility story: a newer hub reading an older snapshot
+    /// narrows to what the older exporter could prove, and never widens to
+    /// "everything".
+    #[serde(default)]
+    pub readable_namespaces: Vec<String>,
 }
 
 fn legacy_unproven() -> String {
     "legacy_unproven".to_string()
+}
+
+/// v1.0.0 #3505 — bound and sanity-check one entry's proven-read set at LOAD.
+///
+/// The hub refuses the WHOLE snapshot rather than dropping the offending
+/// namespaces: a snapshot the exporter could not have produced is evidence
+/// something else is wrong with it, and silently serving the rest would make
+/// which namespaces an agent may subscribe to depend on what a partial parse
+/// happened to keep.
+///
+/// # Errors
+/// Refuses an oversize set, an empty or over-long namespace, one carrying a
+/// control character, and a substrate namespace (#3348 — the own-inbox proof
+/// is the verifier's own unconditional arm and is never carried here).
+fn check_readable_namespaces(entry: &AllowlistEntry) -> anyhow::Result<()> {
+    use anyhow::bail;
+    if entry.readable_namespaces.len() > super::limits::MAX_READABLE_NAMESPACES {
+        bail!(
+            "wake-hub: agent {} carries {} readable namespaces; the ceiling is {}",
+            entry.agent_id,
+            entry.readable_namespaces.len(),
+            super::limits::MAX_READABLE_NAMESPACES
+        );
+    }
+    for namespace in &entry.readable_namespaces {
+        if namespace.is_empty() || namespace.len() > super::limits::MAX_READABLE_NAMESPACE_BYTES {
+            bail!(
+                "wake-hub: agent {} carries a readable namespace outside 1..={} bytes",
+                entry.agent_id,
+                super::limits::MAX_READABLE_NAMESPACE_BYTES
+            );
+        }
+        if namespace.chars().any(char::is_control) {
+            bail!(
+                "wake-hub: agent {} carries a readable namespace with a control character",
+                entry.agent_id
+            );
+        }
+        if crate::visibility::is_substrate_namespace(namespace) {
+            bail!(
+                "wake-hub: agent {} carries the SUBSTRATE namespace {namespace}; substrate rows \
+                 are reachable only by naming them, and the own-inbox proof is the verifier's \
+                 own arm",
+                entry.agent_id
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The derived allowlist file the hub loads.
@@ -866,6 +1005,27 @@ pub struct AllowlistFile {
 }
 
 /// Format version this build reads.
+///
+/// # Why #3505 did NOT bump this
+///
+/// [`AllowlistEntry::readable_namespaces`] is an ADDITIVE field with a
+/// `#[serde(default)]` empty value, and both mismatch directions already fail
+/// in the required direction without a bump:
+///
+/// * A **newer hub reading an OLDER snapshot** defaults the set to EMPTY,
+///   which is own-inbox-only — the pre-#3505 posture, never "everything".
+///   That is exactly the behaviour the issue asks for, and it is only
+///   reachable WITHOUT a bump: [`AllowlistCache::read_checked`] refuses any
+///   version that is not equal to this constant, so bumping would make a
+///   newer hub refuse every older snapshot outright and turn an
+///   exporter-lags-hub upgrade order into a total outage.
+/// * An **older hub reading a NEWER snapshot** fails CLOSED already:
+///   [`AllowlistEntry`] carries `#[serde(deny_unknown_fields)]`, so a build
+///   that has never heard of the field refuses the file whole rather than
+///   part-honouring a grant it does not understand.
+///
+/// The version is therefore reserved for a change that alters the meaning of
+/// an EXISTING field, which this is not.
 pub const ALLOWLIST_FILE_VERSION: u32 = 2;
 
 impl AllowlistCache {
@@ -1035,6 +1195,7 @@ impl AllowlistCache {
             if chrono::DateTime::parse_from_rfc3339(&entry.bound_at)? > refreshed {
                 bail!("wake-hub: root was bound after the cache snapshot");
             }
+            check_readable_namespaces(&entry)?;
             cache.entries.insert(entry.agent_id.clone(), entry.clone());
             cache.insert(
                 &entry.agent_id,

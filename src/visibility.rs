@@ -247,7 +247,71 @@ fn scope_subtree_visible(namespace: &str, caller: &str, ancestor_idx: usize) -> 
     let Some(prefix) = ancestors.get(ancestor_idx) else {
         return false;
     };
-    namespace == *prefix || namespace.starts_with(&format!("{prefix}/"))
+    namespace_subtree_contains(prefix, namespace)
+}
+
+/// #1921 — the subtree containment test, as ONE definition.
+///
+/// `namespace` falls inside `prefix` iff it IS `prefix` or is nested under it.
+/// The `/` in the descendant arm is what stops `acme/eng` from matching
+/// `acme/engineering`; a bare `starts_with` there would silently widen every
+/// `team` / `unit` / `org` scope to any namespace sharing a leading substring.
+///
+/// [`scope_subtree_visible`], `crate::storage::matches_subtree` and the
+/// wake-hub topic derivation ([`namespace_read_scope_admits`]) all route
+/// through this, so the three can never drift — the #951 rule this module
+/// opens with. Semantics are BYTE-IDENTICAL to the two expressions it
+/// replaces.
+#[must_use]
+pub fn namespace_subtree_contains(prefix: &str, namespace: &str) -> bool {
+    namespace == prefix || namespace.starts_with(&format!("{prefix}/"))
+}
+
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// the #1921 `team` / `unit` / `org` prefixes `caller` reads at.
+///
+/// EXACTLY `crate::storage::compute_visibility_prefixes` indices 1, 2 and 3 —
+/// the caller's parent, grandparent and great-grandparent namespaces. Index 0
+/// (the caller's OWN namespace) is deliberately absent: the scope at that
+/// position is `private`, which is OWNER-keyed (#1720), not namespace-keyed,
+/// so it proves nothing about a namespace AS A WHOLE. A caller id with no `/`
+/// yields an EMPTY set, which is the fail-closed answer.
+#[must_use]
+pub fn namespace_read_scope_prefixes(caller: &str) -> Vec<String> {
+    crate::models::namespace_ancestors(caller)
+        .into_iter()
+        .skip(1)
+        .take(3)
+        .filter(|prefix| !prefix.is_empty())
+        .collect()
+}
+
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// may `caller` read `namespace` AS A NAMESPACE?
+///
+/// This is the namespace-LEVEL question, distinct from the row-level
+/// [`is_visible_to_caller`]: it answers "does this caller hold a read scope
+/// over this namespace", never "may this caller read this row". It is what the
+/// wake hub's topic derivation needs, because a wake topic addresses a
+/// namespace rather than a row.
+///
+/// Two gates, both the ones the store already applies:
+///
+/// 1. **#3348** — a SUBSTRATE-owned namespace is never admitted. Those rows
+///    are bookkeeping the substrate writes on one agent's behalf, reachable
+///    only by EXPLICITLY naming the namespace ([`is_readable_on_query`]), so a
+///    namespace-level read scope over them does not exist. The wake hub keeps
+///    its own separate, unconditional own-inbox proof.
+/// 2. **#1921** — the namespace must fall inside one of the caller's
+///    [`namespace_read_scope_prefixes`].
+#[must_use]
+pub fn namespace_read_scope_admits(caller: &str, namespace: &str) -> bool {
+    if namespace.is_empty() || is_substrate_namespace(namespace) {
+        return false;
+    }
+    namespace_read_scope_prefixes(caller)
+        .iter()
+        .any(|prefix| namespace_subtree_contains(prefix, namespace))
 }
 
 /// #1786 — ownership predicate for MUTATION gating (delete / update / promote /
@@ -816,5 +880,84 @@ mod legacy_inbox_3401_tests {
         memory.namespace = "_messages/ai:recipient".into();
         memory.metadata[crate::META_KEY_TARGET_AGENT_ID] = json!("ai:other");
         assert!(!is_visible_to_caller(&memory, "ai:recipient"));
+    }
+}
+
+#[cfg(test)]
+mod namespace_read_scope_3505_tests {
+    //! v1.0.0 #3505 — the NAMESPACE-level read scope the wake hub's topic
+    //! derivation is built on.
+    //!
+    //! These pin the two properties a wrong implementation would silently
+    //! break: the `/` boundary (a prefix must not swallow a longer sibling
+    //! name) and the substrate exclusion (#3348 rows are never namespace-level
+    //! readable, so a wake topic can never be another agent's mail).
+
+    use super::*;
+
+    /// The `/` in the descendant arm is the whole boundary. Without it,
+    /// `eng` would admit `engineering` — a different tenant.
+    #[test]
+    fn a_prefix_never_swallows_a_longer_sibling_name_3505() {
+        assert!(namespace_subtree_contains("eng", "eng"));
+        assert!(namespace_subtree_contains("eng", "eng/alpha"));
+        assert!(!namespace_subtree_contains("eng", "engineering"));
+        assert!(!namespace_subtree_contains("eng", "engineering/alpha"));
+        assert!(!namespace_subtree_contains("eng/alpha", "eng"));
+
+        // And through the caller-facing predicate: `eng/alice` holds exactly
+        // one ancestor prefix, `eng`.
+        assert!(namespace_read_scope_admits("eng/alice", "eng/shared"));
+        assert!(!namespace_read_scope_admits("eng/alice", "engineering"));
+    }
+
+    /// EXACTLY `compute_visibility_prefixes` indices 1..=3 — the caller's own
+    /// namespace is absent because `private` is owner-keyed, not
+    /// namespace-keyed, and anything above the org prefix is out of scope.
+    #[test]
+    fn the_prefixes_are_the_1921_team_unit_org_ancestors_3505() {
+        assert_eq!(
+            namespace_read_scope_prefixes("a/b/c/d/e"),
+            vec![
+                "a/b/c/d".to_string(),
+                "a/b/c".to_string(),
+                "a/b".to_string()
+            ],
+            "team, unit, org — and never the caller's own namespace"
+        );
+        assert!(
+            namespace_read_scope_prefixes("flat").is_empty(),
+            "a flat id has no ancestor, so it proves no namespace read scope"
+        );
+        assert!(
+            namespace_read_scope_prefixes("").is_empty(),
+            "an empty caller proves nothing"
+        );
+        assert!(
+            !namespace_read_scope_admits("a/b/c/d/e", "a"),
+            "`a` is ABOVE the org prefix `a/b`"
+        );
+    }
+
+    /// #3348 — substrate namespaces are reachable only by naming them, so a
+    /// namespace-level read scope over them does not exist. This is what stops
+    /// a derived topic set from ever carrying another agent's inbox.
+    #[test]
+    fn substrate_namespaces_are_never_namespace_readable_3505() {
+        // Well inside the caller's own subtree, and still refused.
+        assert!(!namespace_read_scope_admits(
+            "_inbox/team/alice",
+            "_inbox/team/bob"
+        ));
+        for substrate in ["_agents", "_agent_sessions", "_standards"] {
+            assert!(
+                !namespace_read_scope_admits("_agents/team/alice", substrate),
+                "{substrate} is substrate bookkeeping, never a read scope"
+            );
+        }
+        assert!(
+            !namespace_read_scope_admits("team/alice", ""),
+            "an empty namespace is never admitted"
+        );
     }
 }

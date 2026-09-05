@@ -82,10 +82,68 @@ A wake payload is exactly:
 
 A substrate wake is addressed DIRECTLY to the recipient agent id and never to a
 `#topic`. The hub's route table is keyed by the identity a hello authenticated,
-so a wake for `X` can only ever land on a session that authenticated AS `X` —
-own-inbox only, which is exactly the scope #3468's delegation verifier grants
-until #3505 widens it. A topic-shaped, reserved, empty or over-long recipient is
-refused and counted; it is never coerced into something routable.
+so a wake for `X` can only ever land on a session that authenticated AS `X`.
+A topic-shaped, reserved, empty or over-long recipient is refused and counted;
+it is never coerced into something routable.
+
+### Which topics a session may subscribe to (#3505)
+
+The verifier admits exactly two topic shapes and nothing else:
+
+1. `#_inbox/<agent-id>` for the principal that authenticated — the
+   unconditional own-inbox proof #3468 shipped.
+2. `#<namespace>` for a namespace the CURRENT snapshot PROVES that principal
+   reads.
+
+The proof is derived out of band, by `ai-memory identity hub-cache`, from the
+SAME predicate the store applies for namespace read scope: the #1921 team /
+unit / org subtree the agent's id sits in, with #3348 substrate namespaces
+(`_inbox/`, `_messages/`, `_agents`, …) excluded. There is no second copy of
+that predicate — `crate::visibility::namespace_read_scope_admits` is the one
+definition, and both the sqlite and the postgres exporter call it.
+
+Three properties follow, and each is load-bearing:
+
+* **The hub still opens no database.** The subtree is expanded ONCE by the
+  exporter into an exact list carried in the snapshot, so verify time is a set
+  membership test against material the hub already holds.
+* **The hub never infers a prefix.** Matching is EXACT. A prefix rule at the
+  hub would silently re-widen every scope the exporter narrowed, and the hub is
+  the component with the least information about what the store would allow.
+* **Narrowing takes effect within one second.** Every session's live
+  subscription set — the hello topics AND anything a later `subscribe` frame
+  added — is re-verified on the one-second revalidation. Drop a namespace from
+  the next snapshot and the already-open subscription is dropped, with no
+  reconnect and no cooperation from the client. The session itself survives:
+  losing a namespace costs subscriptions, not the agent's own inbox, because a
+  fleet that reconnects on every scope change is an outage where fewer
+  subscriptions is a degrade.
+
+The proven set is bounded per agent by `MAX_READABLE_NAMESPACES` (tied to
+`MAX_TOPICS_PER_SESSION`, since a session can never hold more). Over that, the
+exporter REFUSES to publish and the hub REFUSES to load — never a truncation,
+because which of an agent's namespaces survived would then depend on ordering.
+
+**Snapshot format.** `readable_namespaces` is an ADDITIVE field and
+`ALLOWLIST_FILE_VERSION` deliberately stayed at `2`. Both mismatch directions
+already fail in the right direction: a NEWER hub reading an OLDER snapshot sees
+no field, defaults the set to EMPTY and admits own-inbox only (never
+"everything") — which a version bump would have turned into an outright refusal
+of every older file, so upgrading the hub before the exporter would take the
+fleet down; an OLDER hub reading a NEWER snapshot refuses the file whole through
+`deny_unknown_fields`, so it can never part-honour a grant it does not
+understand. The version stays reserved for a change to the meaning of an
+EXISTING field.
+
+**Not in this lane — the producer half.** Nothing in the substrate publishes a
+TOPIC-addressed wake yet. The #3469 sink emits DIRECT wakes only
+(`Frame.to = <agent-id>`), so today a namespace topic is subscribable and is
+fed only by another authenticated session sending `wake` to `#<namespace>`.
+Making the substrate emit a topic wake when a shared-namespace row lands is a
+separate, deliberate change to `src/wake_sink/` and its `agent_notified`
+producer — it needs its own decision about which namespaces are worth
+broadcasting and how the fan-out is charged, and it is tracked as a follow-up
+rather than smuggled in behind a verifier widening.
 
 Wakes are never sourced from the webhook lane. That lane is operator egress,
 with a global dispatch semaphore and a subscription-scan ceiling; sourcing an

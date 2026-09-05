@@ -78,6 +78,9 @@ fn publish_snapshot(path: &Path, key: &SigningKey, age_secs: i64) {
             bind_authority: "possession_proof".to_owned(),
             bound_at: "2026-09-01T00:00:00Z".to_owned(),
             revoked_keys: Vec::new(),
+            // #3505 — this suite's agent proves no namespace read scope, so
+            // its topics stay own-inbox only exactly as before.
+            readable_namespaces: Vec::new(),
         }],
     };
     hub_cache::publish(path, &file).expect("publish");

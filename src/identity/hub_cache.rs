@@ -20,11 +20,13 @@ pub const HUB_REVOKE_EVENT: &str = "identity.hub_revoke";
 /// Derive one entry from a durable history snapshot.
 ///
 /// # Errors
-/// Refuses missing, unproven, closed, malformed or future history.
+/// Refuses missing, unproven, closed, malformed or future history, and an
+/// over-ceiling proven-read set (see [`readable_namespaces_for`]).
 pub fn entry(
     agent_id: &str,
     history: &[crate::storage::AgentPubkeyVersion],
     mut revoked_keys: Vec<String>,
+    readable_namespaces: Vec<String>,
     now: &str,
 ) -> Result<AllowlistEntry> {
     super::hub_authority::current_issuer(agent_id, history, now)?;
@@ -37,7 +39,66 @@ pub fn entry(
         bind_authority: current.bind_authority.clone(),
         bound_at: current.bound_at.clone(),
         revoked_keys,
+        readable_namespaces,
     })
+}
+
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// the namespaces `agent_id` PROVABLY reads, out of the ones that exist.
+///
+/// The predicate is [`crate::visibility::namespace_read_scope_admits`], which
+/// is the store's OWN namespace read scope — #1921 subtree containment against
+/// the agent's team / unit / org ancestors, with #3348 substrate namespaces
+/// excluded. It is reused, never re-derived: a second copy of a visibility
+/// predicate is the #951 defect this codebase has already paid for twice.
+///
+/// Deriving the set HERE rather than at the hub is what keeps the hub
+/// store-free: the subtree is expanded once, out of band, into an exact list
+/// the hub matches literally.
+///
+/// The result is sorted and deduplicated so the snapshot is byte-stable across
+/// refreshes that changed nothing — an unstable ordering would republish a new
+/// inode every cycle and defeat #3504's reuse.
+///
+/// # Errors
+/// Refuses when the set exceeds
+/// [`crate::wake_hub::limits::MAX_READABLE_NAMESPACES`]. Refusing beats
+/// truncating: a truncation is silent, and which namespaces survived would
+/// depend on ordering.
+pub fn readable_namespaces_for(agent_id: &str, existing: &[String]) -> Result<Vec<String>> {
+    use crate::wake_hub::limits::{MAX_READABLE_NAMESPACE_BYTES, MAX_READABLE_NAMESPACES};
+    let mut admitted: Vec<String> = existing
+        .iter()
+        .filter(|namespace| namespace.len() <= MAX_READABLE_NAMESPACE_BYTES)
+        .filter(|namespace| crate::visibility::namespace_read_scope_admits(agent_id, namespace))
+        .cloned()
+        .collect();
+    admitted.sort();
+    admitted.dedup();
+    if admitted.len() > MAX_READABLE_NAMESPACES {
+        anyhow::bail!(
+            "identity hub-cache: agent {agent_id} reads {} namespaces, over the wake-hub ceiling \
+             of {MAX_READABLE_NAMESPACES}. Publishing a truncated set would make which topics \
+             that agent may subscribe to depend on ordering, so this refuses instead. Narrow the \
+             agent's namespace scope, or omit it from --include-agent.",
+            admitted.len()
+        );
+    }
+    Ok(admitted)
+}
+
+/// The live namespaces to derive proven-read sets against, or an empty list
+/// when no selected agent could read anything anyway.
+///
+/// A flat agent id (no `/`) has no team / unit / org ancestor, so its proven
+/// set is empty whatever exists — enumerating the corpus for such a fleet
+/// would be pure cost. This is the ONE place that decides whether the
+/// (unbounded) namespace listing is worth issuing.
+#[must_use]
+pub fn namespace_scan_needed(agents: &[String]) -> bool {
+    agents
+        .iter()
+        .any(|agent| !crate::visibility::namespace_read_scope_prefixes(agent).is_empty())
 }
 
 /// v1.0.0 #3469 — the store-free `wake-hub-producer` row, derived from this
@@ -90,6 +151,10 @@ pub fn daemon_producer_entry(key_dir: &Path, now: &str) -> Result<AllowlistEntry
         // stamping it now — never backdating — keeps that ordering meaningful.
         bound_at: now.to_owned(),
         revoked_keys: Vec::new(),
+        // #3505 — the reserved producer owns no memories and no namespace, so
+        // it proves no namespace read scope. Its only authority stays "may
+        // deliver a content-free wake hint addressed to an agent's own inbox".
+        readable_namespaces: Vec::new(),
     })
 }
 
@@ -102,6 +167,16 @@ pub fn derive_sqlite(conn: &rusqlite::Connection, agents: &[String]) -> Result<A
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let now = chrono::Utc::now().to_rfc3339();
+    // #3505 — enumerate live namespaces ONCE for the whole export, and only
+    // when some selected agent could read one at all.
+    let namespaces: Vec<String> = if namespace_scan_needed(agents) {
+        crate::db::list_namespaces(conn)?
+            .into_iter()
+            .map(|row| row.namespace)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut entries = Vec::with_capacity(agents.len());
     for agent in agents {
         crate::validate::validate_agent_id_shape(agent)?;
@@ -115,7 +190,8 @@ pub fn derive_sqlite(conn: &rusqlite::Connection, agents: &[String]) -> Result<A
             .filter(|cert| cert.revoked)
             .map(|cert| URL_SAFE_NO_PAD.encode(cert.instance_key_id))
             .collect();
-        entries.push(entry(agent, &history, revoked, &now)?);
+        let readable = readable_namespaces_for(agent, &namespaces)?;
+        entries.push(entry(agent, &history, revoked, readable, &now)?);
     }
     Ok(AllowlistFile {
         version: ALLOWLIST_FILE_VERSION,
@@ -159,6 +235,12 @@ pub fn events(
                 new.agent_id == entry.agent_id
                     && new.pubkey_b64 == entry.pubkey_b64
                     && new.revoked_keys == entry.revoked_keys
+                    // #3505 — a NARROWED proven-read set is a revocation of
+                    // topic authority, so it rides the same audit spine as a
+                    // revoked key. Without this the removal side would be
+                    // silent while the grant side (struct equality, below)
+                    // already fires.
+                    && new.readable_namespaces == entry.readable_namespaces
             }) {
                 events.push(crate::signed_events::SignedEvent::with_daemon_signature(
                     hash.clone(),
