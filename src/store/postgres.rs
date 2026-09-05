@@ -49,6 +49,11 @@ mod hub;
 
 use crate::models::ConfidenceSource;
 mod coordination_create;
+// #3064 lane L-PGP — postgres SAL for the tools whose HTTP mirrors were
+// fail-closed 501 on this backend. Its own module because postgres.rs is at
+// its qual_10 module-size budget (the lane brief mandates a submodule over a
+// private ceiling bump).
+mod parity_3064;
 mod pubkey_history;
 
 use crate::models::field_names;
@@ -31739,6 +31744,17 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("list (namespace) agent_quotas rows", e))?;
 
         rows.iter().map(row_to_quota_status).collect()
+    }
+
+    /// #3064 lane L-PGP family F3 — forwards to the `parity_3064` submodule
+    /// (postgres.rs is at its qual_10 module-size budget, so the SQL lives
+    /// beside its siblings there rather than behind a private ceiling bump).
+    async fn calibrate_confidence_report(
+        &self,
+        days: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
+        self.calibrate_confidence_report_pg(days, now).await
     }
 
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {

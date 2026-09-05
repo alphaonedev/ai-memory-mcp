@@ -4192,6 +4192,53 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3064 lane L-PGP family F3 — the Form-5 calibration sweep
+    /// (`memory_calibrate_confidence`).
+    ///
+    /// Reads `confidence_shadow_observations` over the trailing `days`
+    /// window and returns the per-(namespace, source) baselines. `now` is a
+    /// parameter, not a clock read, so the window boundary is deterministic
+    /// and both adapters compute the SAME `since` cutoff.
+    ///
+    /// The sweep is READ-ONLY over the report's inputs; the one write any
+    /// adapter may perform is the `recall_outcome` backfill from the
+    /// `recall_observations` ledger, which is a maintenance enrichment of
+    /// `consumption_utility` / `consume_access_divergence` and is skipped —
+    /// never forced — when it cannot run (absent ledger, or a stopped record
+    /// plane on the postgres adapter). The baselines themselves never depend
+    /// on it, so a skipped backfill DEGRADES the report's optional evidence
+    /// fields to `None` and never yields a wrong number.
+    ///
+    /// # Caller gate
+    ///
+    /// There is NONE, on either adapter, and that is deliberate for the
+    /// #3064 port: the sqlite sweep this method was lifted from applies no
+    /// caller filter, so the aggregation spans every namespace and the
+    /// returned baselines disclose per-namespace names plus aggregate
+    /// confidence statistics to any caller that reaches the route.
+    /// Reproducing that verbatim kept the two backends equal rather than
+    /// silently diverging; it did not WIDEN the exposure, since a sqlite
+    /// daemon already served the same report. The gap itself is tracked in
+    /// #3507 and must be closed on BOTH adapters together — an
+    /// implementor adding a caller filter to only one of them would
+    /// reintroduce exactly the cross-backend divergence this method exists
+    /// to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidInput`] when `days` is outside `0..=36500` (the
+    /// bounded-window refusal), or a backend error. Default returns
+    /// `UnsupportedCapability`.
+    async fn calibrate_confidence_report(
+        &self,
+        _days: i64,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CALIBRATE_CONFIDENCE".to_string(),
+        })
+    }
+
     /// #3064 batch B — inbound `reflects_on` dependents of `memory_id`
     /// (MCP `memory_dependents_of_invalidated` direct list). Read-only.
     /// Default returns `UnsupportedCapability`.

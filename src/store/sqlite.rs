@@ -2983,6 +2983,20 @@ impl MemoryStore for SqliteStore {
         quotas::list_status(&conn, Some(namespace)).map_err(box_err)
     }
 
+    /// #3064 lane L-PGP family F3 — delegates VERBATIM to the sqlite SSOT
+    /// `crate::confidence::calibrate::calibrate_from_shadow`, so the wire
+    /// bytes on this backend are byte-for-byte what `memory_calibrate_confidence`
+    /// has always emitted (bounded-window refusal, two-pass streaming
+    /// aggregation, `recall_outcome` backfill, and all).
+    async fn calibrate_confidence_report(
+        &self,
+        days: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
+        let conn = self.state.lock().await;
+        crate::confidence::calibrate::calibrate_from_shadow(&conn, days, now).map_err(box_err)
+    }
+
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
         // Filter shape: at least one of `(source_id, target_id)` OR
         // `link_id` must be set. `link_id` on the SQLite path is the
