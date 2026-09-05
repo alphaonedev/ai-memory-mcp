@@ -386,3 +386,200 @@ async fn f1_find_paths_alias_matches_kg_find_paths_postgres() {
 fn _postgres_url_referenced() -> Option<String> {
     postgres_url()
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// F2 — `POST /api/v1/memory_smart_load`
+// ─────────────────────────────────────────────────────────────────────
+
+/// The exact top-level key set the `memory_smart_load` envelope carries on
+/// BOTH backends. Pinned as a literal (not merely compared backend-to-backend)
+/// so a change that drops a field on both at once still fails.
+const F2_ENVELOPE_KEYS: &[&str] = &[
+    "chosen_family",
+    "chosen_family_source",
+    "count",
+    "intent",
+    "k",
+    "memories",
+    "namespace",
+    "score",
+];
+
+/// A deliberately ordinary operator intent. The routing decision is a pure
+/// function of this string (no embedder is wired into the fixture), so the
+/// chosen family is whatever `pick_family_for_intent` returns — the test
+/// reads it back rather than hard-coding one, which keeps the assertion
+/// about DISPATCH rather than about the keyword table's current tuning.
+const F2_INTENT: &str = "load the recent project decisions and context";
+
+async fn smart_load(client: &reqwest::Client, base: &str, ns: &str) -> (u16, Value) {
+    let resp = client
+        .post(format!("{base}/api/v1/memory_smart_load"))
+        .json(&json!({"intent": F2_INTENT, "namespace": ns, "k": 20}))
+        .send()
+        .await
+        .expect("smart_load POST");
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.expect("smart_load body");
+    (status, body)
+}
+
+/// Drive smart_load over one daemon and return
+/// `(probe_status, owner_body, intruder_body, stored_id, bad_intent_status)`.
+///
+/// The DENIED half is the real owner-isolation property, not a validation
+/// stub: the family-tagged row is written by `OWNER_AGENT` with no explicit
+/// `scope`, which `is_visible_to_caller` treats as PRIVATE, so a second
+/// principal driving the identical request must not receive it.
+async fn f2_exercise(base: &str) -> (u16, Value, Value, String, u16) {
+    let owner = pg_test_client(OWNER_AGENT);
+    let ns = format!("f2-smart-load-{}", uuid::Uuid::new_v4());
+
+    // Probe first so the family the router picks is read from the wire.
+    let (probe_status, probe) = smart_load(&owner, base, &ns).await;
+    let family = probe["chosen_family"]
+        .as_str()
+        .expect("chosen_family")
+        .to_string();
+
+    let resp = owner
+        .post(format!("{base}/api/v1/memories"))
+        .json(&json!({
+            "tier": "long",
+            "namespace": ns,
+            "title": "f2 family-tagged row",
+            "content": "smart_load must surface this to its owner only",
+            "tags": [],
+            "priority": 9,
+            "confidence": 1.0,
+            "source": "system",
+            "metadata": {"family": family},
+        }))
+        .send()
+        .await
+        .expect("store POST");
+    assert!(
+        resp.status().is_success(),
+        "family-tagged store must succeed: status={}",
+        resp.status()
+    );
+    let stored: Value = resp.json().await.expect("store body");
+    let stored_id = stored["id"].as_str().expect("stored id").to_string();
+
+    let (owner_status, owner_body) = smart_load(&owner, base, &ns).await;
+    assert_eq!(owner_status, 200, "owner smart_load body={owner_body}");
+
+    let intruder = pg_test_client(OTHER_AGENT);
+    let (intruder_status, intruder_body) = smart_load(&intruder, base, &ns).await;
+    assert_eq!(
+        intruder_status, 200,
+        "intruder smart_load body={intruder_body}"
+    );
+
+    // A missing `intent` is refused identically on both backends.
+    let bad = owner
+        .post(format!("{base}/api/v1/memory_smart_load"))
+        .json(&json!({"namespace": ns}))
+        .send()
+        .await
+        .expect("bad smart_load POST");
+    let bad_status = bad.status().as_u16();
+
+    (
+        probe_status,
+        owner_body,
+        intruder_body,
+        stored_id,
+        bad_status,
+    )
+}
+
+fn f2_assert(
+    probe_status: u16,
+    owner_body: &Value,
+    intruder_body: &Value,
+    stored_id: &str,
+    bad_status: u16,
+    backend: &str,
+) {
+    assert_eq!(probe_status, 200, "{backend}: probe body={owner_body}");
+    assert_eq!(
+        key_shape(owner_body),
+        F2_ENVELOPE_KEYS
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect::<Vec<_>>(),
+        "{backend}: smart_load envelope shape drifted"
+    );
+    assert_eq!(
+        key_shape(intruder_body),
+        key_shape(owner_body),
+        "{backend}: the refused caller must get the SAME envelope shape, not a different one"
+    );
+    let ids: Vec<&str> = owner_body["memories"]
+        .as_array()
+        .expect("memories array")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&stored_id),
+        "{backend}: the owner's family-tagged row must be returned: {owner_body}"
+    );
+    let intruder_ids: Vec<&str> = intruder_body["memories"]
+        .as_array()
+        .expect("memories array")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        !intruder_ids.contains(&stored_id),
+        "{backend}: a second principal must NOT see the owner's private \
+         family-tagged row: {intruder_body}"
+    );
+    assert_eq!(
+        bad_status, 400,
+        "{backend}: a missing `intent` must be refused"
+    );
+}
+
+/// smart_load wraps load_family. The sqlite leg pins the reference behaviour
+/// the postgres leg must reproduce byte-for-byte in envelope shape.
+#[cfg(feature = "sal")]
+#[tokio::test(flavor = "multi_thread")]
+async fn f2_smart_load_wraps_load_family_sqlite() {
+    let dir = fresh_dir("f2-sqlite");
+    let state = sqlite_app_state(&dir.path().join("f2.db"));
+    let (base, shutdown, handle) = spawn(state).await;
+
+    let (probe, owner_body, intruder_body, id, bad) = f2_exercise(&base).await;
+    f2_assert(probe, &owner_body, &intruder_body, &id, bad, "sqlite");
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// The postgres leg. `app.db` is an EMPTY in-memory sqlite, so a handler that
+/// read the scratch database instead of `app.store` would return zero
+/// memories and fail the owner assertion — which is the whole point of the
+/// proof.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn f2_smart_load_wraps_load_family_postgres() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping f2_smart_load_wraps_load_family_postgres");
+        return;
+    };
+    let state = postgres_app_state(&url).await;
+    let (base, shutdown, handle) = spawn(state).await;
+
+    let (probe, owner_body, intruder_body, id, bad) = f2_exercise(&base).await;
+    assert_ne!(
+        probe, 501,
+        "memory_smart_load must no longer be fail-closed on postgres"
+    );
+    f2_assert(probe, &owner_body, &intruder_body, &id, bad, "postgres");
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}

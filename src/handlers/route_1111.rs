@@ -139,6 +139,16 @@ pub async fn handle_smart_load_http(
     // no private row.
     let caller =
         crate::handlers::parity::resolve_caller_agent_id(None, &headers, None).unwrap_or_default();
+    // #3064 lane L-PGP family F2 — postgres SAL dispatch. The family PICK is
+    // pure Rust (`mcp::tools::load_family::pick_family_for_intent`) and the
+    // family-tagged READ rides the SAME `app.store.list` path
+    // `POST /api/v1/memory_load_family` already uses on postgres, so the
+    // handler never reaches `app.db.lock()` (the empty scratch sqlite) on that
+    // backend. Pre-fix the route was fail-closed 501 for exactly that reason.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return smart_load_http_via_store(&app, &headers, &body).await;
+    }
     let lock = app.db.lock().await;
     let embedder = app
         .embedder
@@ -151,6 +161,89 @@ pub async fn handle_smart_load_http(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// #3064 lane L-PGP family F2 — the postgres arm of
+/// [`handle_smart_load_http`].
+///
+/// Mirrors the sqlite path step for step so the wire envelope is identical:
+///
+/// 1. `intent` is required and is TRIMMED before routing (same validation
+///    order and same message as `mcp::handle_smart_load`, so a missing
+///    `intent` is a 400 on both backends).
+/// 2. `namespace`, when present, is validated with the SAME
+///    `validate::validate_namespace` the sqlite `handle_load_family` applies,
+///    so a malformed namespace refuses rather than silently listing the whole
+///    corpus.
+/// 3. `k` defaults to 20 and clamps to `1..=100` — the `handle_load_family`
+///    contract, restated here because the postgres read does not pass through
+///    that function.
+/// 4. the family pick and the envelope build are the SHARED pure helpers, so
+///    the routing decision and the JSON shape cannot drift between backends.
+///
+/// Never touches `app.db`: the read is `MemoryStore::list` through
+/// [`crate::handlers::power_consolidation::load_family_rows_via_store`].
+#[cfg(feature = "sal")]
+async fn smart_load_http_via_store(
+    app: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+) -> axum::response::Response {
+    let Some(intent_raw) = body["intent"].as_str() else {
+        return err_response("intent is required".to_string());
+    };
+    let intent = intent_raw.trim();
+    let namespace = body
+        .get(crate::mcp::param_names::NAMESPACE)
+        .and_then(Value::as_str);
+    if let Some(ns) = namespace
+        && let Err(e) = crate::validate::validate_namespace(ns)
+    {
+        return err_response(e.to_string());
+    }
+    let k_raw = body
+        .get(crate::mcp::param_names::K)
+        .and_then(Value::as_u64)
+        .unwrap_or(20);
+    let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
+
+    let embedder = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .map(|e| e as &dyn crate::embeddings::Embed);
+    let (family, score, source) = crate::mcp::pick_family_for_intent(intent, embedder);
+    let family_name = family.name();
+    tracing::info!(
+        target: "memory_smart_load",
+        chosen_family = family_name,
+        score = score,
+        source = source,
+        intent_len = intent.len(),
+        "smart_load routed intent to family (postgres)"
+    );
+
+    let rows = match crate::handlers::power_consolidation::load_family_rows_via_store(
+        app,
+        headers,
+        family_name,
+        namespace,
+        k,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(resp) => return resp,
+    };
+    let inner = json!({
+        "family": family_name,
+        "namespace": namespace,
+        "k": k,
+        "count": rows.len(),
+        "memories": rows,
+    });
+    let envelope = crate::mcp::smart_load_envelope(family_name, score, source, intent, &inner);
+    (StatusCode::OK, Json(envelope)).into_response()
 }
 
 /// `POST /api/v1/memory_reflect` — substrate reflection over a

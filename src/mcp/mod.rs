@@ -641,7 +641,12 @@ pub use check_duplicate::handle_check_duplicate;
 // surfaces.
 pub use expand_query::handle_expand_query;
 pub use kg_query::handle_kg_query;
-pub use load_family::{handle_load_family, handle_smart_load};
+// #3064 lane L-PGP family F2 — `pick_family_for_intent` + `smart_load_envelope`
+// are the pure routing/wire halves of `handle_smart_load`, re-exported so the
+// postgres HTTP branch shares them instead of carrying a drift-prone copy.
+pub use load_family::{
+    handle_load_family, handle_smart_load, pick_family_for_intent, smart_load_envelope,
+};
 pub(crate) use namespace::AUDIT_KIND_NAMESPACE_CLEAR_STANDARD;
 pub(crate) use namespace::authorize_namespace_standard_bind;
 // #2542 — consumed only by the SAL/postgres HTTP funnel (the sqlite HTTP path

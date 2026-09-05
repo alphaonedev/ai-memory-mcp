@@ -271,6 +271,14 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // Never `app.db.lock()`. MCP `signed_at` is `VerifyLinkReport::signed_at`
         // (link `valid_from`).
         ("POST", super::routes::MEMORY_VERIFY) => true,
+        // #3064 lane L-PGP family F2 — `POST /api/v1/memory_smart_load`. The
+        // family PICK is pure Rust (`mcp::pick_family_for_intent`) and the
+        // family-tagged READ rides the SAME `app.store.list` +
+        // `Filter::metadata_eq` path `MEMORY_LOAD_FAMILY` (allow-listed above)
+        // already uses on postgres, via the shared
+        // `power_consolidation::load_family_rows_via_store`. Never
+        // `app.db.lock()`.
+        ("POST", super::routes::MEMORY_SMART_LOAD) => true,
         // #3064 batch B — inbound `reflects_on` dependents + optional
         // `lineage_descendants` for `transitive`. Never `app.db.lock()`.
         ("POST", super::routes::MEMORY_DEPENDENTS_OF_INVALIDATED) => true,

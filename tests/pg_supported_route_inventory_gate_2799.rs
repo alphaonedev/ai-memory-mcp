@@ -194,6 +194,10 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// 2026-08-29 (#3064 batch D): `memory_replay` LEFT this set —
 /// SAL `replay_transcript_union` + `fetch_transcript_content`
 /// (pg `memory_transcripts` / `memory_transcript_links` v22/v24).
+/// 2026-09-05 (#3064 lane L-PGP family F2): `memory_smart_load` LEFT this
+/// set — the family PICK is the pure `mcp::pick_family_for_intent` and the
+/// family-tagged READ is the SAME SAL `list` + `Filter::metadata_eq` path
+/// `memory_load_family` already uses on postgres. Never `app.db.lock()`.
 /// 2026-09-05 (#3064 lane L-PGP family F1): `/api/v1/find_paths` LEFT
 /// this set. It is a bare ALIAS: `src/lib.rs` routes it to the SAME
 /// handler as the already-pg-supported `/api/v1/kg/find_paths`
@@ -208,7 +212,6 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
         routes::MEMORY_CALIBRATE_CONFIDENCE,
         routes::MEMORY_CHECK_AGENT_ACTION,
         routes::MEMORY_RULE_LIST,
-        routes::MEMORY_SMART_LOAD,
         routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
         routes::MEMORY_SUBSCRIPTION_REPLAY,
         routes::SKILL_ID,
@@ -273,8 +276,21 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // postgres daemon 501 a route whose supported twin it already serves.
 // Proof-of-dispatch: `tests/pg_parity_3064.rs::
 // f1_find_paths_alias_matches_kg_find_paths_on_both_backends`.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 68;
-const EXPECTED_FULLY_501_PATHS: usize = 16;
+// 2026-09-05 (#3064 lane L-PGP family F2) — bumped 67 -> 68 pg-supported /
+// 16 -> 15 fully-501: `POST /api/v1/memory_smart_load`. The BINDING SAFETY
+// INVARIANT holds because the handler's postgres branch dispatches through
+// `crate::handlers::power_consolidation::load_family_rows_via_store` ->
+// `MemoryStore::list` (the SAME `Filter::metadata_eq` GIN pushdown +
+// `is_visible_to_caller` re-apply the already-supported
+// `MEMORY_LOAD_FAMILY` route uses) and never `app.db.lock()`. smart_load
+// wraps load_family, so opening it adds NO storage surface that was not
+// already pg-supported; the routing decision is a pure function of the
+// intent string and the optional embedder.
+// Proof-of-dispatch: `tests/pg_parity_3064.rs::
+// f2_smart_load_wraps_load_family_{sqlite,postgres}` (owner sees the
+// family-tagged row, a second principal does not).
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 69;
+const EXPECTED_FULLY_501_PATHS: usize = 15;
 const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 84;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
@@ -324,6 +340,9 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "MEMORY_REFLECT",
     "MEMORY_REFLECTION_ORIGIN",
     "MEMORY_REPLAY",
+    // #3064 family F2 — smart_load wraps the already-frozen
+    // `MEMORY_LOAD_FAMILY` read through the shared SAL helper.
+    "MEMORY_SMART_LOAD",
     "MEMORY_VERIFY",
     "METRICS",
     "METRICS_BARE",

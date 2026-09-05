@@ -1140,64 +1140,18 @@ pub async fn load_family_handler(
     // case both queries move zero rows.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let family_eq = crate::store::MetadataEq::new(crate::META_KEY_FAMILY, family_name);
-        let build_filter = |limit: usize| crate::store::Filter {
-            namespace: body.namespace.clone(),
-            tier: None,
-            tags_any: Vec::new(),
-            agent_id: None,
-            since: None,
-            until: None,
-            valid_at: None,
-            limit,
-            // #1876 — load_family listing serves the first window.
-            offset: 0,
-            // #2167 — load_family listing never runs the recall space gate.
-            active_embedding_space: None,
-            // #2580 — GIN-served pushdown of the family predicate.
-            metadata_eq: Some(family_eq.clone()),
-            // #3185/#3127 — keyword-search-only axis; list ignores it.
-            source_uri: None,
-            // Recall-hybrid only; list ignores it (default false).
-            skip_access_ledger: false,
-
-            ..Default::default()
+        let filtered = match load_family_rows_via_store(
+            &app,
+            &headers,
+            family_name,
+            body.namespace.as_deref(),
+            k,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(resp) => return resp,
         };
-        // QC P1 fix (2026-05-20): load_family lists every memory in
-        // the namespace tagged with a `family` metadata field. With
-        // `for_admin` this leaked scope=private memories of other
-        // tenants in the same namespace. Resolve the caller from
-        // headers so the SAL visibility filter naturally limits the
-        // result set to the caller's own memories (+ scope=shared/
-        // public, which the filter passes through).
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        let narrow = |rows: Vec<Memory>| -> Vec<Memory> {
-            let mut kept: Vec<Memory> = rows.into_iter().filter(|m| family_eq.matches(m)).collect();
-            // priority DESC, updated_at DESC, id ASC (mirrors handle_load_family
-            // + the #2602/#2615 `store::list` tiebreak). `sort_by` is stable, so
-            // this in-process sort inherits determinism only IMPLICITLY from the
-            // already-ordered `store.list` result; an explicit `id` tiebreak
-            // makes this call site a self-contained total order rather than one
-            // that silently depends on an upstream invariant holding.
-            kept.sort_by(|a, b| {
-                b.priority
-                    .cmp(&a.priority)
-                    .then_with(|| b.updated_at.cmp(&a.updated_at))
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            kept
-        };
-        let mut filtered = match app.store.list(&ctx, &build_filter(k)).await {
-            Ok(rows) => narrow(rows),
-            Err(e) => return store_err_to_response(e),
-        };
-        if filtered.len() < k {
-            filtered = match app.store.list(&ctx, &build_filter(MAX_BULK_SIZE)).await {
-                Ok(rows) => narrow(rows),
-                Err(e) => return store_err_to_response(e),
-            };
-        }
-        filtered.truncate(k);
         let count = filtered.len();
         return Json(json!({
             "family": family_name,
@@ -1234,4 +1188,107 @@ pub async fn load_family_handler(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
+}
+
+/// #3064 lane L-PGP family F2 — the POSTGRES family-tagged read, extracted
+/// from [`load_family_handler`] so `memory_smart_load`'s postgres branch
+/// (`crate::handlers::route_1111::handle_smart_load_http`) reuses the SAME
+/// SAL dispatch instead of a second copy that could drift on the visibility
+/// filter, the fail-closed re-check, or the escalation window.
+///
+/// Pre-#2580 the caller pulled `MAX_BULK_SIZE` (=1000) FULL rows regardless of
+/// `k` and filtered them on `metadata.family` in Rust, because the SAL
+/// `Filter` had no metadata axis. Measured on the 8k-row Atlas corpus:
+/// ~982 kB of content+metadata moved per call to return ZERO rows,
+/// 54.3 ms p50 — the slowest surface on the postgres backend, on an
+/// ALWAYS-ON core-profile tool.
+///
+/// The predicate rides the SAL `Filter::metadata_eq` axis into the
+/// SAME hardened `list` query (see `crate::store::MetadataEq`), served
+/// by the pre-existing `memories_metadata_gin` index. Two properties are
+/// load-bearing and deliberately NOT traded away for the speed:
+///
+///  1. FAIL-CLOSED RE-CHECK. The in-process `metadata.family` predicate
+///     is RETAINED (`MetadataEq::matches`), mirroring the belt-and-
+///     suspenders `is_visible_to_caller` re-apply inside
+///     `PostgresStore::list`. The pushdown can therefore only ever
+///     NARROW: an adapter that ignored the axis would degrade to fewer
+///     results, never widen the set with rows the caller did not ask for.
+///  2. NEVER FEWER RESULTS THAN PRE-#2580. The fast path asks for
+///     exactly `k` rows, but the SAL `list` applies the strictly-NARROWER
+///     Rust `is_visible_to_caller` (the #1921 team/unit/org subtree gate
+///     has no SQL twin in the `$6` clause) AFTER the SQL `LIMIT`, so a
+///     bare `LIMIT k` could under-return where the old 1000-row window
+///     did not. When the narrowed set is short of `k` we therefore
+///     re-ask at the historical `MAX_BULK_SIZE` window.
+///
+/// QC P1 fix (2026-05-20): load_family lists every memory in the namespace
+/// tagged with a `family` metadata field. With `for_admin` this leaked
+/// scope=private memories of other tenants in the same namespace. The caller
+/// is resolved from headers so the SAL visibility filter naturally limits the
+/// result set to the caller's own memories (+ scope=shared/public, which the
+/// filter passes through).
+///
+/// Returns the visibility-filtered, family-tagged rows truncated to `k`, or
+/// the typed store-error response the caller must return verbatim.
+#[cfg(feature = "sal")]
+pub(crate) async fn load_family_rows_via_store(
+    app: &AppState,
+    headers: &HeaderMap,
+    family_name: &str,
+    namespace: Option<&str>,
+    k: usize,
+) -> Result<Vec<Memory>, axum::response::Response> {
+    let family_eq = crate::store::MetadataEq::new(crate::META_KEY_FAMILY, family_name);
+    let build_filter = |limit: usize| crate::store::Filter {
+        namespace: namespace.map(str::to_string),
+        tier: None,
+        tags_any: Vec::new(),
+        agent_id: None,
+        since: None,
+        until: None,
+        valid_at: None,
+        limit,
+        // #1876 — load_family listing serves the first window.
+        offset: 0,
+        // #2167 — load_family listing never runs the recall space gate.
+        active_embedding_space: None,
+        // #2580 — GIN-served pushdown of the family predicate.
+        metadata_eq: Some(family_eq.clone()),
+        // #3185/#3127 — keyword-search-only axis; list ignores it.
+        source_uri: None,
+        // Recall-hybrid only; list ignores it (default false).
+        skip_access_ledger: false,
+
+        ..Default::default()
+    };
+    let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
+    let narrow = |rows: Vec<Memory>| -> Vec<Memory> {
+        let mut kept: Vec<Memory> = rows.into_iter().filter(|m| family_eq.matches(m)).collect();
+        // priority DESC, updated_at DESC, id ASC (mirrors handle_load_family
+        // + the #2602/#2615 `store::list` tiebreak). `sort_by` is stable, so
+        // this in-process sort inherits determinism only IMPLICITLY from the
+        // already-ordered `store.list` result; an explicit `id` tiebreak
+        // makes this call site a self-contained total order rather than one
+        // that silently depends on an upstream invariant holding.
+        kept.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        kept
+    };
+    let mut filtered = match app.store.list(&ctx, &build_filter(k)).await {
+        Ok(rows) => narrow(rows),
+        Err(e) => return Err(store_err_to_response(e)),
+    };
+    if filtered.len() < k {
+        filtered = match app.store.list(&ctx, &build_filter(MAX_BULK_SIZE)).await {
+            Ok(rows) => narrow(rows),
+            Err(e) => return Err(store_err_to_response(e)),
+        };
+    }
+    filtered.truncate(k);
+    Ok(filtered)
 }
