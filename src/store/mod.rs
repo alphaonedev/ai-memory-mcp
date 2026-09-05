@@ -192,6 +192,31 @@ pub struct KgQueryRow {
     pub depth: usize,
     /// `src->mid->target` chain as discovered by the traversal.
     pub path: String,
+    // -- #3424 -------------------------------------------------------------
+    // The five display fields the documented `POST /api/v1/kg/query` wire
+    // shape carries and this row type did not, which is WHY the postgres
+    // branch of the handler projected four fields where sqlite projected
+    // nine: the data never reached the handler. They mirror
+    // [`crate::models::KgQueryNode`] field-for-field so ONE projection can
+    // serve both backends, and the sibling [`KgTimelineRow`] already carries
+    // `title` / `target_namespace` / `valid_from` for the same reason.
+    //
+    // Adapters MUST populate them. On postgres both traversal paths (AGE
+    // Cypher and the relational CTE) leave them empty and a single shared
+    // hydration step fills them, so the two paths cannot drift.
+    /// The target memory's title.
+    pub title: String,
+    /// The target memory's namespace.
+    pub target_namespace: String,
+    /// The LAST traversed edge's `valid_from` (claim-bitemporal open
+    /// instant), `None` when the edge carries none.
+    pub valid_from: Option<String>,
+    /// The LAST traversed edge's `valid_until` (close instant), `None` while
+    /// the edge is still current.
+    pub valid_until: Option<String>,
+    /// The LAST traversed edge's `observed_by` attribution, `None` when the
+    /// edge was not attributed.
+    pub observed_by: Option<String>,
 }
 
 /// One row returned by a knowledge-graph timeline scan at the SAL layer.
@@ -7058,10 +7083,20 @@ mod tests {
             relation: "related_to".to_string(),
             depth: 2,
             path: "mem-0->mem-1->mem-2".to_string(),
+            // #3424 — the five display fields the documented wire shape carries.
+            title: "the second memory".to_string(),
+            target_namespace: "team/alpha".to_string(),
+            valid_from: Some("2026-01-01T00:00:00+00:00".to_string()),
+            valid_until: None,
+            observed_by: Some("ai:alice".to_string()),
         };
         let json = serde_json::to_string(&row).unwrap();
         assert!(json.contains("\"target_id\":\"mem-2\""));
         assert!(json.contains("\"depth\":2"));
+        // #3424 — the display fields round-trip too.
+        assert!(json.contains("\"title\":\"the second memory\""));
+        assert!(json.contains("\"target_namespace\":\"team/alpha\""));
+        assert!(json.contains("\"observed_by\":\"ai:alice\""));
         let back: KgQueryRow = serde_json::from_str(&json).unwrap();
         assert_eq!(back, row);
     }
