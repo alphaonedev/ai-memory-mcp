@@ -1533,11 +1533,17 @@ secret is written. Use a new `--out` path when renewing a delegation.
 ### `identity hub-cache` — refresh the public hub authority cache
 
 ```bash
-ai-memory identity hub-cache --agent-id ai:worker --out /run/allow.json
+ai-memory identity hub-cache --include-agent ai:worker --out /run/allow.json
 ai-memory identity hub-cache --out /run/allow.json # revoke all cached principals
 ```
 
-Repeat `--agent-id` for each permitted principal. The command derives proven
+Repeat `--include-agent` for each permitted principal. It is deliberately
+**not** named `--agent-id` ([#3508](https://github.com/alphaonedev/ai-memory-mcp/issues/3508)):
+the root `--agent-id` is `global` + `env = AI_MEMORY_AGENT_ID` and names the
+CALLER, so reusing that long under a different argument id made clap refuse to
+build the command (`'--agent-id' in use by both 'agents' and 'agent_id'`) and
+broke `completions` / `man` generation. Same hazard as `agents subkey-certs
+--principal` (#3017). The command derives proven
 current keys and revoked delegated keys from v97, records allow/revoke decisions
 in the existing `signed_events` audit spine, then atomically publishes a 0600
 public snapshot. Omitted or revoked principals lose admission. Audit failure or

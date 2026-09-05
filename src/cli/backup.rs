@@ -84,6 +84,12 @@ const RESTORE_TMP_INFIX: &str = "restore-tmp";
 /// database. Anything else is a refusal.
 const SQLITE_INTEGRITY_OK: &str = "ok";
 
+/// v1.0.0 #3508 — SQLite reserves the page holding byte offset
+/// `0x4000_0000` (the "pending byte" / lock-byte page). It exists only in
+/// databases larger than 1 GiB, never stores content, and therefore appears
+/// neither in `dbstat` nor on the freelist.
+const SQLITE_PENDING_BYTE: i64 = 0x4000_0000;
+
 /// v1.0.0 #3131 — `restore --json` cannot prompt: an interactive question
 /// on the JSON path would corrupt the envelope the caller is parsing.
 pub const RESTORE_JSON_REQUIRES_YES: &str = "restore: --json requires --yes (restore REPLACES the live database; \
@@ -261,6 +267,120 @@ fn stage_and_verify(snapshot: &Path, staged: &Path) -> Result<()> {
         anyhow::bail!(
             "the staged restore {} FAILED PRAGMA integrity_check ({verdict}) — \
              refusing to publish it; the live database is untouched (#3131)",
+            staged.display()
+        );
+    }
+    // #3508 — a verdict of `ok` no longer means every page was examined.
+    // See `verify_page_accounting`.
+    verify_page_accounting(&probe, staged)?;
+    Ok(())
+}
+
+/// v1.0.0 #3508 — re-assert the whole-file page accounting that
+/// `PRAGMA integrity_check` silently STOPS performing on this schema.
+///
+/// SQLite builds the whole-database root-page list for `integrity_check`
+/// from the schema's table hash, and every schema object with NO root page
+/// of its own — a VIEW, a VIRTUAL TABLE — contributes root page **0**.
+/// When such an entry heads that list, `btree.c` reads it as "this is a
+/// PARTIAL check" (`bPartial = 1`) and skips BOTH the freelist scan AND the
+/// "make sure every page in the file is referenced" pass — while still
+/// answering the single word `ok`. Which object heads the list is decided
+/// by SQLite's schema hash, not by us: adding the `inbox_namespace_aliases`
+/// view in schema v98 (#3401) moved a zero-root entry to the head of the
+/// ai-memory schema, and the consequence was not cosmetic — `restore`
+/// PUBLISHED a snapshot carrying unaccounted pages over the live corpus and
+/// the #3131 gate reported nothing (reproduced on tip 9cc9cf1b against the
+/// bundled SQLite 3.46.0). `memories_fts` is a second, older zero-root
+/// entry, so this is a standing hazard rather than a one-off.
+///
+/// The accounting is exact for a rollback-journal database: every page is
+/// either reachable from a b-tree (one `dbstat` row per page, overflow and
+/// FTS5 shadow-table pages included), on the freelist, or the reserved
+/// pending-byte page. A file that DECLARES more pages than that carries
+/// content SQLite cannot account for — the class `VACUUM INTO` can never
+/// produce and the class a truncated, extended or bit-rotted snapshot does.
+///
+/// Scope, deliberately narrow so this can never refuse a sound restore:
+/// - No zero-root schema object → SQLite's own pass cannot have been
+///   downgraded; nothing to re-assert.
+/// - `auto_vacuum` enabled → pointer-map pages are neither in `dbstat` nor
+///   on the freelist, so the identity does not hold. ai-memory never
+///   enables `auto_vacuum` (no `PRAGMA auto_vacuum` anywhere in the crate
+///   or the migrations) and `VACUUM INTO` inherits the source setting, so
+///   this is unreachable for a database this product wrote. WARN and leave
+///   the primary verdict as the only coverage rather than block a disaster
+///   recovery we cannot fully verify — degrade, never corrupt.
+/// - `dbstat` unavailable → a build without `SQLITE_ENABLE_DBSTAT_VTAB`.
+///   Every shipped build bundles SQLite with that flag (it is set for the
+///   plain and the SQLCipher bundle alike), so this means the binary cannot
+///   verify a replacement it already knows may have been only partially
+///   checked: refuse (fail closed) rather than publish it.
+///
+/// # Errors
+/// The page-accounting refusal, an unavailable `dbstat`, or a PRAGMA query
+/// failure.
+fn verify_page_accounting(probe: &rusqlite::Connection, staged: &Path) -> Result<()> {
+    let zero_root_objects: i64 = probe
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type IN ('view', 'table') AND COALESCE(rootpage, 0) = 0",
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "counting the root-less schema objects in the staged restore {} \
+                 (#3508)",
+                staged.display()
+            )
+        })?;
+    if zero_root_objects == 0 {
+        return Ok(());
+    }
+    let auto_vacuum: i64 = probe
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .with_context(|| {
+            format!(
+                "reading auto_vacuum on the staged restore {} (#3508)",
+                staged.display()
+            )
+        })?;
+    if auto_vacuum != 0 {
+        tracing::warn!(
+            staged = %staged.display(),
+            "PRAGMA integrity_check may have run as a PARTIAL check (the schema \
+             carries a root-less object) and this auto_vacuum database cannot be \
+             page-accounted, so unreferenced pages were NOT verified on this \
+             restore (#3508)"
+        );
+        return Ok(());
+    }
+    let page_count: i64 = probe.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let page_size: i64 = probe.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let freelist: i64 = probe.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let reachable: i64 = probe
+        .query_row("SELECT COUNT(*) FROM dbstat", [], |r| r.get(0))
+        .with_context(|| {
+            format!(
+                "this build cannot page-account the staged restore {} (no dbstat \
+                 virtual table), and its PRAGMA integrity_check may have run as a \
+                 PARTIAL check because the schema carries a root-less object — \
+                 refusing to publish a replacement it cannot verify (#3508)",
+                staged.display()
+            )
+        })?;
+    // A page size is always >= 512, so the division cannot trap.
+    let pending_page = SQLITE_PENDING_BYTE / page_size.max(1) + 1;
+    let accounted = reachable + freelist + i64::from(page_count >= pending_page);
+    if accounted != page_count {
+        anyhow::bail!(
+            "the staged restore {} declares {page_count} pages but only \
+             {accounted} are accounted for (b-tree {reachable} + freelist \
+             {freelist}) — its PRAGMA integrity_check answered `ok` only because \
+             a root-less object in the schema downgrades it to a PARTIAL check \
+             that skips the unreferenced-page pass (#3508); refusing to publish \
+             it, the live database is untouched (#3131)",
             staged.display()
         );
     }
@@ -2210,6 +2330,59 @@ mod tests {
             before,
             "staging must never write to the target"
         );
+        let _ = std::fs::remove_file(&staged);
+    }
+
+    /// v1.0.0 #3508 — the control that stands where `PRAGMA integrity_check`
+    /// stopped standing.
+    ///
+    /// From schema v98 (#3401) the `inbox_namespace_aliases` VIEW heads the
+    /// schema hash with root page 0, which makes SQLite run
+    /// `integrity_check` as a PARTIAL check: it skips the freelist scan and
+    /// the "every page in the file is referenced" pass, and answers `ok` on a
+    /// snapshot carrying unaccounted pages. Before this control `run_restore`
+    /// PUBLISHED such a snapshot over the live corpus. The test asserts on
+    /// the OBSERVED verdict rather than hard-coding SQLite's behaviour, so a
+    /// future SQLite (or a schema shuffle) that restores the full pass makes
+    /// the primary gate fire instead — and the file is refused either way.
+    #[test]
+    fn stage_and_verify_refuses_pages_integrity_check_no_longer_reports_3508() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let backup_dir = db.parent().unwrap().join("backups-3508-accounting");
+        let manifest = take_backup(&mut env, &db, &backup_dir);
+        let snap = backup_dir.join(&manifest.snapshot);
+
+        // A sound snapshot must PASS both gates: this control may never
+        // refuse a restore the operator is entitled to.
+        let clean_staged = sidecar_path(&db, ".stage-clean-3508");
+        stage_and_verify(&snap, &clean_staged).expect("a sound snapshot must verify");
+        let _ = std::fs::remove_file(&clean_staged);
+
+        damage_page_accounting(&snap);
+        let verdict: String = {
+            let probe = db::open_read_only(&snap).expect("open damaged snapshot");
+            probe
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .expect("integrity_check answers")
+        };
+        let staged = sidecar_path(&db, ".stage-accounting-3508");
+        let err = stage_and_verify(&snap, &staged)
+            .expect_err("a snapshot with unaccounted pages must be refused");
+        let msg = err.to_string();
+        if verdict == SQLITE_INTEGRITY_OK {
+            assert!(
+                msg.contains("are accounted for") && msg.contains("#3508"),
+                "integrity_check answered `ok` on a damaged file, so the #3508 \
+                 page-accounting control must be the one refusing; got: {msg}"
+            );
+        } else {
+            assert!(msg.contains("FAILED PRAGMA integrity_check"), "got: {msg}");
+        }
         let _ = std::fs::remove_file(&staged);
     }
 

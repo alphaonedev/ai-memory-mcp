@@ -2435,6 +2435,11 @@ pub fn replay_subscription_events(
 /// to MCP dispatch table" warning in the prior docstring was stale
 /// per the v0.7.0 multi-agent literal-sweep (scanner B finding
 /// F-B6.x); registration has been in tree since K7.
+///
+/// v1.0.0 #3366 — the envelope's `since` field echoes the CANONICAL bound
+/// that was applied (micros + `Z`), not the caller's spelling of it, so a
+/// cutoff written `+05:00` and the same instant written `Z` report the same
+/// value. Pinned by `tests/k7_replay_tool.rs` (#3508).
 pub fn memory_subscription_replay(
     conn: &Connection,
     subscription_id: &str,

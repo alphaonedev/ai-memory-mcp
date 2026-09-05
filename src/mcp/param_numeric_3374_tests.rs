@@ -52,6 +52,27 @@ fn fresh() -> rusqlite::Connection {
     crate::storage::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 
+/// #3508 — pin the SINGLE-OPERATOR posture for the whole test.
+///
+/// `AI_MEMORY_AGENT_ID` is process-global, and the lease rows below assert a
+/// PARAMETER-SHAPE refusal (`ttl_secs must be an integer`) with a fixed
+/// `holder` (`ai:worker`). `handle_lease_acquire` binds `holder` to the
+/// authenticated caller BEFORE it parses `ttl_secs` — which is the correct
+/// fail-closed order (#3361/#3363: identity first, parameters second) and must
+/// NOT be relaxed. So when a sibling test in the same binary has the env
+/// caller set to `ai:bob`, the identity gate legitimately fires first and this
+/// test observes `agent_id mismatch: caller 'ai:bob' may only acquire a lease
+/// as itself` instead of the shape refusal — passing alone, failing in a full
+/// parallel `--lib` run.
+///
+/// The fixture (not the ordering) is what was wrong: this suite is about the
+/// parameter guard, so it declares the posture it needs. The crate-wide
+/// [`crate::identity::agent_id_env_unset_guard`] takes the shared env test
+/// lock, removes any leaked value for the duration and restores it on drop.
+fn single_operator_posture() -> crate::identity::AgentIdEnvUnsetGuard {
+    crate::identity::agent_id_env_unset_guard()
+}
+
 fn action_create() -> Adapter {
     Box::new(action::handle_action_create)
 }
@@ -96,6 +117,7 @@ fn seed_leased_action(conn: &rusqlite::Connection) -> String {
 /// handlers: each returned `Ok` with a body computed from the server default.
 #[test]
 fn numeric_and_boolean_param_shapes_are_refused_3374() {
+    let _posture = single_operator_posture();
     let conn = fresh();
     let action_id = seed_leased_action(&conn);
 
@@ -203,6 +225,7 @@ fn numeric_and_boolean_param_shapes_are_refused_3374() {
 /// documented default.
 #[test]
 fn well_formed_numeric_and_boolean_params_are_honoured_3374() {
+    let _posture = single_operator_posture();
     let conn = fresh();
 
     // priority: the supplied rank is stored, and an ABSENT priority still

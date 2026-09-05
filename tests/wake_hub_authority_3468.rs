@@ -155,9 +155,24 @@ async fn postgres_proven_root_and_revocation_match_sqlite_and_audit_the_decision
     use ai_memory::store::{CallerContext, MemoryStore as _};
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .expect("live isolated PostgreSQL URL required; never skip");
+    // v1.0.0 #3508 — the original assertion pinned the #3468 lane's OWN
+    // database name (`ai_memory_codex_3468`), so this test could only ever
+    // pass inside that one worktree: every other lane, the merge gate
+    // (`ai_memory_gate_<n>`) and CI (`ai_memory_test_ci_<run>_*`) failed it on
+    // an environment mismatch rather than on the behaviour under test. The
+    // invariant it protects is "never run against the SHARED live store" (the
+    // :9077 test-fleet daemon's `ai_memory_test`), so assert that instead —
+    // it holds for every correctly isolated lane.
+    let database = url.split('/').next_back().unwrap_or_default();
+    let database = database.split('?').next().unwrap_or_default();
+    assert_ne!(
+        database, "ai_memory_test",
+        "refusing to run against the shared live store; point \
+         AI_MEMORY_TEST_POSTGRES_URL at this lane's own isolated database"
+    );
     assert!(
-        url.contains("/ai_memory_codex_3468?"),
-        "test requires this lane's isolated database"
+        !database.is_empty(),
+        "AI_MEMORY_TEST_POSTGRES_URL must name a database"
     );
     let store = ai_memory::store::postgres::PostgresStore::connect(&url)
         .await
