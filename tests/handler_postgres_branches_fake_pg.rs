@@ -881,8 +881,16 @@ async fn pg_list_agents_returns_array() {
 
 #[tokio::test]
 async fn pg_register_agent_then_list() {
-    let (router, _f) = build_fake_pg_router();
-    let (status, v) = post_json(
+    // #3398 (security, 2026-09-03) — `POST /api/v1/agents` UPSERTS the roster
+    // row, so registering a principal OTHER than the resolved caller is a
+    // cross-register and goes through the canonical `require_admin` gate.
+    // This suite's original caller was anonymous (no `X-Agent-Id`), which the
+    // gate now — correctly — refuses with `403 {"error":"admin role
+    // required"}`. Drive the pg branch through the ADMIN context the #3303
+    // lineage test uses instead of weakening the gate.
+    mark_request_authn_for_admin_tests();
+    let (router, _f) = build_fake_pg_router_with_admins(vec!["ai:pg-admin".to_string()]);
+    let (status, v) = post_json_as(
         &router,
         "/api/v1/agents",
         json!({
@@ -890,11 +898,44 @@ async fn pg_register_agent_then_list() {
             "agent_type": "human",
             "capabilities": ["store"],
         }),
+        "ai:pg-admin",
     )
     .await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "{v}",
+    );
+}
+
+#[tokio::test]
+async fn pg_register_agent_cross_register_requires_admin_3398() {
+    // The DENIED twin of `pg_register_agent_then_list`: a plain tenant caller
+    // registering SOMEONE ELSE's principal must be refused with the exact
+    // `require_admin` wire shape, on the pg branch too. Pre-#3398 this
+    // overwrote the victim's `agent_type` / `capabilities` and the admin-gated
+    // `GET` then served the forgery as roster truth.
+    mark_request_authn_for_admin_tests();
+    let (router, _f) = build_fake_pg_router_with_admins(vec!["ai:pg-admin".to_string()]);
+    let (status, v) = post_json_as(
+        &router,
+        "/api/v1/agents",
+        json!({
+            "agent_id": "pg-agent-1",
+            "agent_type": "human",
+            "capabilities": ["TAMPERED"],
+        }),
+        "ai:pg-tenant",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#3398: cross-register by a non-admin MUST be refused; body={v}"
+    );
+    assert_eq!(
+        v,
+        json!({"error": "admin role required"}),
+        "#3398: the refusal keeps the canonical require_admin wire shape"
     );
 }
 

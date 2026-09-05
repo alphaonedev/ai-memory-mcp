@@ -1,6 +1,16 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+//! #3355 key-directory isolation, re-armed explicitly per child (#3516).
+//!
+//! The guard is armed per PROCESS — `cfg(test)`, a call to
+//! `test_key_dir::install()`, or the `TEST_KEY_GUARD_ENV` marker — never by
+//! the `test-support` feature, which `cargo test` unifies into the shipped
+//! `ai-memory` binary as well. Every probe child below is a TEST child, so it
+//! carries the marker; `tests/key_dir_guard_not_in_binary_3516.rs` pins the
+//! other half (an unmarked binary never sees the guard at all).
+
+use ai_memory::identity::test_key_dir::TEST_KEY_GUARD_ENV;
 use std::process::Command;
 
 #[test]
@@ -24,6 +34,7 @@ fn resolver_panics_under_temporary_home_and_accepts_isolated_override() {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "resolver_probe", "--nocapture"])
             .env("KEY_ISOLATION_PROBE_3355", "1")
+            .env(TEST_KEY_GUARD_ENV, "1")
             .env("HOME", home.path())
             .env("AI_MEMORY_KEY_DIR", &path)
             .output()
@@ -68,11 +79,12 @@ fn shared_helper_isolates_x25519_and_ed25519_writes() {
 }
 
 #[test]
-fn unarmed_library_uses_the_shared_sandbox_instead_of_home() {
+fn guarded_child_without_override_uses_the_shared_sandbox_instead_of_home() {
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "resolver_probe", "--nocapture"])
         .env("KEY_ISOLATION_PROBE_3355", "1")
+        .env(TEST_KEY_GUARD_ENV, "1")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env_remove("AI_MEMORY_KEY_DIR")
@@ -96,6 +108,7 @@ fn resolver_rejects_a_symlink_alias_into_temporary_home() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "resolver_probe", "--nocapture"])
         .env("KEY_ISOLATION_PROBE_3355", "1")
+        .env(TEST_KEY_GUARD_ENV, "1")
         .env("HOME", home.path())
         .env("AI_MEMORY_KEY_DIR", alias.join("keys"))
         .output()

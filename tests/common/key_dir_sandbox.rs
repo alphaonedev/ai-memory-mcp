@@ -4,9 +4,13 @@
 //! Shared integration-test keystore sandbox (#3198, #3355).
 //!
 //! Include with `#[path = "common/key_dir_sandbox.rs"] mod key_dir_sandbox;`
-//! and call [`pin`] before accessing default keys. This arms the library's
-//! test-support override without modifying the process environment.
-//! For child processes also pass `.env("AI_MEMORY_KEY_DIR", pin())`.
+//! and call [`pin`] before accessing default keys. This ARMS the key-dir
+//! guard for THIS process (#3516) and exports
+//! `ai_memory::identity::test_key_dir::TEST_KEY_GUARD_ENV` so inherited
+//! children stay guarded too.
+//! For child processes also pass `.env("AI_MEMORY_KEY_DIR", pin())`; a
+//! spawner that calls `env_clear()` must additionally pass
+//! `.env(TEST_KEY_GUARD_ENV, "1")` when the child is meant to be guarded.
 
 #![allow(dead_code)]
 #![allow(clippy::missing_panics_doc, clippy::doc_markdown)]

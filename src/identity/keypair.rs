@@ -223,24 +223,25 @@ pub(crate) fn resolved_default_key_dir_path() -> Result<PathBuf> {
         super::test_key_dir::assert_isolated(&p);
         return Ok(p);
     }
+    // Integration tests and their CLI children link a non-cfg(test) rlib; the
+    // self dev-dependency enables the same explicit test-support override
+    // there, including env-cleared child processes (#3355). #3516 — the
+    // sandbox is handed out only to a process that ARMED the guard, because
+    // that dev-dependency also unifies `test-support` into the `ai-memory`
+    // BIN, which operators and CI steps then run as a plain binary; an
+    // unarmed process falls through to the production resolution below.
     #[cfg(any(test, feature = "test-support"))]
-    {
-        // Integration tests and their CLI children link a non-cfg(test) rlib.
-        // The self dev-dependency enables the same explicit test-support
-        // override there, including env-cleared child processes (#3355).
-        Ok(super::test_key_dir::install().to_path_buf())
+    if let Some(sandbox) = super::test_key_dir::armed_sandbox() {
+        return Ok(sandbox.to_path_buf());
     }
-    #[cfg(not(any(test, feature = "test-support")))]
-    {
-        // COVERAGE: ok_or_else closure reachable only on hosts where
-        //           dirs::config_dir() returns None — i.e. exotic
-        //           platforms with no HOME env var. Not deterministic to
-        //           trigger in tests because removing HOME breaks tempfile.
-        let base = dirs::config_dir()
-            .ok_or_else(|| anyhow!("OS did not advertise a config directory for key storage"))?;
-        let path = base.join("ai-memory").join("keys");
-        Ok(path)
-    }
+    // COVERAGE: ok_or_else closure reachable only on hosts where
+    //           dirs::config_dir() returns None — i.e. exotic
+    //           platforms with no HOME env var. Not deterministic to
+    //           trigger in tests because removing HOME breaks tempfile.
+    let base = dirs::config_dir()
+        .ok_or_else(|| anyhow!("OS did not advertise a config directory for key storage"))?;
+    let path = base.join("ai-memory").join("keys");
+    Ok(path)
 }
 
 /// The well-known stable label used by the daemon when auto-generating
