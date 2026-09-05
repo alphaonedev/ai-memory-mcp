@@ -510,3 +510,107 @@ async fn inbox_wait_returns_on_the_bounded_backstop_with_no_hub_3470() {
         .expect("a timeout is not a failure");
     assert!(none.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Fixture server for the SDK real-socket legs
+// ---------------------------------------------------------------------------
+
+/// Serve a REAL hub, with the REAL file-backed delegation verifier, so the
+/// Python and TypeScript SDK suites can run their opt-in real-socket legs
+/// against the shipped Rust implementation rather than a mock.
+///
+/// `#[ignore]` because it is a fixture, not an assertion: it blocks for a
+/// while by design. Run it as
+///
+/// ```bash
+/// AI_MEMORY_TEST_WAKE_HUB_DIR=<dir> AI_MEMORY_TEST_WAKE_HUB_SECS=90 \
+///   cargo test --test wake_client_3470 -- --ignored --nocapture
+/// ```
+///
+/// It writes `<dir>/fixture.json` naming the socket, the 0600 delegation
+/// bundle and the hub id, then keeps the allowlist snapshot fresh (the hub
+/// refuses a cache older than `identity::hub_cache::MAX_CACHE_AGE_SECS`)
+/// until the window closes.
+#[tokio::test]
+#[ignore = "fixture server for the SDK real-socket legs; run with --ignored"]
+async fn serves_a_real_hub_for_the_sdk_clients_3470() {
+    let Ok(dir) = std::env::var("AI_MEMORY_TEST_WAKE_HUB_DIR") else {
+        eprintln!("skip: set AI_MEMORY_TEST_WAKE_HUB_DIR to a 0700 directory");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let secs: u64 = std::env::var("AI_MEMORY_TEST_WAKE_HUB_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+
+    let hub_id = "ai-memory-wake-hub";
+    let agent = uid("sdk-listener");
+    let staged = StagedIdentity::stage(&agent, hub_id, 3_600);
+
+    // The bundle the SDKs load, at a path they can reach, mode 0600.
+    let bundle_path = dir.join("bundle.json");
+    std::fs::copy(staged.bundle_path(), &bundle_path).expect("copy bundle");
+    std::fs::set_permissions(&bundle_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod bundle");
+
+    // The REAL derived allowlist file the shipped verifier reads.
+    let allow_path = dir.join("allow.json");
+    let write_allowlist = || {
+        let now = chrono::Utc::now();
+        let doc = serde_json::json!({
+            "version": 2,
+            "refreshed_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "agents": [{
+                "agent_id": agent,
+                "pubkey_b64": ai_memory::identity::keypair::encode_public_base64(
+                    &staged.enrolled_public,
+                ),
+                "bind_authority": "possession_proof",
+                "bound_at": (now - chrono::Duration::seconds(5))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "revoked_keys": [],
+            }],
+        });
+        std::fs::write(&allow_path, serde_json::to_vec_pretty(&doc).expect("json"))
+            .expect("write allowlist");
+        std::fs::set_permissions(&allow_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod allowlist");
+    };
+    write_allowlist();
+
+    let verifier = Arc::new(ScopedDelegationVerifier::new(
+        ai_memory::wake_hub::delegation_verifier::ReloadingAllowlist::new(allow_path.clone())
+            .expect("the shipped file-backed resolver must load a fresh snapshot"),
+    ));
+    let harness = Harness::start(
+        |cfg| cfg.hub_id = "ai-memory-wake-hub".to_owned(),
+        verifier,
+        Arc::new(SameUidAuthorizer::for_current_process()),
+    );
+
+    let fixture = serde_json::json!({
+        "socket": harness.socket.display().to_string(),
+        "bundle": bundle_path.display().to_string(),
+        "hub_id": harness.hub_id,
+        "agent_id": agent,
+    });
+    std::fs::write(
+        dir.join("fixture.json"),
+        serde_json::to_vec_pretty(&fixture).expect("json"),
+    )
+    .expect("write fixture");
+    println!("wake-hub fixture ready: {fixture}");
+
+    // Keep the snapshot fresh: the hub REFUSES a cache older than
+    // MAX_CACHE_AGE_SECS, which is the point — a stale allowlist cannot
+    // extend authority.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        write_allowlist();
+    }
+    harness.stop().await;
+}

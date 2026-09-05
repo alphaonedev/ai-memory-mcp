@@ -347,6 +347,34 @@ having seen it. There is no body variable because there is no body on the wire.
 These variables are EMITTED by the listener, not read by the substrate, so they
 carry no precedence ladder and appear in no `AI_MEMORY_*` resolution table.
 
+### Replacing a polling fleet
+
+A fleet that coordinates through `memory_notify` + `ai-memory inbox` on a timer
+converts to the wake plane one agent at a time, and never all at once:
+
+```bash
+# 1. once per agent, on the host that will listen
+ai-memory identity delegate --scope a2a-hub --agent-id <agent> --hub-id ai-memory-wake-hub
+
+# 2. replace `sleep 180; ai-memory inbox --agent-id <agent> --json`
+ai-memory inbox --wait --timeout 180 --agent-id <agent> --json
+
+# 3. or, for a long-lived worker, replace the loop entirely
+ai-memory wake-listen --agent-id <agent> --exec 'my-handler'
+```
+
+Nothing about the durable side changes: the same rows, the same read, the same
+output. What changes is that the read happens when there is mail rather than
+every three minutes — and, because the `<=60 s` backstop is always armed, an
+agent whose hub is unreachable is strictly no worse off than the poller it
+replaced.
+
+The `sdk/python/swarm` acceptance harness converts the same way: set
+`SWARM_WAKE_HUB_SOCKET` + `SWARM_WAKE_HUB_BUNDLE_DIR` and its consumer lanes
+wait for the wake instead of racing the write. Leaving them unset keeps the
+harness byte-identical to its pre-#3470 behaviour, which is what makes the
+switch safe to roll out per fleet rather than per release.
+
 ### `ai-memory inbox --wait`
 
 The one-shot form: block on the wake plane, then perform and print the read
