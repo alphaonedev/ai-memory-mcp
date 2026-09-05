@@ -466,29 +466,49 @@ export interface NotifyRequest {
   why_trace?: string;
 }
 
-export interface InboxMessage {
+/** Canonical receipt returned by notify on every backend. */
+export interface NotifyReceipt {
   id: string;
   from: string;
   to: string;
-  subject: string;
-  body: string;
-  memory_id?: string;
-  payload?: Record<string, unknown>;
+  namespace: string;
+  tier: Tier;
+  delivered_at: string;
+}
+
+export interface InboxMessage {
+  id: string;
+  from: string;
+  title: string;
+  payload: string;
+  content: string;
+  priority: number;
+  tier: Tier;
+  namespace: string;
+  metadata: Record<string, unknown>;
   read: boolean;
+  access_count: number;
+  agent_id: string;
+  from_agent_id: string;
+  target_agent_id: string;
   created_at: string;
+  updated_at: string;
 }
 
 export interface InboxResponse {
+  agent_id: string;
+  namespace: string;
   messages: InboxMessage[];
   count: number;
-  unread: number;
+  unread_count: number;
+  unread_only: boolean;
 }
 
 export interface InboxQuery {
-  /** Only return unread messages. */
-  unread?: boolean;
+  agent_id?: string;
+  /** Filter before applying the page limit. */
+  unread_only?: boolean;
   limit?: number;
-  since?: string;
 }
 
 /** Cluster peer info. */

@@ -7267,7 +7267,12 @@ pub fn build_list_query(
     let mut sql = String::from(SQL_LIST_BASE);
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.to_string())];
     if let Some(ns) = namespace {
-        sql.push_str(SQL_FRAGMENT_AND_NAMESPACE_EQ);
+        if ns.starts_with(crate::INBOX_NAMESPACE_PREFIX) {
+            sql.push_str(" AND namespace IN (SELECT ? UNION SELECT legacy_prefix || substr(?, length(canonical_prefix) + 1) FROM inbox_namespace_aliases)");
+            params_vec.push(Box::new(ns.to_string()));
+        } else {
+            sql.push_str(SQL_FRAGMENT_AND_NAMESPACE_EQ);
+        }
         params_vec.push(Box::new(ns.to_string()));
     }
     if let Some(t) = tier {
@@ -15792,18 +15797,25 @@ pub fn list_archived(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<serde_json::Value>> {
+    let ns_predicate = if namespace.is_some_and(|ns| ns.starts_with(crate::INBOX_NAMESPACE_PREFIX))
+    {
+        "namespace IN (SELECT ?1 UNION SELECT legacy_prefix || substr(?1, length(canonical_prefix) + 1) FROM inbox_namespace_aliases)"
+    } else {
+        "namespace = ?1"
+    };
     let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match namespace {
         Some(ns) => (
-            "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
+            format!(
+                "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
              source, access_count, created_at, updated_at, last_accessed_at, \
              expires_at, archived_at, archive_reason, metadata, \
              reflection_depth, memory_kind, entity_id, persona_version, \
              citations, source_uri, source_span, confidence_source, \
              confidence_signals, confidence_decayed_at, version, \
              atomised_into, atom_of, mentioned_entity_id \
-             FROM archived_memories WHERE namespace = ?1 \
+             FROM archived_memories WHERE {ns_predicate} \
              ORDER BY archived_at DESC LIMIT ?2 OFFSET ?3"
-                .to_string(),
+            ),
             vec![Box::new(ns.to_string()), Box::new(limit), Box::new(offset)],
         ),
         None => (

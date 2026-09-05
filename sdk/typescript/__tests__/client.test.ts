@@ -205,9 +205,17 @@ describe("v1.0.0 wire contract (#3331)", () => {
 
   test("notify sends and types daemon field names", async () => {
     let body = "";
-    const result = await clientWith({ id: "n1", target_agent_id: "ai:b", namespace: "global", storage_backend: "postgres" }, (_url, init) => { body = String(init.body); }).notify({ target_agent_id: "ai:b", title: "hello", payload: "unit-of-work" });
+    const result = await clientWith({ id: "n1", from: "ai:a", to: "ai:b", namespace: "_inbox/ai:b", tier: "short", delivered_at: "2026-09-04T00:00:00Z" }, (_url, init) => { body = String(init.body); }).notify({ target_agent_id: "ai:b", title: "hello", payload: "unit-of-work" });
     expect(JSON.parse(body).target_agent_id).toBe("ai:b");
-    expect(result.storage_backend).toBe("postgres");
+    expect(result.to).toBe("ai:b");
+    expect(result.tier).toBe("short");
+  });
+
+  test("inbox sends the canonical unread filter", async () => {
+    let requestedUrl = "";
+    const result = await clientWith({ agent_id: "ai:b", namespace: "_inbox/ai:b", messages: [], count: 0, unread_count: 0, unread_only: true }, (url) => { requestedUrl = url; }).inbox({ unread_only: true, limit: 20 });
+    expect(new URL(requestedUrl).searchParams.get("unread_only")).toBe("true");
+    expect(result.unread_count).toBe(0);
   });
 
   test("stats exposes total_memories", async () => {

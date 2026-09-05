@@ -94,11 +94,11 @@ pub async fn get_inbox(
         let cap = q
             .limit
             .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(100)
-            .clamp(1, 1000);
+            .unwrap_or(50)
+            .min(500);
         let unread_only = q.unread_only.unwrap_or(false);
         let filter = crate::store::Filter {
-            namespace: Some(ns),
+            namespace: Some(ns.clone()),
             limit: cap,
             // v1.0.0 #3463 — push the unread narrowing into the SQL (`AND
             // access_count = 0` before `LIMIT`) instead of dropping read rows in
@@ -131,59 +131,16 @@ pub async fn get_inbox(
                         // on the `Filter` above); it can only narrow, never widen.
                         !unread_only || m.access_count == 0
                     })
-                    .map(|m| {
-                        json!({
-                            "id": m.id,
-                            "title": m.title,
-                            "payload": m.content,
-                            "content": m.content,
-                            "priority": m.priority,
-                            "tier": m.tier.as_str(),
-                            "namespace": m.namespace,
-                            "metadata": m.metadata,
-                            (field_names::CREATED_AT): m.created_at,
-                            (field_names::UPDATED_AT): m.updated_at,
-                            // #3027 — surface the same read-state pair the
-                            // sqlite/MCP inbox projects, so a client cannot be
-                            // told a message is unread by one backend and read
-                            // by the other.
-                            "read": m.access_count > 0,
-                            (field_names::ACCESS_COUNT): m.access_count,
-                            "agent_id": m.metadata
-                                .get("agent_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(""),
-                            (field_names::FROM_AGENT_ID): m.metadata
-                                .get(field_names::FROM_AGENT_ID)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(""),
-                            (field_names::TARGET_AGENT_ID): m.metadata
-                                .get(field_names::TARGET_AGENT_ID)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(""),
-                        })
-                    })
+                    .map(|m| crate::mcp::inbox_message(&m))
                     .collect();
-                let message_count = messages.len();
-                // #3027 — count from the SAME derived marker the filter uses.
-                let unread_count = messages
-                    .iter()
-                    .filter(|m| m.get("read").and_then(serde_json::Value::as_bool) != Some(true))
-                    .count();
                 (
                     StatusCode::OK,
-                    Json(json!({
-                        "agent_id": owner,
-                        "messages": messages,
-                        // #3463 — `count` and `unread_only` echoed here too, so
-                        // the postgres inbox envelope carries the same three
-                        // fields the sqlite/MCP twin returns and a client cannot
-                        // read a different shape per backend.
-                        "count": message_count,
-                        "unread_count": unread_count,
-                        (field_names::UNREAD_ONLY): unread_only,
-                        (field_names::STORAGE_BACKEND): "postgres",
-                    })),
+                    Json(crate::mcp::inbox_envelope(
+                        &owner,
+                        &ns,
+                        unread_only,
+                        messages,
+                    )),
                 )
                     .into_response()
             }

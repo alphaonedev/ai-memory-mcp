@@ -33,7 +33,7 @@ pub fn handle_notify(
             .as_i64()
             .unwrap_or(i64::from(crate::models::DEFAULT_PRIORITY)),
     );
-    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
+    let tier_str = params["tier"].as_str().unwrap_or(Tier::Short.as_str());
     let tier =
         Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
 
@@ -42,7 +42,7 @@ pub fn handle_notify(
     validate::validate_content(payload).map_err(|e| e.to_string())?;
 
     let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    let namespace = super::agent::messages_namespace_for(target);
+    let namespace = crate::inbox_namespace(target);
 
     let now = chrono::Utc::now();
     let expires_at = resolved_ttl
@@ -51,8 +51,8 @@ pub fn handle_notify(
 
     let mut metadata = json!({
         "agent_id": sender.clone(),
-        "recipient_agent_id": target,
-        "message_kind": "notify",
+        (field_names::TARGET_AGENT_ID): target,
+        "notify": true,
     });
     // #2122 — covenant clause-1 why_trace path for `memory_notify`. The
     // notification `payload` is VERBATIM caller content, so the substrate
@@ -76,7 +76,7 @@ pub fn handle_notify(
         namespace: namespace.clone(),
         title: title.to_string(),
         content: payload.to_string(),
-        tags: vec!["_message".to_string()],
+        tags: vec!["notify".to_string()],
         priority,
         confidence: 1.0,
         source: "notify".to_string(),
@@ -126,14 +126,96 @@ pub fn handle_notify(
         }
     };
 
-    Ok(json!({
-        "id": actual_id,
+    Ok(notify_receipt(
+        &actual_id,
+        &sender,
+        target,
+        &namespace,
+        &mem.tier,
+        &mem.created_at,
+    ))
+}
+
+/// Canonical backend-blind notify response envelope (#3401).
+pub(crate) fn notify_receipt(
+    id: &str,
+    sender: &str,
+    target: &str,
+    namespace: &str,
+    tier: &Tier,
+    delivered_at: &str,
+) -> Value {
+    json!({
+        "id": id,
         "from": sender,
         "to": target,
         "namespace": namespace,
-        "tier": mem.tier,
-        "delivered_at": mem.created_at,
-    }))
+        "tier": tier,
+        "delivered_at": delivered_at,
+    })
+}
+
+/// Canonical backend-blind projection of one inbox row (#3401).
+pub(crate) fn inbox_message(m: &Memory) -> Value {
+    let sender = m
+        .metadata
+        .get(param_names::AGENT_ID)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let from_agent_id = m
+        .metadata
+        .get(field_names::FROM_AGENT_ID)
+        .and_then(Value::as_str)
+        .unwrap_or(sender);
+    let target_agent_id = m
+        .metadata
+        .get(field_names::TARGET_AGENT_ID)
+        .or_else(|| m.metadata.get("recipient_agent_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let namespace = m
+        .namespace
+        .strip_prefix(crate::LEGACY_INBOX_NAMESPACE_PREFIX)
+        .map_or_else(|| m.namespace.clone(), crate::inbox_namespace);
+    json!({
+        "id": m.id,
+        "from": sender,
+        "title": m.title,
+        "payload": m.content,
+        "content": m.content,
+        "priority": m.priority,
+        "tier": m.tier,
+        "namespace": namespace,
+        "metadata": m.metadata,
+        (field_names::CREATED_AT): m.created_at,
+        (field_names::UPDATED_AT): m.updated_at,
+        "read": m.access_count > 0,
+        (field_names::ACCESS_COUNT): m.access_count,
+        "agent_id": sender,
+        (field_names::FROM_AGENT_ID): from_agent_id,
+        (field_names::TARGET_AGENT_ID): target_agent_id,
+    })
+}
+
+/// Canonical backend-blind inbox response envelope (#3401).
+pub(crate) fn inbox_envelope(
+    owner: &str,
+    namespace: &str,
+    unread_only: bool,
+    messages: Vec<Value>,
+) -> Value {
+    let unread_count = messages
+        .iter()
+        .filter(|message| message.get("read").and_then(Value::as_bool) != Some(true))
+        .count();
+    json!({
+        "agent_id": owner,
+        "namespace": namespace,
+        "count": messages.len(),
+        "unread_count": unread_count,
+        (field_names::UNREAD_ONLY): unread_only,
+        "messages": messages,
+    })
 }
 
 pub fn handle_inbox(
@@ -207,7 +289,7 @@ pub(crate) fn handle_inbox_with_policy(
     let limit = crate::mcp::param_guard::optional_non_negative_u64(params, param_names::LIMIT)?
         .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX))
         .min(500);
-    let namespace = super::agent::messages_namespace_for(&owner);
+    let namespace = crate::inbox_namespace(&owner);
     // v1.0.0 #3463 — the unread narrowing is PUSHED DOWN into the query
     // (`list_filtered`'s `unread_only` axis -> `AND access_count = 0` before the
     // SQL `LIMIT`). It used to run in Rust on the already-limited page, so an
@@ -240,42 +322,8 @@ pub(crate) fn handle_inbox_with_policy(
         .iter()
         .filter(|m| !unread_only || m.access_count == 0)
         .collect();
-    let messages: Vec<Value> = filtered
-        .iter()
-        .map(|m| {
-            let sender = m
-                .metadata
-                .get(param_names::AGENT_ID)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            json!({
-                "id": m.id,
-                "from": sender,
-                "title": m.title,
-                "payload": m.content,
-                "priority": m.priority,
-                "tier": m.tier,
-                (field_names::CREATED_AT): m.created_at,
-                "read": m.access_count > 0,
-                (field_names::ACCESS_COUNT): m.access_count,
-            })
-        })
-        .collect();
-    // #3463 — `unread_count` derived from the SAME `access_count` marker the
-    // filter and the `read` wire field use, so the three can never disagree.
-    // Reported on this surface too (it was postgres-only), which is what lets a
-    // client compare inboxes across backends. Scope: the returned page. Under
-    // `unread_only: true` the page IS the unread window (the narrowing now runs
-    // before `LIMIT`), so this is the exact unread count up to `limit`.
-    let unread_count = filtered.iter().filter(|m| m.access_count == 0).count();
-    Ok(json!({
-        "agent_id": owner,
-        "namespace": namespace,
-        "count": messages.len(),
-        "unread_count": unread_count,
-        (field_names::UNREAD_ONLY): unread_only,
-        "messages": messages,
-    }))
+    let messages = filtered.into_iter().map(inbox_message).collect();
+    Ok(inbox_envelope(&owner, &namespace, unread_only, messages))
 }
 
 // --- D1.5 (#986): per-tool McpTool impls for the 2 other-family notify tools ---
@@ -427,12 +475,12 @@ mod d1_5_986_tests {
             &crate::config::ResolvedTtl::default(),
             Some("ai:sender"),
         )
-        .expect("notify owns the messages namespace");
+        .expect("notify owns the canonical inbox namespace");
 
-        assert_eq!(response["namespace"], "_messages/ai:victim");
+        assert_eq!(response["namespace"], "_inbox/ai:victim");
         let rows = db::list(
             &conn,
-            Some("_messages/ai:victim"),
+            Some("_inbox/ai:victim"),
             None,
             10,
             0,
@@ -456,7 +504,7 @@ mod d1_5_986_tests {
         let client = "quota-sender";
         let sender = crate::identity::resolve_agent_id(None, Some(client)).unwrap();
         let target = "ai:quota-recipient";
-        let namespace = super::super::agent::messages_namespace_for(target);
+        let namespace = crate::inbox_namespace(target);
         for index in 0..3 {
             let params = json!({
                 "target_agent_id": target,
@@ -492,7 +540,7 @@ mod d1_5_986_tests {
         let client = "quota-limited";
         let sender = crate::identity::resolve_agent_id(None, Some(client)).unwrap();
         let target = "ai:quota-target";
-        let namespace = super::super::agent::messages_namespace_for(target);
+        let namespace = crate::inbox_namespace(target);
         crate::quotas::get_status(&conn, &sender, &namespace).expect("seed quota row");
         conn.execute(
             "UPDATE agent_quotas SET max_memories_per_day = 0
@@ -537,6 +585,32 @@ mod d1_5_986_tests {
         assert_eq!(InboxTool::family(), "power");
     }
 
+    #[test]
+    fn notify_uses_canonical_namespace_shape_and_short_default_3401() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let result = handle_notify(
+            &conn,
+            &json!({
+                "target_agent_id": "ai:bob",
+                "title": "canonical notify",
+                "payload": "backend-blind payload",
+            }),
+            &crate::config::ResolvedTtl::default(),
+            Some("ai:alice"),
+        )
+        .unwrap();
+        assert_eq!(result["namespace"], "_inbox/ai:bob");
+        assert_eq!(result["tier"], "short");
+
+        let id = result["id"].as_str().unwrap();
+        let memory = db::get(&conn, id).unwrap().unwrap();
+        assert_eq!(memory.namespace, "_inbox/ai:bob");
+        assert_eq!(memory.tier, Tier::Short);
+        assert_eq!(memory.tags, ["notify"]);
+        assert_eq!(memory.metadata[field_names::TARGET_AGENT_ID], "ai:bob");
+        assert_eq!(memory.metadata["notify"], true);
+    }
+
     /// #1557 — seed one message into `owner`'s inbox namespace, sent by
     /// `sender`, so the owner-bind on `handle_inbox` can be exercised.
     fn seed_inbox_message(conn: &rusqlite::Connection, owner: &str, sender: &str) -> String {
@@ -547,7 +621,7 @@ mod d1_5_986_tests {
             valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
-            namespace: super::super::agent::messages_namespace_for(owner),
+            namespace: crate::inbox_namespace(owner),
             title: format!("msg from {sender}"),
             content: format!("private payload for {owner}"),
             tags: vec![],

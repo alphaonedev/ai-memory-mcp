@@ -110,7 +110,7 @@ CLI subcommands):
 | HTTP routes | **97 production `.route(...)` registrations** / 83 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v97** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v97" |
+| Schema | **v98** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v98" |
 
 ## Secure-default flips (breaking)
 
@@ -604,12 +604,12 @@ those two review lanes raised, and no tag has been cut.
 > summarized here for completeness and to record that both review lanes
 > closed with zero GA-blockers among the findings they raised.
 
-## Schema ladder v78 → v97
+## Schema ladder v78 → v98
 
-`CURRENT_SCHEMA_VERSION = 97` on both adapters
+`CURRENT_SCHEMA_VERSION = 98` on both adapters
 (`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
-`src/store/postgres.rs::{migrate_v79 … migrate_v97}`.
+`src/store/postgres.rs::{migrate_v79 … migrate_v98}`.
 
 **The ladder is not uniformly additive, and this document previously
 said it was.** v79–v85 are pure additive `ADD COLUMN` / `CREATE TABLE`
@@ -659,6 +659,8 @@ durable-row probe, so a populated database can never migrate unsnapshotted
 | v89 | postgres FTS `tags` fold — cross-backend determinism fix ([#2392](https://github.com/alphaonedev/ai-memory-mcp/issues/2392); 5-agent vote `4d3ea1c5`). SQLite's `memories_fts` FTS5 table has always indexed `(title, content, tags)`, but the postgres stored generated `tsv` tsvector (v57) folded only `title + content`, so a tag-only-hit search / recall / contradiction returned the row on SQLite but ZERO rows on the enterprise (postgres) tier. `migrate_v89` redefines the generated column to fold `coalesce(tags::text, '')` — the generated-column-LEGAL fold (a GENERATED column bars `jsonb_array_elements_text`; the immutable `jsonb -> text` cast's JSON punctuation tokenizes away, leaving the array elements as lexemes under the same `'english'` config already applied to title + content) — and every `tsv`-reading path (search / recall / contradiction / list) is fixed uniformly. PG16 has no `ALTER COLUMN ... SET EXPRESSION`, so the arm is `DROP COLUMN IF EXISTS tsv` (cascades away `memories_tsv_gin`) + `ADD COLUMN tsv ... GENERATED ... STORED` + recreate the GIN, one transaction on the pooled connection retaining `lock_timeout` (the ACCESS EXCLUSIVE STORED-generated rewrite cannot be `CONCURRENTLY`, so it fails CLOSED under contention — DEGRADE to fewer tag results, never a wrong result). The SQLite v89 arm is a version-stamp no-op (FTS5 already indexes tags), so both adapters keep ONE logical schema number. `tsv` is derived data regenerated from the durable text |
 | v90 | archive genesis-cid parity — **purely additive on both backends**, no full-table rebuild and therefore no trigger recreation (the v63/v65 lesson) ([#2385](https://github.com/alphaonedev/ai-memory-mcp/issues/2385)). `archived_memories` never gained the v74/#1825 genesis content-id pair, so every archive `INSERT…SELECT` DROPPED the row's BLAKE3 address on the way into cold storage and both `restore_archived*` paths RE-MINTED it on the way back out, recomputing `stamp_cid(agent_id, namespace, title, memory_kind, created_at, plaintext)` from six reconstructed inputs. A re-mint reproduces the original address only if all six are byte-identical at restore time; a rewritten `metadata.agent_id`, or a decrypt failure whose `unwrap_or` hashes the CIPHERTEXT placeholder instead of the plaintext, silently re-addressed the durable row and dangled every `memory_links.source_cid` / `target_cid` mirror resolving to it — the v74 genesis-identity contract violated with no write intent and no error. v90 adds `cid` (TEXT) + `cid_genesis` (BLOB / BYTEA) to `archived_memories`, carries them through all seven archive funnels on each backend, and makes both restore paths bind the CARRIED pair atomically (`CASE WHEN cid IS NOT NULL THEN cid ELSE <re-mint> END`, and the same predicate for `cid_genesis` — mixing a carried address with a re-derived pre-image would produce a row whose own verify disagrees with itself). It **backfills nothing**: a pre-v90 archived row's genesis address cannot be proven from the archive alone, so those rows keep NULL and keep the legacy re-mint fallback — degrade, never corrupt; inventing an address we cannot prove would be the corruption the rung exists to stop. SQLite applies it as a probe-guarded `ALTER` (no `ADD COLUMN IF NOT EXISTS`); postgres uses `ADD COLUMN IF NOT EXISTS`. Idempotent on both |
 | v97 | proof-of-possession enrollment history — additive `agent_pubkey_history` and single-use `agent_pubkey_bind_challenges` tables on both backends ([#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464)). Candidate-key proof can bootstrap only an identity with no prior trust history, or reassert the same live key. Once anchored, a distinct replacement must traverse the predecessor-signed succession or guardian-recovery lineage path; admin role plus possession of an unrelated candidate key cannot replace another identity's trust anchor. Closed or revoked history cannot be reopened by direct bind. |
+
+| v98 | Canonical `_inbox/<agent>` namespace on both backends (#3401). An additive view aliases live and archived legacy rows without rewriting any signed or stored bytes. Idempotent; rollback drops the view. |
 
 ## Honest limits
 

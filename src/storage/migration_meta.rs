@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships a 95-step migration ladder (v2 → v96) whose
+//! The substrate ships a 97-step migration ladder (v2 → v98) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -438,10 +438,12 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // to remains in `memories` — NoLoss. `CREATE TABLE IF NOT EXISTS` +
     // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
     // the whole batch re-runnable, so a crash mid-arm self-heals on the next
-    // open — idempotent. No full-table rebuild. Literal tail: MUST equal
-    // CURRENT_SCHEMA_VERSION.
+    // open — idempotent. No full-table rebuild. Settled literal rung;
+    // v98 now owns the moving tip.
     // Postgres twin is `PostgresStore::migrate_v97`.
     meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
+    // v98: live/archive namespace alias view; rollback drops the view, NoLoss.
+    meta(98, "CANONICAL_INBOX_NAMESPACE", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

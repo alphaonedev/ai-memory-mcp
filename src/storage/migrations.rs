@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 97).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 98).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -992,7 +992,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// for schema reporting and compatibility checks. Settled ladder arms still
 /// gate on their own literal rung so adding v98 cannot make a v96 database
 /// skip v97.
-const CURRENT_SCHEMA_VERSION: i64 = 97;
+const CURRENT_SCHEMA_VERSION: i64 = 98;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1791,6 +1791,19 @@ const MIGRATION_V95_SQLITE: &str =
 // `PostgresStore::migrate_v97`.
 const MIGRATION_V97_SQLITE: &str =
     include_str!("../../migrations/sqlite/0081_v97_agent_pubkey_history.sql");
+
+// v98 (#3401): canonical namespace for live and archived inbox rows.
+const MIGRATION_V98_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0082_v98_canonical_inbox_namespace.sql");
+
+const SQL_CLEAR_SCHEMA_VERSION: &str = "DELETE FROM schema_version";
+
+fn migrate_v98(conn: &Connection) -> Result<()> {
+    conn.execute_batch(MIGRATION_V98_SQLITE)?;
+    conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
+    conn.execute("INSERT INTO schema_version (version) VALUES (98)", [])?;
+    Ok(())
+}
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -4403,7 +4416,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             crate::storage::embed_skip::apply_sqlite_v96(conn)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 97 {
             // v97 (#3464, v1.0.0, security-high) — APPEND-ONLY AGENT PUBKEY
             // HISTORY. Pre-#3464 an agent's Ed25519 attestation key lived ONLY
             // in the flat `metadata.agent_pubkey` field of its `_agents` row,
@@ -4479,6 +4492,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V97_SQLITE)?;
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v98 (#3401): alias legacy inbox rows without rewriting signed data.
+            migrate_v98(conn)?;
+        }
+
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
         // POSTGRES) is a SQLite NO-OP. SQLite has carried all three indexes
         // since v56 (#1579 A2 + B6d) — `idx_memories_list_order`,
@@ -4540,7 +4558,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             )));
         }
 
-        conn.execute("DELETE FROM schema_version", [])?;
+        conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             params![CURRENT_SCHEMA_VERSION],
@@ -7188,5 +7206,72 @@ mod tests {
         // it is COMPLETE on both (two empty sets would satisfy equality).
         assert_memory_links_tip_shape(&upgraded, "v1 replay");
         assert_memory_links_tip_shape(&fresh, "fresh install");
+    }
+
+    #[test]
+    fn v98_aliases_live_and_archived_legacy_messages_3401() {
+        let conn = fresh_db_via_migrate();
+        for (id, namespace) in [
+            ("legacy-live", "_messages/ai:bob"),
+            ("ordinary-live", "project/notes"),
+            ("legacy-archive", "_messages/ai:carol"),
+        ] {
+            conn.execute(
+                "INSERT INTO memories
+                 (id, tier, namespace, title, content, tags, priority, confidence,
+                  source, access_count, created_at, updated_at, metadata)
+                 VALUES (?1, 'short', ?2, ?1, 'payload', '[]', 5, 1.0,
+                         'test', 0, '2026-09-02T00:00:00Z',
+                         '2026-09-02T00:00:00Z', '{}')",
+                params![id, namespace],
+            )
+            .unwrap();
+        }
+        crate::storage::archive_memory(&conn, "legacy-archive", Some("test")).unwrap();
+
+        let snapshot = |table: &str| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY id"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let live_before = snapshot("memories");
+        let archived_before = snapshot("archived_memories");
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (97)", [])
+            .unwrap();
+        migrate_v98(&conn).unwrap();
+
+        migrate_v98(&conn).unwrap();
+        assert_eq!(snapshot("memories"), live_before);
+        assert_eq!(snapshot("archived_memories"), archived_before);
+        let aliases: i64 = conn
+            .query_row("SELECT COUNT(*) FROM inbox_namespace_aliases", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(aliases, 1);
+        let inbox = crate::mcp::handle_inbox(
+            &conn,
+            &serde_json::json!({"agent_id": "ai:bob"}),
+            None,
+            Some("ai:bob"),
+        )
+        .unwrap();
+        assert_eq!(inbox["messages"][0]["id"], "legacy-live");
+        assert_eq!(inbox["messages"][0]["namespace"], "_inbox/ai:bob");
+        let archives =
+            crate::storage::list_archived(&conn, Some("_inbox/ai:carol"), 10, 0).unwrap();
+        assert_eq!(archives[0]["id"], "legacy-archive");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
     }
 }
