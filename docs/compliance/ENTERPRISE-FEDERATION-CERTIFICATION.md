@@ -935,11 +935,24 @@ following should **not** treat v1.0.0 as sufficient:
   cleartext. The per-content X25519/ChaCha envelope (`AI_MEMORY_ENCRYPT_AT_REST`)
   is likewise per-node: catch-up decrypts and the receiver re-seals under its
   own key.
-- **Postgres federation gaps.** On the Postgres backend, archives / restores /
+- **Postgres federation gaps — CLOSED at #3075.** This entry previously read
+  "Postgres federation gaps": on the Postgres backend the archives / restores /
   pendings / pending_decisions / namespace_meta / namespace_meta_clears /
-  checkpoints federation lanes report `unsupported_on_postgres` rather than
-  fully replicating (honest non-ack, never a silent drop). The sqlite/MCP-native
-  path is complete.
+  checkpoints federation lanes reported `unsupported_on_postgres` rather than
+  fully replicating (honest non-ack, never a silent drop). #3075 lane L-PGP
+  trait-covers ALL SEVEN, each gated by the SAME `receive_auth` verdict the
+  sqlite receiver runs — #2479 Amendment E; the #2447 by-id STORED-namespace
+  confinement; the #1848 / G30 forget-tombstone refusal on restore; the
+  FED-RQ-01 #1936 / #125 resolver-key attestation with the #2708
+  claimed-AND-stored confinement, the L5 reserved-anchor refusal and
+  first-resolution-wins (the receiver NEVER re-signs); and the #2529 / #1920 /
+  #2478 / #2532 / #2720 governance-queue chain. The §7 separation-of-duties
+  statement below is therefore **strengthened**, not weakened: the
+  commit-checkpoint freeze anchor it rests on now replicates to a Postgres peer
+  instead of stopping at it. The `unsupported_on_postgres` field is retained and
+  reports 0, so a future un-migrated subcollection must still disclose itself
+  rather than being silently dropped. The sqlite/MCP-native path is complete on
+  every lane.
 - **Scale envelope — ARCHITECTED, not MEASURED.** ~1000 agents, ≤ 50 peers
   per block — **not 1M**. PEER dimension MEASURED (#2921 bench,
   `docs/bench/capacity-envelope-2921.md`): full mesh converged at

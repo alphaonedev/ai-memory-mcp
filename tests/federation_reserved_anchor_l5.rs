@@ -36,13 +36,21 @@
 //!
 //! # K3 (sqlite ↔ postgres) parity
 //!
-//! The inbound-checkpoint APPLY path is sqlite/MCP-native only: the postgres
-//! `/sync/push` funnel reports checkpoints as `unsupported_on_postgres`
-//! (#2464/#1936/#125) and NEVER reaches an apply, so postgres already refuses
-//! EVERY inbound checkpoint resolution (a strictly stronger disposition). There
-//! is therefore no postgres twin to poison; the sqlite refusal proven here is
-//! the complete closure for the reachable surface. See
-//! `pg_checkpoint_apply_is_unsupported_parity_note` below.
+//! **Updated at #3075.** This file previously recorded that the postgres
+//! `/sync/push` funnel reported checkpoints as `unsupported_on_postgres` and
+//! never reached an apply, so there was "no postgres twin to poison". That is
+//! no longer true: #3075 lane L-PGP trait-covers the lane, and a postgres
+//! receiver now APPLIES federated resolutions. The reserved-anchor refusal
+//! therefore has a REAL postgres twin, and the sqlite refusal proven here is no
+//! longer the complete closure for the reachable surface on its own.
+//!
+//! The refusal itself is SHARED, which is why it did not have to be re-derived:
+//! both adapters call the backend-blind
+//! [`inbound_checkpoint_kind_authorized`] on the CLAIMED wire kind and the
+//! STORED by-id kind. The postgres cell that exercises it end-to-end against a
+//! live receiver is
+//! `tests/fed_checkpoint_lane_3075_pg.rs::reserved_anchor_kind_refused_on_postgres_3075`;
+//! see `pg_checkpoint_apply_parity_note_3075` below.
 
 use ai_memory::checkpoints::{
     InboundResolutionOutcome, apply_inbound_resolution, get, insert, query,
@@ -474,16 +482,42 @@ fn injected_witness_anchor_cannot_suppress_or_move_the_verdict() {
 // K3 parity note (compile-time assertion of the documented disposition).
 // ---------------------------------------------------------------------------
 
-/// The postgres `/sync/push` funnel never reaches an inbound-checkpoint APPLY
-/// (checkpoints are reported `unsupported_on_postgres`, #2464/#1936/#125), so
-/// there is no postgres twin of [`apply_inbound_resolution`] to poison — the
-/// postgres surface already refuses EVERY inbound checkpoint resolution, a
-/// strictly stronger disposition than the sqlite reserved-kind refusal proven
-/// above. This test documents the parity conclusion; the sqlite refusal is the
-/// complete closure for the reachable apply surface.
+/// #3075 — K3 parity, RE-STATED. The postgres `/sync/push` funnel now DOES
+/// reach an inbound-checkpoint apply (`MemoryStore::apply_remote_checkpoint_
+/// resolution`, postgres impl in `src/store/postgres/federation_3075.rs`), so
+/// the prior conclusion — "postgres refuses every inbound resolution, a
+/// strictly stronger disposition, therefore no twin to poison" — is retired.
+///
+/// Parity is preserved by SHARING the classifier rather than by absence: both
+/// adapters gate on the same backend-blind
+/// [`inbound_checkpoint_kind_authorized`], checked on the CLAIMED wire kind AND
+/// the STORED by-id kind, at the head of their respective apply funnels. This
+/// test asserts the property that keeps that true — the classifier is a PURE
+/// function with no backend in its signature, so there is exactly one
+/// definition of "reserved" for both receivers to obey. The end-to-end postgres
+/// proof (live receiver, row state) is
+/// `tests/fed_checkpoint_lane_3075_pg.rs::reserved_anchor_kind_refused_on_postgres_3075`.
 #[test]
-fn pg_checkpoint_apply_is_unsupported_parity_note() {
-    // Nothing to exercise on postgres: the reserved-kind refusal lives in the
-    // sole apply funnel, which postgres never invokes. Kept as an explicit,
-    // named record of the K3 parity reasoning rather than a silent gap.
+fn pg_checkpoint_apply_parity_note_3075() {
+    // The pure classifier both apply funnels call. If a future change gave
+    // either backend its own copy, this cell would still pass — which is why
+    // the load-bearing pg proof is the live-receiver cell named above; this one
+    // pins the SHAPE (one shared, backend-blind verdict) that makes the two
+    // funnels agree by construction.
+    assert!(
+        !inbound_checkpoint_kind_authorized(
+            ai_memory::models::ConditionType::AuditHeadWitness,
+            "team/ops",
+            None,
+        ),
+        "the shared reserved-kind classifier must refuse a reserved wire kind"
+    );
+    assert!(
+        inbound_checkpoint_kind_authorized(
+            ai_memory::models::ConditionType::Approval,
+            "team/ops",
+            None,
+        ),
+        "and must admit an ordinary coordination gate"
+    );
 }
