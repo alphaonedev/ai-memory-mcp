@@ -2149,7 +2149,9 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<String> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        crate::actions::create(&conn, action).map_err(box_err)
+        crate::actions::create_guarded(&conn, action.clone())
+            .map(|a| a.id)
+            .map_err(box_err)
     }
 
     async fn action_get(
@@ -2516,6 +2518,29 @@ impl MemoryStore for SqliteStore {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::routines::routine_freeze(&conn, id, frozen_at, keypair).map_err(box_err)
+    }
+
+    async fn routine_materialize(
+        &self,
+        _ctx: &CallerContext,
+        routine_id: &str,
+        arguments: &serde_json::Value,
+    ) -> StoreResult<Vec<String>> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        let routine = crate::routines::routine_get(&conn, routine_id)
+            .map_err(box_err)?
+            .ok_or_else(|| box_err("routine not found"))?;
+        if routine.state != crate::models::RoutineState::Frozen {
+            return Err(box_err(crate::routines::ROUTINE_NOT_FROZEN));
+        }
+        crate::routines::materialization::materialize_template(
+            &conn,
+            &routine,
+            arguments,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(box_err)
     }
 
     async fn routine_run_create(

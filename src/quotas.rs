@@ -782,36 +782,7 @@ pub fn check_and_record_storage_only(
     let _ = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
     let write_txn = crate::storage::connection::WriteTxn::begin(conn)
         .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("BEGIN IMMEDIATE failed: {e}")))?;
-    let result: std::result::Result<(), QuotaCheckError> = (|| {
-        let row = load_row(conn, agent_id, namespace)
-            .map_err(QuotaCheckError::Sql)?
-            .ok_or_else(|| {
-                QuotaCheckError::Sql(anyhow::anyhow!(
-                    "quota row vanished mid-transaction for agent {agent_id} namespace {namespace}"
-                ))
-            })?;
-        if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
-            return Err(QuotaCheckError::Quota(QuotaError {
-                agent_id: agent_id.to_string(),
-                namespace: namespace.to_string(),
-                limit: QuotaLimit::StorageBytes,
-                current: row.current_storage_bytes,
-                max: row.max_storage_bytes,
-            }));
-        }
-        // Storage bytes are cumulative (never daily-reset), so no
-        // day-roll branch is needed — just accumulate.
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE agent_quotas SET
-               current_storage_bytes = current_storage_bytes + ?1,
-               updated_at = ?2
-             WHERE agent_id = ?3 AND namespace = ?4",
-            params![bytes, now, agent_id, namespace],
-        )
-        .map_err(quota_update_failed)?;
-        Ok(())
-    })();
+    let result = check_and_record_storage_only_in_transaction(conn, agent_id, namespace, bytes);
     match result {
         Ok(()) => {
             write_txn
@@ -824,6 +795,55 @@ pub fn check_and_record_storage_only(
             Err(e)
         }
     }
+}
+
+/// Charge storage inside a caller-owned transaction so a later DAG failure
+/// rolls back the charge as well as the actions. Shared with the standalone gate.
+///
+/// # Errors
+/// Returns a quota refusal or a database error. Requires an active transaction.
+pub(crate) fn check_and_record_storage_only_in_transaction(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    bytes: i64,
+) -> std::result::Result<(), QuotaCheckError> {
+    crate::storage::record_stop::gate_storage_conn(conn)
+        .map_err(|e| QuotaCheckError::Sql(e.into()))?;
+    if conn.is_autocommit() {
+        return Err(QuotaCheckError::Sql(anyhow::anyhow!(
+            "storage charge requires a transaction"
+        )));
+    }
+    let _ = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
+    let row = load_row(conn, agent_id, namespace)
+        .map_err(QuotaCheckError::Sql)?
+        .ok_or_else(|| {
+            QuotaCheckError::Sql(anyhow::anyhow!(
+                "quota row vanished mid-transaction for agent {agent_id} namespace {namespace}"
+            ))
+        })?;
+    if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
+        return Err(QuotaCheckError::Quota(QuotaError {
+            agent_id: agent_id.to_string(),
+            namespace: namespace.to_string(),
+            limit: QuotaLimit::StorageBytes,
+            current: row.current_storage_bytes,
+            max: row.max_storage_bytes,
+        }));
+    }
+    // Storage bytes are cumulative (never daily-reset), so no
+    // day-roll branch is needed — just accumulate.
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_quotas SET
+               current_storage_bytes = current_storage_bytes + ?1,
+               updated_at = ?2
+             WHERE agent_id = ?3 AND namespace = ?4",
+        params![bytes, now, agent_id, namespace],
+    )
+    .map_err(quota_update_failed)?;
+    Ok(())
 }
 
 /// #1807 — byte estimate for a coordination create (action / signal /

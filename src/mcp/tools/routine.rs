@@ -22,9 +22,7 @@
 
 use crate::identity::keypair::AgentKeypair;
 use crate::mcp::param_names;
-use crate::models::{
-    Action, ActionState, AttestLevel, EdgeType, Routine, RoutineRun, RoutineRunState, RoutineState,
-};
+use crate::models::{AttestLevel, Routine, RoutineRun, RoutineRunState, RoutineState};
 use serde_json::{Value, json};
 
 /// JSON response field carrying the serialized routine object (SSOT for the
@@ -173,222 +171,6 @@ pub fn handle_routine_freeze(
     }
 }
 
-/// Recursively substitute `{{key}}` placeholders inside every `Value::String`
-/// of `v` with the matching `arguments[key]`. A string value (`Value::String`)
-/// is substituted verbatim; any other JSON value is stringified via
-/// [`Value::to_string`] (so a numeric / boolean / object argument is injected as
-/// its JSON text). Unmatched placeholders are left verbatim. Non-string nodes
-/// recurse into arrays / objects; scalars pass through unchanged.
-fn substitute_placeholders(v: &Value, arguments: &serde_json::Map<String, Value>) -> Value {
-    match v {
-        Value::String(s) => {
-            let mut out = s.clone();
-            for (key, val) in arguments {
-                let needle = format!("{{{{{key}}}}}");
-                if out.contains(&needle) {
-                    let replacement = match val {
-                        Value::String(sv) => sv.clone(),
-                        other => other.to_string(),
-                    };
-                    out = out.replace(&needle, &replacement);
-                }
-            }
-            Value::String(out)
-        }
-        Value::Array(arr) => Value::Array(
-            arr.iter()
-                .map(|e| substitute_placeholders(e, arguments))
-                .collect(),
-        ),
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, val) in map {
-                out.insert(k.clone(), substitute_placeholders(val, arguments));
-            }
-            Value::Object(out)
-        }
-        other => other.clone(),
-    }
-}
-
-/// Materialise a frozen routine's `template` under a concrete `arguments`
-/// binding into first-class [`crate::actions`] rows (+ their DAG edges).
-///
-/// The template is expected to be a JSON object with an optional `"actions"`
-/// array — each element an object `{kind, title, payload?, priority?}` — and an
-/// optional `"edges"` array — each element `{from, to, type?}` where `from` /
-/// `to` are 0-based indices into the just-created actions array. Every string
-/// field of an action spec (`kind`, `title`, and string values inside
-/// `payload`) has its `{{name}}` placeholders substituted from `arguments`.
-/// Returns the created action ids in template order.
-///
-/// Every parse step is a graceful `Err(String)` — a malformed template never
-/// panics; the caller records the run as `Failed` with the returned message.
-fn materialize_template(
-    conn: &rusqlite::Connection,
-    routine: &Routine,
-    arguments: &serde_json::Map<String, Value>,
-    now: i64,
-) -> Result<Vec<String>, String> {
-    let template = routine
-        .template
-        .as_object()
-        .ok_or_else(|| "routine template must be a JSON object".to_string())?;
-
-    // #3010 — REJECT unknown top-level template keys instead of silently
-    // dropping them. `materialize_template` recognizes only `actions` + `edges`;
-    // pre-fix a template of `{steps:[...]}` materialized ZERO actions yet the run
-    // still reported `state:completed, error:null` (indistinguishable from a run
-    // that did its job — the #2444 shape), and `{actions,edges,UNKNOWN_KEY}`
-    // dropped UNKNOWN_KEY. The check runs BEFORE any action is inserted so an
-    // unrecognized-key template is an ATOMIC reject (no partial materialisation),
-    // recorded as a Failed run by the caller.
-    const RECOGNIZED_KEYS: [&str; 2] = ["actions", "edges"];
-    for key in template.keys() {
-        if !RECOGNIZED_KEYS.contains(&key.as_str()) {
-            return Err(format!(
-                "unrecognized template key '{key}' (recognized keys: actions, edges)"
-            ));
-        }
-    }
-
-    // #3191 F-3 — materialise every action + edge inside ONE transaction so a
-    // rejected edge (self-edge / cycle / out-of-range index / malformed spec)
-    // or any mid-loop failure rolls the WHOLE materialisation back. Pre-fix the
-    // per-action `crate::actions::create` calls each auto-committed, so a
-    // template whose LATER edges were rejected left the EARLIER actions inserted
-    // and ORPHANED in the frontier while the run was recorded Failed — first-
-    // class coordination rows with no routine run owning them. Every `return
-    // Err(..)`/`?` below drops `tx` and rolls the inserts back; success commits.
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    let mut created_ids: Vec<String> = Vec::new();
-
-    if let Some(actions_val) = template.get("actions") {
-        let actions = actions_val
-            .as_array()
-            .ok_or_else(|| "template `actions` must be an array".to_string())?;
-        for (i, spec) in actions.iter().enumerate() {
-            let spec_obj = spec
-                .as_object()
-                .ok_or_else(|| format!("template action [{i}] must be an object"))?;
-            let kind_raw = spec_obj
-                .get("kind")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("template action [{i}] is missing a string `kind`"))?;
-            let title_raw = spec_obj
-                .get("title")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("template action [{i}] is missing a string `title`"))?;
-            // Substitute placeholders in the string fields + the payload.
-            let kind =
-                match substitute_placeholders(&Value::String(kind_raw.to_string()), arguments) {
-                    Value::String(s) => s,
-                    _ => kind_raw.to_string(),
-                };
-            let title =
-                match substitute_placeholders(&Value::String(title_raw.to_string()), arguments) {
-                    Value::String(s) => s,
-                    _ => title_raw.to_string(),
-                };
-            let payload = spec_obj
-                .get("payload")
-                .map_or_else(|| json!({}), |p| substitute_placeholders(p, arguments));
-            let priority = spec_obj
-                .get("priority")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-
-            let action = Action {
-                id: uuid::Uuid::new_v4().to_string(),
-                namespace: routine.namespace.clone(),
-                kind,
-                state: ActionState::Pending,
-                title,
-                payload,
-                priority,
-                agent_id: Some(routine.created_by.clone()),
-                claimed_by: None,
-                vector_clock: json!({}),
-                metadata: json!({}),
-                created_at: now,
-                updated_at: now,
-            };
-            crate::actions::create(&tx, &action).map_err(|e| e.to_string())?;
-            created_ids.push(action.id);
-        }
-    }
-
-    if let Some(edges_val) = template.get("edges") {
-        let edges = edges_val
-            .as_array()
-            .ok_or_else(|| "template `edges` must be an array".to_string())?;
-        for (i, spec) in edges.iter().enumerate() {
-            let spec_obj = spec
-                .as_object()
-                .ok_or_else(|| format!("template edge [{i}] must be an object"))?;
-            let from_idx = spec_obj
-                .get("from")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| format!("template edge [{i}] needs a numeric `from` index"))?;
-            let to_idx = spec_obj
-                .get("to")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| format!("template edge [{i}] needs a numeric `to` index"))?;
-            let from_id = created_ids
-                .get(usize::try_from(from_idx).unwrap_or(usize::MAX))
-                .ok_or_else(|| {
-                    format!("template edge [{i}] `from` index {from_idx} out of range")
-                })?;
-            let to_id = created_ids
-                .get(usize::try_from(to_idx).unwrap_or(usize::MAX))
-                .ok_or_else(|| format!("template edge [{i}] `to` index {to_idx} out of range"))?;
-            let edge_type = spec_obj
-                .get("type")
-                .and_then(Value::as_str)
-                .and_then(EdgeType::from_str)
-                .unwrap_or(EdgeType::Sibling);
-            // #3008 — a self-edge / ordering-cycle template edge fails the run
-            // (recorded Failed by the caller) rather than silently wedging the
-            // materialised frontier.
-            match crate::actions::add_edge(&tx, from_id, to_id, edge_type, now)
-                .map_err(|e| e.to_string())?
-            {
-                crate::actions::AddEdgeOutcome::SelfEdge => {
-                    return Err(format!("template edge [{i}] is a self-edge (from == to)"));
-                }
-                crate::actions::AddEdgeOutcome::WouldCycle => {
-                    return Err(format!(
-                        "template edge [{i}] would close a cycle in the action ordering DAG"
-                    ));
-                }
-                crate::actions::AddEdgeOutcome::Added => {}
-            }
-        }
-    }
-
-    // #3010 — a run that materialised ZERO actions is a distinct outcome, NOT
-    // silent success: a frozen, daemon-signed routine that produces nothing is
-    // indistinguishable from one that did its job. Surface it as a Failed run
-    // (the caller records the returned error) so `created_action_ids:[]` +
-    // `state:completed, error:null` can no longer coexist.
-    //
-    // NOTE (#3010 idempotency, DEFERRED): re-running the same routine with the
-    // same arguments materialises a fresh set of actions each time (non-
-    // idempotent), so a timeout-retry duplicates work. A run-key primitive is a
-    // design call left out of this change per the issue.
-    if created_ids.is_empty() {
-        // Dropping `tx` here rolls back — nothing to commit for a zero-action run.
-        return Err(
-            "routine template materialised zero actions (no `actions` entries)".to_string(),
-        );
-    }
-
-    // #3191 F-3 — all actions + edges materialised without a rejection; commit
-    // the whole set atomically.
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(created_ids)
-}
-
 /// MCP handler for `memory_routine_run`. Materialises a FROZEN routine under a
 /// concrete argument binding into first-class action (+ edge) rows, recording
 /// the created action ids on a `routine_runs` row.
@@ -412,16 +194,16 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         .ok_or_else(|| "routine_id is required".to_string())?;
     let arguments = params
         .get(param_names::ARGUMENTS)
-        .and_then(Value::as_object)
-        .ok_or_else(|| "arguments is required (a JSON object of {{param}} -> value)".to_string())?
-        .clone();
+        .filter(|v| v.is_object())
+        .ok_or_else(|| "arguments is required (a JSON object of {{param}} -> value)".to_string())?;
+    crate::coordination_guard::require_payload_size(param_names::ARGUMENTS, arguments)?;
 
     // (1) Load the routine; it must exist AND be frozen before a run.
     let routine = crate::routines::routine_get(conn, routine_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("routine not found: {routine_id}"))?;
     if routine.state != RoutineState::Frozen {
-        return Err("routine must be frozen before it can be run".to_string());
+        return Err(crate::routines::ROUTINE_NOT_FROZEN.to_string());
     }
 
     // (2) Insert the run row in the Running state before materialising.
@@ -430,7 +212,7 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         id: uuid::Uuid::new_v4().to_string(),
         routine_id: routine_id.to_string(),
         namespace: routine.namespace.clone(),
-        arguments: Value::Object(arguments.clone()),
+        arguments: arguments.clone(),
         state: RoutineRunState::Running,
         created_action_ids: json!([]),
         started_at: now,
@@ -454,7 +236,7 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
 
     // (3) Materialise the template — a SINGLE match folds the success /
     // failure paths so the failed run is always recorded, never lost.
-    match materialize_template(conn, &routine, &arguments, now) {
+    match crate::routines::materialization::materialize_template(conn, &routine, arguments, now) {
         Err(err) => {
             let failed = crate::routines::run_set_state(
                 conn,
@@ -803,6 +585,45 @@ mod handler_tests {
 
     fn fresh() -> rusqlite::Connection {
         crate::storage::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    #[test]
+    fn run_guard_failures_are_atomic_and_arguments_are_bounded_3359() {
+        let conn = fresh();
+        let created = handle_routine_create(
+            &conn,
+            &json!({
+                "namespace": "routine3359", "name": "guards", "created_by": "routine3359",
+                "template": {"actions": [
+                    {"kind": "work", "title": "first"},
+                    {"kind": "work", "title": "{{title}}"}
+                ]}
+            }),
+        )
+        .expect("create");
+        let id = created["id"].as_str().expect("id");
+        handle_routine_freeze(&conn, &json!({"id": id}), None).expect("freeze");
+        let error = handle_routine_run(
+            &conn,
+            &json!({"routine_id": id, "arguments": {"title": "x".repeat(65_536)}}),
+        )
+        .expect_err("arguments cap");
+        assert!(error.contains("arguments exceeds"), "{error}");
+        let failed = handle_routine_run(
+            &conn,
+            &json!({"routine_id": id, "arguments": {"title": ""}}),
+        )
+        .expect("failed run recorded");
+        assert_eq!(failed["run"]["state"], "failed");
+        assert_eq!(failed["run"]["created_action_ids"], json!([]));
+        let counts: (i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM actions), (SELECT coalesce(sum(current_storage_bytes),0) FROM agent_quotas)", [], |row| Ok((row.get(0)?, row.get(1)?))).expect("counts");
+        assert_eq!(counts, (0, 0));
+        let allowed = handle_routine_run(
+            &conn,
+            &json!({"routine_id": id, "arguments": {"title": "second"}}),
+        )
+        .expect("run");
+        assert_eq!(allowed["run"]["state"], "completed");
     }
 
     /// Create -> freeze (unsigned) -> run with arguments {{what}} -> assert the
