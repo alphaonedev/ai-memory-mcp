@@ -84,24 +84,29 @@ pub const MAX_TOPIC_BYTES: usize = 64;
 pub const MAX_TOPICS_PER_SESSION: usize = 32;
 
 /// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
-/// hard ceiling on the PROVEN readable-namespace set the derived allowlist
+/// hard ceiling on the PROVEN readable-PREFIX set the derived allowlist
 /// snapshot carries for ONE agent.
 ///
-/// Tied to [`MAX_TOPICS_PER_SESSION`] on purpose: a session can never hold
-/// more subscriptions than that, so carrying more proven namespaces than a
-/// session could ever use buys nothing and only grows the snapshot every hello
-/// re-reads. The exporter REFUSES to publish a set larger than this rather
-/// than truncating one — a truncation would be silent, and which of an
-/// agent's namespaces survived would then depend on ordering, which is exactly
-/// the property #3504 refused to accept for "which key is trusted".
-pub const MAX_READABLE_NAMESPACES: usize = MAX_TOPICS_PER_SESSION;
+/// DEFINED as `crate::visibility::NAMESPACE_READ_SCOPE_DEPTH`, not merely
+/// equal to it: the snapshot carries the store's own #1921 `team` / `unit` /
+/// `org` prefixes, so the hub's ceiling and the derivation are ONE number and
+/// cannot drift into a hub that refuses a set the store considers legitimate.
+///
+/// It is a ceiling on PREFIXES, deliberately not on expanded namespaces. An
+/// exact list would grow with the CORPUS — an org-level agent over a few
+/// hundred namespaces would exceed any fixed cap, and refusing the export then
+/// publishes NOTHING, which after the snapshot TTL makes the hub refuse every
+/// hello: a fleet-wide availability failure caused by the corpus growing. The
+/// prefix set is a property of the agent's own id, so it is O(1) forever.
+pub const MAX_READABLE_PREFIXES: usize = crate::visibility::NAMESPACE_READ_SCOPE_DEPTH;
 
-/// v1.0.0 #3505 — longest namespace a proven-read entry may carry, in bytes.
+/// v1.0.0 #3505 — longest prefix a proven-read entry may carry, in bytes.
 ///
 /// A topic is `#` + the namespace and is itself bounded by
-/// [`MAX_TOPIC_BYTES`], so a longer namespace could never be subscribed to;
-/// carrying one would be dead weight the hub must still parse.
-pub const MAX_READABLE_NAMESPACE_BYTES: usize = MAX_TOPIC_BYTES - 1;
+/// [`MAX_TOPIC_BYTES`]; a prefix longer than that could only ever admit
+/// namespaces no session could subscribe to, so carrying one would be dead
+/// weight the hub must still parse on every hello.
+pub const MAX_READABLE_PREFIX_BYTES: usize = MAX_TOPIC_BYTES - 1;
 
 /// Length of the hub-issued handshake nonce, in bytes.
 pub const HELLO_NONCE_BYTES: usize = 32;

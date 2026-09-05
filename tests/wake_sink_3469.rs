@@ -584,7 +584,7 @@ fn recipient_row(
         // #3505 — a wake RECIPIENT needs no namespace topic: the sink
         // addresses wakes DIRECTLY to the agent, so own-inbox stays the whole
         // proof this row carries.
-        readable_namespaces: Vec::new(),
+        readable_prefixes: Vec::new(),
     }
 }
 

@@ -268,6 +268,17 @@ pub fn namespace_subtree_contains(prefix: &str, namespace: &str) -> bool {
 }
 
 /// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// how many #1921 ancestor prefixes a namespace read scope spans:
+/// `team`, `unit`, `org`.
+///
+/// Named because two places must agree on it and neither may guess: this
+/// derivation, and the wake-hub snapshot ceiling
+/// (`crate::wake_hub::limits::MAX_READABLE_PREFIXES`, which is DEFINED as this
+/// const). A hub bound that could disagree with the derivation would refuse a
+/// set the store itself considers legitimate.
+pub const NAMESPACE_READ_SCOPE_DEPTH: usize = 3;
+
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
 /// the #1921 `team` / `unit` / `org` prefixes `caller` reads at.
 ///
 /// EXACTLY `crate::storage::compute_visibility_prefixes` indices 1, 2 and 3 —
@@ -276,12 +287,16 @@ pub fn namespace_subtree_contains(prefix: &str, namespace: &str) -> bool {
 /// position is `private`, which is OWNER-keyed (#1720), not namespace-keyed,
 /// so it proves nothing about a namespace AS A WHOLE. A caller id with no `/`
 /// yields an EMPTY set, which is the fail-closed answer.
+///
+/// At most [`NAMESPACE_READ_SCOPE_DEPTH`] entries, ALWAYS — the set is a
+/// property of the caller's own id, never of how many namespaces the corpus
+/// happens to hold, so deriving it is O(1) and can never grow with the store.
 #[must_use]
 pub fn namespace_read_scope_prefixes(caller: &str) -> Vec<String> {
     crate::models::namespace_ancestors(caller)
         .into_iter()
         .skip(1)
-        .take(3)
+        .take(NAMESPACE_READ_SCOPE_DEPTH)
         .filter(|prefix| !prefix.is_empty())
         .collect()
 }

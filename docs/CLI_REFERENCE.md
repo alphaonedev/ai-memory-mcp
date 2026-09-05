@@ -1609,24 +1609,28 @@ The published JSON reports how much topic authority the snapshot grants:
 
 ```json
 {"allowlist":"/run/ai-memory/hub-allow.json","agents":3,"refreshed_at":"…",
- "max_age_secs":60,"readable_namespaces":7,"max_readable_namespaces_per_agent":32}
+ "max_age_secs":60,"readable_prefixes":7,"max_readable_prefixes_per_agent":3}
 ```
 
-`readable_namespaces` is the TOTAL across every published agent of the
-namespaces the export proved each one reads
+`readable_prefixes` is the TOTAL across every published agent of the read
+PREFIXES the export proved each one holds
 ([#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505)) — the
-namespace topics those agents may subscribe to on the hub, on top of their
-always-permitted own inbox. The per-agent sets live inside the 0600 file; the
-total is here so a widening (or a narrowing) is visible in the same line that
-reports the publish, without opening the snapshot. The set is derived from the
-store's own namespace read scope — the #1921 team / unit / org subtree the
-agent's id sits in, with #3348 substrate namespaces excluded — and is bounded
-per agent by `max_readable_namespaces_per_agent`. An agent over that ceiling
-REFUSES the export by name rather than publishing a truncated set, because
-which of its namespaces survived a truncation would depend on ordering; narrow
-that agent's scope or drop it from `--include-agent`. An agent id with no `/`
-has no team / unit / org ancestor, so it proves no namespace read scope and
-this total stays `0` for it.
+namespace topics those agents may subscribe to, and address a wake to, on the
+hub, on top of their always-permitted own inbox. The per-agent sets live inside
+the 0600 file; the total is here so a widening (or a narrowing) is visible in
+the same line that reports the publish, without opening the snapshot.
+
+The set is the store's own #1921 read scope for that agent: the team / unit /
+org ancestors of its id, at most `max_readable_prefixes_per_agent` of them. The
+hub then admits a namespace when the store's own subtree containment test
+places it inside one carried prefix and it is not a #3348 substrate namespace.
+Because the set is derived from the agent's ID, this export issues NO
+corpus-wide namespace scan and its size never grows with the store — which is
+what keeps a 30-second refresher cheap, and what stops an org-level agent in a
+large corpus from becoming unexportable (an export that refuses publishes
+nothing, and once the snapshot ages out the hub refuses every hello). An agent
+id with no `/` has no team / unit / org ancestor, so it proves no namespace
+read scope and this total stays `0` for it.
 
 Repeat `--include-agent` for each permitted principal. It is deliberately
 **not** named `--agent-id` ([#3508](https://github.com/alphaonedev/ai-memory-mcp/issues/3508)):

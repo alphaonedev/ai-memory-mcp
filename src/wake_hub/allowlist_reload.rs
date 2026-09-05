@@ -236,13 +236,13 @@ impl RootKeyResolver for ReloadingAllowlist {
         self.snapshot()?.check_delegate(agent_id, key, issued)
     }
 
-    fn readable_namespaces(&self, agent_id: &str) -> Result<Vec<String>, DenyReason> {
+    fn readable_prefixes(&self, agent_id: &str) -> Result<Vec<String>, DenyReason> {
         // #3505 — served from the SAME snapshot every other identity answer
         // comes from, so the permission gate and the age gate run on this call
         // too. A widened, replaced, expired or removed snapshot narrows the
-        // proven set on the very next revalidation, exactly as it narrows the
-        // enrolled root.
-        self.snapshot()?.readable_namespaces(agent_id)
+        // proven prefixes on the very next revalidation, exactly as it narrows
+        // the enrolled root.
+        self.snapshot()?.readable_prefixes(agent_id)
     }
 }
 

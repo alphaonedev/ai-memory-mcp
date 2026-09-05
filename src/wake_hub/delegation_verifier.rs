@@ -41,17 +41,22 @@
 //!
 //! 1. `#_inbox/<agent-id>` for the authenticated principal — the
 //!    unconditional own-inbox proof #3468 shipped, unchanged.
-//! 2. `#<namespace>` for a namespace the CURRENT snapshot PROVES the
-//!    principal reads, by EXACT match against
-//!    [`AllowlistEntry::readable_namespaces`].
+//! 2. `#<namespace>` for a namespace covered by one of the exporter-proven
+//!    read PREFIXES the snapshot carries for the principal
+//!    ([`AllowlistEntry::readable_prefixes`]).
 //!
-//! The proof is derived out of band by the exporter, from the SAME predicate
-//! the store applies for namespace read scope
-//! ([`crate::visibility::namespace_read_scope_admits`]: #1921 subtree scopes,
-//! #3348 substrate exclusions), and carried in the public snapshot. The hub
-//! therefore still opens NO database at verify time, and it never infers a
-//! prefix — the derivation already expanded the subtree, so a topic is
-//! admitted only if the exporter named that exact namespace.
+//! The prefixes are derived out of band by the exporter from the caller's own
+//! id ([`crate::visibility::namespace_read_scope_prefixes`]: the #1921
+//! `team` / `unit` / `org` ancestors), and the hub applies the STORE'S OWN
+//! containment test to them ([`crate::visibility::namespace_subtree_contains`])
+//! plus the #3348 substrate exclusion. Both halves are the shared predicate the
+//! store uses, so nothing re-widens: `acme/eng` never admits
+//! `acme/engineering`, and a substrate namespace is never admitted at all.
+//!
+//! The hub therefore still opens NO database at verify time, and the snapshot
+//! stays O(1) in the agent's id rather than O(corpus) in its namespaces — an
+//! exact expanded list would grow with the corpus and make a large-scope agent
+//! unexportable, which after the snapshot TTL is a fleet-wide hello refusal.
 
 use std::collections::HashMap;
 
@@ -219,9 +224,9 @@ pub trait RootKeyResolver: Send + Sync + 'static {
         Ok(())
     }
 
-    /// v1.0.0 #3505 — the namespaces the CURRENT snapshot proves `agent_id`
-    /// may read, as an EXACT set (the derivation already expanded the #1921
-    /// subtree, so the hub never infers a prefix).
+    /// v1.0.0 #3505 — the #1921 read PREFIXES the CURRENT snapshot proves
+    /// `agent_id` holds. A namespace is admitted when the store's own subtree
+    /// containment test places it inside one of them.
     ///
     /// The default is the EMPTY set, which means own-inbox only. A resolver
     /// that cannot answer therefore narrows rather than widens — an
@@ -230,7 +235,7 @@ pub trait RootKeyResolver: Send + Sync + 'static {
     ///
     /// # Errors
     /// Refuses a lookup fault. A fault is a refusal, never a default set.
-    fn readable_namespaces(&self, _agent_id: &str) -> Result<Vec<String>, DenyReason> {
+    fn readable_prefixes(&self, _agent_id: &str) -> Result<Vec<String>, DenyReason> {
         Ok(Vec::new())
     }
 }
@@ -300,13 +305,13 @@ impl RootKeyResolver for AllowlistCache {
         Ok(())
     }
 
-    fn readable_namespaces(&self, agent_id: &str) -> Result<Vec<String>, DenyReason> {
+    fn readable_prefixes(&self, agent_id: &str) -> Result<Vec<String>, DenyReason> {
         // An agent with no snapshot row has proved no namespace read scope, so
         // the answer is the empty set — own-inbox only, the narrowest posture.
         Ok(self
             .entries
             .get(agent_id)
-            .map(|entry| entry.readable_namespaces.clone())
+            .map(|entry| entry.readable_prefixes.clone())
             .unwrap_or_default())
     }
 }
@@ -442,9 +447,10 @@ impl<R: RootKeyResolver> HelloVerifier for ScopedDelegationVerifier<R> {
         }
 
         // v1.0.0 #3505 — anything else must be a namespace the CURRENT
-        // snapshot proves this principal reads. The set is resolved ONCE, from
-        // the snapshot the hub already holds; the hub opens no database.
-        let proven = self.resolver.readable_namespaces(agent_id)?;
+        // snapshot proves this principal reads. The prefixes are resolved
+        // ONCE, from the snapshot the hub already holds; the hub opens no
+        // database.
+        let proven = self.resolver.readable_prefixes(agent_id)?;
         for topic in topics {
             if *topic == own_inbox {
                 continue;
@@ -461,10 +467,15 @@ impl<R: RootKeyResolver> HelloVerifier for ScopedDelegationVerifier<R> {
             if crate::visibility::is_substrate_namespace(namespace) {
                 return Err(DenyReason::TopicsRefused);
             }
-            // EXACT match only. The derivation already expanded the #1921
-            // subtree, so the hub never infers a prefix — a prefix rule here
-            // would silently re-widen every scope the exporter narrowed.
-            if !proven.iter().any(|admitted| admitted == namespace) {
+            // The STORE'S OWN containment test, reused verbatim — never a
+            // second copy and never a bare `starts_with`, which would widen
+            // `acme/eng` to `acme/engineering`. A namespace is admitted iff it
+            // IS a proven prefix or is nested under one, exactly as the
+            // #1921 subtree scope reads it in `crate::storage`.
+            if !proven
+                .iter()
+                .any(|prefix| crate::visibility::namespace_subtree_contains(prefix, namespace))
+            {
                 return Err(DenyReason::TopicsRefused);
             }
         }
@@ -917,14 +928,22 @@ pub struct AllowlistEntry {
     #[serde(default)]
     pub revoked_keys: Vec<String>,
     /// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505)
-    /// — the namespaces the exporter PROVED this agent may read, expanded from
-    /// the store's own #1921 subtree scopes with #3348 substrate namespaces
-    /// excluded ([`crate::visibility::namespace_read_scope_admits`]).
+    /// — the read PREFIXES the exporter PROVED this agent holds: the store's
+    /// own #1921 `team` / `unit` / `org` ancestors of the agent's id
+    /// ([`crate::visibility::namespace_read_scope_prefixes`]).
     ///
-    /// Carried in the snapshot so the hub can admit a namespace topic with NO
-    /// store lookup — the hub still never opens a database. Bounded by
-    /// [`super::limits::MAX_READABLE_NAMESPACES`]; a snapshot that exceeds it
-    /// is REFUSED whole.
+    /// Entries are PREFIXES, not exact namespaces. The hub admits `#<ns>` when
+    /// [`crate::visibility::namespace_subtree_contains`] — the store's own
+    /// containment test — places `<ns>` inside one of them AND `<ns>` is not a
+    /// #3348 substrate namespace. Carrying prefixes rather than an expanded
+    /// list is what keeps the snapshot O(1) in the agent's id instead of
+    /// O(corpus): an expanded list would grow without bound as namespaces are
+    /// created, and refusing an oversize export would publish NOTHING, which
+    /// after the snapshot TTL makes the hub refuse every hello.
+    ///
+    /// Bounded by [`super::limits::MAX_READABLE_PREFIXES`]; a snapshot that
+    /// exceeds it is REFUSED whole (the exporter can never produce one, so an
+    /// oversize set is evidence the file is not what it claims to be).
     ///
     /// An entry that OMITS the field defaults to EMPTY, which means
     /// own-inbox-only — the pre-#3505 posture. That default is the whole
@@ -932,52 +951,56 @@ pub struct AllowlistEntry {
     /// narrows to what the older exporter could prove, and never widens to
     /// "everything".
     #[serde(default)]
-    pub readable_namespaces: Vec<String>,
+    pub readable_prefixes: Vec<String>,
 }
 
 fn legacy_unproven() -> String {
     "legacy_unproven".to_string()
 }
 
-/// v1.0.0 #3505 — bound and sanity-check one entry's proven-read set at LOAD.
+/// v1.0.0 #3505 — bound and sanity-check one entry's proven-read prefixes at
+/// LOAD.
 ///
 /// The hub refuses the WHOLE snapshot rather than dropping the offending
-/// namespaces: a snapshot the exporter could not have produced is evidence
+/// prefixes: a snapshot the exporter could not have produced is evidence
 /// something else is wrong with it, and silently serving the rest would make
 /// which namespaces an agent may subscribe to depend on what a partial parse
 /// happened to keep.
 ///
 /// # Errors
-/// Refuses an oversize set, an empty or over-long namespace, one carrying a
-/// control character, and a substrate namespace (#3348 — the own-inbox proof
-/// is the verifier's own unconditional arm and is never carried here).
-fn check_readable_namespaces(entry: &AllowlistEntry) -> anyhow::Result<()> {
+/// Refuses an oversize set, an empty or over-long prefix, one carrying a
+/// control character, and a substrate prefix (#3348 — the own-inbox proof is
+/// the verifier's own unconditional arm and is never carried here).
+fn check_readable_prefixes(entry: &AllowlistEntry) -> anyhow::Result<()> {
     use anyhow::bail;
-    if entry.readable_namespaces.len() > super::limits::MAX_READABLE_NAMESPACES {
+    if entry.readable_prefixes.len() > super::limits::MAX_READABLE_PREFIXES {
         bail!(
-            "wake-hub: agent {} carries {} readable namespaces; the ceiling is {}",
+            "wake-hub: agent {} carries {} readable prefixes; the ceiling is {}",
             entry.agent_id,
-            entry.readable_namespaces.len(),
-            super::limits::MAX_READABLE_NAMESPACES
+            entry.readable_prefixes.len(),
+            super::limits::MAX_READABLE_PREFIXES
         );
     }
-    for namespace in &entry.readable_namespaces {
-        if namespace.is_empty() || namespace.len() > super::limits::MAX_READABLE_NAMESPACE_BYTES {
+    for prefix in &entry.readable_prefixes {
+        if prefix.is_empty() || prefix.len() > super::limits::MAX_READABLE_PREFIX_BYTES {
             bail!(
-                "wake-hub: agent {} carries a readable namespace outside 1..={} bytes",
+                "wake-hub: agent {} carries a readable prefix outside 1..={} bytes",
                 entry.agent_id,
-                super::limits::MAX_READABLE_NAMESPACE_BYTES
+                super::limits::MAX_READABLE_PREFIX_BYTES
             );
         }
-        if namespace.chars().any(char::is_control) {
+        if prefix.chars().any(char::is_control) {
             bail!(
-                "wake-hub: agent {} carries a readable namespace with a control character",
+                "wake-hub: agent {} carries a readable prefix with a control character",
                 entry.agent_id
             );
         }
-        if crate::visibility::is_substrate_namespace(namespace) {
+        // A substrate PREFIX would place every substrate namespace under it,
+        // handing over `#_inbox/<someone-else>` wholesale. The own-inbox proof
+        // is the verifier's own unconditional arm and is never carried here.
+        if crate::visibility::is_substrate_namespace(prefix) {
             bail!(
-                "wake-hub: agent {} carries the SUBSTRATE namespace {namespace}; substrate rows \
+                "wake-hub: agent {} carries the SUBSTRATE prefix {prefix}; substrate rows \
                  are reachable only by naming them, and the own-inbox proof is the verifier's \
                  own arm",
                 entry.agent_id
@@ -1008,7 +1031,7 @@ pub struct AllowlistFile {
 ///
 /// # Why #3505 did NOT bump this
 ///
-/// [`AllowlistEntry::readable_namespaces`] is an ADDITIVE field with a
+/// [`AllowlistEntry::readable_prefixes`] is an ADDITIVE field with a
 /// `#[serde(default)]` empty value, and both mismatch directions already fail
 /// in the required direction without a bump:
 ///
@@ -1195,7 +1218,7 @@ impl AllowlistCache {
             if chrono::DateTime::parse_from_rfc3339(&entry.bound_at)? > refreshed {
                 bail!("wake-hub: root was bound after the cache snapshot");
             }
-            check_readable_namespaces(&entry)?;
+            check_readable_prefixes(&entry)?;
             cache.entries.insert(entry.agent_id.clone(), entry.clone());
             cache.insert(
                 &entry.agent_id,

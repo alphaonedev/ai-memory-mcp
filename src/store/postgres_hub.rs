@@ -17,19 +17,11 @@ impl PostgresStore {
     /// Any source lookup failure prevents cache publication.
     pub async fn derive_hub_cache(&self, agents: &[String]) -> Result<AllowlistFile> {
         let now = chrono::Utc::now().to_rfc3339();
-        // #3505 — the SAME derivation the sqlite exporter runs: enumerate live
-        // namespaces once, then filter each agent's set through the shared
-        // `crate::visibility::namespace_read_scope_admits` predicate. Two
-        // backends, one predicate — the #951 rule.
-        let namespaces: Vec<String> = if crate::identity::hub_cache::namespace_scan_needed(agents) {
-            self.list_namespaces()
-                .await?
-                .into_iter()
-                .map(|row| row.namespace)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // #3505 — the SAME derivation the sqlite exporter runs: the agent's own
+        // #1921 team / unit / org prefixes, through the shared
+        // `crate::visibility::namespace_read_scope_prefixes`. Two backends, one
+        // predicate — the #951 rule — and NO corpus-wide namespace scan on
+        // either, so the 30 s refresher's cost does not grow with the store.
         let mut entries = Vec::with_capacity(agents.len());
         for agent in agents {
             crate::validate::validate_agent_id_shape(agent)?;
@@ -41,7 +33,7 @@ impl PostgresStore {
             let revoked: Vec<Vec<u8>> = sqlx::query_scalar(
                 "SELECT instance_key_id FROM agent_subkey_certs WHERE principal = $1 AND revoked = TRUE",
             ).bind(agent).fetch_all(self.pool()).await?;
-            let readable = crate::identity::hub_cache::readable_namespaces_for(agent, &namespaces)?;
+            let readable = crate::identity::hub_cache::readable_prefixes_for(agent);
             entries.push(crate::identity::hub_cache::entry(
                 agent,
                 &history,

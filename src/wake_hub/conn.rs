@@ -480,6 +480,63 @@ impl Conn {
             return self.send_error(ErrorCode::UnknownDestination, "empty destination");
         }
 
+        // v1.0.0 #3505 — SEND gate on NAMESPACE-topic wakes.
+        //
+        // Subscribe was never the only door onto a topic. Before this lane
+        // nobody could SUBSCRIBE to `#<namespace>`, so an ungated
+        // topic-addressed SEND fanned out to nobody and cost nothing. Now that
+        // a proven namespace is subscribable, an ungated send would let ANY
+        // authenticated peer — outside the subtree, or carrying no proven
+        // prefixes at all — publish fabricated hints (row id, sender, digest)
+        // to every subscriber of a team namespace, forcing catch-up reads
+        // fleet-wide while paying only its own token bucket.
+        //
+        // The gate is the SAME proof the subscription takes, so a sender may
+        // address exactly the namespace topics it could itself subscribe to.
+        // Consequently the reserved `wake-hub-producer` — a flat id carrying
+        // an EMPTY prefix set by design (#3469) — cannot publish to a
+        // namespace topic at all, and an out-of-scope send is refused rather
+        // than silently delivered to nobody, so the sender learns its scope
+        // instead of guessing.
+        //
+        // SCOPE: a SUBSTRATE topic (`#_inbox/<agent>` and the rest of #3348)
+        // is deliberately NOT gated here, and that is not a hole. It is the
+        // pre-#3505 own-inbox addressing, and it is ADDRESS-EQUIVALENT to the
+        // direct `to = <agent-id>` wake, which is ungated and always has been:
+        // the ONLY substrate subscription the verifier ever grants is a
+        // principal's own inbox, so such a topic has at most ONE subscriber
+        // and there is no fan-out amplification to charge. Gating it would
+        // refuse one spelling of a wake while leaving the identical direct
+        // spelling open — no security gained, and every peer-to-peer inbox
+        // wake broken. The authority #3505 CREATED is the namespace topic, and
+        // that is exactly what this gate covers.
+        //
+        // `Forbidden`, not `Unauthorized`: this is one refused frame on an
+        // otherwise valid session (`send_error` keeps the connection open for
+        // `Forbidden` and closes it for `Unauthorized`), and closing a
+        // producer's session over one mis-addressed wake would convert an
+        // authorization refusal into a reconnect storm.
+        if let Some(namespace) = frame.to.strip_prefix('#')
+            && !crate::visibility::is_substrate_namespace(namespace)
+            && let Err(reason) = self
+                .state
+                .deps
+                .verifier
+                .verify_topics(&agent.agent_id, std::slice::from_ref(&frame.to))
+        {
+            self.state.metrics.denied_forged_from();
+            tracing::debug!(
+                agent = %agent.agent_id,
+                topic = %frame.to,
+                reason = ?reason,
+                "wake-hub: refused a topic wake outside the sender's proven scope"
+            );
+            return self.send_error(
+                ErrorCode::Forbidden,
+                "topic outside the sender's proven read scope",
+            );
+        }
+
         let recipients = if frame.to_is_topic() {
             self.state
                 .router

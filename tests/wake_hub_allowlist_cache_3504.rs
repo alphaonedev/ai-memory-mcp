@@ -80,7 +80,7 @@ fn publish_snapshot(path: &Path, key: &SigningKey, age_secs: i64) {
             revoked_keys: Vec::new(),
             // #3505 — this suite's agent proves no namespace read scope, so
             // its topics stay own-inbox only exactly as before.
-            readable_namespaces: Vec::new(),
+            readable_prefixes: Vec::new(),
         }],
     };
     hub_cache::publish(path, &file).expect("publish");

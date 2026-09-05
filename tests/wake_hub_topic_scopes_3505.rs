@@ -10,19 +10,24 @@
 //! security argument rests on two halves that this suite proves separately:
 //!
 //! * The **derivation** half. The exporter decides what "provably reads" means
-//!   by reusing the store's own namespace read scope
-//!   (`crate::visibility::namespace_read_scope_admits`: #1921 subtree scopes,
-//!   #3348 substrate exclusions). Both backends must agree, because the
-//!   postgres exporter is a SECOND implementation of the same export — so
-//!   "the snapshot names exactly the readable namespaces" is proved twice.
-//! * The **verification** half. The hub matches the carried set EXACTLY, over
-//!   a real socket, with no store lookup — and, load-bearing, it re-checks
-//!   EVERY live subscription once a second, so narrowing the snapshot drops a
-//!   subscription that is already open.
+//!   by reusing the store's own #1921 read scope
+//!   (`crate::visibility::namespace_read_scope_prefixes`: the agent's team /
+//!   unit / org ancestors). Both backends must agree, because the postgres
+//!   exporter is a SECOND implementation of the same export — so "the snapshot
+//!   carries exactly the store's own prefixes" is proved twice. It carries
+//!   PREFIXES rather than an expanded namespace list precisely so the export
+//!   cannot grow with the corpus and eventually refuse to publish at all.
+//! * The **verification** half. The hub applies the store's OWN subtree
+//!   containment test to the carried prefixes, over a real socket, with no
+//!   store lookup — on SUBSCRIBE and on SEND, because a topic has two doors —
+//!   and, load-bearing, it re-checks EVERY live subscription once a second, so
+//!   narrowing the snapshot drops a subscription that is already open.
 //!
-//! The revalidation cell is the one that would be missing if this were only a
-//! unit suite: before #3505 a topic added by a later `subscribe` frame was
-//! never re-checked at all, so it could outlive the proof that admitted it.
+//! Two cells would be missing if this were only a unit suite: the revalidation
+//! one (before #3505 a topic added by a later `subscribe` frame was never
+//! re-checked at all, so it could outlive the proof that admitted it), and the
+//! SEND gate (an ungated topic send would let any authenticated peer publish
+//! fabricated hints to a whole team namespace it cannot read).
 
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 
@@ -42,7 +47,7 @@ use ai_memory::wake_hub::delegation_verifier::{
 };
 use ai_memory::wake_hub::frame::{ErrorCode, Kind};
 use ai_memory::wake_hub::identity::SameUidAuthorizer;
-use ai_memory::wake_hub::limits::MAX_READABLE_NAMESPACES;
+use ai_memory::wake_hub::limits::MAX_READABLE_PREFIXES;
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
@@ -64,6 +69,16 @@ const BOB: &str = "ai/acme/eng/team1/bob";
 const SHARED: &str = "ai/acme/eng/team1/shared";
 /// A namespace OUTSIDE every ancestor either of them holds.
 const FOREIGN: &str = "zz/other/secret";
+/// A third principal in a DIFFERENT tenant: authenticated, enrolled, and
+/// holding no read scope over `SHARED`. The send-gate cells need a peer that
+/// is legitimate at the identity layer and unproven at the topic layer,
+/// because that is the exact shape an ungated send would have handed a
+/// fleet-wide fan-out to.
+const CAROL: &str = "zz/other/team9/carol";
+/// A namespace inside CAROL's own subtree, so she is not a principal who
+/// simply proves nothing — her scope is real, and simply does not reach
+/// `SHARED`.
+const CAROL_NS: &str = "zz/other/team9/notes";
 
 fn root_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -103,7 +118,7 @@ fn row(agent: &str, root: &SigningKey, readable: &[&str]) -> AllowlistEntry {
         bind_authority: "possession_proof".to_owned(),
         bound_at: "2026-09-01T00:00:00Z".to_owned(),
         revoked_keys: Vec::new(),
-        readable_namespaces: readable.iter().map(|n| (*n).to_string()).collect(),
+        readable_prefixes: readable.iter().map(|n| (*n).to_string()).collect(),
     }
 }
 
@@ -169,9 +184,9 @@ async fn join(
 // Derivation — the snapshot names exactly what the store predicate admits
 // ---------------------------------------------------------------------------
 
-/// Every namespace the corpus holds, plus what each side of the predicate says
-/// about ALICE. Shared by the sqlite and postgres cells so the two backends
-/// are compared against ONE expectation, not two hand-written ones.
+/// Every namespace the corpus holds, and what the hub says about ALICE for
+/// each. Shared by the sqlite and postgres cells so the two backends are
+/// compared against ONE expectation, not two hand-written ones.
 fn corpus() -> Vec<&'static str> {
     vec![
         SHARED,                   // inside the team subtree -> ADMITTED
@@ -185,43 +200,77 @@ fn corpus() -> Vec<&'static str> {
     ]
 }
 
-fn expected_for_alice() -> Vec<String> {
+/// ALICE's #1921 `team` / `unit` / `org` ancestors, sorted — exactly what the
+/// exporter carries, and derived from her ID ALONE.
+fn expected_prefixes_for_alice() -> Vec<String> {
     let mut want = vec![
         "ai/acme".to_string(),
         "ai/acme/eng".to_string(),
-        "ai/acme/eng/bob".to_string(),
-        SHARED.to_string(),
+        "ai/acme/eng/team1".to_string(),
     ];
     want.sort();
     want
 }
 
-/// The pure predicate: what the exporter will emit, stated once.
+/// The pure derivation: what the exporter emits, stated once — and the
+/// admission verdict the hub then reaches for each corpus namespace, so the
+/// two halves of the proof are pinned against ONE table.
 #[test]
-fn the_proven_set_is_exactly_what_the_store_read_scope_admits_3505() {
-    let existing: Vec<String> = corpus().into_iter().map(ToString::to_string).collect();
-    let got = hub_cache::readable_namespaces_for(ALICE, &existing).expect("derive");
+fn the_proven_prefixes_are_the_store_read_scope_and_admit_exactly_it_3505() {
+    let got = hub_cache::readable_prefixes_for(ALICE);
     assert_eq!(
         got,
-        expected_for_alice(),
-        "the derivation must emit the #1921 subtree and nothing else"
+        expected_prefixes_for_alice(),
+        "the derivation must emit the #1921 team / unit / org ancestors and nothing else"
+    );
+    assert!(
+        got.len() <= MAX_READABLE_PREFIXES,
+        "the derivation is bounded BY CONSTRUCTION, never by a refusal"
     );
 
-    // DENIED, itemised, so a future widening names which rule it broke.
-    for denied in ["ai", FOREIGN, "_agents", "_inbox/ai/acme/eng/team1/bob"] {
-        assert!(
-            !got.iter().any(|n| n == denied),
-            "{denied} must never reach the snapshot"
-        );
+    // The hub's admission rule, applied to the same corpus the exporter used
+    // to be handed. ADMITTED entries are covered by a carried prefix; DENIED
+    // ones are not, and the two substrate rows are refused by the #3348 gate
+    // even though `_inbox/...` shares no prefix anyway.
+    let admits = |namespace: &str| {
+        !ai_memory::visibility::is_substrate_namespace(namespace)
+            && got
+                .iter()
+                .any(|prefix| ai_memory::visibility::namespace_subtree_contains(prefix, namespace))
+    };
+    for admitted in [SHARED, "ai/acme/eng/bob", "ai/acme/eng", "ai/acme"] {
+        assert!(admits(admitted), "{admitted} must be admitted");
     }
-    // And the substrate exclusion holds even for the agent's OWN inbox: the
-    // hub's own-inbox arm is the proof for that topic, never a carried row.
-    let own_inbox = format!("_inbox/{ALICE}");
+    for denied in ["ai", FOREIGN, "_agents", "_inbox/ai/acme/eng/bob"] {
+        assert!(!admits(denied), "{denied} must never be admitted");
+    }
+    // Containment is SEGMENT-WISE, never a bare string prefix: on its own,
+    // `ai/acme/eng` admits `ai/acme/eng/x` and refuses `ai/acme/engineering`.
+    // Asserted against the predicate directly, because ALICE also holds the
+    // BROADER `ai/acme` prefix, under which `ai/acme/engineering` legitimately
+    // IS in scope — testing it through her whole set would prove nothing.
+    assert!(ai_memory::visibility::namespace_subtree_contains(
+        "ai/acme/eng",
+        "ai/acme/eng/x"
+    ));
     assert!(
-        hub_cache::readable_namespaces_for(ALICE, std::slice::from_ref(&own_inbox))
-            .expect("derive")
+        !ai_memory::visibility::namespace_subtree_contains("ai/acme/eng", "ai/acme/engineering"),
+        "a bare starts_with would widen every scope to a sibling name"
+    );
+    // And the agent's OWN inbox is never carried: the hub's own-inbox arm is
+    // the proof for that topic.
+    assert!(!admits(&format!("_inbox/{ALICE}")), "#3348 stays excluded");
+}
+
+/// A FLAT agent id has no team / unit / org ancestor, so it proves nothing —
+/// which is what makes the reserved `wake-hub-producer` unable to address a
+/// namespace topic under the #3505 send gate.
+#[test]
+fn a_flat_agent_id_proves_no_namespace_scope_3505() {
+    assert!(
+        hub_cache::readable_prefixes_for(ai_memory::identity::sentinels::WAKE_HUB_PRODUCER)
             .is_empty(),
-        "#3348 substrate namespaces stay out of the carried set"
+        "the reserved producer holds no namespace read scope"
     );
 }
 
@@ -262,9 +311,31 @@ fn sqlite_derivation_carries_the_proven_set_into_the_snapshot_3505() {
     let snapshot = hub_cache::derive_sqlite(&conn, &[ALICE.to_owned()]).expect("derive");
     assert_eq!(snapshot.agents.len(), 1);
     assert_eq!(
-        snapshot.agents[0].readable_namespaces,
-        expected_for_alice(),
-        "the sqlite exporter must carry exactly the store-admitted set"
+        snapshot.agents[0].readable_prefixes,
+        expected_prefixes_for_alice(),
+        "the sqlite exporter must carry exactly the store's own prefixes"
+    );
+
+    // AVAILABILITY, the property the prefix form exists for: the corpus above
+    // holds more in-scope namespaces than the hub's per-agent ceiling, and the
+    // export still SUCCEEDS at a fixed size. An expanded list would have
+    // refused here, publishing nothing — after which the snapshot ages out and
+    // the hub refuses every hello, fleet-wide, because the corpus grew.
+    for i in 0..=MAX_READABLE_PREFIXES {
+        ai_memory::db::insert(
+            &conn,
+            &memory_in(
+                &format!("ai/acme/eng/team1/bulk{i}"),
+                &format!("m-3505-bulk-{i}"),
+            ),
+        )
+        .expect("insert");
+    }
+    let again = hub_cache::derive_sqlite(&conn, &[ALICE.to_owned()]).expect("derive");
+    assert_eq!(
+        again.agents[0].readable_prefixes,
+        expected_prefixes_for_alice(),
+        "the exported set is a property of the AGENT ID, never of the corpus"
     );
 
     // And the hub reads it back through its own loader unchanged.
@@ -272,8 +343,8 @@ fn sqlite_derivation_carries_the_proven_set_into_the_snapshot_3505() {
     hub_cache::publish(&path, &snapshot).expect("publish");
     let cache = AllowlistCache::load_from_file(&path).expect("load");
     assert_eq!(
-        cache.readable_namespaces(ALICE).expect("resolve"),
-        expected_for_alice()
+        cache.readable_prefixes(ALICE).expect("resolve"),
+        expected_prefixes_for_alice()
     );
 }
 
@@ -305,6 +376,13 @@ async fn postgres_derivation_carries_the_same_proven_set_3505() {
     let tag = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
     let alice = format!("pg{tag}/acme/eng/team1/alice");
     let ctx = CallerContext::for_agent(&alice);
+    // The prefixes the export must carry: alice's team / unit / org ancestors.
+    let mut want: Vec<String> = vec![
+        format!("pg{tag}/acme"),
+        format!("pg{tag}/acme/eng"),
+        format!("pg{tag}/acme/eng/team1"),
+    ];
+    want.sort();
     let admitted: Vec<String> = vec![
         format!("pg{tag}/acme"),
         format!("pg{tag}/acme/eng"),
@@ -363,19 +441,29 @@ async fn postgres_derivation_carries_the_same_proven_set_3505() {
         .await
         .expect("derive");
     assert_eq!(snapshot.agents.len(), 1);
-    let mut want = admitted.clone();
-    want.sort();
+    let carried = &snapshot.agents[0].readable_prefixes;
     assert_eq!(
-        snapshot.agents[0].readable_namespaces, want,
-        "the postgres exporter must carry the SAME set the sqlite one does"
+        carried, &want,
+        "the postgres exporter must carry the SAME prefixes the sqlite one does"
     );
+    // The admission verdict those prefixes then produce, checked against the
+    // same corpus both halves of this suite use.
+    let admits = |namespace: &str| {
+        !ai_memory::visibility::is_substrate_namespace(namespace)
+            && carried
+                .iter()
+                .any(|prefix| ai_memory::visibility::namespace_subtree_contains(prefix, namespace))
+    };
+    for allowed in &admitted {
+        assert!(
+            admits(allowed),
+            "{allowed} must be admitted on postgres too"
+        );
+    }
     for refused in &denied {
         assert!(
-            !snapshot.agents[0]
-                .readable_namespaces
-                .iter()
-                .any(|n| n == refused),
-            "{refused} must never reach the postgres-derived snapshot"
+            !admits(refused),
+            "{refused} must never be admitted by the postgres-derived snapshot"
         );
     }
 }
@@ -405,7 +493,9 @@ async fn allowed_a_proven_namespace_topic_delivers_a_wake_3505() {
     let topic = format!("#{SHARED}");
     alice.subscribe(std::slice::from_ref(&topic)).await;
     // A `subscribe` the hub accepts answers with nothing, so prove acceptance
-    // by the delivery below rather than by an absent error frame.
+    // by the delivery below rather than by an absent error frame. The same
+    // delivery is the ALLOWED half of the #3505 SEND gate: BOB's row proves
+    // the namespace, so his topic-addressed wake is admitted and fans out.
     bob.wake(&topic, "row-3505-a").await;
 
     let wake = alice.expect_frame().await;
@@ -452,6 +542,160 @@ async fn denied_an_unproven_namespace_topic_is_refused_3505() {
         "a refused subscribe must leave no route behind"
     );
     drop(bob);
+    hub.stop().await;
+}
+
+/// DENIED, the SEND half: a peer OUTSIDE the namespace's scope cannot publish
+/// to it, and the subscriber receives nothing.
+///
+/// Subscribe was never the only door onto a topic. Before #3505 nobody could
+/// subscribe to `#<namespace>`, so an ungated topic SEND reached nobody and
+/// cost nothing; the moment a proven namespace became subscribable, an ungated
+/// send would have let any authenticated peer fan fabricated hints out to a
+/// whole team's subscribers, forcing catch-up reads fleet-wide while paying
+/// only its own bucket.
+#[tokio::test]
+async fn denied_a_topic_send_outside_the_senders_scope_is_refused_3505() {
+    let dir = owner_only_dir();
+    let path = dir.path().join("allow.json");
+    publish(
+        &path,
+        vec![
+            row(ALICE, &root_key(91), &[SHARED]),
+            row(BOB, &root_key(93), &[SHARED]),
+            // CAROL is enrolled and authenticates fine; her proven scope is
+            // real and simply does not reach SHARED.
+            row(CAROL, &root_key(95), &[CAROL_NS]),
+        ],
+    );
+    let hub = hub_over(path);
+
+    let mut alice = join(&hub, ALICE, 91, 92).await;
+    let mut carol = join(&hub, CAROL, 95, 96).await;
+    let mut bob = join(&hub, BOB, 93, 94).await;
+
+    let topic = format!("#{SHARED}");
+    alice.subscribe(std::slice::from_ref(&topic)).await;
+
+    // CAROL addresses a namespace she cannot read.
+    carol.wake(&topic, "row-3505-forged").await;
+    let reason = carol.expect_error(ErrorCode::Forbidden.as_u16()).await;
+    assert!(
+        reason.contains("scope"),
+        "the sender is told its scope is the problem: {reason}"
+    );
+    // Nothing reached the subscriber.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), alice.read_frame())
+            .await
+            .is_err(),
+        "a refused topic send must deliver to NOBODY"
+    );
+
+    // `Forbidden` refuses ONE frame; CAROL's session survives, so a
+    // mis-addressed wake never becomes a reconnect storm — proved by a wake
+    // she IS allowed to send landing on the very same connection.
+    carol
+        .wake(&format!("#_inbox/{ALICE}"), "row-3505-carol-inbox")
+        .await;
+    let survived = alice.expect_frame().await;
+    assert_eq!(survived.from, CAROL, "the refused session is still usable");
+
+    // And the topic itself still works for a peer that DOES prove it, so the
+    // gate refused the sender rather than breaking the route.
+    bob.wake(&topic, "row-3505-legit").await;
+    let wake = alice.expect_frame().await;
+    assert_eq!(wake.kind, Kind::Wake);
+    assert_eq!(wake.to, topic);
+    assert_eq!(wake.from, BOB, "the proven sender still fans out");
+    hub.stop().await;
+}
+
+/// SCOPE of the send gate: a SUBSTRATE topic (`#_inbox/<agent>`) stays
+/// ungated, because it is the pre-#3505 own-inbox addressing and is
+/// ADDRESS-EQUIVALENT to the direct `to = <agent-id>` wake, which is ungated
+/// and always has been.
+///
+/// The verifier grants exactly ONE substrate subscription — a principal's own
+/// inbox — so such a topic has at most one subscriber and carries no fan-out
+/// amplification to charge. Gating it would refuse one spelling of a wake while
+/// leaving the identical direct spelling open: no security gained, every
+/// peer-to-peer inbox wake broken.
+#[tokio::test]
+async fn a_substrate_inbox_topic_send_stays_ungated_3505() {
+    let dir = owner_only_dir();
+    let path = dir.path().join("allow.json");
+    publish(
+        &path,
+        vec![
+            row(ALICE, &root_key(111), &[SHARED]),
+            // CAROL proves NOTHING that ALICE holds — she still may wake
+            // ALICE's inbox, exactly as she may wake ALICE directly.
+            row(CAROL, &root_key(113), &[CAROL_NS]),
+        ],
+    );
+    let hub = hub_over(path);
+
+    let mut alice = join(&hub, ALICE, 111, 112).await;
+    let mut carol = join(&hub, CAROL, 113, 114).await;
+
+    // The topic spelling.
+    carol
+        .wake(&format!("#_inbox/{ALICE}"), "row-3505-inbox-topic")
+        .await;
+    let wake = alice.expect_frame().await;
+    assert_eq!(wake.kind, Kind::Wake);
+    assert_eq!(wake.to, format!("#_inbox/{ALICE}"));
+    assert_eq!(wake.from, CAROL);
+
+    // The direct spelling, which was never gated and still is not — the two
+    // must not disagree, or the gate would be a spelling rule rather than an
+    // authorization one.
+    carol.wake(ALICE, "row-3505-inbox-direct").await;
+    let direct = alice.expect_frame().await;
+    assert_eq!(direct.kind, Kind::Wake);
+    assert_eq!(direct.to, ALICE);
+    hub.stop().await;
+}
+
+/// DENIED, the empty-scope case: a principal carrying NO proven prefixes — the
+/// shape of the reserved `wake-hub-producer` (#3469), which is why it cannot
+/// publish to a namespace topic — is refused, while its DIRECT wakes are
+/// untouched.
+#[tokio::test]
+async fn denied_a_topic_send_from_an_empty_scope_peer_is_refused_3505() {
+    let dir = owner_only_dir();
+    let path = dir.path().join("allow.json");
+    publish(
+        &path,
+        vec![
+            row(ALICE, &root_key(101), &[SHARED]),
+            row(BOB, &root_key(103), &[]),
+        ],
+    );
+    let hub = hub_over(path);
+
+    let mut alice = join(&hub, ALICE, 101, 102).await;
+    let mut bob = join(&hub, BOB, 103, 104).await;
+
+    let topic = format!("#{SHARED}");
+    alice.subscribe(std::slice::from_ref(&topic)).await;
+
+    bob.wake(&topic, "row-3505-empty-scope").await;
+    bob.expect_error(ErrorCode::Forbidden.as_u16()).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), alice.read_frame())
+            .await
+            .is_err(),
+        "an empty-scope peer must reach no topic subscriber"
+    );
+
+    // The DIRECT wake — the only thing the producer ever needed — is unchanged.
+    bob.wake(&format!("#_inbox/{ALICE}"), "row-3505-direct")
+        .await;
+    let wake = alice.expect_frame().await;
+    assert_eq!(wake.kind, Kind::Wake);
+    assert_eq!(wake.to, format!("#_inbox/{ALICE}"));
     hub.stop().await;
 }
 
@@ -515,38 +759,46 @@ async fn a_namespace_removed_by_a_refresh_drops_the_subscription_3505() {
 // Snapshot format — bounds, substrate, and both mismatch directions
 // ---------------------------------------------------------------------------
 
-/// An oversize proven set is REFUSED, on both sides of the file.
+/// An oversize prefix set is REFUSED at LOAD. The exporter can never produce
+/// one — the set is bounded by construction — so an oversize file is evidence
+/// the snapshot is not what it claims to be, and the loader refuses it whole
+/// rather than serving a truncation whose surviving entries would depend on
+/// parse order.
 #[test]
-fn an_oversize_proven_set_is_refused_3505() {
+fn an_oversize_prefix_set_is_refused_at_load_3505() {
     let dir = owner_only_dir();
     let path = dir.path().join("allow.json");
-    let over: Vec<String> = (0..=MAX_READABLE_NAMESPACES)
+    let over: Vec<String> = (0..=MAX_READABLE_PREFIXES)
         .map(|i| format!("ai/acme/eng/ns{i}"))
         .collect();
     let over_refs: Vec<&str> = over.iter().map(String::as_str).collect();
 
-    // The LOADER refuses the whole snapshot rather than serving a truncation.
     publish(&path, vec![row(ALICE, &root_key(51), &over_refs)]);
     let err = AllowlistCache::load_from_file(&path).expect_err("over the ceiling");
     let rendered = format!("{err:#}");
     assert!(rendered.contains("ceiling"), "{rendered}");
+    assert!(rendered.contains(ALICE), "{rendered}");
     assert!(
-        ReloadingAllowlist::new(path).is_err(),
+        ReloadingAllowlist::new(path.clone()).is_err(),
         "the live resolver must refuse to arm on an oversize snapshot"
     );
 
-    // And the EXPORTER refuses to publish one, naming the agent so an operator
-    // can act on it.
-    let err = hub_cache::readable_namespaces_for(ALICE, &over).expect_err("over the ceiling");
-    let rendered = format!("{err:#}");
-    assert!(rendered.contains(ALICE), "{rendered}");
-    assert!(rendered.contains("ceiling"), "{rendered}");
-    // Exactly AT the ceiling is fine — proving the bound is `>`, not `>=`.
+    // Exactly AT the ceiling loads — proving the bound is `>`, not `>=`.
+    publish(
+        &path,
+        vec![row(
+            ALICE,
+            &root_key(51),
+            &over_refs[..MAX_READABLE_PREFIXES],
+        )],
+    );
     assert_eq!(
-        hub_cache::readable_namespaces_for(ALICE, &over[..MAX_READABLE_NAMESPACES])
+        AllowlistCache::load_from_file(&path)
             .expect("at the ceiling")
+            .readable_prefixes(ALICE)
+            .expect("resolve")
             .len(),
-        MAX_READABLE_NAMESPACES
+        MAX_READABLE_PREFIXES
     );
 }
 
@@ -562,7 +814,7 @@ fn a_substrate_namespace_in_a_snapshot_is_refused_3505() {
         &path,
         vec![row(ALICE, &root_key(61), &[&format!("_inbox/{BOB}")])],
     );
-    let err = AllowlistCache::load_from_file(&path).expect_err("substrate namespace");
+    let err = AllowlistCache::load_from_file(&path).expect_err("substrate prefix");
     let rendered = format!("{err:#}");
     assert!(rendered.contains("SUBSTRATE"), "{rendered}");
 }
@@ -591,10 +843,7 @@ async fn an_older_format_snapshot_yields_own_inbox_only_3505() {
 
     let cache = AllowlistCache::load_from_file(&path).expect("an older snapshot still loads");
     assert!(
-        cache
-            .readable_namespaces(ALICE)
-            .expect("resolve")
-            .is_empty(),
+        cache.readable_prefixes(ALICE).expect("resolve").is_empty(),
         "an absent field means own-inbox only, never a wildcard"
     );
 
@@ -627,7 +876,7 @@ fn an_unknown_entry_field_refuses_the_snapshot_whole_3505() {
                 ),
                 "bind_authority": "possession_proof",
                 "bound_at": "2026-09-01T00:00:00Z",
-                "readable_namespaces": [SHARED],
+                "readable_prefixes": [SHARED],
                 "some_grant_from_2027": ["everything"],
             }],
         }),
