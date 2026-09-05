@@ -47,7 +47,12 @@
 //! | `AI_MEMORY_WAKE_INBOX_COUNT` | messages the catch-up read returned |
 //!
 //! A hook is bounded by [`EXEC_HOOK_TIMEOUT`] and killed past it: a hung hook
-//! must not become a listener that stops reading its inbox.
+//! must not become a listener that stops reading its inbox. The spawn itself
+//! goes through the #1937 audited chokepoint
+//! ([`crate::spawn_audit::audited_tokio_command`]) under
+//! [`crate::spawn_audit::CALLER_CLI_WAKE_LISTEN_HOOK`], so launching an
+//! operator-supplied shell from a long-lived listener leaves a signed
+//! `process.spawn_audited` row like every other production spawn.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -318,37 +323,44 @@ pub async fn run_exec_hook(
     count: u64,
 ) -> Result<()> {
     let meta = signal.meta.as_ref();
-    let mut child = tokio::process::Command::new(EXEC_HOOK_SHELL)
-        .arg("-c")
-        .arg(cmd)
-        .env("AI_MEMORY_WAKE_REASON", signal.reason.label())
-        .env("AI_MEMORY_WAKE_AGENT_ID", &resolved.agent_id)
-        .env("AI_MEMORY_WAKE_HUB_ID", &resolved.hub_id)
-        .env(
-            "AI_MEMORY_WAKE_INBOX_ROW_ID",
-            meta.map_or("", |m| m.inbox_row_id.as_str()),
-        )
-        .env(
-            "AI_MEMORY_WAKE_NAMESPACE",
-            meta.map_or("", |m| m.namespace.as_str()),
-        )
-        .env(
-            "AI_MEMORY_WAKE_SENDER",
-            meta.map_or("", |m| m.sender.as_str()),
-        )
-        .env(
-            "AI_MEMORY_WAKE_DIGEST",
-            meta.map_or_else(String::new, |m| hex_digest(&m.digest)),
-        )
-        .env(
-            "AI_MEMORY_WAKE_SEQ",
-            meta.map_or(0, |m| m.seq_high_watermark).to_string(),
-        )
-        .env("AI_MEMORY_WAKE_MISSED", signal.missed.to_string())
-        .env("AI_MEMORY_WAKE_PENDING", signal.pending_count.to_string())
-        .env("AI_MEMORY_WAKE_INBOX_COUNT", count.to_string())
-        .spawn()
-        .with_context(|| format!("spawning the wake hook via {EXEC_HOOK_SHELL}"))?;
+    // #1937: EVERY production subprocess launch routes through the audited
+    // chokepoint, which emits one best-effort signed `process.spawn_audited`
+    // row and hands back the command to configure exactly as before. Built
+    // ONCE and spawned once, so the row is emitted once per logical spawn.
+    let mut child = crate::spawn_audit::audited_tokio_command(
+        EXEC_HOOK_SHELL,
+        crate::spawn_audit::CALLER_CLI_WAKE_LISTEN_HOOK,
+    )
+    .arg("-c")
+    .arg(cmd)
+    .env("AI_MEMORY_WAKE_REASON", signal.reason.label())
+    .env("AI_MEMORY_WAKE_AGENT_ID", &resolved.agent_id)
+    .env("AI_MEMORY_WAKE_HUB_ID", &resolved.hub_id)
+    .env(
+        "AI_MEMORY_WAKE_INBOX_ROW_ID",
+        meta.map_or("", |m| m.inbox_row_id.as_str()),
+    )
+    .env(
+        "AI_MEMORY_WAKE_NAMESPACE",
+        meta.map_or("", |m| m.namespace.as_str()),
+    )
+    .env(
+        "AI_MEMORY_WAKE_SENDER",
+        meta.map_or("", |m| m.sender.as_str()),
+    )
+    .env(
+        "AI_MEMORY_WAKE_DIGEST",
+        meta.map_or_else(String::new, |m| hex_digest(&m.digest)),
+    )
+    .env(
+        "AI_MEMORY_WAKE_SEQ",
+        meta.map_or(0, |m| m.seq_high_watermark).to_string(),
+    )
+    .env("AI_MEMORY_WAKE_MISSED", signal.missed.to_string())
+    .env("AI_MEMORY_WAKE_PENDING", signal.pending_count.to_string())
+    .env("AI_MEMORY_WAKE_INBOX_COUNT", count.to_string())
+    .spawn()
+    .with_context(|| format!("spawning the wake hook via {EXEC_HOOK_SHELL}"))?;
 
     match tokio::time::timeout(EXEC_HOOK_TIMEOUT, child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
