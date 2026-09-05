@@ -6,7 +6,9 @@
 use anyhow::{Context as _, Result};
 use std::path::Path;
 
-use crate::wake_hub::delegation_verifier::{ALLOWLIST_FILE_VERSION, AllowlistEntry, AllowlistFile};
+use crate::wake_hub::delegation_verifier::{
+    ALLOWLIST_FILE_VERSION, AllowlistEntry, AllowlistFile, DAEMON_KEY_DIR_AUTHORITY,
+};
 
 /// Maximum age of a public identity snapshot; refresh before this expires.
 pub const MAX_CACHE_AGE_SECS: i64 = 60;
@@ -35,6 +37,59 @@ pub fn entry(
         bind_authority: current.bind_authority.clone(),
         bound_at: current.bound_at.clone(),
         revoked_keys,
+    })
+}
+
+/// v1.0.0 #3469 — the store-free `wake-hub-producer` row, derived from this
+/// host's key directory rather than from the v97 ledger.
+///
+/// # Why this cannot come from the store
+///
+/// [`derive_sqlite`] resolves each principal through
+/// [`super::hub_authority::current_issuer`], which needs a v97 key history.
+/// `wake-hub-producer` is a RESERVED id
+/// ([`crate::validate::RESERVED_AGENT_IDS`]) with no store row and no enrolled
+/// root of its own — deliberately, so that no second identity root exists — so
+/// asking the store for it yields an empty history and the principal is
+/// SILENTLY OMITTED by the `continue` in that loop. This function is the honest
+/// alternative: it reads only `daemon.pub`, states its provenance as
+/// [`DAEMON_KEY_DIR_AUTHORITY`], and is reachable only from an explicit
+/// operator switch.
+///
+/// # What it reads, and what it never touches
+///
+/// The PUBLIC half only, through [`crate::identity::keypair::load_public`].
+/// The daemon's private key is never opened here, and no other agent's key
+/// material is consulted.
+///
+/// # Errors
+///
+/// Refuses when the host has no `daemon.pub` — an operator asking to publish a
+/// binding for a key that does not exist has made a mistake worth stopping on,
+/// not a row worth inventing.
+pub fn daemon_producer_entry(key_dir: &Path, now: &str) -> Result<AllowlistEntry> {
+    let public = crate::identity::keypair::load_public(
+        crate::identity::keypair::DAEMON_KEYPAIR_LABEL,
+        key_dir,
+    )
+    .with_context(|| {
+        format!(
+            "identity hub-cache --daemon-producer: no `{}` public key in {}. Start the \
+             daemon once so it generates its enrolled keypair, or pre-stage one, then \
+             re-run.",
+            crate::identity::keypair::DAEMON_KEYPAIR_LABEL,
+            key_dir.display()
+        )
+    })?;
+    Ok(AllowlistEntry {
+        agent_id: crate::identity::sentinels::WAKE_HUB_PRODUCER.to_owned(),
+        pubkey_b64: crate::identity::keypair::encode_public_base64(&public),
+        bind_authority: DAEMON_KEY_DIR_AUTHORITY.to_owned(),
+        // The instant the operator asserted the binding. The hub refuses a
+        // delegation ISSUED before this (`AllowlistCache::check_delegate`), so
+        // stamping it now — never backdating — keeps that ordering meaningful.
+        bound_at: now.to_owned(),
+        revoked_keys: Vec::new(),
     })
 }
 
@@ -148,4 +203,115 @@ pub fn publish(path: &Path, snapshot: &AllowlistFile) -> Result<()> {
     file.as_file().sync_all()?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wake_hub::delegation_verifier::RootBindAuthority;
+
+    fn key_dir_with_daemon_key() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        let kp = crate::identity::keypair::generate(crate::identity::keypair::DAEMON_KEYPAIR_LABEL)
+            .expect("generate");
+        crate::identity::keypair::save(&kp, dir.path()).expect("save");
+        dir
+    }
+
+    /// ALLOWED: the producer row names the reserved principal, carries THIS
+    /// host's daemon public key, and states its provenance honestly.
+    #[test]
+    fn the_producer_row_binds_the_reserved_name_to_the_daemon_public_key_3469() {
+        let dir = key_dir_with_daemon_key();
+        let expected = crate::identity::keypair::load_public(
+            crate::identity::keypair::DAEMON_KEYPAIR_LABEL,
+            dir.path(),
+        )
+        .expect("load public");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let row = daemon_producer_entry(dir.path(), &now).expect("derive the producer row");
+        assert_eq!(row.agent_id, crate::identity::sentinels::WAKE_HUB_PRODUCER);
+        assert_eq!(
+            row.pubkey_b64,
+            crate::identity::keypair::encode_public_base64(&expected)
+        );
+        assert_eq!(row.bind_authority, DAEMON_KEY_DIR_AUTHORITY);
+        assert_eq!(row.bound_at, now);
+        assert!(row.revoked_keys.is_empty());
+        // And the hub accepts that authority for this principal only.
+        let authority = RootBindAuthority::from_column(&row.bind_authority);
+        assert!(authority.may_delegate_for(&row.agent_id));
+        assert!(!authority.may_delegate_for("ai:alice"));
+        assert!(
+            !authority.may_delegate(),
+            "the row must not claim a proven authority it does not have"
+        );
+    }
+
+    /// DENIED: no daemon key on this host means no row — an operator asking to
+    /// publish a binding for a key that does not exist has made a mistake
+    /// worth stopping on, not a row worth inventing.
+    #[test]
+    fn an_absent_daemon_key_refuses_rather_than_inventing_a_row_3469() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = daemon_producer_entry(dir.path(), &chrono::Utc::now().to_rfc3339())
+            .expect_err("no key, no row");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("--daemon-producer"), "{rendered}");
+    }
+
+    /// The row is derived from PUBLIC material only: it is still produced when
+    /// the private half is absent, so publishing an allowlist never requires
+    /// the daemon's signing key to be readable.
+    #[test]
+    fn the_producer_row_needs_only_public_material_3469() {
+        let dir = key_dir_with_daemon_key();
+        std::fs::remove_file(dir.path().join(format!(
+            "{}.priv",
+            crate::identity::keypair::DAEMON_KEYPAIR_LABEL
+        )))
+        .expect("drop the private half");
+        daemon_producer_entry(dir.path(), &chrono::Utc::now().to_rfc3339())
+            .expect("the public half is all this needs");
+    }
+
+    /// The producer row rides the SAME audit spine as a store-derived one: it
+    /// produces an allow event when it appears and a revoke event when it is
+    /// dropped from the next snapshot.
+    #[test]
+    fn the_producer_row_is_audited_like_any_other_grant_3469() {
+        let dir = key_dir_with_daemon_key();
+        let now = chrono::Utc::now().to_rfc3339();
+        let row = daemon_producer_entry(dir.path(), &now).expect("row");
+        let with_producer = AllowlistFile {
+            version: ALLOWLIST_FILE_VERSION,
+            refreshed_at: Some(now.clone()),
+            agents: vec![row],
+        };
+        let without = AllowlistFile {
+            version: ALLOWLIST_FILE_VERSION,
+            refreshed_at: Some(now),
+            agents: Vec::new(),
+        };
+
+        let granted = events(Some(&without), &with_producer).expect("events");
+        assert_eq!(granted.len(), 1);
+        assert_eq!(granted[0].event_type, HUB_ALLOW_EVENT);
+        assert_eq!(
+            granted[0].agent_id,
+            crate::identity::sentinels::WAKE_HUB_PRODUCER
+        );
+
+        let revoked = events(Some(&with_producer), &without).expect("events");
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].event_type, HUB_REVOKE_EVENT);
+        assert_eq!(
+            revoked[0].agent_id,
+            crate::identity::sentinels::WAKE_HUB_PRODUCER
+        );
+    }
 }

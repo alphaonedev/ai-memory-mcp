@@ -805,7 +805,10 @@ which one is missing if not:
 1. this host has the daemon's enrolled keypair (`daemon.priv`) in the ai-memory
    key directory — it is auto-generated on first start; and
 2. the hub's allowlist carries a row binding `wake-hub-producer` to that
-   daemon public key, published with `identity hub-cache`.
+   daemon public key, published with
+   `identity hub-cache --daemon-producer` (off by default; it reads only the
+   public key and records the grant on the audit spine, and omitting it on the
+   next refresh revokes the daemon's wake authority).
 
 The daemon issues its own short-lived `a2a-hub/join/v1` delegation for the
 reserved `wake-hub-producer` session under that enrolled key, minting a fresh

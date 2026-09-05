@@ -534,49 +534,95 @@ fn app_config_with_sink(socket: &std::path::Path, hub_id: &str) -> ai_memory::co
     }
 }
 
-/// ALLOWED, the whole operational path: `[wake_hub].sink_socket` plus the
-/// daemon's enrolled key in the key directory produce a forwarder that joins a
-/// REAL hub through #3468's REAL `ScopedDelegationVerifier` — under a
-/// delegation the daemon's OWN enrolled root issued for the reserved producer
-/// name — and a substrate wake reaches the recipient's own session.
+/// Publish an allowlist through the REAL path: `derive_with_extra` (which
+/// appends store-free rows and audits the whole snapshot on a real sqlite audit
+/// spine) -> `hub_cache::publish` (atomic, 0600) -> the file the hub loads.
 ///
-/// Nothing here is stubbed: real key files, real delegation minting, real
-/// signature verification, real socket, real hub.
+/// The producer row comes from `hub_cache::daemon_producer_entry`, i.e. from
+/// this host's key directory, exactly as `identity hub-cache --daemon-producer`
+/// produces it. The recipient row rides the same `extra` channel so the entire
+/// published file is audited rather than hand-appended after the fact.
+fn publish_allowlist(
+    out: &std::path::Path,
+    rows: &[ai_memory::wake_hub::delegation_verifier::AllowlistEntry],
+) {
+    let db = tempfile::NamedTempFile::new().expect("tempfile");
+    let db_path = db.path().to_path_buf();
+    let _ = ai_memory::db::open(&db_path).expect("db::open");
+    std::mem::forget(db);
+    let snapshot = ai_memory::cli::identity_hub_cache::derive_with_extra(
+        &db_path,
+        None,
+        &[],
+        Some(None),
+        rows,
+    )
+    .expect("derive + audit the snapshot");
+    assert_eq!(snapshot.agents.len(), rows.len());
+    ai_memory::identity::hub_cache::publish(out, &snapshot).expect("publish 0600");
+}
+
+/// The reserved producer row, derived from a staged key directory the way the
+/// `--daemon-producer` switch derives it.
+fn producer_row(
+    key_dir: &std::path::Path,
+) -> ai_memory::wake_hub::delegation_verifier::AllowlistEntry {
+    ai_memory::identity::hub_cache::daemon_producer_entry(key_dir, &chrono::Utc::now().to_rfc3339())
+        .expect("derive the producer row from the key dir")
+}
+
+fn recipient_row(
+    agent_id: &str,
+    root: &SigningKey,
+) -> ai_memory::wake_hub::delegation_verifier::AllowlistEntry {
+    ai_memory::wake_hub::delegation_verifier::AllowlistEntry {
+        agent_id: agent_id.to_owned(),
+        pubkey_b64: ai_memory::identity::keypair::encode_public_base64(&root.verifying_key()),
+        bind_authority: "possession_proof".to_owned(),
+        bound_at: "2026-01-01T00:00:00Z".to_owned(),
+        revoked_keys: Vec::new(),
+    }
+}
+
+/// ALLOWED, the whole operational path end to end, with the allowlist produced
+/// by the REAL publication path rather than hand-built:
+///
+/// key dir -> `daemon_producer_entry` -> `derive_with_extra` (audited) ->
+/// `publish` (0600) -> `AllowlistCache::load_from_file` -> #3468's real
+/// `ScopedDelegationVerifier` -> a real hub on a real socket -> the boot-wired
+/// forwarder joins under a delegation the daemon's OWN enrolled root issued ->
+/// a substrate wake lands on the recipient's own session.
+///
+/// This is the test that would have caught the gap where the documented
+/// `hub-cache` invocation could never publish the producer row at all.
 #[tokio::test]
 async fn the_boot_wired_forwarder_joins_a_real_hub_and_delivers_3469() {
-    use ai_memory::wake_hub::delegation_verifier::{
-        AllowlistCache, EnrolledRoot, RootBindAuthority, ScopedDelegationVerifier,
-    };
+    use ai_memory::wake_hub::delegation_verifier::{AllowlistCache, ScopedDelegationVerifier};
 
     let recipient = uid("hana");
     let key_dir = staged_key_dir(true);
-    let daemon_public = load_daemon_key(key_dir.path());
-
-    // The recipient is an ordinary enrolled agent with its own delegated key.
     let recipient_root = SigningKey::from_bytes(&[51u8; 32]);
     let recipient_delegate = SigningKey::from_bytes(&[52u8; 32]);
 
-    // The operator's grant: the reserved producer name is bound to the
-    // DAEMON's enrolled key. No second root exists anywhere in this test.
-    let mut allowlist = AllowlistCache::new();
-    allowlist.insert(
-        WAKE_HUB_PRODUCER,
-        EnrolledRoot {
-            pubkey: daemon_public,
-            authority: RootBindAuthority::PossessionProof,
-        },
+    // The operator's grant, produced the way the CLI produces it.
+    let allow_dir = tempfile::tempdir().expect("tempdir");
+    let allow = allow_dir.path().join("allow.json");
+    let producer = producer_row(key_dir.path());
+    assert_eq!(producer.agent_id, WAKE_HUB_PRODUCER);
+    assert_eq!(
+        producer.pubkey_b64,
+        ai_memory::identity::keypair::encode_public_base64(&load_daemon_key(key_dir.path())),
+        "the published row must bind THIS host's daemon key"
     );
-    allowlist.insert(
-        &recipient,
-        EnrolledRoot {
-            pubkey: recipient_root.verifying_key(),
-            authority: RootBindAuthority::PossessionProof,
-        },
+    publish_allowlist(
+        &allow,
+        &[producer, recipient_row(&recipient, &recipient_root)],
     );
 
+    let cache = AllowlistCache::load_from_file(&allow).expect("the hub must load the snapshot");
     let harness = Harness::start(
         |_| {},
-        Arc::new(ScopedDelegationVerifier::new(allowlist)),
+        Arc::new(ScopedDelegationVerifier::new(cache)),
         Arc::new(ai_memory::wake_hub::identity::SameUidAuthorizer::for_current_process()),
     );
 
@@ -624,6 +670,87 @@ async fn the_boot_wired_forwarder_joins_a_real_hub_and_delivers_3469() {
     assert_eq!(meta.inbox_row_id, "row-boot");
     assert_eq!(meta.seq_high_watermark, 3469);
     assert_eq!(sink.metrics().snapshot().delivered, 1);
+
+    harness.stop().await;
+}
+
+/// DENIED, the twin: the SAME published allowlist WITHOUT the producer row —
+/// i.e. an operator who refreshed the snapshot without `--daemon-producer` —
+/// and the boot-wired forwarder is refused. The recipient is still admitted, so
+/// the refusal is specific to the producer grant and not a broken fixture, and
+/// no wake ever reaches the recipient.
+///
+/// This is what revocation looks like: drop the switch, refresh, and the
+/// daemon's wake authority is gone.
+#[tokio::test]
+async fn without_the_producer_row_the_forwarder_is_refused_3469() {
+    use ai_memory::wake_hub::delegation_verifier::{AllowlistCache, ScopedDelegationVerifier};
+
+    let recipient = uid("ivan");
+    let key_dir = staged_key_dir(true);
+    let recipient_root = SigningKey::from_bytes(&[61u8; 32]);
+    let recipient_delegate = SigningKey::from_bytes(&[62u8; 32]);
+
+    let allow_dir = tempfile::tempdir().expect("tempdir");
+    let allow = allow_dir.path().join("allow.json");
+    // The recipient only. No `--daemon-producer`, so no producer row.
+    publish_allowlist(&allow, &[recipient_row(&recipient, &recipient_root)]);
+
+    let cache = AllowlistCache::load_from_file(&allow).expect("load");
+    let harness = Harness::start(
+        |_| {},
+        Arc::new(ScopedDelegationVerifier::new(cache)),
+        Arc::new(ai_memory::wake_hub::identity::SameUidAuthorizer::for_current_process()),
+    );
+
+    let mut client = harness.connect().await;
+    client.delegation = mint_delegation(
+        &recipient,
+        &harness.hub_id,
+        &recipient_root,
+        &recipient_delegate,
+    );
+    client.hello(&recipient, &recipient_delegate, &[]).await;
+    assert_eq!(
+        client.expect_frame().await.kind,
+        Kind::Welcome,
+        "the recipient's own grant is unaffected"
+    );
+
+    let cfg = app_config_with_sink(&harness.socket, &harness.hub_id);
+    let sink = ai_memory::wake_sink::boot::spawn_forwarder(&cfg, key_dir.path())
+        .expect("starting is allowed; being ADMITTED is what the missing row denies")
+        .expect("configured");
+
+    sink.on_wake(&InboxEvent::AgentNotified {
+        seq: 7,
+        recipient_agent_id: recipient.clone(),
+        correlation_id: "sha256:c".into(),
+        inbox_row_id: "row-denied".into(),
+        namespace: format!("_inbox/{recipient}"),
+        sender_agent_id: "ai:alice".into(),
+        content_digest: format!("sha256:{}", "88".repeat(32)),
+        notified_at: "2026-09-05T00:00:00Z".into(),
+    });
+
+    // The hub refuses the hello, so nothing is ever delivered.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let snap = harness.metrics.snapshot(0);
+    assert!(
+        snap.denied_hello >= 1,
+        "the hub must refuse a producer with no allowlist row: {snap:?}"
+    );
+    assert_eq!(
+        sink.metrics().snapshot().delivered,
+        0,
+        "an unadmitted forwarder delivers nothing"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), client.read_frame())
+            .await
+            .is_err(),
+        "no wake may reach the recipient"
+    );
 
     harness.stop().await;
 }

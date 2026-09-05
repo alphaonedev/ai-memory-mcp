@@ -172,13 +172,38 @@ reserved principal `wake-hub-producer`, signed by the daemon's OWN enrolled
 row binding that name to that public key:
 
 ```bash
-ai-memory identity hub-cache --agent-id wake-hub-producer --out <allow.json>
+ai-memory identity hub-cache --daemon-producer \
+    --include-agent <each agent that may listen> --out <allow.json>
 ```
 
-This row is the single, revocable grant that says "this host's daemon may wake
-agents on this hub". Remove it (and refresh the snapshot) and the forwarder is
-refused within a second — the hub revalidates every established session once
-per second against the current snapshot.
+`--daemon-producer` is the switch that publishes it. It reads only
+`daemon.pub` from this host's owner-only key directory and writes the row with
+`bind_authority: "daemon_key_dir"`.
+
+That row is the single, revocable grant that says "this host's daemon may wake
+agents on this hub". Drop the switch on the next refresh and the row disappears,
+which revokes the daemon's wake authority within a second — the hub revalidates
+every established session once per second against the current snapshot. Both the
+grant and the revocation are recorded on the `signed_events` audit spine as
+`identity.hub_allow` / `identity.hub_revoke`, exactly like an agent's.
+
+There is deliberately no way to publish this row by naming the principal:
+`--include-agent wake-hub-producer` is REFUSED, because a reserved principal has no
+key history and the store loop would silently omit it, publishing a snapshot
+that looked successful and granted nothing.
+
+### What `daemon_key_dir` does and does not attest
+
+It says: the operator of this host, with read access to its 0700 key directory,
+asserted that this host's daemon key may wake agents on this hub. It does NOT
+claim a possession challenge was answered or that a v97 ledger row backs it —
+neither is true, and stamping `possession_proof` would be a lie about the
+durable identity root. The hub therefore treats it as delegating authority for
+the reserved `wake-hub-producer` name and for NO other principal: that name is
+unclaimable on the wire, owns no memories and no namespace, and the only thing
+it can do is deliver a content-free wake hint addressed to an agent's own inbox.
+A hub build that has never heard of the value maps it to "unrecognised", which
+cannot delegate at all — so an older hub reading a newer snapshot fails closed.
 
 **3. Point the daemon at the hub.** In `config.toml`:
 

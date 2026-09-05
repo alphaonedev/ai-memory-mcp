@@ -95,7 +95,7 @@ impl DaemonIssuedCredential {
                  issue a `{WAKE_HUB_PRODUCER}` session under. Start the daemon once to \
                  auto-generate it, or pre-stage it, then publish an allowlist row binding \
                  `{WAKE_HUB_PRODUCER}` to that public key with `ai-memory identity \
-                 hub-cache --agent-id {WAKE_HUB_PRODUCER} --out <allowlist>`.",
+                 hub-cache --daemon-producer --out <allowlist>`.",
                     keypair::DAEMON_KEYPAIR_LABEL,
                     key_dir.display()
                 )
