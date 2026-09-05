@@ -831,6 +831,15 @@ and the `postgres_endpoint_supported()` allow-list ever drift.
 > `calibrate_confidence_report` method: the pg
 > `confidence_shadow_observations` table has shipped in the bootstrap
 > schema since v0.7.0, so the sweep needed a port, not a new relation.
+> **Caller-gate caveat.** That port deliberately reproduced the sqlite
+> sweep's existing posture, and that posture has NO caller gate on
+> either backend: the aggregation spans every namespace, so the report
+> discloses per-namespace names and aggregate confidence statistics to
+> any caller who can reach the route. Opening the route on postgres
+> did not widen that exposure — the same report was already reachable
+> on a sqlite daemon — but it does mean a postgres deployment now
+> shares it. Tracked in [#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507); the fix belongs on BOTH backends
+> at once, exactly as with `/api/v1/share` and #3379.
 > `memory_atomise` followed last (69/14 -> 70/13) with NO port at all: its
 > HTTP surface never had storage access to port — the call site owns no
 > `AtomiseToolHandler`, so every HTTP call terminates in the tier-locked

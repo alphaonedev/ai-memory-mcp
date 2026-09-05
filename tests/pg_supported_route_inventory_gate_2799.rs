@@ -207,7 +207,14 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// 2026-09-05 (#3064 lane L-PGP family F3): `memory_calibrate_confidence`
 /// LEFT this set — SAL `calibrate_confidence_report` over the pg
 /// `confidence_shadow_observations` table (present since the bootstrap
-/// schema; no new relation, no schema rung).
+/// schema; no new relation, no schema rung). CAVEAT: the port
+/// reproduced sqlite's posture verbatim, and that posture has NO caller
+/// gate on either backend — the aggregation spans every namespace, so
+/// the report discloses per-namespace names + aggregate confidence
+/// statistics to any caller reaching the route. Opening it on postgres
+/// did not WIDEN the exposure (sqlite already served it) but does share
+/// it with pg deployments. Tracked in #3507; fix belongs on BOTH
+/// backends at once (cf. `/api/v1/share` + #3379 above).
 /// 2026-09-05 (#3064 lane L-PGP family F2): `memory_smart_load` LEFT this
 /// set — the family PICK is the pure `mcp::pick_family_for_intent` and the
 /// family-tagged READ is the SAME SAL `list` + `Filter::metadata_eq` path
@@ -316,6 +323,10 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // f3_calibrate_confidence_{sqlite,postgres}` — the postgres leg SEEDS the
 // postgres table and asserts the seeded baseline appears, so a scratch read
 // fails loudly.
+// The tool's CALLER-GATE posture (absent on both backends; cross-namespace
+// aggregate disclosure) is a separate concern from this dispatch entry and
+// is tracked in #3507 — opening the route on pg reproduced sqlite's
+// behaviour rather than widening it.
 // 2026-09-05 (#3064 lane L-PGP family F5) — bumped 69 -> 70 pg-supported /
 // 14 -> 13 fully-501: `POST /api/v1/memory_atomise`. This entry is unlike its
 // siblings: NOTHING was ported, because the HTTP surface never had storage

@@ -4209,6 +4209,21 @@ pub trait MemoryStore: Send + Sync {
     /// on it, so a skipped backfill DEGRADES the report's optional evidence
     /// fields to `None` and never yields a wrong number.
     ///
+    /// # Caller gate
+    ///
+    /// There is NONE, on either adapter, and that is deliberate for the
+    /// #3064 port: the sqlite sweep this method was lifted from applies no
+    /// caller filter, so the aggregation spans every namespace and the
+    /// returned baselines disclose per-namespace names plus aggregate
+    /// confidence statistics to any caller that reaches the route.
+    /// Reproducing that verbatim kept the two backends equal rather than
+    /// silently diverging; it did not WIDEN the exposure, since a sqlite
+    /// daemon already served the same report. The gap itself is tracked in
+    /// #3507 and must be closed on BOTH adapters together — an
+    /// implementor adding a caller filter to only one of them would
+    /// reintroduce exactly the cross-backend divergence this method exists
+    /// to prevent.
+    ///
     /// # Errors
     ///
     /// [`StoreError::InvalidInput`] when `days` is outside `0..=36500` (the
