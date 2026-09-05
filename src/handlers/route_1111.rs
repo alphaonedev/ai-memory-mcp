@@ -818,12 +818,63 @@ pub async fn handle_calibrate_confidence_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3064 lane L-PGP family F3 — postgres SAL dispatch through
+    // `MemoryStore::calibrate_confidence_report`. Pre-fix this route took
+    // `app.db.lock()` unconditionally, so on a postgres daemon it would have
+    // swept the EMPTY scratch sqlite and reported an all-zero calibration as
+    // if it were the corpus's — which is why the gate refused it outright.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return calibrate_confidence_http_via_store(&app, &body).await;
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_calibrate_confidence(&lock.0, &body);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+/// #3064 lane L-PGP family F3 — the postgres arm of
+/// [`handle_calibrate_confidence_http`].
+///
+/// Restates the SAME argument contract `mcp::handle_calibrate_confidence`
+/// applies before it reaches the substrate, in the SAME order, so a refusal
+/// carries the identical message on both backends:
+///
+/// * `days` defaults to `DEFAULT_WINDOW_DAYS` and must be non-negative;
+/// * `days` must not exceed `validate::MAX_DURATION_DAYS` (the #3384
+///   bounded-window refusal — a caller-controlled window must never reach
+///   chrono's panicking duration arithmetic).
+///
+/// The substrate-error prefix is preserved verbatim so an operator's log
+/// greps match across backends.
+#[cfg(feature = "sal")]
+async fn calibrate_confidence_http_via_store(
+    app: &AppState,
+    body: &Value,
+) -> axum::response::Response {
+    let days = body
+        .get("days")
+        .and_then(Value::as_i64)
+        .unwrap_or(crate::confidence::calibrate::DEFAULT_WINDOW_DAYS);
+    if days < 0 {
+        return err_response("days must be non-negative".to_string());
+    }
+    if days > crate::validate::MAX_DURATION_DAYS {
+        return err_response(format!(
+            "days must not exceed {} days (got {days})",
+            crate::validate::MAX_DURATION_DAYS
+        ));
+    }
+    match app
+        .store
+        .calibrate_confidence_report(days, chrono::Utc::now())
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(json!({ "report": report }))).into_response(),
+        Err(e) => err_response(format!("memory_calibrate_confidence substrate error: {e}")),
     }
 }
 

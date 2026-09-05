@@ -194,6 +194,10 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// 2026-08-29 (#3064 batch D): `memory_replay` LEFT this set —
 /// SAL `replay_transcript_union` + `fetch_transcript_content`
 /// (pg `memory_transcripts` / `memory_transcript_links` v22/v24).
+/// 2026-09-05 (#3064 lane L-PGP family F3): `memory_calibrate_confidence`
+/// LEFT this set — SAL `calibrate_confidence_report` over the pg
+/// `confidence_shadow_observations` table (present since the bootstrap
+/// schema; no new relation, no schema rung).
 /// 2026-09-05 (#3064 lane L-PGP family F2): `memory_smart_load` LEFT this
 /// set — the family PICK is the pure `mcp::pick_family_for_intent` and the
 /// family-tagged READ is the SAME SAL `list` + `Filter::metadata_eq` path
@@ -209,7 +213,6 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
     [
         routes::SHARE,
         routes::MEMORY_ATOMISE,
-        routes::MEMORY_CALIBRATE_CONFIDENCE,
         routes::MEMORY_CHECK_AGENT_ACTION,
         routes::MEMORY_RULE_LIST,
         routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
@@ -289,8 +292,23 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // Proof-of-dispatch: `tests/pg_parity_3064.rs::
 // f2_smart_load_wraps_load_family_{sqlite,postgres}` (owner sees the
 // family-tagged row, a second principal does not).
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 69;
-const EXPECTED_FULLY_501_PATHS: usize = 15;
+// 2026-09-05 (#3064 lane L-PGP family F3) — bumped 68 -> 69 pg-supported /
+// 15 -> 14 fully-501: `POST /api/v1/memory_calibrate_confidence`. The
+// BINDING SAFETY INVARIANT holds because the handler's postgres branch
+// dispatches to `MemoryStore::calibrate_confidence_report`
+// (`src/store/postgres/parity_3064.rs`) and never `app.db.lock()`. That
+// distinction is unusually load-bearing on this route: the empty scratch
+// sqlite ALSO ships a `confidence_shadow_observations` table, so the
+// pre-fix handler would have returned a plausible all-zero report instead
+// of erroring — the exact silent-wrong-answer class the gate exists to
+// prevent. The pg table has shipped in the bootstrap schema since v0.7.0;
+// no new relation and no schema rung.
+// Proof-of-dispatch: `tests/pg_parity_3064.rs::
+// f3_calibrate_confidence_{sqlite,postgres}` — the postgres leg SEEDS the
+// postgres table and asserts the seeded baseline appears, so a scratch read
+// fails loudly.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 70;
+const EXPECTED_FULLY_501_PATHS: usize = 14;
 const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 84;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
@@ -333,6 +351,9 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "LINKS_VERIFY",
     "MEMORIES",
     "MEMORIES_BULK",
+    // #3064 family F3 — SAL `calibrate_confidence_report` over the pg
+    // `confidence_shadow_observations` table.
+    "MEMORY_CALIBRATE_CONFIDENCE",
     "MEMORY_DEPENDENTS_OF_INVALIDATED",
     "MEMORY_EXPORT_REFLECTION",
     "MEMORY_LOAD_FAMILY",

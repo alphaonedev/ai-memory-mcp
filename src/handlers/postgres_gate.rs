@@ -279,6 +279,14 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // `power_consolidation::load_family_rows_via_store`. Never
         // `app.db.lock()`.
         ("POST", super::routes::MEMORY_SMART_LOAD) => true,
+        // #3064 lane L-PGP family F3 — `POST /api/v1/memory_calibrate_confidence`
+        // dispatches to `MemoryStore::calibrate_confidence_report`, whose
+        // postgres impl sweeps the pg `confidence_shadow_observations` table
+        // (+ the read-only `LEFT JOIN memories` access-count evidence). Never
+        // `app.db.lock()` — which mattered here more than most: the empty
+        // scratch sqlite ALSO carries that table, so an ungated handler would
+        // have reported a plausible all-zero calibration rather than failing.
+        ("POST", super::routes::MEMORY_CALIBRATE_CONFIDENCE) => true,
         // #3064 batch B — inbound `reflects_on` dependents + optional
         // `lineage_descendants` for `transitive`. Never `app.db.lock()`.
         ("POST", super::routes::MEMORY_DEPENDENTS_OF_INVALIDATED) => true,

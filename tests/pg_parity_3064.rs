@@ -583,3 +583,223 @@ async fn f2_smart_load_wraps_load_family_postgres() {
     shutdown.notify_one();
     let _ = handle.await;
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// F3 — `POST /api/v1/memory_calibrate_confidence`
+// ─────────────────────────────────────────────────────────────────────
+
+/// The exact top-level key set of the `report` object, pinned as a literal so
+/// a field dropped on BOTH backends at once still fails.
+const F3_REPORT_KEYS: &[&str] = &["baselines", "total_observations", "window_days"];
+
+/// Derived-confidence values seeded per backend. Three values give an ODD
+/// count, so the median is the single central value (0.4) — the branch of the
+/// #1915 median contract a two-value fixture would not exercise — and they
+/// land in three DISTINCT histogram buckets, so a bucket-indexing divergence
+/// between the adapters cannot hide.
+const F3_VALUES: [f64; 3] = [0.2, 0.4, 0.6];
+const F3_SOURCE: &str = "system";
+
+/// Drive the calibration sweep and return
+/// `(status, body, negative_days_status, huge_days_status)`.
+async fn f3_call(client: &reqwest::Client, base: &str) -> (u16, Value, u16, u16) {
+    let resp = client
+        .post(format!("{base}/api/v1/memory_calibrate_confidence"))
+        .json(&json!({"days": 30}))
+        .send()
+        .await
+        .expect("calibrate POST");
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.expect("calibrate body");
+
+    // DENIED half — the two bounded-window refusals. A caller-controlled
+    // window must never reach chrono's panicking duration arithmetic (#3384),
+    // and the refusal must be identical on both backends.
+    let negative = client
+        .post(format!("{base}/api/v1/memory_calibrate_confidence"))
+        .json(&json!({"days": -1}))
+        .send()
+        .await
+        .expect("negative days POST");
+    let negative_status = negative.status().as_u16();
+    let negative_body: Value = negative.json().await.expect("negative body");
+    assert!(
+        negative_body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("non-negative"),
+        "negative days must be refused by message: {negative_body}"
+    );
+
+    let huge = client
+        .post(format!("{base}/api/v1/memory_calibrate_confidence"))
+        .json(&json!({"days": i64::MAX}))
+        .send()
+        .await
+        .expect("huge days POST");
+    let huge_status = huge.status().as_u16();
+    let huge_body: Value = huge.json().await.expect("huge body");
+    assert!(
+        huge_body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must not exceed 36500"),
+        "an unbounded window must be refused by message: {huge_body}"
+    );
+
+    (status, body, negative_status, huge_status)
+}
+
+/// Locate the baseline for the seeded `(namespace, source)` group and assert
+/// the aggregation matches the seeded values on either backend.
+fn f3_assert(body: &Value, ns: &str, backend: &str) {
+    let report = &body["report"];
+    assert_eq!(
+        key_shape(report),
+        F3_REPORT_KEYS
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect::<Vec<_>>(),
+        "{backend}: calibration report shape drifted: {body}"
+    );
+    assert_eq!(report["window_days"].as_i64(), Some(30), "{backend}");
+    let baseline = report["baselines"]
+        .as_array()
+        .expect("baselines array")
+        .iter()
+        .find(|b| b["namespace"].as_str() == Some(ns))
+        .unwrap_or_else(|| panic!("{backend}: no baseline for the seeded namespace {ns}: {body}"));
+    assert_eq!(baseline["source"].as_str(), Some(F3_SOURCE), "{backend}");
+    assert_eq!(baseline["count"].as_u64(), Some(3), "{backend}: {baseline}");
+    let median = baseline["median"].as_f64().expect("median");
+    assert!(
+        (median - 0.4).abs() < 1e-9,
+        "{backend}: odd-count median must be the single central value: {baseline}"
+    );
+    let mean = baseline["mean"].as_f64().expect("mean");
+    assert!(
+        (mean - 0.4).abs() < 1e-9,
+        "{backend}: mean drifted: {baseline}"
+    );
+    let buckets: Vec<u64> = baseline["buckets"]
+        .as_array()
+        .expect("buckets array")
+        .iter()
+        .map(|b| b.as_u64().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        buckets,
+        vec![0, 0, 1, 0, 1, 0, 1, 0, 0, 0],
+        "{backend}: histogram bucketing diverged: {baseline}"
+    );
+    // No `recall_observations` row correlates with these seeds, so the
+    // optional evidence fields are an honest `null`, never a misleading 0.0.
+    assert!(
+        baseline["consumption_utility"].is_null(),
+        "{backend}: unjudged rows must report null, not 0.0: {baseline}"
+    );
+    assert!(
+        report["total_observations"].as_u64().unwrap_or_default() >= 3,
+        "{backend}: total_observations must count the seeded window: {report}"
+    );
+}
+
+#[cfg(feature = "sal")]
+#[tokio::test(flavor = "multi_thread")]
+async fn f3_calibrate_confidence_sqlite() {
+    let dir = fresh_dir("f3-sqlite");
+    let db_path = dir.path().join("f3.db");
+    let state = sqlite_app_state(&db_path);
+    let (base, shutdown, handle) = spawn(state).await;
+
+    let client = pg_test_client(OWNER_AGENT);
+    let ns = format!("f3-calibrate-{}", uuid::Uuid::new_v4());
+    let id = store_memory(&client, &base, &ns, "f3 seed", "calibration seed row").await;
+
+    // Seed the shadow observations on a SECOND connection to the same WAL
+    // database — the daemon's own handle stays untouched.
+    {
+        let conn = ai_memory::db::open(&db_path).expect("seed connection");
+        let now = chrono::Utc::now().to_rfc3339();
+        for v in F3_VALUES {
+            conn.execute(
+                "INSERT INTO confidence_shadow_observations
+                     (memory_id, namespace, source, caller_confidence,
+                      derived_confidence, signals, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6)",
+                rusqlite::params![&id, &ns, F3_SOURCE, 0.5_f64, v, &now],
+            )
+            .expect("seed shadow observation");
+        }
+    }
+
+    let (status, body, negative, huge) = f3_call(&client, &base).await;
+    assert_eq!(status, 200, "sqlite calibrate body={body}");
+    f3_assert(&body, &ns, "sqlite");
+    assert_eq!(negative, 400);
+    assert_eq!(huge, 400);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// The postgres leg SEEDS THE POSTGRES TABLE directly and asserts the report
+/// reflects those rows. This is the discriminating proof: `app.db` on this
+/// daemon is an EMPTY in-memory sqlite that also carries a
+/// `confidence_shadow_observations` table, so a handler that swept the
+/// scratch database would report an all-zero calibration — plausible-looking
+/// and completely wrong — and the seeded baseline would be absent.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn f3_calibrate_confidence_postgres() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping f3_calibrate_confidence_postgres");
+        return;
+    };
+    let state = postgres_app_state(&url).await;
+    let (base, shutdown, handle) = spawn(state).await;
+
+    let client = pg_test_client(OWNER_AGENT);
+    let ns = format!("f3-calibrate-{}", uuid::Uuid::new_v4());
+    let id = store_memory(&client, &base, &ns, "f3 seed", "calibration seed row").await;
+
+    {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("seed pool");
+        let now = chrono::Utc::now().to_rfc3339();
+        for v in F3_VALUES {
+            sqlx::query(
+                "INSERT INTO confidence_shadow_observations
+                     (memory_id, namespace, source, caller_confidence,
+                      derived_confidence, signals, observed_at)
+                 VALUES ($1, $2, $3, $4, $5, '{}', $6)",
+            )
+            .bind(&id)
+            .bind(&ns)
+            .bind(F3_SOURCE)
+            .bind(0.5_f64)
+            .bind(v)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .expect("seed shadow observation");
+        }
+        pool.close().await;
+    }
+
+    let (status, body, negative, huge) = f3_call(&client, &base).await;
+    assert_ne!(
+        status, 501,
+        "memory_calibrate_confidence must no longer be fail-closed on postgres: {body}"
+    );
+    assert_eq!(status, 200, "postgres calibrate body={body}");
+    f3_assert(&body, &ns, "postgres");
+    assert_eq!(negative, 400);
+    assert_eq!(huge, 400);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
