@@ -24908,6 +24908,17 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         pa: &crate::models::PendingAction,
     ) -> StoreResult<()> {
+        // #3175 parity — the gate is called HERE as well as inside the
+        // `postgres/federation_3075.rs` implementation (or the already-gated
+        // funnel it composes). `tests/qual_pg_record_stop_gate_parity_3175.rs`
+        // resolves the delegation TEXTUALLY within this file, so a callee in a
+        // submodule is invisible to it: without this line the parity check
+        // reports the arm ungated even though the write is gated. Keep BOTH —
+        // deleting the inner call would make the gate depend on this file's
+        // arm, and deleting this one re-breaks the parity scan.
+        // `gate_record_stop` is an idempotent read-probe, so the double call is
+        // behaviour-free and fails closed either way.
+        self.gate_record_stop().await?;
         self.apply_remote_pending_action_pg(pa).await
     }
 
@@ -24918,6 +24929,8 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         incoming: &crate::models::Checkpoint,
     ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        // #3175 parity double-gate — see `apply_remote_pending_action` above.
+        self.gate_record_stop().await?;
         self.apply_remote_checkpoint_resolution_pg(ctx, incoming)
             .await
     }
@@ -24935,12 +24948,16 @@ impl MemoryStore for PostgresStore {
     /// #3075 — federated `archives[]` apply. Owner-BLIND by trait contract; the
     /// peer-scope gate is the authorization on this lane.
     async fn apply_remote_archive(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        // #3175 parity double-gate — see `apply_remote_pending_action` above.
+        self.gate_record_stop().await?;
         self.apply_remote_archive_pg(ctx, id).await
     }
 
     /// #3075 — federated `restores[]` apply, with the #1848/G30 forget-tombstone
     /// gate the OPERATOR un-forget path (`archive_restore`) deliberately omits.
     async fn apply_remote_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        // #3175 parity double-gate — see `apply_remote_pending_action` above.
+        self.gate_record_stop().await?;
         self.apply_remote_restore_pg(ctx, id).await
     }
 
