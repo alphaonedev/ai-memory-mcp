@@ -273,7 +273,9 @@ async fn scale_smoke_the_connection_ceiling_refuses_rather_than_growing() {
     let over_the_line = tokio::net::UnixStream::connect(&hub.socket)
         .await
         .expect("the listener still accepts");
-    drop(over_the_line);
+    // Keep the peer alive until the credential gate has observed it. On macOS
+    // an already-closed peer may no longer expose LOCAL_PEERPID, correctly
+    // producing a credential refusal before capacity is considered.
     for _ in 0..100 {
         if hub.metrics.snapshot(0).denied_ceiling > 0 {
             break;
@@ -286,5 +288,6 @@ async fn scale_smoke_the_connection_ceiling_refuses_rather_than_growing() {
         "past the ceiling the hub must refuse and COUNT it, not grow"
     );
     assert!(counters.connections_current <= ceiling);
+    drop(over_the_line);
     hub.stop().await;
 }

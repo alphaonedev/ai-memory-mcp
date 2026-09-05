@@ -768,7 +768,26 @@ rate_per_sec = 500             # authenticated frames/s, per connection
 rate_burst = 2000              # fan-out is charged to the SENDER
 pending_max_agents = 1024      # coalesced offline state, bounded
 pending_max_ids = 64           # ids retained per offline agent, then `lagged`
+allowlist = "/run/user/1000/ai-memory/wake-hub-allow.json"   # #3468
 ```
+
+**`allowlist`** (#3468) is the version-2 public snapshot produced by
+`identity hub-cache`: enrolled public keys, proven v97 binding authority and
+binding time, revoked delegated keys, and a mandatory refresh timestamp. The
+hub loads only a regular file owned by its uid, with exact mode 0600, through
+one descriptor; symlinks, duplicate ids and unsupported formats are refused.
+Refresh the complete snapshot more frequently than its 60-second maximum age.
+The hub revalidates established sessions every second, including idle listeners.
+No private key or store handle is needed in the hub. Cache publication is
+preceded by allow/revoke events in the durable audit spine on SQLite or PostgreSQL.
+
+**Unset means the hub admits NOBODY.** That is the fail-closed default, not a
+degraded mode: a wake plane with no identity source must refuse rather than
+trust whoever can reach the socket. If the key IS set and the file cannot be
+loaded, the hub REFUSES TO START rather than falling back — reporting
+`delegation/v1` in `--posture` while actually admitting nobody would be worse
+than either posture stated honestly. `ai-memory wake-hub --posture` prints which
+of the two verifiers a given configuration installs.
 
 Precedence per field: **CLI flag > `[wake_hub]` > compiled bound**
 (`src/wake_hub/limits.rs`). Every field is optional, and an unset field falls

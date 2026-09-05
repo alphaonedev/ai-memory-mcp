@@ -50,9 +50,10 @@ use std::fmt;
 use bytes::{BufMut, Bytes, BytesMut};
 
 use super::limits::{
-    FRAME_HEADER_BYTES, MAX_FRAME_BYTES, MAX_ID_BYTES, MAX_PAYLOAD_BYTES, MAX_TOPIC_BYTES,
-    MAX_TOPICS_PER_FRAME, MAX_WAKE_META_BYTES, PUBKEY_BYTES, SIGNATURE_BYTES, WAKE_DIGEST_BYTES,
-    WIRE_MAGIC, WIRE_VERSION,
+    FRAME_HEADER_BYTES, MAX_DELEGATION_WIRE_BYTES, MAX_FRAME_BYTES, MAX_ID_BYTES,
+    MAX_LIVENESS_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES, MAX_TOPIC_BYTES, MAX_TOPICS_PER_FRAME,
+    MAX_WAKE_META_BYTES, PUBKEY_BYTES, SIGNATURE_BYTES, WAKE_DIGEST_BYTES, WIRE_MAGIC,
+    WIRE_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -199,7 +200,7 @@ impl Kind {
                 MAX_PAYLOAD_BYTES
             }
             Self::Wake | Self::Welcome | Self::Error => MAX_WAKE_META_BYTES,
-            Self::Ping | Self::Pong => 32,
+            Self::Ping | Self::Pong => MAX_LIVENESS_PAYLOAD_BYTES,
         }
     }
 
@@ -289,6 +290,11 @@ pub enum FrameError {
         /// Observed frame length.
         len: usize,
     },
+    /// The presented delegation exceeded [`MAX_DELEGATION_WIRE_BYTES`].
+    DelegationTooLarge {
+        /// Observed delegation length.
+        len: usize,
+    },
     /// A [`WakeMeta`] did not fit [`MAX_WAKE_META_BYTES`].
     MetaTooLarge {
         /// Observed metadata length.
@@ -307,7 +313,8 @@ impl FrameError {
         match self {
             Self::PayloadTooLarge { .. }
             | Self::FrameTooLarge { .. }
-            | Self::MetaTooLarge { .. } => ErrorCode::TooLarge,
+            | Self::MetaTooLarge { .. }
+            | Self::DelegationTooLarge { .. } => ErrorCode::TooLarge,
             _ => ErrorCode::Malformed,
         }
     }
@@ -347,6 +354,10 @@ impl fmt::Display for FrameError {
             Self::FrameTooLarge { len } => {
                 write!(f, "frame {len} B exceeds the {MAX_FRAME_BYTES} B ceiling")
             }
+            Self::DelegationTooLarge { len } => write!(
+                f,
+                "delegation {len} B exceeds the {MAX_DELEGATION_WIRE_BYTES} B ceiling"
+            ),
             Self::MetaTooLarge { len } => {
                 write!(
                     f,
@@ -763,10 +774,19 @@ fn take_short(buf: &[u8]) -> Result<(&[u8], &[u8]), FrameError> {
 /// asserted topic list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloPayload {
-    /// Ed25519 public key the client is authenticating with.
+    /// Ed25519 public key the client is authenticating with. This is the
+    /// DELEGATED key; the delegation below is what ties it to an enrolled
+    /// agent.
     pub pubkey: [u8; PUBKEY_BYTES],
     /// Signature over the domain-separated hello transcript.
     pub signature: [u8; SIGNATURE_BYTES],
+    /// The scoped `a2a-hub/join/v1` delegation authorising `pubkey` to speak
+    /// for an enrolled agent at this hub (#3468). Empty means "none
+    /// presented", which every production verifier refuses — the field is
+    /// optional on the WIRE so a malformed or absent delegation is a clean
+    /// `401` rather than a framing error that closes the connection before the
+    /// identity gate can log why.
+    pub delegation: Bytes,
     /// Topics the client wants at handshake time.
     pub topics: Vec<String>,
 }
@@ -778,10 +798,23 @@ impl HelloPayload {
     ///
     /// [`FrameError::BadTopics`] for an invalid topic list.
     pub fn encode(&self) -> Result<Bytes, FrameError> {
+        if self.delegation.len() > MAX_DELEGATION_WIRE_BYTES {
+            return Err(FrameError::DelegationTooLarge {
+                len: self.delegation.len(),
+            });
+        }
+        let delegation_len =
+            u16::try_from(self.delegation.len()).map_err(|_| FrameError::DelegationTooLarge {
+                len: self.delegation.len(),
+            })?;
         let topics = encode_topics(&self.topics)?;
-        let mut buf = BytesMut::with_capacity(PUBKEY_BYTES + SIGNATURE_BYTES + topics.len());
+        let mut buf = BytesMut::with_capacity(
+            PUBKEY_BYTES + SIGNATURE_BYTES + 2 + self.delegation.len() + topics.len(),
+        );
         buf.put_slice(&self.pubkey);
         buf.put_slice(&self.signature);
+        buf.put_u16(delegation_len);
+        buf.put_slice(&self.delegation);
         buf.put_slice(&topics);
         Ok(buf.freeze())
     }
@@ -793,18 +826,33 @@ impl HelloPayload {
     /// [`FrameError::MetaTruncated`] when shorter than key + signature,
     /// [`FrameError::BadTopics`] for an invalid topic list.
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
-        const FIXED: usize = PUBKEY_BYTES + SIGNATURE_BYTES;
+        const FIXED: usize = PUBKEY_BYTES + SIGNATURE_BYTES + 2;
         if buf.len() < FIXED {
             return Err(FrameError::MetaTruncated);
         }
         let mut pubkey = [0u8; PUBKEY_BYTES];
         pubkey.copy_from_slice(&buf[..PUBKEY_BYTES]);
         let mut signature = [0u8; SIGNATURE_BYTES];
-        signature.copy_from_slice(&buf[PUBKEY_BYTES..FIXED]);
+        signature.copy_from_slice(&buf[PUBKEY_BYTES..PUBKEY_BYTES + SIGNATURE_BYTES]);
+        let delegation_len = usize::from(u16::from_be_bytes([buf[FIXED - 2], buf[FIXED - 1]]));
+        if delegation_len > MAX_DELEGATION_WIRE_BYTES {
+            return Err(FrameError::DelegationTooLarge {
+                len: delegation_len,
+            });
+        }
+        let delegation_end = FIXED
+            .checked_add(delegation_len)
+            .ok_or(FrameError::MetaTruncated)?;
+        if buf.len() < delegation_end {
+            return Err(FrameError::MetaTruncated);
+        }
         Ok(Self {
             pubkey,
             signature,
-            topics: decode_topics(&buf[FIXED..])?,
+            delegation: Bytes::copy_from_slice(&buf[FIXED..delegation_end]),
+            // The topic list stays TRAILING so its no-trailing-bytes rule still
+            // holds: a body cannot ride along behind it.
+            topics: decode_topics(&buf[delegation_end..])?,
         })
     }
 }
@@ -1168,6 +1216,7 @@ mod tests {
         let h = HelloPayload {
             pubkey: [7u8; PUBKEY_BYTES],
             signature: [9u8; SIGNATURE_BYTES],
+            delegation: Bytes::from_static(b"delegation-bytes"),
             topics: vec!["#hive".into()],
         };
         let wire = h.encode().expect("encode");
@@ -1175,6 +1224,42 @@ mod tests {
         assert_eq!(HelloPayload::decode(&wire).expect("decode"), h);
         assert_eq!(
             HelloPayload::decode(&wire[..PUBKEY_BYTES]),
+            Err(FrameError::MetaTruncated)
+        );
+    }
+
+    #[test]
+    fn hello_payload_carries_a_bounded_delegation() {
+        let empty = HelloPayload {
+            pubkey: [1u8; PUBKEY_BYTES],
+            signature: [2u8; SIGNATURE_BYTES],
+            delegation: Bytes::new(),
+            topics: Vec::new(),
+        };
+        let wire = empty.encode().expect("encode");
+        assert_eq!(HelloPayload::decode(&wire).expect("decode"), empty);
+
+        let over = HelloPayload {
+            pubkey: [1u8; PUBKEY_BYTES],
+            signature: [2u8; SIGNATURE_BYTES],
+            delegation: Bytes::from(vec![0u8; MAX_DELEGATION_WIRE_BYTES + 1]),
+            topics: Vec::new(),
+        };
+        assert_eq!(
+            over.encode(),
+            Err(FrameError::DelegationTooLarge {
+                len: MAX_DELEGATION_WIRE_BYTES + 1
+            }),
+            "the delegation is bounded at the wire boundary, before any parse"
+        );
+
+        // A declared length longer than the body is a truncation, not a
+        // silently-short delegation.
+        let mut truncated = wire.to_vec();
+        truncated[PUBKEY_BYTES + SIGNATURE_BYTES] = 0;
+        truncated[PUBKEY_BYTES + SIGNATURE_BYTES + 1] = 8;
+        assert_eq!(
+            HelloPayload::decode(&truncated),
             Err(FrameError::MetaTruncated)
         );
     }

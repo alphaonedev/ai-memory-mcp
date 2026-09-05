@@ -64,6 +64,19 @@ struct RawPeer {
 }
 
 impl RawPeer {
+    /// `Some(byte)` if the hub wrote ANYTHING, `None` on a clean EOF within the
+    /// timeout. Byte-level rather than frame-level so a malformed or partial
+    /// reply cannot pass as "nothing was sent".
+    async fn read_any_byte(&mut self) -> Option<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), self.stream.read(&mut byte)).await {
+            Ok(Ok(0) | Err(_)) | Err(_) => None,
+            Ok(Ok(_)) => Some(byte[0]),
+        }
+    }
+
+    #[allow(dead_code)]
     async fn read_frame(&mut self) -> Option<Frame> {
         use tokio::io::AsyncReadExt;
         let mut len = [0u8; 4];
@@ -92,18 +105,15 @@ async fn denied_wrong_peer_uid_is_refused_before_a_byte_is_read() {
         .await
         .expect("the socket accepts a connection");
     let mut peer = RawPeer { stream };
-    // The refusal is a 401 and then EOF — and critically the hub never sent the
-    // `hello` challenge, because it refused before reading or writing any
-    // protocol at all.
-    if let Some(first) = peer.read_frame().await {
-        assert_eq!(
-            first.kind,
-            Kind::Error,
-            "a denied peer gets an error, never a challenge"
-        );
-        let (code, _) = decode_error(&first.payload).expect("error payload");
-        assert_eq!(code, ErrorCode::Unauthorized.as_u16());
-    }
+    // NOT ONE BYTE. The accept loop reads credentials and authorizes BEFORE it
+    // takes a connection permit or writes anything, so an unauthorized peer
+    // gets silence and EOF — no `hello` challenge, and no `507` even when the
+    // hub is at its ceiling. A reply would confirm to an unauthorized caller
+    // that the hub is there.
+    assert!(
+        peer.read_any_byte().await.is_none(),
+        "a peer refused on kernel-attested credentials must receive NOTHING"
+    );
 
     let mut counters = hub.metrics.snapshot(0);
     for _ in 0..100 {
@@ -117,6 +127,94 @@ async fn denied_wrong_peer_uid_is_refused_before_a_byte_is_read() {
     assert_eq!(
         counters.frames_in, 0,
         "a denied peer's bytes are never parsed"
+    );
+    hub.stop().await;
+}
+
+/// Admits the first `admit` peers and refuses every later one, so a test can
+/// put the hub at its connection ceiling with legitimate peers and THEN present
+/// an unauthorized one.
+#[derive(Debug)]
+struct AdmitThenRefuse {
+    admit: usize,
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl ai_memory::wake_hub::identity::PeerAuthorizer for AdmitThenRefuse {
+    fn authorize(&self, _cred: ai_memory::wake_hub::identity::PeerCred) -> Result<(), DenyReason> {
+        let nth = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if nth < self.admit {
+            Ok(())
+        } else {
+            Err(DenyReason::PeerUidMismatch {
+                expected: 0,
+                got: 1,
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn denied_an_unauthorized_peer_at_the_ceiling_is_refused_on_credentials_not_capacity() {
+    // ORDERING REGRESSION. The accept loop must read credentials and authorize
+    // BEFORE taking a connection permit. With the old permit-first order, a
+    // hub sitting at its ceiling answered an UNAUTHORIZED peer with a `507`
+    // — telling a caller that failed the kernel-credential gate that the hub
+    // exists and is saturated, and doing so without ever looking at who it was.
+    let ceiling = ai_memory::wake_hub::limits::MIN_CONNECTION_CEILING;
+    let key_a = key(1);
+    let mut verifier = TestVerifier::new();
+    for index in 0..ceiling {
+        verifier.allow(&format!("agent-{index}"), &key_a);
+    }
+    let hub = Harness::start(
+        |hub_cfg: &mut HubConfig| {
+            hub_cfg.max_connections = ceiling;
+        },
+        Arc::new(verifier),
+        Arc::new(AdmitThenRefuse {
+            admit: ceiling,
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+
+    // Fill every permit with authorized, authenticated peers.
+    let mut held = Vec::new();
+    for index in 0..ceiling {
+        let mut client = hub.connect().await;
+        client.hello(&format!("agent-{index}"), &key_a, &[]).await;
+        assert_eq!(client.expect_frame().await.kind, Kind::Welcome);
+        held.push(client);
+    }
+    assert_eq!(hub.metrics.snapshot(0).connections_current, ceiling);
+
+    // Now an unauthorized peer arrives while the hub is full.
+    let stream = tokio::net::UnixStream::connect(&hub.socket)
+        .await
+        .expect("the listener still accepts");
+    let mut peer = RawPeer { stream };
+    assert!(
+        peer.read_any_byte().await.is_none(),
+        "an unauthorized peer must be refused on CREDENTIALS and told nothing — \
+         not handed a 507 that confirms the hub exists and is saturated"
+    );
+
+    let mut counters = hub.metrics.snapshot(0);
+    for _ in 0..100 {
+        if counters.denied_peer_cred > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        counters = hub.metrics.snapshot(0);
+    }
+    assert_eq!(
+        counters.denied_peer_cred, 1,
+        "the refusal must be attributed to the credential gate"
+    );
+    assert_eq!(
+        counters.denied_ceiling, 0,
+        "capacity must never be the reason an UNAUTHORIZED peer is turned away — \
+         that is the permit-first ordering this test exists to catch"
     );
     hub.stop().await;
 }

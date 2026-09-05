@@ -49,9 +49,24 @@ pub const MAX_ID_BYTES: usize = 128;
 /// seq_high_watermark}` at 256 bytes.
 pub const MAX_WAKE_META_BYTES: usize = 256;
 
-/// Maximum payload of ANY frame kind. `hello` is the largest (32-byte public
-/// key + 64-byte signature + the asserted topic list).
-pub const MAX_PAYLOAD_BYTES: usize = 1_024;
+/// Maximum payload of the handshake/subscription frame class
+/// (`hello` / `join` / `depart` / `subscribe` / `unsubscribe`).
+///
+/// 2026-09-03 (#3468, Fable-approved): raised 1_024 -> 1_536 to admit the
+/// scoped `a2a-hub/join/v1` delegation a `hello` now carries. At 1_024 the
+/// budget was 32-byte key + 64-byte signature + up to 521 bytes of topics,
+/// leaving ~15 bytes — not enough for a ~390-byte delegation, and shrinking
+/// the topic allowance instead would have made the wire depend on how many
+/// topics an agent happens to want. The routed classes are UNCHANGED: a
+/// `wake` still cannot exceed [`MAX_WAKE_META_BYTES`] and a `ping` still
+/// cannot exceed [`MAX_LIVENESS_PAYLOAD_BYTES`], so the fan-out envelope this
+/// governs did not move.
+pub const MAX_PAYLOAD_BYTES: usize = 1_536;
+
+/// Maximum payload of a liveness frame (`ping` / `pong`). Named rather than a
+/// bare literal at the match site so the hardcoded-literal gate has one
+/// definition to point at.
+pub const MAX_LIVENESS_PAYLOAD_BYTES: usize = 32;
 
 /// Absolute frame ceiling handed to `LengthDelimitedCodec::max_frame_length`.
 /// Derived, never hand-typed, so the codec bound and the field bounds cannot
@@ -76,6 +91,12 @@ pub const PUBKEY_BYTES: usize = 32;
 
 /// Length of an Ed25519 signature, in bytes.
 pub const SIGNATURE_BYTES: usize = 64;
+
+/// Maximum encoded size of the scoped `a2a-hub/join/v1` delegation a `hello`
+/// carries (#3468). Derived from the delegation's own element bounds:
+/// version(1) + principal(1+128) + scope(1+32) + delegate key(32)
+/// + hub id(1+64) + not_before(1+32) + not_after(1+32) + signature(64).
+pub const MAX_DELEGATION_WIRE_BYTES: usize = 1 + 129 + 33 + 32 + 65 + 33 + 33 + 64;
 
 /// Length of the content digest carried in `wake` metadata (SHA-256). A wake
 /// carries the DIGEST of the inbox body, never the body.
@@ -319,7 +340,7 @@ mod tests {
 
     #[test]
     fn max_frame_bytes_is_derived_from_the_field_bounds() {
-        assert_eq!(MAX_FRAME_BYTES, 24 + 256 + 1_024);
+        assert_eq!(MAX_FRAME_BYTES, 24 + 256 + 1_536);
         // Every per-kind payload bound must fit inside the codec ceiling.
         assert!(MAX_WAKE_META_BYTES <= MAX_PAYLOAD_BYTES);
         assert!(FRAME_HEADER_BYTES + (2 * MAX_ID_BYTES) + MAX_PAYLOAD_BYTES <= MAX_FRAME_BYTES);
@@ -327,12 +348,27 @@ mod tests {
 
     #[test]
     fn hello_payload_bound_admits_the_largest_legal_hello() {
-        let largest =
-            PUBKEY_BYTES + SIGNATURE_BYTES + 1 + MAX_TOPICS_PER_FRAME * (1 + MAX_TOPIC_BYTES);
+        // key + signature + the 2-byte-prefixed delegation + the topic list.
+        let largest = PUBKEY_BYTES
+            + SIGNATURE_BYTES
+            + 2
+            + MAX_DELEGATION_WIRE_BYTES
+            + 1
+            + MAX_TOPICS_PER_FRAME * (1 + MAX_TOPIC_BYTES);
         assert!(
             largest <= MAX_PAYLOAD_BYTES,
             "largest legal hello ({largest} B) must fit MAX_PAYLOAD_BYTES ({MAX_PAYLOAD_BYTES} B)"
         );
+    }
+
+    #[test]
+    fn raising_the_handshake_budget_did_not_widen_the_routed_classes() {
+        // #3468 raised MAX_PAYLOAD_BYTES for the handshake class only. The
+        // classes that actually fan out must not have moved with it, or the
+        // memory envelope the byte budgets bound would have silently grown.
+        assert_eq!(MAX_WAKE_META_BYTES, 256);
+        assert_eq!(MAX_LIVENESS_PAYLOAD_BYTES, 32);
+        assert!(MAX_WAKE_META_BYTES < MAX_PAYLOAD_BYTES);
     }
 
     #[test]
