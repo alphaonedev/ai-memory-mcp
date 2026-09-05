@@ -2847,6 +2847,49 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #3075 — apply a remote-origin PENDING-action row (`/sync/push`
+    /// `pendings[]`).
+    ///
+    /// The federated governance-queue injection lane: upsert the originator's
+    /// canonical row so replays and races converge on it. `pa.status` is
+    /// ALWAYS `"pending"` by the time an adapter sees it — the funnel refuses a
+    /// wire row claiming a terminal status (#2529), because decisions converge
+    /// through `pending_decisions[]` and a pre-decided injection would skip the
+    /// decision path entirely.
+    ///
+    /// ## Why this is not a generic "upsert pending" verb
+    ///
+    /// There is deliberately no caller-facing pending-upsert on this trait: a
+    /// pending row is an AUTHORITY REQUEST whose approval reaches
+    /// [`execute_pending_action`](MemoryStore::execute_pending_action) — an
+    /// arbitrary-namespace `insert` / `delete` / `promote` / `reflect`. The only
+    /// sanctioned producers are the governance gate
+    /// ([`enforce_governance_action`](MemoryStore::enforce_governance_action))
+    /// and THIS federated lane, which the funnel guards with the #1920
+    /// authorship gate, the #2529 status refusals and the #2478 effect-namespace
+    /// scope gate before calling it.
+    ///
+    /// Adapters MUST upsert on the primary key (idempotent on replay) and MUST
+    /// NOT apply an owner/tenant predicate — the peer-scope gate is the
+    /// authorization on this lane, exactly as on the sqlite receiver, whose
+    /// inline loop calls the owner-blind `db::upsert_pending_action`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; the caller counts an error as
+    /// `skipped` (an honest per-item non-ack), and the batch survives.
+    async fn apply_remote_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        _pa: &crate::models::PendingAction,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_PENDING_ACTION".to_string(),
+        })
+    }
+
     /// v1.0.0 #3075 / FED-RQ-01 (#1936) — apply a remote-origin resolved
     /// commit-checkpoint RESOLUTION (`/sync/push` `checkpoints[]`).
     ///

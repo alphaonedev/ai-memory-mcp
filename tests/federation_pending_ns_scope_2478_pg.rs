@@ -4,37 +4,47 @@
 //! #2478 (CWE-284) — POSTGRES twin of
 //! `tests/federation_pending_ns_scope_2478.rs`.
 //!
-//! ## What this file pins, and what it deliberately does NOT claim
+//! ## What changed at #3075
 //!
-//! On a postgres-backed receiver the federated governance lanes are
-//! STRUCTURALLY UNREACHABLE: `sync_push` hands the whole request to
-//! `federation_signing_check::sync_push_via_store` before the sqlite
-//! `pendings[]` / `pending_decisions[]` loops run, and that funnel buckets both
-//! subcollections into `unsupported_on_postgres` — it never calls
-//! `decide_pending_action`, `approve_with_approver_type`, or
-//! `execute_pending_action`. So there is no pg hole to confine, and the honest
-//! claim is narrow:
+//! This file used to record that the federated governance lanes were
+//! STRUCTURALLY UNREACHABLE on postgres — `sync_push_via_store` bucketed
+//! `pendings[]` / `pending_decisions[]` into `unsupported_on_postgres` and
+//! never called `approve_with_approver_type` or `execute_pending_action`, so
+//! there was "no pg hole to confine". That was TRUE and is now the description
+//! of a CLOSED coverage gap: #3075 lane L-PGP trait-covers both lanes, so a
+//! postgres receiver APPLIES federated governance rows and EXECUTES approved
+//! ones.
 //!
-//! > the FEDERATED `pendings[]` / `pending_decisions[]` subcollections never
-//! > reach a pending-execution path on postgres
+//! The two EXPLOIT cells below are therefore no longer "controls green by
+//! construction" — they are the live proof that the #2478 effect-namespace gate
+//! runs on postgres. Their security assertions are UNCHANGED (no row lands in
+//! the victim namespace; the out-of-scope victim row survives a
+//! pending-executed delete); only the disposition counters moved, from
+//! `unsupported_on_postgres` to a per-lane refusal.
 //!
-//! and NOT "pending execution is unreachable on postgres" — it IS reachable
-//! there through the LOCAL approve surfaces (`handlers::approvals`,
-//! `handlers::governance`), which are governed by local authz rather than peer
-//! scope and are out of scope for #2478.
+//! Three cells are ADDED so each direction is pinned:
 //!
-//! ## Why the file exists anyway (the #2488 lesson)
+//! * the APPLIED half — an in-scope pending is upserted and its approval
+//!   EXECUTES, landing the payload row (without it, the exploit cells would
+//!   also pass on the pre-#3075 funnel that applied nothing at all);
+//! * the #2529 refusal — a wire row claiming a TERMINAL status is refused, so a
+//!   peer cannot inject a pre-approved row and skip the decision path;
+//! * the #2529 clobber refusal — a replay cannot overwrite a locally-DECIDED
+//!   row.
+//!
+//! The claim stays narrow in the other direction: this is about the FEDERATED
+//! subcollections. Pending execution is ALSO reachable through the LOCAL
+//! approve surfaces (`handlers::approvals`, `handlers::governance`), which are
+//! governed by local authz rather than peer scope and are out of scope here.
+//!
+//! ## Why the file exists (the #2488 lesson)
 //!
 //! #2488/#2491 were the same two lines on the two funnels breaking in OPPOSITE
-//! directions, undetected, because only one backend was covered. These cells
-//! turn "postgres is structurally safe here" from a comment into an executable
-//! assertion, so a future change that trait-covers these subcollections cannot
-//! quietly open the lane on the backend nobody was watching. They are CONTROLS:
-//! green at the parent commit by design, exactly like the #2497 pg controls.
-//!
-//! The disposition is also asserted to be HONEST, not merely safe:
-//! `unsupported_on_postgres > 0` is a sender-side non-ack, so the origin learns
-//! the governance rows did not replicate rather than being told they did.
+//! directions, undetected, because only one backend was covered. The verdict is
+//! now SHARED by construction —
+//! `federation_receive::pending_namespaces_authorized_resolved` is called by
+//! both funnels, which differ only in HOW a stored namespace is read — and
+//! these cells keep that honest end-to-end.
 //!
 //! Gated on `feature = "sal-postgres"` + a runtime `AI_MEMORY_TEST_POSTGRES_URL`
 //! soft-skip. Deliberately NOT `#[ignore]`: the PR postgres job does not pass
@@ -267,13 +277,15 @@ fn counter(report: &Value, key: &str) -> i64 {
 }
 
 // ---------------------------------------------------------------------
-// CONTROL — the EXACT sqlite exploit shape, replayed at a postgres-backed
+// EXPLOIT — the EXACT sqlite exploit shape, replayed at a postgres-backed
 // receiver: an in-scope declared namespace carrying an out-of-scope payload
-// namespace, plus its approval, in one push.
+// namespace, plus its approval, in one push. Since #3075 this is a LIVE
+// exploit cell against a lane that really applies, not a control against a
+// lane that applied nothing.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn federated_pending_store_is_unsupported_on_postgres_2478() {
+async fn federated_pending_store_refused_out_of_scope_on_postgres_2478() {
     let Some(url) = pg_url() else {
         eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
@@ -331,22 +343,29 @@ async fn federated_pending_store_is_unsupported_on_postgres_2478() {
         "#2478 pg: the federated governance lanes must not land a row in a \
          namespace outside the peer's scope. Report: {report}"
     );
-    assert!(
-        counter(&report, "unsupported_on_postgres") >= 2,
-        "#2478 pg: both the pending AND its decision must be reported \
-         `unsupported_on_postgres` — that counter is a sender-side NON-ACK, so \
-         the origin learns the governance rows did not replicate instead of \
-         being told they did. A silent drop would be the #2491 class. \
+    assert_eq!(
+        counter(&report, "pendings_applied"),
+        0,
+        "#2478 pg: the out-of-scope injection must be REFUSED, not upserted. \
          Report: {report}"
     );
     assert_eq!(
         counter(&report, "pending_decisions_applied"),
-        -1,
-        "#2478 pg: the postgres funnel does not even emit a \
-         `pending_decisions_applied` counter, because it never runs that loop. \
-         If this key appears, the lane has been trait-covered and MUST be routed \
-         through `federation_receive::pending_namespaces_authorized` first. \
-         Report: {report}"
+        0,
+        "#2478 pg: and its approval must not execute. The counter now EXISTS \
+         (#3075 trait-covered the lane) — the assertion is that it stays zero \
+         for an out-of-scope effect namespace. Report: {report}"
+    );
+    assert!(
+        counter(&report, "skipped") >= 1,
+        "#2478 pg: the refusal must be sender-visible, never a silent drop — \
+         the #2491 class. Report: {report}"
+    );
+    assert_eq!(
+        counter(&report, "unsupported_on_postgres"),
+        0,
+        "#3075: the governance lanes no longer bucket as unsupported; a \
+         refusal is now reported per-lane. Report: {report}"
     );
 }
 
@@ -403,5 +422,224 @@ async fn federated_pending_delete_cannot_erase_out_of_scope_row_on_postgres_2478
         0,
         "#2478 pg: nothing was destroyed, so the envelope must not claim \
          otherwise. Report: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// #3075 — the APPLIED half. Without it every cell above would also pass
+// on the pre-#3075 funnel, which applied nothing at all.
+// ---------------------------------------------------------------------
+
+/// Register `agent_id` so the pg Human approve arm's registered-approver check
+/// (#1793/#3448) admits it. The gate is deliberately unconditional on the
+/// postgres approval surface, so an unregistered decider is refused there even
+/// when everything else is in order — which is why this cell registers one
+/// rather than reaching for a bypass.
+async fn register_approver(store: &Arc<dyn MemoryStore>, agent_id: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    store
+        .register_agent(
+            &admin_ctx(),
+            &ai_memory::models::AgentRegistration {
+                agent_id: agent_id.to_string(),
+                agent_type: "nhi".to_string(),
+                capabilities: Vec::new(),
+                registered_at: now.clone(),
+                last_seen_at: now,
+            },
+        )
+        .await
+        .expect("register approver");
+}
+
+/// An IN-SCOPE federated pending is upserted, and its approval EXECUTES on a
+/// postgres receiver: the payload row lands. Every gate in the chain runs — the
+/// #1920 authorship gate, the #2529 status checks, the #2478 effect-namespace
+/// verdict, the hardened `approve_with_approver_type` (self-approval refusal +
+/// registered approver) — and the row is the proof they all passed.
+#[tokio::test]
+async fn federated_pending_applies_and_executes_in_scope_on_postgres_3075() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let public_root = uniq("public-3075");
+    let in_scope_ns = format!("{public_root}/ok");
+    set_scoped_posture(&public_root);
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+
+    let approver = uniq("ai:approver-3075");
+    register_approver(&store, &approver).await;
+
+    let pid = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = json!({
+        "id": pid,
+        "action_type": "store",
+        "memory_id": null,
+        "namespace": in_scope_ns,
+        "payload": {
+            "id": uuid::Uuid::new_v4().to_string(),
+            "tier": "long",
+            "namespace": in_scope_ns,
+            "title": uniq("governed write via federated pending"),
+            "content": "must LAND on a postgres receiver (#3075)",
+            "tags": [],
+            "priority": 5,
+            "confidence": 1.0,
+            "source": "api",
+            "access_count": 0,
+            "created_at": now,
+            "updated_at": now,
+            "metadata": {"agent_id": PEER_ID},
+            "reflection_depth": 0,
+            "memory_kind": "observation",
+        },
+        "requested_by": PEER_ID,
+        "requested_at": now,
+        "status": "pending",
+        "decided_by": null,
+        "decided_at": null,
+        "approvals": []
+    });
+    let decision = json!({ "id": pid, "approved": true, "decider": approver });
+
+    let (status, report) = push_governance(&router, vec![entry], vec![decision]).await;
+    assert!(status.is_success(), "{report}");
+    assert_eq!(
+        counter(&report, "pendings_applied"),
+        1,
+        "#3075: the in-scope pending must be upserted on pg: {report}"
+    );
+    assert_eq!(
+        counter(&report, "pending_decisions_applied"),
+        1,
+        "#3075: and its approval must apply: {report}"
+    );
+    assert_eq!(
+        count_ns(&pool, &in_scope_ns).await,
+        1,
+        "#3075: the approved pending must EXECUTE and land its payload row on a \
+         postgres receiver: {report}"
+    );
+    assert_eq!(counter(&report, "unsupported_on_postgres"), 0, "{report}");
+}
+
+/// #2529 — a wire row claiming a TERMINAL status is refused, so a peer cannot
+/// inject a pre-approved governance row and skip the decision path entirely.
+/// Asserted on the pg funnel because the refusal is the funnel's, not the
+/// store's — though the upsert SQL hard-codes `status = 'pending'` as a second,
+/// independent layer.
+#[tokio::test]
+async fn federated_pending_with_terminal_status_refused_on_postgres_2529() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let public_root = uniq("public-2529");
+    let in_scope_ns = format!("{public_root}/ok");
+    set_scoped_posture(&public_root);
+    let (router, _store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+
+    let pid = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = json!({
+        "id": pid,
+        "action_type": "store",
+        "memory_id": null,
+        "namespace": in_scope_ns,
+        "payload": {},
+        "requested_by": PEER_ID,
+        "requested_at": now,
+        // The whole point: a peer claiming the row is ALREADY approved.
+        "status": "approved",
+        "decided_by": PEER_ID,
+        "decided_at": now,
+        "approvals": []
+    });
+
+    let (status, report) = push_governance(&router, vec![entry], vec![]).await;
+    assert!(status.is_success(), "the batch survives: {report}");
+    assert_eq!(
+        counter(&report, "pendings_applied"),
+        0,
+        "#2529: a pre-decided injection must be refused on pg: {report}"
+    );
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_actions WHERE id = $1")
+        .bind(&pid)
+        .fetch_one(&pool)
+        .await
+        .expect("count pending row");
+    assert_eq!(
+        n, 0,
+        "#2529: and no governance row may exist for it: {report}"
+    );
+}
+
+/// #2529 — the CLOBBER half: a replay must not overwrite a row this node has
+/// already DECIDED. The funnel refuses on the locally-probed status, and the
+/// upsert's `ON CONFLICT ... WHERE status = 'pending'` clause refuses again
+/// underneath it, so neither layer is load-bearing alone.
+#[tokio::test]
+async fn federated_pending_cannot_clobber_decided_row_on_postgres_2529() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let public_root = uniq("public-2529c");
+    let in_scope_ns = format!("{public_root}/ok");
+    set_scoped_posture(&public_root);
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+
+    let pid = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = json!({
+        "id": pid,
+        "action_type": "store",
+        "memory_id": null,
+        "namespace": in_scope_ns,
+        "payload": {},
+        "requested_by": PEER_ID,
+        "requested_at": now,
+        "status": "pending",
+        "decided_by": null,
+        "decided_at": null,
+        "approvals": []
+    });
+    let (status, report) = push_governance(&router, vec![entry.clone()], vec![]).await;
+    assert!(status.is_success(), "{report}");
+    assert_eq!(counter(&report, "pendings_applied"), 1, "{report}");
+
+    // Decide it LOCALLY (the surface a pg deployment really uses).
+    store
+        .pending_decide(&admin_ctx(), &pid, false, "ai:local-operator")
+        .await
+        .expect("local decide");
+
+    // A replay of the same wire row must not resurrect it.
+    let (status, report) = push_governance(&router, vec![entry], vec![]).await;
+    assert!(status.is_success(), "the batch survives: {report}");
+    assert_eq!(
+        counter(&report, "pendings_applied"),
+        0,
+        "#2529: a replay must not clobber a locally-decided row: {report}"
+    );
+    let (st,): (String,) = sqlx::query_as("SELECT status FROM pending_actions WHERE id = $1")
+        .bind(&pid)
+        .fetch_one(&pool)
+        .await
+        .expect("read status");
+    assert_eq!(
+        st, "rejected",
+        "the local decision must survive the replay: {report}"
     );
 }

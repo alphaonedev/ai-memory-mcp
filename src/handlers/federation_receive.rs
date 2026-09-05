@@ -1574,6 +1574,121 @@ pub(super) fn pending_namespaces_authorized(
     peer_id: Option<&str>,
     require_push_namespace_scope: bool,
 ) -> bool {
+    // #3075 — the SQLITE reader half. The DECISION lives once in
+    // [`pending_namespaces_authorized_resolved`]; this wrapper only supplies
+    // the by-id namespace probes, through the same unscoped scalar accessor the
+    // inline receive loops use. The elision below is why the probe list is
+    // built here rather than inside the verdict: when Layer 1 is unarmed no
+    // stored namespace can change the outcome, so a zero-config deployment must
+    // pay ZERO extra reads.
+    let probes: Vec<(&str, ProbedNamespace)> =
+        if pending_scope_needs_by_id_probe(peer_id, attest_cfg) {
+            pending_scope_by_id_targets(pa)
+                .into_iter()
+                .map(|memory_id| {
+                    let probed = match db::namespace_by_id(conn, memory_id) {
+                        Ok(Some(namespace)) => ProbedNamespace::Resolved(namespace),
+                        Ok(None) => ProbedNamespace::Absent,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: ATTESTATION_TRACE_TARGET,
+                                pending_id = %pa.id,
+                                memory_id = %memory_id,
+                                error = %e,
+                                "sync_push: pending by-id namespace probe failed (#2478 \
+                                 fail-closed)"
+                            );
+                            ProbedNamespace::Unresolvable
+                        }
+                    };
+                    (memory_id, probed)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    pending_namespaces_authorized_resolved(
+        base_lane,
+        pa,
+        stored_pending_namespace,
+        &probes,
+        attest_cfg,
+        peer_id,
+        require_push_namespace_scope,
+    )
+}
+
+/// The `pending_actions.status` value of an UNDECIDED governance row.
+///
+/// #3075 — one SSOT for the #2529 refusals, which the sqlite receive loop and
+/// the postgres funnel both make: a wire row claiming a TERMINAL status is
+/// refused, and a locally-DECIDED row is never clobbered by a replay. Two
+/// spellings of "pending" that could drift is exactly how one backend would
+/// start accepting an injection the other refuses.
+pub(super) const PENDING_STATUS_PENDING: &str = "pending";
+
+/// #3075 — one by-id namespace probe's resolution, as fed to
+/// [`pending_namespaces_authorized_resolved`].
+///
+/// Three states, not two, and the distinction is load-bearing: `Absent` is
+/// "provably no local row" (nothing in any namespace to protect, so the gate
+/// has no subject and must not manufacture a refusal), while `Unresolvable` is
+/// a read fault the verdict MUST fail closed on. Collapsing them is the
+/// #2497 defect shape.
+pub(super) enum ProbedNamespace {
+    /// Provably no local row with this id.
+    Absent,
+    /// The row's stored namespace.
+    Resolved(String),
+    /// The probe could not be answered — fail CLOSED.
+    Unresolvable,
+}
+
+/// #3075 — the memory ids a pending action's EXECUTION would touch by id, so a
+/// backend can pre-resolve their stored namespaces for
+/// [`pending_namespaces_authorized_resolved`]. Empty when the `action_type` is
+/// unknown; the verdict itself default-denies that case.
+#[must_use]
+pub(super) fn pending_scope_by_id_targets(pa: &crate::models::PendingAction) -> Vec<&str> {
+    pending_action_effect(pa)
+        .map(|e| e.by_id)
+        .unwrap_or_default()
+}
+
+/// #3075 — whether a caller must run the by-id probes at all. Mirrors the
+/// #2488 ELISION exactly: Layer 1 unarmed ⇒ no stored namespace can change the
+/// verdict, so probing would be pure cost.
+#[must_use]
+pub(super) fn pending_scope_needs_by_id_probe(
+    peer_id: Option<&str>,
+    attest_cfg: &PeerAttestationConfig,
+) -> bool {
+    crate::federation::receive_auth::peer_declares_namespace_scope(peer_id, attest_cfg)
+}
+
+/// #3075 — the #2478 pending-scope DECISION, fed pre-resolved by-id probes.
+///
+/// Split out of [`pending_namespaces_authorized`] so the POSTGRES federation
+/// funnel renders the IDENTICAL verdict rather than growing a second
+/// implementation: the two backends differ only in HOW a stored namespace is
+/// read (`db::namespace_by_id` vs `MemoryStore::namespace_by_id`), never in what
+/// the answer means. That is the #2488 lesson — the delete lane broke in
+/// OPPOSITE directions on the two funnels because each carried its own copy of
+/// the gate.
+///
+/// A by-id target with NO entry in `probes` is treated as
+/// [`ProbedNamespace::Unresolvable`] (fail CLOSED), so a caller that forgets to
+/// probe refuses rather than passes.
+#[must_use]
+pub(super) fn pending_namespaces_authorized_resolved(
+    base_lane: &str,
+    pa: &crate::models::PendingAction,
+    stored_pending_namespace: Option<&str>,
+    probes: &[(&str, ProbedNamespace)],
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
     use crate::federation::receive_auth::{
         LANE_PENDING_DECISION_DELETE, LANE_PENDING_DECISIONS, inbound_by_id_namespace_authorized,
         inbound_write_namespace_authorized, peer_declares_namespace_scope,
@@ -1640,24 +1755,42 @@ pub(super) fn pending_namespaces_authorized(
     }
 
     // Existing rows the execution destroys, mutates, or derives from. The probe
-    // is the SCALAR `db::namespace_by_id`: `db::get` maps through
-    // `row_to_memory`'s fail-closed at-rest decrypt, which would make a row with
-    // an unopenable envelope permanently un-actionable by federation (#2497).
+    // is the SCALAR by-id namespace projection on both backends, never a
+    // full-row `get`: the full-row mappers are pinned to a fail-closed at-rest
+    // decrypt, which would make a row with an unopenable envelope permanently
+    // un-actionable by federation (#2497).
     for memory_id in effect.by_id {
-        let stored = match db::namespace_by_id(conn, memory_id) {
-            Ok(Some(namespace)) => namespace,
+        let probed = probes
+            .iter()
+            .find(|(id, _)| *id == memory_id)
+            .map(|(_, p)| p);
+        match probed {
+            Some(ProbedNamespace::Resolved(stored)) => {
+                if !inbound_by_id_namespace_authorized(
+                    lane,
+                    memory_id,
+                    Some(stored.as_str()),
+                    attest_cfg,
+                    peer_id,
+                    require_push_namespace_scope,
+                ) {
+                    return false;
+                }
+            }
             // Provably no such local row — there is nothing in any namespace to
             // protect. The arm itself is then a no-op (`delete`) or errors
             // downstream (`promote` / `reflect`); either way this gate has no
             // subject and must not manufacture a refusal.
-            Ok(None) => continue,
-            Err(e) => {
+            Some(ProbedNamespace::Absent) => continue,
+            // An unresolvable probe, or a caller that did not probe at all.
+            // Both fail CLOSED: reporting either as "provably no local row" is
+            // exactly the input the stored-vs-claimed bypass needs.
+            Some(ProbedNamespace::Unresolvable) | None => {
                 tracing::warn!(
                     target: ATTESTATION_TRACE_TARGET,
                     pending_id = %pa.id,
                     memory_id = %memory_id,
                     cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
-                    error = %e,
                     "sync_push: refusing federated {lane} entry — a row its execution would \
                      touch has an UNRESOLVABLE namespace on this node, so the scope gate \
                      cannot decide (#2478 fail-closed). Investigate the storage error rather \
@@ -1665,16 +1798,6 @@ pub(super) fn pending_namespaces_authorized(
                 );
                 return false;
             }
-        };
-        if !inbound_by_id_namespace_authorized(
-            lane,
-            memory_id,
-            Some(&stored),
-            attest_cfg,
-            peer_id,
-            require_push_namespace_scope,
-        ) {
-            return false;
         }
     }
 
@@ -3372,7 +3495,7 @@ pub async fn sync_push(
         // governance rows. Decisions converge through `pending_decisions[]`.
         // Refuse wire rows that already claim a terminal status, so a peer
         // cannot inject a pre-approved/rejected row and skip the decision path.
-        if pa.status != "pending" {
+        if pa.status != PENDING_STATUS_PENDING {
             tracing::warn!(
                 target: ATTESTATION_TRACE_TARGET,
                 pending_id = %pa.id,
@@ -3424,7 +3547,7 @@ pub async fn sync_push(
         // #2529 — a locally DECIDED pending is terminal from the wire's view.
         // Refuse resurrection / clobber of decided_by / approvals / status.
         if let Some(ref existing) = local_pending {
-            if existing.status != "pending" {
+            if existing.status != PENDING_STATUS_PENDING {
                 tracing::warn!(
                     target: ATTESTATION_TRACE_TARGET,
                     pending_id = %pa.id,
@@ -3486,7 +3609,7 @@ pub async fn sync_push(
                 // event; that's the documented K4 behaviour and matches
                 // the existing `pending_action_expired` semantics. K7
                 // (subscription reliability) layers DLQ + dedup on top.
-                if pa.status == "pending" {
+                if pa.status == PENDING_STATUS_PENDING {
                     crate::subscriptions::dispatch_approval_requested(&lock.0, &pa.id, &lock.1);
                 }
             }

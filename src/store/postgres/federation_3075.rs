@@ -322,3 +322,68 @@ fn is_unique_violation(err: &super::StoreError) -> bool {
 
 /// SQLSTATE `23505` — `unique_violation`.
 const PG_UNIQUE_VIOLATION_SQLSTATE: &str = "23505";
+
+/// The federated pending-action UPSERT — the postgres twin of
+/// `db::upsert_pending_action`, clause for clause.
+///
+/// The three properties that make it safe are all in the SQL, not in the
+/// caller, so no future call site can drop one:
+///
+/// * the INSERT hard-codes `status = 'pending'`, `decided_by`/`decided_at` NULL
+///   and `approvals = '[]'` — a wire row can never inject a pre-DECIDED
+///   governance action (#2529), independently of the funnel's own status check;
+/// * the `ON CONFLICT` arm updates ONLY while the LOCAL row is still `pending`,
+///   so a peer replay cannot clobber a decision this node already made;
+/// * and only when `requested_by` matches, so one peer cannot rewrite another
+///   requester's queued action by id.
+const SQL_UPSERT_REMOTE_PENDING_ACTION: &str = "INSERT INTO pending_actions \
+        (id, action_type, memory_id, namespace, payload, requested_by, \
+         requested_at, status, decided_by, decided_at, approvals) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NULL, NULL, '[]'::jsonb) \
+     ON CONFLICT (id) DO UPDATE SET \
+        action_type  = EXCLUDED.action_type, \
+        memory_id    = EXCLUDED.memory_id, \
+        namespace    = EXCLUDED.namespace, \
+        payload      = EXCLUDED.payload, \
+        requested_by = EXCLUDED.requested_by, \
+        requested_at = EXCLUDED.requested_at \
+     WHERE pending_actions.status = 'pending' \
+       AND pending_actions.requested_by = EXCLUDED.requested_by";
+
+impl PostgresStore {
+    /// #3075 — see [`crate::store::MemoryStore::apply_remote_pending_action`].
+    ///
+    /// `pending_actions.requested_at` is `TIMESTAMPTZ` on postgres while the
+    /// wire (and sqlite) carry an RFC3339 string, so it is PARSED here. An
+    /// unparseable stamp is REFUSED (`InvalidInput`, counted `skipped` by the
+    /// funnel) rather than silently replaced with `now()`: substituting a
+    /// timestamp would make the two backends disagree about when a governance
+    /// request was raised, and `requested_at` is what the K2 timeout sweep and
+    /// every audit reading of the queue order by.
+    pub(super) async fn apply_remote_pending_action_pg(
+        &self,
+        pa: &crate::models::PendingAction,
+    ) -> StoreResult<()> {
+        self.gate_record_stop().await?;
+        let requested_at = chrono::DateTime::parse_from_rfc3339(&pa.requested_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| super::StoreError::InvalidInput {
+                detail: format!(
+                    "federated pending action {} carries an unparseable requested_at {:?}: {e}",
+                    pa.id, pa.requested_at
+                ),
+            })?;
+        sqlx::query(SQL_UPSERT_REMOTE_PENDING_ACTION)
+            .bind(&pa.id)
+            .bind(&pa.action_type)
+            .bind(&pa.memory_id)
+            .bind(&pa.namespace)
+            .bind(&pa.payload)
+            .bind(&pa.requested_by)
+            .bind(requested_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("apply_remote_pending_action", e))?;
+        Ok(())
+    }
+}

@@ -1587,6 +1587,20 @@ impl MemoryStore for SqliteStore {
         db::delete(&conn, id).map_err(box_err)
     }
 
+    /// #3075 — delegates VERBATIM to `db::upsert_pending_action`, the free
+    /// function the sqlite `/sync/push` `pendings[]` loop has always called.
+    /// Owner-BLIND by trait contract: the peer-scope gate (#2478) plus the
+    /// #1920 authorship gate are the authorization on this lane.
+    async fn apply_remote_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        pa: &crate::models::PendingAction,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::upsert_pending_action(&conn, pa).map_err(box_err)
+    }
+
     /// #3075 / FED-RQ-01 — delegates VERBATIM to
     /// [`crate::checkpoints::apply_inbound_resolution`], the free function the
     /// sqlite `/sync/push` `checkpoints[]` loop has always called. The reserved-

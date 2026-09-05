@@ -24901,6 +24901,16 @@ impl MemoryStore for PostgresStore {
 
     /// `_ctx` is deliberately discarded — see the trait doc on
     /// [`MemoryStore::apply_remote_deletion`] (#2488).
+    /// #3075 — delegated to `postgres/federation_3075.rs`. Owner-BLIND by trait
+    /// contract; the #1920 authorship + #2478 scope gates are the authorization.
+    async fn apply_remote_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        pa: &crate::models::PendingAction,
+    ) -> StoreResult<()> {
+        self.apply_remote_pending_action_pg(pa).await
+    }
+
     /// #3075 / FED-RQ-01 — delegated to `postgres/federation_3075.rs`. The
     /// receiver NEVER re-signs; the sender's attestation is persisted verbatim.
     async fn apply_remote_checkpoint_resolution(

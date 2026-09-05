@@ -1050,11 +1050,14 @@ within FP tolerance.)
 ### Federation subcollection coverage on a PostgreSQL receiver
 
 When a PostgreSQL-backed daemon is the **receiver** on a federated
-`/sync/push`, each subcollection is either **APPLIED** (trait-covered:
-the postgres funnel runs the same `receive_auth` verdict the sqlite
-funnel runs, then writes through the `MemoryStore` trait) or bucketed as
-an **honest, sender-visible non-ack** (`unsupported_on_postgres` in the
-push response) — never a silent drop, never a partial apply.
+`/sync/push`, **every** subcollection is now **APPLIED** — trait-covered,
+with the postgres funnel running the SAME `receive_auth` verdict the
+sqlite funnel runs before writing through the `MemoryStore` trait
+([#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)
+completed the migration). The `unsupported_on_postgres` field remains on
+the wire and reports **0**: it is the honest, sender-visible non-ack
+counter, and a future subcollection that lands without a postgres apply
+must report itself there rather than being silently dropped.
 
 | Subcollection | Federated lane | Postgres receiver | Tracked |
 |---|---|---|---|
@@ -1063,13 +1066,13 @@ push response) — never a silent drop, never a partial apply.
 | `links` | Link replication | **applied** | — |
 | `signals` | Signed inter-agent signals | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
 | `action_transitions` | Coordination-action CAS | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
+| `pendings` | Governance PENDING-action broadcast | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) / [#2529](https://github.com/alphaonedev/ai-memory-mcp/issues/2529) |
+| `pending_decisions` | Governance pending-DECISION broadcast | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) / [#2532](https://github.com/alphaonedev/ai-memory-mcp/issues/2532) |
 | `checkpoints` | Federated commit-checkpoint RESOLUTION (the separation-of-duties freeze anchor) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) / FED-RQ-01 [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936) |
 | `archives` | Archive fanout (soft move into `archived_memories`) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
 | `restores` | Restore fanout (archive -> live) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) / [#1848](https://github.com/alphaonedev/ai-memory-mcp/issues/1848) |
 | `namespace_meta` | Governance-STANDARD (namespace-standard rebind) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
 | `namespace_meta_clears` | Governance-STANDARD clear | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
-| `pendings` | Governance PENDING-action broadcast | `unsupported_on_postgres` | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
-| `pending_decisions` | Governance pending-DECISION broadcast | `unsupported_on_postgres` | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
 
 What this means for an operator:
 
@@ -1096,31 +1099,28 @@ What this means for an operator:
   `signature` / `resolver_pubkey` are persisted verbatim, which is what keeps
   the freeze anchor verifiable downstream. Counters: `checkpoints_applied` /
   `checkpoints_conflicted`.
-- **A non-ack lane reports non-ack; it does NOT silently drop.** The
-  disposition is **refuse-to-apply and honest** — the sender sees a
-  non-zero `unsupported_on_postgres` count for the batch, so a
-  heterogeneous federation never mistakes "not applied" for "applied"
-  (data-integrity North Star: fail closed, disclose, never corrupt).
-  This is not bypassable by an inbound peer.
+  The governance-QUEUE lanes carry the #2529 status refusals (a wire row
+  claiming a terminal status is refused; a replay cannot clobber a
+  locally-decided row), the #1920 authorship gate, the #2478
+  effect-namespace gate (whose subject is the UNION of every namespace the
+  EXECUTION would touch, not the row's declared namespace), the #3278
+  payload secret screen, the hardened `approve_with_approver_type` on the
+  APPROVE arm, and the #2720 decider rebinding on the REJECT arm.
+  Counters: `pendings_applied` / `pending_decisions_applied`.
+- **A refusal is reported, never silently dropped.** Every gate's refusal
+  increments a sender-visible counter (`skipped`, or the additive
+  `namespace_meta_refused`), so a heterogeneous federation never mistakes
+  "not applied" for "applied" (data-integrity North Star: fail closed,
+  disclose, never corrupt). This is not bypassable by an inbound peer.
 - **Single-node deployments and sqlite-receiver deployments are
-  unaffected.** Every lane applies fully on a sqlite-backed receiver and
-  on the MCP / epoch-apply-native local paths. The remaining gap is the
-  postgres-*receiver* federation lane ONLY — the same governance and
-  checkpoint operations remain fully reachable on a postgres daemon
-  through its LOCAL surfaces (governed by local authz rather than peer
-  scope).
-- **The receive-side signature/authority gates still hold on every
-  lane.** A still-unsupported lane refuses-to-apply rather than writes, so no
-  unverified inbound pending execution can land on a postgres receiver — a safe
-  coverage gap, not a security regression.
-
-Postgres-receiver replication of the remaining lanes (a trait-covered
-`apply_remote_*` write per lane, routed through the existing
-backend-blind `receive_auth` verdicts) continues under
-[#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075).
-Operators who need multi-node federated replication of a subcollection
-still marked `unsupported_on_postgres` should pin a sqlite-backed
-receiver for the affected namespaces.
+  unaffected.** Every lane applies on both backends, and the same
+  governance and checkpoint operations also remain reachable on a
+  postgres daemon through its LOCAL surfaces (governed by local authz
+  rather than peer scope).
+- **The receive-side signature/authority gates hold on every lane, on
+  both backends.** They are the SAME shared `receive_auth` verdicts — a
+  postgres receiver does not carry a second implementation that could
+  drift from the sqlite one.
 
 ## Performance notes
 
