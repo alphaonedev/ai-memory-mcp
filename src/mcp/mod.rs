@@ -509,7 +509,7 @@ mod link;
 #[path = "tools/list.rs"]
 mod list;
 #[path = "tools/load_family.rs"]
-mod load_family;
+pub(crate) mod load_family;
 #[path = "tools/namespace.rs"]
 mod namespace;
 #[path = "tools/notify.rs"]

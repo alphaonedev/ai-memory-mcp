@@ -215,7 +215,7 @@ async fn smart_load_http_via_store(
     let (family, score, source) = crate::mcp::pick_family_for_intent(intent, embedder);
     let family_name = family.name();
     tracing::info!(
-        target: "memory_smart_load",
+        target: crate::mcp::load_family::SMART_LOAD_LOG_TARGET,
         chosen_family = family_name,
         score = score,
         source = source,

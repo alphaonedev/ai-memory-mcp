@@ -35,6 +35,15 @@ pub struct LoadFamilyRequest {
 
 /// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_load_family`.
 #[allow(dead_code)]
+/// `tracing` target for the `memory_smart_load` routing decision, bound to the
+/// tool-name SSOT rather than repeating the string.
+///
+/// Both emit sites — the sqlite `forward_to_load_family` and the postgres
+/// `handlers::route_1111::smart_load_http_via_store` — reference this const, so
+/// the log target cannot drift from the wire tool name and the literal is not
+/// scattered across production sites (pm-v3.1 / the hardcoded-literal gate).
+pub(crate) const SMART_LOAD_LOG_TARGET: &str = crate::mcp::registry::tool_names::MEMORY_SMART_LOAD;
+
 pub struct LoadFamilyTool;
 
 impl McpTool for LoadFamilyTool {
@@ -506,7 +515,7 @@ fn forward_to_load_family(
 ) -> Result<Value, String> {
     let family_name = family.name();
     tracing::info!(
-        target: "memory_smart_load",
+        target: SMART_LOAD_LOG_TARGET,
         chosen_family = family_name,
         score = score,
         source = source,

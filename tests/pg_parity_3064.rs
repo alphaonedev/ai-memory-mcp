@@ -70,6 +70,15 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
 /// daemon opens one even on postgres — see `src/daemon_runtime.rs`), and the
 /// `store` + `storage_backend` pair is what selects the backend a
 /// SAL-dispatching handler actually reads.
+#[cfg_attr(
+    not(feature = "sal"),
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "`SalStore` is a ZST without `sal`, but under `sal` its inner \
+                  `Arc<dyn MemoryStore>` is MOVED into the struct literal below; \
+                  one signature keeps both feature legs building identically."
+    )
+)]
 fn app_state_with(db: Db, backend: StorageBackend, store: SalStore) -> AppState {
     // #1570 — model an AUTHENTICATED deployment (api_key configured at boot)
     // so the admin-gated routes admit the fixture's header role-claims.
@@ -242,6 +251,9 @@ async fn store_memory(
     v["id"].as_str().expect("stored id").to_string()
 }
 
+/// Only the `sal`-gated F1 family builds a link chain (no other family needs
+/// graph edges), so this helper carries the same gate.
+#[cfg(feature = "sal")]
 async fn link(client: &reqwest::Client, base: &str, source: &str, target: &str) {
     let resp = client
         .post(format!("{base}/api/v1/links"))
@@ -262,6 +274,7 @@ async fn link(client: &reqwest::Client, base: &str, source: &str, target: &str) 
 
 /// Drive both the bare alias and its canonical twin over one daemon and
 /// return `(alias_status, alias_body, kg_status, kg_body, denied_status)`.
+#[cfg(feature = "sal")]
 async fn f1_exercise(base: &str) -> (u16, Value, u16, Value, u16) {
     let client = pg_test_client(OWNER_AGENT);
     let ns = format!("f1-find-paths-{}", uuid::Uuid::new_v4());
@@ -309,10 +322,13 @@ async fn f1_exercise(base: &str) -> (u16, Value, u16, Value, u16) {
 /// `postgres_endpoint_supported`, so a postgres daemon answered 501 for a
 /// route whose twin it already served.
 ///
-/// `sal`-gated on BOTH backends: `handlers::kg_find_paths` is compiled out
-/// without the feature and answers `find_paths requires --features sal`, so
-/// there is no default-feature behaviour to pin for this family (the other
-/// families in this file DO run on the default-feature leg).
+/// This is the ONE family whose sqlite leg is `sal`-gated:
+/// `handlers::kg_find_paths` is compiled out without the feature and answers
+/// `find_paths requires --features sal`, so there is no default-feature
+/// behaviour to pin. F2 / F3 / F5's sqlite legs deliberately are NOT gated —
+/// their handlers' sqlite paths compile in the default build, so the
+/// default-feature CI leg exercises them for real instead of reporting a
+/// vacuous `running 0 tests`.
 #[cfg(feature = "sal")]
 #[tokio::test(flavor = "multi_thread")]
 async fn f1_find_paths_alias_matches_kg_find_paths_sqlite() {
@@ -545,7 +561,6 @@ fn f2_assert(
 
 /// smart_load wraps load_family. The sqlite leg pins the reference behaviour
 /// the postgres leg must reproduce byte-for-byte in envelope shape.
-#[cfg(feature = "sal")]
 #[tokio::test(flavor = "multi_thread")]
 async fn f2_smart_load_wraps_load_family_sqlite() {
     let dir = fresh_dir("f2-sqlite");
@@ -704,7 +719,6 @@ fn f3_assert(body: &Value, ns: &str, backend: &str) {
     );
 }
 
-#[cfg(feature = "sal")]
 #[tokio::test(flavor = "multi_thread")]
 async fn f3_calibrate_confidence_sqlite() {
     let dir = fresh_dir("f3-sqlite");
@@ -883,7 +897,6 @@ fn f5_assert(status: u16, body: &Value, missing: u16, bad: u16, backend: &str) {
 /// The HTTP atomise surface is storage-free on BOTH backends: the call site
 /// owns no `AtomiseToolHandler`, so the tier-locked envelope is the complete
 /// answer. The sqlite leg pins the reference bytes.
-#[cfg(feature = "sal")]
 #[tokio::test(flavor = "multi_thread")]
 async fn f5_atomise_tier_locked_sqlite() {
     let dir = fresh_dir("f5-sqlite");
