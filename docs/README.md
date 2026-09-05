@@ -62,6 +62,11 @@ authoritative for its topic; this page is just the map.
   SQLCipher at rest, attested identity, SSRF hardening.
 - **[ARCHITECTURAL_LIMITS.md](ARCHITECTURAL_LIMITS.html)** — performance
   bounds and constraints under the current design.
+- **[wake-hub.md](wake-hub.html)** — the agent wake plane: the
+  `agent_notified` bus, the `ai-memory wake-hub` switch and the bus sink
+  between them. States the NORMATIVE backstop inbox poll, what a wake may
+  and may not carry, and why every bound there drops a hint rather than
+  producing a wrong one.
 - **[RUNBOOK-ollama-kv-tuning.md](RUNBOOK-ollama-kv-tuning.html)** —
   `OLLAMA_KV_CACHE_TYPE=q4_0` for 2–4× LLM memory reduction. Zero
   ai-memory code change.

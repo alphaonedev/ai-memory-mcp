@@ -338,6 +338,10 @@ pub fn validate_source(source: &str) -> Result<()> {
 /// - `"governance-internal"` → `src/store/postgres.rs::governance_*`
 /// - `"embedding-backfill"` → `src/daemon_runtime.rs` serve-boot
 ///   embedding-backfill sweep (#1579 A4)
+/// - `"wake-hub-producer"` → `src/wake_sink/*` (#3469): the identity a
+///   SUBSTRATE-originated wake frame is stamped with on the wake-hub
+///   plane. Reserved so a wire caller cannot register the name and
+///   forge a substrate-originated wake.
 /// - `"system"` → `src/handlers/hook_subscribers.rs` (stamped on
 ///   legacy-rewrite rows; also matched as the unowned-marker sentinel
 ///   in cross-tenant gates, so wire spoofing it would let the caller
@@ -352,6 +356,7 @@ pub const RESERVED_AGENT_IDS: &[&str] = &[
     crate::identity::sentinels::EXPORT_INTERNAL,
     crate::identity::sentinels::GOVERNANCE_INTERNAL,
     crate::identity::sentinels::EMBEDDING_BACKFILL,
+    crate::identity::sentinels::WAKE_HUB_PRODUCER,
 ];
 
 /// Shape-only validation for an agent identifier — the pre-#977

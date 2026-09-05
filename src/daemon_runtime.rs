@@ -7325,6 +7325,14 @@ pub async fn bootstrap_serve(
     // follows (see the comment at the shutdown sequence: "Dropping a
     // Tokio JoinHandle would detach the task and permit a late write
     // after the final checkpoint").
+    // v1.0.0 #3469 (EPIC #3466) — attach the daemon-side wake-hub forwarder,
+    // if and only if `[wake_hub].sink_socket` is set. Placed HERE, after the
+    // store handle and `app_state` exist, because the sink must not be on the
+    // `agent_notified` bus before the surface that publishes on it is up. The
+    // whole decision (including every refusal and its remediation) lives in
+    // `wake_sink::boot`; unset is the fail-closed default and starts nothing.
+    crate::wake_sink::boot::install_from_config_logged(app_config);
+
     let (auto_tag_tx, auto_tag_handle) =
         crate::background::auto_tag_worker::spawn(app_state.clone());
     app_state.auto_tag_queue = Some(auto_tag_tx);

@@ -63,6 +63,25 @@ pub enum RootBindAuthority {
     LineageSuccession,
     /// Bound by verified guardian recovery (#3464).
     GuardianRecovery,
+    /// v1.0.0 #3469 — the HOST DAEMON's own enrolled key, bound to the
+    /// reserved `wake-hub-producer` principal by an operator running
+    /// `ai-memory identity hub-cache --daemon-producer` ON that host.
+    ///
+    /// Deliberately NOT one of the proven authorities, and
+    /// [`Self::may_delegate`] is `false` for it: no possession challenge was
+    /// answered and no v97 ledger row backs it, so claiming
+    /// `possession_proof` would be a lie about the durable identity root. What
+    /// it actually attests is narrower and honest — the operator of this host,
+    /// with read access to its owner-only key directory, asserted that this
+    /// host's daemon key may wake agents on this hub.
+    ///
+    /// That is enough for exactly ONE principal and no other, which is what
+    /// [`Self::may_delegate_for`] enforces: the name is reserved
+    /// ([`crate::validate::RESERVED_AGENT_IDS`]) so no wire caller can claim
+    /// it, it owns no memories and no namespace, and the only authority it
+    /// carries is "may deliver a content-free wake hint addressed to an
+    /// agent's own inbox".
+    DaemonKeyDir,
     /// Bound before #3464 required proof. MUST NOT mint a delegation.
     LegacyUnproven,
     /// An authority string this build does not recognise. Treated as unproven:
@@ -81,6 +100,8 @@ impl RootBindAuthority {
             Self::LineageSuccession
         } else if value == BindAuthority::GuardianRecovery.as_str() {
             Self::GuardianRecovery
+        } else if value == DAEMON_KEY_DIR_AUTHORITY {
+            Self::DaemonKeyDir
         } else if value == "legacy_unproven" {
             Self::LegacyUnproven
         } else {
@@ -100,7 +121,33 @@ impl RootBindAuthority {
             Self::PossessionProof | Self::LineageSuccession | Self::GuardianRecovery
         )
     }
+
+    /// May a root bound this way mint a delegation FOR `principal`?
+    ///
+    /// The principal-aware gate. [`Self::may_delegate`] answers the general
+    /// question and stays `false` for [`Self::DaemonKeyDir`]; this one adds the
+    /// single narrow carve-out #3469 needs — a host daemon key bound from the
+    /// key directory may speak for the reserved `wake-hub-producer` name and
+    /// for NOTHING else. Ordering matters: the carve-out is reached only after
+    /// the general answer is `false`, so it can widen nothing that was already
+    /// refused for another reason.
+    #[must_use]
+    pub fn may_delegate_for(self, principal: &str) -> bool {
+        if self.may_delegate() {
+            return true;
+        }
+        matches!(self, Self::DaemonKeyDir)
+            && principal == crate::identity::sentinels::WAKE_HUB_PRODUCER
+    }
 }
+
+/// The `bind_authority` column/field value for [`RootBindAuthority::DaemonKeyDir`].
+///
+/// A build that has never heard of it maps the string to
+/// [`RootBindAuthority::Unrecognised`], which cannot delegate — so an older hub
+/// reading a newer snapshot fails CLOSED rather than admitting a binding it
+/// does not understand.
+pub const DAEMON_KEY_DIR_AUTHORITY: &str = "daemon_key_dir";
 
 /// An agent's enrolled root key, with the provenance of its binding.
 #[derive(Debug, Clone)]
@@ -338,8 +385,10 @@ impl<R: RootKeyResolver> HelloVerifier for ScopedDelegationVerifier<R> {
         )?;
         self.verify_topics(req.claimed_agent_id, req.topics)?;
 
-        // (5) an UNPROVEN root may not delegate.
-        if !root.authority.may_delegate() {
+        // (5) an UNPROVEN root may not delegate — and a root bound from the
+        // host key directory (#3469) may delegate for the reserved producer
+        // principal and for nothing else.
+        if !root.authority.may_delegate_for(req.claimed_agent_id) {
             return Err(DenyReason::DelegationInvalid);
         }
 
@@ -395,6 +444,68 @@ impl<R: RootKeyResolver> HelloVerifier for ScopedDelegationVerifier<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v1.0.0 #3469 — the daemon-key-dir binding is honest about what it is:
+    /// NOT a proven authority in general, and delegating for exactly one
+    /// reserved principal.
+    #[test]
+    fn the_daemon_key_dir_authority_delegates_for_the_producer_and_nothing_else_3469() {
+        let a = RootBindAuthority::from_column(DAEMON_KEY_DIR_AUTHORITY);
+        assert_eq!(a, RootBindAuthority::DaemonKeyDir);
+        assert!(
+            !a.may_delegate(),
+            "it answered no possession challenge and has no v97 row; the general \
+             answer must stay NO"
+        );
+        assert!(a.may_delegate_for(crate::identity::sentinels::WAKE_HUB_PRODUCER));
+        for other in [
+            "ai:alice",
+            "daemon",
+            crate::identity::sentinels::DAEMON_PRINCIPAL,
+            "",
+        ] {
+            assert!(
+                !a.may_delegate_for(other),
+                "the carve-out must not widen to {other}"
+            );
+        }
+    }
+
+    /// The carve-out never NARROWS a genuinely proven authority, and never
+    /// widens the unproven ones.
+    #[test]
+    fn the_principal_aware_gate_agrees_with_the_general_one_elsewhere_3469() {
+        for proven in [
+            RootBindAuthority::PossessionProof,
+            RootBindAuthority::LineageSuccession,
+            RootBindAuthority::GuardianRecovery,
+        ] {
+            assert!(proven.may_delegate());
+            assert!(proven.may_delegate_for("ai:alice"));
+            assert!(proven.may_delegate_for(crate::identity::sentinels::WAKE_HUB_PRODUCER));
+        }
+        for unproven in [
+            RootBindAuthority::LegacyUnproven,
+            RootBindAuthority::Unrecognised,
+        ] {
+            assert!(!unproven.may_delegate());
+            assert!(!unproven.may_delegate_for("ai:alice"));
+            assert!(
+                !unproven.may_delegate_for(crate::identity::sentinels::WAKE_HUB_PRODUCER),
+                "an unproven binding must not reach the producer carve-out either"
+            );
+        }
+    }
+
+    /// An older hub reading a newer snapshot must FAIL CLOSED.
+    #[test]
+    fn an_unknown_authority_string_cannot_delegate_3469() {
+        let future = RootBindAuthority::from_column("some_authority_from_2027");
+        assert_eq!(future, RootBindAuthority::Unrecognised);
+        assert!(!future.may_delegate());
+        assert!(!future.may_delegate_for(crate::identity::sentinels::WAKE_HUB_PRODUCER));
+    }
+
     use crate::identity::hub_delegation::{A2A_HUB_SCOPE, sign_hub_delegation};
     use crate::wake_hub::identity::{PeerCred, hello_transcript, topics_hash};
     use crate::wake_hub::limits::{HELLO_NONCE_BYTES, PUBKEY_BYTES};

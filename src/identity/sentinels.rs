@@ -85,6 +85,23 @@ pub const AI_CURATOR: &str = "ai:curator";
 /// [`crate::store::CallerContext::for_admin`], not from this string.
 pub const AI_OPERATOR: &str = "ai:operator";
 
+/// v1.0.0 #3469 (EPIC #3466) — the identity a SUBSTRATE-originated
+/// wake is stamped with on the `ai-memory wake-hub` plane.
+///
+/// A wake produced by [`crate::wake_sink`] from the `agent_notified`
+/// bus is NOT stamped with the notifying agent's id: no hub session
+/// ever authenticated that agent for that frame, so putting its id on
+/// the frame's `from` would be a claim the hub never checked. The real
+/// sender rides in the wake METADATA, where it is plainly metadata.
+///
+/// Because the name is a [`crate::validate::RESERVED_AGENT_IDS`]
+/// member, no wire caller can register or claim it, so "may wake any
+/// agent on this host" stays an operator grant to one unclaimable name
+/// rather than something an agent can talk its way into. It is NOT a
+/// privileged store principal: nothing constructs a `CallerContext`
+/// with it and no cross-tenant ownership gate exempts it.
+pub const WAKE_HUB_PRODUCER: &str = "wake-hub-producer";
+
 /// Prefix for per-request synthesized anonymous HTTP principals
 /// (`anonymous:req-<uuid8>` — see
 /// [`crate::identity::anonymous_request_id`], the one synthesis
@@ -118,6 +135,7 @@ mod tests {
             EXPORT_INTERNAL,
             GOVERNANCE_INTERNAL,
             EMBEDDING_BACKFILL,
+            WAKE_HUB_PRODUCER,
         ] {
             assert!(
                 crate::validate::RESERVED_AGENT_IDS.contains(&s),
