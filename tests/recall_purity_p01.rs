@@ -911,7 +911,7 @@ fn fold_flips_inbox_unread_marker() {
         "notify: purity ping",
         "hello from alice",
         Tier::Short,
-        "_messages/ai:bob",
+        "_inbox/ai:bob",
     );
     let id = db::insert(&conn, &m).expect("insert inbox message");
     assert_eq!(access_count(&conn, &id), 0, "fresh message is unread");
@@ -1222,10 +1222,10 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     let dir = tempfile::tempdir_in(&root).expect("tempdir");
     let path = dir.path().join("v77.db");
 
-    // Fresh open reaches the current tip (v91, #3250 archive-link cids)
+    // Fresh open reaches the current tip
     // with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 97);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 98);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",

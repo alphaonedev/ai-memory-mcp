@@ -6,7 +6,7 @@
 //! Closes the three-surface-parity gap on `memory_inbox`. The MCP
 //! tool ([`crate::mcp::handle_inbox`]) and the HTTP route landed
 //! previously; this module wires the CLI surface so operators can
-//! read an agent inbox (`_messages/<agent_id>/`) from a terminal.
+//! read an agent inbox (`_inbox/<agent_id>/`) from a terminal.
 
 use anyhow::Result;
 use clap::Args;
@@ -116,13 +116,8 @@ mod tests {
     fn inbox_cli_text_output_lists_messages() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        // Seed a message into _messages/ai:bob (the inbox namespace).
-        crate::cli::test_utils::seed_memory(
-            &db,
-            "_messages/ai:bob",
-            "hello bob",
-            "message payload",
-        );
+        // Seed a message into _inbox/ai:bob (the inbox namespace).
+        crate::cli::test_utils::seed_memory(&db, "_inbox/ai:bob", "hello bob", "message payload");
         let args = InboxArgs {
             agent_id: Some("ai:bob".into()),
             unread_only: false,
@@ -144,7 +139,7 @@ mod tests {
     fn inbox_cli_unread_only_filters() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        crate::cli::test_utils::seed_memory(&db, "_messages/ai:carol", "msg", "body");
+        crate::cli::test_utils::seed_memory(&db, "_inbox/ai:carol", "msg", "body");
         let args = InboxArgs {
             agent_id: Some("ai:carol".into()),
             unread_only: true,

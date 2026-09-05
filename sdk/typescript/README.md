@@ -281,13 +281,12 @@ if (!deleted) throw new Error(`subscription ${sub.id} was not removed`);
 
 ```ts
 await memory.notify({
-  to: "ai:codex-5.4@ci:pid-42",
-  subject: "review needed",
-  body: "please approve pending action pa_123",
-  memory_id: "b4e3…",
+  target_agent_id: "ai:codex-5.4@ci:pid-42",
+  title: "review needed",
+  payload: "please approve pending action pa_123",
 });
 
-const { messages, unread } = await memory.inbox({ unread: true, limit: 20 });
+const { messages, unread_count } = await memory.inbox({ unread_only: true, limit: 20 });
 ```
 
 #### `.agents()` / `.registerAgent()`

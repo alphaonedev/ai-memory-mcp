@@ -11,7 +11,7 @@
 //! ## DRY contract
 //!
 //! No business logic lives here — validation, namespace resolution
-//! (`_messages/<target>/`), and the per-tier expiry computation live
+//! (`_inbox/<target>/`), and the per-tier expiry computation live
 //! in [`crate::mcp::handle_notify`]. The MCP, HTTP, and CLI surfaces
 //! share that one implementation.
 

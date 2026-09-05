@@ -286,7 +286,8 @@ pg_test!(pg_get_inbox_empty_default, url, {
     let r = pg_router(&url).await;
     let (status, body) = get(&r, "/api/v1/inbox").await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(body["storage_backend"], "postgres");
+    assert_eq!(body["namespace"], ai_memory::inbox_namespace(CALLER));
+    assert_eq!(body["unread_only"], false);
     assert_eq!(body["agent_id"], CALLER);
     assert!(body["messages"].is_array());
 });
@@ -315,7 +316,8 @@ pg_test!(pg_get_inbox_after_notify_unread_only, url, {
     // unread_only=true exercises the metadata `read` filter branch.
     let (status, body) = get(&r, "/api/v1/inbox?unread_only=true&limit=50").await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(body["storage_backend"], "postgres");
+    assert_eq!(body["namespace"], ai_memory::inbox_namespace(CALLER));
+    assert_eq!(body["unread_only"], true);
     assert!(
         body["messages"].as_array().is_some_and(|m| !m.is_empty()),
         "expected at least our own notify message; body={body}"

@@ -212,14 +212,20 @@ pub async fn notify(
         {
             return resp;
         }
+        let namespace = crate::inbox_namespace(&body.target_agent_id);
+        let fallback_tier = resolved_tier.unwrap_or(Tier::Short);
+        let fallback_delivered_at = Utc::now().to_rfc3339();
+        let receipt_mem = fanout_mem.as_ref();
         return (
             StatusCode::CREATED,
-            Json(json!({
-                "id": new_id,
-                (field_names::TARGET_AGENT_ID): body.target_agent_id,
-                "namespace": crate::inbox_namespace(&body.target_agent_id),
-                (field_names::STORAGE_BACKEND): "postgres",
-            })),
+            Json(crate::mcp::notify_receipt(
+                &new_id,
+                &sender,
+                &body.target_agent_id,
+                &namespace,
+                receipt_mem.map_or(&fallback_tier, |m| &m.tier),
+                receipt_mem.map_or(fallback_delivered_at.as_str(), |m| m.created_at.as_str()),
+            )),
         )
             .into_response();
     }

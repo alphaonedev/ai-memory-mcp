@@ -192,7 +192,7 @@ track provenance) and the curator (to mark contradictions).
 ## Namespace
 
 String partition for memories. Typical use: one namespace per project
-or per agent. Reserved prefix `_` (e.g. `_messages/<target>`,
+or per agent. Reserved prefix `_` (e.g. `_inbox/<target>`,
 `_curator/reports`, `_agents`) is for system use — the curator
 ignores `_`-prefixed namespaces.
 

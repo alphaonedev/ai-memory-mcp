@@ -46,6 +46,7 @@ import type {
   MemoryLink,
   MetricsResponse,
   NotifyRequest,
+  NotifyReceipt,
   RecallRequest,
   RecallResponse,
   RegisterAgentRequest,
@@ -673,8 +674,8 @@ export class AiMemoryClient {
   async notify(
     body: NotifyRequest,
     opts?: RequestOptions,
-  ): Promise<{ id: string; target_agent_id: string; namespace: string; storage_backend: string }> {
-    return this.call<{ id: string; target_agent_id: string; namespace: string; storage_backend: string }, NotifyRequest>({
+  ): Promise<NotifyReceipt> {
+    return this.call<NotifyReceipt, NotifyRequest>({
       method: "POST",
       path: "/api/v1/notify",
       body,

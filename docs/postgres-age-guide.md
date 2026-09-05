@@ -49,9 +49,9 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends are at **schema parity at v97**
-(`CURRENT_SCHEMA_VERSION = 97` on both ladders — the postgres upgrade
-ladder ends at `migrate_v97()`).
+The two backends are at **schema parity at v98**
+(`CURRENT_SCHEMA_VERSION = 98` on both ladders — the postgres upgrade
+ladder ends at `migrate_v98()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
@@ -336,7 +336,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v97 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v98 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.

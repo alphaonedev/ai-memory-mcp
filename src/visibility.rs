@@ -179,7 +179,7 @@ pub fn is_visible_by_fields(
         .and_then(serde_json::Value::as_str);
     match scope_str.map(MemoryScope::from_str) {
         // Field absent → default private (owner-keyed).
-        None => private_visible(metadata, caller),
+        None => private_visible(namespace, metadata, caller),
         // Present but not a `MemoryScope`: the closed legacy set is honoured
         // broadly; every other token degrades to the absent-key default.
         Some(None) => {
@@ -196,10 +196,10 @@ pub fn is_visible_by_fields(
                      Valid scopes: {}",
                     crate::models::namespace::VALID_SCOPES.join(", ")
                 );
-                private_visible(metadata, caller)
+                private_visible(namespace, metadata, caller)
             }
         }
-        Some(Some(MemoryScope::Private)) => private_visible(metadata, caller),
+        Some(Some(MemoryScope::Private)) => private_visible(namespace, metadata, caller),
         // Visible to every authenticated caller, regardless of namespace.
         Some(Some(MemoryScope::Collective)) => true,
         // #1921 — subtree-restricted: the memory's namespace must fall
@@ -214,7 +214,7 @@ pub fn is_visible_by_fields(
 }
 
 /// Owner / inbox-target check for a `scope=private` (or default) row.
-fn private_visible(metadata: &serde_json::Value, caller: &str) -> bool {
+fn private_visible(namespace: &str, metadata: &serde_json::Value, caller: &str) -> bool {
     let owner = metadata
         .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
@@ -227,6 +227,14 @@ fn private_visible(metadata: &serde_json::Value, caller: &str) -> bool {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     target == caller
+        || (namespace.strip_prefix(crate::LEGACY_INBOX_NAMESPACE_PREFIX) == Some(caller)
+            && !metadata
+                .as_object()
+                .is_some_and(|m| m.contains_key(crate::META_KEY_TARGET_AGENT_ID))
+            && metadata
+                .get("recipient_agent_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(caller))
 }
 
 /// #1921 — subtree gate for `team` / `unit` / `org` scope. `ancestor_idx`
@@ -303,7 +311,7 @@ pub fn caller_owns_for_mutation(mem: &Memory, caller: &str, allow_inbox: bool) -
 /// #3348 (which is about substrate bookkeeping leaking), and silently breaking
 /// `share` to close an unreported hole would be the wrong trade.
 pub const SUBSTRATE_NAMESPACE_PREFIXES: &[&str] = &[
-    "_messages/",
+    crate::LEGACY_INBOX_NAMESPACE_PREFIX,
     "_inbox/",
     "_curator/",
     "_subscriptions/",
@@ -780,5 +788,33 @@ mod tests {
             caller_owns_for_mutation(&inbox, "ai:bob", true),
             "inbox recipient may mutate with allow_inbox"
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_inbox_3401_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_recipient_is_bound_to_namespace_and_cannot_override_target_3401() {
+        let mut memory = Memory {
+            namespace: "_messages/ai:recipient".into(),
+            metadata: json!({"agent_id": "ai:sender", "recipient_agent_id": "ai:recipient"}),
+            ..Default::default()
+        };
+        assert!(is_visible_to_caller(&memory, "ai:recipient"));
+        assert!(!is_visible_to_caller(&memory, "ai:other"));
+        assert!(!is_readable_on_query(&memory, Some("ai:recipient"), None));
+        assert!(is_readable_on_query(
+            &memory,
+            Some("ai:recipient"),
+            Some("_inbox/ai:recipient")
+        ));
+        memory.namespace = "ordinary".into();
+        assert!(!is_visible_to_caller(&memory, "ai:recipient"));
+        memory.namespace = "_messages/ai:recipient".into();
+        memory.metadata[crate::META_KEY_TARGET_AGENT_ID] = json!("ai:other");
+        assert!(!is_visible_to_caller(&memory, "ai:recipient"));
     }
 }

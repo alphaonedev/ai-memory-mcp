@@ -1535,6 +1535,10 @@ const MIGRATION_V95_ATTESTED_WRITE_LEDGER: &str =
 const MIGRATION_V97_AGENT_PUBKEY_HISTORY: &str =
     include_str!("../../migrations/postgres/0054_v97_agent_pubkey_history.sql");
 
+/// v98 (#3401): canonical namespace for live and archived inbox rows.
+const MIGRATION_V98_CANONICAL_INBOX_NAMESPACE: &str =
+    include_str!("../../migrations/postgres/0055_v98_canonical_inbox_namespace.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1925,7 +1929,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 97;
+const CURRENT_SCHEMA_VERSION: i32 = 98;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3759,8 +3763,11 @@ impl PostgresStore {
         if current_version < 96 {
             self.migrate_v96().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 97 {
             self.migrate_v97().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v98().await?;
         }
 
         Ok(())
@@ -6896,6 +6903,38 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v96 applied (#3344: embed_skip — durable skip \
              cache for unembeddable rows; restore the key to heal)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #3401 — schema v98: alias legacy live and archived
+    /// `_messages/<agent>` rows to the canonical `_inbox/<agent>` namespace.
+    /// The view preserves every signed byte and follows imports and restores.
+    async fn migrate_v98(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V98_CANONICAL_INBOX_NAMESPACE.contains("archived_memories"),
+            "#3401: the v98 DDL doc twin must migrate archived inbox rows"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v98 canonical-inbox migration tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V98_CANONICAL_INBOX_NAMESPACE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v98 canonical-inbox migration", e))?;
+
+        record_schema_version(&mut tx, 98).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v98 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v98 applied (#3401: `_messages/<agent>` rows aliased \
+             to canonical `_inbox/<agent>` in live and archived storage)"
         );
         Ok(())
     }
@@ -17605,6 +17644,9 @@ impl PostgresStore {
 /// even under sqlx's generic prepared-statement plan.
 const NS_FILTER_SARGABLE: &str = "namespace = $1";
 
+/// Canonical inbox reads include the signed legacy namespace without rewriting it.
+const NS_FILTER_INBOX_ALIASES: &str = "namespace IN (SELECT $1::text UNION SELECT legacy_prefix || substr($1, length(canonical_prefix) + 1) FROM inbox_namespace_aliases)";
+
 /// #1473 — OR-NULL optional namespace predicate for `list()`. Emitted
 /// only when the caller passes NO namespace, where it is a no-op (an
 /// unfiltered list has no index to exploit, so the OR-NULL form costs
@@ -23187,7 +23229,13 @@ impl MemoryStore for PostgresStore {
         // `list_by_namespace_prefix` uses. When namespace is absent we
         // keep the OR-NULL no-op form: an unfiltered list has no index
         // to use, so the scan is unavoidable and correct.
-        let ns_predicate = if filter.namespace.is_some() {
+        let ns_predicate = if filter
+            .namespace
+            .as_deref()
+            .is_some_and(|ns| ns.starts_with(crate::INBOX_NAMESPACE_PREFIX))
+        {
+            NS_FILTER_INBOX_ALIASES
+        } else if filter.namespace.is_some() {
             NS_FILTER_SARGABLE
         } else {
             NS_FILTER_OPTIONAL
@@ -23264,6 +23312,9 @@ impl MemoryStore for PostgresStore {
                    OR COALESCE(metadata->>'scope', 'private') <> 'private'
                    OR metadata->>'agent_id' = $6
                    OR metadata->>'target_agent_id' = $6
+                   OR (namespace = '_messages/' || $6
+                       AND metadata->>'recipient_agent_id' = $6
+                       AND NOT (metadata ? 'target_agent_id'))
                )
                AND ($7::text IS NULL OR metadata->>'agent_id' = $7)
                AND (
@@ -34279,11 +34330,14 @@ impl PostgresStore {
         // The `None` arm keeps the no-op form: an unfiltered archive list
         // has no namespace to seek on and `archived_memories_archived_at_idx`
         // already serves it sort-free.
-        let ns_predicate = if namespace.is_some() {
-            ARCHIVED_NS_FILTER_SARGABLE
-        } else {
-            ARCHIVED_NS_FILTER_OPTIONAL
-        };
+        let ns_predicate =
+            if namespace.is_some_and(|ns| ns.starts_with(crate::INBOX_NAMESPACE_PREFIX)) {
+                NS_FILTER_INBOX_ALIASES
+            } else if namespace.is_some() {
+                ARCHIVED_NS_FILTER_SARGABLE
+            } else {
+                ARCHIVED_NS_FILTER_OPTIONAL
+            };
         let rows = sqlx::query(&format!(
             "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
              source, access_count, created_at, updated_at, last_accessed_at, \
@@ -36817,6 +36871,8 @@ mod tests {
             "schema_version must reach CURRENT_SCHEMA_VERSION"
         );
     }
+
+    include!("postgres_inbox_tests.rs");
 
     #[tokio::test]
     async fn live_migration_v17_to_current_is_idempotent() {

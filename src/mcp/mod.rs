@@ -665,6 +665,8 @@ pub use namespace::{
     handle_namespace_set_standard_trusted,
 };
 pub use notify::{handle_inbox, handle_notify};
+#[cfg(feature = "sal")]
+pub(crate) use notify::{inbox_envelope, inbox_message, notify_receipt};
 pub use pending::{handle_pending_approve, handle_pending_reject};
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
 // #1416 — `prepare_capture_turn` + the request type are re-exported so
@@ -1135,8 +1137,6 @@ use update::handle_update;
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 use crate::transcripts::replay::REPLAY_VERBOSE_THRESHOLD_BYTES;
-#[cfg(test)]
-use agent::messages_namespace_for;
 #[cfg(test)]
 use namespace::{auto_register_path_hierarchy, extract_governance};
 
@@ -6220,11 +6220,11 @@ mod tests {
     }
 
     #[test]
-    fn messages_namespace_is_prefixed() {
-        assert_eq!(super::messages_namespace_for("alice"), "_messages/alice");
+    fn inbox_namespace_is_prefixed() {
+        assert_eq!(crate::inbox_namespace("alice"), "_inbox/alice");
         assert_eq!(
-            super::messages_namespace_for("ai:claude-opus-4.7"),
-            "_messages/ai:claude-opus-4.7"
+            crate::inbox_namespace("ai:claude-opus-4.7"),
+            "_inbox/ai:claude-opus-4.7"
         );
     }
 
@@ -9503,7 +9503,7 @@ mod tests {
             .to_string();
         let val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(val["agent_id"], owner);
-        assert!(val["namespace"].as_str().unwrap().starts_with("_messages/"));
+        assert!(val["namespace"].as_str().unwrap().starts_with("_inbox/"));
         assert_eq!(val["count"], 0);
     }
 
@@ -9545,7 +9545,7 @@ mod tests {
         let val: Value = serde_json::from_str(&text).unwrap();
         assert!(val["id"].is_string());
         assert_eq!(val["to"], "alice");
-        assert_eq!(val["namespace"], "_messages/alice");
+        assert_eq!(val["namespace"], "_inbox/alice");
     }
 
     #[test]
@@ -10692,18 +10692,18 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // messages_namespace_for — confirm both ASCII and ai: prefixes.
+    // inbox_namespace — confirm both ASCII and ai: prefixes.
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_messages_namespace_for_plain_id() {
-        assert_eq!(super::messages_namespace_for("alice"), "_messages/alice");
+    fn test_inbox_namespace_for_plain_id() {
+        assert_eq!(crate::inbox_namespace("alice"), "_inbox/alice");
     }
 
     #[test]
-    fn test_messages_namespace_for_ai_prefixed_id() {
-        let ns = super::messages_namespace_for("ai:claude@host:pid-1");
-        assert!(ns.starts_with("_messages/"));
+    fn test_inbox_namespace_for_ai_prefixed_id() {
+        let ns = crate::inbox_namespace("ai:claude@host:pid-1");
+        assert!(ns.starts_with("_inbox/"));
         assert!(ns.contains("ai:"));
     }
 

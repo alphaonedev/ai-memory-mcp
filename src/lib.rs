@@ -648,6 +648,8 @@ pub use crate::quotas::GLOBAL_NAMESPACE;
 /// (`format!("_inbox/{target}")`); see [`inbox_namespace`] for the
 /// canonical helper.
 pub const INBOX_NAMESPACE_PREFIX: &str = "_inbox/";
+/// Legacy signed inbox namespace, retained through v98 read aliases.
+pub const LEGACY_INBOX_NAMESPACE_PREFIX: &str = "_messages/";
 
 /// Build the canonical inbox namespace for a target agent id.
 /// Returns `"_inbox/<target>"` formatted via the
