@@ -44,7 +44,10 @@ use tokio_util::codec::{Encoder as _, FramedRead, LengthDelimitedCodec};
 
 use super::bundle::HubJoinBundle;
 use crate::wake_hub::codec::codec;
-use crate::wake_hub::frame::{Frame, HelloPayload, Kind, WakeMeta, WelcomePayload, decode_error};
+use crate::wake_hub::frame::{
+    CTX_DECODING_HUB_FRAME, CTX_HUB_CLOSED, CTX_UNPARSEABLE_REFUSAL, Frame, HelloPayload, Kind,
+    WakeMeta, WelcomePayload, decode_error,
+};
 use crate::wake_hub::identity::{hello_transcript, topics_hash};
 use crate::wake_hub::limits::{DEFAULT_HANDSHAKE_TIMEOUT_MS, HELLO_NONCE_BYTES};
 use crate::wake_hub::startup::{SOCKET_DIR_MODE, SOCKET_MODE, current_euid};
@@ -118,10 +121,10 @@ impl Session {
     /// already committed and the backstop poll still finds it.
     pub async fn next_event(&mut self) -> Result<SessionEvent> {
         let Some(next) = self.reader.next().await else {
-            bail!("the hub closed the connection");
+            bail!(CTX_HUB_CLOSED);
         };
         let body = next.context("framing error from the hub")?;
-        let frame = Frame::decode(&body).context("decoding a frame from the hub")?;
+        let frame = Frame::decode(&body).context(CTX_DECODING_HUB_FRAME)?;
         match frame.kind {
             Kind::Wake => {
                 let meta = WakeMeta::decode(&frame.payload)
@@ -137,7 +140,7 @@ impl Session {
             }
             Kind::Error => {
                 let (code, reason) =
-                    decode_error(&frame.payload).unwrap_or((0, "unparseable refusal".to_owned()));
+                    decode_error(&frame.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
                 bail!("the hub refused this session: {code} {reason}");
             }
             // A future hub may send frames this version has no opinion about.
@@ -227,7 +230,7 @@ async fn handshake(
         }),
         Kind::Error => {
             let (code, reason) =
-                decode_error(&reply.payload).unwrap_or((0, "unparseable refusal".to_owned()));
+                decode_error(&reply.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
             bail!("the hub refused the handshake: {code} {reason}");
         }
         other => bail!("the hub answered the hello with {other}, not a welcome"),
@@ -243,9 +246,9 @@ async fn read_one(
         bail!("timed out");
     };
     match next {
-        None => bail!("the hub closed the connection"),
+        None => bail!(CTX_HUB_CLOSED),
         Some(Err(e)) => bail!("framing error: {e}"),
-        Some(Ok(body)) => Frame::decode(&body).context("decoding a frame from the hub"),
+        Some(Ok(body)) => Frame::decode(&body).context(CTX_DECODING_HUB_FRAME),
     }
 }
 

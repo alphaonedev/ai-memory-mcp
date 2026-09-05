@@ -54,6 +54,7 @@ use crate::identity::hub_delegation::{
     verify_hub_delegation,
 };
 use crate::identity::keypair;
+use crate::wake_hub::frame::DEBUG_FIELD_DELEGATION_BYTES;
 use crate::wake_hub::limits::{PUBKEY_BYTES, SIGNATURE_BYTES};
 
 /// The only mode a bundle holding a private seed may carry.
@@ -78,7 +79,7 @@ impl std::fmt::Debug for HubJoinBundle {
             .field("agent_id", &self.agent_id)
             .field("hub_id", &self.hub_id)
             .field("delegate", &"<delegated session key>")
-            .field("delegation_bytes", &self.delegation.len())
+            .field(DEBUG_FIELD_DELEGATION_BYTES, &self.delegation.len())
             .field("not_after", &self.not_after)
             .finish()
     }
@@ -100,7 +101,7 @@ impl std::fmt::Debug for SignedHello {
         f.debug_struct("SignedHello")
             .field("pubkey_bytes", &self.pubkey.len())
             .field("signature_bytes", &self.signature.len())
-            .field("delegation_bytes", &self.delegation.len())
+            .field(DEBUG_FIELD_DELEGATION_BYTES, &self.delegation.len())
             .finish()
     }
 }
