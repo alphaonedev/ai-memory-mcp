@@ -45,7 +45,7 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
 }
 
 /// Run the built binary with CWD pinned inside `dir`, `--db` pointed at a
-/// scratch file, and `AI_MEMORY_KEY_DIR` / `HOME` redirected into `dir` so a
+/// scratch file, and `AI_MEMORY_KEY_DIR` / `HOME` redirected to sibling paths so a
 /// key-writing verb can never touch the operator's real key dir.
 fn run(dir: &Path, args: &[&str]) -> Output {
     let db = dir.join("scratch.db");
@@ -59,8 +59,8 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         // Never read the developer's real config, and never write their keys.
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_KEY_DIR", &keys)
-        .env("HOME", dir)
-        .env("XDG_CONFIG_HOME", dir.join(".config"));
+        .env("HOME", dir.join("home"))
+        .env("XDG_CONFIG_HOME", dir.join("home/.config"));
     cmd.output().expect("spawn ai-memory")
 }
 

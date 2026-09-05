@@ -10256,6 +10256,7 @@ pub(crate) const TEST_ENV_ISOLATION_ROLE_ENV: &str = "AI_MEMORY_TEST_ENV_ISOLATI
 /// asserts the child stdout reports `1 passed` and never `0 passed`.
 #[cfg(test)]
 pub(crate) fn run_env_isolated_child_or_spawn(exact_path: &str) -> bool {
+    let _ = crate::identity::test_key_dir::install();
     if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
         return false; // caller runs the real body in this isolated child
     }

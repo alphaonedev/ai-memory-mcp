@@ -452,6 +452,8 @@ pub enum Command {
     /// key storage (TPM/HSM/Secure Enclave) is out of OSS scope and
     /// lives in the AgenticMem commercial layer.
     Identity(IdentityArgs),
+    /// Inspect and prune unregistered key files.
+    Keys(cli::keys::KeysArgs),
     /// v0.9.0 G10.1 (#1827) — macaroon capability-token lifecycle:
     /// `keygen` (per-issuer `.caproot` mint secret, mode 0600) /
     /// `mint` (root token; mandatory-expiry lint) / `attenuate`
@@ -2087,6 +2089,14 @@ pub async fn run(
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::agents::run_agents(&db_path, a, j, &mut out)
+        }
+        Command::Keys(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::keys::run(&db_path, a, j, &mut out)
         }
         Command::Identity(a) => {
             // v0.7 H1 — keypair lifecycle is DB-free. The handler

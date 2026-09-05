@@ -48,6 +48,10 @@ fn scratch_home() -> PathBuf {
 fn armed_failing_cmd(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env_clear();
+    cmd.env(
+        "AI_MEMORY_KEY_DIR",
+        ai_memory::identity::test_key_dir::install(),
+    );
     // Minimal env the process needs, plus the isolated scratch roots.
     cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
     cmd.env("HOME", home);

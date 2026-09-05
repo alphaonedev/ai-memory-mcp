@@ -77,7 +77,10 @@ use crate::validate;
 // submodule so this file stays focused on `agent_id` resolution. H2+
 // will plumb the loaded `AgentKeypair` through `AppState` for outbound
 // link signing.
+pub mod key_inventory;
 pub mod keypair;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_key_dir;
 
 /// v0.9.0 §25.3 S1 (D3-012, #1870) — conservative model-family
 /// normalizer for the model-attestation substrate.

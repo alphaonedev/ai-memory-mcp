@@ -45,6 +45,7 @@ dependencies = [
 name = "ai-memory"
 version = "1.0.0"
 dependencies = [
+ "ai-memory",
  "anyhow",
  "assert_cmd",
  "async-trait",

@@ -160,6 +160,7 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
         let port_s = port.to_string();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.env("AI_MEMORY_NO_CONFIG", "1")
+            .env("HOME", db.parent().expect("fixture database parent"))
             // #3198 — sandboxed 0700 keystore so the daemon never touches the
             // host operator keys and never fails closed on a 0775 host dir.
             .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())

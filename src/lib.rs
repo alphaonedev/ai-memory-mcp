@@ -511,7 +511,7 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 83;
 /// `WakeHub` for the `ai-memory wake-hub` same-host CONTENT-FREE agent wake
 /// plane (a 0600 Unix-domain-socket wake switch that carries a bounded hint
 /// and never a message body), bumping 92 → 93.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 93;
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 94;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -536,7 +536,7 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 93;
 /// command), bumping 93 → 94; v1.0.0 #3467 (EPIC #3466) added `WakeHub`
 /// (same-host CONTENT-FREE agent wake plane over a 0600 Unix domain socket),
 /// bumping 94 → 95.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 95;
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 96;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
