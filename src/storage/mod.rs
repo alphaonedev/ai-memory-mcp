@@ -13934,7 +13934,8 @@ pub(crate) use pubkey_history::{
     downgrade_registration_attestation, select_agent_pubkey_versions_for_attestation,
 };
 pub(crate) use pubkey_history::{
-    strip_unproven_agent_pubkey_binding, validate_agent_pubkey_transition_time,
+    select_agent_pubkey_version_at, strip_unproven_agent_pubkey_binding,
+    validate_agent_pubkey_transition_time,
 };
 
 /// Fetch the Ed25519 public key bound to `agent_id`, if any (#626

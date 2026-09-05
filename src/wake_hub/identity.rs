@@ -244,8 +244,14 @@ pub struct HelloRequest<'a> {
     pub claimed_agent_id: &'a str,
     /// Ed25519 public key the client presented.
     pub pubkey: &'a [u8; PUBKEY_BYTES],
-    /// Signature the client presented over [`hello_transcript`].
+    /// Signature the client presented over [`hello_transcript`], made with the
+    /// DELEGATED key in `pubkey`.
     pub signature: &'a [u8],
+    /// The scoped `a2a-hub/join/v1` delegation the client presented (#3468),
+    /// as carried on the wire. Empty means none was presented — which every
+    /// production verifier refuses, but as a logged `401` rather than a
+    /// framing error.
+    pub delegation: &'a [u8],
     /// Topics the client asserted, in wire order.
     pub topics: &'a [String],
     /// Kernel-attested peer credentials for this connection.
@@ -301,6 +307,10 @@ pub struct MembershipRequest<'a> {
     pub nonce: &'a [u8; HELLO_NONCE_BYTES],
     /// The authenticated agent id the session is bound to.
     pub agent_id: &'a str,
+    /// The key the session authenticated with. Carried so a verifier can
+    /// actually CHECK the membership signature: without it the request could
+    /// only ever be rubber-stamped, which is why the trait default refuses.
+    pub pubkey: &'a [u8; PUBKEY_BYTES],
     /// Signature over [`membership_transcript`].
     pub signature: &'a [u8],
     /// Kernel-attested peer credentials.
@@ -335,6 +345,18 @@ pub trait HelloVerifier: Send + Sync + 'static {
     /// A [`DenyReason`]. Implementations MUST fail closed: any doubt is a
     /// refusal, never an admission.
     fn verify(&self, req: &HelloRequest<'_>) -> Result<VerifiedAgent, DenyReason>;
+
+    /// Authorize a subscription added after the hello.
+    ///
+    /// # Errors
+    /// Refuses topics without an established namespace read scope.
+    fn verify_topics(&self, _agent_id: &str, topics: &[String]) -> Result<(), DenyReason> {
+        if topics.is_empty() {
+            Ok(())
+        } else {
+            Err(DenyReason::TopicsRefused)
+        }
+    }
 
     /// Verify a nonce-bound `join` / `depart`.
     ///
@@ -491,6 +513,7 @@ mod tests {
             claimed_agent_id: "agent-a",
             pubkey: &[0u8; PUBKEY_BYTES],
             signature: &[0u8; 64],
+            delegation: &[],
             topics: &topics,
             peer: PeerCred {
                 uid: 1_000,
@@ -574,6 +597,7 @@ mod tests {
             hub_id: "hub",
             nonce: &NONCE,
             agent_id: "agent-a",
+            pubkey: &[0u8; PUBKEY_BYTES],
             signature: &[0u8; 64],
             peer: PeerCred {
                 uid: 1_000,

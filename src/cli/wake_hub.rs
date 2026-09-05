@@ -16,19 +16,9 @@
 //!
 //! # There is no `--insecure` flag, and there never will be
 //!
-//! The shipped identity verifier
-//! ([`crate::wake_hub::identity::DenyAllVerifier`]) REFUSES every hello until
-//! the scoped `a2a-hub/join/v1` delegation lands in
-//! [#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468). This
-//! subcommand deliberately exposes NO way to substitute a permissive verifier:
-//! a flag that disables identity verification is a flag that eventually gets
-//! set in production. Tests inject their own verifier through the library API
-//! ([`crate::wake_hub::WakeHub::bind`]), which the shipped binary never calls
-//! with anything but the production gates.
-//!
-//! Running it today therefore gets you a hub that binds, asserts its start-up
-//! invariants, serves metrics — and admits nobody. That is the intended,
-//! fail-closed intermediate state, and `--posture` says so out loud.
+//! Production uses a scoped delegation verifier over a refreshed public cache.
+//! Without a configured cache it refuses every hello. Tests inject their own
+//! verifier through the library API; the CLI exposes no permissive override.
 
 use std::path::PathBuf;
 
@@ -37,6 +27,11 @@ use clap::Args;
 
 use crate::cli::CliOutput;
 use crate::config::AppConfig;
+use std::sync::Arc;
+
+use crate::wake_hub::delegation_verifier::{
+    AllowlistCache, ReloadingAllowlist, ScopedDelegationVerifier,
+};
 use crate::wake_hub::{HubConfig, HubDeps, WakeHub, startup};
 
 #[derive(Args, Debug, Clone)]
@@ -54,6 +49,11 @@ pub struct WakeHubArgs {
     /// `RLIMIT_NOFILE`. Overrides `[wake_hub].max_connections`.
     #[arg(long, value_name = "N")]
     pub max_connections: Option<usize>,
+    /// Derived allowlist cache: the agents permitted to join, with their
+    /// ENROLLED public keys. Public material only, 0600, refreshed out of band
+    /// from ai-memory. Without it the hub admits nobody.
+    #[arg(long, value_name = "PATH")]
+    pub allowlist: Option<PathBuf>,
     /// Print the resolved posture (socket path, limits, identity state) and
     /// exit WITHOUT binding. Safe to run against a host already serving a hub.
     #[arg(long)]
@@ -100,6 +100,10 @@ pub fn resolve_config(args: &WakeHubArgs, app_config: &AppConfig) -> Result<HubC
     if let Some(n) = cfg_block.pending_max_ids {
         hub.pending_max_ids = n;
     }
+    hub.allowlist_path = args
+        .allowlist
+        .clone()
+        .or_else(|| cfg_block.allowlist.clone());
     Ok(hub)
 }
 
@@ -129,8 +133,12 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
             "reconnect_jitter_ms": cfg.reconnect_jitter_ms,
             "peer_credentials_available": peer_creds_ok,
             "carries_message_bodies": false,
-            "identity_verifier": "deny-all",
-            "identity_note": WAKE_HUB_IDENTITY_NOTE,
+            "identity_verifier": IdentityPosture::resolve(cfg).label(),
+            "identity_note": IdentityPosture::resolve(cfg).note(),
+            "allowlist": cfg
+                .allowlist_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
         });
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&doc)?)?;
         return Ok(());
@@ -183,16 +191,74 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
         }
     )?;
     writeln!(out.stdout, "  carries message bodies: no (structurally)")?;
-    writeln!(out.stdout, "  identity verifier:     deny-all")?;
-    writeln!(out.stdout, "  {WAKE_HUB_IDENTITY_NOTE}")?;
+    let posture = IdentityPosture::resolve(cfg);
+    writeln!(out.stdout, "  identity verifier:     {}", posture.label())?;
+    writeln!(
+        out.stdout,
+        "  allowlist:             {}",
+        cfg.allowlist_path.as_ref().map_or_else(
+            || "<none configured>".to_string(),
+            |p| p.display().to_string()
+        )
+    )?;
+    writeln!(out.stdout, "  {}", posture.note())?;
     Ok(())
 }
 
 /// The one place the "identity is not wired yet" wording lives, so the JSON
 /// posture, the human posture and the boot banner cannot drift apart.
-pub const WAKE_HUB_IDENTITY_NOTE: &str = "every hello is REFUSED until the scoped \
-     a2a-hub/join/v1 delegation lands (#3468); a wake is a hint and the <=60 s backstop \
-     poll remains the guarantee, so this degrades wake latency and nothing else";
+pub const WAKE_HUB_IDENTITY_NOTE: &str = "every hello is REFUSED: no allowlist is \
+     configured, so no agent can present a verifiable delegation. A wake is a hint and the \
+     <=60 s backstop poll remains the guarantee, so this degrades wake latency and nothing else";
+
+/// Which identity verifier a resolved configuration will actually install.
+///
+/// ONE definition, read by the JSON posture, the human posture and the runtime
+/// wiring alike. The posture reporting a verifier the hub does not run is worse
+/// than no posture at all — an operator would believe identity is enforced when
+/// it is not — so the string cannot be written down in more than one place
+/// (#3468, Fable ruling 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityPosture {
+    /// The scoped `a2a-hub/join/v1` delegation verifier is installed.
+    Delegation,
+    /// No allowlist is configured, so nothing can be admitted.
+    DenyAll,
+}
+
+impl IdentityPosture {
+    /// Resolve the posture the given configuration will produce.
+    #[must_use]
+    pub fn resolve(cfg: &HubConfig) -> Self {
+        if cfg.allowlist_path.is_some() {
+            Self::Delegation
+        } else {
+            Self::DenyAll
+        }
+    }
+
+    /// The stable label the posture surfaces report.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Delegation => "delegation/v1",
+            Self::DenyAll => "deny-all",
+        }
+    }
+
+    /// The operator-facing explanation.
+    #[must_use]
+    pub const fn note(self) -> &'static str {
+        match self {
+            Self::Delegation => {
+                "hellos are admitted only with a scoped a2a-hub/join/v1 \
+                 delegation minted by an agent's ENROLLED key, bound to this hub and to the \
+                 presented hello key, inside a bounded window"
+            }
+            Self::DenyAll => WAKE_HUB_IDENTITY_NOTE,
+        }
+    }
+}
 
 /// Bind and serve until SIGINT / SIGTERM.
 ///
@@ -210,8 +276,37 @@ pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<()> 
         return print_posture(&cfg, args, &mut out);
     }
 
-    let hub = WakeHub::bind(cfg, HubDeps::default())?;
-    tracing::warn!("wake-hub: identity verification is NOT wired yet — {WAKE_HUB_IDENTITY_NOTE}");
+    // Resolve the posture and BUILD THE VERIFIER before `cfg` is consumed, so
+    // what the operator was told in `--posture` is what actually gets
+    // installed. Any failure to load the allowlist is a refusal to start: a hub
+    // that silently fell back to deny-all after being handed an allowlist would
+    // be reporting one posture and running another.
+    let posture = IdentityPosture::resolve(&cfg);
+    let deps = match &cfg.allowlist_path {
+        Some(path) => {
+            let cache = AllowlistCache::load_from_file(path)?;
+            tracing::info!(
+                verifier = posture.label(),
+                agents = cache.len(),
+                allowlist = %path.display(),
+                "wake-hub: scoped delegation verification is armed"
+            );
+            HubDeps {
+                verifier: Arc::new(ScopedDelegationVerifier::new(ReloadingAllowlist::new(
+                    path.clone(),
+                )?)),
+                ..HubDeps::default()
+            }
+        }
+        None => {
+            tracing::warn!(
+                "wake-hub: no allowlist configured — {}",
+                IdentityPosture::DenyAll.note()
+            );
+            HubDeps::default()
+        }
+    };
+    let hub = WakeHub::bind(cfg, deps)?;
     hub.serve(shutdown_signal()).await
 }
 
@@ -254,6 +349,7 @@ mod tests {
             socket: None,
             hub_id: None,
             max_connections: None,
+            allowlist: None,
             posture: false,
             json: false,
         }
@@ -303,42 +399,90 @@ mod tests {
         assert_eq!(cfg.rate_per_sec, DEFAULT_RATE_TOKENS_PER_SEC);
     }
 
+    /// Ruling 4 (#3468): the posture must report the verifier the hub will
+    /// ACTUALLY install. JSON, human text and the config knob are pinned
+    /// together in one test, because the failure mode is precisely the three
+    /// drifting apart — an operator reading `deny-all` while a delegation
+    /// verifier runs, or the reverse, is worse than no posture at all.
     #[test]
-    fn posture_reports_deny_all_and_never_binds() {
-        let mut a = args();
-        a.socket = Some(PathBuf::from("/tmp/never-bound-3467.sock"));
-        a.posture = true;
-        let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
-        let mut so = Vec::new();
-        let mut se = Vec::new();
-        let mut out = CliOutput::from_std(&mut so, &mut se);
-        print_posture(&cfg, &a, &mut out).expect("posture");
-        let text = String::from_utf8(so).expect("utf8");
-        assert!(text.contains("deny-all"));
-        assert!(text.contains("carries message bodies: no"));
-        assert!(text.contains("#3468"));
-        assert!(
-            !std::path::Path::new("/tmp/never-bound-3467.sock").exists(),
-            "--posture must never create a socket"
-        );
+    fn posture_reports_the_configured_verifier_in_both_renderings() {
+        for (allowlist, expected_label) in [
+            (None, "deny-all"),
+            (Some(PathBuf::from("/tmp/allow-3468.json")), "delegation/v1"),
+        ] {
+            let mut a = args();
+            a.socket = Some(PathBuf::from("/tmp/never-bound-3468.sock"));
+            a.allowlist = allowlist.clone();
+            a.posture = true;
+            let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
+            assert_eq!(
+                IdentityPosture::resolve(&cfg).label(),
+                expected_label,
+                "the knob decides the posture"
+            );
+
+            // Human rendering.
+            let mut so = Vec::new();
+            let mut se = Vec::new();
+            let mut out = CliOutput::from_std(&mut so, &mut se);
+            print_posture(&cfg, &a, &mut out).expect("posture");
+            let text = String::from_utf8(so).expect("utf8");
+            assert!(
+                text.contains(expected_label),
+                "human posture must name the verifier: {text}"
+            );
+            assert!(text.contains("carries message bodies: no"));
+
+            // Machine rendering.
+            let mut a_json = a.clone();
+            a_json.json = true;
+            let mut so = Vec::new();
+            let mut se = Vec::new();
+            let mut out = CliOutput::from_std(&mut so, &mut se);
+            print_posture(&cfg, &a_json, &mut out).expect("posture");
+            let doc: serde_json::Value = serde_json::from_slice(&so).expect("valid JSON");
+            assert_eq!(doc["identity_verifier"], expected_label);
+            assert_eq!(doc["carries_message_bodies"], false);
+            assert_eq!(doc["socket_mode"], "0600");
+            assert_eq!(doc["socket_dir_mode"], "0700");
+            assert_eq!(
+                doc["identity_note"],
+                IdentityPosture::resolve(&cfg).note(),
+                "the note must come from the same SSOT as the label"
+            );
+
+            assert!(
+                !std::path::Path::new("/tmp/never-bound-3468.sock").exists(),
+                "--posture must never create a socket"
+            );
+        }
     }
 
     #[test]
-    fn posture_json_is_machine_readable_and_declares_the_content_free_contract() {
+    fn an_absent_allowlist_resolves_to_deny_all() {
+        // The fail-closed default is a property of the CONFIG, not of a code
+        // path somebody remembered to take.
         let mut a = args();
         a.socket = Some(PathBuf::from("/tmp/x.sock"));
-        a.posture = true;
-        a.json = true;
         let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
-        let mut so = Vec::new();
-        let mut se = Vec::new();
-        let mut out = CliOutput::from_std(&mut so, &mut se);
-        print_posture(&cfg, &a, &mut out).expect("posture");
-        let doc: serde_json::Value =
-            serde_json::from_slice(&so).expect("posture --json must be valid JSON");
-        assert_eq!(doc["identity_verifier"], "deny-all");
-        assert_eq!(doc["carries_message_bodies"], false);
-        assert_eq!(doc["socket_mode"], "0600");
-        assert_eq!(doc["socket_dir_mode"], "0700");
+        assert!(cfg.allowlist_path.is_none());
+        assert_eq!(IdentityPosture::resolve(&cfg), IdentityPosture::DenyAll);
+    }
+
+    #[test]
+    fn the_allowlist_flag_beats_the_config_block() {
+        let mut a = args();
+        a.socket = Some(PathBuf::from("/tmp/x.sock"));
+        a.allowlist = Some(PathBuf::from("/tmp/from-flag.json"));
+        let mut app = AppConfig::default();
+        app.wake_hub = Some(WakeHubConfig {
+            allowlist: Some(PathBuf::from("/tmp/from-config.json")),
+            ..WakeHubConfig::default()
+        });
+        let cfg = resolve_config(&a, &app).expect("resolve");
+        assert_eq!(
+            cfg.allowlist_path,
+            Some(PathBuf::from("/tmp/from-flag.json"))
+        );
     }
 }

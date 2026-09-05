@@ -44,6 +44,9 @@
 //! fixture). Unit tests in this module exercise only the SQL-builder
 //! helpers that don't need a running Postgres.
 
+#[path = "postgres_hub.rs"]
+mod hub;
+
 use crate::models::ConfidenceSource;
 mod pubkey_history;
 

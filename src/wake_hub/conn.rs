@@ -67,6 +67,7 @@ struct Conn {
     handle: EgressHandle,
     nonce: [u8; HELLO_NONCE_BYTES],
     agent: Option<VerifiedAgent>,
+    session_hello: Option<HelloPayload>,
     bucket: TokenBucket,
     preauth: TokenBucket,
 }
@@ -112,6 +113,7 @@ pub(super) async fn run(
         handle,
         nonce: state.new_nonce(),
         agent: None,
+        session_hello: None,
         bucket: TokenBucket::new(state.cfg.rate_per_sec, state.cfg.rate_burst, now),
         preauth: TokenBucket::new(state.cfg.preauth_rate_per_sec, state.cfg.preauth_burst, now),
         state: Arc::clone(&state),
@@ -138,6 +140,8 @@ async fn read_loop(
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let deadline = tokio::time::Instant::now() + conn.state.cfg.handshake_timeout;
+    let mut recheck = tokio::time::interval(std::time::Duration::from_secs(1));
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let next = tokio::select! {
             biased;
@@ -151,6 +155,10 @@ async fn read_loop(
             () = tokio::time::sleep_until(deadline), if conn.agent.is_none() => {
                 tracing::debug!(session = conn.session, "wake-hub: handshake deadline expired");
                 return;
+            }
+            _ = recheck.tick(), if conn.agent.is_some() => {
+                if !conn.revalidate() { return; }
+                continue;
             }
             item = reader.next() => item,
         };
@@ -174,6 +182,30 @@ async fn read_loop(
 }
 
 impl Conn {
+    /// Recheck expiry and the refreshed public root even for idle recipients.
+    fn revalidate(&self) -> bool {
+        let (Some(agent), Some(payload)) = (&self.agent, &self.session_hello) else {
+            return false;
+        };
+        let request = HelloRequest {
+            hub_id: &self.state.cfg.hub_id,
+            nonce: &self.nonce,
+            claimed_agent_id: &agent.agent_id,
+            pubkey: &payload.pubkey,
+            signature: &payload.signature,
+            delegation: &payload.delegation,
+            topics: &payload.topics,
+            peer: self.peer,
+        };
+        match self.state.deps.verifier.verify(&request) {
+            Ok(verified) => verified == *agent,
+            Err(reason) => {
+                tracing::info!(agent = %agent.agent_id, reason = reason.label(), "wake-hub: session authority expired or revoked");
+                false
+            }
+        }
+    }
+
     /// Handle one decoded body. Returns `false` when the connection must close.
     fn handle_body(&mut self, body: &[u8]) -> bool {
         let now = Instant::now();
@@ -227,6 +259,7 @@ impl Conn {
             claimed_agent_id: &frame.from,
             pubkey: &payload.pubkey,
             signature: &payload.signature,
+            delegation: &payload.delegation,
             topics: &payload.topics,
             peer: self.peer,
         };
@@ -246,7 +279,11 @@ impl Conn {
                 return false;
             }
         };
-        self.admit(verified, &payload.topics)
+        let admitted = self.admit(verified, &payload.topics);
+        if admitted {
+            self.session_hello = Some(payload);
+        }
+        admitted
     }
 
     /// Install a verified session.
@@ -442,6 +479,14 @@ impl Conn {
             }
         };
         if frame.kind == Kind::Subscribe {
+            if let Err(reason) = self
+                .state
+                .deps
+                .verifier
+                .verify_topics(&agent.agent_id, &topics)
+            {
+                return self.send_error(reason.wire_code(), reason.wire_reason());
+            }
             if self.state.router.subscribe(&agent.agent_id, &topics) {
                 true
             } else {
@@ -455,10 +500,9 @@ impl Conn {
 
     /// Nonce-bound `join` / `depart`.
     ///
-    /// Both are refused by the shipped verifier. Membership admission and
-    /// revocation are audit-spine events in the durable identity root (#3468),
-    /// so a hub with no verifier wired must not be able to grant or destroy
-    /// membership.
+    /// The delegated session key signs each action under its connection nonce.
+    /// Durable allow/revoke decisions live in the identity root; these frames
+    /// change only the disposable session and routing state.
     fn handle_membership(
         &mut self,
         agent: &VerifiedAgent,
@@ -470,6 +514,7 @@ impl Conn {
             hub_id: &self.state.cfg.hub_id,
             nonce: &self.nonce,
             agent_id: &agent.agent_id,
+            pubkey: &agent.pubkey,
             signature: &frame.payload,
             peer: self.peer,
         };
