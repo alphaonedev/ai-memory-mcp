@@ -175,8 +175,13 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// SAL-less:
 ///   - 8 skill routes — no pg skills table (`migrate_v82` no-op).
 ///   - `/api/v1/find_paths` — bare alias; operators use `/api/v1/kg/find_paths`.
-///   - `/api/v1/share` — openable via SAL get+store, but the pg source-read
-///     CallerContext is a T3 authz posture choice (deferred to a vote).
+///   - `/api/v1/share` — blocked on #3379, NOT on a missing pg SAL method.
+///     `mcp::tools::share::handle_share` applies no caller-owns-source gate
+///     at all, so a pg port must pick a `CallerContext` for the source read:
+///     `for_admin` reproduces that hole as a cross-tenant read primitive, and
+///     the header-derived caller closes it but makes pg deliberately stricter
+///     than sqlite on a data-plane write. Fix #3379 first, then open the
+///     route on BOTH backends together.
 ///   - route_1111 family that is verified app.db-bound (calls `app.db.lock()`
 ///     with no pg branch) or has NO SAL trait method:
 ///       memory_atomise, memory_calibrate_confidence, memory_smart_load,

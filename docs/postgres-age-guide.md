@@ -10,8 +10,8 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **67 of the 84** unique production HTTP paths;
-> the other **17 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
+> v1.0.0 postgres serves **71 of the 84** unique production HTTP paths;
+> the other **13 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
 > HTTP daemon instead). Read "The 13 fully-501 paths" and
@@ -57,8 +57,8 @@ ladder ends at `migrate_v98()`).
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**67 of the 84 unique production HTTP paths are served on postgres and
-17 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
+**71 of the 84 unique production HTTP paths are served on postgres and
+13 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
 is SQLite-only**. See "The 13 fully-501 paths" below for the exact
 inventory, which is frozen against regression by
@@ -673,7 +673,7 @@ The eight remaining sqlite-only surfaces land here.
 > on a postgres-backed daemon, with "no residual 501 envelope on
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
-> **RETRACTED**. The measured, gate-pinned inventory is **65
+> **RETRACTED**. The measured, gate-pinned inventory is **71
 > pg-supported unique paths, 13 fully-501 paths, 84 unique paths
 > total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 71` /
 > `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 84`,
@@ -800,8 +800,8 @@ tool names is unaffected. On sqlite nothing changes.
 
 Of the **84 unique production URL paths** (over **98 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **66 are served on a postgres-backed daemon
-and 17 are fully fail-closed** — every HTTP method on those 17 paths
+`/api/v1/capabilities`), **70 are served on a postgres-backed daemon
+and 13 are fully fail-closed** — every HTTP method on those 13 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty
 in-memory scratch SQLite database that `bootstrap_serve` opens against
@@ -866,8 +866,16 @@ and [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)):**
   Operators running postgres MUST NOT plan on the skills plane in v1.0:
   it is a hard 501, not a degraded mode. Use a sqlite-backed daemon for
   skills, or wait for the v1.x postgres skills storage.
-- **`/api/v1/share`** — the pg source-read `CallerContext` is a T3
-  authorization posture choice deferred to a vote. *(v1.x.)*
+- **`/api/v1/share`** — blocked on
+  [#3379](https://github.com/alphaonedev/ai-memory-mcp/issues/3379), not on a
+  missing pg SAL method. `mcp::tools::share::handle_share` applies **no
+  caller-owns-source gate at all**, so a postgres port must choose a
+  `CallerContext` for the source read: `for_admin` would faithfully
+  reproduce that hole as a cross-tenant read primitive, and the
+  header-derived caller would close it while making postgres deliberately
+  stricter than sqlite on a data-plane write. The sqlite gate is fixed
+  first (#3379); the route then opens on BOTH backends together, so they
+  converge on the safe semantics instead of diverging. *(v1.x.)*
 - **`memory_*` MCP-parity routes with no pg SAL method / app.db binding**
   (4 paths): `memory_subscription_replay`,
   `memory_subscription_dlq_list`, and `memory_rule_list` +
@@ -918,7 +926,7 @@ postgres skills storage specifically is
 | `memory_skill_promote_from_reflection` | `POST /api/v1/skill/{id}/promote` | Skills plane. |
 | `memory_skill_compositional_context` | `POST /api/v1/skill/{id}/compose` | Skills plane. |
 | `memory_skill_retire` | `POST /api/v1/skill/{id}/retire` | Skills plane. |
-| `memory_share` | `POST /api/v1/share` | pg source-read `CallerContext` is a T3 authz posture choice deferred to a vote. |
+| `memory_share` | `POST /api/v1/share` | Blocked on [#3379](https://github.com/alphaonedev/ai-memory-mcp/issues/3379) (sqlite has no caller-owns-source gate), not on a missing pg SAL method — see the path list above. |
 | `memory_subscription_replay` | `POST /api/v1/memory_subscription_replay` | No pg SAL method — `app.db`-bound. |
 | `memory_subscription_dlq_list` | `POST /api/v1/memory_subscription_dlq_list` | No pg SAL method — `app.db`-bound. |
 | `memory_rule_list` | `POST /api/v1/memory_rule_list` | Governance **inspection/read** only (no `governance_rules` table); enforcement itself works on postgres. |
