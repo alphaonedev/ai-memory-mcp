@@ -1018,8 +1018,11 @@ endpoint availability:
   approving caller re-issues the underlying write via the standard
   CRUD path. The full state machine runs identically on both
   backends — only the auto-replay step is gated.
-- Federation fanout subcollections that ride sqlite-only fed-tracker
-  state: archive / restore / purge / pending-decision broadcast.
+- Federation SEND-side fanout that rides sqlite-only fed-tracker
+  state: archive / restore / purge / pending-decision broadcast. (The
+  RECEIVE lane is a separate concern — archives / restores are
+  trait-covered on a pg receiver since #3075; see the coverage table
+  above.)
   Memories / deletions / links / sync_push core round-trip through
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
@@ -1060,13 +1063,13 @@ push response) — never a silent drop, never a partial apply.
 | `links` | Link replication | **applied** | — |
 | `signals` | Signed inter-agent signals | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
 | `action_transitions` | Coordination-action CAS | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
+| `archives` | Archive fanout (soft move into `archived_memories`) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
+| `restores` | Restore fanout (archive -> live) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) / [#1848](https://github.com/alphaonedev/ai-memory-mcp/issues/1848) |
 | `namespace_meta` | Governance-STANDARD (namespace-standard rebind) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
 | `namespace_meta_clears` | Governance-STANDARD clear | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
 | `checkpoints` | Federated commit-checkpoint RESOLUTION (the separation-of-duties freeze anchor) | `unsupported_on_postgres` | [#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) / FED-RQ-01 [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936) |
 | `pendings` | Governance PENDING-action broadcast | `unsupported_on_postgres` | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
 | `pending_decisions` | Governance pending-DECISION broadcast | `unsupported_on_postgres` | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
-| `archives` | Archive fanout | `unsupported_on_postgres` | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
-| `restores` | Restore fanout | `unsupported_on_postgres` | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
 
 What this means for an operator:
 
@@ -1078,7 +1081,13 @@ What this means for an operator:
   not declare `**`, the declared-parent check, and the #2536
   deep-descendant probe. A refusal is reported to the sender in the
   additive `namespace_meta_refused` counter, alongside
-  `namespace_meta_applied` / `namespace_meta_cleared`.
+  `namespace_meta_applied` / `namespace_meta_cleared`. The archive /
+  restore lanes carry the #2447 by-id confinement on the row's STORED
+  namespace (resolved through a scalar projection, fail-closed on an
+  unresolvable probe) and, on `restores[]`, the #1848 / G30
+  forget-tombstone gate — so a peer still cannot undo a local forget by
+  pushing a restore, on either backend. Their counters are `archived` /
+  `restored`.
 - **A non-ack lane reports non-ack; it does NOT silently drop.** The
   disposition is **refuse-to-apply and honest** — the sender sees a
   non-zero `unsupported_on_postgres` count for the batch, so a
@@ -1255,7 +1264,7 @@ parity test is the gate that prevents it.
 | HTTP full governance pipeline (multi-vote consensus + approver_type + inheritance walk on writes) | ✓ | ✓ (Wave-3 Continuation 3 — Phase 20) |
 | HTTP forget / consolidate / contradictions / notify / gc / import / export / archive write paths | ✓ | ✓ (Wave-3 Continuation 3 — Phase 13/14/15/16/17/18/19) |
 | `execute_pending_action` payload-replay on Approved | ✓ | sqlite-only — postgres returns `{approved: true, executed: false}`; caller re-issues underlying write |
-| Federation fanout subcollections (archive / restore / pending-decision broadcast) | ✓ | sqlite-only fed-tracker state |
+| Federation SEND-side fanout (archive / restore / pending-decision broadcast) | ✓ | sqlite-only fed-tracker state (the RECEIVE lane for archives / restores is trait-covered since #3075) |
 | Migration tool both directions | ✓ | ✓ |
 | `schema-init` CLI | n/a (auto-create) | ✓ (Wave 1 Stream B) |
 | `--store-url <URL>` flag on `serve` | ✓ (sqlite://) | ✓ (postgres://, postgresql://) |

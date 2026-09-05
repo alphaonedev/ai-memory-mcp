@@ -990,13 +990,15 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
-    // ---- archives / restores / pendings / pending_decisions /
-    //      namespace_meta / namespace_meta_clears -----------------------
+    // ---- pendings / pending_decisions / checkpoints --------------------
     //
-    // These subcollections write into tables (archived_memories,
-    // pending_actions, namespace_meta) not yet trait-covered. Surface
-    // them with the same noop posture sqlite uses on missing rows so
-    // a heterogeneous federation reports an honest count.
+    // The subcollections still not trait-covered for a verbatim inbound write
+    // on postgres. Surfaced as an honest, sender-visible non-ack so a
+    // heterogeneous federation reports a true count — never a silent drop,
+    // never a partial apply. #3075 migrates the remaining families one at a
+    // time; `archives[]` / `restores[]` / `namespace_meta[]` /
+    // `namespace_meta_clears[]` have already left this bucket (see their loops
+    // below).
     //
     // FED-RQ-01 (#1936) — commit-checkpoint RESOLUTIONS are counted here too:
     // the checkpoints table is not yet MemoryStore-trait-covered for a
@@ -1037,11 +1039,8 @@ pub(super) async fn sync_push_via_store(
     // shared `receive_auth` verdict it wraps) BEFORE approving — the #2488
     // lesson is that the two backends break in opposite directions when a lane
     // is confined on one funnel only.
-    unsupported_on_postgres += body.archives.len()
-        + body.restores.len()
-        + body.pendings.len()
-        + body.pending_decisions.len()
-        + body.checkpoints.len();
+    unsupported_on_postgres +=
+        body.pendings.len() + body.pending_decisions.len() + body.checkpoints.len();
 
     // #1718 — signals round-trip via the SAL trait (`apply_remote_signal`:
     // accept-and-flag-unsigned, idempotent on the UUID, forged-sig refused) —
@@ -1270,6 +1269,141 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
+    // #2447 (CWE-284) — the by-id sibling lanes (`archives[]` / `restores[]`)
+    // and the governance-STANDARD lanes probe under the whole ENROLLED posture,
+    // not just a declared scope, so Layer 2's disposition of an unscoped
+    // enrolled peer is IDENTICAL on every lane and on both backends.
+    let ns_gate_enrolled = attest_cfg.has_allowlist();
+    // ---- archives / restores (#2447, #3075) ----------------------------
+    //
+    // v0.6.2 (S29) sqlite-twin parity. `archives[]` is the SOFT move of a live
+    // row into `archived_memories` (distinct from `deletions[]`, which hard
+    // deletes); `restores[]` is its inverse. Both apply through the SAL trait
+    // (`apply_remote_archive` / `apply_remote_restore`, both adapters) instead
+    // of reporting the lane `unsupported_on_postgres` (#3075).
+    //
+    // #2447 — both lanes are the same BY-ID reach into a foreign namespace the
+    // #1934 delete gate closed, one step softer: an archive still removes the
+    // row from every live read of a namespace the peer was denied, and an
+    // ARCHIVED row is the input `restores[]` resurrects. So both are confined
+    // with the shared `inbound_by_id_namespace_authorized` verdict on the
+    // row's STORED namespace, resolved through the SCALAR by-id projection —
+    // `namespace_by_id` for archives (the row is still live) and
+    // `archived_namespace_by_id` for restores (the row is in the archive
+    // table, which is the whole point of the lane). A missing row stays a
+    // no-op; an UNRESOLVABLE probe fails CLOSED, because reporting a read
+    // fault as "provably no local row" is exactly the input a
+    // stored-vs-claimed relocate bypass needs (#2497).
+    //
+    // The #1848 / G30 forget-tombstone gate on `restores[]` is NOT here: it
+    // lives inside `apply_remote_restore` on BOTH adapters, so it cannot be
+    // omitted by a future caller that reaches the trait method another way.
+    let mut archived = 0usize;
+    let mut restored = 0usize;
+    for arch_id in &body.archives {
+        if validate::validate_id(arch_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        if ns_gate_enrolled {
+            match resolve_stored_namespace(&app, body.sender_agent_id.clone(), arch_id).await {
+                Ok(Some(namespace)) => {
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        crate::federation::receive_auth::LANE_ARCHIVES,
+                        arch_id,
+                        Some(&namespace),
+                        &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
+                    ) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %arch_id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        "sync_push(store): archive pre-resolve failed for {arch_id}: {e}; \
+                         refusing the archive (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app.store.apply_remote_archive(&apply_ctx, arch_id).await {
+            Ok(true) => archived += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push(store): apply_remote_archive failed for {arch_id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+    for res_id in &body.restores {
+        if validate::validate_id(res_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        if ns_gate_enrolled {
+            let probe_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+            match app.store.archived_namespace_by_id(&probe_ctx, res_id).await {
+                Ok(Some(namespace)) => {
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        crate::federation::receive_auth::LANE_RESTORES,
+                        res_id,
+                        Some(&namespace),
+                        &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
+                    ) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %res_id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        "sync_push(store): restore pre-resolve failed for {res_id}: {e}; \
+                         refusing the restore (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app.store.apply_remote_restore(&apply_ctx, res_id).await {
+            Ok(true) => restored += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push(store): apply_remote_restore failed for {res_id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+
     // ---- namespace_meta / namespace_meta_clears (#2479, #3075) ---------
     //
     // v0.6.2 (S35) sqlite-twin parity: apply the peer's governance-STANDARD
@@ -1289,7 +1423,6 @@ pub(super) async fn sync_push_via_store(
     // `namespace_meta_refused` counter AND `skipped` — identical to the sqlite
     // twin, and deliberately not folded, because this funnel enqueues nothing to
     // the push DLQ (#2498) so the sender is the only party that can retry.
-    let ns_gate_enrolled = attest_cfg.has_allowlist();
     let mut namespace_meta_applied = 0usize;
     let mut namespace_meta_cleared = 0usize;
     let mut namespace_meta_refused = 0usize;
@@ -1411,6 +1544,9 @@ pub(super) async fn sync_push_via_store(
         Json(json!({
             "applied": applied,
             "deleted": deleted,
+            // #3075 — archive / restore lane counters, sqlite-twin names.
+            "archived": archived,
+            "restored": restored,
             "links_applied": links_applied,
             "signals_applied": signals_applied,
             "action_transitions_applied": action_transitions_applied,
@@ -1428,9 +1564,10 @@ pub(super) async fn sync_push_via_store(
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
             (field_names::STORAGE_BACKEND): "postgres",
-            "note": "pendings / archives / restores / checkpoints are sqlite-only in this \
+            "note": "pendings / pending_decisions / checkpoints are sqlite-only in this \
                      funnel; memories / deletions / links / signals / action_transitions / \
-                     namespace_meta / namespace_meta_clears round-trip via the SAL trait",
+                     archives / restores / namespace_meta / namespace_meta_clears \
+                     round-trip via the SAL trait",
         })),
     )
         .into_response()

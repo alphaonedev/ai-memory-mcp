@@ -488,7 +488,10 @@ the governance-STANDARD lanes **`namespace_meta[]`** +
 `receive_auth::inbound_namespace_meta_authorized` verdict the sqlite
 funnel calls (Amendment E's unconditional global-`*` refusal included)
 and reported through `namespace_meta_applied` /
-`namespace_meta_cleared` / `namespace_meta_refused`. A fixed set of the
+`namespace_meta_cleared` / `namespace_meta_refused`, and the archive /
+restore siblings **`archives[]`** + **`restores[]`**, which carry the same
+#2447 by-id confinement on the row's STORED namespace and the same
+#1848 / G30 forget-tombstone refusal on restore. A fixed set of the
 remaining subcollections is **not yet** trait-covered for a verbatim
 inbound write against the postgres store, so on a postgres receiver
 those lanes are bucketed as **honest, sender-visible non-ack**
@@ -504,8 +507,6 @@ applied. The still-affected subcollections are:
 - **`pendings`** + **`pending_decisions`** — the governance PENDING-action
   and pending-DECISION broadcast lanes
   ([#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478)).
-- **`archives`** + **`restores`** — the archive / restore fanout siblings
-  ([#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447)).
 
 This is a **safe coverage gap, not a bypass**: the disposition is
 refuse-to-apply AND honest — a postgres receiver reports a non-zero

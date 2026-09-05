@@ -1587,6 +1587,52 @@ impl MemoryStore for SqliteStore {
         db::delete(&conn, id).map_err(box_err)
     }
 
+    /// #3075 — the #2447 `restores[]` scope probe, read through the SAME
+    /// unscoped scalar accessor the sqlite receive loop already calls, so the
+    /// trait route and the inline route cannot disagree about what "provably no
+    /// archived row" means. `_ctx` is discarded for the reason the trait doc
+    /// gives on the live twin: this value renders a REFUSAL and is never
+    /// returned to the peer.
+    async fn archived_namespace_by_id(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::archived_namespace_by_id(&conn, id).map_err(box_err)
+    }
+
+    /// #3075 — federated archive, delegating VERBATIM to the free function the
+    /// sqlite `/sync/push` `archives[]` loop has always called, with the shared
+    /// `sync_push` reason marker. Owner-BLIND by contract (see the trait doc):
+    /// the peer-scope gate is the authorization on this lane, and adding a
+    /// tenant predicate here would make the trait route refuse rows the inline
+    /// receive loop applies.
+    async fn apply_remote_archive(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::archive_memory(
+            &conn,
+            id,
+            Some(crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH),
+        )
+        .map_err(box_err)
+    }
+
+    /// #3075 — federated restore. The #1848 / G30 forget-tombstone gate runs
+    /// FIRST and reports a tombstoned id as the lane's no-op (`Ok(false)`), so a
+    /// peer cannot undo a local forget by pushing a restore; then the owner-BLIND
+    /// `db::restore_archived` (the operator un-forget funnel, #1771) does the
+    /// move. Byte-for-byte the order the inline receive loop uses.
+    async fn apply_remote_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        if db::memory_is_tombstoned(&conn, id).map_err(box_err)? {
+            return Ok(false);
+        }
+        db::restore_archived(&conn, id).map_err(box_err)
+    }
+
     async fn recall_hybrid(
         &self,
         ctx: &CallerContext,

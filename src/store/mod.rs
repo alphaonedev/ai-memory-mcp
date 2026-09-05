@@ -2733,6 +2733,120 @@ pub trait MemoryStore: Send + Sync {
         }
     }
 
+    /// v1.0.0 #3075 — resolve an ARCHIVED row's namespace by id, for the
+    /// federation `restores[]` namespace-scope gate (#2447).
+    ///
+    /// The sibling of [`namespace_by_id`](MemoryStore::namespace_by_id), reading
+    /// the ARCHIVE table instead of the live one, because at the moment a
+    /// `restores[]` entry is authorized the row lives in `archived_memories` —
+    /// that is the whole point of the lane. Same fail-closed contract as its
+    /// live twin, and it matters for the same reason: `Ok(None)` MUST mean
+    /// "provably no archived row" (the caller may then treat the entry as a
+    /// no-op), and `Err(_)` means UNRESOLVABLE, on which every caller MUST fail
+    /// closed rather than treat the row as absent — an unresolvable probe is
+    /// exactly the input a stored-vs-claimed relocate bypass needs.
+    ///
+    /// A SCALAR projection, never a full-row read, for the #2488 reasons the
+    /// live twin documents: the full-row archive mapper is pinned to a
+    /// fail-closed at-rest decrypt, so a gate built on it would make a row with
+    /// an unopenable envelope permanently un-restorable by federation with no
+    /// operator escape hatch.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; adapters MUST NOT fold a read
+    /// fault into `Ok(None)`.
+    async fn archived_namespace_by_id(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVED_NAMESPACE_BY_ID".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3075 — apply a remote-origin ARCHIVE (`/sync/push` `archives[]`).
+    ///
+    /// The federated soft-move of a live row into `archived_memories`, stamped
+    /// with [`field_names::ARCHIVE_REASON_SYNC_PUSH`](crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH).
+    /// Returns `true` when a live row was actually moved, `false` when there
+    /// was nothing to archive (the peer already archived it, or never sent the
+    /// original write) — the sqlite receive loop's long-standing no-op posture,
+    /// which the caller reports as `noop` rather than `skipped`.
+    ///
+    /// ## Why this is not [`archive_by_ids`](MemoryStore::archive_by_ids)
+    ///
+    /// `archive_by_ids` is the CALLER-OWNS verb (#3193): a tenant may not
+    /// archive another tenant's row. The federated lane has a different
+    /// authorization model entirely — the peer-scope gate
+    /// (`receive_auth::inbound_by_id_namespace_authorized` on the row's STORED
+    /// namespace, #2447) plus the enrolled-peer envelope — and the sqlite
+    /// receive loop has always applied it through the owner-BLIND
+    /// `db::archive_memory`. A separate method keeps the two contracts from
+    /// being conflated at a call site, and keeps the caller-owns contract of
+    /// `archive_by_ids` intact for the tenant surfaces that depend on it.
+    ///
+    /// Adapters MUST NOT apply an owner/tenant predicate here, and MUST NOT
+    /// relax any OTHER gate the local archive funnel enforces (link snapshot,
+    /// governance pre-write, record-stop).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; the caller counts an error as
+    /// `skipped` (an honest per-item non-ack), never as applied.
+    async fn apply_remote_archive(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_ARCHIVE".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3075 — apply a remote-origin RESTORE (`/sync/push` `restores[]`).
+    ///
+    /// The inverse of [`apply_remote_archive`](MemoryStore::apply_remote_archive):
+    /// move the row from `archived_memories` back into `memories`. Returns
+    /// `true` when a row was restored, `false` for the no-op cases (no archived
+    /// row, or the id is FORGET-TOMBSTONED).
+    ///
+    /// ## The #1848 / G30 tombstone gate lives HERE, and only here
+    ///
+    /// `restores[]` is the AUTOMATIC, peer-triggered resurrection vector: a peer
+    /// must not be able to undo a local forget by pushing a restore of a
+    /// tombstoned id. So this method MUST check `forget_tombstones` before
+    /// restoring and report a tombstoned id as `Ok(false)` (a no-op, matching
+    /// the lane's posture for a missing row).
+    ///
+    /// It is deliberately NOT checked by
+    /// [`archive_restore`](MemoryStore::archive_restore): that is the OPERATOR
+    /// un-forget path, an authorized restore per the #1771 recoverable-delete
+    /// contract, and gating it would break a documented operator capability.
+    /// The postgres `archive_restore` carried a comment justifying its missing
+    /// tombstone gate by the premise that "federation `/sync/push` restores[]
+    /// are sqlite-only" — #3075 retires that premise, which is why the gate
+    /// lands on this method rather than on that one.
+    ///
+    /// Adapters MUST NOT apply an owner/tenant predicate here (see
+    /// `apply_remote_archive` for why), and MUST keep every other gate the
+    /// local restore funnel enforces (the already-live collision refusal,
+    /// governance pre-write, cid re-mint, link re-insertion, record-stop).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Conflict` when the id already exists in live `memories` (the
+    /// caller counts it `skipped`, matching the sqlite receive loop), or
+    /// `Backend` on a storage error.
+    async fn apply_remote_restore(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_RESTORE".to_string(),
+        })
+    }
+
     /// #1718 — apply a remote-origin signal via the accept-and-flag-unsigned
     /// posture (a signal is a *message*, not an authority grant — same as
     /// [`apply_remote_memory`](MemoryStore::apply_remote_memory) /

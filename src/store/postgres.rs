@@ -54,6 +54,10 @@ mod coordination_create;
 // its qual_10 module-size budget (the lane brief mandates a submodule over a
 // private ceiling bump).
 mod parity_3064;
+// #3075 lane L-PGP — postgres SAL for the federation `/sync/push`
+// subcollections that were bucketed `unsupported_on_postgres`. Own module for
+// the same qual_10 budget reason as `parity_3064` above.
+mod federation_3075;
 mod pubkey_history;
 
 use crate::models::field_names;
@@ -24057,13 +24061,11 @@ impl MemoryStore for PostgresStore {
         // wholesale-preserved any string leaf under a `*_b64` key, so a
         // credential-shaped catchup-pull leaf egressed verbatim. Local
         // `store` / `store_batch` keep the TrustedByName storage screen.
-        let tombstoned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
-        )
-        .bind(&memory.id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
+        let tombstoned: bool = sqlx::query_scalar(federation_3075::SQL_FORGET_TOMBSTONE_EXISTS)
+            .bind(&memory.id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
         if tombstoned {
             tracing::info!(
                 target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
@@ -24561,13 +24563,11 @@ impl MemoryStore for PostgresStore {
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
         // tombstoned id (tombstone-wins) so a peer cannot revive a forgotten
         // row via LWW.
-        let tombstoned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
-        )
-        .bind(&inbound.id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
+        let tombstoned: bool = sqlx::query_scalar(federation_3075::SQL_FORGET_TOMBSTONE_EXISTS)
+            .bind(&inbound.id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
         if tombstoned {
             tracing::info!(
                 target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
@@ -24901,6 +24901,28 @@ impl MemoryStore for PostgresStore {
 
     /// `_ctx` is deliberately discarded — see the trait doc on
     /// [`MemoryStore::apply_remote_deletion`] (#2488).
+    /// #3075 — delegated to `postgres/federation_3075.rs` (this file is at its
+    /// qual_10 budget). Fail-closed scalar probe; see the trait doc.
+    async fn archived_namespace_by_id(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<String>> {
+        self.archived_namespace_by_id_pg(id).await
+    }
+
+    /// #3075 — federated `archives[]` apply. Owner-BLIND by trait contract; the
+    /// peer-scope gate is the authorization on this lane.
+    async fn apply_remote_archive(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.apply_remote_archive_pg(ctx, id).await
+    }
+
+    /// #3075 — federated `restores[]` apply, with the #1848/G30 forget-tombstone
+    /// gate the OPERATOR un-forget path (`archive_restore`) deliberately omits.
+    async fn apply_remote_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.apply_remote_restore_pg(ctx, id).await
+    }
+
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop().await?;
         // #2493 / #2503 / #3192 — this override still does NOT compose
@@ -29949,9 +29971,18 @@ impl MemoryStore for PostgresStore {
         }
 
         // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
-        // the OPERATOR un-forget path (federation /sync/push restores[] are
-        // sqlite-only per federation_signing_check.rs, never PostgresStore), so
-        // NO tombstone gate here — an authorized restore round-trips per #1771.
+        // the OPERATOR un-forget path, so NO tombstone gate here — an authorized
+        // restore round-trips per #1771.
+        //
+        // #3075 — the ORIGINAL justification for that omission was "federation
+        // /sync/push restores[] are sqlite-only per federation_signing_check.rs,
+        // never PostgresStore". That premise is RETIRED: the postgres receiver
+        // now applies `restores[]`. The omission stands anyway, on the #1771
+        // reasoning alone — but the G30 gate the federated lane needs is no
+        // longer absent, it MOVED: it lives on `apply_remote_restore`
+        // (`postgres/federation_3075.rs`), which runs it BEFORE composing this
+        // method. Do NOT "fix" the two by merging them: gating here would break
+        // the documented operator un-forget capability on both backends.
 
         // Reject if the id is already in active memories.
         let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)

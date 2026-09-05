@@ -1025,19 +1025,28 @@ async fn pg_sync_push_via_store_tampered_link_signature_skipped() {
 }
 
 // ---------------------------------------------------------------------------
-// sync_push_via_store — archives/restores -> unsupported_on_postgres tally.
+// sync_push_via_store — archives/restores missing-row NO-OP tally (#3075).
 // ---------------------------------------------------------------------------
 
+/// #3075 — these two lanes USED to land in `unsupported_on_postgres`; they now
+/// APPLY through the SAL trait. This cell pins the MISSING-ROW disposition,
+/// which is the one an operator most needs to be stable: an id with no live
+/// row (archive) or no archived row (restore) is the lane's documented `noop`,
+/// NOT a `skipped` and NOT an inflated non-ack. A peer that already archived a
+/// row, or that never sent the original write, must not make a heterogeneous
+/// federation look like it is refusing traffic.
 #[tokio::test]
-async fn pg_sync_push_via_store_archives_restores_unsupported_tally() {
+async fn pg_sync_push_via_store_archives_restores_missing_rows_noop_3075() {
     let _g = FED_ENV_LOCK.lock().await;
     let Some(url) = pg_url() else {
-        eprintln!("SKIP pg_sync_push_via_store_archives_restores_unsupported_tally: env unset");
+        eprintln!(
+            "SKIP pg_sync_push_via_store_archives_restores_missing_rows_noop_3075: env unset"
+        );
         return;
     };
     clear_fed_env();
-    // archives + restores are sqlite-only collections on the postgres path;
-    // they land in the `unsupported_on_postgres` counter, not applied.
+    // Zero-config posture: no peer allowlist, so the #2447 by-id scope gate
+    // short-circuits and the ids simply resolve to no local row.
     // SAFETY: this test holds FED_ENV_LOCK for the duration.
     unsafe {
         std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
@@ -1064,8 +1073,21 @@ async fn pg_sync_push_via_store_archives_restores_unsupported_tally() {
     );
     assert_eq!(
         b["unsupported_on_postgres"].as_i64().unwrap_or(0),
+        0,
+        "#3075: archives/restores no longer bucket as unsupported; body={b}"
+    );
+    assert_eq!(
+        b["noop"].as_i64().unwrap_or(-1),
         3,
-        "2 archives + 1 restore tallied unsupported; body={b}"
+        "2 absent archives + 1 absent restore are the lane's no-op; body={b}"
+    );
+    assert_eq!(b["archived"].as_i64().unwrap_or(-1), 0, "body={b}");
+    assert_eq!(b["restored"].as_i64().unwrap_or(-1), 0, "body={b}");
+    // The crate const is `pub(crate)`, so the wire name is spelled once here.
+    assert_eq!(
+        b["skipped"].as_i64().unwrap_or(-1),
+        0,
+        "a missing row is a no-op, never a skip; body={b}"
     );
 }
 

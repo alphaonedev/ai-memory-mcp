@@ -936,14 +936,15 @@ following should **not** treat v1.0.0 as sufficient:
   is likewise per-node: catch-up decrypts and the receiver re-seals under its
   own key.
 - **Postgres federation gaps (narrowing under #3075).** On the Postgres
-  backend, the archives / restores / pendings / pending_decisions / checkpoints
-  federation lanes report `unsupported_on_postgres` rather than fully
-  replicating (honest non-ack, never a silent drop). The governance-STANDARD
-  lanes (namespace_meta / namespace_meta_clears) **no longer** sit in this set:
-  since #3075 they APPLY on a Postgres receiver through the SAL trait, gated by
-  the SAME backend-blind `receive_auth::inbound_namespace_meta_authorized`
-  verdict the sqlite receiver runs (#2479 Amendment E included), so the §7
-  separation-of-duties statement below is unchanged by that migration. The
+  backend, the pendings / pending_decisions / checkpoints federation lanes
+  report `unsupported_on_postgres` rather than fully replicating (honest
+  non-ack, never a silent drop). Four lanes **no longer** sit in this set:
+  since #3075 the governance-STANDARD lanes (namespace_meta /
+  namespace_meta_clears) and the archive / restore lanes APPLY on a Postgres
+  receiver through the SAL trait, each gated by the SAME `receive_auth` verdict
+  the sqlite receiver runs (#2479 Amendment E; the #2447 by-id STORED-namespace
+  confinement; the #1848 / G30 forget-tombstone refusal on restore), so the §7
+  separation-of-duties statement below is unchanged by those migrations. The
   sqlite/MCP-native path is complete on every lane.
 - **Scale envelope — ARCHITECTED, not MEASURED.** ~1000 agents, ≤ 50 peers
   per block — **not 1M**. PEER dimension MEASURED (#2921 bench,
