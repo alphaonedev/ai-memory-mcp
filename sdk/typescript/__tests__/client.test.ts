@@ -17,6 +17,7 @@
  */
 
 import { AiMemoryClient } from "../src/client.js";
+import { AgentSigningKey } from "../src/attestation.js";
 import { ValidationError, NotFoundError } from "../src/errors.js";
 import type { Memory } from "../src/types.js";
 
@@ -117,6 +118,71 @@ describe("AiMemoryClient constructor", () => {
     const c = new AiMemoryClient({ baseUrl: "http://localhost:9077/" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((c as any).baseUrl).toBe("http://localhost:9077");
+  });
+});
+
+describe("AiMemoryClient bind proof-of-possession (#3464)", () => {
+  test("encodes a SPIFFE id and performs challenge-sign-bind in order", async () => {
+    const seen: Array<{ url: string; method: string; body: unknown }> = [];
+    const fetchImpl = async (url: unknown, init: { method?: string; body?: string }) => {
+      const method = init.method ?? "GET";
+      seen.push({
+        url: String(url),
+        method,
+        body: init.body === undefined ? undefined : JSON.parse(init.body),
+      });
+      const json =
+        method === "POST"
+          ? {
+              nonce: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              expires_at: "2099-01-01T00:00:00Z",
+              transcript_b64: "unused-by-client",
+            }
+          : { bound: true, agent_id: "spiffe://example.org/ns/prod" };
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => json,
+        text: async () => JSON.stringify(json),
+      };
+    };
+    const client = new AiMemoryClient(
+      { baseUrl: "http://localhost:9077" },
+      fetchImpl as never,
+    );
+    const key = AgentSigningKey.fromSeed(
+      Buffer.from(
+        "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+        "hex",
+      ),
+    );
+
+    await expect(
+      client.bindAgentPubkey("spiffe://example.org/ns/prod", key),
+    ).resolves.toEqual({
+      bound: true,
+      agent_id: "spiffe://example.org/ns/prod",
+    });
+
+    const encoded = "spiffe%3A%2F%2Fexample.org%2Fns%2Fprod";
+    expect(seen).toEqual([
+      {
+        url: `http://localhost:9077/api/v1/agents/${encoded}/pubkey/challenge`,
+        method: "POST",
+        body: { pubkey_b64: "_FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU" },
+      },
+      {
+        url: `http://localhost:9077/api/v1/agents/${encoded}/pubkey`,
+        method: "PUT",
+        body: {
+          pubkey_b64: "_FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU",
+          nonce: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          proof_b64:
+            "BaTpj_PpEXMkobgeJYpbS3ypihTrnYEdATwCkrTfUaGd67fpbl0vsAZSWX1YuMO1Hd0Cd_ew6YW7-QLckweqCA",
+        },
+      },
+    ]);
   });
 });
 

@@ -191,12 +191,14 @@ async fn rebroadcast_tombstoned_source_stays_agent_attested_2863() {
 
     // Enroll the origin author's key at this receiver so the write_signature
     // verifies (both DO nodes had it enrolled).
+    // #3464 — the bind proves possession from the keypair itself, so the
+    // separately-encoded public key this used to pass is no longer needed
+    // (`base64` is still used below for the write signature).
     let kp = ai_memory::identity::keypair::generate(author).unwrap();
-    let pk_b64 = base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes());
     {
         let lock = db.lock().await;
         ai_memory::db::register_agent(&lock.0, author, "nhi", &[]).unwrap();
-        ai_memory::db::bind_agent_pubkey(&lock.0, author, &pk_b64).unwrap();
+        ai_memory::db::bind_agent_pubkey_with_keypair(&lock.0, author, &kp).unwrap();
     }
 
     let id = uuid::Uuid::new_v4().to_string();

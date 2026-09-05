@@ -248,7 +248,9 @@ fn enroll(db_path: &std::path::Path) -> ai_memory::identity::keypair::AgentKeypa
     let kp = ai_memory::identity::keypair::generate(AGENT).expect("keypair");
     let conn = ai_memory::db::open(db_path).expect("reopen for enroll");
     ai_memory::storage::register_agent(&conn, AGENT, "nhi", &[]).expect("register agent");
-    ai_memory::storage::bind_agent_pubkey(&conn, AGENT, &kp.public_base64()).expect("bind");
+    // #3464 — the bind funnel demands proof of possession; this fixture holds
+    // the private half, so it runs the real challenge-response handshake.
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, AGENT, &kp).expect("bind");
     kp
 }
 

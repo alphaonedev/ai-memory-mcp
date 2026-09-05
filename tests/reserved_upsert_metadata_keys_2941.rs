@@ -181,7 +181,7 @@ fn reregister_preserves_bound_pubkey_and_signed_store_stays_agent_attested() {
     let pubkey = kp.public_base64();
 
     ai_memory::storage::register_agent(&conn, agent_id, "nhi", &[]).expect("register");
-    ai_memory::storage::bind_agent_pubkey(&conn, agent_id, &pubkey).expect("bind");
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, agent_id, &kp).expect("bind");
     assert_eq!(
         bound_pubkey(&conn, agent_id).as_deref(),
         Some(pubkey.as_str()),
@@ -317,8 +317,16 @@ mod pg {
             last_seen_at: String::new(),
         };
         store.register_agent(&ctx, &reg).await.expect("register");
+        let proof = ai_memory::store::prove_possession_via_store(
+            &store,
+            &ctx,
+            &agent_id,
+            kp.private.as_ref().expect("generated private key"),
+        )
+        .await
+        .expect("prove possession");
         store
-            .bind_agent_pubkey(&ctx, &agent_id, &pubkey)
+            .bind_agent_pubkey(&ctx, &agent_id, &pubkey, proof)
             .await
             .expect("bind");
         assert_eq!(

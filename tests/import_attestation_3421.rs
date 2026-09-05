@@ -154,14 +154,16 @@ async fn import_as_admin(router: &axum::Router, body: Value) -> (StatusCode, Val
 }
 
 fn fixture(id: &str, title: &str, author: &str) -> Memory {
+    // #3464: the signed write must fall inside its newly enrolled key window.
+    let stamp = ai_memory::identity::attest::now_attestable_rfc3339();
     Memory {
         id: id.to_string(),
         tier: Tier::Long,
         namespace: "imp".to_string(),
         title: title.to_string(),
         content: "the durable body of the imported memory".to_string(),
-        created_at: "2026-01-01T00:00:00+00:00".to_string(),
-        updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+        created_at: stamp.clone(),
+        updated_at: stamp,
         metadata: json!({ "agent_id": author }),
         ..Memory::default()
     }
@@ -190,8 +192,7 @@ fn enroll(db_path: &std::path::Path, agent_id: &str) -> ai_memory::identity::key
     let kp = ai_memory::identity::keypair::generate(agent_id).expect("generate keypair");
     let conn = ai_memory::db::open(db_path).expect("reopen for enroll");
     ai_memory::storage::register_agent(&conn, agent_id, "nhi", &[]).expect("register agent");
-    ai_memory::storage::bind_agent_pubkey(&conn, agent_id, &kp.public_base64())
-        .expect("bind pubkey");
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, agent_id, &kp).expect("bind pubkey");
     kp
 }
 

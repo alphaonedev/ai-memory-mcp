@@ -1872,6 +1872,15 @@ fn insert_inner(
         mem
     };
 
+    // Generic writes never carry identity authority. Sanitize at the shared
+    // SQLite write funnel so the v97 trigger remains a raw-SQL backstop.
+    let sanitized = (mem.namespace == AGENTS_NAMESPACE).then(|| {
+        let mut sanitized = mem.clone();
+        strip_unproven_agent_pubkey_binding(&mut sanitized);
+        sanitized
+    });
+    let mem = sanitized.as_ref().unwrap_or(mem);
+
     let tags_json = serde_json::to_string(&mem.tags)?;
     // #1757 / #1719 item 2b — populate-on-write: advance THIS node's own
     // component of the per-memory vector clock. `db::insert` is the
@@ -13912,69 +13921,21 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
     Ok(agents)
 }
 
-/// Bind (or rotate) an agent's Ed25519 public key into its `_agents`
-/// registration row metadata (#626 Layer-3, Task 1.3 / C3).
-///
-/// The pubkey is the anchor the write-path attestation gate verifies
-/// against: a signed write claiming `agent_id` is upgraded from *claimed*
-/// to *attested* only when its signature verifies under the key bound
-/// here. Stored under `metadata.agent_pubkey` (URL-safe-no-pad base64)
-/// alongside a `pubkey_bound_at` RFC3339 timestamp for rotation
-/// provenance.
-///
-/// Migration-free: the key rides in the existing registration row's
-/// JSON metadata (no schema bump). `json_set` updates `metadata` and the
-/// mirrored `content` column atomically so `list_agents` / the verifier
-/// observe a consistent row.
-///
-/// The agent MUST already be registered (`register_agent`) — binding a
-/// key to an unregistered id is rejected so a stray pubkey can never
-/// shadow a future legitimate registration. Re-binding overwrites the
-/// previous key (key rotation / revoke-then-rebind).
-///
-/// # Errors
-///
-/// - the agent is not registered (no `_agents` row for `agent_id`)
-/// - the underlying `UPDATE` fails
-pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) -> Result<()> {
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    let title = crate::models::agent_registration_title(agent_id);
-    let now = Utc::now().to_rfc3339();
-    let affected = conn.execute(
-        "UPDATE memories SET
-            metadata = json_set(metadata, '$.agent_pubkey', ?3, '$.pubkey_bound_at', ?4),
-            content  = json_set(content,  '$.agent_pubkey', ?3, '$.pubkey_bound_at', ?4),
-            updated_at = ?4
-         WHERE namespace = ?1 AND title = ?2",
-        params![AGENTS_NAMESPACE, &title, pubkey_b64, &now],
-    )?;
-    if affected == 0 {
-        anyhow::bail!(
-            "cannot bind pubkey: agent '{agent_id}' is not registered (register it first)"
-        );
-    }
-    // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the in-place
-    // pubkey-bind UPDATE rewrites the registration row's content; append
-    // ONE identity-only SUPERSEDE leaf in the same connection. Gated so
-    // flag-OFF skips even the id lookup (byte-identical legacy path).
-    if crate::config::append_only_enabled() {
-        let mid: String = conn.query_row(
-            "SELECT id FROM memories WHERE namespace = ?1 AND title = ?2",
-            params![AGENTS_NAMESPACE, &title],
-            |r| r.get(0),
-        )?;
-        crate::revisions::emit_revision_leaf_if_enabled(
-            conn,
-            &mid,
-            crate::revisions::RecordKind::Supersede,
-            None,
-            AGENTS_NAMESPACE,
-            None,
-            &now,
-        )?;
-    }
-    Ok(())
-}
+mod pubkey_history;
+use pubkey_history::bind_agent_pubkey_no_tx;
+pub use pubkey_history::{
+    AgentPubkeyVersion, AttestationPubkeyAt, agent_pubkey_at, agent_pubkey_for_attestation_at,
+    agent_pubkey_versions, bind_agent_pubkey, bind_agent_pubkey_with_keypair,
+    bind_agent_pubkey_with_signing_key, consume_pubkey_bind_challenge, issue_pubkey_bind_challenge,
+    prove_possession_with_conn, reap_expired_pubkey_bind_challenges,
+};
+#[cfg(feature = "sal-postgres")]
+pub(crate) use pubkey_history::{
+    downgrade_registration_attestation, select_agent_pubkey_versions_for_attestation,
+};
+pub(crate) use pubkey_history::{
+    strip_unproven_agent_pubkey_binding, validate_agent_pubkey_transition_time,
+};
 
 /// Fetch the Ed25519 public key bound to `agent_id`, if any (#626
 /// Layer-3, Task 1.3 / C3).
@@ -14208,6 +14169,63 @@ pub fn insert_subkey_cert(
     Ok(())
 }
 
+/// v1.0.0 #3464 — mark a persisted sub-key certificate REVOKED.
+///
+/// `agent_subkey_certs.revoked` shipped with the v79 table but nothing ever
+/// SET it and nothing ever READ it, so delegation revocation did not fire: a
+/// leaked instance sub-key kept minting `agent_attested` writes for the whole
+/// life of its cert window. This is the writer; [`subkey_is_revoked`] is the
+/// reader the v2 ingest gate consults.
+///
+/// Returns `true` when a live row was flipped, `false` when no such cert is
+/// persisted or it was already revoked (idempotent — re-revoking is a no-op,
+/// never an error, so a fleet-wide revocation sweep is safely resumable).
+///
+/// Revocation is deliberately one-way: there is no un-revoke. A key believed
+/// compromised must be replaced, not re-trusted, and a reversible revoke would
+/// be a second forgery surface.
+///
+/// # Errors
+///
+/// Surfaces underlying `UPDATE` failures.
+pub fn revoke_subkey_cert(conn: &Connection, cert_id: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    let affected = conn.execute(
+        "UPDATE agent_subkey_certs SET revoked = 1 WHERE id = ?1 AND revoked = 0",
+        params![cert_id],
+    )?;
+    Ok(affected > 0)
+}
+
+/// v1.0.0 #3464 — whether any persisted certificate binding `instance_key_id`
+/// to `principal` has been revoked.
+///
+/// Keyed on the SUB-KEY, not on one certificate encoding of it: revoking a
+/// delegation must kill the sub-key itself, so a second cert minted over the
+/// same instance key (a different validity window, a different
+/// `model_version_ref`) cannot resurrect it.
+///
+/// # Errors
+///
+/// Surfaces underlying query failures. A backend fault must NEVER flatten to
+/// `Ok(false)` — that would silently re-admit a revoked delegation, turning a
+/// transient error into a forged-provenance window (the #3145 lesson).
+pub fn subkey_is_revoked(
+    conn: &Connection,
+    principal: &str,
+    instance_key_id: &[u8],
+) -> Result<bool> {
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_subkey_certs
+             WHERE principal = ?1 AND instance_key_id = ?2 AND revoked = 1",
+            params![principal, instance_key_id],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("checking sub-key revocation for {principal}"))?;
+    Ok(found > 0)
+}
+
 /// A read-back row of the `agent_subkey_certs` table (spec §2.3), for the
 /// `ai-memory agents subkey-certs` inspect surface.
 #[derive(Debug, Clone)]
@@ -14280,8 +14298,9 @@ pub fn list_subkey_certs(conn: &Connection, principal: Option<&str>) -> Result<V
 /// Removes the `agent_pubkey` + `pubkey_bound_at` keys from both the
 /// metadata and the mirrored `content` JSON, stamping a
 /// `pubkey_revoked_at` marker so the revocation is auditable. After
-/// revocation the agent reverts to the permissive *claimed* posture
-/// (no key to verify against) until a fresh key is bound.
+/// revocation the agent reverts to the permissive *claimed* posture (no key to
+/// verify against). Candidate proof cannot reopen the closed history; recovery
+/// must use the signed-lineage authority.
 ///
 /// Idempotent: revoking an agent with no bound key still succeeds (the
 /// `json_remove` is a no-op) as long as the agent is registered.
@@ -14291,16 +14310,62 @@ pub fn list_subkey_certs(conn: &Connection, principal: Option<&str>) -> Result<V
 /// - the agent is not registered (no `_agents` row for `agent_id`)
 /// - the underlying `UPDATE` fails
 pub fn revoke_agent_pubkey(conn: &Connection, agent_id: &str) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    let write_txn = connection::WriteTxn::begin(conn).context("revoke_agent_pubkey: begin tx")?;
+    let result = revoke_agent_pubkey_no_tx(conn, agent_id);
+    match result {
+        Ok(()) => {
+            write_txn
+                .commit()
+                .context("revoke_agent_pubkey: commit tx")?;
+            Ok(())
+        }
+        Err(error) => {
+            write_txn.rollback();
+            Err(error)
+        }
+    }
+}
+
+fn revoke_agent_pubkey_no_tx(conn: &Connection, agent_id: &str) -> Result<()> {
+    use rusqlite::OptionalExtension as _;
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
+    // v1.0.0 #3464 — close the ledger window instead of losing the key.
+    // Revocation stops the key being LIVE; it does not un-sign the
+    // `agent_attested` rows it already signed, so the anchor those rows are
+    // verified against must survive the revoke. Stamped BEFORE the flat
+    // removal for the same reason `bind_agent_pubkey` appends first: a crash
+    // between the two must never leave a live key with no ledger row.
+    // Guarded by `superseded_at IS NULL`, so a second revoke is a no-op rather
+    // than a rewrite of an already-closed window (append-only).
+    let open_bound: Option<String> = conn
+        .query_row(
+            "SELECT bound_at FROM agent_pubkey_history
+             WHERE agent_id = ?1 AND superseded_at IS NULL",
+            params![agent_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(bound_at) = open_bound.as_deref() {
+        validate_agent_pubkey_transition_time(bound_at, None, &now)?;
+    }
+    conn.execute(
+        "UPDATE agent_pubkey_history SET superseded_at = ?2
+         WHERE agent_id = ?1 AND superseded_at IS NULL",
+        params![agent_id, &now],
+    )?;
     let affected = conn.execute(
         "UPDATE memories SET
             metadata = json_set(
-                json_remove(metadata, '$.agent_pubkey', '$.pubkey_bound_at'),
-                '$.pubkey_revoked_at', ?3),
+                json_remove(metadata, '$.agent_pubkey', '$.pubkey_bound_at', '$.write_signature'),
+                '$.pubkey_revoked_at', ?3,
+                '$.attest_level', 'claimed'),
             content  = json_set(
-                json_remove(content,  '$.agent_pubkey', '$.pubkey_bound_at'),
-                '$.pubkey_revoked_at', ?3),
+                json_remove(content,  '$.agent_pubkey', '$.pubkey_bound_at', '$.write_signature'),
+                '$.pubkey_revoked_at', ?3,
+                '$.attest_level', 'claimed'),
             updated_at = ?3
          WHERE namespace = ?1 AND title = ?2",
         params![AGENTS_NAMESPACE, &title, &now],
@@ -14520,7 +14585,32 @@ pub fn append_lineage_record(
         .context("append_lineage_record: insert body (duplicate epoch is refused by the C5 PK)")?;
 
         // Flat-binding sync — attest_write keeps trusting this key (C6).
-        bind_agent_pubkey(conn, agent_id, &record.successor_pubkey_b64)?;
+        //
+        // #3464 — the authority here is the SUCCESSION RECORD, not a
+        // possession proof: the pre-flight above has already `verify_strict`ed
+        // this record under the PREDECESSOR key (or, for a recovery record,
+        // under the M-of-N guardian quorum), so an existing trust authority
+        // authorised this exact successor key. The history row distinguishes
+        // predecessor-signed `lineage_succession` from `guardian_recovery`:
+        // only the latter may advance a closed/revoked history head. Both
+        // constructors are crate-private and reachable only after the
+        // corresponding verification above.
+        let proof = if record.reason == LineageReason::Recovery {
+            crate::identity::pubkey_bind::PossessionProof::from_verified_guardian_recovery(
+                agent_id,
+                &record.predecessor_pubkey_b64,
+                &record.successor_pubkey_b64,
+            )?
+        } else {
+            crate::identity::pubkey_bind::PossessionProof::from_verified_lineage_succession(
+                agent_id,
+                &record.predecessor_pubkey_b64,
+                &record.successor_pubkey_b64,
+            )?
+        };
+        let successor_pubkey =
+            crate::identity::keypair::canonical_public_base64(&record.successor_pubkey_b64)?;
+        bind_agent_pubkey_no_tx(conn, agent_id, &successor_pubkey, &proof)?;
 
         // Append-only witness (C1/C3 anchor), in THIS transaction.
         let witness = crate::signed_events::SignedEvent {
@@ -15307,6 +15397,19 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     // mirrors the observations prune posture immediately above.
     if let Err(e) = crate::signals::prune_expired(conn, Utc::now().timestamp()) {
         tracing::warn!("expired-signal prune failed (in gc): {e}");
+    }
+    // v1.0.0 #3464 — reap expired proof-of-possession bind challenges from the
+    // same chokepoint, so `agent_pubkey_challenges` is bounded by the challenge
+    // TTL rather than by history on every gc topology (serve / MCP stdio /
+    // CLI). Best-effort (WARN, never abort the sweep) — mirrors the
+    // observations / signals prune posture above. An unreaped expired row is
+    // inert, never admissible: the consuming UPDATE tests `expires_at` itself.
+    match reap_expired_pubkey_bind_challenges(conn) {
+        Ok(n) if n > 0 => {
+            tracing::debug!("reaped {n} expired agent pubkey bind challenge(s) (in gc)");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("expired bind-challenge reap failed (in gc): {e}"),
     }
     let now = Utc::now().to_rfc3339();
     // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
@@ -16824,6 +16927,15 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     } else {
         mem
     };
+
+    // Federation writes have no identity-binding authority. Keep this at the
+    // shared newer-wins funnel as a final backstop after receive validation.
+    let sanitized = (mem.namespace == AGENTS_NAMESPACE).then(|| {
+        let mut sanitized = mem.clone();
+        strip_unproven_agent_pubkey_binding(&mut sanitized);
+        sanitized
+    });
+    let mem = sanitized.as_ref().unwrap_or(mem);
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
@@ -23289,7 +23401,40 @@ mod tests {
         )
         .expect("enroll genesis");
 
-        // K0 is LOST. A fresh primary + 3 guardians (enroll 2-of-3).
+        // Prepare an ordinary K0-signed rotation before explicit revocation.
+        // Once the history window closes this otherwise-valid signature is
+        // stale authority and must not reopen the identity.
+        let genesis = lineage_head(&conn, "rec-agent")
+            .expect("read genesis")
+            .expect("genesis head")
+            .0;
+        let stale_successor = keypair::generate("rec-agent-stale").expect("stale successor");
+        let stale_rotation = crate::identity::lineage::LineageRecord::rotation(
+            &genesis,
+            &stale_successor.public_base64(),
+            None,
+            &Utc::now().to_rfc3339(),
+        )
+        .expect("prepare stale rotation");
+        let stale_signature =
+            crate::identity::sign::sign_succession(&k0, &stale_rotation.to_signable())
+                .expect("sign stale rotation before revoke");
+        revoke_agent_pubkey(&conn, "rec-agent").expect("close current history window");
+        let stale_error =
+            append_lineage_record(&conn, "rec-agent", &stale_rotation, &stale_signature)
+                .expect_err(
+                    "a predecessor signature prepared before revoke must not reopen a closed head",
+                );
+        assert!(
+            stale_error
+                .downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
+                .is_some(),
+            "closed-head refusal remains typed: {stale_error:#}"
+        );
+        assert_eq!(agent_pubkey(&conn, "rec-agent").unwrap(), None);
+        assert_eq!(read_lineage(&conn, "rec-agent").unwrap().len(), 1);
+
+        // K0 is LOST/revoked. A fresh primary + 3 guardians (enroll 2-of-3).
         let k_new = keypair::generate("rec-agent").expect("k_new");
         let guardians: Vec<_> = (0..3)
             .map(|_| keypair::generate("guardian").expect("guardian"))
@@ -23347,6 +23492,20 @@ mod tests {
             &not_before,
         )
         .expect("append recovery");
+
+        let history = agent_pubkey_versions(&conn, "rec-agent").expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[1].bind_authority,
+            crate::identity::pubkey_bind::BindAuthority::GuardianRecovery.as_str(),
+            "only the independently verified guardian quorum may advance a closed head"
+        );
+
+        let quorum_blob = crate::identity::lineage::encode_recovery_quorum(&quorum)
+            .expect("encode replay quorum");
+        append_lineage_record(&conn, "rec-agent", &record, &quorum_blob)
+            .expect_err("the persisted recovery record cannot be replayed");
+        assert_eq!(agent_pubkey_versions(&conn, "rec-agent").unwrap().len(), 2);
 
         // The chain now verifies to the FRESH head via the guardian quorum.
         let verified = verify_agent_lineage(&conn, "rec-agent")
@@ -32437,7 +32596,7 @@ mod tests {
 
         let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
         let b64 = kp.public_base64();
-        bind_agent_pubkey(&conn, "ai:curator", &b64).expect("bind");
+        bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).expect("bind");
         assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(b64));
     }
 
@@ -32451,7 +32610,8 @@ mod tests {
     #[test]
     fn bind_agent_pubkey_rejects_unregistered_agent() {
         let conn = test_db();
-        let err = bind_agent_pubkey(&conn, "ai:ghost", "AAAA").unwrap_err();
+        let kp = crate::identity::keypair::generate("ai:ghost").expect("generate");
+        let err = bind_agent_pubkey_with_keypair(&conn, "ai:ghost", &kp).unwrap_err();
         assert!(
             err.to_string().contains("not registered"),
             "binding to an unregistered agent must be rejected; got: {err}",
@@ -32459,21 +32619,145 @@ mod tests {
     }
 
     #[test]
-    fn bind_agent_pubkey_rotates_key_in_place() {
+    fn bind_agent_pubkey_refuses_candidate_only_rotation() {
         let conn = test_db();
         register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
-        let k1 = crate::identity::keypair::generate("ai:curator")
-            .unwrap()
-            .public_base64();
-        let k2 = crate::identity::keypair::generate("ai:curator")
-            .unwrap()
-            .public_base64();
+        let kp1 = crate::identity::keypair::generate("ai:curator").unwrap();
+        let kp2 = crate::identity::keypair::generate("ai:curator").unwrap();
+        let k1 = kp1.public_base64();
+        let k2 = kp2.public_base64();
         assert_ne!(k1, k2, "two fresh keys differ");
-        bind_agent_pubkey(&conn, "ai:curator", &k1).expect("bind k1");
-        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k1));
-        // Rotation overwrites in place.
-        bind_agent_pubkey(&conn, "ai:curator", &k2).expect("rotate to k2");
-        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
+        bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp1).expect("bind k1");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k1.clone()));
+        let error = bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp2)
+            .expect_err("a distinct replacement requires signed lineage authority");
+        assert!(
+            error
+                .downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
+                .is_some(),
+            "refusal must remain typed: {error:#}"
+        );
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k1.clone()));
+        let history = agent_pubkey_versions(&conn, "ai:curator").expect("history");
+        assert_eq!(history.len(), 1, "refusal must not mutate history");
+        assert_eq!(history[0].pubkey_b64, k1);
+        assert_eq!(history[0].version, 1);
+        assert!(
+            history[0].superseded_at.is_none(),
+            "the live key stays open"
+        );
+        drop(k2);
+    }
+
+    #[test]
+    fn historical_attestation_key_uses_window_and_never_current_on_gap_3464() {
+        let conn = test_db();
+        register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
+        let title = crate::models::agent_registration_title("ai:curator");
+        let keys: Vec<_> = ["old", "next", "current"]
+            .map(|label| {
+                crate::identity::keypair::generate(label)
+                    .unwrap()
+                    .public_base64()
+            })
+            .into();
+        conn.execute(
+            "INSERT INTO agent_pubkey_history
+                (agent_id, version, pubkey_b64, bind_authority, proof_nonce,
+                 bound_at, superseded_at)
+             VALUES
+                ('ai:curator', 1, ?1, 'legacy_unproven', NULL,
+                 '2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00'),
+                ('ai:curator', 2, ?2, 'lineage_succession', NULL,
+                 '2026-02-01T00:00:00+00:00', '2026-03-01T00:00:00+00:00'),
+                ('ai:curator', 3, ?3, 'lineage_succession', NULL,
+                 '2026-04-01T00:00:00+00:00', NULL)",
+            params![&keys[0], &keys[1], &keys[2]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET metadata = json_set(metadata, '$.agent_pubkey', ?3)
+             WHERE namespace = ?1 AND title = ?2",
+            params![AGENTS_NAMESPACE, title, &keys[2]],
+        )
+        .unwrap();
+
+        let old = agent_pubkey_for_attestation_at(&conn, "ai:curator", "2026-01-15T00:00:00+00:00")
+            .unwrap();
+        assert!(old.history_exists);
+        assert_eq!(old.candidate_pubkeys_b64, [keys[0].clone()]);
+
+        let at_old_bound =
+            agent_pubkey_for_attestation_at(&conn, "ai:curator", "2026-01-01T00:00:00+00:00")
+                .unwrap();
+        assert_eq!(at_old_bound.candidate_pubkeys_b64, [keys[0].clone()]);
+        let exact_handoff =
+            agent_pubkey_for_attestation_at(&conn, "ai:curator", "2026-02-01T00:00:00+00:00")
+                .unwrap();
+        assert_eq!(
+            exact_handoff.candidate_pubkeys_b64,
+            [keys[0].clone(), keys[1].clone()],
+            "both adjacent keys are eligible at handoff; the signature selects exactly one"
+        );
+
+        let revoked_gap =
+            agent_pubkey_for_attestation_at(&conn, "ai:curator", "2026-03-15T00:00:00+00:00")
+                .unwrap();
+        assert!(revoked_gap.history_exists);
+        assert_eq!(
+            revoked_gap.candidate_pubkeys_b64,
+            Vec::<String>::new(),
+            "history miss must not substitute the different current flat key"
+        );
+    }
+
+    #[test]
+    fn historical_attestation_key_refuses_overlapping_history_3464() {
+        let conn = test_db();
+        let keys: Vec<_> = ["one", "two"]
+            .map(|label| {
+                crate::identity::keypair::generate(label)
+                    .unwrap()
+                    .public_base64()
+            })
+            .into();
+        conn.execute(
+            "INSERT INTO agent_pubkey_history
+                (agent_id, version, pubkey_b64, bind_authority, proof_nonce,
+                 bound_at, superseded_at)
+             VALUES
+                ('ai:ambiguous', 1, ?1, 'legacy_unproven', NULL,
+                 '2026-01-01T00:00:00+00:00', '2026-04-01T00:00:00+00:00'),
+                ('ai:ambiguous', 2, ?2, 'lineage_succession', NULL,
+                 '2026-03-01T00:00:00+00:00', NULL)",
+            params![&keys[0], &keys[1]],
+        )
+        .unwrap();
+        let error =
+            agent_pubkey_for_attestation_at(&conn, "ai:ambiguous", "2026-03-15T00:00:00+00:00")
+                .expect_err("overlapping history is ambiguous and must fail closed");
+        assert!(error.to_string().contains("overlapping pubkey history"));
+
+        conn.execute(
+            "UPDATE agent_pubkey_history SET superseded_at = '2026-03-01T00:00:00+00:00'
+             WHERE agent_id = 'ai:ambiguous' AND version = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM agent_pubkey_history
+             WHERE agent_id = 'ai:ambiguous' AND version = 1",
+            [],
+        )
+        .unwrap();
+        let error =
+            agent_pubkey_for_attestation_at(&conn, "ai:ambiguous", "2026-03-15T00:00:00+00:00")
+                .expect_err("missing history version must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("missing or out-of-order version")
+        );
     }
 
     #[test]
@@ -32490,7 +32774,7 @@ mod tests {
         .expect("register");
         let before = list_agents(&conn).expect("list before");
         let kp = crate::identity::keypair::generate("ai:curator").unwrap();
-        bind_agent_pubkey(&conn, "ai:curator", &kp.public_base64()).expect("bind");
+        bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).expect("bind");
         let after = list_agents(&conn).expect("list after");
 
         let a_before = before
@@ -32515,7 +32799,7 @@ mod tests {
         let conn = test_db();
         register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
         let kp = crate::identity::keypair::generate("ai:curator").unwrap();
-        bind_agent_pubkey(&conn, "ai:curator", &kp.public_base64()).expect("bind");
+        bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).expect("bind");
         assert!(agent_pubkey(&conn, "ai:curator").unwrap().is_some());
         revoke_agent_pubkey(&conn, "ai:curator").expect("revoke");
         assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), None);
@@ -32551,7 +32835,7 @@ mod tests {
         )
         .expect("register");
         let kp = crate::identity::keypair::generate("ai:curator").unwrap();
-        bind_agent_pubkey(&conn, "ai:curator", &kp.public_base64()).expect("bind");
+        bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).expect("bind");
         revoke_agent_pubkey(&conn, "ai:curator").expect("revoke");
         let after = list_agents(&conn).expect("list after");
         let a = after
@@ -32566,20 +32850,31 @@ mod tests {
     }
 
     #[test]
-    fn revoke_then_rebind_restores_attestable_key() {
+    fn revoke_then_candidate_rebind_is_refused() {
         let conn = test_db();
         register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
-        let k1 = crate::identity::keypair::generate("ai:curator")
-            .unwrap()
-            .public_base64();
-        bind_agent_pubkey(&conn, "ai:curator", &k1).expect("bind k1");
+        let kp1 = crate::identity::keypair::generate("ai:curator").unwrap();
+        let k1 = kp1.public_base64();
+        bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp1).expect("bind k1");
         revoke_agent_pubkey(&conn, "ai:curator").expect("revoke");
         assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), None);
-        let k2 = crate::identity::keypair::generate("ai:curator")
-            .unwrap()
-            .public_base64();
-        bind_agent_pubkey(&conn, "ai:curator", &k2).expect("rebind k2");
-        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
+        let kp2 = crate::identity::keypair::generate("ai:curator").unwrap();
+        let error = bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp2)
+            .expect_err("a closed identity can only recover through lineage authority");
+        assert!(
+            error
+                .downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
+                .is_some(),
+            "refusal must remain typed: {error:#}"
+        );
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), None);
+        let history = agent_pubkey_versions(&conn, "ai:curator").expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].pubkey_b64, k1);
+        assert!(
+            history[0].superseded_at.is_some(),
+            "revoke closed the window"
+        );
     }
 
     #[test]

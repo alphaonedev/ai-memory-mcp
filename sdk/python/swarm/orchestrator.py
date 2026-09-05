@@ -157,9 +157,11 @@ class Swarm:
                 await admin.register_agent(
                     agent.identity.agent_id, agent_type="ai:glm-swarm"
                 )
+                # #3464 — the bind runs a challenge/response, so it takes the
+                # signing key itself (the private half proves possession).
                 await admin.bind_agent_pubkey(
                     agent.identity.agent_id,
-                    agent.identity.signing_key.public_key_b64(),
+                    agent.identity.signing_key,
                 )
                 await asyncio.sleep(self.config.stagger_secs)
             await self.preflight()

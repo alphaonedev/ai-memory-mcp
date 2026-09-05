@@ -417,7 +417,13 @@ pub const META_KEY_FAMILY: &str = "family";
 // (`handlers::release_quarantined`) — admin-gated inspect + audited release of
 // rows the #1948 federation containment posture holds. Both are new PATHS, so
 // EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 2 as well.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 96;
+// 2026-09-02 (#3464) — bumped 96 → 97: the proof-of-possession bind challenge
+// `POST /api/v1/agents/{id}/pubkey/challenge`
+// (`handlers::bind_agent_pubkey_challenge`) — admin-gated issue of the
+// single-use nonce the candidate key must sign before
+// `PUT /api/v1/agents/{id}/pubkey` will bind it. A new PATH, so
+// EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 1 as well.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 97;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -450,7 +456,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // 2026-08-22 (#2402) — bumped 80 → 82: the two new unique paths
 // `/api/v1/admin/quarantine` (operator inspect) and
 // `/api/v1/admin/quarantine/{id}/release` (audited operator release).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 82;
+// 2026-09-02 (#3464) — bumped 82 → 83: the new unique path
+// `/api/v1/agents/{id}/pubkey/challenge` (proof-of-possession bind challenge).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 83;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -1336,6 +1344,10 @@ pub fn build_router_with_timeout(
         .route(
             handlers::routes::AGENTS_ID_PUBKEY,
             axum::routing::put(handlers::bind_agent_pubkey),
+        )
+        .route(
+            handlers::routes::AGENTS_ID_PUBKEY_CHALLENGE,
+            post(handlers::bind_agent_pubkey_challenge),
         )
         .route(handlers::routes::PENDING, get(handlers::list_pending))
         .route(

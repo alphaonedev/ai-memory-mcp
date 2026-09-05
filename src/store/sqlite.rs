@@ -156,6 +156,24 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// Preserve the #3464 authorization refusal across the sqlite SAL adapter so
+/// callers receive the same typed 403 as PostgreSQL, never a backend-shaped
+/// 500. Every other storage failure retains the established mapping.
+fn pubkey_bind_err(error: anyhow::Error, agent_id: &str) -> StoreError {
+    if error
+        .downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
+        .is_some()
+    {
+        StoreError::PermissionDenied {
+            action: crate::handlers::BIND_AGENT_PUBKEY_ACTION.to_string(),
+            target: agent_id.to_string(),
+            reason: crate::errors::msg::BIND_PROOF_REFUSED.to_string(),
+        }
+    } else {
+        box_err(error)
+    }
+}
+
 /// v1.0.0 #3275 — `(agent_id, target_agent_id)` owner strings of a memory
 /// (empty when the key is absent), for the SAL `delete_link` caller-owns gate.
 fn link_owner_target_of(m: &Memory) -> (String, String) {
@@ -1328,10 +1346,58 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         agent_id: &str,
         pubkey_b64: &str,
+        // v1.0.0 #3464 — the possession witness. Threaded straight through to
+        // the storage funnel, which is where the append-only history is kept.
+        proof: crate::identity::pubkey_bind::PossessionProof,
     ) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::bind_agent_pubkey(&conn, agent_id, pubkey_b64).map_err(box_err)
+        db::bind_agent_pubkey(&conn, agent_id, pubkey_b64, proof)
+            .map_err(|error| pubkey_bind_err(error, agent_id))
+    }
+
+    async fn issue_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        pubkey_b64: &str,
+        issuer_daemon_id: &str,
+    ) -> StoreResult<crate::identity::pubkey_bind::BindChallenge> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::issue_pubkey_bind_challenge(&conn, agent_id, pubkey_b64, issuer_daemon_id)
+            .map_err(box_err)
+    }
+
+    async fn consume_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        nonce_b64: &str,
+    ) -> StoreResult<Option<crate::identity::pubkey_bind::ConsumedBindChallenge>> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::consume_pubkey_bind_challenge(&conn, agent_id, nonce_b64).map_err(box_err)
+    }
+
+    async fn agent_pubkey_versions(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Vec<crate::storage::AgentPubkeyVersion>> {
+        let conn = self.state.lock().await;
+        db::agent_pubkey_versions(&conn, agent_id).map_err(box_err)
+    }
+
+    async fn agent_pubkey_for_attestation_at(
+        &self,
+        agent_id: &str,
+        at_rfc3339: &str,
+    ) -> StoreResult<crate::storage::AttestationPubkeyAt> {
+        // One mutex hold spans BOTH the history probe and the legacy-flat
+        // fallback decision, so a concurrent first bind cannot appear as
+        // "no history" in one read and as a flat key in a later read.
+        let conn = self.state.lock().await;
+        db::agent_pubkey_for_attestation_at(&conn, agent_id, at_rfc3339).map_err(box_err)
     }
 
     async fn agent_pubkey(&self, agent_id: &str) -> StoreResult<Option<String>> {

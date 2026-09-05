@@ -78,7 +78,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 /// Schema version the corpus is anchored to. Asserted against the canonical
 /// [`ai_memory::storage::migrations::current_schema_version`] so the manifest
 /// can never claim a schema the code does not ship (docs-vs-SSOT parity).
-const CORPUS_SCHEMA_VERSION: i64 = 96;
+const CORPUS_SCHEMA_VERSION: i64 = 97;
 
 /// Fixed deterministic Ed25519 seed for the write-signing sub-key. A distinct,
 /// documented test seed (never a production key) so the signed vector is

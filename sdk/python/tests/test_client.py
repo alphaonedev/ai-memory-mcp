@@ -231,6 +231,120 @@ def test_unsubscribe_targets_collection_path_with_id_query() -> None:
     assert "/api/v1/subscriptions/" not in str(request.url)
 
 
+class _FakeSigningKey:
+    def public_key_b64(self) -> str:
+        return "candidate-public-key"
+
+
+def _pubkey_bind_transport(seen: list[httpx.Request]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "nonce": "single-use-nonce",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "transcript_b64": "dHJhbnNjcmlwdA",
+                },
+            )
+        if request.method == "PUT":
+            return httpx.Response(
+                200,
+                json={"bound": True, "agent_id": "spiffe://example.org/ns/prod"},
+            )
+        raise AssertionError(request.method)
+
+    return httpx.MockTransport(handler)
+
+
+def _assert_encoded_pubkey_bind_sequence(seen: list[httpx.Request]) -> None:
+    encoded = "spiffe%3A%2F%2Fexample.org%2Fns%2Fprod"
+    assert [request.method for request in seen] == ["POST", "PUT"]
+    assert seen[0].url.raw_path.decode() == (
+        f"/api/v1/agents/{encoded}/pubkey/challenge"
+    )
+    assert seen[1].url.raw_path.decode() == f"/api/v1/agents/{encoded}/pubkey"
+    assert json.loads(seen[0].read()) == {"pubkey_b64": "candidate-public-key"}
+    assert json.loads(seen[1].read()) == {
+        "pubkey_b64": "candidate-public-key",
+        "nonce": "single-use-nonce",
+        "proof_b64": "candidate-proof",
+    }
+
+
+def test_pubkey_bind_percent_encodes_spiffe_agent_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ai_memory.client as sync_client_module
+
+    seen: list[httpx.Request] = []
+    signed: list[dict[str, str]] = []
+
+    def fake_sign(_signing_key: object, **kwargs: str) -> str:
+        signed.append(kwargs)
+        return "candidate-proof"
+
+    monkeypatch.setattr(sync_client_module, "sign_bind_challenge", fake_sign)
+    client = AiMemoryClient(base_url=TEST_BASE_URL)
+    client._client = httpx.Client(  # noqa: SLF001 - offline URL/PoP probe
+        base_url=TEST_BASE_URL, transport=_pubkey_bind_transport(seen)
+    )
+    try:
+        result = client.bind_agent_pubkey(
+            "spiffe://example.org/ns/prod", _FakeSigningKey()  # type: ignore[arg-type]
+        )
+    finally:
+        client.close()
+
+    assert result["bound"] is True
+    assert signed == [
+        {
+            "agent_id": "spiffe://example.org/ns/prod",
+            "nonce": "single-use-nonce",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+    ]
+    _assert_encoded_pubkey_bind_sequence(seen)
+
+
+@pytest.mark.asyncio
+async def test_pubkey_bind_percent_encodes_spiffe_agent_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ai_memory.async_client as async_client_module
+    from ai_memory import AsyncAiMemoryClient
+
+    seen: list[httpx.Request] = []
+    signed: list[dict[str, str]] = []
+
+    def fake_sign(_signing_key: object, **kwargs: str) -> str:
+        signed.append(kwargs)
+        return "candidate-proof"
+
+    monkeypatch.setattr(async_client_module, "sign_bind_challenge", fake_sign)
+    client = AsyncAiMemoryClient(base_url=TEST_BASE_URL)
+    client._client = httpx.AsyncClient(  # noqa: SLF001 - offline URL/PoP probe
+        base_url=TEST_BASE_URL, transport=_pubkey_bind_transport(seen)
+    )
+    try:
+        result = await client.bind_agent_pubkey(
+            "spiffe://example.org/ns/prod", _FakeSigningKey()  # type: ignore[arg-type]
+        )
+    finally:
+        await client.aclose()
+
+    assert result["bound"] is True
+    assert signed == [
+        {
+            "agent_id": "spiffe://example.org/ns/prod",
+            "nonce": "single-use-nonce",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+    ]
+    _assert_encoded_pubkey_bind_sequence(seen)
+
+
 def test_removed_v1_methods_are_gone() -> None:
     """``grant`` / ``revoke`` / ``cluster`` hit routes the daemon never had.
 

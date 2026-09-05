@@ -140,6 +140,12 @@ pub struct ImportReport {
     pub governance_rejected: usize,
     /// Trust anchors seen in the envelope (advisory — never adopted).
     pub trust_anchors_seen: usize,
+    /// `_agents` rows whose caller-carried flat public-key binding was
+    /// removed. Since schema v97, only a persisted possession, open-head
+    /// succession, or guardian-recovery witness may append the authoritative
+    /// history row; `--trust-source` preserves authorship claims but is
+    /// intentionally not key possession.
+    pub pubkey_bindings_stripped: usize,
     /// v1.0.0 #2571 — `archived_memories[]` rows staged (raw, byte-preserved).
     pub archived_memories: usize,
     /// v1.0.0 #2571 — archived rows skipped because admitting them would
@@ -347,19 +353,17 @@ pub fn import_full_envelope(
         );
     }
     // ── Pre-ship 3x7 advisory — the explicit-trust posture is LOUD. ──
-    // Under `--trust-source` wire identity claims (metadata.agent_id /
-    // agent_pubkey) are preserved VERBATIM by design (operator-trusted
-    // backup restore), which includes `_agents` registration rows that can
-    // ENROLL key material consulted by future write/federation
-    // verification (`db::agent_pubkey`). That is the accepted risk of
-    // explicit operator trust — never import an untrusted bundle under
-    // this flag (see #2264 for the v1-wire-form sibling).
+    // Under `--trust-source`, ordinary wire authorship claims
+    // (`metadata.agent_id`) are preserved by design.  Public-key bindings are
+    // different: operator trust is not target-agent possession, so an
+    // imported `_agents.agent_pubkey` is stripped and reported below.  The
+    // destination's v97 history ledger remains the only trust authority.
     if opts.trust_source {
         tracing::warn!(
             target: IMPORT_TRACE_TARGET,
-            "--trust-source: wire identity claims (metadata.agent_id / agent_pubkey) are \
-             preserved VERBATIM — imported _agents registration rows can enroll key material \
-             for future verification; accepted risk of explicit operator trust (#2264)"
+            "--trust-source: wire metadata.agent_id claims are preserved, but imported \
+             _agents public-key bindings are stripped and reported because operator trust is \
+             not proof of target-agent key possession (#3464)"
         );
     }
     // ── ALL-OR-NOTHING: one transaction wraps the entire apply. ──
@@ -370,16 +374,7 @@ pub fn import_full_envelope(
     // acquires the reservation before any trust read or returns retriable busy
     // without applying any rows.
     let tx = begin_atomic_import(conn)?;
-    // ── Pre-ship 3x7 HIGH-1: snapshot the DESTINATION-enrolled author keys
-    // AFTER reserving the writer but BEFORE staging any bundle row. Verifying against a
-    // lookup made INSIDE the transaction would let a crafted bundle
-    // self-enroll (stage an `_agents` registration row carrying an
-    // attacker `agent_pubkey`, then have a later row in the SAME bundle
-    // "verify" against it). The snapshot pins verification to the keys the
-    // destination trusted at this transaction's serialization point.
-    let enrolled_keys = snapshot_dest_enrolled_keys(&tx, env, opts)?;
-
-    let mut report = apply_all_classes(&tx, env, opts, &enrolled_keys)?;
+    let mut report = apply_all_classes(&tx, env, opts)?;
 
     // ── FAIL-CLOSED spine gate ──
     // Re-verify the STAGED audit spine with the substrate's own authoritative
@@ -462,7 +457,6 @@ fn apply_all_classes(
     conn: &Connection,
     env: &ExportEnvelope,
     opts: &ImportOptions,
-    enrolled_keys: &std::collections::HashMap<String, Option<String>>,
 ) -> Result<ImportReport> {
     let mut report = ImportReport::default();
 
@@ -619,6 +613,19 @@ fn apply_all_classes(
         // #2211 — the L1 restamp-by-default provenance hygiene (shared with
         // the `archived_memories[]` lane since #3150).
         let original_claim = restamp_inbound_identity(&mut staged, opts, &mut report);
+        if crate::storage::strip_unproven_agent_pubkey_binding(&mut staged) {
+            report.pubkey_bindings_stripped += 1;
+            report.warnings.push(format!(
+                "memory {}: imported agent_pubkey binding stripped; bind with a persisted \
+                 proof-of-possession challenge or verified lineage succession",
+                staged.id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %staged.id,
+                "imported _agents public-key binding stripped: wire trust is not key possession (#3464)"
+            );
+        }
         // #2353 (sibling of #2340) — redact to the TO-BE-PERSISTED form
         // BEFORE the attestation re-derivation below, so the stamp covers
         // exactly the bytes `storage::insert_imported`'s origin-blind screen
@@ -648,10 +655,10 @@ fn apply_all_classes(
         // the row (per-row skip + WARN, the federation caller's
         // disposition); everything else lands `claimed` at worst.
         if !apply_import_attestation(
+            conn,
             &mut staged,
             original_claim.as_deref(),
             opts.trust_source,
-            enrolled_keys,
             &mut report,
         )? {
             continue;
@@ -951,12 +958,25 @@ fn apply_all_classes(
         //      redact, exactly as on the live lane — the archive can no
         //      longer take a raw credential verbatim.)
         let original_claim = restamp_inbound_identity(&mut row.memory, opts, &mut report);
+        if crate::storage::strip_unproven_agent_pubkey_binding(&mut row.memory) {
+            report.pubkey_bindings_stripped += 1;
+            report.warnings.push(format!(
+                "archived memory {}: imported agent_pubkey binding stripped; restore cannot \
+                 bootstrap trust without proof of possession or verified lineage",
+                row.memory.id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %row.memory.id,
+                "archived _agents public-key binding stripped: archive restore is not key possession (#3464)"
+            );
+        }
         crate::federation::receive_auth::redact_inbound_before_attestation(&mut row.memory);
         if !apply_import_attestation(
+            conn,
             &mut row.memory,
             original_claim.as_deref(),
             opts.trust_source,
-            enrolled_keys,
             &mut report,
         )? {
             continue;
@@ -1754,59 +1774,6 @@ fn memory_row_exists(conn: &Connection, id: &str) -> Result<bool> {
     .with_context(|| format!("import: endpoint-presence probe for memory {id}"))
 }
 
-/// Pre-ship 3x7 HIGH-1 — resolve the DESTINATION-enrolled Ed25519 key for
-/// every author the bundle's memories will be attributed to, BEFORE the
-/// import transaction stages any bundle row.
-///
-/// The lookup ([`crate::storage::agent_pubkey`]) reads the flat
-/// `metadata.agent_pubkey` off the `_agents` registration row — a row shape
-/// an unauthenticated bundle can itself carry. Snapshotting pre-transaction
-/// structurally prevents in-bundle self-enrollment: a crafted registration
-/// row staged earlier in the SAME bundle can never supply the key a later
-/// row "verifies" against.
-///
-/// Under the default restamp posture the only attributed author is the
-/// caller; under `--trust-source` each memory keeps its own claimed author.
-/// Covers BOTH the live `memories[]` and (since #3150) the
-/// `archived_memories[]` lane.
-///
-/// # Errors
-///
-/// Surfaces underlying key-lookup query failures.
-fn snapshot_dest_enrolled_keys(
-    conn: &Connection,
-    env: &ExportEnvelope,
-    opts: &ImportOptions,
-) -> Result<std::collections::HashMap<String, Option<String>>> {
-    let mut keys = std::collections::HashMap::new();
-    // #3150 — the `archived_memories[]` lane now runs the same attestation
-    // re-derivation as `memories[]`, so its authors must be in the SAME
-    // pre-transaction snapshot. Resolving them lazily inside the transaction
-    // would reopen the in-bundle self-enrollment hole this snapshot exists to
-    // close.
-    let archived_authors = env.archived_memories.iter().map(|d| &d.memory);
-    for mem in env.memories.iter().chain(archived_authors) {
-        let author: Option<String> = if opts.trust_source {
-            mem.metadata
-                .get(crate::META_KEY_AGENT_ID)
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        } else {
-            Some(opts.caller_agent_id.clone())
-        };
-        let Some(author) = author.filter(|a| !a.is_empty()) else {
-            continue;
-        };
-        if !keys.contains_key(&author) {
-            let bound = crate::storage::agent_pubkey(conn, &author).with_context(|| {
-                format!("portability import: resolving enrolled key for author {author}")
-            })?;
-            keys.insert(author, bound);
-        }
-    }
-    Ok(keys)
-}
-
 /// Pre-ship 3x7 HIGH-1 — re-derive a staged memory's attestation from what
 /// the DESTINATION can verify, never from the wire (the federation
 /// [`crate::handlers::federation_receive`] `apply_inbound_write_attestation`
@@ -1826,22 +1793,39 @@ fn snapshot_dest_enrolled_keys(
 ///
 /// # Errors
 ///
-/// None currently beyond the `Result` plumbing shared with the loop; forged
-/// signatures are a counted per-row skip, not a batch abort.
+/// A key-history lookup failure aborts this all-or-nothing transaction for a
+/// genuinely verifiable signed row. Unsigned, malformed, author-less, and
+/// re-attributed rows never consult history and retain their per-row outcome.
 fn apply_import_attestation(
+    conn: &Connection,
     staged: &mut crate::models::Memory,
     original_claim: Option<&str>,
     trust_source: bool,
-    enrolled_keys: &std::collections::HashMap<String, Option<String>>,
     report: &mut ImportReport,
 ) -> Result<bool> {
     use crate::identity::attest::{ImportClaimedCause, ImportSkipCause};
 
+    let resolved_pubkeys = if let Some(author) =
+        crate::identity::attest::presented_attestation_author_needing_bound_key(
+            staged,
+            original_claim,
+        ) {
+        Some(
+            crate::storage::agent_pubkey_for_attestation_at(conn, author, &staged.created_at)
+                .with_context(|| {
+                format!(
+                    "portability import: resolving key history for author {author} at the signed envelope timestamp"
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     let outcome = crate::identity::attest::reconcile_imported_attestation(
         staged,
         original_claim,
         !trust_source,
-        enrolled_keys,
+        resolved_pubkeys.as_ref(),
     );
 
     if let Some(cause) = outcome.skipped() {
@@ -2060,7 +2044,9 @@ mod tests {
     }
 
     #[test]
-    fn import_entrypoint_reserves_writer_before_enrolled_key_snapshot_2250() {
+    fn import_entrypoint_reserves_writer_before_per_row_key_lookup_2250() {
+        use base64::Engine as _;
+
         let _trace_guard = IMPORT_TRACE_GUARD
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2071,16 +2057,39 @@ mod tests {
 
         let src = fresh_conn("entrypoint-order-src-2250-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
-        env.memories.push(memory_fixture(
+        let mut dst = fresh_conn("entrypoint-order-dst-2250-");
+        let signer = crate::identity::keypair::generate("ai:source-2250").expect("keygen");
+        crate::storage::register_agent(&dst, "ai:source-2250", "ai:generic", &[])
+            .expect("register signer");
+        crate::storage::bind_agent_pubkey_with_keypair(&dst, "ai:source-2250", &signer)
+            .expect("bind signer");
+        let mut incoming = memory_fixture(
             "mem-entrypoint-order-2250",
             "transaction ordering",
             "ai:source-2250",
-        ));
-        let mut dst = fresh_conn("entrypoint-order-dst-2250-");
+        );
+        let bound_at = crate::storage::agent_pubkey_versions(&dst, "ai:source-2250")
+            .expect("history")
+            .pop()
+            .expect("bound key version")
+            .bound_at;
+        let signed_at = crate::identity::attest::canonicalize_attested_created_at(&bound_at)
+            .expect("history timestamp canonicalizes for a signed write");
+        incoming.created_at.clone_from(&signed_at);
+        incoming.updated_at = signed_at;
+        let signature =
+            crate::identity::attest::sign_memory_write(&signer, &incoming, "ai:source-2250")
+                .expect("sign incoming row");
+        incoming.metadata.as_object_mut().unwrap().insert(
+            crate::models::field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(signature)),
+        );
+        env.memories.push(incoming);
         dst.trace(Some(import_trace_callback));
         let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
         dst.trace(None);
         assert_eq!(report.memories, 1);
+        assert_eq!(report.attestation_downgraded, 0);
 
         let trace = IMPORT_TRACE_LOG
             .lock()
@@ -2096,10 +2105,10 @@ mod tests {
                 statement.contains("json_extract(metadata, '$.agent_pubkey')")
                     && statement.contains("WHERE namespace")
             })
-            .expect("entrypoint must query the destination-enrolled author key");
+            .expect("a signed row must resolve the destination-enrolled author key");
         assert!(
             begin < snapshot,
-            "writer reservation must precede trust snapshot; trace={trace:?}"
+            "writer reservation must precede each signed row's key lookup; trace={trace:?}"
         );
     }
 
@@ -2746,8 +2755,7 @@ mod tests {
         let dst = fresh_conn("attest-forged-dst-");
         crate::storage::register_agent(&dst, "ai:author-3x7", "ai:generic", &[]).expect("register");
         let kp = crate::identity::keypair::generate("ai:author-3x7").expect("keygen");
-        crate::storage::bind_agent_pubkey(&dst, "ai:author-3x7", &kp.public_base64())
-            .expect("bind");
+        crate::storage::bind_agent_pubkey_with_keypair(&dst, "ai:author-3x7", &kp).expect("bind");
 
         let src = fresh_conn("attest-forged-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
@@ -2854,7 +2862,7 @@ mod tests {
         let dst = fresh_conn("attest-restamp-dst-2264-");
         crate::storage::register_agent(&dst, original_agent, "ai:generic", &[])
             .expect("register original signer");
-        crate::storage::bind_agent_pubkey(&dst, original_agent, &kp.public_base64())
+        crate::storage::bind_agent_pubkey_with_keypair(&dst, original_agent, &kp)
             .expect("bind original key");
         let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
         assert_eq!(report.memories, 1);
@@ -2890,10 +2898,18 @@ mod tests {
         let dst = fresh_conn("attest-ok-dst-");
         crate::storage::register_agent(&dst, "ai:signer-3x7", "ai:generic", &[]).expect("register");
         let kp = crate::identity::keypair::generate("ai:signer-3x7").expect("keygen");
-        crate::storage::bind_agent_pubkey(&dst, "ai:signer-3x7", &kp.public_base64())
-            .expect("bind");
+        crate::storage::bind_agent_pubkey_with_keypair(&dst, "ai:signer-3x7", &kp).expect("bind");
 
         let mut mem = memory_fixture("mem-valid-sig-3x7", "signed row", "ai:signer-3x7");
+        let bound_at = crate::storage::agent_pubkey_versions(&dst, "ai:signer-3x7")
+            .expect("history")
+            .pop()
+            .expect("bound key version")
+            .bound_at;
+        let signed_at = crate::identity::attest::canonicalize_attested_created_at(&bound_at)
+            .expect("history timestamp canonicalizes for a signed write");
+        mem.created_at.clone_from(&signed_at);
+        mem.updated_at = signed_at;
         let sig =
             crate::identity::attest::sign_memory_write(&kp, &mem, "ai:signer-3x7").expect("sign");
         mem.metadata.as_object_mut().unwrap().insert(
@@ -2946,6 +2962,55 @@ mod tests {
             "the wire identity-key claim must be stripped under restamp, got: {}",
             got.metadata
         );
+    }
+
+    #[test]
+    fn trust_source_cannot_bootstrap_agent_pubkey_and_reports_strip_3464() {
+        use crate::models::field_names;
+        let src = fresh_conn("pubkey-trusted-strip-src-3464");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let agent = "ai:trusted-import-cannot-bind-3464";
+        let fake_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut mem = memory_fixture("mem-trusted-pubkey-3464", "identity plant", agent);
+        mem.namespace = crate::models::AGENTS_NAMESPACE.to_string();
+        mem.title = crate::models::agent_registration_title(agent);
+        mem.metadata = serde_json::json!({
+            "agent_id": agent,
+            (field_names::AGENT_PUBKEY): fake_key,
+            (field_names::PUBKEY_BOUND_AT): "2026-07-14T00:00:00Z",
+        });
+        mem.content = serde_json::to_string(&mem.metadata).expect("registration mirror");
+        env.memories.push(mem);
+
+        let dst = fresh_conn("pubkey-trusted-strip-dst-3464");
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("trusted import");
+        assert_eq!(report.memories, 1);
+        assert_eq!(report.pubkey_bindings_stripped, 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("agent_pubkey binding stripped"))
+        );
+        assert_eq!(
+            crate::storage::agent_pubkey(&dst, agent).expect("flat key"),
+            None,
+            "operator trust must not substitute for target-agent possession"
+        );
+        assert!(
+            crate::storage::agent_pubkey_versions(&dst, agent)
+                .expect("history")
+                .is_empty(),
+            "a generic import must not mint an authoritative history row"
+        );
+        let got = crate::storage::get(&dst, "mem-trusted-pubkey-3464")
+            .expect("get")
+            .expect("registration landed without binding");
+        assert!(got.metadata.get(field_names::AGENT_PUBKEY).is_none());
+        let mirrored: serde_json::Value =
+            serde_json::from_str(&got.content).expect("registration content JSON");
+        assert!(mirrored.get(field_names::AGENT_PUBKEY).is_none());
+        assert!(mirrored.get(field_names::PUBKEY_BOUND_AT).is_none());
     }
 
     /// ★ HIGH-2: rows violating the write invariants (over-MAX_CONTENT_SIZE,

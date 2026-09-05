@@ -207,7 +207,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.8.0** | `AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1` (overlaid via pgdg apt on base `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`; `CREATE EXTENSION age` reports extversion 1.8.0), `EXPECTED_AGE_VERSION=1.8.0` |
 | pgvector (server extension) | **0.8.6** | `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v93** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 96` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 91`). A deployment-validation anchor at the current schema would be a separate config. |
+| ai-memory postgres schema | **v93** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 97` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 91`). A deployment-validation anchor at the current schema would be a separate config. |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)

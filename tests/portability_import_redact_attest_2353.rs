@@ -56,7 +56,8 @@ fn signed_bundle_memory(
     // #3422 — `Z` is not the storage-stable rendering; `sign_memory_write`
     // refuses to mint a signature over a `created_at` postgres would return
     // as `+00:00`.
-    let now = "2026-07-20T00:00:00+00:00".to_string();
+    // #3464: newly enrolled history cannot attest a pre-enrollment write.
+    let now = attest::now_attestable_rfc3339();
     let mut mem = Memory {
         id: id.into(),
         namespace: "portability".into(),
@@ -110,7 +111,7 @@ fn dest_with_enrolled_author() -> (Connection, ai_memory::identity::keypair::Age
     let conn = fresh_db("dest");
     ai_memory::db::register_agent(&conn, AUTHOR, "ai:generic", &[]).expect("register");
     let kp = ai_memory::identity::keypair::generate(AUTHOR).expect("keypair");
-    ai_memory::db::bind_agent_pubkey(&conn, AUTHOR, &kp.public_base64()).expect("bind");
+    ai_memory::db::bind_agent_pubkey_with_keypair(&conn, AUTHOR, &kp).expect("bind");
     (conn, kp)
 }
 

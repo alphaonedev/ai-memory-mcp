@@ -136,6 +136,11 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // #1539 — attestation pubkey bind routes through the SAL
         // `MemoryStore::bind_agent_pubkey`, implemented on postgres.
         ("PUT", p) if agents_pubkey_path(p) => true,
+        // v1.0.0 #3464 — the proof-of-possession bind CHALLENGE. Supported on
+        // postgres because both stores durably persist it. A shared-store
+        // replica can therefore consume a challenge issued by another
+        // replica; there is no `app.db` scratch-read hazard.
+        ("POST", p) if agents_pubkey_challenge_path(p) => true,
         // Wave-3 continuation — list_namespaces (read-only).
         ("GET", super::routes::NAMESPACES) => {
             // GET /api/v1/namespaces with no query string lists namespaces.
@@ -385,6 +390,23 @@ fn agents_pubkey_path(p: &str) -> bool {
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
+/// v1.0.0 #3464 — matches `POST /api/v1/agents/{id}/pubkey/challenge` (the
+/// proof-of-possession bind challenge), where `{id}` is a single non-empty,
+/// non-slash path segment. DISTINCT from [`agents_pubkey_path`], which
+/// suffix-matches `/pubkey` exactly and therefore never matches this path.
+///
+/// `sal`-gated like every sibling matcher here: the only caller is
+/// `postgres_endpoint_supported`, which is itself behind that feature, so
+/// without the gate this is dead code on the default / vectorlite legs.
+#[cfg(feature = "sal")]
+fn agents_pubkey_challenge_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/agents/") else {
+        return false;
+    };
+    rest.strip_suffix("/pubkey/challenge")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// #1718 — matches `POST /api/v1/actions/{id}/transition` (the coordination
 /// action-transition write surface), where `{id}` is a single non-empty,
 /// non-slash path segment.
@@ -510,6 +532,12 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("POST", super::routes::AGENTS) => true,
         // #1539 — attestation pubkey bind.
         ("PUT", p) if agents_pubkey_path(p) => true,
+        // v1.0.0 #3464 — the proof-of-possession bind challenge. Registered
+        // here as well as in `postgres_endpoint_supported`: the two registries
+        // must agree that the route EXISTS, or a future narrowing of the pg
+        // allowlist would make the middleware answer 404 for a route the router
+        // really does serve, instead of the truthful 501 (#1410 / #1052).
+        ("POST", p) if agents_pubkey_challenge_path(p) => true,
         // Pending governance.
         ("GET", super::routes::PENDING) => true,
         // Approvals SSE stream (path form not parameterised).

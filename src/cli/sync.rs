@@ -110,44 +110,34 @@ struct InboundAttestTally {
     downgraded: usize,
     /// Rows SKIPPED because a presented signature was malformed or forged.
     forged_skipped: usize,
+    /// `_agents` rows whose flat key pair was refused as transport data.
+    pubkey_bindings_stripped: usize,
+    /// Signed rows refused because destination key history could not be read.
+    key_history_refused: usize,
 }
 
-/// #3457 — resolve the DESTINATION-enrolled key for every author this leg could
-/// attribute a row to, BEFORE any row is written.
-///
-/// Taken as a pre-loop snapshot for the same reason the portability import does
-/// (#3150): resolving lazily inside the loop would let an `_agents`
-/// registration row carried by the REMOTE database self-enroll the very key
-/// that then verifies its siblings. Under the default restamp posture every row
-/// is attributed to `caller_id`, so that is the only key consulted; under
-/// `--trust-source` each row keeps its own author, so each distinct author is
-/// resolved once.
-fn resolve_destination_enrolled_keys(
-    dest: &rusqlite::Connection,
-    mems: &[models::Memory],
-    trust_source: bool,
-    caller_id: &str,
-) -> Result<std::collections::HashMap<String, Option<String>>> {
-    use anyhow::Context as _;
-    let mut keys: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-    for mem in mems {
-        let author = if trust_source {
-            original_agent_claim(mem)
-        } else {
-            Some(caller_id.to_string())
-        };
-        let Some(author) = author.filter(|a| !a.is_empty()) else {
-            continue;
-        };
-        if !keys.contains_key(&author) {
-            let bound = db::agent_pubkey(dest, &author).with_context(|| {
-                format!("sync: resolving the destination-enrolled key for author {author}")
-            })?;
-            keys.insert(author, bound);
-        }
+fn strip_sync_pubkey_binding(mem: &mut models::Memory, stripped: &mut usize) {
+    if crate::storage::strip_unproven_agent_pubkey_binding(mem) {
+        *stripped += 1;
+        tracing::warn!(
+            memory_id = %mem.id,
+            "sync: transported _agents public-key binding stripped and carried attestation downgraded; sync is not proof of possession or lineage (#3464)"
+        );
     }
-    Ok(keys)
+}
+
+fn resolve_sync_attestation_key(
+    dest: &rusqlite::Connection,
+    mem: &models::Memory,
+    original_claim: Option<&str>,
+) -> Result<Option<crate::storage::AttestationPubkeyAt>> {
+    let Some(author) = crate::identity::attest::presented_attestation_author_needing_bound_key(
+        mem,
+        original_claim,
+    ) else {
+        return Ok(None);
+    };
+    db::agent_pubkey_for_attestation_at(dest, author, &mem.created_at).map(Some)
 }
 
 /// #3457 — surface the inbound attestation tally on the human-readable output,
@@ -168,6 +158,20 @@ fn write_attestation_tally(out: &mut CliOutput<'_>, tally: &InboundAttestTally) 
             out.stdout,
             "  {} inbound row(s) SKIPPED: presented write_signature is malformed or forged",
             tally.forged_skipped
+        )?;
+    }
+    if tally.pubkey_bindings_stripped > 0 {
+        writeln!(
+            out.stdout,
+            "  {} transported agent public-key binding(s) stripped; use the persisted PoP or lineage bind flow",
+            tally.pubkey_bindings_stripped
+        )?;
+    }
+    if tally.key_history_refused > 0 {
+        writeln!(
+            out.stdout,
+            "  {} signed inbound row(s) SKIPPED: destination key history unavailable",
+            tally.key_history_refused
         )?;
     }
     Ok(())
@@ -201,14 +205,14 @@ fn reconcile_inbound_attestation(
     mem: &mut models::Memory,
     original_claim: Option<&str>,
     trust_source: bool,
-    keys: &std::collections::HashMap<String, Option<String>>,
+    resolved_pubkeys: Option<&crate::storage::AttestationPubkeyAt>,
     tally: &mut InboundAttestTally,
 ) -> bool {
     let outcome = crate::identity::attest::reconcile_imported_attestation(
         mem,
         original_claim,
         !trust_source,
-        keys,
+        resolved_pubkeys,
     );
     if let Some(cause) = outcome.skipped() {
         tally.forged_skipped += 1;
@@ -341,13 +345,6 @@ pub fn run(
             let mems = db::export_all(&remote_conn)?;
             let links = db::export_links(&remote_conn)?;
             let mut n = 0;
-            // #3457 — pre-loop snapshot of the DESTINATION-enrolled keys.
-            let enrolled = resolve_destination_enrolled_keys(
-                &local_conn,
-                &mems,
-                args.trust_source,
-                &caller_id,
-            )?;
             let mut tally = InboundAttestTally::default();
             for mem in &mems {
                 let mut owned = mem.clone();
@@ -355,13 +352,29 @@ pub fn run(
                 if !args.trust_source {
                     restamp_agent_id(&mut owned, &caller_id);
                 }
+                strip_sync_pubkey_binding(&mut owned, &mut tally.pubkey_bindings_stripped);
+                let bound_pubkey = match resolve_sync_attestation_key(
+                    &local_conn,
+                    &owned,
+                    original_claim.as_deref(),
+                ) {
+                    Ok(bound) => bound,
+                    Err(e) => {
+                        tally.key_history_refused += 1;
+                        tracing::warn!(
+                            memory_id = %owned.id,
+                            "sync: signed row skipped because destination key-history resolution failed: {e}"
+                        );
+                        continue;
+                    }
+                };
                 // #3457 — re-derive the attestation from what THIS node can
                 // verify, before the row is validated or stored.
                 if !reconcile_inbound_attestation(
                     &mut owned,
                     original_claim.as_deref(),
                     args.trust_source,
-                    &enrolled,
+                    bound_pubkey.as_ref(),
                     &mut tally,
                 ) {
                     continue;
@@ -396,8 +409,10 @@ pub fn run(
                         "imported": n,
                         // #3457 — additive: what the inbound attestation
                         // reconcile decided. Zero on the ordinary path.
-                        "attestation_downgraded": tally.downgraded,
-                        "forged_signature_skipped": tally.forged_skipped,
+                        (models::field_names::ATTESTATION_DOWNGRADED): tally.downgraded,
+                        (models::field_names::FORGED_SIGNATURE_SKIPPED): tally.forged_skipped,
+                        (models::field_names::PUBKEY_BINDINGS_STRIPPED): tally.pubkey_bindings_stripped,
+                        "key_history_refused": tally.key_history_refused,
                     })
                 )?;
             } else {
@@ -409,12 +424,15 @@ pub fn run(
             let mems = db::export_all(&local_conn)?;
             let links = db::export_links(&local_conn)?;
             let mut n = 0;
+            let mut pubkey_bindings_stripped = 0usize;
             for mem in &mems {
-                if let Err(e) = validate::validate_memory(mem) {
-                    tracing::warn!("sync: skipping invalid memory {}: {}", mem.id, e);
+                let mut owned = mem.clone();
+                strip_sync_pubkey_binding(&mut owned, &mut pubkey_bindings_stripped);
+                if let Err(e) = validate::validate_memory(&owned) {
+                    tracing::warn!("sync: skipping invalid memory {}: {}", owned.id, e);
                     continue;
                 }
-                if db::insert(&remote_conn, mem).is_ok() {
+                if db::insert(&remote_conn, &owned).is_ok() {
                     n += 1;
                 }
             }
@@ -435,10 +453,20 @@ pub fn run(
                 writeln!(
                     out.stdout,
                     "{}",
-                    serde_json::json!({"direction": "push", "exported": n})
+                    serde_json::json!({
+                        "direction": "push",
+                        "exported": n,
+                        (models::field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
+                    })
                 )?;
             } else {
                 writeln!(out.stdout, "pushed {n} memories to remote")?;
+                if pubkey_bindings_stripped > 0 {
+                    writeln!(
+                        out.stdout,
+                        "  {pubkey_bindings_stripped} transported agent public-key binding(s) stripped; use the persisted PoP or lineage bind flow"
+                    )?;
+                }
             }
         }
         "merge" => {
@@ -447,14 +475,6 @@ pub fn run(
             let l_mems = db::export_all(&local_conn)?;
             let l_links = db::export_links(&local_conn)?;
             let (mut pulled, mut pushed) = (0, 0);
-            // #3457 — same pre-loop key snapshot + same shared funnel as the
-            // `pull` leg; the two inbound legs must not drift.
-            let enrolled = resolve_destination_enrolled_keys(
-                &local_conn,
-                &r_mems,
-                args.trust_source,
-                &caller_id,
-            )?;
             let mut tally = InboundAttestTally::default();
             for mem in &r_mems {
                 let mut owned = mem.clone();
@@ -462,11 +482,27 @@ pub fn run(
                 if !args.trust_source {
                     restamp_agent_id(&mut owned, &caller_id);
                 }
+                strip_sync_pubkey_binding(&mut owned, &mut tally.pubkey_bindings_stripped);
+                let bound_pubkey = match resolve_sync_attestation_key(
+                    &local_conn,
+                    &owned,
+                    original_claim.as_deref(),
+                ) {
+                    Ok(bound) => bound,
+                    Err(e) => {
+                        tally.key_history_refused += 1;
+                        tracing::warn!(
+                            memory_id = %owned.id,
+                            "sync: signed row skipped because destination key-history resolution failed: {e}"
+                        );
+                        continue;
+                    }
+                };
                 if !reconcile_inbound_attestation(
                     &mut owned,
                     original_claim.as_deref(),
                     args.trust_source,
-                    &enrolled,
+                    bound_pubkey.as_ref(),
                     &mut tally,
                 ) {
                     continue;
@@ -492,10 +528,12 @@ pub fn run(
                 );
             }
             for mem in &l_mems {
-                if validate::validate_memory(mem).is_err() {
+                let mut owned = mem.clone();
+                strip_sync_pubkey_binding(&mut owned, &mut tally.pubkey_bindings_stripped);
+                if validate::validate_memory(&owned).is_err() {
                     continue;
                 }
-                if db::insert_if_newer(&remote_conn, mem).is_ok() {
+                if db::insert_if_newer(&remote_conn, &owned).is_ok() {
                     pushed += 1;
                 }
             }
@@ -521,8 +559,10 @@ pub fn run(
                         "pulled": pulled,
                         "pushed": pushed,
                         // #3457 — additive; describes the INBOUND leg only.
-                        "attestation_downgraded": tally.downgraded,
-                        "forged_signature_skipped": tally.forged_skipped,
+                        (models::field_names::ATTESTATION_DOWNGRADED): tally.downgraded,
+                        (models::field_names::FORGED_SIGNATURE_SKIPPED): tally.forged_skipped,
+                        (models::field_names::PUBKEY_BINDINGS_STRIPPED): tally.pubkey_bindings_stripped,
+                        "key_history_refused": tally.key_history_refused,
                     })
                 )?;
             } else {
@@ -998,6 +1038,42 @@ mod tests {
         restamp_agent_id(&mut mem, "same-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "same-agent");
         assert!(mem.metadata.get("imported_from_agent_id").is_none());
+    }
+
+    #[test]
+    fn transported_registration_key_downgrades_direct_sync_attestation_3464() {
+        use crate::models::field_names;
+        let mirror = serde_json::json!({
+            "agent_id": "ai:source",
+            (field_names::AGENT_PUBKEY): "unproven-key",
+            (field_names::PUBKEY_BOUND_AT): "2026-01-01T00:00:00+00:00",
+            (field_names::WRITE_SIGNATURE): "mirrored-carried-signature",
+            (field_names::ATTEST_LEVEL): "agent_attested",
+        });
+        let mut mem = models::Memory {
+            id: "sync-agent-registration-3464".to_string(),
+            namespace: crate::models::AGENTS_NAMESPACE.to_string(),
+            title: crate::models::agent_registration_title("ai:source"),
+            content: serde_json::to_string(&mirror).expect("mirror"),
+            metadata: serde_json::json!({
+                "agent_id": "ai:source",
+                (field_names::AGENT_PUBKEY): "unproven-key",
+                (field_names::PUBKEY_BOUND_AT): "2026-01-01T00:00:00+00:00",
+                (field_names::WRITE_SIGNATURE): "carried-signature",
+                (field_names::ATTEST_LEVEL): "agent_attested",
+            }),
+            ..models::Memory::default()
+        };
+        let mut stripped = 0;
+        strip_sync_pubkey_binding(&mut mem, &mut stripped);
+        assert_eq!(stripped, 1);
+        assert!(mem.metadata.get(field_names::AGENT_PUBKEY).is_none());
+        assert!(mem.metadata.get(field_names::WRITE_SIGNATURE).is_none());
+        assert_eq!(mem.metadata[field_names::ATTEST_LEVEL], "claimed");
+        let content: serde_json::Value = serde_json::from_str(&mem.content).expect("content");
+        assert!(content.get(field_names::AGENT_PUBKEY).is_none());
+        assert!(content.get(field_names::WRITE_SIGNATURE).is_none());
+        assert_eq!(content[field_names::ATTEST_LEVEL], "claimed");
     }
 
     #[tokio::test]

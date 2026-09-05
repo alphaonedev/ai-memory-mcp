@@ -169,8 +169,57 @@ ai-memory agents bind-key --agent-id my-agent \
 > with a usage error (exit 2) — a documented recipe that failed on ~3% of
 > generated keys.
 
-Now the daemon can verify signatures from `my-agent`. Re-binding
-overwrites in place (that's how you rotate — see below).
+Now the daemon can verify signatures from `my-agent`. Reasserting the same key
+is idempotent. A distinct replacement is deliberately not a second bind:
+rotate through the current-key-signed lineage command below. Since
+[#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464) every
+binding is appended to the `agent_pubkey_history` ledger (schema v97) with a
+dense 1-based version and a `[bound_at, superseded_at)` window, so writes an
+older key already attested stay verifiable against the key that signed them.
+
+### Proof of possession (#3464)
+
+A bind now has to PROVE the caller holds the private half of the key being
+bound. Admin authority says a caller may enroll a key; it never said WHICH
+key, so before #3464 anyone with the admin role could bind a key they
+controlled to another agent's id and then mint `agent_attested` writes as
+that agent.
+
+The CLI does this for you when the private key is in the local key store —
+the command above is unchanged. For a key held by someone else (or on an
+air-gapped signer), use the offline flow:
+
+```bash
+# 1. On the daemon host: print the challenge (nonce + expiry + transcript)
+ai-memory agents bind-challenge --agent-id my-agent --pubkey <pub_b64> --json
+
+# 2. On the key holder's machine: sign `transcript_b64` with the PRIVATE key
+#    and write {"nonce", "expires_at", "signature_b64"} to proof.json
+
+# 3. Back on the daemon host:
+ai-memory agents bind-key --agent-id my-agent --pubkey <pub_b64> \
+  --proof-file proof.json
+```
+
+Over HTTP the same handshake is two admin-gated calls: `POST
+/api/v1/agents/{id}/pubkey/challenge` returns `{nonce, expires_at,
+transcript_b64}`, and `PUT /api/v1/agents/{id}/pubkey` takes
+`{pubkey_b64, nonce, proof_b64}`. The nonce is single use and short-lived;
+every failure mode returns the same opaque `403`, so the endpoint cannot be
+used as an oracle. The SDKs wrap both calls: `client.bind_agent_pubkey(id,
+signing_key)` (Python) and `client.bindAgentPubkey(id, signingKey)`
+(TypeScript) now take the SIGNING key, not a bare public one.
+
+Candidate proof authorizes only a first bootstrap (no flat key and no key
+history) or an idempotent reassertion of the same live key. It cannot replace
+an anchored identity: a distinct rotation must use `ai-memory identity
+succeed`, whose succession record is signed by the agent's CURRENT key-holder.
+That signature is the replacement authority. It is recorded distinctly as
+`bind_authority = lineage_succession`, and bindings that predate this gate
+are labelled `legacy_unproven`, so an operator can enumerate every binding
+that was never proved. Once a key is explicitly revoked, a stale predecessor
+signature cannot reopen it; only a verified M-of-N guardian recovery can
+advance the closed head, recorded as `bind_authority = guardian_recovery`.
 
 ### Step 4 — Sign on each write surface
 
@@ -381,15 +430,12 @@ signature didn't verify — see [Troubleshooting](#troubleshooting).
 ## Rotate & revoke
 
 ```bash
-# Rotate the key (overwrite in place), then re-bind the new public key
-ai-memory identity generate --agent-id my-agent --force
-ai-memory agents bind-key --agent-id my-agent --pubkey <new pub_b64>
-
-# Rotate WITH a signed lineage handoff so the identity survives the
-# rotation (v0.9.0 #1828 — the retiring key signs the succession first)
+# Rotate with a signed lineage handoff. The retiring/current key signs the
+# successor before it is replaced; generic admin authority cannot substitute.
 ai-memory identity succeed --agent-id my-agent
 
-# Revoke — the agent reverts to permissive "claimed" until a fresh key is bound
+# Revoke closes the live window. Candidate-only bind cannot reopen it; recover
+# through the configured signed-lineage guardian quorum.
 ai-memory agents revoke-key --agent-id my-agent
 ```
 
@@ -443,7 +489,7 @@ column):
 | Symptom | Cause | Fix |
 |---|---|---|
 | `403 ATTESTATION_FAILED` on an **unsigned** write | attestation is required on this surface — HTTP direct-write by default, or any surface under global-strict `=1` | sign the write (Option B) **or** set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (Option A). Note MCP/CLI are permissive by default, so this should only appear on HTTP direct-write unless you set `=1` |
-| `403 ATTESTATION_FAILED` on a **signed** write | presented signature didn't verify | the bound public key doesn't match the signing key — re-run `agents bind-key` with the current `pub_b64`; or the `created_at` you signed drifted outside the freshness window (sign with the timestamp you send) |
+| `403 ATTESTATION_FAILED` on a **signed** write | presented signature didn't verify | if no key is anchored yet, bootstrap with `agents bind-key --pubkey <pub_b64>` while its matching private key is in the local key store (or supply a fresh persisted challenge response); if a different key is already anchored, rotate through `identity succeed` instead — a direct bind cannot replace it. Also check that the `created_at` you signed is inside the freshness window and exactly matches the timestamp you send |
 | `400 … must be the canonical UTC form both storage backends round-trip` | the `created_at` you signed is a rendering PostgreSQL cannot return byte-for-byte (`…Z`, a non-UTC offset, a `.000` fraction, or nanoseconds) | sign and send the exact string the error names — see [`created_at` must be the canonical storage-stable form](#created_at-must-be-the-canonical-storage-stable-form-3422) |
 | `--sign requires a local keypair for agent '<id>'` | no `<id>.priv` in the key dir | `ai-memory identity generate --agent-id <id>` (check `AI_MEMORY_KEY_DIR`) |
 | MCP writes silently fail / host shows a tool error | MCP server rejecting unsigned writes — only happens if you set global-strict `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (MCP is permissive by default) | remove the `=1` from the server's `env` block (or set `=0`), or switch to a signing client (see [MCP configuration](#mcp-configuration-crystal-clear)) |

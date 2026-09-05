@@ -665,10 +665,12 @@ fn mutating_ssot_funnels_refuse_under_record_stop_b6() {
         "delete_link",
         ai_memory::db::delete_link(&conn, "a", "b").map(|_| ())
     );
-    check_any!(
-        "bind_agent_pubkey",
-        ai_memory::db::bind_agent_pubkey(&conn, "ai:x", "AAAA")
-    );
+    check_any!("bind_agent_pubkey", {
+        // #3464 — the funnel takes a possession witness, so the record-stop
+        // gate is probed through the helper that mints one from a real key.
+        let kp = ai_memory::identity::keypair::generate("ai:x").expect("keypair");
+        ai_memory::db::bind_agent_pubkey_with_keypair(&conn, "ai:x", &kp)
+    });
     check_any!(
         "purge_archive",
         ai_memory::db::purge_archive(&conn, None).map(|_| ())

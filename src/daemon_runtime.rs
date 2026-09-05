@@ -8592,7 +8592,21 @@ pub async fn sync_cycle_once(
             // is recoverable after enrollment, and leaping `next_since` is silent
             // inbound data loss (same disposition as the serve catchup puller).
             let mut to_insert = mem.clone();
-            if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut to_insert) {
+            crate::handlers::federation_receive::sanitize_inbound_pull_memory(&mut to_insert);
+            let author_bound_key =
+                crate::identity::attest::presented_attestation_author_needing_bound_key(
+                    &to_insert, None,
+                )
+                .and_then(|author| {
+                    crate::handlers::federation_receive::historical_author_key_or_warn(
+                        db::agent_pubkey_for_attestation_at(&conn, author, &to_insert.created_at),
+                        author,
+                    )
+                });
+            if !crate::handlers::federation_receive::attest_inbound_pull_memory(
+                &mut to_insert,
+                author_bound_key.as_ref(),
+            ) {
                 apply_halted = true;
                 continue;
             }
