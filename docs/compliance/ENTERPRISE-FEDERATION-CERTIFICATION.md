@@ -17,6 +17,26 @@
 wire path or the `AI_MEMORY_FED_*` surface **voids this certification and
 triggers re-cert** (see §7).
 
+> ## STATUS — **VOID / EXPIRED as of 2026-09-05**
+>
+> The federation wire path changed again under
+> [**#3502**](https://github.com/alphaonedev/ai-memory-mcp/issues/3502)
+> (branch `hotfix/3502-v97-acceptance-and-attest-parity`; the wire-path
+> commit is `7e8f96bef9c4ccd48aee7f8552fe9e7a9f327ceb` and this expiry
+> record is the second commit of that same change). The §7 expiry trigger
+> has therefore **FIRED**, and this certification is **VOID pending
+> re-validation and re-issue** — see the #3502 record at the end of §7 for
+> the files, the reason and the scope.
+>
+> **Do not cite this document as a live certification while this banner
+> stands.** Re-running §5.4(2)–(5) on the certified tier and re-issuing
+> this document against the new SHA is a Conductor task, tracked by
+> [**#3501**](https://github.com/alphaonedev/ai-memory-mcp/issues/3501);
+> the certification returns to a live state only when #3501 lands that
+> re-issue. The historical bind remains `e22bc93c`, and §8's 2026-08-12
+> determination is retained as the HISTORICAL record of what was
+> certified at that SHA — it is not a current claim.
+
 > **Landing-SHA note (why the binding SHA and the SHA you are reading
 > first differ).** The certification **binds to** `e22bc93c`, but the
 > original artifacts — this document, the removal-proof harness, and the
@@ -233,6 +253,35 @@ triggers re-cert** (see §7).
 > wire path remains **expired pending re-validation and re-issue by Fable**.
 > This coder change does not re-mint the certification or approve its own
 > control; the historical certification bind remains `e22bc93c`.
+>
+> **Amendment (2026-09-05, #3502 — §7 EXPIRY RECORD, certification VOID).**
+> Three §7-watched federation-wire paths changed:
+> `src/federation/receive_auth.rs`,
+> `src/handlers/federation_receive.rs` and
+> `src/handlers/federation_signing_check.rs`. The change makes a per-item
+> attestation refusal on `/sync/push` VISIBLE — the response now carries
+> `attestation_rejections: [{memory_id, cause}]` on both backends (and on the
+> 429 quota short-circuit) with a matching cause-specific receiver WARN, so a
+> signed write the receiver cannot verify no longer disappears behind a `200`
+> with only an anonymous `skipped` counter (the #2444 "reports success while
+> doing nothing" shape). `receive_auth.rs` gains ONE observability-only cause
+> token, `no_eligible_key_at_created_at`, splitting "the author IS enrolled
+> here but had no key live at the signed `created_at`" out of
+> `unenrolled_author_strict`, whose operator remedy is the opposite. The two
+> receive twins' hand-copied WARN cascades are replaced by one shared funnel
+> so the taxonomy cannot drift between sqlite and postgres. **No protocol or
+> authorization semantics changed:** the same rows are accepted and the same
+> rows are refused as before this change, no `AI_MEMORY_FED_*` identifier was
+> added, removed or renamed, no schema rung was cut (still v97), no `PeerScope`
+> / signature-verification / quarantine control was removed or weakened, and
+> the #3464 timestamp-eligible key resolver is kept EXACTLY as certified —
+> #3502 explicitly re-affirmed it rather than loosening it. The delta is
+> strictly MORE observable, never weaker. **This coder change does NOT re-mint
+> the certification and does not approve its own control:** it records the
+> expiry. Re-running §5.4(2)–(5) on the certified tier and re-issuing this
+> document against the new SHA is a Conductor task tracked by
+> [**#3501**](https://github.com/alphaonedev/ai-memory-mcp/issues/3501).
+> Historical bind remains `e22bc93c`.
 >
 ---
 
@@ -1087,6 +1136,48 @@ test forever — the posture those tests exist to prove we survive.
 is the operator/reviewer gate. Until that re-affirmation lands, treat
 the certification as EXPIRED per this clause for the changed path —
 the shipped federation posture is UNCHANGED from `e22bc93c`.
+
+**Re-cert trigger — FIRED; certification VOID pending re-validation and
+re-issue ([#3502](https://github.com/alphaonedev/ai-memory-mcp/issues/3502),
+2026-09-05, branch `hotfix/3502-v97-acceptance-and-attest-parity`, wire-path
+commit `7e8f96bef9c4ccd48aee7f8552fe9e7a9f327ceb`, this record its second
+commit).** This is the §7 expiry record the top-of-document **STATUS —
+VOID / EXPIRED as of 2026-09-05** banner points at.
+
+*Watched federation-wire paths changed (all three):*
+
+| Path | What changed |
+|---|---|
+| `src/federation/receive_auth.rs` | `+1` public const — the observability-only cause token `CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT` (`"no_eligible_key_at_created_at"`). No predicate, no gate, no env knob. |
+| `src/handlers/federation_receive.rs` | The `/sync/push` (sqlite) refusal arm now records each refused item and returns it; its three hand-copied `tracing::warn!` arms move into one shared reporter + a pure classifier. `attestation_rejections` added to the 200 and 429 response envelopes. |
+| `src/handlers/federation_signing_check.rs` | The postgres twin calls that same shared reporter and returns the same array on its 200 and 429 envelopes. Its local WARN cascade is deleted, not re-implemented. |
+
+*Reason, stated in the terms this clause cares about.* Per-item attestation
+refusals are now surfaced on `/sync/push`, plus one new cause token
+`no_eligible_key_at_created_at`. **No protocol or authorization semantics
+changed.** Concretely: the set of inbound rows ACCEPTED and the set REFUSED are
+identical to the certified behaviour; no `AI_MEMORY_FED_*` identifier was added,
+removed or renamed (so the mechanized env-surface trigger did not fire — the
+PATH watch did); no schema rung was cut (still v97); no §7.1 `PeerScope`
+confinement, peer attestation, per-write signature verification, or quarantine
+control was removed, relaxed, or made conditional; and the #3464
+timestamp-eligible key resolver
+(`storage::pubkey_history::agent_pubkey_for_attestation_at`) is retained
+EXACTLY as certified — #3502 examined it and re-affirmed it rather than
+loosening it to `updated_at` / receive-time / current-key, which would have
+granted a freshly bound key retroactive authority over older signed envelopes.
+What changed is that a refusal which was previously visible only in the
+receiver's journal is now also in the response the pushing peer reads, so a
+partially applied batch can no longer be acknowledged as a clean success. The
+posture is strictly MORE observable than at `e22bc93c`, never weaker — the same
+disposition as the #2968 observability amendment above.
+
+*Disposition.* **This change does NOT re-mint the certification and does not
+approve its own control.** Re-running §5.4(2)–(5) on the certified tier and
+re-issuing this document against the new SHA is a Conductor task, tracked by
+[**#3501**](https://github.com/alphaonedev/ai-memory-mcp/issues/3501). Until
+#3501 lands that re-issue, this certification is **VOID** and must not be cited
+as live. The historical bind remains `e22bc93c`.
 
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the

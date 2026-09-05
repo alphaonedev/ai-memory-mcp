@@ -71,6 +71,9 @@ pub(crate) const QUOTA_REFUSED_FIELD: &str = "quota_refused";
 /// receiver report and the quorum/DLQ ack decision cannot drift apart.
 pub(crate) const SKIPPED_FIELD: &str = "skipped";
 
+/// Per-memory attestation refusals in both federation push response paths (#3502).
+pub(crate) const ATTESTATION_REJECTIONS_FIELD: &str = "attestation_rejections";
+
 /// #2341 (W1A2-01/02) — `unsupported_on_postgres` count field on the
 /// postgres federation `/sync/push` response envelope (the FED-RQ-01
 /// honest count of subcollections the pg receiver cannot apply). Shared

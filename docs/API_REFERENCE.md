@@ -1218,7 +1218,14 @@ Peer-to-peer push with timestamp-aware merge.
 ```
 
 Response includes `applied`, `noop`, `skipped`, `receiver_agent_id`,
-`receiver_clock`.
+`receiver_clock`, and `attestation_rejections`. The latter is an array of
+`{memory_id, cause}` for refused memory attestations on both backends (#3502),
+where `cause` is one of `unenrolled_author_strict`,
+`no_eligible_key_at_created_at`, `missing_signature` or `forged_or_malformed`.
+HTTP 200 can represent a partially applied batch: inspect these refusals and
+`skipped` before acknowledging replication. Refused rows also emit receiver
+WARNs. The rejection array survives a later quota refusal (HTTP 429).
+See [historical key eligibility and rejection causes](attestation.md#historical-key-eligibility-on-federation-receive-3502).
 
 **Federation headers (v0.7.0 secure defaults).** Under
 `AI_MEMORY_FED_REQUIRE_SIG=1` (default, #791) the request must carry an

@@ -33,7 +33,7 @@ use tower::ServiceExt as _;
 /// Process-global async lock — these tests mutate federation env vars.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_app() -> ai_memory::handlers::AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -51,8 +51,8 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
     };
-    let app_state = ai_memory::handlers::AppState {
-        db: db.clone(),
+    ai_memory::handlers::AppState {
+        db,
         embedder: std::sync::Arc::new(None),
         vector_index: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         federation: std::sync::Arc::new(None),
@@ -89,7 +89,10 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
-    };
+    }
+}
+
+fn router_for(app_state: ai_memory::handlers::AppState) -> axum::Router {
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,
         mtls_enforced: false,
@@ -98,8 +101,13 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    ai_memory::build_router(api_key_state, app_state)
+}
+
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+    let app = build_app();
+    let db = std::sync::Arc::clone(&app.db);
+    (router_for(app), db)
 }
 
 /// Relax the ENVELOPE-level federation gates so the per-write attestation lane
@@ -205,7 +213,8 @@ async fn rebroadcast_tombstoned_source_stays_agent_attested_2863() {
     let ns = "team/alpha";
     let title = "kubernetes deployment guide";
     let content = "scale the deployment to three replicas";
-    let created = "2026-08-10T12:00:00+00:00";
+    // #3502: bind before signing; receiver history is authoritative at created_at.
+    let created = ai_memory::identity::attest::now_attestable_rfc3339();
 
     // Sign the 6-field SignableWrite exactly as the AUTHORING node would.
     let to_sign = ai_memory::models::Memory {
@@ -213,7 +222,7 @@ async fn rebroadcast_tombstoned_source_stays_agent_attested_2863() {
         namespace: ns.to_string(),
         title: title.to_string(),
         content: content.to_string(),
-        created_at: created.to_string(),
+        created_at: created.clone(),
         metadata: json!({ "agent_id": author }),
         ..ai_memory::models::Memory::default()
     };
@@ -224,7 +233,9 @@ async fn rebroadcast_tombstoned_source_stays_agent_attested_2863() {
     let status1 = post_sync_push(
         &router,
         author,
-        memory_json(&id, ns, title, content, created, created, author, &sig_b64),
+        memory_json(
+            &id, ns, title, content, &created, &created, author, &sig_b64,
+        ),
     )
     .await;
     assert_eq!(status1, StatusCode::OK, "fresh signed self-relay push");
@@ -238,11 +249,11 @@ async fn rebroadcast_tombstoned_source_stays_agent_attested_2863() {
     // POST 2 — the #2860 RE-BROADCAST: same source (same id + write_signature),
     // NEWER updated_at (the tombstone disposition), relayed under the DAEMON
     // federation identity (a third-party relay from the receiver's view).
-    let newer = "2026-08-10T19:14:31+00:00";
+    let newer = ai_memory::identity::attest::now_attestable_rfc3339();
     let status2 = post_sync_push(
         &router,
         daemon,
-        memory_json(&id, ns, title, content, created, newer, author, &sig_b64),
+        memory_json(&id, ns, title, content, &created, &newer, author, &sig_b64),
     )
     .await;
     assert_eq!(status2, StatusCode::OK, "re-broadcast push accepted");
@@ -254,4 +265,253 @@ async fn rebroadcast_tombstoned_source_stays_agent_attested_2863() {
          receiver-verified level to `claimed` (origin stays agent_attested)"
     );
     assert_eq!(owner2, author, "authorship preserved as the true author");
+}
+
+#[derive(Clone, Default)]
+struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// v1.0.0 #3502 — ONE mixed batch that pins the whole decision on either
+/// backend: an eligible signed write still replicates, an INELIGIBLE one (a
+/// valid signature over a `created_at` that PREDATES the author's key binding)
+/// and a forged one are both refused, and BOTH refusals are visible to the
+/// pushing peer in the 200 response as well as in the receiver's WARN stream.
+///
+/// The decision this pins (issue #3502 question 2): the v97 timestamp-eligible
+/// resolver is CORRECT — a key bound after a memory's signed `created_at`
+/// legitimately cannot verify it, because letting it would hand every freshly
+/// bound key retroactive authority over arbitrarily old envelopes, which is the
+/// exact hole #3464 closed (and `bind_pubkey_possession_3464`'s
+/// `sqlite_skew_boundary_reverification_cryptographically_selects_one_key_3464`
+/// already pins the empty candidate set outside the skew-expanded window). The
+/// fix is therefore on the OTHER side of the 200: the refusal is no longer
+/// silent.
+async fn push_timestamp_matrix(
+    router: axum::Router,
+    author: &str,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) -> (String, String, String) {
+    use tracing::instrument::WithSubscriber as _;
+
+    let old_id = uuid::Uuid::new_v4().to_string();
+    let forged_id = uuid::Uuid::new_v4().to_string();
+    let good_id = uuid::Uuid::new_v4().to_string();
+    let now = ai_memory::identity::attest::now_attestable_rfc3339();
+    let old = ai_memory::identity::attest::canonicalize_attested_created_at(
+        &(chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+    )
+    .expect("canonical old timestamp");
+    let memories: Vec<Value> = [(&old_id, &old), (&forged_id, &now), (&good_id, &now)]
+        .into_iter()
+        .map(|(id, created)| {
+            let mut value = memory_json(
+                id,
+                "team/alpha",
+                id,
+                "replicated content",
+                created,
+                &now,
+                author,
+                "",
+            );
+            let memory: ai_memory::models::Memory =
+                serde_json::from_value(value.clone()).expect("memory");
+            let mut signature =
+                ai_memory::identity::attest::sign_memory_write(kp, &memory, author).expect("sign");
+            if id == &forged_id {
+                signature[0] ^= 1;
+            }
+            value["metadata"]["write_signature"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(signature));
+            value
+        })
+        .collect();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sync/push")
+        .header("content-type", "application/json")
+        .header(
+            ai_memory::federation::peer_attestation::PEER_ID_HEADER,
+            author,
+        )
+        .body(Body::from(
+            json!({
+                "sender_agent_id": author, "sender_clock": {"entries": {}},
+                "memories": memories, "dry_run": false,
+            })
+            .to_string(),
+        ))
+        .expect("push request");
+    let logs = CapturedLog::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let response = router
+        .oneshot(request)
+        .with_subscriber(subscriber)
+        .await
+        .expect("push response");
+    assert_eq!(response.status(), StatusCode::OK, "partial batch response");
+    let bytes = axum::body::to_bytes(response.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("response body");
+    let body: Value = serde_json::from_slice(&bytes).expect("response JSON");
+    assert_eq!(body["applied"], 1, "eligible key still replicates: {body}");
+    assert_eq!(
+        body["skipped"], 2,
+        "ineligible and forged writes refused: {body}"
+    );
+    assert_eq!(
+        body["attestation_rejections"],
+        json!([
+            {
+                "memory_id": old_id,
+                "cause": ai_memory::federation::receive_auth::CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT,
+            },
+            {
+                "memory_id": forged_id,
+                "cause": ai_memory::federation::receive_auth::CAUSE_FORGED_OR_MALFORMED,
+            },
+        ]),
+        "HTTP 200 must expose every attestation refusal"
+    );
+    let log = String::from_utf8(logs.0.lock().expect("log buffer").clone()).expect("UTF-8 log");
+    for (id, cause) in [
+        (
+            &old_id,
+            ai_memory::federation::receive_auth::CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT,
+        ),
+        (
+            &forged_id,
+            ai_memory::federation::receive_auth::CAUSE_FORGED_OR_MALFORMED,
+        ),
+    ] {
+        assert!(
+            log.lines()
+                .any(|line| line.contains("WARN") && line.contains(id) && line.contains(cause)),
+            "each refused item must emit its cause at WARN: {log}"
+        );
+    }
+    assert!(
+        log.contains(&old),
+        "rejection log must identify the signed timestamp: {log}"
+    );
+    (old_id, forged_id, good_id)
+}
+
+/// SQLite arm of the #3502 decision (see [`push_timestamp_matrix`]): the two
+/// refused rows must not persist, and the eligible one must still land
+/// `agent_attested`. DEGRADE, never corrupt — a refusal costs one row, never a
+/// wrong attestation.
+#[tokio::test]
+async fn sqlite_prebinding_signature_rejected_visibly_3502() {
+    let _guard = ENV_LOCK.lock().await;
+    reset_env_zero_config();
+    let (router, db) = build_router_with_db();
+    let author = "ai:timestamp-sqlite";
+    let kp = ai_memory::identity::keypair::generate(author).expect("keypair");
+    {
+        let lock = db.lock().await;
+        ai_memory::db::register_agent(&lock.0, author, "nhi", &[]).expect("register");
+        ai_memory::db::bind_agent_pubkey_with_keypair(&lock.0, author, &kp).expect("bind");
+    }
+    let (old, forged, good) = push_timestamp_matrix(router, author, &kp).await;
+    let lock = db.lock().await;
+    for id in [old, forged] {
+        assert!(
+            ai_memory::db::get(&lock.0, &id)
+                .expect("read refused row")
+                .is_none(),
+            "refused row must not persist"
+        );
+    }
+    let memory = ai_memory::db::get(&lock.0, &good)
+        .expect("read accepted row")
+        .expect("accepted row persists");
+    assert_eq!(memory.metadata["attest_level"], "agent_attested");
+}
+
+/// PostgreSQL twin of [`sqlite_prebinding_signature_rejected_visibly_3502`].
+/// Both backends must reach the same verdict, the same cause tokens and the
+/// same response shape; a backend-specific answer to "is this write attested"
+/// is a data-integrity divergence, not a feature gap.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_prebinding_signature_rejected_visibly_3502() {
+    let _guard = ENV_LOCK.lock().await;
+    reset_env_zero_config();
+    let url =
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");
+    let mut app = build_app();
+    app.store = std::sync::Arc::new(
+        ai_memory::store::postgres::PostgresStore::connect(&url)
+            .await
+            .expect("own PG database"),
+    );
+    app.storage_backend = ai_memory::handlers::StorageBackend::Postgres;
+    let author = "ai:timestamp-postgres";
+    let kp = ai_memory::identity::keypair::generate(author).expect("keypair");
+    let ctx = ai_memory::store::CallerContext::for_agent(author);
+    let now = ai_memory::identity::attest::now_attestable_rfc3339();
+    app.store
+        .register_agent(
+            &ctx,
+            &ai_memory::models::AgentRegistration {
+                agent_id: author.to_string(),
+                agent_type: "nhi".to_string(),
+                capabilities: Vec::new(),
+                registered_at: now.clone(),
+                last_seen_at: now,
+            },
+        )
+        .await
+        .expect("register");
+    let proof = ai_memory::store::prove_possession_via_store(
+        app.store.as_ref(),
+        &ctx,
+        author,
+        kp.private.as_ref().expect("private key"),
+    )
+    .await
+    .expect("prove possession");
+    app.store
+        .bind_agent_pubkey(&ctx, author, &kp.public_base64(), proof)
+        .await
+        .expect("bind");
+    let (old, forged, good) = push_timestamp_matrix(router_for(app), author, &kp).await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("PG inspection");
+    for id in [old, forged] {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read refused row");
+        assert_eq!(count, 0, "refused row must not persist");
+    }
+    let level: String =
+        sqlx::query_scalar("SELECT metadata->>'attest_level' FROM memories WHERE id = $1")
+            .bind(good)
+            .fetch_one(&pool)
+            .await
+            .expect("accepted row persists");
+    assert_eq!(level, "agent_attested");
+    pool.close().await;
 }

@@ -153,6 +153,7 @@ pub(super) async fn sync_push_via_store(
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
+    let mut attestation_rejections = Vec::new();
     let mut deleted = 0usize;
     let mut links_applied = 0usize;
     let mut latest_seen: Option<String> = None;
@@ -387,53 +388,20 @@ pub(super) async fn sync_push_via_store(
             bound_pubkey.as_ref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
-            // #1801→#1954 item 7 (postgres twin of `federation_receive.rs`) —
-            // split the generic AttestationRequired refusal into the SAME three
-            // actionable causes the sqlite path emits, so an operator gets a
-            // precise signal + the closed-set DLQ cause token. `bound_pubkey`
-            // was already hoisted above for the attestation lookup.
-            let has_write_sig = to_insert
-                .metadata
-                .get(crate::models::field_names::WRITE_SIGNATURE)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|s| !s.trim().is_empty());
-            if bound_pubkey
-                .as_ref()
-                .is_none_or(|keys| keys.candidate_pubkeys_b64.is_empty())
-            {
-                tracing::warn!(
-                    target: ATTESTATION_TRACE_TARGET,
-                    memory_id = %to_insert.id,
-                    attribute_agent = %attribute_agent,
-                    sender = %body.sender_agent_id,
-                    cause = crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT,
-                    error = %e,
-                    "sync_push (postgres): honored third-party relay refused — ORIGIN author has no \
-                     locally-enrolled key to verify the propagated write_signature against; \
-                     enroll author {attribute_agent}'s Ed25519 key at this node (unenrolled_author_strict, #1464/#1801→#1954)"
-                );
-            } else if !has_write_sig {
-                tracing::warn!(
-                    target: ATTESTATION_TRACE_TARGET,
-                    memory_id = %to_insert.id,
-                    attribute_agent = %attribute_agent,
-                    sender = %body.sender_agent_id,
-                    cause = crate::federation::receive_auth::CAUSE_MISSING_SIGNATURE,
-                    error = %e,
-                    "sync_push (postgres): honored third-party relay refused — no metadata.write_signature \
-                     present under the strict flip (author must EMIT the signature at store time, #1801→#1954)"
-                );
-            } else {
-                tracing::warn!(
-                    target: ATTESTATION_TRACE_TARGET,
-                    memory_id = %to_insert.id,
-                    attribute_agent = %attribute_agent,
-                    sender = %body.sender_agent_id,
-                    cause = crate::federation::receive_auth::CAUSE_FORGED_OR_MALFORMED,
-                    error = %e,
-                    "sync_push (postgres): per-write content attestation failed; rejecting memory (#1464)"
-                );
-            }
+            // #3502 — the SSOT refusal funnel shared with the sqlite twin
+            // (`federation_receive::report_inbound_attestation_rejection`), so
+            // the cause taxonomy, the WARN fields and the response entry cannot
+            // drift between backends.
+            attestation_rejections.push(
+                crate::handlers::federation_receive::report_inbound_attestation_rejection(
+                    &to_insert,
+                    &attribute_agent,
+                    &body.sender_agent_id,
+                    bound_pubkey.as_ref(),
+                    crate::handlers::StorageBackend::Postgres,
+                    &e,
+                ),
+            );
             skipped += 1;
             continue;
         }
@@ -696,6 +664,7 @@ pub(super) async fn sync_push_via_store(
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
+                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
                 "reset_at": reset_at,
                 (field_names::STORAGE_BACKEND): "postgres",
             })),
@@ -1253,6 +1222,7 @@ pub(super) async fn sync_push_via_store(
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
+            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
             (crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD): unsupported_on_postgres,
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,

@@ -984,6 +984,190 @@ pub(super) fn apply_inbound_write_attestation(
     .map(|_| ())
 }
 
+/// v1.0.0 #3502 — ONE refused memory, reported identically by the SQLite
+/// (`sync_push`) and PostgreSQL (`sync_push_via_store`) receive twins.
+///
+/// ## Why this crosses the wire at all
+///
+/// Both receive loops answer a partially-refused batch with **HTTP 200** and a
+/// bumped `skipped` counter. `skipped` is a single number that also absorbs
+/// namespace-confinement refusals, malformed ids and quarantine, so a sender
+/// could not tell WHICH of its signed writes never landed, nor why — the
+/// refusal was visible only in the receiver's journal, on the far side of an
+/// operator boundary. A signed write that the receiver cannot verify must not
+/// vanish behind a 200 (#3502): the per-item disposition is now part of the
+/// response, so the sender can surface, retry or quarantine exactly the items
+/// that were dropped instead of recording a phantom success.
+///
+/// ## Why only these two fields
+///
+/// Only the id the PEER ITSELF submitted and a CLOSED-SET cause token cross the
+/// boundary. The verifier's `anyhow` chain (which can name local key material,
+/// history rows and storage errors) stays in the receiver's WARN. An attacker
+/// probing the endpoint therefore learns nothing beyond "this item of mine was
+/// refused, in one of four already-documented ways".
+///
+/// The array is bounded by the request the peer itself sent — at most one entry
+/// per submitted `memories[]` item, each a uuid plus a short token, against an
+/// inbound row that is itself far larger — so it needs no separate cap beyond
+/// the existing HTTP body limit.
+#[derive(serde::Serialize)]
+pub(crate) struct InboundAttestationRejection {
+    /// The id EXACTLY as the peer submitted it, so the sender can join this
+    /// entry back onto its own outbound batch without guessing.
+    memory_id: String,
+    /// One of the four closed-set tokens in
+    /// [`crate::federation::receive_auth`]; never free-form verifier text.
+    cause: &'static str,
+}
+
+/// Classify a per-write attestation refusal into its closed-set cause token.
+///
+/// Split out of the reporter so the classification is a pure, total function of
+/// (presented signature, resolved key candidates) — rust-1.98 ERRORS-09: the
+/// four dispositions are enumerated once, in one place, and neither backend can
+/// grow a fifth silently.
+///
+/// The `history_exists` arm is the #3502 correction. Pre-#3502 an empty
+/// candidate set was labelled `unenrolled_author_strict` unconditionally, which
+/// told an operator to enroll a key that IS already enrolled; an authoritative
+/// history that simply has no version live at the signed `created_at` is a
+/// different fact with a different remedy
+/// ([`crate::federation::receive_auth::CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT`]).
+fn classify_inbound_attestation_rejection(
+    memory: &Memory,
+    keys: Option<&crate::storage::AttestationPubkeyAt>,
+) -> &'static str {
+    use crate::federation::receive_auth::{
+        CAUSE_FORGED_OR_MALFORMED, CAUSE_MISSING_SIGNATURE, CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT,
+        CAUSE_UNENROLLED_AUTHOR_STRICT,
+    };
+    // No lookup result at all: no history row and no legacy flat binding.
+    let Some(keys) = keys else {
+        return CAUSE_UNENROLLED_AUTHOR_STRICT;
+    };
+    if keys.candidate_pubkeys_b64.is_empty() {
+        // History is authoritative and produced no key live at the signed
+        // instant. Never fall back to the current key — that is exactly the
+        // retroactive-authority hole #3464 closed — so the row is unverifiable
+        // at this node, which is a DIFFERENT fact from "never enrolled".
+        return if keys.history_exists {
+            CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT
+        } else {
+            CAUSE_UNENROLLED_AUTHOR_STRICT
+        };
+    }
+    // A key WAS resolvable, so the refusal is about the signature itself.
+    let has_write_sig = memory
+        .metadata
+        .get(crate::models::field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|signature| !signature.trim().is_empty());
+    if has_write_sig {
+        CAUSE_FORGED_OR_MALFORMED
+    } else {
+        CAUSE_MISSING_SIGNATURE
+    }
+}
+
+/// v1.0.0 #3502 — emit the per-item refusal WARN and mint the response entry.
+///
+/// The SSOT funnel for BOTH receive twins: pre-#3502 each twin carried its own
+/// hand-copied three-arm `tracing::warn!` cascade, so a cause token or a remedy
+/// sentence could drift between backends (and did not cover the #3464
+/// timestamp-eligibility miss at all). `backend` keeps the sqlite/postgres
+/// discriminator the old per-twin message prefixes carried, sourced from
+/// [`crate::handlers::StorageBackend::as_str`] rather than a fresh literal.
+///
+/// Every arm carries the same structured fields (`memory_id`, `created_at`,
+/// `attribute_agent`, `sender`, `cause`, `backend`, `error`) so a log query can
+/// select on cause alone; only the operator-remedy prose differs, because the
+/// four remedies genuinely differ.
+pub(crate) fn report_inbound_attestation_rejection(
+    memory: &Memory,
+    attribute_agent: &str,
+    sender: &str,
+    keys: Option<&crate::storage::AttestationPubkeyAt>,
+    backend: crate::handlers::StorageBackend,
+    error: &anyhow::Error,
+) -> InboundAttestationRejection {
+    use crate::federation::receive_auth::{
+        CAUSE_MISSING_SIGNATURE, CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT,
+        CAUSE_UNENROLLED_AUTHOR_STRICT,
+    };
+    let cause = classify_inbound_attestation_rejection(memory, keys);
+    let backend = backend.as_str();
+    // #1801→#1954 item 7 (+ #3502) — an actionable cause per refusal, not one
+    // generic AttestationRequired line: the four remedies are "enroll the
+    // author's key", "bind BEFORE signing", "emit a signature at store time"
+    // and "investigate a forgery", and an operator must not be sent down the
+    // wrong one.
+    match cause {
+        CAUSE_UNENROLLED_AUTHOR_STRICT => tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %memory.id,
+            created_at = %memory.created_at,
+            attribute_agent,
+            sender,
+            cause,
+            backend,
+            error = %error,
+            "sync_push: honored third-party relay refused — ORIGIN author has no \
+             locally-enrolled key to verify the propagated write_signature against; \
+             enroll author {attribute_agent}'s Ed25519 key at this node \
+             (unenrolled_author_strict, #1464/#1801→#1954)"
+        ),
+        CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT => tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %memory.id,
+            created_at = %memory.created_at,
+            attribute_agent,
+            sender,
+            cause,
+            backend,
+            error = %error,
+            "sync_push: relayed write refused — author {attribute_agent} IS enrolled here, but \
+             NO agent_pubkey_history version is live at the SIGNED created_at (skew-expanded), \
+             and an authoritative history never falls back to the current key. Re-enrolling \
+             changes nothing: the author must bind its key BEFORE it signs \
+             (no_eligible_key_at_created_at, #3464/#3502)"
+        ),
+        CAUSE_MISSING_SIGNATURE => tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %memory.id,
+            created_at = %memory.created_at,
+            attribute_agent,
+            sender,
+            cause,
+            backend,
+            error = %error,
+            "sync_push: honored third-party relay refused — no metadata.write_signature \
+             present under the strict flip (author must EMIT the signature at store time, \
+             #1801→#1954)"
+        ),
+        // `CAUSE_FORGED_OR_MALFORMED` — and, deliberately, the catch-all: the
+        // `cause` FIELD always carries whatever
+        // `classify_inbound_attestation_rejection` returned, so a token added
+        // later is still reported honestly even before it earns its own
+        // remedy sentence here.
+        _ => tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %memory.id,
+            created_at = %memory.created_at,
+            attribute_agent,
+            sender,
+            cause,
+            backend,
+            error = %error,
+            "sync_push: per-write content attestation failed; rejecting memory (#1464)"
+        ),
+    }
+    InboundAttestationRejection {
+        memory_id: memory.id.clone(),
+        cause,
+    }
+}
+
 /// #2715 (CB-11 / B-4, data-integrity/federation) — attested apply-gate for the
 /// federation PULL paths (the `serve` catch-up puller
 /// [`crate::federation::receive::catchup_once_with_store`] + the `sync-daemon`
@@ -2188,6 +2372,7 @@ pub async fn sync_push(
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
+    let mut attestation_rejections = Vec::new();
     let mut deleted = 0usize;
     let mut archived = 0usize;
     let mut restored = 0usize;
@@ -2441,54 +2626,14 @@ pub async fn sync_push(
             author_bound_key.as_ref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
-            // #1801→#1954 item 7 — split the generic AttestationRequired WARN
-            // into three actionable causes (unenrolled-author / missing-signature
-            // / forged-or-malformed) so an operator gets a precise signal.
-            // A missing/unenrolled author key under the strict flip carries the
-            // closed-set DLQ cause token `unenrolled_author_strict`
-            // (`push_dlq::classify_quarantine_cause`).
-            let has_write_sig = to_insert
-                .metadata
-                .get(crate::models::field_names::WRITE_SIGNATURE)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|s| !s.trim().is_empty());
-            if author_bound_key
-                .as_ref()
-                .is_none_or(|keys| keys.candidate_pubkeys_b64.is_empty())
-            {
-                tracing::warn!(
-                    target: ATTESTATION_TRACE_TARGET,
-                    memory_id = %to_insert.id,
-                    attribute_agent = %attribute_agent,
-                    sender = %body.sender_agent_id,
-                    cause = crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT,
-                    error = %e,
-                    "sync_push: honored third-party relay refused — ORIGIN author has no \
-                     locally-enrolled key to verify the propagated write_signature against; \
-                     enroll author {attribute_agent}'s Ed25519 key at this node (unenrolled_author_strict, #1464/#1801→#1954)"
-                );
-            } else if !has_write_sig {
-                tracing::warn!(
-                    target: ATTESTATION_TRACE_TARGET,
-                    memory_id = %to_insert.id,
-                    attribute_agent = %attribute_agent,
-                    sender = %body.sender_agent_id,
-                    cause = crate::federation::receive_auth::CAUSE_MISSING_SIGNATURE,
-                    error = %e,
-                    "sync_push: honored third-party relay refused — no metadata.write_signature \
-                     present under the strict flip (author must EMIT the signature at store time, #1801→#1954)"
-                );
-            } else {
-                tracing::warn!(
-                    target: ATTESTATION_TRACE_TARGET,
-                    memory_id = %to_insert.id,
-                    attribute_agent = %attribute_agent,
-                    sender = %body.sender_agent_id,
-                    cause = crate::federation::receive_auth::CAUSE_FORGED_OR_MALFORMED,
-                    error = %e,
-                    "sync_push: per-write content attestation failed; rejecting memory (#1464)"
-                );
-            }
+            attestation_rejections.push(report_inbound_attestation_rejection(
+                &to_insert,
+                &attribute_agent,
+                &body.sender_agent_id,
+                author_bound_key.as_ref(),
+                crate::handlers::StorageBackend::Sqlite,
+                &e,
+            ));
             skipped += 1;
             continue;
         }
@@ -2745,6 +2890,7 @@ pub async fn sync_push(
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
+                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
                 "reset_at": reset_at,
             })),
         )
@@ -4182,6 +4328,7 @@ pub async fn sync_push(
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
+            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
             "dry_run": body.dry_run,
             "receiver_agent_id": local_agent_id,
             "receiver_clock": receiver_clock,

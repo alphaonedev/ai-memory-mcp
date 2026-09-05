@@ -323,9 +323,22 @@ fn signed_store_body(
     body
 }
 
-/// Register the NHI agent (open surface) and enroll its Ed25519 pubkey
-/// (admin-gated `PUT /agents/{id}/pubkey`). Required once before a signed
-/// store can attest against the bound key.
+/// Register the NHI agent (open surface) and enroll its Ed25519 pubkey.
+/// Required once, BEFORE any signed store, so the write can attest against the
+/// bound key (a key bound after a memory's signed `created_at` can never verify
+/// it — see #3464 / #3502 and `docs/attestation.md`).
+///
+/// v1.0.0 #3464 (migrated here by #3502) — the enroll is a two-leg
+/// proof-of-possession handshake, not a flat PUT. `POST
+/// /api/v1/agents/{id}/pubkey/challenge` mints a single-use, short-lived nonce
+/// bound to THIS `(agent_id, candidate key)` pair; the holder of the private
+/// half signs the domain-separated transcript; `PUT
+/// /api/v1/agents/{id}/pubkey` then carries `{pubkey_b64, nonce, proof_b64}`.
+/// The pre-v97 flat body (`{pubkey_b64}` alone) is refused with 403 by design —
+/// admin authority is no longer sufficient to bind a key the caller does not
+/// hold. This mirrors `tests/issue_1539_bind_pubkey_route.rs::proved_bind_body`
+/// and `tests/bind_pubkey_surfaces_3464.rs`; the GA acceptance client is the
+/// end-to-end twin of that unit-level flow, over a real daemon.
 fn register_and_enroll(
     client: &reqwest::blocking::Client,
     daemon: &DaemonChild,
@@ -345,10 +358,36 @@ fn register_and_enroll(
         daemon.stderr_snapshot()
     );
 
+    let challenge_response = client
+        .post(daemon.url(&format!("/api/v1/agents/{NHI_AGENT}/pubkey/challenge")))
+        .header("X-Agent-Id", NHI_AGENT)
+        .json(&json!({"pubkey_b64": kp.public_base64()}))
+        .send()
+        .expect("issue pubkey bind challenge");
+    assert_eq!(
+        challenge_response.status(),
+        reqwest::StatusCode::OK,
+        "bind challenge must succeed before signing"
+    );
+    let wire: Value = challenge_response.json().expect("bind challenge JSON");
+    let challenge = ai_memory::identity::pubkey_bind::BindChallenge {
+        agent_id: NHI_AGENT.to_string(),
+        pubkey_b64: kp.public_base64(),
+        nonce_b64: wire["nonce"].as_str().expect("challenge nonce").to_string(),
+        expires_at: wire["expires_at"]
+            .as_str()
+            .expect("challenge expiry")
+            .to_string(),
+    };
+    let proof = ai_memory::identity::pubkey_bind::sign_bind_challenge(
+        kp.private.as_ref().expect("NHI private key"),
+        &challenge,
+    );
+
     let bind = client
         .put(daemon.url(&format!("/api/v1/agents/{NHI_AGENT}/pubkey")))
         .header("X-Agent-Id", NHI_AGENT)
-        .json(&json!({"pubkey_b64": kp.public_base64()}))
+        .json(&json!({"pubkey_b64": kp.public_base64(), "nonce": challenge.nonce_b64, "proof_b64": proof}))
         .send()
         .expect("bind pubkey request");
     assert!(

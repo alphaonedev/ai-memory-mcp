@@ -45,10 +45,11 @@ Enrolling the key
 -----------------
 
 A signature only attests if the daemon has the matching public key bound to
-the agent. Bind it once (admin-gated) via
-``PUT /api/v1/agents/{id}/pubkey`` with body ``{"pubkey_b64": "..."}`` —
-:meth:`AgentSigningKey.public_key_b64` emits the accepted form, and
-:meth:`AiMemoryClient.bind_agent_pubkey` calls the route. Without a bound key
+the agent. Bind it before signing writes using
+``client.bind_agent_pubkey(agent_id, signing_key)``. This issues an admin-gated
+``POST /api/v1/agents/{id}/pubkey/challenge``, signs its transcript with the
+candidate private key, and answers ``PUT /api/v1/agents/{id}/pubkey`` with
+``{pubkey_b64, nonce, proof_b64}``. A bare public key is insufficient. Without a bound key
 the daemon cannot verify and still returns 403 (fail-closed, by design).
 
 Known limits (stated rather than hidden)
