@@ -142,7 +142,17 @@ max_seq_tokens = 256             # rerank input-sequence cap (#1604).
 # ---------------------------------------------------------------------
 [storage]
 default_namespace = "alphaone"
-archive_on_gc     = true
+archive_on_gc     = true         # archive expired memories into
+                                 # `archived_memories` BEFORE the TTL sweep
+                                 # deletes them, so eviction stays reversible.
+                                 # `false` = PERMANENT hard delete, no archive,
+                                 # no rollback (crypto-erase-on-expiry) and the
+                                 # daemon emits a boot WARN. Precedence (#3385):
+                                 # THIS key > the deprecated flat top-level
+                                 # `archive_on_gc` > compiled default `true`.
+                                 # Setting both emits a one-shot stderr WARN;
+                                 # `ai-memory doctor` reports the effective
+                                 # value and its source.
 archive_max_days  = 90
 max_memory_mb     = 4096
 db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7).
@@ -579,7 +589,16 @@ The v0.6.x flat-field shape (`llm_model`, `ollama_url`, `embed_url`,
 `auto_tag_model`) still parse at v1.0.0 and feed the
 resolver's `Legacy` arm. Loading a legacy config emits a one-shot
 stderr WARN pointing operators at the migration tool. **These fields
-remain parseable at v1.0.0.** They were slated for removal in v0.8.0
+remain parseable at v1.0.0.**
+
+A legacy field is the lowest-precedence **fallback**, not inert: the
+sectioned value wins where it is set, and the flat field still decides
+any key the sections leave unset. For `archive_on_gc` that difference
+governs whether TTL expiry is reversible, so [#3385](https://github.com/alphaonedev/ai-memory-mcp/issues/3385)
+adds a dedicated one-shot stderr WARN whenever the flat key is the one
+in effect, or the two keys disagree, and makes `ai-memory doctor` report
+the effective `archive_on_gc` value alongside its `archive_on_gc_source`
+(`config` / `legacy` / `compiled-default`). They were slated for removal in v0.8.0
 (the `#[deprecated(note = "… slated for removal in v0.8.0")]`
 attribute in `src/config.rs` still says so), but that hard removal
 has not yet shipped — migrate off them with `ai-memory config

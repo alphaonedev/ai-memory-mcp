@@ -196,6 +196,69 @@ fn warn_max_memory_mb_inert_once() {
     });
 }
 
+/// v1.0.0 #3385 — compiled default for `archive_on_gc`: archive expired
+/// memories into `archived_memories` BEFORE the TTL sweep deletes them, so
+/// eviction stays reversible. The unsafe value is `false` (permanent
+/// hard-delete, no rollback) and it is never the default — an operator has
+/// to ask for it, and [`AppConfig::warn_if_archive_on_gc_disabled`] says so
+/// at boot when they do.
+const DEFAULT_ARCHIVE_ON_GC: bool = true;
+
+/// v1.0.0 #3385 — one-shot deprecation WARN for the flat `archive_on_gc`
+/// key, emitted from [`AppConfig::effective_archive_on_gc`] (the single
+/// resolution funnel) so it fires on EVERY surface that resolves the policy
+/// — CLI, MCP stdio, and the serve daemon alike — not only on file load.
+///
+/// Two arms, both about a decision that governs whether expiry is
+/// reversible, so neither may be silent:
+///
+/// - **flat key IN EFFECT** (no `[storage].archive_on_gc`): the operator is
+///   steering GC through a key slated for removal. Name the v2 replacement.
+/// - **the two DISAGREE**: `[storage]` wins and the flat key is inert.
+///   Before #3385 the flat key won here, so this WARN is also the migration
+///   signal for anyone whose behaviour just changed.
+///
+/// Two keys that agree are dead weight, not a hazard — the load-time
+/// [`AppConfig::warn_legacy_schema_drift`] WARN already names them, so this
+/// helper stays quiet rather than double-reporting.
+///
+/// Writes to stderr (not `tracing`) deliberately: CLI surfaces such as
+/// `ai-memory gc` and `ai-memory doctor` install no tracing subscriber, and
+/// a WARN nobody can see is not a WARN. Mirrors
+/// [`AppConfig::warn_legacy_schema_drift`].
+fn warn_deprecated_flat_archive_on_gc(section: Option<bool>, legacy: Option<bool>) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+
+    let Some(legacy) = legacy else { return };
+    // Both keys set to the SAME value: dead weight, not a hazard.
+    if matches!(section, Some(v) if v == legacy) {
+        return;
+    }
+    // Formatting stays INSIDE `call_once` so the steady state (this runs
+    // from `gc_if_needed` on CLI store/recall hot paths) costs one atomic
+    // load, not a `format!` allocation per call.
+    WARNED.call_once(|| {
+        let key = config_keys::ARCHIVE_ON_GC;
+        match section {
+            Some(v) => eprintln!(
+                "ai-memory: WARN — conflicting `{key}` configuration: \
+                 `[storage].{key} = {v}` (v2) is IN EFFECT and the DEPRECATED flat \
+                 `{key} = {legacy}` is IGNORED. Before v1.0.0 the flat key won here, \
+                 so GC archive behaviour on this host just changed to the value you \
+                 asked for under [storage]. Delete the flat key (or run \
+                 `ai-memory config migrate`) to remove the ambiguity."
+            ),
+            None => eprintln!(
+                "ai-memory: WARN — the flat `{key} = {legacy}` key is DEPRECATED \
+                 and is the value IN EFFECT for GC archiving on this host. Move it \
+                 to `[storage].{key} = {legacy}` (or run `ai-memory config \
+                 migrate`); the flat key is slated for removal."
+            ),
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Feature tiers
 // ---------------------------------------------------------------------------
@@ -8283,9 +8346,12 @@ impl AppConfig {
     ///   shape — point them at `ai-memory config migrate`.
     ///
     /// - **Drift** (`schema_version >= 2` AND any legacy field set):
-    ///   operator has migrated but left legacy fields in place —
-    ///   legacy fields are ignored under v2, point them at
-    ///   `ai-memory config migrate` to clean up the dead weight.
+    ///   operator has migrated but left legacy fields in place. The
+    ///   sectioned value WINS where it is set, but the legacy field is
+    ///   still the lowest-precedence FALLBACK for any key the sections
+    ///   leave unset — it is not inert, which is exactly how #3385
+    ///   turned a stale flat `archive_on_gc` into a live data-loss
+    ///   hazard. Point them at `ai-memory config migrate`.
     ///
     /// The WARN is gated by [`std::sync::Once`] so re-loading the
     /// config in the same process (e.g. tests that call
@@ -8328,9 +8394,10 @@ impl AppConfig {
                      are still present in {} (llm_model / ollama_url / embed_url / \
                      embedding_model / cross_encoder / default_namespace / \
                      archive_on_gc / archive_max_days / max_memory_mb / \
-                     auto_tag_model). Under v2 the legacy fields are IGNORED in \
-                     favor of [llm] / [embeddings] / [reranker] / [storage] \
-                     sections. Run `ai-memory config migrate` to remove them.",
+                     auto_tag_model). Section values in [llm] / [embeddings] / \
+                     [reranker] / [storage] WIN, but a legacy field is still the \
+                     FALLBACK for any key the sections leave unset — it is NOT \
+                     inert (#3385). Run `ai-memory config migrate` to remove them.",
                     self.schema_version,
                     path.display(),
                 );
@@ -8927,12 +8994,62 @@ impl AppConfig {
         ResolvedScoring::from_config(self.scoring.as_ref())
     }
 
-    /// Whether to archive memories before GC deletion (default: true).
+    /// Whether to archive memories before GC deletion (default: `true`).
     ///
-    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    /// v1.0.0 #3385 — precedence, highest first:
+    ///
+    /// 1. `[storage].archive_on_gc` — the documented v2 key.
+    /// 2. the DEPRECATED flat `archive_on_gc` key (v1 shape).
+    /// 3. the compiled default `true` (archive before deletion).
+    ///
+    /// Before #3385 this resolver read the flat key ALONE while
+    /// [`AppConfig::resolve_storage`] read the v2 key, so the documented
+    /// `[storage].archive_on_gc` was dead config on every consuming surface
+    /// (CLI `gc` / `gc_if_needed`, MCP `memory_gc` + `memory_forget`, the
+    /// serve GC loop). Both directions of that split were wrong, and one of
+    /// them destroys data: `[storage].archive_on_gc = true` next to a stale
+    /// flat `archive_on_gc = false` silently HARD-DELETED expired memories
+    /// with no archive copy, against an explicit operator instruction to
+    /// keep one. The mirror case silently kept recoverable plaintext for an
+    /// operator who asked for crypto-erase-on-expiry. This resolver is now
+    /// the single source of truth: `resolve_storage` delegates to it, so the
+    /// two can no longer disagree.
+    ///
+    /// Resolving a config whose flat key is IN EFFECT — or whose two keys
+    /// DISAGREE — emits a one-shot deprecation WARN naming the winner.
+    #[must_use]
     #[allow(deprecated)]
     pub fn effective_archive_on_gc(&self) -> bool {
-        self.archive_on_gc.unwrap_or(true)
+        let section = self.storage.as_ref().and_then(|s| s.archive_on_gc);
+        let legacy = self.archive_on_gc;
+        warn_deprecated_flat_archive_on_gc(section, legacy);
+        section.or(legacy).unwrap_or(DEFAULT_ARCHIVE_ON_GC)
+    }
+
+    /// v1.0.0 #3385 — provenance of the [`AppConfig::effective_archive_on_gc`]
+    /// value, reported by `ai-memory doctor` so an operator can see WHICH
+    /// layer decided whether expiry is reversible.
+    ///
+    /// [`ConfigSource::Config`] when `[storage].archive_on_gc` is set,
+    /// [`ConfigSource::Legacy`] when only the deprecated flat key is set,
+    /// otherwise [`ConfigSource::CompiledDefault`]. Pure — unlike
+    /// [`AppConfig::effective_archive_on_gc`] it emits no WARN, so callers
+    /// may report the source without a second one-shot side effect.
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn archive_on_gc_source(&self) -> ConfigSource {
+        if self
+            .storage
+            .as_ref()
+            .and_then(|s| s.archive_on_gc)
+            .is_some()
+        {
+            ConfigSource::Config
+        } else if self.archive_on_gc.is_some() {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        }
     }
 
     /// #1775 — one-shot boot WARN when the resolved `archive_on_gc` is
@@ -9745,10 +9862,7 @@ impl AppConfig {
             .or(legacy_ns)
             .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
-        let archive_on_gc = cfg
-            .and_then(|s| s.archive_on_gc)
-            .or(self.archive_on_gc)
-            .unwrap_or(true);
+        let archive_on_gc = self.effective_archive_on_gc();
 
         let archive_max_days = cfg
             .and_then(|s| s.archive_max_days)
@@ -11253,6 +11367,61 @@ legacy_scoring = false
             ..AppConfig::default()
         };
         assert!(!cfg.effective_archive_on_gc());
+    }
+
+    /// v1.0.0 #3385 — the documented v2 `[storage].archive_on_gc` key must
+    /// GOVERN `effective_archive_on_gc()`, and must WIN over a stale flat
+    /// key. Pre-#3385 the resolver read the flat key alone, so a conflicting
+    /// pair resolved to the legacy value on every GC surface — including the
+    /// data-loss direction pinned by the second half of this test, where a
+    /// stale `archive_on_gc = false` hard-deleted expired memories against an
+    /// explicit `[storage].archive_on_gc = true`. The end-to-end GC-path
+    /// proof (sqlite + postgres) lives in
+    /// `tests/archive_on_gc_config_3385.rs`.
+    #[test]
+    fn effective_archive_on_gc_v2_key_wins_over_legacy_3385() {
+        let section_only = AppConfig {
+            storage: Some(StorageSection {
+                archive_on_gc: Some(false),
+                ..StorageSection::default()
+            }),
+            ..AppConfig::default()
+        };
+        assert!(!section_only.effective_archive_on_gc());
+        assert_eq!(section_only.archive_on_gc_source(), ConfigSource::Config);
+
+        // Conflict, data-loss direction: [storage] asks to KEEP a restorable
+        // copy; the deprecated flat key must not be able to override that.
+        let conflict = AppConfig {
+            archive_on_gc: Some(false),
+            storage: Some(StorageSection {
+                archive_on_gc: Some(true),
+                ..StorageSection::default()
+            }),
+            ..AppConfig::default()
+        };
+        assert!(conflict.effective_archive_on_gc());
+        assert_eq!(conflict.archive_on_gc_source(), ConfigSource::Config);
+        // The single-source-of-truth property: the two resolvers agree.
+        assert_eq!(
+            conflict.resolve_storage().archive_on_gc,
+            conflict.effective_archive_on_gc()
+        );
+    }
+
+    /// v1.0.0 #3385 — provenance reported by `ai-memory doctor` when no key
+    /// is set (compiled default) and when only the deprecated flat key is.
+    #[test]
+    fn archive_on_gc_source_reports_default_and_legacy_3385() {
+        assert_eq!(
+            AppConfig::default().archive_on_gc_source(),
+            ConfigSource::CompiledDefault
+        );
+        let legacy = AppConfig {
+            archive_on_gc: Some(false),
+            ..AppConfig::default()
+        };
+        assert_eq!(legacy.archive_on_gc_source(), ConfigSource::Legacy);
     }
 
     // #1775 — the boot WARN helper is a pure side-effecting `eprintln`/

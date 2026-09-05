@@ -67,6 +67,12 @@ const FACT_DIM_VIOLATIONS: &str = "dim_violations";
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
 /// (see [`crate::storage::schema_integrity`]).
 const FACT_CORE_RELATIONS: &str = "core_relations";
+/// v1.0.0 #3385 — provenance of the reported `archive_on_gc` fact:
+/// `config` (`[storage].archive_on_gc`), `legacy` (the deprecated flat key),
+/// or `compiled-default`. The value alone cannot tell an operator whether a
+/// `[storage]` key they wrote is the one actually governing GC, which is the
+/// exact confusion #3385 was filed over.
+const FACT_ARCHIVE_ON_GC_SOURCE: &str = "archive_on_gc_source";
 const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
 const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
@@ -1369,6 +1375,15 @@ fn pg_extensions_verdict_3264(
 /// the same PROPAGATING `AppConfig::load_for_boot` the daemon boot uses and
 /// reports the error verbatim, so an operator staring at an unexpectedly empty
 /// corpus learns that `ai-memory serve` would have refused, and why.
+///
+/// v1.0.0 #3385 — also reports the EFFECTIVE `archive_on_gc` policy and the
+/// layer that supplied it ([`FACT_ARCHIVE_ON_GC_SOURCE`]). That single flag
+/// decides whether TTL expiry is reversible (archive-then-delete) or a
+/// permanent hard delete, and it is resolved from two keys of differing
+/// precedence, so "which value is actually in force, and who set it" is not
+/// something an operator can read off `config.toml` by eye. An UNUSABLE
+/// config reports the load error instead: no config was resolved, so there is
+/// no honest effective value to print.
 fn section_config_health_3166() -> ReportSection {
     const NAME: &str = "Configuration";
     let config_path = crate::config::AppConfig::config_path().map_or_else(
@@ -1385,17 +1400,38 @@ fn section_config_health_3166() -> ReportSection {
                     "status".into(),
                     "skipped (AI_MEMORY_NO_CONFIG is truthy)".into(),
                 ),
+                (
+                    crate::config::config_keys::ARCHIVE_ON_GC.into(),
+                    crate::config::AppConfig::default()
+                        .effective_archive_on_gc()
+                        .to_string(),
+                ),
+                (
+                    FACT_ARCHIVE_ON_GC_SOURCE.into(),
+                    crate::config::AppConfig::default()
+                        .archive_on_gc_source()
+                        .as_str()
+                        .into(),
+                ),
             ],
             note: None,
         };
     }
     match crate::config::AppConfig::load_for_boot() {
-        Ok(_) => ReportSection {
+        Ok(config) => ReportSection {
             name: NAME.into(),
             severity: Severity::Info,
             facts: vec![
                 (FACT_CONFIG_PATH.into(), config_path),
                 ("status".into(), "ok (or absent — compiled defaults)".into()),
+                (
+                    crate::config::config_keys::ARCHIVE_ON_GC.into(),
+                    config.effective_archive_on_gc().to_string(),
+                ),
+                (
+                    FACT_ARCHIVE_ON_GC_SOURCE.into(),
+                    config.archive_on_gc_source().as_str().into(),
+                ),
             ],
             note: None,
         },
