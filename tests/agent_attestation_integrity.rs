@@ -485,6 +485,11 @@ fn cli_require_attestation_rejects_unsigned_store() {
     let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("cargo_bin");
     let assert = cmd
         .env_clear()
+        .env("HOME", dir.path())
+        .env(
+            "AI_MEMORY_KEY_DIR",
+            ai_memory::identity::test_key_dir::install(),
+        )
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1")
         .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1609")
@@ -524,6 +529,11 @@ fn cli_default_permissive_lands_unsigned_store_claimed_1985() {
     let db = dir.path().join("cli-attest-default.db");
     let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("cargo_bin");
     cmd.env_clear()
+        .env("HOME", dir.path())
+        .env(
+            "AI_MEMORY_KEY_DIR",
+            ai_memory::identity::test_key_dir::install(),
+        )
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1985")
         .args([
@@ -739,6 +749,11 @@ fn cli_opt_out_zero_lands_unsigned_store_claimed_1751() {
     let db = dir.path().join("cli-attest-optout.db");
     let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("cargo_bin");
     cmd.env_clear()
+        .env("HOME", dir.path())
+        .env(
+            "AI_MEMORY_KEY_DIR",
+            ai_memory::identity::test_key_dir::install(),
+        )
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1751")

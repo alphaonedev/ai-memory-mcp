@@ -26,6 +26,17 @@
 
 use std::fs;
 
+#[test]
+fn keys_prune_is_present_in_the_counted_cli_surface() {
+    use clap::CommandFactory as _;
+    let command = ai_memory::daemon_runtime::Cli::command();
+    let keys = command.find_subcommand("keys").expect("#3355 keys command");
+    assert!(
+        keys.find_subcommand("prune").is_some(),
+        "#3355 prune must be reachable"
+    );
+}
+
 /// Returns (`default_count`, `sal_count_total`) — `sal_count_total`
 /// is the FULL count when `--features sal` (or `sal-postgres`) is
 /// active (default variants + sal-gated variants).

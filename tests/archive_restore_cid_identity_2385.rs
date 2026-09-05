@@ -30,6 +30,7 @@ use rusqlite::{Connection, params};
 const NS: &str = "cid-identity-2385";
 
 fn open_db() -> Connection {
+    let _ = ai_memory::identity::test_key_dir::install();
     db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 

@@ -2040,3 +2040,36 @@ ai-memory forget --tier short --namespace my-app
 # Compact after deletion
 sqlite3 /path/to/ai-memory.db "VACUUM"
 ```
+
+### Orphan key files
+
+`ai-memory doctor --json` reports `orphan_key_files` in its Identity section.
+The inventory reads the configured SQLite or PostgreSQL `_agents` registry,
+including expired registrations, and reports an unknown count if that registry
+cannot be read. It never treats an unavailable registry as empty.
+
+Public-only `.pub` / `.x25519.pub` files without a sibling private key are reported separately as `enrolled_public_keys` (peer/guardian verification material) and retained unless both `--include-public-only` and `--yes` are supplied.
+
+Preview using the same database and key directory as your deployment:
+
+```bash
+ai-memory --db /path/to/memory.db keys --key-dir /path/to/keys prune --dry-run
+ai-memory keys --store-url "$AI_MEMORY_STORE_URL" --key-dir /path/to/keys prune --dry-run
+```
+
+Omitting both flags also performs a dry run. After reviewing the candidate names,
+repeat with `--yes` instead of `--dry-run` to remove them. Registered agent keys
+(including nested agent IDs and X25519 keys), daemon, operator, audit-witness and default capability-owner keys, hidden archive
+directories and unrelated files remain protected. Symlink entries are skipped;
+a symlink in the key directory's path is refused. Use the physical directory
+path when the operating system exposes it through an alias. Key bytes are never
+read or printed. Deletion holds a registry lock so a concurrent registration
+cannot become a pruning candidate. PostgreSQL requires a `sal-postgres` build
+and permission to read the registry; deletion also needs the table-lock privilege.
+
+Tests use `ai_memory::identity::test_key_dir::install()` for in-process keys and
+pass its returned path through `Command::env("AI_MEMORY_KEY_DIR", path)` for
+child commands. Cargo's self dev-dependency enables the `test-support` feature
+across the integration-test library boundary, including CLI children. Test builds
+use this shared temporary fallback even when a child clears its environment;
+ordinary production builds do not enable it. The test resolver panics on a key path under HOME, including aliases.

@@ -266,23 +266,10 @@ const X25519_PRIV_SUFFIX: &str = ".x25519.priv";
 /// X25519 secret/public key length in bytes (both are 32).
 const X25519_KEY_LEN: usize = 32;
 
-/// Resolve the directory used to persist per-agent X25519 keypairs.
-/// Production resolves the platform key directory (honoring
-/// `AI_MEMORY_KEY_DIR`); test builds use a process-wide ephemeral
-/// tempdir so the unit suite never reads or writes the real key store.
-#[cfg(not(test))]
+/// Resolve the shared key directory. Unit and integration builds use the same
+/// test-support sandbox and resolver guard.
 fn keypair_persist_dir() -> Result<PathBuf> {
     crate::identity::keypair::default_key_dir()
-}
-
-#[cfg(test)]
-fn keypair_persist_dir() -> Result<PathBuf> {
-    use std::sync::OnceLock;
-    static TEST_KEY_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-    Ok(TEST_KEY_DIR
-        .get_or_init(|| tempfile::tempdir().expect("create ephemeral x25519 test key dir"))
-        .path()
-        .to_path_buf())
 }
 
 /// `(pub_path, priv_path)` for `agent_id` under `dir`.

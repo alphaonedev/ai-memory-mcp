@@ -292,6 +292,7 @@ notify = { version = "8.2.0", optional = true }
 # Operators who want encryption at rest also supply
 # `--db-passphrase-file <path>` at daemon startup to unlock the DB.
 [features]
+test-support = []
 # ARCH-11 (FX-C4-batch2, 2026-05-26) — every flag listed below MUST
 # have at least one `cfg(feature = "<name>")` consumer in `src/` or
 # `tests/`, OR be enumerated in the carve-out list in
@@ -355,6 +356,7 @@ fs-notify = ["dep:notify"]
 vectorlite = ["rusqlite/load_extension"]
 
 [dev-dependencies]
+ai-memory = { path = ".", features = ["test-support"] }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 uuid = { version = "1", features = ["v4", "v7"] }

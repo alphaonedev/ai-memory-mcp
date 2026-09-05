@@ -62,6 +62,7 @@ pub mod io_writer;
 /// of every subcommand's `--json` support, so a verb can neither ignore the
 /// flag silently nor inherit it by accident.
 pub mod json_contract;
+pub mod keys;
 pub mod link;
 pub mod logs;
 pub mod model_attest;

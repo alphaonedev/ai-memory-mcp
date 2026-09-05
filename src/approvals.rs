@@ -1383,6 +1383,7 @@ pub mod signed {
 
         #[test]
         fn gate_fails_closed_when_stored_flag_requires_but_no_sigs() {
+            let _ = crate::identity::test_key_dir::install();
             let payload = serde_json::json!({ REQUIRES_SIGNED_APPROVAL_KEY: true });
             let v = evaluate_signed_approval_gate(
                 &payload,
@@ -1399,6 +1400,7 @@ pub mod signed {
 
         #[test]
         fn gate_fails_closed_when_namespace_term_requires_but_no_sigs() {
+            let _ = crate::identity::test_key_dir::install();
             // No stored flag on the payload — term (2) alone engages the gate.
             let payload = serde_json::json!({ "k": "v" });
             let v = evaluate_signed_approval_gate(
@@ -1416,6 +1418,7 @@ pub mod signed {
 
         #[test]
         fn gate_engages_when_sig_presented_even_if_not_required() {
+            let _ = crate::identity::test_key_dir::install();
             // No requirement, but a signature IS presented → the gate runs
             // (never silently ignored) and fails closed absent a met quorum.
             let stranger = kp(2);

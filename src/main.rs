@@ -423,6 +423,7 @@ mod tests {
     /// `governance::audit::init`.
     #[test]
     fn init_forensic_audit_with_temp_dir_does_not_panic() {
+        let _ = ai_memory::identity::test_key_dir::install();
         // Scratch under the repo's gitignored .local-runs/ per the
         // project no-/tmp HARD RULE.
         let root = std::env::current_dir()

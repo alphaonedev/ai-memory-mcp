@@ -200,6 +200,8 @@ pub fn key_dir_env_override() -> Option<PathBuf> {
 /// to relocate the key store in production can use the same override.
 pub fn default_key_dir() -> Result<PathBuf> {
     let resolved = resolved_default_key_dir_path()?;
+    #[cfg(any(test, feature = "test-support"))]
+    super::test_key_dir::assert_isolated(&resolved);
     // #3198 — refuse at RESOLUTION, so a group-writable key store is named once
     // at boot rather than surfacing later as a confusing per-operation failure.
     // A path that does not exist yet passes; `ensure_parent` creates it `0700`.
@@ -217,15 +219,28 @@ pub fn default_key_dir() -> Result<PathBuf> {
 /// exists to refuse.
 pub(crate) fn resolved_default_key_dir_path() -> Result<PathBuf> {
     if let Some(p) = key_dir_env_override() {
+        #[cfg(any(test, feature = "test-support"))]
+        super::test_key_dir::assert_isolated(&p);
         return Ok(p);
     }
-    // COVERAGE: ok_or_else closure reachable only on hosts where
-    //           dirs::config_dir() returns None — i.e. exotic
-    //           platforms with no HOME env var. Not deterministic to
-    //           trigger in tests because removing HOME breaks tempfile.
-    let base = dirs::config_dir()
-        .ok_or_else(|| anyhow!("OS did not advertise a config directory for key storage"))?;
-    Ok(base.join("ai-memory").join("keys"))
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        // Integration tests and their CLI children link a non-cfg(test) rlib.
+        // The self dev-dependency enables the same explicit test-support
+        // override there, including env-cleared child processes (#3355).
+        Ok(super::test_key_dir::install().to_path_buf())
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        // COVERAGE: ok_or_else closure reachable only on hosts where
+        //           dirs::config_dir() returns None — i.e. exotic
+        //           platforms with no HOME env var. Not deterministic to
+        //           trigger in tests because removing HOME breaks tempfile.
+        let base = dirs::config_dir()
+            .ok_or_else(|| anyhow!("OS did not advertise a config directory for key storage"))?;
+        let path = base.join("ai-memory").join("keys");
+        Ok(path)
+    }
 }
 
 /// The well-known stable label used by the daemon when auto-generating
@@ -2128,7 +2143,10 @@ mod tests {
         // Shape only — do NOT go through `default_key_dir()`, which
         // refuses a group-writable live keystore (#3198). This host's
         // `~/.config/ai-memory/keys` is `0o775` under `umask 0002`.
-        let p = resolved_default_key_dir_path().expect("default dir path");
+        let p = dirs::config_dir()
+            .expect("platform config path")
+            .join("ai-memory")
+            .join("keys");
         let s = p.to_string_lossy();
         assert!(s.ends_with("ai-memory/keys") || s.ends_with("ai-memory\\keys"));
     }

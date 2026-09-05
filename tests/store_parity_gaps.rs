@@ -1069,46 +1069,10 @@ mod postgres_side {
         }
     }
 
-    /// Provision a fresh, private (`0700`) directory for X25519 keypair
-    /// storage and point `AI_MEMORY_KEY_DIR` at it for the test's scope,
-    /// reusing the shared [`EnvGuard`] (serialized under the serial
-    /// `#[ignore]` pg run, restored on `Drop`).
-    ///
-    /// Integration-test binaries link the crate compiled in NON-test config,
-    /// so `encryption::seal_content` resolves the REAL key store via
-    /// `identity::keypair::default_key_dir()` (which honors `AI_MEMORY_KEY_DIR`)
-    /// rather than the ephemeral `#[cfg(test)]` tempdir the unit suite gets.
-    /// With no override, `default_key_dir` fails closed in the cert cell
-    /// ("resolving the key directory for x25519 keypair storage" — no config
-    /// dir / group-writable default under `umask 0002`), so every encryption
-    /// cell must supply an isolated dir (#3302). Mirrors the tempdir +
-    /// `AI_MEMORY_KEY_DIR` precedent in `tests/backup_fail_closed_2444.rs` and
-    /// `tests/federation_*.rs`.
-    ///
-    /// The returned `TempDir` MUST be bound in a `let` that outlives the test
-    /// body: dropping it deletes the directory and the key store vanishes
-    /// mid-test. Bind BOTH returned values.
-    #[must_use]
-    fn key_dir_guard() -> (tempfile::TempDir, EnvGuard) {
-        let tmp = tempfile::tempdir().expect("create ephemeral x25519 key dir");
-        // #3198 — `default_key_dir` refuses a group/world-WRITABLE key store.
-        // `tempfile` creates the dir subject to the ambient `umask`, so under
-        // this fleet's `umask 0002` it lands `0o775` (group-writable) and would
-        // be refused. Force `0o700` so the cell is hermetic w.r.t. the runner's
-        // umask, not silently reliant on a `022` CI default.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
-                .expect("tighten ephemeral key dir to 0700");
-        }
-        let guard = EnvGuard::set(
-            "AI_MEMORY_KEY_DIR",
-            tmp.path()
-                .to_str()
-                .expect("ephemeral key dir path is valid UTF-8"),
-        );
-        (tmp, guard)
+    /// All encrypted PG fixtures use the same guarded sandbox as the unit and
+    /// integration suites, without process-global environment mutation.
+    fn key_dir_guard() -> &'static std::path::Path {
+        ai_memory::identity::test_key_dir::install()
     }
 
     async fn live_pg() -> Option<PostgresStore> {
@@ -1508,8 +1472,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         let agent = "pg-commit-b-on-agent";
         let run = uuid::Uuid::new_v4().simple().to_string();
@@ -1567,8 +1531,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         let agent = "pg-2288-batch-agent";
         let run = uuid::Uuid::new_v4().simple().to_string();
@@ -1700,8 +1664,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
         let plaintext = "pg SENSITIVE 2292 store_with_embedding";
         let mut mem = sample_memory(&format!("pg-2292-swe-on-{run}"));
         mem.content = plaintext.to_string();
@@ -1755,8 +1719,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
         let plaintext = "pg SENSITIVE 2292 apply_remote";
         let mut mem = sample_memory(&format!("pg-2292-remote-on-{run}"));
         mem.content = plaintext.to_string();
@@ -1816,8 +1780,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         // Capture a tight since-bound BEFORE the insert so the send-path
         // read below scopes to just this row on a shared live DB.
@@ -1884,8 +1848,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         let plaintext = "pg SENSITIVE 2292 capture_turn";
         let mut mem = sample_memory(&format!("pg-2292-capture-{run}"));
@@ -1937,8 +1901,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         let plaintext = "pg SENSITIVE 2292 recover_turn";
         let mut mem = sample_memory(&format!("pg-2292-recover-{run}"));
@@ -1983,8 +1947,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         // Seed one source memory to reflect on.
         let mut src = sample_memory(&format!("pg-2292-reflect-src-{run}"));
@@ -2038,8 +2002,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         let mut src = sample_memory(&format!("pg-2292-consol-src-{run}"));
         src.namespace.clone_from(&ns);
@@ -2088,8 +2052,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         let mut orig = sample_memory(&format!("pg-2292-supersede-{run}"));
         orig.content = "original body".to_string();
@@ -2138,8 +2102,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         // Seed the existing row (sealed under the gate).
         let mut orig = sample_memory(&format!("pg-2292-merge-{run}"));
@@ -2188,8 +2152,8 @@ mod postgres_side {
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         // #3302 — supply an isolated key dir so `seal_content`'s
-        // `default_key_dir()` resolves (non-test crate build). Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        // `default_key_dir()` resolves through the shared test-support sandbox.
+        let _keys = key_dir_guard();
 
         // Seed the row with V1 (sealed under the gate).
         let mut orig = sample_memory(&format!("pg-2292-update-{run}"));
@@ -2338,7 +2302,7 @@ mod postgres_side {
         // #3302 — this cell enrolls a keypair via `get_or_create_keypair`
         // directly (no `ENCRYPT_AT_REST` gate), so it needs an isolated key
         // dir too or `default_key_dir()` fails closed. Hold both.
-        let (_key_dir, _key_dir_env) = key_dir_guard();
+        let _keys = key_dir_guard();
         let seal_agent = "pg-commit-b-seal";
         let wrong_agent = "pg-commit-b-wrong";
         let kp = get_or_create_keypair(seal_agent).expect("keypair");

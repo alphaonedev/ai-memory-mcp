@@ -339,10 +339,10 @@ pub fn enforced_rule_passes(
 /// Base64url-no-pad (or standard) encoded verifying key written by
 /// `ai-memory rules keygen` (Layout 2 in
 /// [`crate::cli::rules::load_operator_signing_key_from_dir`]).
-const OPERATOR_PUBKEY_KEYGEN_FILE: &str = "operator.key.pub";
+pub(crate) const OPERATOR_PUBKEY_KEYGEN_FILE: &str = "operator.key.pub";
 /// Raw 32-byte verifying key written by the legacy `kp::save` keypair
 /// layout (Layout 1 — pairs with `operator.priv`).
-const OPERATOR_PUBKEY_LEGACY_FILE: &str = "operator.pub";
+pub(crate) const OPERATOR_PUBKEY_LEGACY_FILE: &str = "operator.pub";
 
 /// `attest_level` stamped on operator-signed governance rows AND on the
 /// `signed_events` audit emissions that record their lifecycle.

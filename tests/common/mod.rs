@@ -177,6 +177,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// subprocesses don't share the parent's `#[tokio::test]` runtime.
 pub fn ensure_no_config_env() {
     static INIT: std::sync::Once = std::sync::Once::new();
+    let _ = ai_memory::identity::test_key_dir::install();
     INIT.call_once(|| {
         // SAFETY: `std::env::set_var` is `unsafe` on the 2024 edition
         // because env mutation is process-global. We gate it through

@@ -91,6 +91,7 @@ pub fn json_support(command: &Command) -> JsonSupport {
         | Command::Archive(..)
         | Command::Agents(..)
         | Command::Identity(..)
+        | Command::Keys(..)
         | Command::Capability(..)
         | Command::Rules(..)
         | Command::ModelAttest(..)

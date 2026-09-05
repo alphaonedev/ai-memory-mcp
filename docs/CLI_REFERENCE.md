@@ -1175,6 +1175,8 @@ this precedes enabling enforced reads.
 Global flag: `--key-dir <PATH>` overrides the key storage directory
 (default: platform config dir; `AI_MEMORY_KEY_DIR` env honoured).
 
+`ai-memory keys prune` reports public-only peer/guardian files as `enrolled_public_keys` and retains them unless both `--include-public-only` and `--yes` are supplied (see [orphan key files](ADMIN_GUIDE.md#orphan-key-files)).
+
 ### `verify-signed-events-chain` — V-4 closeout verifier
 
 Walks the `signed_events` cross-row hash chain end-to-end. Supports

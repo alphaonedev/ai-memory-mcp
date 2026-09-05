@@ -1019,7 +1019,7 @@ fn run_local(db_path: &Path) -> Report {
                 facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), p.supported.to_string()));
                 facts.push(("schema_stamp".into(), "poisoned".into()));
             }
-            sections.push(section_identity_3147(None));
+            sections.push(section_identity_3147(None, db_path));
             sections.push(ReportSection {
                 name: "Storage".into(),
                 severity: Severity::Critical,
@@ -1069,7 +1069,7 @@ fn run_local(db_path: &Path) -> Report {
         }
     };
 
-    sections.push(section_identity_3147(Some(&conn)));
+    sections.push(section_identity_3147(Some(&conn), db_path));
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
     sections.push(section_embedding_space_census_2167(&conn));
@@ -1124,7 +1124,7 @@ fn core_relation_status(
 ///
 /// Returns `Err` when the runtime cannot be built or the probe panicked.
 #[cfg(feature = "sal-postgres")]
-fn run_pg_probe<F, Fut, T>(make_fut: F) -> Result<T>
+pub(crate) fn run_pg_probe<F, Fut, T>(make_fut: F) -> Result<T>
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = T>,
@@ -1539,8 +1539,44 @@ fn identity_signing_facts(
 /// never rewrites modes. Surfaces the daemon keypair half-state, the
 /// #3198 key-dir posture, and whether `HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`
 /// is inert with zero enrolled keys.
-fn section_identity_3147(conn: Option<&rusqlite::Connection>) -> ReportSection {
+fn section_identity_3147(conn: Option<&rusqlite::Connection>, db_path: &Path) -> ReportSection {
     let (mut facts, mut severity, mut notes) = identity_keystore_facts();
+    let inventory = crate::identity::keypair::resolved_default_key_dir_path()
+        .and_then(|dir| super::keys::inventory(db_path, None, &dir, false, false));
+    match inventory {
+        Ok(inventory) => {
+            facts.push((
+                "orphan_key_files".into(),
+                inventory.orphan_files.len().to_string(),
+            ));
+            facts.push((
+                "key_symlinks_skipped".into(),
+                inventory.skipped_symlinks.len().to_string(),
+            ));
+            facts.push((
+                "enrolled_public_keys".into(),
+                inventory.enrolled_public_keys.len().to_string(),
+            ));
+            if !inventory.enrolled_public_keys.is_empty() {
+                notes.push(format!(
+                    "enrolled public keys — peer/guardian verification material, not pruned: {}",
+                    inventory.enrolled_public_keys.join(", ")
+                ));
+            }
+            if !inventory.orphan_files.is_empty() {
+                severity = severity_max(severity, Severity::Warning);
+                notes.push(format!("key files name no registered agent: {}; review with `ai-memory keys prune --dry-run` using the same --db or store URL and key directory", inventory.orphan_files.join(", ")));
+            }
+        }
+        Err(e) => {
+            severity = severity_max(severity, Severity::Warning);
+            facts.push(("orphan_key_files".into(), "unknown".into()));
+            facts.push(("enrolled_public_keys".into(), "unknown".into()));
+            notes.push(crate::logging::redact_urls_in_message(&format!(
+                "key registry inspection failed: {e:#}"
+            )));
+        }
+    }
     let mode = crate::config::http_attested_identity_mode();
     facts.push(("http_identity_mode".into(), mode.as_str().into()));
     let enrolled = conn.map_or(0, |c| {
