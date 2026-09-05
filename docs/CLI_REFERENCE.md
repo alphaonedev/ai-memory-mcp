@@ -1671,12 +1671,26 @@ happens, never WHAT it returns.
 
 `--timeout <SECS>` bounds the wait; on expiry the command still performs the
 read and prints the result, because a timeout means "nothing arrived in that
-window", never "skip the durable truth". A welcome carrying no offline backlog
-does not end the wait (on a healthy hub every session is welcomed at once, so
-returning there would make `--wait` an alias for `inbox`); a welcome that
-reports coalesced wakes, or one flagged `lagged`, does. If the wake plane is
-unreachable the command logs a warning and reads immediately rather than
-refusing — an inbox read must never depend on a latency optimisation.
+window", never "skip the durable truth". **Omitting `--timeout` does not mean
+waiting forever:** the backstop tick is itself a return, so a wait without it
+lasts at most one poll interval (`<= 60 s`, `wake_sink::BACKSTOP_POLL_MAX`).
+A welcome carrying no offline backlog does not end the wait (on a healthy hub
+every session is welcomed at once, so returning there would make `--wait` an
+alias for `inbox`); a welcome that reports coalesced wakes, or one flagged
+`lagged`, does.
+
+When the hub CREDENTIAL will not load — a host that never ran
+`ai-memory identity delegate`, an expired bundle, one minted for another hub —
+the command logs that refusal once at `WARN` with its full cause chain (so the
+re-mint remediation is visible) and then **waits on the bounded backstop poll
+anyway**, which is what "otherwise the bounded backstop poll" above means. It
+does NOT read immediately: a `--wait` that returned at once on a credential
+error would turn the `sleep 180; ai-memory inbox` replacement into a hot loop
+of immediate reads. `ai-memory wake-listen` keeps the hard refusal instead —
+an operator who started the listener explicitly asked for a hub session and
+needs to see why it will not open. Only a failure to start the hub-LESS
+stream (an invalid poll interval, no runtime) makes the command read at once,
+because neither is recoverable by waiting.
 
 ## Shell, completions, man
 

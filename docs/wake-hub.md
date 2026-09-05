@@ -380,9 +380,21 @@ switch safe to roll out per fleet rather than per release.
 The one-shot form: block on the wake plane, then perform and print the read
 exactly as `ai-memory inbox` does. `--timeout` bounds the wait, and on expiry
 the read STILL happens — a timeout means "nothing arrived in that window",
-never "skip the durable truth". An unreachable wake plane logs a warning and
-reads immediately, because an inbox read must never depend on a latency
-optimisation.
+never "skip the durable truth". **Omitting `--timeout` does not mean waiting
+forever:** the backstop tick is itself a return, so a wait without it lasts at
+most one poll interval (`<= 60 s`, `wake_sink::BACKSTOP_POLL_MAX`).
+
+A hub that is merely DOWN is already covered by the always-armed backstop: the
+credential loads, the session loop backs off, and the poll returns on schedule.
+When the CREDENTIAL itself will not load — no `ai-memory identity delegate` was
+ever run on this host, the bundle expired, or it was minted for another hub —
+`--wait` logs that refusal once at `WARN` with its cause chain and then waits
+on the bounded poll anyway. That is deliberate: `--wait` is the drop-in for
+`sleep 180; ai-memory inbox`, and a version that returned immediately on a
+credential error would replace a paced poll with a hot loop. `ai-memory
+wake-listen` keeps the hard refusal, because an operator who started the
+listener explicitly asked for a hub session and needs to see why it will not
+open.
 
 ## Operating the hub
 

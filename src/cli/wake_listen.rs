@@ -376,40 +376,93 @@ pub async fn run_exec_hook(
 
 /// Block until a wake is due, then return the signal.
 ///
-/// This is the engine behind `ai-memory inbox --wait`. A `Welcome` that
-/// carries NO offline backlog is deliberately NOT returned: on a healthy hub
-/// every session is welcomed immediately, and returning on that would make
-/// `--wait` an alias for `inbox`. A welcome that reports coalesced wakes, or
-/// one flagged `lagged`, DOES return — there is mail waiting.
+/// A `Welcome` that carries NO offline backlog is deliberately NOT returned:
+/// on a healthy hub every session is welcomed immediately, and returning on
+/// that would make a wait an alias for a plain read. A welcome that reports
+/// coalesced wakes, or one flagged `lagged`, DOES return — there is mail
+/// waiting.
 ///
-/// # Errors
-///
-/// Every start-up refusal from [`start_stream`]. `Ok(None)` means the timeout
-/// expired without a wake — a bounded, honest "nothing arrived".
-pub async fn wait_for_wake(
-    resolved: &Resolved,
-    timeout: Option<Duration>,
-) -> Result<Option<WakeSignal>> {
-    let mut stream = start_stream(resolved)?;
+/// `None` means the caller's timeout expired, or every producer stopped —
+/// a bounded, honest "nothing arrived".
+async fn wait_on(stream: &mut WakeStream, timeout: Option<Duration>) -> Option<WakeSignal> {
     let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
     loop {
         let signal = match deadline {
             Some(at) => match tokio::time::timeout_at(at, stream.next()).await {
                 Ok(next) => next,
-                Err(_) => return Ok(None),
+                Err(_) => return None,
             },
             None => stream.next().await,
         };
-        let Some(signal) = signal else {
-            return Ok(None);
-        };
+        let signal = signal?;
         if signal.reason == WakeReason::Welcome && signal.pending_count == 0 {
             // An empty welcome is "you are attached", not "you have mail".
             stream.note_read();
             continue;
         }
-        return Ok(Some(signal));
+        return Some(signal);
     }
+}
+
+/// Block until a wake is due, refusing if the hub credential will not load.
+///
+/// The shape `ai-memory wake-listen` wants: an operator who ran the listener
+/// explicitly asked for a hub session, so a bundle that is missing, expired or
+/// minted for another hub is an error they need to see, not something to work
+/// around.
+///
+/// # Errors
+///
+/// Every start-up refusal from [`start_stream`].
+pub async fn wait_for_wake(
+    resolved: &Resolved,
+    timeout: Option<Duration>,
+) -> Result<Option<WakeSignal>> {
+    let mut stream = start_stream(resolved)?;
+    Ok(wait_on(&mut stream, timeout).await)
+}
+
+/// Block until a wake is due, DEGRADING to the bounded poll when the hub
+/// credential will not load.
+///
+/// The shape `ai-memory inbox --wait` wants, and the one the plane's own
+/// contract requires. `--wait` promises "the hub when one is configured,
+/// otherwise the bounded backstop poll", and the fleet conversion recipe
+/// swaps `sleep 180; ai-memory inbox` for `ai-memory inbox --wait --timeout
+/// 180`. On a host that never ran `ai-memory identity delegate` — or whose
+/// bundle expired, or was minted for another hub — [`start_stream`] fails
+/// BEFORE any stream exists, and returning that error would make the caller
+/// read immediately. In a loop that is a hot loop: one process boot per
+/// iteration, a warning each time, and none of the pacing the recipe it
+/// replaced provided.
+///
+/// A hub that is merely DOWN never had this problem — the bundle loads, the
+/// session loop backs off, and the always-armed backstop returns on schedule.
+/// This closes the case where the CREDENTIAL, not the hub, is what is
+/// missing: the refusal is logged once at WARN with its full cause chain (so
+/// the operator sees the re-mint remediation), and the wait then runs on a
+/// hub-less stream, staying bounded by `min(timeout, poll_interval)`.
+///
+/// # Errors
+///
+/// Only a failure to start the hub-LESS stream — an invalid poll interval or
+/// no Tokio runtime. Neither is recoverable by waiting.
+pub async fn wait_for_wake_or_backstop(
+    resolved: &Resolved,
+    timeout: Option<Duration>,
+) -> Result<Option<WakeSignal>> {
+    let mut stream = match start_stream(resolved) {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!(
+                "inbox --wait: the wake-hub credential could not be loaded ({e:#}); waiting on \
+                 the bounded backstop poll instead (at most {:?})",
+                resolved.client.poll_interval
+            );
+            WakeStream::start(resolved.client.clone(), None)?
+        }
+    };
+    Ok(wait_on(&mut stream, timeout).await)
 }
 
 /// Serve `ai-memory wake-listen` until SIGINT / SIGTERM.

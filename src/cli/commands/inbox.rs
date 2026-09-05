@@ -44,7 +44,12 @@ pub struct InboxArgs {
     #[arg(long)]
     pub wait: bool,
 
-    /// Longest time `--wait` will block, in seconds. Unbounded when omitted.
+    /// Longest time `--wait` will block, in seconds.
+    ///
+    /// Omitting it does NOT mean waiting forever: the backstop tick is itself
+    /// a return, so a wait without `--timeout` lasts at most one poll interval
+    /// (`<= 60 s`, `wake_sink::BACKSTOP_POLL_MAX`). Pass it to bound the wait
+    /// tighter than that.
     ///
     /// On expiry the command still performs the read and prints the result,
     /// so a timeout is "nothing arrived in that window", never a failure and
@@ -112,10 +117,16 @@ pub fn cmd_inbox(
 /// Without `--wait` this is a straight delegate, so the non-waiting path is
 /// byte-identical to pre-#3470.
 ///
+/// A hub CREDENTIAL that will not load is deliberately NOT an error here: it
+/// is logged once at WARN and the wait falls through to the bounded backstop
+/// poll (see [`crate::cli::wake_listen::wait_for_wake_or_backstop`]). A
+/// `--wait` that returned immediately on a missing bundle would turn the
+/// documented `sleep 180; ai-memory inbox` replacement into a hot loop.
+///
 /// # Errors
 ///
-/// Every refusal from the wake-listener resolution (a missing agent id, a
-/// bundle that does not verify, a poll interval over the normative bound),
+/// Refusals from the wake-listener RESOLUTION — a missing agent id, an
+/// unresolvable key directory, a poll interval over the normative bound —
 /// plus every failure [`cmd_inbox`] can produce.
 pub async fn cmd_inbox_waiting(
     db_path: &std::path::Path,
@@ -143,7 +154,14 @@ pub async fn cmd_inbox_waiting(
         };
         let resolved = crate::cli::wake_listen::resolve(&listen, app_config, cli_agent_id)?;
         let timeout = args.timeout.map(std::time::Duration::from_secs);
-        match crate::cli::wake_listen::wait_for_wake(&resolved, timeout).await {
+        // `wait_for_wake_or_backstop`, never `wait_for_wake`: a host that
+        // never ran `ai-memory identity delegate` — or whose bundle expired,
+        // or was minted for another hub — must still WAIT on the bounded
+        // poll. Returning the credential error here would make `--wait` read
+        // immediately, and the fleet recipe that swaps `sleep 180;
+        // ai-memory inbox` for this command would become a hot loop of
+        // immediate reads with a warning per iteration.
+        match crate::cli::wake_listen::wait_for_wake_or_backstop(&resolved, timeout).await {
             Ok(Some(signal)) => {
                 tracing::debug!(reason = signal.reason.label(), "inbox --wait: woken");
             }
@@ -151,12 +169,14 @@ pub async fn cmd_inbox_waiting(
                 tracing::debug!("inbox --wait: timed out; reading anyway");
             }
             Err(e) => {
-                // Degrade, never refuse: the durable rows are readable
-                // whether or not the wake plane is reachable, and refusing
-                // here would make an inbox read depend on a latency
-                // optimisation.
+                // Only an invalid poll interval or a missing runtime reaches
+                // here, and neither is recoverable by waiting. Degrade, never
+                // refuse: the durable rows are readable whether or not the
+                // wake plane is, and refusing would make an inbox read depend
+                // on a latency optimisation.
                 tracing::warn!(
-                    "inbox --wait: the wake plane is unavailable ({e:#}); reading immediately"
+                    "inbox --wait: the wake plane could not be started ({e:#}); reading \
+                     immediately"
                 );
             }
         }

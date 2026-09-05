@@ -511,6 +511,89 @@ async fn inbox_wait_returns_on_the_bounded_backstop_with_no_hub_3470() {
     assert!(none.is_none());
 }
 
+/// REGRESSION: `ai-memory inbox --wait` on a host whose hub CREDENTIAL will
+/// not load must still WAIT on the bounded backstop, not read immediately.
+///
+/// `cmd_inbox_waiting` resolves with `no_hub: false`, so the wait always tries
+/// to load the bundle `ai-memory identity delegate --scope a2a-hub` writes. On
+/// a host that never ran it — or whose bundle expired, or was minted for
+/// another hub — the load fails BEFORE any stream exists. Returning that error
+/// made the command read at once, which turns the documented fleet conversion
+/// (`sleep 180; ai-memory inbox` -> `ai-memory inbox --wait --timeout 180`)
+/// into a hot loop: one process boot per iteration, a warning each time, and
+/// none of the pacing the recipe it replaced provided.
+///
+/// A hub that is merely DOWN never had this problem — the bundle loads, the
+/// session loop backs off and the always-armed backstop returns. This pins the
+/// CREDENTIAL case through the SAME `resolve` +
+/// `wait_for_wake_or_backstop` path `inbox --wait` uses.
+#[tokio::test]
+async fn inbox_wait_falls_back_to_the_backstop_when_the_bundle_will_not_load_3470() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700");
+    // An empty key directory: no `identity delegate` was ever run here.
+    let listen = WakeListenArgs {
+        agent_id: Some(uid("credential-less")),
+        socket: Some(dir.path().join("no-such-hub.sock")),
+        hub_id: None,
+        key_dir: Some(dir.path().to_path_buf()),
+        bundle: None,
+        poll_secs: Some(1),
+        unread_only: false,
+        limit: None,
+        json: false,
+        exec: None,
+        // Exactly what `cmd_inbox_waiting` builds: `--wait` always ASKS for a
+        // hub, which is why the credential failure has to be survivable.
+        once: true,
+        no_hub: false,
+    };
+    let resolved =
+        resolve(&listen, &ai_memory::config::AppConfig::default(), None).expect("resolve");
+    assert!(
+        resolved.socket.is_some(),
+        "the wait must be asking for a hub, or this would not exercise the fallback"
+    );
+    // The strict form — the one `wake-listen` keeps — still REFUSES, so an
+    // operator who ran the listener explicitly sees the bundle error.
+    let strict =
+        ai_memory::cli::wake_listen::wait_for_wake(&resolved, Some(Duration::from_secs(3)))
+            .await
+            .expect_err("wake-listen must not paper over a missing credential");
+    assert!(
+        format!("{strict:#}").contains("identity delegate")
+            || format!("{strict:#}").contains("delegation bundle"),
+        "the refusal must name the remediation: {strict:#}"
+    );
+
+    // The `inbox --wait` form DEGRADES: it waits on the bounded poll.
+    let started = std::time::Instant::now();
+    let signal = ai_memory::cli::wake_listen::wait_for_wake_or_backstop(
+        &resolved,
+        Some(Duration::from_secs(3)),
+    )
+    .await
+    .expect("a missing credential must not stop the bounded wait")
+    .expect("the backstop must return inside the timeout");
+    assert_eq!(
+        signal.reason,
+        WakeReason::Backstop,
+        "with no usable credential the bounded poll IS the delivery mechanism"
+    );
+    assert!(
+        started.elapsed() >= resolved.client.poll_interval,
+        "the wait must last at least one poll interval ({:?}), not return immediately — \
+         elapsed {:?}",
+        resolved.client.poll_interval,
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "and it must stay bounded by min(timeout, poll interval)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fixture server for the SDK real-socket legs
 // ---------------------------------------------------------------------------
