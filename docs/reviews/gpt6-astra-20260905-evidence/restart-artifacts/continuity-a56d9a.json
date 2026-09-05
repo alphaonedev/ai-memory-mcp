@@ -1,0 +1,72 @@
+{
+ "run": "a56d9a",
+ "cycles": [
+  {
+   "cycle": 1,
+   "retained": true,
+   "resume_ms": 1089.0,
+   "health_ok_ms": 381.7,
+   "embedder_ready_ms": 381.7,
+   "killed_pid": 1265237,
+   "new_pid": 1267783,
+   "acked_writes_at_kill": 91,
+   "load_errors_during_outage": {
+    "TransportError": 48
+   },
+   "checks": {
+    "mission_memory_retained": true,
+    "inbox_retained": true,
+    "recall_finds_mission": true,
+    "acked_writes_present": "91/91",
+    "no_acked_write_lost": true,
+    "key_binding_retained_signed_write_ok": true,
+    "stats_total_pre_post": "9149->9241"
+   }
+  },
+  {
+   "cycle": 2,
+   "retained": true,
+   "resume_ms": 1014.4,
+   "health_ok_ms": 339.7,
+   "embedder_ready_ms": 339.7,
+   "killed_pid": 1267783,
+   "new_pid": 1268237,
+   "acked_writes_at_kill": 112,
+   "load_errors_during_outage": {
+    "TransportError": 48
+   },
+   "checks": {
+    "mission_memory_retained": true,
+    "inbox_retained": true,
+    "recall_finds_mission": true,
+    "acked_writes_present": "112/112",
+    "no_acked_write_lost": true,
+    "key_binding_retained_signed_write_ok": true,
+    "stats_total_pre_post": "9243->9356"
+   }
+  },
+  {
+   "cycle": 3,
+   "retained": true,
+   "resume_ms": 996.7,
+   "health_ok_ms": 329.1,
+   "embedder_ready_ms": 329.1,
+   "killed_pid": 1268237,
+   "new_pid": 1268632,
+   "acked_writes_at_kill": 130,
+   "load_errors_during_outage": {
+    "TransportError": 48
+   },
+   "checks": {
+    "mission_memory_retained": true,
+    "inbox_retained": true,
+    "recall_finds_mission": true,
+    "acked_writes_present": "130/130",
+    "no_acked_write_lost": true,
+    "key_binding_retained_signed_write_ok": true,
+    "stats_total_pre_post": "9358->9489"
+   }
+  }
+ ],
+ "ts": "2026-09-01T20:30:27Z"
+}

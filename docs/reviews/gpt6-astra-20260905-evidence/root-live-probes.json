@@ -1,0 +1,496 @@
+{
+  "source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+  "binary_sha256": "eb0be845cce86e79116be19b73c182a89cbcaa15da783089086362044801d0ac",
+  "note": "Only this review's synthetic fixtures. Elapsed times are single observed calls, not benchmarks. Raw MCP text envelopes preserved. source_commit names the reviewed checkout only; the installed binary build SHA was not established.",
+  "calls": [
+    {
+      "tool": "memory_store",
+      "args": {
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "title": "Astra assessment synthetic deployment rule",
+        "content": "SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4317. Source of truth: this controlled probe written by GPT 6 Astra.",
+        "tier": "long",
+        "kind": "observation",
+        "source_uri": "urn:astra-review:20260905:fixture-a",
+        "confidence": 0.8,
+        "tags": [
+          "synthetic-review",
+          "astra-20260905"
+        ]
+      },
+      "elapsed_ms": 4,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "source URI must start with one of: uri:, doc:, file:"
+          }
+        ],
+        "isError": true
+      }
+    },
+    {
+      "tool": "memory_store",
+      "args": {
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "title": "Astra assessment synthetic deployment rule",
+        "content": "SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4317. Source of truth: this controlled probe written by GPT 6 Astra.",
+        "tier": "long",
+        "kind": "observation",
+        "source_uri": "doc:astra-review/20260905/fixture-a",
+        "confidence": 0.8,
+        "tags": [
+          "synthetic-review",
+          "astra-20260905"
+        ]
+      },
+      "elapsed_ms": 440,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"agent_id\": \"ai:codex\",\n  \"atomise_mode\": \"off\",\n  \"atomise_outcome\": \"skipped_policy_disabled\",\n  \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n  \"namespace\": \"review/gpt6-astra/2026-09-05\",\n  \"tier\": \"long\",\n  \"title\": \"Astra assessment synthetic deployment rule\"\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_get",
+      "args": {
+        "id": "9201017b-e5af-4970-81ac-df3b13d1a93c"
+      },
+      "elapsed_ms": 2,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"access_count\": 0,\n  \"cid\": \"b3:bd72fc4c15896fd7248c6d87c01b186dc191f1e15b2ce7dec933b9d5aa01f4a0\",\n  \"citations\": [],\n  \"confidence\": 0.8,\n  \"confidence_source\": \"caller_provided\",\n  \"content\": \"SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4317. Source of truth: this controlled probe written by GPT 6 Astra.\",\n  \"created_at\": \"2026-09-05T21:00:16.234690+00:00\",\n  \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n  \"lifecycle_state\": \"open\",\n  \"links\": [],\n  \"memory_kind\": \"observation\",\n  \"metadata\": {\n    \"agent_id\": \"ai:codex\",\n    \"attest_level\": \"claimed\",\n    \"kind_provenance\": \"declared\",\n    \"version_vector\": {\n      \"entries\": {\n        \"host:FROSTYi.local\": \"2026-09-05T21:00:16.234690+00:00\"\n      }\n    }\n  },\n  \"namespace\": \"review/gpt6-astra/2026-09-05\",\n  \"priority\": 5,\n  \"reflection_depth\": 0,\n  \"source\": \"nhi\",\n  \"source_uri\": \"doc:astra-review/20260905/fixture-a\",\n  \"tags\": [\n    \"synthetic-review\",\n    \"astra-20260905\"\n  ],\n  \"tier\": \"long\",\n  \"title\": \"Astra assessment synthetic deployment rule\",\n  \"updated_at\": \"2026-09-05T21:00:16.234690+00:00\",\n  \"version\": 1\n}"
+          }
+        ]
+      },
+      "start": 1788642027756,
+      "end": 1788642027758
+    },
+    {
+      "tool": "memory_search",
+      "args": {
+        "query": "COBALT-731",
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "format": "json",
+        "limit": 3
+      },
+      "elapsed_ms": 604,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"count\": 1,\n  \"results\": [\n    {\n      \"access_count\": 0,\n      \"citations\": [],\n      \"confidence\": 0.8,\n      \"confidence_source\": \"caller_provided\",\n      \"content\": \"SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4317. Source of truth: this controlled probe written by GPT 6 Astra.\",\n      \"created_at\": \"2026-09-05T21:00:16.234690+00:00\",\n      \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n      \"lifecycle_state\": \"open\",\n      \"memory_kind\": \"observation\",\n      \"metadata\": {\n        \"agent_id\": \"ai:codex\",\n        \"attest_level\": \"claimed\",\n        \"kind_provenance\": \"declared\",\n        \"version_vector\": {\n          \"entries\": {\n            \"host:FROSTYi.local\": \"2026-09-05T21:00:16.234690+00:00\"\n          }\n        }\n      },\n      \"namespace\": \"review/gpt6-astra/2026-09-05\",\n      \"priority\": 5,\n      \"reflection_depth\": 0,\n      \"source\": \"nhi\",\n      \"source_uri\": \"doc:astra-review/20260905/fixture-a\",\n      \"tags\": [\n        \"synthetic-review\",\n        \"astra-20260905\"\n      ],\n      \"tier\": \"long\",\n      \"title\": \"Astra assessment synthetic deployment rule\",\n      \"updated_at\": \"2026-09-05T21:00:16.234690+00:00\",\n      \"version\": 1\n    }\n  ]\n}"
+          }
+        ]
+      },
+      "start": 1788642027756,
+      "end": 1788642028360
+    },
+    {
+      "tool": "memory_recall",
+      "args": {
+        "context": "What port does the Frostline staging gateway use and what approval code is required?",
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "format": "json",
+        "limit": 3,
+        "budget_tokens": 1200,
+        "verbose_provenance": true
+      },
+      "elapsed_ms": 602,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"budget_tokens\": 1200,\n  \"count\": 1,\n  \"memories\": [\n    {\n      \"access_count\": 0,\n      \"citations\": [],\n      \"confidence\": 0.8,\n      \"confidence_source\": \"caller_provided\",\n      \"confidence_tier\": \"likely\",\n      \"content\": \"SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4317. Source of truth: this controlled probe written by GPT 6 Astra.\",\n      \"created_at\": \"2026-09-05T21:00:16.234690+00:00\",\n      \"freshness_state\": \"fresh\",\n      \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n      \"lifecycle_state\": \"open\",\n      \"memory_kind\": \"observation\",\n      \"metadata\": {\n        \"agent_id\": \"ai:codex\",\n        \"attest_level\": \"claimed\",\n        \"kind_provenance\": \"declared\",\n        \"version_vector\": {\n          \"entries\": {\n            \"host:FROSTYi.local\": \"2026-09-05T21:00:16.234690+00:00\"\n          }\n        }\n      },\n      \"namespace\": \"review/gpt6-astra/2026-09-05\",\n      \"priority\": 5,\n      \"provenance_tier\": \"unsigned_caller\",\n      \"reflection_depth\": 0,\n      \"score\": 0.729,\n      \"source\": \"nhi\",\n      \"source_uri\": \"doc:astra-review/20260905/fixture-a\",\n      \"tags\": [\n        \"synthetic-review\",\n        \"astra-20260905\"\n      ],\n      \"tier\": \"long\",\n      \"title\": \"Astra assessment synthetic deployment rule\",\n      \"updated_at\": \"2026-09-05T21:00:16.234690+00:00\",\n      \"version\": 1\n    }\n  ],\n  \"meta\": {\n    \"blend_weight\": 0.5,\n    \"budget_overflow\": false,\n    \"budget_tokens_remaining\": 1148,\n    \"budget_tokens_used\": 52,\n    \"candidate_counts\": {\n      \"fts\": 1,\n      \"hnsw\": 0\n    },\n    \"memories_dropped\": 0,\n    \"recall_mode\": \"hybrid\",\n    \"reranker_used\": \"neural\",\n    \"semantic_withheld\": {\n      \"dim_mismatch\": 0,\n      \"measured\": true,\n      \"space_mismatch\": 0,\n      \"total\": 0,\n      \"unverified_space\": 0\n    }\n  },\n  \"mode\": \"hybrid+rerank\",\n  \"recall_id\": \"88eddb96-c5e6-498f-b9bf-09acb3fe6cdc\",\n  \"tokens_used\": 52\n}"
+          }
+        ]
+      },
+      "start": 1788642027756,
+      "end": 1788642028358
+    },
+    {
+      "tool": "memory_recall",
+      "args": {
+        "context": "Frostline staging approval",
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "limit": 2,
+        "budget_tokens": 1200
+      },
+      "elapsed_ms": 808,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "count:1|mode:hybrid+rerank|tokens_used:52|budget_tokens:1200\nmemories[id|title|tier|namespace|priority|score|tags|agent_id]:\n9201017b-e5af-4970-81ac-df3b13d1a93c|Astra assessment synthetic deployment rule|long|review/gpt6-astra/2026-09-05|5|0.718|synthetic-review,astra-20260905|ai\\:codex\n"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_session_start",
+      "args": {
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "limit": 2,
+        "format": "json"
+      },
+      "elapsed_ms": 3474,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"count\": 1,\n  \"memories\": [\n    {\n      \"access_count\": 0,\n      \"cid\": \"b3:bd72fc4c15896fd7248c6d87c01b186dc191f1e15b2ce7dec933b9d5aa01f4a0\",\n      \"citations\": [],\n      \"confidence\": 0.8,\n      \"confidence_source\": \"caller_provided\",\n      \"confidence_tier\": \"likely\",\n      \"content\": \"SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4317. Source of truth: this controlled probe written by GPT 6 Astra.\",\n      \"created_at\": \"2026-09-05T21:00:16.234690+00:00\",\n      \"freshness_state\": \"fresh\",\n      \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n      \"lifecycle_state\": \"open\",\n      \"memory_kind\": \"observation\",\n      \"metadata\": {\n        \"agent_id\": \"ai:codex\",\n        \"attest_level\": \"claimed\",\n        \"kind_provenance\": \"declared\",\n        \"version_vector\": {\n          \"entries\": {\n            \"host:FROSTYi.local\": \"2026-09-05T21:00:16.234690+00:00\"\n          }\n        }\n      },\n      \"namespace\": \"review/gpt6-astra/2026-09-05\",\n      \"priority\": 5,\n      \"provenance_tier\": \"unsigned_caller\",\n      \"reflection_depth\": 0,\n      \"score\": 0.0,\n      \"source\": \"nhi\",\n      \"source_uri\": \"doc:astra-review/20260905/fixture-a\",\n      \"tags\": [\n        \"synthetic-review\",\n        \"astra-20260905\"\n      ],\n      \"tier\": \"long\",\n      \"title\": \"Astra assessment synthetic deployment rule\",\n      \"updated_at\": \"2026-09-05T21:00:16.234690+00:00\",\n      \"version\": 1\n    }\n  ],\n  \"mode\": \"session_start\",\n  \"summary\": \"According to a synthetic review fixture and controlled probe authored by GPT 6 Astra (which is not intended for production guidance), Project Frostline's deployment approval code is COBALT-731, and its staging gateway listens on port 4317.\"\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_update",
+      "args": {
+        "id": "9201017b-e5af-4970-81ac-df3b13d1a93c",
+        "expected_version": 0,
+        "content_append": " This update must be rejected due to stale version."
+      },
+      "elapsed_ms": 2,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"current_version\":1,\"expected_version\":0,\"id\":\"9201017b-e5af-4970-81ac-df3b13d1a93c\",\"status\":\"conflict\"}"
+          }
+        ],
+        "isError": true
+      }
+    },
+    {
+      "tool": "memory_update",
+      "args": {
+        "id": "9201017b-e5af-4970-81ac-df3b13d1a93c",
+        "expected_version": 1,
+        "content_replace_from": "port 4317",
+        "content_replace_to": "port 4318"
+      },
+      "elapsed_ms": 447,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"edit_source\": \"agent\",\n  \"memory\": {\n    \"access_count\": 0,\n    \"cid\": \"b3:bd72fc4c15896fd7248c6d87c01b186dc191f1e15b2ce7dec933b9d5aa01f4a0\",\n    \"citations\": [],\n    \"confidence\": 0.8,\n    \"confidence_source\": \"caller_provided\",\n    \"content\": \"SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4318. Source of truth: this controlled probe written by GPT 6 Astra.\",\n    \"created_at\": \"2026-09-05T21:00:16.234690+00:00\",\n    \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n    \"lifecycle_state\": \"open\",\n    \"memory_kind\": \"observation\",\n    \"metadata\": {\n      \"agent_id\": \"ai:codex\",\n      \"attest_level\": \"claimed\",\n      \"kind_provenance\": \"declared\",\n      \"version_vector\": {\n        \"entries\": {\n          \"host:FROSTYi.local\": \"2026-09-05T21:00:16.234690+00:00\"\n        }\n      }\n    },\n    \"namespace\": \"review/gpt6-astra/2026-09-05\",\n    \"priority\": 5,\n    \"reflection_depth\": 0,\n    \"source\": \"nhi\",\n    \"source_uri\": \"doc:astra-review/20260905/fixture-a\",\n    \"tags\": [\n      \"synthetic-review\",\n      \"astra-20260905\"\n    ],\n    \"tier\": \"long\",\n    \"title\": \"Astra assessment synthetic deployment rule\",\n    \"updated_at\": \"2026-09-05T21:02:00.246796+00:00\",\n    \"version\": 2\n  },\n  \"updated\": true\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_get",
+      "args": {
+        "id": "9201017b-e5af-4970-81ac-df3b13d1a93c"
+      },
+      "elapsed_ms": 5,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"access_count\": 0,\n  \"cid\": \"b3:bd72fc4c15896fd7248c6d87c01b186dc191f1e15b2ce7dec933b9d5aa01f4a0\",\n  \"citations\": [],\n  \"confidence\": 0.8,\n  \"confidence_source\": \"caller_provided\",\n  \"content\": \"SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4318. Source of truth: this controlled probe written by GPT 6 Astra.\",\n  \"created_at\": \"2026-09-05T21:00:16.234690+00:00\",\n  \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n  \"lifecycle_state\": \"open\",\n  \"links\": [],\n  \"memory_kind\": \"observation\",\n  \"metadata\": {\n    \"agent_id\": \"ai:codex\",\n    \"attest_level\": \"claimed\",\n    \"kind_provenance\": \"declared\",\n    \"version_vector\": {\n      \"entries\": {\n        \"host:FROSTYi.local\": \"2026-09-05T21:00:16.234690+00:00\"\n      }\n    }\n  },\n  \"namespace\": \"review/gpt6-astra/2026-09-05\",\n  \"priority\": 5,\n  \"reflection_depth\": 0,\n  \"source\": \"nhi\",\n  \"source_uri\": \"doc:astra-review/20260905/fixture-a\",\n  \"tags\": [\n    \"synthetic-review\",\n    \"astra-20260905\"\n  ],\n  \"tier\": \"long\",\n  \"title\": \"Astra assessment synthetic deployment rule\",\n  \"updated_at\": \"2026-09-05T21:02:00.246796+00:00\",\n  \"version\": 2\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_reflect",
+      "args": {
+        "title": "Astra synthetic derived deployment check",
+        "content": "Synthetic review inference: check the Frostline gateway on port 4318 using approval code COBALT-731. This is a test inference, not production guidance.",
+        "source_ids": [
+          "9201017b-e5af-4970-81ac-df3b13d1a93c"
+        ],
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "depth": 1,
+        "tier": "long",
+        "confidence": 0.7,
+        "tags": [
+          "synthetic-review"
+        ]
+      },
+      "elapsed_ms": 508,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"id\": \"584c70be-03d3-4689-b35e-8b460336dfcd\",\n  \"namespace\": \"review/gpt6-astra/2026-09-05\",\n  \"reflection_depth\": 1,\n  \"reflects_on\": [\n    \"9201017b-e5af-4970-81ac-df3b13d1a93c\"\n  ]\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_lineage",
+      "args": {
+        "id": "584c70be-03d3-4689-b35e-8b460336dfcd",
+        "direction": "ancestors",
+        "max_depth": 3
+      },
+      "elapsed_ms": 7,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"count\": 1,\n  \"direction\": \"ancestors\",\n  \"id\": \"584c70be-03d3-4689-b35e-8b460336dfcd\",\n  \"nodes\": [\n    {\n      \"cid\": \"b3:bd72fc4c15896fd7248c6d87c01b186dc191f1e15b2ce7dec933b9d5aa01f4a0\",\n      \"depth\": 1,\n      \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n      \"relation\": \"reflects_on\"\n    }\n  ],\n  \"propagated_trust\": \"claimed\"\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_get_links",
+      "args": {
+        "id": "584c70be-03d3-4689-b35e-8b460336dfcd"
+      },
+      "elapsed_ms": 4,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"count\": 1,\n  \"links\": [\n    {\n      \"attest_level\": \"self_signed\",\n      \"created_at\": \"2026-09-05T21:02:00.702863+00:00\",\n      \"observed_by\": \"daemon\",\n      \"relation\": \"reflects_on\",\n      \"source_id\": \"584c70be-03d3-4689-b35e-8b460336dfcd\",\n      \"target_id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n      \"valid_from\": \"2026-09-05T21:02:00.702863+00:00\"\n    }\n  ]\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_recall",
+      "args": {
+        "context": "Frostline staging gateway port",
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "format": "json",
+        "limit": 3,
+        "budget_tokens": 1500
+      },
+      "elapsed_ms": 432,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"budget_tokens\": 1500,\n  \"count\": 2,\n  \"memories\": [\n    {\n      \"access_count\": 0,\n      \"citations\": [],\n      \"confidence\": 0.7,\n      \"confidence_source\": \"caller_provided\",\n      \"confidence_tier\": \"likely\",\n      \"content\": \"Synthetic review inference: check the Frostline gateway on port 4318 using approval code COBALT-731. This is a test inference, not production guidance.\",\n      \"created_at\": \"2026-09-05T21:02:00.698748+00:00\",\n      \"freshness_state\": \"fresh\",\n      \"id\": \"584c70be-03d3-4689-b35e-8b460336dfcd\",\n      \"latest_link_attest_level\": \"self_signed\",\n      \"lifecycle_state\": \"open\",\n      \"memory_kind\": \"reflection\",\n      \"metadata\": {\n        \"agent_id\": \"ai:codex\",\n        \"attest_level\": \"claimed\",\n        \"reflection_metadata\": {\n          \"reflected_on_source_ids\": [\n            \"9201017b-e5af-4970-81ac-df3b13d1a93c\"\n          ],\n          \"reflection_created_at\": \"2026-09-05T21:02:00.698748+00:00\",\n          \"reflection_depth\": 1\n        }\n      },\n      \"namespace\": \"review/gpt6-astra/2026-09-05\",\n      \"priority\": 5,\n      \"provenance_tier\": \"self_signed\",\n      \"reflection_depth\": 1,\n      \"score\": 0.852,\n      \"source\": \"nhi\",\n      \"tags\": [\n        \"synthetic-review\"\n      ],\n      \"tier\": \"long\",\n      \"title\": \"Astra synthetic derived deployment check\",\n      \"updated_at\": \"2026-09-05T21:02:00.698748+00:00\",\n      \"version\": 1\n    },\n    {\n      \"access_count\": 0,\n      \"citations\": [],\n      \"confidence\": 0.8,\n      \"confidence_source\": \"caller_provided\",\n      \"confidence_tier\": \"likely\",\n      \"content\": \"SYNTHETIC REVIEW FIXTURE, not production guidance. Project Frostline deployment approval code is COBALT-731. The staging gateway listens on port 4318. Source of truth: this controlled probe written by GPT 6 Astra.\",\n      \"created_at\": \"2026-09-05T21:00:16.234690+00:00\",\n      \"freshness_state\": \"fresh\",\n      \"id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n      \"latest_link_attest_level\": \"self_signed\",\n      \"lifecycle_state\": \"open\",\n      \"memory_kind\": \"observation\",\n      \"metadata\": {\n        \"agent_id\": \"ai:codex\",\n        \"attest_level\": \"claimed\",\n        \"kind_provenance\": \"declared\",\n        \"version_vector\": {\n          \"entries\": {\n            \"host:FROSTYi.local\": \"2026-09-05T21:00:16.234690+00:00\"\n          }\n        }\n      },\n      \"namespace\": \"review/gpt6-astra/2026-09-05\",\n      \"priority\": 5,\n      \"provenance_tier\": \"self_signed\",\n      \"reflection_depth\": 0,\n      \"score\": 0.733,\n      \"source\": \"nhi\",\n      \"source_uri\": \"doc:astra-review/20260905/fixture-a\",\n      \"tags\": [\n        \"synthetic-review\",\n        \"astra-20260905\"\n      ],\n      \"tier\": \"long\",\n      \"title\": \"Astra assessment synthetic deployment rule\",\n      \"updated_at\": \"2026-09-05T21:02:00.246796+00:00\",\n      \"version\": 1\n    }\n  ],\n  \"meta\": {\n    \"blend_weight\": 0.5,\n    \"budget_overflow\": false,\n    \"budget_tokens_remaining\": 1414,\n    \"budget_tokens_used\": 86,\n    \"candidate_counts\": {\n      \"fts\": 2,\n      \"hnsw\": 0\n    },\n    \"memories_dropped\": 0,\n    \"recall_mode\": \"hybrid\",\n    \"reranker_used\": \"neural\",\n    \"semantic_withheld\": {\n      \"dim_mismatch\": 0,\n      \"measured\": true,\n      \"space_mismatch\": 0,\n      \"total\": 0,\n      \"unverified_space\": 0\n    }\n  },\n  \"mode\": \"hybrid+rerank\",\n  \"recall_id\": \"45aa2a4b-0ea5-40c1-b062-8c694c08fdff\",\n  \"tokens_used\": 86\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_offload",
+      "args": {
+        "content": "Synthetic GPT 6 Astra review payload.\nExact bytes: frost ❄️ 4318 COBALT-731.\n",
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "ttl_seconds": 3600
+      },
+      "elapsed_ms": 6,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"content_sha256\": \"aabf3d60a80e19fdbddae9092a9ca551193ed8f5b0455e2f533e97fb0b8ea325\",\n  \"namespace\": \"review/gpt6-astra/2026-09-05\",\n  \"ref_id\": \"ofl_VK7T2YFIBYM72\",\n  \"stored_at\": 1788642132\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_action_create",
+      "args": {
+        "kind": "task",
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "title": "Synthetic Astra review coordination action",
+        "payload": {
+          "synthetic": true,
+          "no_external_effects": true
+        },
+        "priority": 1
+      },
+      "elapsed_ms": 5,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"action\": {\n    \"agent_id\": \"ai:codex\",\n    \"claimed_by\": null,\n    \"created_at\": 1788642414,\n    \"id\": \"56c1a0d4-6b3b-44f3-9330-cec61237208c\",\n    \"kind\": \"task\",\n    \"metadata\": null,\n    \"namespace\": \"review/gpt6-astra/2026-09-05\",\n    \"payload\": {\n      \"no_external_effects\": true,\n      \"synthetic\": true\n    },\n    \"priority\": 1,\n    \"state\": \"pending\",\n    \"title\": \"Synthetic Astra review coordination action\",\n    \"updated_at\": 1788642414,\n    \"vector_clock\": {}\n  },\n  \"id\": \"56c1a0d4-6b3b-44f3-9330-cec61237208c\"\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_verify",
+      "args": {
+        "source_id": "584c70be-03d3-4689-b35e-8b460336dfcd",
+        "target_id": "9201017b-e5af-4970-81ac-df3b13d1a93c",
+        "relation": "reflects_on"
+      },
+      "elapsed_ms": 3,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"attest_level\": \"self_signed\",\n  \"signature_verified\": true,\n  \"signed_at\": \"2026-09-05T21:02:00.702863+00:00\",\n  \"signed_by\": \"daemon\"\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_replay",
+      "args": {
+        "memory_id": "9201017b-e5af-4970-81ac-df3b13d1a93c",
+        "depth": 1,
+        "verbose": true
+      },
+      "elapsed_ms": 2,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"count\": 0,\n  \"memory_id\": \"9201017b-e5af-4970-81ac-df3b13d1a93c\",\n  \"transcripts\": []\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_action_transition",
+      "args": {
+        "id": "56c1a0d4-6b3b-44f3-9330-cec61237208c",
+        "to": "done"
+      },
+      "elapsed_ms": 3,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "illegal action transition: pending -> done"
+          }
+        ],
+        "isError": true
+      }
+    },
+    {
+      "tool": "memory_lease_acquire",
+      "args": {
+        "action_id": "56c1a0d4-6b3b-44f3-9330-cec61237208c",
+        "holder": "astra-review-holder-a",
+        "ttl_secs": 120
+      },
+      "elapsed_ms": 4,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"lease\": {\n    \"acquired_at\": 1788642424,\n    \"action_id\": \"56c1a0d4-6b3b-44f3-9330-cec61237208c\",\n    \"expires_at\": 1788642544,\n    \"heartbeat_at\": 1788642424,\n    \"holder\": \"astra-review-holder-a\"\n  }\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_lease_acquire",
+      "args": {
+        "action_id": "56c1a0d4-6b3b-44f3-9330-cec61237208c",
+        "holder": "astra-review-holder-b",
+        "ttl_secs": 120
+      },
+      "elapsed_ms": 3,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "lease conflict: 56c1a0d4-6b3b-44f3-9330-cec61237208c held by another holder"
+          }
+        ],
+        "isError": true
+      }
+    },
+    {
+      "tool": "memory_action_transition",
+      "args": {
+        "id": "56c1a0d4-6b3b-44f3-9330-cec61237208c",
+        "to": "claimed",
+        "claimed_by": "astra-review-holder-a"
+      },
+      "elapsed_ms": 4,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"action\": {\n    \"agent_id\": \"ai:codex\",\n    \"claimed_by\": \"astra-review-holder-a\",\n    \"created_at\": 1788642414,\n    \"id\": \"56c1a0d4-6b3b-44f3-9330-cec61237208c\",\n    \"kind\": \"task\",\n    \"metadata\": null,\n    \"namespace\": \"review/gpt6-astra/2026-09-05\",\n    \"payload\": {\n      \"no_external_effects\": true,\n      \"synthetic\": true\n    },\n    \"priority\": 1,\n    \"state\": \"claimed\",\n    \"title\": \"Synthetic Astra review coordination action\",\n    \"updated_at\": 1788642424,\n    \"vector_clock\": {}\n  }\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_action_frontier",
+      "args": {
+        "namespace": "review/gpt6-astra/2026-09-05",
+        "limit": 5
+      },
+      "elapsed_ms": 3,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"actions\": []\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_lease_release",
+      "args": {
+        "action_id": "56c1a0d4-6b3b-44f3-9330-cec61237208c",
+        "holder": "astra-review-holder-a"
+      },
+      "elapsed_ms": 3,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"released\": true\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_action_transition",
+      "args": {
+        "id": "56c1a0d4-6b3b-44f3-9330-cec61237208c",
+        "to": "abandoned"
+      },
+      "elapsed_ms": 3,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"action\": {\n    \"agent_id\": \"ai:codex\",\n    \"claimed_by\": null,\n    \"created_at\": 1788642414,\n    \"id\": \"56c1a0d4-6b3b-44f3-9330-cec61237208c\",\n    \"kind\": \"task\",\n    \"metadata\": null,\n    \"namespace\": \"review/gpt6-astra/2026-09-05\",\n    \"payload\": {\n      \"no_external_effects\": true,\n      \"synthetic\": true\n    },\n    \"priority\": 1,\n    \"state\": \"abandoned\",\n    \"title\": \"Synthetic Astra review coordination action\",\n    \"updated_at\": 1788642424,\n    \"vector_clock\": {}\n  }\n}"
+          }
+        ]
+      }
+    }
+  ],
+  "cleanup": [
+    {
+      "tool": "memory_delete",
+      "id": "584c70be-03d3-4689-b35e-8b460336dfcd",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"deleted\": true\n}"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "memory_delete",
+      "id": "9201017b-e5af-4970-81ac-df3b13d1a93c",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"deleted\": true\n}"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+  "docs": {
+    "files": 525,
+    "text_files": 524,
+    "words": 1288931,
+    "requested_directories_fully_read": 60,
+    "method": "full-input lexical/structural screen; per-record panel screen; exact full-read assignment in CSV; not semantic line audit of all docs"
+  },
+  "issues": {
+    "records": 2406,
+    "closed": 2109,
+    "open": 297,
+    "comments_retrieved": 3634,
+    "unavailable_vs_API_counts": {
+      "1388": 2,
+      "1470": 1,
+      "3266": 1
+    },
+    "method": "all records bounded screened, selected full threads; not every comment fully semantically audited"
+  },
+  "source": {
+    "selected_files": 1720,
+    "selected_lines": 976142,
+    "extensions": [
+      ".rs",
+      ".py",
+      ".ts",
+      ".tsx",
+      ".js",
+      ".mjs",
+      ".sh",
+      ".bash",
+      ".sql",
+      ".toml",
+      ".yml",
+      ".yaml"
+    ],
+    "direct_read_line_union": 19727,
+    "full_files": 14,
+    "partial_files": 35,
+    "method": "every selected line lexically screened; semantic direct-read coverage only recorded ranges; predicate includes vendor code but excludes other file types, dependency internals and binary artifacts"
+  }
+}

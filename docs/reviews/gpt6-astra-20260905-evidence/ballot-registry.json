@@ -1,0 +1,300 @@
+{
+  "protocol": "Seven distinct recurring jurors, three waves, one ballot each per wave. Root excluded. Same-model, shared-context process, not statistical independence or 21 distinct model instances.",
+  "reviewed_source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+  "wave1_scope_note": "Original A/B/C W1 ballots explicitly voted value and grand slam but did not separately label the later broad-readiness proposition. Null means not separately recorded; no retrospective vote inferred. Later source corrections in initial ballots are marked.",
+  "preliminary_rounds_excluded": [
+    "w2-retrieval.md",
+    "w2-security.md",
+    "wave2-enterprise.md",
+    "preliminary-w3-retrieval.md",
+    "preliminary-w3-security.md",
+    "preliminary-w3-enterprise.md"
+  ],
+  "final_tally": {
+    "agent_value": {
+      "YES_conditional": 7,
+      "NO": 0,
+      "NOT_PROVEN": 0
+    },
+    "universal_grand_slam": {
+      "YES": 0,
+      "NO": 3,
+      "NOT_PROVEN": 4
+    },
+    "broad_mission_critical": {
+      "YES": 0,
+      "NO": 5,
+      "NOT_PROVEN": 2
+    },
+    "accept_both_documents": 7
+  },
+  "adjudicated_document_sha256": {
+    "assessment": "906e7abf8b39e770c389b7779fc6d66acca449dd527de55353effa627c99582c",
+    "test_plan": "5202003f5e603b5c9d5899680cfbb8726262d0f6813f54bbb3a2e116cc9e4284"
+  },
+  "permitted_post_adjudication_changes": "All seven accepted mechanical final tally, coverage count, evidence copying, links/hashes and publication bookkeeping. No new substantive findings or plan changes after these accepted snapshots.",
+  "ballots": [
+    {
+      "wave": 1,
+      "juror": "A",
+      "agent_task": "/root/retrieval_juror",
+      "model": "GPT 6 Astra",
+      "file": "w1-retrieval.md",
+      "sha256": "724a287de196ff56e5964437cfe45d5b44f2ebcea9def42d5226411af5d0a5e0",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": null,
+      "accept_both_documents": null
+    },
+    {
+      "wave": 1,
+      "juror": "B",
+      "agent_task": "/root/security_juror",
+      "model": "GPT 6 Astra",
+      "file": "w1-security.md",
+      "sha256": "a2a52f3f8546d4b9b906fae95ca16c8c1fcdc43f0dbdc700fa86388355bd9805",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": null,
+      "accept_both_documents": null
+    },
+    {
+      "wave": 1,
+      "juror": "C",
+      "agent_task": "/root/enterprise_juror",
+      "model": "GPT 6 Astra",
+      "file": "w1-enterprise.md",
+      "sha256": "cbfc2104298a6c96b9c25014d966d71458747450ffb6ee00b5dec061c71e19cc",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": null,
+      "accept_both_documents": null
+    },
+    {
+      "wave": 1,
+      "juror": "D",
+      "agent_task": "/root/continuity_juror",
+      "model": "GPT 6 Astra",
+      "file": "w1-continuity.md",
+      "sha256": "abcec28f67888cb2abdbbff90b31ccdd2170cbef1401be33b342dbc0038c3f8d",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": "NOT PROVEN",
+      "accept_both_documents": null
+    },
+    {
+      "wave": 1,
+      "juror": "E",
+      "agent_task": "/root/cognition_juror",
+      "model": "GPT 6 Astra",
+      "file": "w1-cognition.md",
+      "sha256": "ee2039ccaaab183467a2cb6badb4acb842fddb43c0719aa48be94d121bd969a7",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NOT PROVEN",
+      "accept_both_documents": null,
+      "original_ballot_sha256": "b842b52fafd74506f67e377d67fc618d31494f45c45c0811ba805b02a67d5f14"
+    },
+    {
+      "wave": 1,
+      "juror": "F",
+      "agent_task": "/root/operations_juror",
+      "model": "GPT 6 Astra",
+      "file": "w1-operations.md",
+      "sha256": "4c52e868922da863f8da1e06d3f03c7dad2c48953b0b720c9b4a61658f420046",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": null,
+      "original_ballot_sha256": "ac31a56bfa6ca9d00909e58862af77341645e03e6c2bf23d186acf66c1b3ea97"
+    },
+    {
+      "wave": 1,
+      "juror": "G",
+      "agent_task": "/root/architecture_juror",
+      "model": "GPT 6 Astra",
+      "file": "w1-architecture.md",
+      "sha256": "578c6c297bdf78c63736a12dd6cd36f59b8ce600a405e57c4d32ee7cf74091ef",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": null,
+      "original_ballot_sha256": "4fc9c60d7268e892b2b166eeda2a1d853560f0faa6c2f4729b9f05bc80a1595a"
+    },
+    {
+      "wave": 2,
+      "juror": "A",
+      "agent_task": "/root/retrieval_juror",
+      "model": "GPT 6 Astra",
+      "file": "w2-fullpanel-retrieval.md",
+      "sha256": "9de9697efcbfa1c80ed9a9d66ad2ca24eecdc806ee811f10b4ee05080195e1b4",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": null
+    },
+    {
+      "wave": 2,
+      "juror": "B",
+      "agent_task": "/root/security_juror",
+      "model": "GPT 6 Astra",
+      "file": "w2-fullpanel-security.md",
+      "sha256": "e415f6424b5072622c7c9ed2127f8c70a5d7297a0e43bdd1b9049c9feddfd455",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": null
+    },
+    {
+      "wave": 2,
+      "juror": "C",
+      "agent_task": "/root/enterprise_juror",
+      "model": "GPT 6 Astra",
+      "file": "w2-fullpanel-enterprise.md",
+      "sha256": "79afc4a8cb012a90f87c07e16874e68b90a6e2c0f4ed13782bb980ce93c671e0",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NOT PROVEN",
+      "accept_both_documents": null
+    },
+    {
+      "wave": 2,
+      "juror": "D",
+      "agent_task": "/root/continuity_juror",
+      "model": "GPT 6 Astra",
+      "file": "w2-fullpanel-continuity.md",
+      "sha256": "cf6583e45bb9ad37a433b48c0ae96e87a2942126c4a231d1f882af77963935dc",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": "NOT PROVEN",
+      "accept_both_documents": null
+    },
+    {
+      "wave": 2,
+      "juror": "E",
+      "agent_task": "/root/cognition_juror",
+      "model": "GPT 6 Astra",
+      "file": "w2-fullpanel-cognition.md",
+      "sha256": "f5037d5b2a46ba6dd6cb1722adb9acf9a9b7396dcd9b452835f830a805849118",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": null,
+      "original_ballot_sha256": "60730fe10d89446e4c1ddb1c4cfee36aef8de0e7b037af98003e6c216e80e143"
+    },
+    {
+      "wave": 2,
+      "juror": "F",
+      "agent_task": "/root/operations_juror",
+      "model": "GPT 6 Astra",
+      "file": "w2-fullpanel-operations.md",
+      "sha256": "ff50eaf5e8ea1dcaabfc272fd9632e10b6f377deffec46968aa0c9149c571cce",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": null,
+      "original_ballot_sha256": "cdc2a48f7fa43159e34b973360afdf74db65f619bd4a8f147e44a7dc3c1b57bc"
+    },
+    {
+      "wave": 2,
+      "juror": "G",
+      "agent_task": "/root/architecture_juror",
+      "model": "GPT 6 Astra",
+      "file": "w2-fullpanel-architecture.md",
+      "sha256": "841f36448bd71caf17f7039e0ed0ae903056af9b76da9624915b66f720daa02b",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": null,
+      "original_ballot_sha256": "fcdc0ba96802255089519548a474f2a464ba240a8595a6421a067da0e1be3f08"
+    },
+    {
+      "wave": 3,
+      "juror": "A",
+      "agent_task": "/root/retrieval_juror",
+      "model": "GPT 6 Astra",
+      "file": "w3-fullpanel-retrieval.md",
+      "sha256": "8bf34473819ebb04b64a9aa306d5ed425246c816003f02646e12b4450faa2b66",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": true
+    },
+    {
+      "wave": 3,
+      "juror": "B",
+      "agent_task": "/root/security_juror",
+      "model": "GPT 6 Astra",
+      "file": "w3-fullpanel-security.md",
+      "sha256": "44d6f7b4e69ce9fe2184be4d960cf682b6796dc12882f857c9c59c1362f1414d",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": true
+    },
+    {
+      "wave": 3,
+      "juror": "C",
+      "agent_task": "/root/enterprise_juror",
+      "model": "GPT 6 Astra",
+      "file": "w3-fullpanel-enterprise.md",
+      "sha256": "b10b7b7bd37bc4662d6529d328420d77ae185f2dd2bc9376646094c0d12dafba",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NOT PROVEN",
+      "accept_both_documents": true
+    },
+    {
+      "wave": 3,
+      "juror": "D",
+      "agent_task": "/root/continuity_juror",
+      "model": "GPT 6 Astra",
+      "file": "w3-fullpanel-continuity.md",
+      "sha256": "4b58fd1bad6a60be235347cc67bb36880e41ac952ce6d916f4d96f4b57011b5b",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NO",
+      "broad_mission_critical": "NOT PROVEN",
+      "accept_both_documents": true
+    },
+    {
+      "wave": 3,
+      "juror": "E",
+      "agent_task": "/root/cognition_juror",
+      "model": "GPT 6 Astra",
+      "file": "w3-fullpanel-cognition.md",
+      "sha256": "471b378ce7ccdedfaf4c8802c16f3f2e17a093806bb45a22c28fdabad9208cb5",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": true,
+      "original_ballot_sha256": "1d4cc3face4406a2d29137e9fa9c804c5e31effc77058584baaf55a3727abb0d"
+    },
+    {
+      "wave": 3,
+      "juror": "F",
+      "agent_task": "/root/operations_juror",
+      "model": "GPT 6 Astra",
+      "file": "w3-fullpanel-operations.md",
+      "sha256": "a3d089c1e08d19e8a3c3ea85d8410694c2e04ed586affeb8c91e4321c888491c",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": true,
+      "original_ballot_sha256": "0783507118f0e0ca7da680317c8efaad71c61d4f18689002589f346f97a5408b"
+    },
+    {
+      "wave": 3,
+      "juror": "G",
+      "agent_task": "/root/architecture_juror",
+      "model": "GPT 6 Astra",
+      "file": "w3-fullpanel-architecture.md",
+      "sha256": "d3c4627464bb9b7f347d9aa8b1f9236482abecb256d96f2af6d0e5072bb0d186",
+      "agent_value": "YES (conditional)",
+      "universal_grand_slam": "NOT PROVEN",
+      "broad_mission_critical": "NO",
+      "accept_both_documents": true,
+      "original_ballot_sha256": "5b5f1ae82599b348a9c08288cbd9efe02304709b46035f92e316f58a405e87e2"
+    }
+  ],
+  "publication_normalization": "Trailing whitespace/extra EOF blank lines normalized where necessary; original hashes retained for affected ballots. Wording and votes unchanged."
+}

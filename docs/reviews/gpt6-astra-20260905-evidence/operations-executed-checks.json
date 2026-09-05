@@ -1,0 +1,27 @@
+{
+  "commands": [
+    {
+      "command": "python3 scripts/check-build-script-vetting.py",
+      "exit": 0,
+      "observed": "PASS 90/90 custom-build packages ledgered out of 548 resolved; 2 SOURCE-REVIEWED; 88 INVENTORIED-NOT-REVIEWED ceiling88"
+    },
+    {
+      "command": "python3 scripts/check-build-script-vetting.py --self-test",
+      "exit": 0,
+      "observed": "all legs passed, including R-203 frozen-prefix"
+    },
+    {
+      "command": "bash scripts/check-git-dependency-sources.sh --self-test",
+      "exit": 0,
+      "observed": "3 violation shapes caught; clean control passed"
+    }
+  ],
+  "memory_call": {
+    "tool": "memory_capabilities",
+    "args": {
+      "family": "core",
+      "verbose": false
+    },
+    "observed": "loaded_under_active_profile=true; memory_store, memory_recall, memory_search, memory_list, memory_load_family, memory_smart_load, memory_get"
+  }
+}

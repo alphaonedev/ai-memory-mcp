@@ -1,0 +1,16 @@
+{
+  "recorded_at_utc": "2026-09-05 21:55 UTC",
+  "note": "Repeated dereference of the existing synthetic one-hour-TTL offload; no new fixture created. Earlier initial dereference was not retained in the root call-log file.",
+  "tool": "memory_deref",
+  "args": {
+    "ref_id": "ofl_VK7T2YFIBYM72"
+  },
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"content\": \"Synthetic GPT 6 Astra review payload.\\nExact bytes: frost ❄️ 4318 COBALT-731.\\n\",\n  \"ref_id\": \"ofl_VK7T2YFIBYM72\",\n  \"sha256\": \"aabf3d60a80e19fdbddae9092a9ca551193ed8f5b0455e2f533e97fb0b8ea325\",\n  \"stored_at\": 1788642132\n}"
+      }
+    ]
+  }
+}

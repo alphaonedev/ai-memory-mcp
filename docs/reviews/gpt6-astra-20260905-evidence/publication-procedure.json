@@ -1,0 +1,7 @@
+{
+  "authorization": "User explicitly approved temporary lift of administrator enforcement solely to commit the review documents, and prohibited a CI release.",
+  "planned_scope": "Only the branch enforce_admins toggle, only for a signed fast-forward documentation-only push to release/v1.0.0 with [skip ci], followed immediately by restoration and equality verification. Required signatures and required check definitions remain configured; no release tag, release workflow dispatch, synthetic status or source-code change.",
+  "status": "Not yet executed at document finalization. Actual push and restoration must be verified by the operator-facing execution record; this file does not claim they already occurred.",
+  "ci_skip_reference": "https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs",
+  "qualification_boundary": "The publication exception is not product release qualification, and does not change the reviewed source SHA or make its failed workflows green."
+}

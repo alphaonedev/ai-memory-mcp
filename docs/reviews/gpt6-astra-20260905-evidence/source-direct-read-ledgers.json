@@ -1,0 +1,1463 @@
+{
+  "source-coverage-architecture": {
+    "reviewer": "GPT 6 Astra architecture juror G",
+    "source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "method": "Conservative exact displayed ranges, CodeGraph structural discovery followed by focused complete implementation reads. Additional fragmented CodeGraph snippets are not claimed as complete ranges. No tests executed.",
+    "files": [
+      {
+        "path": "src/handlers/transport.rs",
+        "sha256": "25d6a58b3be6529a1e1d5bf99b6542f59f945136388e1435d9ba65ad8ce5c75b",
+        "ranges": [
+          [
+            1,
+            330
+          ]
+        ],
+        "full_file_read": false,
+        "physical_lines": 1687
+      },
+      {
+        "path": "src/store/postgres_parity.rs",
+        "sha256": "f4e3086a62f45e8ab61cec0e7296723193ad5526aec6179fdaec07bd9e505f0b",
+        "ranges": [
+          [
+            1,
+            341
+          ]
+        ],
+        "full_file_read": false,
+        "physical_lines": 683
+      },
+      {
+        "path": "src/store/postgres.rs",
+        "sha256": "1847442e93a24fbc4412c35d392703164decaefc003f3620d3291d0bfbc7c387",
+        "ranges": [
+          [
+            30530,
+            30655
+          ]
+        ],
+        "full_file_read": false,
+        "physical_lines": 41625
+      },
+      {
+        "path": "src/handlers/admin.rs",
+        "sha256": "fc742586e607e53ff4d2486eae216429068f892debdb55c3c081b9874fa8d8c3",
+        "ranges": [
+          [
+            1000,
+            1148
+          ]
+        ],
+        "full_file_read": false,
+        "physical_lines": 1880
+      },
+      {
+        "path": "src/export_taxonomy.rs",
+        "sha256": "1e57bdc51bce7b921af6a208431528d339d9f0c0a9cca33a43228873ea45d833",
+        "ranges": [
+          [
+            303,
+            349
+          ],
+          [
+            413,
+            496
+          ]
+        ],
+        "full_file_read": false,
+        "physical_lines": 668
+      },
+      {
+        "path": "src/export_scope.rs",
+        "sha256": "bfe0345ee15bac10b9d6b2d977cdd066fbe2b2f18124eeb4e14d3b702445e18e",
+        "ranges": [
+          [
+            1,
+            96
+          ]
+        ],
+        "full_file_read": false,
+        "physical_lines": 470
+      },
+      {
+        "path": "src/store/mod.rs",
+        "sha256": "03a8c96c633d4e8f540f1d1a888512b3bc050c8575a6f566d8cca93c90b41278",
+        "ranges": [
+          [
+            3878,
+            3920
+          ]
+        ],
+        "full_file_read": false,
+        "physical_lines": 7446
+      },
+      {
+        "path": "tests/pg_export_entity_parity_3174.rs",
+        "sha256": "e08da56df65025bc65cdbac455118e6675e7c42a8ef140941a349c6ff0e2c9bc",
+        "ranges": [
+          [
+            1,
+            164
+          ]
+        ],
+        "full_file_read": true,
+        "physical_lines": 164
+      }
+    ]
+  },
+  "source-coverage-operations": {
+    "assessor": "GPT 6 Astra juror F operations",
+    "sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "scope": "Bounded semantic review only; no whole-repository line-by-line claim",
+    "files": [
+      {
+        "path": "src/cli/backup.rs",
+        "sha256": "685f0cf78ac309dda1bcee2901be07c02ee110c6204f50a61cc22731c466bf3f",
+        "total_lines": 2470,
+        "ranges": [
+          [
+            1,
+            1234
+          ]
+        ],
+        "coverage_kind": "complete production module; embedded tests excluded",
+        "method": "CodeGraph explore then exact source reads"
+      },
+      {
+        "path": ".github/workflows/release.yml",
+        "sha256": "8e5747859c6c97b40b486b6dd4bb6b5861832c6c8533b524034c2e9160fb4a72",
+        "total_lines": 1152,
+        "ranges": [
+          [
+            1,
+            1152
+          ]
+        ],
+        "coverage_kind": "complete file",
+        "method": "CodeGraph explore then exact source reads"
+      },
+      {
+        "path": "scripts/check-build-script-vetting.py",
+        "sha256": "785724d7af552a1f2f65505a868ccfa1303d0a01fd0acc0e801ca46ea1d5f3bc",
+        "total_lines": 858,
+        "ranges": [
+          [
+            1,
+            545
+          ]
+        ],
+        "coverage_kind": "complete production verifier and I/O, beginning of frozen-prefix helper; self-test remainder executed but not completely read",
+        "method": "CodeGraph explore then exact source reads"
+      }
+    ],
+    "docs_fully_read": [
+      "docs/production-deployment.md",
+      "docs/RUNBOOK-chaos-campaign.md"
+    ],
+    "issues_full_threads_read": [
+      2487,
+      2635,
+      2895,
+      3131,
+      3199,
+      3501
+    ]
+  },
+  "source-coverage-cognition": {
+    "juror": "E cognition",
+    "wave": 1,
+    "source_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "method": "CodeGraph explore first, then exact scoped source reads; ranges below are read union, not whole repository coverage",
+    "files": [
+      {
+        "path": "docs/ROADMAP-v110.md",
+        "sha256": "4244cd5c9bbde21d38682d64f6cb9ee0c0e6986d680e2204db6ebe74f6381c16",
+        "ranges": [
+          [
+            1,
+            412
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      },
+      {
+        "path": "src/observations/mod.rs",
+        "sha256": "908066c583eed2472730d90ef57927990b1336d0b65c19a4b5ab8ce062e62d5d",
+        "ranges": [
+          [
+            1,
+            430
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      },
+      {
+        "path": "src/mcp/tools/swarm_rewind.rs",
+        "sha256": "5b1c7c955f4db1380adf3f2b628e8f8abbe6a35254ff265dea4a22ddfeda7116",
+        "ranges": [
+          [
+            1,
+            319
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      },
+      {
+        "path": "src/storage/mod.rs",
+        "sha256": "a60b6f8a925078fa6c798d9420180575524e4f3149286cb514592f02ed55253c",
+        "ranges": [
+          [
+            3286,
+            3438
+          ],
+          [
+            13051,
+            13318
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      },
+      {
+        "path": "src/models/memory.rs",
+        "sha256": "77067e5c35d9ac008743384b7bf2c973d0881103f9a7a87cc626de16738da217",
+        "ranges": [
+          [
+            992,
+            1050
+          ],
+          [
+            1438,
+            1547
+          ],
+          [
+            1550,
+            1575
+          ],
+          [
+            1769,
+            1803
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      },
+      {
+        "path": "sdk/python/swarm/agent.py",
+        "sha256": "21a195c0bf5a927219ee26af671be6027fab838fe18b21d645aa51928ab14520",
+        "ranges": [
+          [
+            82,
+            252
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      },
+      {
+        "path": "sdk/python/swarm/orchestrator.py",
+        "sha256": "ec1f7d758a8f970654b489e9c038d95a875b8349918b886bccdeb48fd90a2ccd",
+        "ranges": [
+          [
+            28,
+            229
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      },
+      {
+        "path": "sdk/python/swarm/audit.py",
+        "sha256": "7d0f9ef0a175f6a65a773e1b0608cd648f12aa03a59c044c032e9781900b9b78",
+        "ranges": [
+          [
+            15,
+            111
+          ],
+          [
+            272,
+            444
+          ]
+        ],
+        "notes": "Ranges directly read or read through exact CodeGraph excerpts; unlisted ranges are outside this lens review."
+      }
+    ],
+    "complete_function_reads": [
+      "observations::record_recall",
+      "observations::mark_consumed",
+      "observations::record_recall_with_identity",
+      "observations::mark_consumed_guarded",
+      "observations::list_observations",
+      "observations::parse_cite_batch",
+      "observations::try_mark_consumed_from_params",
+      "storage::fold_recall_accesses",
+      "storage::swarm_rewind",
+      "storage::swarm_rewind_audit_payload",
+      "mcp::swarm_rewind production handlers",
+      "SwarmAgent.phase_goal",
+      "SwarmAgent.decide",
+      "SwarmAgent.act",
+      "SwarmAgent.run",
+      "SwarmAgent.run_once",
+      "mission_evidence",
+      "Swarm.mission_completion",
+      "Swarm.mission_progress"
+    ],
+    "historical_data": {
+      "run": "journals-nhi-grok46-run2-20260901T225637Z",
+      "calls_parsed": 273,
+      "steps_selected_tool_and_outcome_prefix_screened": 48,
+      "rubrics_read": 8,
+      "proof_limit": "Not full-text reading of all repeated memory payloads; historical deployment identity distinct from pinned source."
+    },
+    "skill": "Rust 1.98 P0 checklist read; ERRORS-01/02/19 informed explicit distinction between propagated failure and deliberate best-effort telemetry."
+  },
+  "source-coverage-security": {
+    "source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "assessor": "GPT 6 Astra security juror",
+    "scope": "Conservative directly displayed source ranges supporting security findings, including CodeGraph verbatim on-disk source. Not all prior source reads or full transitive dependency closure. No source tests executed in this coverage pass.",
+    "files": [
+      {
+        "path": "src/mcp/tools/share.rs",
+        "sha256": "7f4fe5c10fac73ef1c5e38c4511190e75ff9046a206f2f2427e6c40c7f06f6be",
+        "read_ranges_inclusive": [
+          {
+            "start": 37,
+            "end": 224
+          },
+          {
+            "start": 272,
+            "end": 337
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "handle_share58-157",
+          "ShareTool188-204"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/mcp/tools/archive.rs",
+        "sha256": "68b944c15b7b3776b020c61c2b9d9f9d065a7b7297f704ac7b676c044d6706e8",
+        "read_ranges_inclusive": [
+          {
+            "start": 46,
+            "end": 165
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "handle_archive_purge46-162"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/mcp/mod.rs",
+        "sha256": "b095f9157dbb8950350f120374453d818d6927a08e7114592c5e27385cb9e391",
+        "read_ranges_inclusive": [
+          {
+            "start": 2623,
+            "end": 2625
+          },
+          {
+            "start": 2692,
+            "end": 2694
+          },
+          {
+            "start": 3460,
+            "end": 3628
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "dispatch_memory_archive_purge",
+          "dispatch_memory_share"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/handlers/share.rs",
+        "sha256": "50d362fcad638ac1418b332e93de04f09108a0467984526f34ac85685f2c9652",
+        "read_ranges_inclusive": [
+          {
+            "start": 1,
+            "end": 90
+          }
+        ],
+        "full_file_read": true,
+        "full_primary_functions_read": [
+          "share_memory53-89"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/handlers/archive.rs",
+        "sha256": "c776cbed87669ade7e03aa9639522ac44303820dacb68ff234820206c44a2dc2",
+        "read_ranges_inclusive": [
+          {
+            "start": 291,
+            "end": 403
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "purge_archive291-403"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/handlers/postgres_gate.rs",
+        "sha256": "3b2dc64660b1f927c187850e88d5b5cf1a507e92c2e796f98a1475f09db3d43f",
+        "read_ranges_inclusive": [
+          {
+            "start": 105,
+            "end": 284
+          },
+          {
+            "start": 485,
+            "end": 500
+          },
+          {
+            "start": 1610,
+            "end": 1635
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "postgres_endpoint_supported105-284"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/identity/mod.rs",
+        "sha256": "7dfc23bd28a354a190ace06082cd6623b20b82b164666b7ce6b52d285f7e115f",
+        "read_ranges_inclusive": [
+          {
+            "start": 355,
+            "end": 393
+          },
+          {
+            "start": 453,
+            "end": 474
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "resolve_read_visibility_caller",
+          "resolve_mcp_read_visibility_caller",
+          "resolve_governance_subject"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/handlers/identity_binding.rs",
+        "sha256": "98c1069dc5b8d5767da1497765a1f0d3ea1b00ff6e1c90659c036354bfee84fc",
+        "read_ranges_inclusive": [
+          {
+            "start": 393,
+            "end": 546
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "enforce_for_request",
+          "inert_enforce_boot_reason",
+          "enforce_idor_identity",
+          "enforce_sensitive_identity"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/governance/mod.rs",
+        "sha256": "330be80ad385d40734919485d0fd925be83e476121c33d21271aa33e727b25db",
+        "read_ranges_inclusive": [
+          {
+            "start": 476,
+            "end": 492
+          },
+          {
+            "start": 511,
+            "end": 699
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "Permissions::evaluate",
+          "Permissions::evaluate_with",
+          "mode_default_for",
+          "matched_rules"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/storage/record_stop.rs",
+        "sha256": "1590ad764caf0b68f0aec7db29f5334be2ec090aaeb94f4541352a07792db99e",
+        "read_ranges_inclusive": [
+          {
+            "start": 265,
+            "end": 311
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "gate_storage_conn278-300",
+          "gate_storage_conn_rusqlite307-309"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/storage/mod.rs",
+        "sha256": "a60b6f8a925078fa6c798d9420180575524e4f3149286cb514592f02ed55253c",
+        "read_ranges_inclusive": [
+          {
+            "start": 1549,
+            "end": 1695
+          },
+          {
+            "start": 1840,
+            "end": 2463
+          },
+          {
+            "start": 2920,
+            "end": 3155
+          },
+          {
+            "start": 12650,
+            "end": 12990
+          },
+          {
+            "start": 16540,
+            "end": 16795
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "insert",
+          "insert_inner",
+          "get",
+          "get_any",
+          "get_many",
+          "get_by_prefix",
+          "resolve_id",
+          "transitive_suspects",
+          "contaminate_row",
+          "stamp_contaminated_descendants",
+          "erasure_purge_candidate_ids",
+          "purge_archive_matching",
+          "archive_purge_predicate",
+          "count_archive_purge_candidates",
+          "purge_archive_scoped",
+          "purge_archive",
+          "purge_archive_for_caller",
+          "archive_stats",
+          "export_all"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/mcp/tools/recall.rs",
+        "sha256": "bbe0fbded7c312a6fb3fcf68bc0765d412f80efb59a27abeec54297419fa17ec",
+        "read_ranges_inclusive": [
+          {
+            "start": 368,
+            "end": 425
+          },
+          {
+            "start": 568,
+            "end": 655
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "provenance_tier",
+          "latest_link_attest_level_many"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "src/mcp/tools/link.rs",
+        "sha256": "03d68d5208307c51f67fe76c978db991adb4e46ff7a6e7eaeb61bed0e6417492",
+        "read_ranges_inclusive": [
+          {
+            "start": 109,
+            "end": 489
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "handle_link109-487"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      },
+      {
+        "path": "tests/contaminated_lifecycle_3324.rs",
+        "sha256": "af2b776b0790dd801e66413a539a659eacc2f00a6cbb00e314768ee10ad547d5",
+        "read_ranges_inclusive": [
+          {
+            "start": 1,
+            "end": 260
+          }
+        ],
+        "full_file_read": false,
+        "full_primary_functions_read": [
+          "auto_stamp_contaminates_derives_from_descendants_and_records_prior_state"
+        ],
+        "method": "CodeGraph verbatim source plus focused native file reads",
+        "limitations": "Other lines/transitive helpers not claimed read by this ledger."
+      }
+    ]
+  },
+  "source-coverage-cognition-wave2": {
+    "juror": "E cognition",
+    "wave": 2,
+    "method": "All seven Wave1 ballots and both drafts full read; no new source analysis or runtime probes",
+    "files": [
+      {
+        "path": ".local-runs/astra-evidence/w1-retrieval.md",
+        "sha256": "724a287de196ff56e5964437cfe45d5b44f2ebcea9def42d5226411af5d0a5e0",
+        "ranges": [
+          [
+            1,
+            33
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w1-security.md",
+        "sha256": "a2a52f3f8546d4b9b906fae95ca16c8c1fcdc43f0dbdc700fa86388355bd9805",
+        "ranges": [
+          [
+            1,
+            41
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w1-enterprise.md",
+        "sha256": "cbfc2104298a6c96b9c25014d966d71458747450ffb6ee00b5dec061c71e19cc",
+        "ranges": [
+          [
+            1,
+            36
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w1-continuity.md",
+        "sha256": "abcec28f67888cb2abdbbff90b31ccdd2170cbef1401be33b342dbc0038c3f8d",
+        "ranges": [
+          [
+            1,
+            54
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w1-cognition.md",
+        "sha256": "b842b52fafd74506f67e377d67fc618d31494f45c45c0811ba805b02a67d5f14",
+        "ranges": [
+          [
+            1,
+            71
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w1-operations.md",
+        "sha256": "ac31a56bfa6ca9d00909e58862af77341645e03e6c2bf23d186acf66c1b3ea97",
+        "ranges": [
+          [
+            1,
+            50
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w1-architecture.md",
+        "sha256": "4fc9c60d7268e892b2b166eeda2a1d853560f0faa6c2f4729b9f05bc80a1595a",
+        "ranges": [
+          [
+            1,
+            68
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": "docs/reviews/GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md",
+        "sha256": "4e626e8c872b0a3c1ffaa2a65608d628b56fe90246ca18de9729cd79909b2269",
+        "ranges": [
+          [
+            1,
+            371
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": "docs/reviews/GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md",
+        "sha256": "944f219c98beca62bfb6cd75d53cf64cc79b0e4fe6c3a626408bd7e08321a62a",
+        "ranges": [
+          [
+            1,
+            292
+          ]
+        ],
+        "coverage": "full"
+      }
+    ]
+  },
+  "source-coverage-continuity": {
+    "juror": "D",
+    "source_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "scope": "Host capture receipts, CLI wrapper core, session-start core, wake hint core, downloaded restart harness; not whole repository",
+    "files": [
+      {
+        "path": "src/llm_cli_wrap.rs",
+        "sha256": "7361926019e4c9a72716630c7ec68e9e466239654e11ac00f2b7ba32eb556bf8",
+        "total_lines": 244,
+        "direct_read_ranges": [
+          [
+            1,
+            244
+          ]
+        ],
+        "method": "Full file including table-pin tests"
+      },
+      {
+        "path": "src/cli/wrap.rs",
+        "sha256": "02495d88aaf84d7b6e82fb652a20ed7c5c7244e04785d048f3a1abdacf19624a",
+        "total_lines": 877,
+        "direct_read_ranges": [
+          [
+            1,
+            419
+          ]
+        ],
+        "method": "Full production prefix; tests after419 not fully reviewed"
+      },
+      {
+        "path": "src/wake_hub/mod.rs",
+        "sha256": "1b27099a7444cca0d24359b4e8ed82ab47e41a73c47e8aa61a5c99ce021144a7",
+        "total_lines": 337,
+        "direct_read_ranges": [
+          [
+            1,
+            337
+          ]
+        ],
+        "method": "Full module including tests"
+      },
+      {
+        "path": "src/wake_hub/pending.rs",
+        "sha256": "28d2571c82a35ab3fd13c0eddbd652fb2076a82e2d93e4ad027aa540c3326e10",
+        "total_lines": 294,
+        "direct_read_ranges": [
+          [
+            1,
+            294
+          ]
+        ],
+        "method": "Full module including tests"
+      },
+      {
+        "path": "src/mcp/tools/session_start.rs",
+        "sha256": "4f277bf2f7c9efa2773170b88f3b95d03d0dc821fa745ba889c77393c4b330f8",
+        "total_lines": 655,
+        "direct_read_ranges": [
+          [
+            1,
+            172
+          ]
+        ],
+        "method": "Complete core handler; remainder not reviewed"
+      },
+      {
+        "path": "src/mcp/tools/capture_turn.rs",
+        "sha256": "201905e062daf0adb172180eb974754c4b93654da3991f94130306aed2eb9e3d",
+        "total_lines": 1109,
+        "direct_read_ranges": [
+          [
+            306,
+            453
+          ]
+        ],
+        "method": "Complete handle_capture_turn; prepare/write implementation excluded"
+      },
+      {
+        "path": "src/cli/boot.rs",
+        "sha256": "6c6b32c252ff5e54ae07751e1900c3b839959ab7e55123481ec30e30574ca1a2",
+        "total_lines": 2443,
+        "direct_read_ranges": [
+          [
+            558,
+            781
+          ]
+        ],
+        "method": "Complete run function, helper internals excluded"
+      },
+      {
+        "path": "clients/openai-shim-py/ai_memory_openai_shim/shim.py",
+        "sha256": "465aaa121312c63bc455c770a67477ebfade4368d2d9adfbac6604a553b087f9",
+        "total_lines": 163,
+        "direct_read_ranges": [
+          [
+            1,
+            163
+          ]
+        ],
+        "method": "Full adapter"
+      },
+      {
+        "path": "clients/openai-shim-py/ai_memory_openai_shim/_capture.py",
+        "sha256": "ae125b643ae2e78da0da3361e07ddc992e9a6d046847e8ed93b539f1d9b7733e",
+        "total_lines": 153,
+        "direct_read_ranges": [
+          [
+            1,
+            153
+          ]
+        ],
+        "method": "Full transport; isolated synthetic receipt experiment"
+      },
+      {
+        "path": "clients/anthropic-shim-py/ai_memory_anthropic_shim/_capture.py",
+        "sha256": "e5ab4b32185953db444d044ea585e9eeab489283f32eb71fb3218709cb5ed546",
+        "total_lines": 165,
+        "direct_read_ranges": [
+          [
+            1,
+            165
+          ]
+        ],
+        "method": "Full transport; isolated synthetic receipt experiment"
+      },
+      {
+        "path": ".github/workflows/session-boot-lifetime.yml",
+        "sha256": "7367eb5b047dfa312f166bc41fe8298ac3b9b63d9c1d4617be62bd0d80055151",
+        "total_lines": 77,
+        "direct_read_ranges": [
+          [
+            1,
+            77
+          ]
+        ],
+        "method": "Full workflow"
+      },
+      {
+        "path": ".local-runs/astra-evidence/f2-runs/continuity-cycle.py",
+        "sha256": "246cfd0b89462a2ae35cb4605107bd3505273264646b9e73d554e4904f8c8185",
+        "total_lines": 132,
+        "direct_read_ranges": [
+          [
+            1,
+            132
+          ]
+        ],
+        "method": "Full downloaded harness; no execution and no authenticated secrets copied into report"
+      },
+      {
+        "path": "src/mcp/mod.rs",
+        "sha256": "b095f9157dbb8950350f120374453d818d6927a08e7114592c5e27385cb9e391",
+        "total_lines": 17255,
+        "direct_read_ranges": [
+          [
+            2747,
+            2755
+          ],
+          [
+            3410,
+            3460
+          ],
+          [
+            3590,
+            3735
+          ]
+        ],
+        "method": "Wave 2 CodeGraph dispatch exploration then complete result-envelope match inspection; pending/ask not translated into isError"
+      }
+    ],
+    "wave2_reviewed_ballots": [
+      "w1-retrieval.md",
+      "w1-security.md",
+      "w1-enterprise.md",
+      "w1-continuity.md",
+      "w1-cognition.md",
+      "w1-operations.md",
+      "w1-architecture.md"
+    ],
+    "wave2_reviewed_drafts": [
+      "docs/reviews/GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md",
+      "docs/reviews/GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md"
+    ]
+  },
+  "source-coverage-retrieval": {
+    "assessor": "GPT 6 Astra — retrieval juror A",
+    "source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "coverage_type": "Direct line-range reads; not whole-project or whole-file coverage",
+    "notes": [
+      "CodeGraph explore was the first structural operation; current focused reads followed explored symbols. storage/mod.rs reports zero indexed symbols, so literal/focused source reads fill its coverage hole.",
+      "Intervals combine actual direct reads in this juror's session. They are not claims that every callee dependency, backend or test was read.",
+      "No complete Rust file is asserted. Supporting complete bodies are enumerated separately. No source changes or new runtime probes in this pass."
+    ],
+    "files": [
+      {
+        "path": "src/storage/mod.rs",
+        "full_file_read": false,
+        "direct_ranges": [
+          [
+            975,
+            1295
+          ],
+          [
+            3241,
+            3435
+          ],
+          [
+            7478,
+            7685
+          ],
+          [
+            7900,
+            8075
+          ],
+          [
+            15295,
+            15625
+          ],
+          [
+            19252,
+            20585
+          ]
+        ],
+        "complete_bodies": [
+          "row_to_memory",
+          "row_to_memory_scan",
+          "row_to_memory_with_policy",
+          "undecryptable_row_error",
+          "fold_recall_accesses",
+          "search",
+          "search_with_source_uri",
+          "apply_token_budget",
+          "gc_if_needed",
+          "gc",
+          "prepare_hybrid_query",
+          "fts_keyword_phase",
+          "vector_recall_allowlist_ids",
+          "semantic_phase",
+          "blend_and_rank",
+          "apply_recall_post_ops",
+          "assemble_recall_telemetry",
+          "recall_hybrid_with_telemetry",
+          "recall_hybrid_with_telemetry_precomputed_hnsw",
+          "recall_hybrid_with_telemetry_inner"
+        ],
+        "not_complete": [
+          "Entire storage module",
+          "all helper callees such as visibility and embedding implementation",
+          "keyword recall implementation"
+        ]
+      },
+      {
+        "path": "src/mcp/tools/recall.rs",
+        "full_file_read": false,
+        "direct_ranges": [
+          [
+            280,
+            329
+          ],
+          [
+            950,
+            1509
+          ]
+        ],
+        "complete_bodies": [
+          "freshness_state",
+          "handle_recall_dto"
+        ],
+        "other_source_context": "Provenance decoration and observation helpers were previously explored; not represented as complete direct-read intervals here."
+      },
+      {
+        "path": "src/models/memory.rs",
+        "full_file_read": false,
+        "direct_ranges": [
+          [
+            1434,
+            1510
+          ]
+        ],
+        "complete_bodies": [
+          "ConfidenceTier::from_confidence",
+          "ConfidenceTier::as_str",
+          "ConfidenceTier::parse",
+          "Memory::confidence_tier"
+        ]
+      },
+      {
+        "path": "src/reranker.rs",
+        "full_file_read": false,
+        "direct_ranges": [
+          [
+            2010,
+            2108
+          ]
+        ],
+        "complete_bodies": [
+          "RerankerScoreFloor::parse",
+          "RerankerScoreFloor::apply"
+        ],
+        "not_complete": [
+          "BatchedReranker or neural model implementation"
+        ]
+      },
+      {
+        "path": "src/bench_relevance.rs",
+        "full_file_read": false,
+        "direct_ranges": [
+          [
+            470,
+            600
+          ]
+        ],
+        "complete_bodies": [
+          "evaluate_probe",
+          "run_scenario"
+        ],
+        "not_complete": [
+          "Full corpus generation and complete harness file"
+        ]
+      },
+      {
+        "path": "docs/reviews/GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md",
+        "full_file_read": true,
+        "direct_ranges": [
+          [
+            1,
+            265
+          ]
+        ],
+        "snapshot_note": "Draft before expanded 3x7 panel and parent amendments; read whole draft for preliminary final-review pass."
+      },
+      {
+        "path": "docs/reviews/GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md",
+        "full_file_read": true,
+        "direct_ranges": [
+          [
+            1,
+            343
+          ]
+        ],
+        "snapshot_note": "Draft before parent amendments; read whole draft for preliminary final-review pass."
+      }
+    ],
+    "new_bounds": [
+      "MCP handle_recall_dto invokes gc_if_needed before retrieval; if expired rows exist gc synchronously folds pending access observations then evicts. Pure core ranking is not a guarantee the complete MCP request writes zero memory rows.",
+      "FTS and semantic SQL carry lifecycle/valid-time selection filters despite omitted output fields; DTO mismatch is not proof of selection bypass.",
+      "HNSW path re-fetches rows and defensively checks embedding space plus visibility; FTS-first fusion keeps its own Memory for an overlapping ID, so an accurate alternative lane does not repair the FTS DTO.",
+      "Reranker cannot rescue candidates truncated/budgeted earlier, but within-page ordering can still benefit agents. Weak top result is deliberately retained by score-floor policy."
+    ]
+  },
+  "source-coverage-root": {
+    "reviewer": "root",
+    "source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "method": "complete direct line reads including in-file tests",
+    "files": [
+      {
+        "path": "src/llm_cli_wrap.rs",
+        "ranges": [
+          [
+            1,
+            244
+          ]
+        ]
+      },
+      {
+        "path": "src/cli/wrap.rs",
+        "ranges": [
+          [
+            1,
+            877
+          ]
+        ]
+      },
+      {
+        "path": "src/toon.rs",
+        "ranges": [
+          [
+            1,
+            762
+          ]
+        ]
+      },
+      {
+        "path": "src/handlers/wire_format.rs",
+        "ranges": [
+          [
+            1,
+            58
+          ]
+        ]
+      }
+    ]
+  },
+  "source-coverage-enterprise": {
+    "reviewer": "GPT 6 Astra enterprise juror C",
+    "reviewed_head": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+    "worktree": "/Users/fate/fable-hardcoder/ai-memory-mcp/.local-runs/wt-astra-assessment",
+    "generated_utc": "2026-09-05T21:32:31.854657+00:00",
+    "scope": "Focused implementation coverage supporting enterprise findings, not complete repository or complete PostgreSQL store review. Full function means its body read, not transitive call graph or all dependencies verified. CodeGraph structural exploration preceded focused reads.",
+    "files": [
+      {
+        "file": "src/cli/epoch_apply.rs",
+        "sha256": "b1a9be7a776db4b661f5cda9f094f64100ecff095f5d2722bb70409d0537c2c1",
+        "total_lines": 273,
+        "direct_read_ranges_inclusive": [
+          [
+            1,
+            273
+          ]
+        ],
+        "scope_notes": [
+          "Entire file, signed epoch CLI verification and SQLite application. Does not establish PostgreSQL epoch catch-up."
+        ]
+      },
+      {
+        "file": "src/handlers/parity.rs",
+        "sha256": "d411c2f90e107c43538fa6a4d8d26e1d390a37bf0cfcd97cf1ab16057e3f77e4",
+        "total_lines": 658,
+        "direct_read_ranges_inclusive": [
+          [
+            1,
+            320
+          ]
+        ],
+        "scope_notes": [
+          "Complete under_replicated_202, fanout_consolidate, fanout_memory, resolve_caller_agent_id and http_caller_ctx implementations; partial file."
+        ]
+      },
+      {
+        "file": "src/handlers/postgres_gate.rs",
+        "sha256": "3b2dc64660b1f927c187850e88d5b5cf1a507e92c2e796f98a1475f09db3d43f",
+        "total_lines": 1906,
+        "direct_read_ranges_inclusive": [
+          [
+            1,
+            300
+          ]
+        ],
+        "scope_notes": [
+          "Complete postgres_not_implemented and postgres_endpoint_supported implementations; partial file."
+        ]
+      },
+      {
+        "file": "src/federation/push_dlq.rs",
+        "sha256": "5b1fec7a914ecd154a048870fc26c38952a3a8cfe26670227443dee37c5155e3",
+        "total_lines": 2529,
+        "direct_read_ranges_inclusive": [
+          [
+            1,
+            295
+          ],
+          [
+            590,
+            1044
+          ]
+        ],
+        "scope_notes": [
+          "Complete replay_once and sink contract; partial file, concrete SQLite/PostgreSQL sink implementations and test module not fully read in this ledger."
+        ]
+      },
+      {
+        "file": "src/store/postgres.rs",
+        "sha256": "1847442e93a24fbc4412c35d392703164decaefc003f3620d3291d0bfbc7c387",
+        "total_lines": 41625,
+        "direct_read_ranges_inclusive": [
+          [
+            12410,
+            12875
+          ],
+          [
+            13195,
+            13678
+          ],
+          [
+            30550,
+            30600
+          ]
+        ],
+        "scope_notes": [
+          "Complete lineage_traverse, find_paths, find_paths_cte, find_paths_frontier_edges, drain_kg_projection_outbox, unproject_memory_ids_best_effort, record_unreconciled_unprojections and spawn_drainer; preceding link_internal tail only. Partial file, NOT all 41k+ lines. Earlier focused observations are in w1-enterprise.md and wave2-enterprise.md; this ledger deliberately records only explicitly established contiguous reads.",
+          "Direct read: complete export_memories and export_links methods, plus adjacent context."
+        ]
+      },
+      {
+        "file": ".local-runs/astra-evidence/dashboard-enterprise-artifacts/continuity-cycle.py",
+        "sha256": "a26aa6fc22fa04cd67d1faf39888782b363c7126bb8e3b751a83983dbcbd5a5d",
+        "total_lines": 132,
+        "direct_read_ranges_inclusive": [
+          [
+            1,
+            132
+          ]
+        ],
+        "scope_notes": [
+          "Entire captured producer source. Continuity copy is sanitized. Historical run does not pin this exact producer hash; see remote byte manifest."
+        ]
+      },
+      {
+        "file": ".local-runs/astra-evidence/dashboard-enterprise-artifacts/module-scaling.py",
+        "sha256": "c486e8cc417201a5ff003e8ddc16e6f11a128397942dcd1e3d39d22c2a743176",
+        "total_lines": 63,
+        "direct_read_ranges_inclusive": [
+          [
+            1,
+            63
+          ]
+        ],
+        "scope_notes": [
+          "Entire captured producer source. Continuity copy is sanitized. Historical run does not pin this exact producer hash; see remote byte manifest."
+        ]
+      },
+      {
+        "file": ".local-runs/astra-evidence/f2-runs/big10-regression.sh",
+        "sha256": "b54be0625d48bda49508ea3781b3d4a5825f81cd235971ebc0eaa5c3f2db6441",
+        "total_lines": 38,
+        "direct_read_ranges_inclusive": [
+          [
+            1,
+            38
+          ]
+        ],
+        "scope_notes": [
+          "Entire captured producer source. Continuity copy is sanitized. Historical run does not pin this exact producer hash; see remote byte manifest."
+        ]
+      },
+      {
+        "file": "src/store/postgres_parity.rs",
+        "sha256": "f4e3086a62f45e8ab61cec0e7296723193ad5526aec6179fdaec07bd9e505f0b",
+        "total_lines": 683,
+        "direct_read_ranges_inclusive": [
+          [
+            51,
+            59
+          ],
+          [
+            114,
+            194
+          ],
+          [
+            353,
+            378
+          ]
+        ],
+        "scope_notes": [
+          "CodeGraph explore rendered exact source: complete export_memories_keyset and export_page_rows. Other snippets partial. No assertion that unrelated truncated explore output was read."
+        ]
+      },
+      {
+        "file": "src/handlers/admin.rs",
+        "sha256": "fc742586e607e53ff4d2486eae216429068f892debdb55c3c081b9874fa8d8c3",
+        "total_lines": 1880,
+        "direct_read_ranges_inclusive": [
+          [
+            1000,
+            1150
+          ]
+        ],
+        "scope_notes": [
+          "Direct read: complete screen_exported_memories and export_memories HTTP handler; partial file."
+        ]
+      },
+      {
+        "file": ".github/workflows/release.yml",
+        "sha256": "8e5747859c6c97b40b486b6dd4bb6b5861832c6c8533b524034c2e9160fb4a72",
+        "total_lines": 1152,
+        "direct_read_ranges_inclusive": [
+          [
+            35,
+            140
+          ]
+        ],
+        "scope_notes": [
+          "Direct read: full preflight and supply-chain jobs plus adjacent context. Other release-workflow claims attributed to F full-file review, not independently whole-file read by C."
+        ]
+      }
+    ],
+    "updated_utc": "2026-09-05T21:49:40.555609+00:00"
+  },
+  "source-coverage-cognition-wave3": {
+    "juror": "E cognition",
+    "wave": 3,
+    "method": "Full reading of all seven expanded Wave2 ballots, both deliverables, evidence README and two relevant proof artifacts; no new runtime or source implementation review",
+    "files": [
+      {
+        "path": ".local-runs/astra-evidence/w2-fullpanel-architecture.md",
+        "sha256": "fcdc0ba96802255089519548a474f2a464ba240a8595a6421a067da0e1be3f08",
+        "ranges": [
+          [
+            1,
+            55
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w2-fullpanel-cognition.md",
+        "sha256": "60730fe10d89446e4c1ddb1c4cfee36aef8de0e7b037af98003e6c216e80e143",
+        "ranges": [
+          [
+            1,
+            51
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w2-fullpanel-continuity.md",
+        "sha256": "cf6583e45bb9ad37a433b48c0ae96e87a2942126c4a231d1f882af77963935dc",
+        "ranges": [
+          [
+            1,
+            50
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w2-fullpanel-enterprise.md",
+        "sha256": "79afc4a8cb012a90f87c07e16874e68b90a6e2c0f4ed13782bb980ce93c671e0",
+        "ranges": [
+          [
+            1,
+            56
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w2-fullpanel-operations.md",
+        "sha256": "cdc2a48f7fa43159e34b973360afdf74db65f619bd4a8f147e44a7dc3c1b57bc",
+        "ranges": [
+          [
+            1,
+            55
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w2-fullpanel-retrieval.md",
+        "sha256": "9de9697efcbfa1c80ed9a9d66ad2ca24eecdc806ee811f10b4ee05080195e1b4",
+        "ranges": [
+          [
+            1,
+            49
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": ".local-runs/astra-evidence/w2-fullpanel-security.md",
+        "sha256": "e415f6424b5072622c7c9ed2127f8c70a5d7297a0e43bdd1b9049c9feddfd455",
+        "ranges": [
+          [
+            1,
+            79
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": "docs/reviews/GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md",
+        "sha256": "5202003f5e603b5c9d5899680cfbb8726262d0f6813f54bbb3a2e116cc9e4284",
+        "ranges": [
+          [
+            1,
+            373
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": "docs/reviews/GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md",
+        "sha256": "906e7abf8b39e770c389b7779fc6d66acca449dd527de55353effa627c99582c",
+        "ranges": [
+          [
+            1,
+            292
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": "docs/reviews/gpt6-astra-20260905-evidence/README.md",
+        "sha256": "a8866e65eb52a1ea72bed09b662523ee0558de83d40646872a7a1be294b8c98c",
+        "ranges": [
+          [
+            1,
+            43
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": "docs/reviews/gpt6-astra-20260905-evidence/weighted-nhi-summary.json",
+        "sha256": "46687c69707ce4f1f8217422f1b73d07740356cd000272914b2eb7c0c9cd6251",
+        "ranges": [
+          [
+            1,
+            23
+          ]
+        ],
+        "coverage": "full"
+      },
+      {
+        "path": "docs/reviews/gpt6-astra-20260905-evidence/restart-artifacts/continuity-a56d9a.json",
+        "sha256": "dd99293d2bc56f6d6b3bf68b2b60eea611e8f74a8c63457f41ffbb59c1ab9552",
+        "ranges": [
+          [
+            1,
+            72
+          ]
+        ],
+        "coverage": "full"
+      }
+    ]
+  },
+  "publication_normalization": {
+    "range_corrections": [
+      {
+        "ledger": "source-coverage-cognition",
+        "path": "sdk/python/swarm/agent.py",
+        "original_end": 258,
+        "normalized_end": 252,
+        "reason": "Cap displayed read window at physical EOF; no nonexistent lines counted. Original scratch ledger retained locally."
+      },
+      {
+        "ledger": "source-coverage-security",
+        "path": "src/handlers/share.rs",
+        "original_end": 91,
+        "normalized_end": 90,
+        "reason": "Cap displayed read window at physical EOF; no nonexistent lines counted. Original scratch ledger retained locally."
+      }
+    ],
+    "scope": "Mechanical range-bound normalization, not additional source review."
+  }
+}
