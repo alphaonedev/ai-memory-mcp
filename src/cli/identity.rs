@@ -144,7 +144,7 @@ pub enum IdentityAction {
         /// Optional base64 Ed25519 recovery public key committed into
         /// the genesis record. Carried for v1.0 forward-compat; the
         /// recovery VERIFY path does NOT exist in v0.9.0.
-        #[arg(long, value_name = "PUBKEY_B64")]
+        #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         recovery_pubkey: Option<String>,
     },
     /// v0.9.0 G13 (#1828) — rotate the keypair WITH a signed lineage
@@ -168,7 +168,7 @@ pub enum IdentityAction {
         agent_id: Option<String>,
         /// base64 Ed25519 recovery public key (URL-safe-no-pad or
         /// standard padding accepted).
-        #[arg(long, value_name = "PUBKEY_B64")]
+        #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         recovery_pubkey: String,
     },
     /// v1.0.0 G17 (#1831) — phase 1 of the M-of-N recovery ceremony: mint
@@ -183,7 +183,7 @@ pub enum IdentityAction {
         agent_id: Option<String>,
         /// base64 Ed25519 PUBLIC key of the FRESH primary key that becomes
         /// the new head (generate it with `identity generate` + export-pub).
-        #[arg(long, value_name = "PUBKEY_B64")]
+        #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         successor_pubkey: String,
         /// Optional: also date a suspected key compromise from this
         /// `signed_events` witness SEQUENCE (a recovery doubling as a
@@ -192,7 +192,7 @@ pub enum IdentityAction {
         from_seq: Option<u64>,
         /// Optional: (re-)register a cold recovery public key on the fresh
         /// head. Absent carries the head's existing commitment forward.
-        #[arg(long, value_name = "PUBKEY_B64")]
+        #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         recovery_pubkey: Option<String>,
     },
     /// v1.0.0 G17 (#1831) — guardian side of the M-of-N recovery ceremony:
@@ -223,7 +223,7 @@ pub enum IdentityAction {
         #[arg(long)]
         agent_id: Option<String>,
         /// The SAME fresh-primary public key passed to `recover-prepare`.
-        #[arg(long, value_name = "PUBKEY_B64")]
+        #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         successor_pubkey: String,
         /// Echo the `not_before` value `recover-prepare` printed (so the
         /// re-minted record is byte-identical to what the guardians signed).
@@ -233,7 +233,7 @@ pub enum IdentityAction {
         #[arg(long, value_name = "SEQ")]
         from_seq: Option<u64>,
         /// The SAME `--recovery-pubkey` (if any) passed to `recover-prepare`.
-        #[arg(long, value_name = "PUBKEY_B64")]
+        #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         recovery_pubkey: Option<String>,
         /// A guardian attestation `guardian_pubkey_b64:signature_b64` (from
         /// `sign-recovery`). Repeat once per guardian; M distinct enrolled
