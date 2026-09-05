@@ -1090,6 +1090,12 @@ fn run_local(db_path: &Path) -> Report {
     sections.push(section_atomisation_curator_2985(&conn));
     sections.push(section_llm_reachability_1146());
     sections.push(section_embeddings_reachability_1598());
+    // v1.0.0 #3471 — the wake-hub posture. Filesystem + `getrlimit` only: the
+    // hub opens no store, so this section cannot be affected by (or affect)
+    // the database connection above.
+    sections.push(crate::cli::doctor_wake_hub::section_wake_hub_3471(
+        &crate::config::AppConfig::load(),
+    ));
 
     Report {
         mode: "local".into(),
@@ -3600,7 +3606,7 @@ mod tests {
         // "Embedding Space Census (#2167)"; #2985 added
         // "Atomisation Curator"; #3166 prepended "Configuration";
         // #3147/#3155 inserted "Identity" after Configuration — total is
-        // now 16.
+        // now 16; #3471 appended "Wake hub (#3471)" — total is now 17.
         //
         // #3264 note: "Postgres extensions (#3264)" is a CONDITIONAL 17th
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -3612,7 +3618,11 @@ mod tests {
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
         // DSN under that same lock. The count stays 16 on a SQLite
         // deployment, which is the invariant this test pins.
-        assert_eq!(report.sections.len(), 16);
+        //
+        // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
+        // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
+        // on a host with no hub and reports `configured = no` there.
+        assert_eq!(report.sections.len(), 17);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -3633,6 +3643,7 @@ mod tests {
                 "Atomisation Curator",
                 "LLM Reachability (#1146)",
                 "Embeddings Reachability (#1598)",
+                crate::cli::doctor_wake_hub::SECTION_WAKE_HUB,
             ]
         );
         let identity = find(&report, SECTION_IDENTITY);

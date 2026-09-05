@@ -2632,10 +2632,16 @@ pub async fn run(
             // Thin delegate. Deliberately does NOT touch `db_path`: the wake
             // hub is content-free and store-free, so it opens no database on
             // either backend.
-            if !a.posture {
+            // #3471 — the two REPORTING modes stay quiet: their whole output is
+            // the report on stdout, and a tracing preamble on stderr would be
+            // noise in a supervisor's health check.
+            if !a.posture && !a.health {
                 init_tracing();
             }
-            cli::wake_hub::dispatch(&a, app_config).await
+            match cli::wake_hub::dispatch(&a, app_config).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Command::Atomise(a) => {
             let stdout = std::io::stdout();
