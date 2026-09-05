@@ -30,6 +30,10 @@
       "types": "./dist/attestation.d.ts",
       "import": "./dist/attestation.js"
     },
+    "./wake": {
+      "types": "./dist/wake.d.ts",
+      "import": "./dist/wake.js"
+    },
     "./errors": {
       "types": "./dist/errors.d.ts",
       "import": "./dist/errors.js"

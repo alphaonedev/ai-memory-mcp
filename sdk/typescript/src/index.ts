@@ -9,7 +9,9 @@
  *
  * Also re-exports all request/response types and the error hierarchy.
  * Webhook helpers live in the `./webhooks` subpath so the SDK can ship
- * to browsers without pulling in `node:crypto` by default.
+ * to browsers without pulling in `node:crypto` by default; the #3470
+ * wake-hub client lives in `./wake` for the same reason (it needs
+ * `node:net` and `node:fs` and is meaningless in a browser).
  */
 
 export {
