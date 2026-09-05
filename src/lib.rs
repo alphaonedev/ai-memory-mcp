@@ -979,6 +979,16 @@ pub mod visibility;
 /// default REFUSES every hello until the scoped `a2a-hub/join/v1` delegation
 /// lands in #3468.
 pub mod wake_hub;
+/// v1.0.0 #3469 (EPIC #3466) — the bridge from the #3465 `agent_notified`
+/// wake bus to the #3467 wake-hub: an in-process sink when the hub is
+/// co-hosted with the daemon, and a Unix-domain-socket forwarder when it runs
+/// as a separate process. Fire-and-forget with bounded buffering, so a slow or
+/// absent hub costs a HINT and a counter, never a committed notify; wakes are
+/// addressed directly to the recipient (never a topic, never the webhook
+/// lane), carry `{inbox_row_id, namespace, sender, digest, seq_high_watermark}`
+/// and never a body, and a lost wake self-heals through the watermark plus the
+/// normative `<=60 s` backstop poll.
+pub mod wake_sink;
 /// v1.0.0 #3403 — the shared memory-write EVENT funnel: one typed emitter
 /// per lifecycle event, binding the canonical event name to the canonical
 /// details type in ONE place, so every write surface (MCP, CLI) dispatches
