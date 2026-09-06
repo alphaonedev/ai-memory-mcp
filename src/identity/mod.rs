@@ -879,12 +879,61 @@ mod tests {
     /// parallel by default, so an unguarded `remove_var` race can
     /// surface as a flake when a sibling test reads the same var
     /// mid-mutation. Acquire this mutex before every env-mutating step.
+    ///
+    /// #3517 — this was a MODULE-LOCAL `OnceLock<Mutex<()>>`, a second,
+    /// independent mutex over the SAME process-global variable that the
+    /// crate-wide [`agent_id_env_test_lock`] guards. `src/**/*.rs` compiles
+    /// into ONE lib test binary, so `identity::tests` mutating `ENV_AGENT_ID`
+    /// under this mutex ran genuinely CONCURRENTLY with
+    /// `mcp::tools::pending` / `coordination_guard` / `storage` mutating the
+    /// same variable under the crate-wide one — the exact cross-module race
+    /// #1998 → #2115 → #2127 fixed for `$HOME` and #3517 reports for the
+    /// caller principal (`agent_id mismatch: caller 'ai:bob' …`).
+    ///
+    /// It is now a DELEGATE to the one canonical lock (the same shape
+    /// `config::tests::env_var_lock` uses for `config::test_env_lock`), so the
+    /// critical section is genuinely process-wide. Nothing below may ALSO
+    /// acquire [`agent_id_env_test_lock`] directly: `std::sync::Mutex` is not
+    /// reentrant, so a double acquisition would self-deadlock (CONCURRENCY-04).
     fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::agent_id_env_test_lock()
+    }
+
+    /// #3517 AFTER-pin — `env_var_lock()` and the crate-wide
+    /// [`agent_id_env_test_lock`] are ONE mutex, verified by OBSERVED MUTUAL
+    /// EXCLUSION rather than by reading the delegate's source.
+    ///
+    /// While this thread holds the module wrapper, a second thread taking the
+    /// crate-wide helper must NOT get through. On the pre-#3517 tree — two
+    /// independent `OnceLock<Mutex<()>>` over the same
+    /// `AI_MEMORY_AGENT_ID` — it got through immediately, which is precisely
+    /// how `identity::tests` and `mcp::tools::pending::tests` came to install
+    /// different principals at the same instant.
+    ///
+    /// Not timing-flaky in the failing direction: the probe thread can only
+    /// complete early if the exclusion is genuinely absent.
+    #[test]
+    fn env_var_lock_is_the_one_crate_wide_lock_3517() {
+        let held = env_var_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let _g = super::agent_id_env_test_lock();
+            let _ = tx.send(());
+        });
+        let overlapped = rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_ok();
+        // Release BEFORE asserting so a failure can never wedge the probe
+        // thread (or the crate-wide lock) for every sibling test.
+        drop(held);
+        probe.join().expect("probe thread must not panic");
+        assert!(
+            !overlapped,
+            "identity::tests::env_var_lock() must BE the crate-wide \
+             agent_id_env_test_lock(): a second thread acquired the crate-wide \
+             lock while this one was held, so AI_MEMORY_AGENT_ID is guarded by \
+             two independent mutexes again (#3517)"
+        );
     }
 
     #[test]
@@ -1073,7 +1122,8 @@ mod tests {
 
     #[test]
     fn mcp_read_visibility_caller_refuses_empty_or_shape_invalid_3356() {
-        let _crate_g = agent_id_env_test_lock();
+        // #3517 — `env_var_lock()` IS the crate-wide `agent_id_env_test_lock()`
+        // now; acquiring both would self-deadlock on a non-reentrant mutex.
         let _g = env_var_lock();
         // SAFETY: env mutation serialised by `_g`.
         unsafe {
@@ -1499,14 +1549,14 @@ mod tests {
         // degraded into a sentinel. Validation now runs FIRST, under every
         // posture, per `validate_agent_id`'s "every WIRE entry point" contract.
         //
-        // Both locks: the crate-wide guard (outermost — every cross-module
-        // mutator takes it) then this module's own, so neither a sibling here
-        // nor a sibling elsewhere can observe a half-applied env.
-        let _crate_g = agent_id_env_test_lock();
+        // ONE lock: `env_var_lock()` delegates to the crate-wide
+        // `agent_id_env_test_lock()` (#3517), which every cross-module mutator
+        // takes, so neither a sibling here nor a sibling elsewhere can observe
+        // a half-applied env. Taking both would self-deadlock (CONCURRENCY-04).
         let _g = env_var_lock();
 
         // MULTI-TENANT posture.
-        // SAFETY: env mutation serialised by both guards held above.
+        // SAFETY: env mutation serialised by the guard held above.
         unsafe { std::env::set_var(ENV_AGENT_ID, "ai:realcaller") };
 
         // DENIED — malformed principal (path traversal), refused BEFORE the
@@ -1532,7 +1582,7 @@ mod tests {
         );
 
         // SINGLE-OPERATOR default — unchanged ladder, still validated.
-        // SAFETY: env mutation serialised by both guards held above.
+        // SAFETY: env mutation serialised by the guard held above.
         unsafe { std::env::remove_var(ENV_AGENT_ID) };
         assert!(
             resolve_governance_subject(Some("../../etc"), None, "probe").is_err(),

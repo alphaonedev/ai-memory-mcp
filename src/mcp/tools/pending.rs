@@ -735,6 +735,13 @@ mod tests {
     // handle_subscription_dlq_list — empty list, count=0, limit echoed.
     #[test]
     fn subscription_dlq_list_empty() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let resp = handle_subscription_dlq_list(&conn, &json!({}), None).expect("ok");
         assert_eq!(resp["count"].as_u64(), Some(0));
@@ -744,6 +751,9 @@ mod tests {
     // handle_subscription_dlq_list — limit clamped to [1, 1000].
     #[test]
     fn subscription_dlq_list_limit_clamped() {
+        // #3517 — same env-first caller resolution as its siblings; pin the
+        // unset posture (the #1874 fixture).
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let resp = handle_subscription_dlq_list(&conn, &json!({"limit": 0u64}), None).expect("ok");
         // limit=0 clamps to 1; 0 is below the min so it should not error.
@@ -753,6 +763,13 @@ mod tests {
     // handle_subscription_dlq_list — subscription_id filter is propagated.
     #[test]
     fn subscription_dlq_list_with_filter() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let resp = handle_subscription_dlq_list(&conn, &json!({"subscription_id": "sub-x"}), None)
             .expect("ok");
@@ -764,6 +781,13 @@ mod tests {
     // sub_id and receives the empty envelope.
     #[test]
     fn subscription_dlq_list_cross_tenant_refused_1118() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         db::register_agent(&conn, "ai:alice", "test", &[]).expect("register alice");
         let sid = crate::subscriptions::insert(

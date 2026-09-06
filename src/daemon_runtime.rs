@@ -9875,12 +9875,53 @@ mod tests {
     /// Mutex env-var guard. Tests that flip env vars must serialize to
     /// avoid clobbering each other; `cargo test --test-threads=2` is the
     /// upstream gate but a per-test mutex keeps the tests honest.
+    ///
+    /// #3517 — this was a MODULE-LOCAL `OnceLock<Mutex<()>>`. Several tests
+    /// below flip CALLER-AFFECTING process-global variables
+    /// (`AI_MEMORY_ADMIN_AGENT_IDS`, `AI_MEMORY_ANONYMIZE`) that
+    /// `identity::resolve_agent_id` / `handlers::admin_role` read, and
+    /// `src/**/*.rs` compiles into ONE lib test binary — so a mutex private to
+    /// this module serialized nothing against the `identity` / `mcp::tools::*`
+    /// / `storage` tests mutating the same principal surface under the
+    /// crate-wide `identity::agent_id_env_test_lock()`. That is the same
+    /// per-module-mutex defect `$HOME` hit three times (#1998 → #2115 →
+    /// #2127) and #3517 reports for the caller principal.
+    ///
+    /// It now DELEGATES to the one canonical lock, so the critical section is
+    /// genuinely process-wide. LOCK ORDER (CONCURRENCY-04): the two tests that
+    /// also hold `crate::test_support::env_lock()` take THAT first and this
+    /// one second; no site anywhere takes them in the opposite order, so the
+    /// pair cannot cycle. Nothing here may acquire
+    /// `identity::agent_id_env_test_lock()` (or `agent_id_env_unset_guard()`)
+    /// directly as well — `std::sync::Mutex` is not reentrant.
     fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::identity::agent_id_env_test_lock()
+    }
+
+    /// #3517 AFTER-pin — the `daemon_runtime` twin of
+    /// `identity::tests::env_var_lock_is_the_one_crate_wide_lock_3517`.
+    /// Verifies by OBSERVED MUTUAL EXCLUSION that this wrapper is the one
+    /// crate-wide caller-identity lock, so the `AI_MEMORY_ADMIN_AGENT_IDS` /
+    /// `AI_MEMORY_ANONYMIZE` mutators below cannot run concurrently with the
+    /// `AI_MEMORY_AGENT_ID` mutators in `identity` / `mcp::tools::*`.
+    #[test]
+    fn env_var_lock_is_the_one_crate_wide_lock_3517() {
+        let held = env_var_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let _g = crate::identity::agent_id_env_test_lock();
+            let _ = tx.send(());
+        });
+        let overlapped = rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_ok();
+        drop(held);
+        probe.join().expect("probe thread must not panic");
+        assert!(
+            !overlapped,
+            "daemon_runtime::tests::env_var_lock() must BE the crate-wide \
+             identity::agent_id_env_test_lock() (#3517)"
+        );
     }
 
     // ----- is_write_command ---------------------------------------------

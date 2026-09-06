@@ -372,6 +372,13 @@ mod tests {
 
     #[test]
     fn naming_the_inbox_namespace_still_boots_your_own_mail_3348() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let (conn, _tmp) = fresh_db();
         seed_in(
             &conn,

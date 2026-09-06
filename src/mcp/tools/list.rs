@@ -261,6 +261,13 @@ mod tests {
 
     #[test]
     fn naming_the_inbox_namespace_still_lists_your_own_mail_3348() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mut mail = make_mem("mail", "_messages/ai:carol", MTier::Mid, "ai:bob");
         mail.metadata[crate::META_KEY_TARGET_AGENT_ID] = json!("ai:carol");
@@ -451,6 +458,13 @@ mod tests {
     // but still sees shared rows.
     #[test]
     fn caller_non_owner_excludes_cross_agent_private() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         db::insert(&conn, &private_mem("p", "ns", "ai:alice")).expect("ins");
         db::insert(&conn, &shared_mem("s", "ns", "ai:bob")).expect("ins");
@@ -466,6 +480,13 @@ mod tests {
     // #1468 — the owning caller sees its OWN private row plus shared rows.
     #[test]
     fn caller_owner_sees_own_private_and_shared() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         db::insert(&conn, &private_mem("p", "ns", "ai:alice")).expect("ins");
         db::insert(&conn, &shared_mem("s", "ns", "ai:bob")).expect("ins");
