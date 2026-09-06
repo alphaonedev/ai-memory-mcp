@@ -290,7 +290,30 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
     assert_eq!(sender.expect_frame().await.kind, Kind::Welcome);
 
     let big_row = "r".repeat(80);
+
+    // The flood runs until the recipient's queue is OBSERVABLY backed up, not
+    // merely until the first refusal fires.
+    //
+    // PLATFORM NOTE. Breaking at the first `overflow >= 1` is a race, and the
+    // two platforms sit on opposite sides of it. The deaf peer never reads, so
+    // the hub's writer task drains the queue into that peer's KERNEL socket
+    // buffer — on the order of 8 KB on macOS and 200 KB on Linux for a default
+    // AF_UNIX stream. On macOS the small buffer saturates almost immediately
+    // and the queue STAYS backed up, so a census taken after the loop still
+    // sees it. On Linux the first refusal is a `ChannelFull` from a transient
+    // burst, reached long before the byte cap; the writer then drains the whole
+    // channel into that much larger buffer, and a census taken afterwards
+    // correctly reads zero. Nothing is wrong with the hub in either case — the
+    // TEST was sampling a live gauge after the moment it described.
+    //
+    // Flooding until the census itself reports the backpressure removes the
+    // race on both platforms, and it is deterministic rather than lucky: once
+    // the deaf peer's buffer is full the writer blocks, and because that peer
+    // never reads, the backed-up state is ABSORBING — it cannot drain back to
+    // zero for the rest of the loop. The loop stays bounded, so a hub that
+    // never applies backpressure fails the run instead of hanging it.
     let mut refused = false;
+    let mut census_observed = false;
     'flood: for _round in 0..200 {
         for _ in 0..50 {
             sender.wake(&deaf_id, &big_row).await;
@@ -298,20 +321,65 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
         // Drain our own error queue so it cannot fill and mask the signal.
         while let Ok(Some(_)) =
             tokio::time::timeout(Duration::from_millis(20), sender.read_frame()).await
-        {
-            if hub.metrics.snapshot(0).overflow >= 1 {
-                refused = true;
-                break 'flood;
-            }
-        }
-        if hub.metrics.snapshot(0).overflow >= 1 {
-            refused = true;
-            break;
+        {}
+
+        // `overflow` is a monotone counter: once refused, always refused.
+        let snap = hub.metrics.snapshot(0);
+        refused |= snap.overflow >= 1;
+
+        // The census is a LIVE gauge, so it is only meaningful at the instant
+        // it is read — assert it HERE, where the backpressure is observed,
+        // rather than after the loop where the writer may have drained it.
+        //
+        // MANDATORY OBSERVABLE: `census.slow_consumers >= 1` — the product's
+        // own watermark predicate (`EgressHandle::is_slow_consumer`), so this
+        // assertion cannot drift away from the thing it claims to pin. The
+        // census is an aggregate over every live route and this hub has two
+        // (the deaf peer, and the sender, which also receives the `error/507`
+        // refusals), so it is paired with EVIDENCE that a PER-RECIPIENT bound
+        // did the refusing. That recipient can only be the deaf peer: the
+        // sender's queue is drained to empty at the top of every round, while
+        // the deaf peer is never read at all. `drop_global_egress_full` is
+        // deliberately NOT accepted — the hub-wide budget says nothing about
+        // any one recipient.
+        //
+        // EITHER per-recipient cause counts, because which one binds is a
+        // function of constants this test does not own. With this config the
+        // BYTE cap binds first, by construction: `try_enqueue_classified`
+        // checks bytes BEFORE the channel, `queue_bytes` is 8 KiB here while
+        // `queue_frames` keeps its 256-slot default, and every frame carries a
+        // 24-byte header plus two 120-byte ids, so a frame is >= 264 B and the
+        // byte cap admits at most 8192/264 ~= 31 of them — far short of 256.
+        // `ChannelFull` could only bind first if a frame were under
+        // 8192/256 = 32 B, which is below the header and ids alone. Accepting
+        // both keeps the test correct if any of those numbers is ever retuned,
+        // instead of turning it into a trip-wire.
+        let census = hub.router().queue_census();
+        let per_recipient_refusal =
+            snap.drop_recipient_queue_full >= 1 || snap.drop_channel_full >= 1;
+        if per_recipient_refusal && census.slow_consumers >= 1 {
+            assert!(
+                census.queued_bytes > 0,
+                "a deaf recipient's queue must be visible in the census: {census:?}"
+            );
+            assert!(
+                census.queued_frames > 0,
+                "the FRAME gauge must move too — bytes and frames are different \
+                 bounds: {census:?}"
+            );
+            census_observed = true;
+            break 'flood;
         }
     }
     assert!(
         refused,
         "a deaf recipient must eventually refuse a delivery"
+    );
+    assert!(
+        census_observed,
+        "a recipient at or above {SLOW_CONSUMER_PERCENT}% of its cap is a slow \
+         consumer, and the census must show it — with its own byte cap on \
+         record as having refused — while the deaf recipient is still backed up"
     );
 
     let snap = hub.metrics.snapshot(0);
@@ -331,20 +399,8 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
         "the slow-consumer signal must fire BEFORE the drop it predicts"
     );
 
-    // The census sees the backed-up recipient while it is still backed up.
-    let census = hub.router().queue_census();
-    assert!(
-        census.queued_bytes > 0,
-        "a deaf recipient's queue must be visible in the census"
-    );
-    assert!(
-        census.slow_consumers >= 1,
-        "a recipient at or above {SLOW_CONSUMER_PERCENT}% of its cap is a slow consumer: {census:?}"
-    );
-    assert!(
-        census.queued_frames > 0,
-        "the FRAME gauge must move too — bytes and frames are different bounds"
-    );
+    // The census assertions ran inside the flood loop above, at the instant the
+    // backpressure was observed; `census_observed` is what proves they ran.
 
     // Let the deaf peer go so the hub can reap it, then drain.
     deaf.shutdown_write().await;
