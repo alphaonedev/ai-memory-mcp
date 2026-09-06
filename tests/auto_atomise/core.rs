@@ -107,6 +107,68 @@ fn test_serial() -> &'static Mutex<()> {
     M.get_or_init(|| Mutex::new(()))
 }
 
+/// v1.0.0 #3523 — INSTALL-FIRST fixture for the store-side governance hook.
+///
+/// # The defect this closes
+///
+/// `db::GOVERNANCE_PRE_WRITE` is a process-wide `OnceLock`: the FIRST `set`
+/// in the binary wins and every later one is a silent no-op. Before #3523
+/// the refusal case installed the hook inside its own body and then
+/// SOFT-SKIPPED its assertions when the insert succeeded, on the theory that
+/// "a prior test installed an Allow-all hook". That made the load-bearing
+/// half of the case — `a refused write must never reach the auto-atomise
+/// funnel` — conditional on TEST ORDERING, which libtest does not promise.
+/// Today no other case in this binary installs a hook, so the skip branch is
+/// dead; but nothing said so, and a case that can quietly stop asserting is
+/// the `#2444` shape (reports success while doing nothing).
+///
+/// # Why install-first rather than an own binary
+///
+/// Every case in this binary already funnels through [`test_serial`], so
+/// arming the hook HERE makes it a precondition of running at all: whichever
+/// case libtest schedules first installs it, and the refusal leg is then
+/// unconditional in every ordering. Moving the case to its own binary would
+/// buy the same determinism at the cost of duplicating the whole private
+/// worker + seeded-policy fixture.
+///
+/// The hook is DISCRIMINATING — it refuses only titles prefixed `refused-`
+/// and allows everything else — so installing it for the whole binary
+/// changes no other case's behaviour.
+fn install_refusal_governance_hook() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let installed = db::GOVERNANCE_PRE_WRITE
+            .set(Box::new(|mem: &Memory| {
+                if mem.title.starts_with("refused-") {
+                    Err("test-policy: refused".to_string())
+                } else {
+                    Ok(())
+                }
+            }))
+            .is_ok();
+        assert!(
+            installed,
+            "#3523: `GOVERNANCE_PRE_WRITE` was already set by something else in \
+             this binary, so the refusal case cannot make its write be refused. \
+             The hook is a process-wide one-shot: route every installer in this \
+             binary through `install_refusal_governance_hook` (or move the case \
+             to its own test binary) rather than restoring the soft-skip, which \
+             is how the assertion silently stopped running."
+        );
+    });
+}
+
+/// The one entry gate every case in this binary takes: install the
+/// governance hook (idempotent, first call wins) and THEN serialise.
+///
+/// Acquiring the lock second is deliberate — the install is idempotent and
+/// `OnceLock`-serialised in its own right, so holding the test mutex across
+/// it would buy nothing and only widen the critical section.
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    install_refusal_governance_hook();
+    test_serial().lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Push a canned curator response onto the SUITE-WIDE queue.
 fn enqueue_atoms(texts: &[&str]) {
     enqueue_atoms_into(&shared_state(), texts);
@@ -464,7 +526,7 @@ fn drain_workers(stable_for: Duration, total_timeout: Duration) {
 
 #[test]
 fn test_auto_atomise_disabled_does_nothing() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -505,7 +567,7 @@ fn test_auto_atomise_disabled_does_nothing() {
 
 #[test]
 fn test_auto_atomise_below_threshold_does_nothing() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -547,7 +609,7 @@ fn test_auto_atomise_below_threshold_does_nothing() {
 
 #[test]
 fn test_auto_atomise_above_threshold_triggers() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -604,7 +666,7 @@ fn test_auto_atomise_above_threshold_triggers() {
 
 #[test]
 fn test_auto_atomise_does_not_block_store_response() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -702,7 +764,7 @@ fn test_auto_atomise_does_not_block_store_response() {
 
 #[test]
 fn test_auto_atomise_inheritance() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -746,7 +808,7 @@ fn test_auto_atomise_inheritance() {
 
 #[test]
 fn test_auto_atomise_child_override() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -806,23 +868,18 @@ fn test_auto_atomise_child_override() {
 /// observe a curator fire would prove nothing by observing none.
 #[test]
 fn test_auto_atomise_refused_memory_not_atomised() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
 
-    // The store-side governance hook is one-shot (`OnceLock::set`).
-    // If a prior test already installed one, this set is a no-op — the
-    // refused leg then soft-skips (see below); the control leg still
-    // runs.
-    let _ = db::GOVERNANCE_PRE_WRITE.set(Box::new(|mem: &Memory| {
-        if mem.title.starts_with("refused-") {
-            Err("test-policy: refused".to_string())
-        } else {
-            Ok(())
-        }
-    }));
-
+    // #3523: the discriminating `GOVERNANCE_PRE_WRITE` hook is installed by
+    // `test_guard()` — the entry gate EVERY case in this binary takes — so it
+    // is in force whichever case libtest schedules first, and the refusal leg
+    // below is unconditional. It is NOT installed here: `OnceLock::set` is a
+    // one-shot, so an in-body `let _ = ...set(...)` silently no-ops whenever
+    // another case got there first — which is precisely how the assertion
+    // used to stop running.
     let (curator_state, atomiser, queue, worker) = private_worker();
     let ns = format!("wt1d-refused-{}", uuid::Uuid::new_v4().simple());
     seed_policy(&conn, &ns, opt_in_policy(500, 200));
@@ -913,12 +970,18 @@ fn test_auto_atomise_refused_memory_not_atomised() {
             assert_eq!(atoms, 0, "no atoms should exist for a refused memory");
         }
         Some(_) => {
-            // A prior test installed an Allow-all hook, so the write was
-            // not refused and there is no refusal to assert about. The
-            // positive control above still ran.
-            eprintln!(
-                "test_auto_atomise_refused_memory_not_atomised: skipping refusal assertion — \
-                 prior test installed Allow-all GOVERNANCE_PRE_WRITE hook"
+            // #3523: UNCONDITIONAL. `store_then_maybe_enqueue` returns `Some`
+            // only when `db::insert` COMMITTED, so reaching this arm means a
+            // `refused-`-prefixed write was allowed — i.e. the discriminating
+            // hook `test_guard()` installs is not the one in force. That is the
+            // defect, not a reason to skip: the pre-#3523 code soft-skipped
+            // here, which made the load-bearing half of this case conditional
+            // on test ordering that libtest does not promise.
+            panic!(
+                "#3523: the governance hook installed by `test_guard()` must REFUSE a \
+                 `refused-`-prefixed write, but the insert committed. The process-wide \
+                 `GOVERNANCE_PRE_WRITE` one-shot was claimed by a different hook, so the \
+                 no-enqueue invariant this case exists to prove would be asserting nothing."
             );
         }
     }
