@@ -428,6 +428,7 @@ mod arch_9_slug_tests {
             },
             StoreError::BackendUnavailable {
                 backend: "b".into(),
+                sqlstate: None,
                 detail: "d".into(),
             },
             StoreError::InvalidInput { detail: "d".into() },

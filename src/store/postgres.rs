@@ -59,6 +59,14 @@ mod parity_3064;
 // the same qual_10 budget reason as `parity_3064` above.
 mod federation_3075;
 mod pubkey_history;
+// v1.0.0 #3520 — the shared bounded-retry funnel for a transaction PostgreSQL
+// aborted as a concurrency victim (40P01 / 40001). Own module for the same
+// qual_10 budget reason as `parity_3064` above.
+mod tx_retry;
+// v1.0.0 #3520 — catalog pre-check that lets an already-migrated database
+// take NO relation-level DDL lock on connect. Own module for the same
+// qual_10 budget reason as `parity_3064` above.
+mod bootstrap_ddl;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -2143,6 +2151,7 @@ async fn acquire_migration_advisory_lock(
         if elapsed >= budget {
             return Err(StoreError::BackendUnavailable {
                 backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                sqlstate: None,
                 detail: format!(
                     "{site}: gave up after {}s waiting for migration advisory lock \
                      {MIGRATION_ADVISORY_LOCK_KEY} held by another session ({probes} probes). \
@@ -2525,6 +2534,7 @@ impl PostgresStore {
             url.parse()
                 .map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
+                    sqlstate: None,
                     // #1579 A3 (SECURITY) — sqlx parse errors can
                     // interpolate the raw URL (credential included)
                     // into their Display; scrub any embedded URL's
@@ -2605,6 +2615,7 @@ impl PostgresStore {
             .await
             .map_err(|e| StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
+                sqlstate: None,
                 detail: format!("connect: {e}"),
             })?;
 
@@ -2631,6 +2642,7 @@ impl PostgresStore {
                 .await
                 .map_err(|e| StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
+                    sqlstate: None,
                     detail: format!("acquire bootstrap lock connection: {e}"),
                 })?;
         // v0.7.0 ship-hardening (2026-05-19, QC P0): the per-session
@@ -2813,6 +2825,7 @@ impl PostgresStore {
                             );
                             return Err(StoreError::BackendUnavailable {
                                 backend: "postgres".to_string(),
+                                sqlstate: None,
                                 detail,
                             });
                         }
@@ -2838,7 +2851,52 @@ impl PostgresStore {
                 }
             }
 
-            let init_sql = render_schema_sql(INIT_SCHEMA, dim);
+            let rendered_sql = render_schema_sql(INIT_SCHEMA, dim);
+            // v1.0.0 #3520 — CATALOG PRE-CHECK. `CREATE INDEX IF NOT EXISTS`
+            // takes a relation-level ShareLock on the table BEFORE it notices
+            // the index is already there, so replaying the ~70 of them in the
+            // bundled script locked ~40 relations on every boot of every
+            // daemon — and ShareLock conflicts with the RowExclusiveLock an
+            // ordinary writer holds, which is the deadlock #3520 observed
+            // (`size_gc delete victim: ... deadlock detected`). Ask the
+            // catalog once and re-emit only the statements whose object is
+            // genuinely absent: on an already-migrated database the surviving
+            // batch contains no CREATE TABLE and no CREATE INDEX at all, so
+            // connecting takes NO relation-level DDL lock. The script stays
+            // idempotent and self-healing (a missing object is still created),
+            // the ladder is untouched, and a fresh database still receives
+            // every statement. A probe failure degrades to the unfiltered
+            // script — worst case, exactly the pre-#3520 boot.
+            let init_sql = if schema_ahead {
+                rendered_sql
+            } else {
+                let statements = bootstrap_ddl::parse(&rendered_sql);
+                let (relations, extensions) = bootstrap_ddl::wanted(&statements);
+                match bootstrap_ddl::probe(&pool, &relations, &extensions).await {
+                    Ok(inventory) => {
+                        let filtered = bootstrap_ddl::filter(&statements, &inventory);
+                        if filtered.is_unfiltered() {
+                            rendered_sql
+                        } else {
+                            tracing::debug!(
+                                target: TRACE_TARGET,
+                                skipped = filtered.skipped,
+                                total = filtered.total,
+                                "#3520: bootstrap DDL trimmed against the catalog; skipped statements take no relation-level lock"
+                            );
+                            filtered.sql
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "#3520: bootstrap catalog pre-check failed; replaying the full idempotent DDL (pre-#3520 behaviour)"
+                        );
+                        rendered_sql
+                    }
+                }
+            };
             let mut last_err: Option<sqlx::Error> = None;
             // v1.0.0 #2445 — `0` attempts when the operator hatch authorised a
             // schema-AHEAD database: this binary's bootstrap set must not be
@@ -2884,6 +2942,7 @@ impl PostgresStore {
                     .unwrap_or_else(|| format!("init schema: {e}"));
                 return Err(StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
+                    sqlstate: None,
                     detail,
                 });
             }
@@ -2897,6 +2956,7 @@ impl PostgresStore {
                 .await
                 .map_err(|e| StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
+                    sqlstate: None,
                     detail: format!("read pgvector version: {e}"),
                 })?;
         if let Some((ver,)) = extver
@@ -7440,6 +7500,7 @@ impl PostgresStore {
             if attempt >= DDL_ARM_MAX_ATTEMPTS {
                 return Err(StoreError::BackendUnavailable {
                     backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                    sqlstate: None,
                     detail: crate::logging::redact_urls_in_message(&format!(
                         "{DDL_BUDGET_EXHAUSTED_MARKER} REFUSING to boot: schema migration \
                          {label} could not acquire the \
@@ -17360,8 +17421,20 @@ async fn pg_apply_entitled_attestation_in_tx(
 
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
+    // v1.0.0 #3520 — capture the backend's OWN machine-readable error code
+    // BEFORE the error is rendered into an operator-facing string. This is the
+    // ONE place a `sqlx::Error` becomes a `StoreError` on this adapter, so it
+    // is also the one place the SQLSTATE can be preserved structurally; every
+    // retry / triage decision downstream reads THIS field rather than
+    // substring-matching `detail` (see [`tx_retry`]). `None` means the failure
+    // was not a database error at all (a pool / connect / config fault).
+    let sqlstate = e
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned);
     StoreError::BackendUnavailable {
         backend: "postgres".to_string(),
+        sqlstate,
         // #1585 (SEC) — the #1579 A3 redaction covered the parse-url
         // site only; this shared helper wraps `pool.acquire` / `begin`
         // / per-statement errors, and `sqlx::Error::Configuration`
@@ -20327,6 +20400,7 @@ impl PostgresStore {
             .await
             .map_err(|e| StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
+                sqlstate: None,
                 detail: e.to_string(),
             })?;
         if engage {
@@ -23583,20 +23657,39 @@ impl MemoryStore for PostgresStore {
         // path does not commit a sever/tombstone for a memory that was never
         // deleted. AGE unprojection stays best-effort after a successful
         // commit (#1783).
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("delete begin tx", e))?;
-        let rows = pg_hard_delete_in_tx(&mut tx, id)
-            .await
-            .map_err(|e| to_store_err("delete", e))?;
-        if rows == 0 {
-            return Err(StoreError::NotFound { id: id.to_string() });
+        // v1.0.0 #3520 — routed through the shared bounded-retry funnel.
+        // `pg_hard_delete_in_tx` touches namespace_meta + forget_tombstones +
+        // memory_links (cascade) + memories in one transaction, so it holds the
+        // multi-relation lock set a concurrent bootstrap's
+        // `CREATE INDEX IF NOT EXISTS` can deadlock against. The AGE
+        // unprojection stays OUTSIDE the retried block: it is a best-effort
+        // post-commit step, and re-running it per attempt would be work outside
+        // the transaction.
+        let mut retry = tx_retry::TxRetry::new("delete tx");
+        loop {
+            let attempt: StoreResult<()> = async {
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| to_store_err("delete begin tx", e))?;
+                let rows = pg_hard_delete_in_tx(&mut tx, id)
+                    .await
+                    .map_err(|e| to_store_err("delete", e))?;
+                if rows == 0 {
+                    return Err(StoreError::NotFound { id: id.to_string() });
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("delete commit tx", e))?;
+                Ok(())
+            }
+            .await;
+            match attempt {
+                Ok(()) => break,
+                Err(e) => retry.consider(e).await?,
+            }
         }
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("delete commit tx", e))?;
         self.unproject_memory_ids_best_effort(&[id]).await;
         Ok(())
     }
@@ -27289,302 +27382,320 @@ impl MemoryStore for PostgresStore {
         // write landing between them could leave the archived-set and
         // deleted-set diverging → a row DELETEd that the archive-SELECT never
         // captured = irrecoverable loss. One tx pins both to the same snapshot.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("forget begin tx", e))?;
-
-        if archive {
-            // Insert matching rows into archived_memories before deletion.
-            sqlx::query(&format!(
-                "INSERT INTO archived_memories (
-                    id, tier, namespace, title, content, tags, priority, confidence,
-                    source, access_count, created_at, updated_at, last_accessed_at,
-                    expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                    -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
-                    reflection_depth, atomised_into, atom_of, memory_kind,
-                    entity_id, persona_version, citations, source_uri, source_span,
-                    confidence_source, confidence_signals, confidence_decayed_at,
-                    -- #2196 - carry lifecycle_state so a non-open archived state
-                    -- survives the archive->restore round-trip (restore no longer
-                    -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                )
-                SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                       source, access_count, created_at, updated_at, last_accessed_at,
-                       expires_at, $4::timestamptz, 'forget', metadata,
-                       embedding, embedding_dim, embedding_space, tier, expires_at,
-                       reflection_depth, atomised_into, atom_of, memory_kind,
-                       entity_id, persona_version, citations, source_uri, source_span,
-                       confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                FROM memories
-                WHERE ($1::text IS NULL OR namespace = $1)
-                  AND ($2::text IS NULL OR tier = $2)
-                  AND ($3::text IS NULL
-                       OR tsv @@ plainto_tsquery('english', $3))
-                -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
-                {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
-            ))
-            .bind(namespace)
-            .bind(tier_str.as_deref())
-            .bind(pattern)
-            .bind(parse_rfc3339_required(&now)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("forget archive copy", e))?;
-        }
-
-        // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
-        // memories' `memory_links` into `archived_memory_links` BEFORE the
-        // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
-        // CASCADE`). Reuse the IDENTICAL forget predicate as a victim
-        // subquery so the snapshot and the delete pin to the same row set
-        // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
-        // twin of the SQLite `archive_links_for_memory` snapshot.
-        //
-        // #2313 — runs ONLY when `archive`, matching the sqlite contract
-        // ("Runs only when `archive` so a hard (non-recoverable) forget
-        // keeps its documented edge-loss", src/storage/mod.rs). Pre-fix
-        // this INSERT ran unconditionally, so an erasure-intent hard
-        // forget (archive = false) permanently retained the victims' edge
-        // topology (relation, observed_by, signature, valid intervals) as
-        // orphan rows no code path ever reaps — with no archived_memories
-        // row, restore could never consume them and archive_purge never
-        // touches archived_memory_links.
-        if archive {
-            sqlx::query(
-                "INSERT INTO archived_memory_links (
-                     source_id, target_id, relation, created_at, valid_from,
-                     valid_until, observed_by, signature, attest_level, archived_at,
-                     source_cid, target_cid
-                 )
-                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                        ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                        ml.attest_level, now(), ml.source_cid, ml.target_cid
-                 FROM memory_links ml
-                 WHERE ml.source_id IN (
-                           SELECT id FROM memories
-                           WHERE ($1::text IS NULL OR namespace = $1)
-                             AND ($2::text IS NULL OR tier = $2)
-                             AND ($3::text IS NULL
-                                  OR tsv @@ plainto_tsquery('english', $3)))
-                    OR ml.target_id IN (
-                           SELECT id FROM memories
-                           WHERE ($1::text IS NULL OR namespace = $1)
-                             AND ($2::text IS NULL OR tier = $2)
-                             AND ($3::text IS NULL
-                                  OR tsv @@ plainto_tsquery('english', $3)))
-                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
-            )
-            .bind(namespace)
-            .bind(tier_str.as_deref())
-            .bind(pattern)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("forget snapshot links", e))?;
-        }
-
-        // v0.9.0 G8 (#1825) T7 — erasure invariant (postgres parity/defence):
-        // NULL the `cid_genesis` pre-image for every row this forget will
-        // reap, BEFORE the delete, mirroring the sqlite `forget_scrub_cid_genesis`.
-        // The DELETE below hard-deletes the row so this scrub is belt-and-braces
-        // (a rollback discards both); it keeps the erase-the-pre-image contract
-        // explicit and correct should this path ever become a soft-delete. The
-        // predicate matches the DELETE's victim set EXACTLY.
-        sqlx::query(
-            "UPDATE memories SET cid_genesis = NULL
-             WHERE cid_genesis IS NOT NULL
-               AND ($1::text IS NULL OR namespace = $1)
-               AND ($2::text IS NULL OR tier = $2)
-               AND ($3::text IS NULL
-                    OR tsv @@ plainto_tsquery('english', $3))",
-        )
-        .bind(namespace)
-        .bind(tier_str.as_deref())
-        .bind(pattern)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
-
-        // #1956 [R56] — CRYPTO-ERASE the per-record envelope key for every
-        // encrypted (0x03) row this forget will reap, BEFORE the delete
-        // (postgres parity with the sqlite `crypto_erase_record_envelope`).
-        // Overwriting the envelope with the destroy marker destroys the
-        // embedded wrapped DEK so the ciphertext is cryptographically
-        // unrecoverable even by a holder of the master KEK; the marker
-        // propagates to replicas / WAL as an UPDATE ahead of the tombstoning
-        // delete. `get_byte(...,0) = 3` selects only per-record envelopes —
-        // legacy 0x02 per-agent rows have no per-record key to destroy (the
-        // honest limit) and are left for row-delete + tombstone only. The
-        // predicate matches the DELETE's victim set EXACTLY. RETURNING id so
-        // the erasure-kind of each victim is known for the attestation below.
-        let erased_ids: Vec<(String,)> = sqlx::query_as(
-            "UPDATE memories SET encrypted_envelope = $4
-             WHERE encrypted_envelope IS NOT NULL
-               AND get_byte(encrypted_envelope, 0) = 3
-               AND ($1::text IS NULL OR namespace = $1)
-               AND ($2::text IS NULL OR tier = $2)
-               AND ($3::text IS NULL
-                    OR tsv @@ plainto_tsquery('english', $3))
-             RETURNING id",
-        )
-        .bind(namespace)
-        .bind(tier_str.as_deref())
-        .bind(pattern)
-        .bind(crate::encryption::crypto_erase_marker())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;
-        let erased_set: std::collections::HashSet<String> =
-            erased_ids.into_iter().map(|(id,)| id).collect();
-
-        // #1783 — RETURNING id so the deleted set is known for AGE
-        // unprojection in THIS tx (the projection commits atomically with
-        // the cascade delete; ghost edges never appear).
-        // W2.3 — RETURNING namespace + agent_id too so the FORGET tombstones
-        // can be recorded in THIS tx (the rows are gone after the DELETE).
-        let deleted: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "DELETE FROM memories
-             WHERE ($1::text IS NULL OR namespace = $1)
-               AND ($2::text IS NULL OR tier = $2)
-               AND ($3::text IS NULL
-                    OR tsv @@ plainto_tsquery('english', $3))
-             RETURNING id, namespace, metadata->>'agent_id'",
-        )
-        .bind(namespace)
-        .bind(tier_str.as_deref())
-        .bind(pattern)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("forget delete", e))?;
-
-        if matches!(self.kg_backend, KgBackend::Age) {
-            for (id, _, _) in &deleted {
-                unproject_memory_from_age(&mut tx, id).await?;
-            }
-        }
-
-        // v0.8.1 W2 (#1821 / gap G30) — postgres parity for the sqlite
-        // `purge_and_tombstone_forget`: purge the non-cascaded derived-store
-        // leaks (`federation_push_dlq` cleartext, `transcript_line_dedup`
-        // hash-oracle) AND record a FORGET tombstone per deleted id, all in
-        // THIS tx. 5-agent vote 4d3ea1c5.
-        if !deleted.is_empty() {
-            let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
-            // #3286 — route through the shared SSOT so this forget reap and the
-            // delete / evict primitives cannot drift on which remanence tables
-            // a crypto-erase purges.
-            pg_purge_dlq_dedup_in_tx(&mut tx, &ids)
-                .await
-                .map_err(|e| to_store_err("forget purge dlq/dedup remanence", e))?;
-            // W2.3 SIGNED tombstones — bulk insert via UNNEST. Identity + time
-            // + owner only (NO content). Each signs the canonical
-            // {memory_id, namespace, forgotten_at} bytes with the daemon audit
-            // key (unsigned when absent) — parity with the sqlite path.
-            let now = chrono::Utc::now().to_rfc3339();
-            let namespaces: Vec<String> = deleted.iter().map(|(_, ns, _)| ns.clone()).collect();
-            let agents: Vec<Option<String>> = deleted.iter().map(|(_, _, a)| a.clone()).collect();
-            let forgotten: Vec<String> = vec![now.clone(); deleted.len()];
-            let signatures: Vec<Option<Vec<u8>>> = deleted
-                .iter()
-                .map(|(id, ns, _)| {
-                    let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now);
-                    crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
-                })
-                .collect();
-            sqlx::query(
-                "INSERT INTO forget_tombstones \
-                     (memory_id, namespace, forgotten_at, agent_id, signature) \
-                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[]) \
-                 ON CONFLICT (memory_id) DO NOTHING",
-            )
-            .bind(&ids)
-            .bind(&namespaces)
-            .bind(&forgotten)
-            .bind(&agents)
-            .bind(&signatures)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("forget record tombstones", e))?;
-
-            // #1956 [R56] — signed `substrate.crypto_erase` erasure attestation
-            // per victim IN THIS tx (postgres parity with the sqlite
-            // `emit_crypto_erase_attestation`). Commits {id, erasure-kind,
-            // actor, timestamp}: `key-destroyed` when the row's per-record
-            // envelope key was destroyed above, else `row-deleted-tombstoned`
-            // (the honest plaintext / legacy-0x02 limit). Chained + verified by
-            // `verify_audit_trail` like every other signed event.
-            let erase_ts = chrono::Utc::now();
-            let erase_ts_str = erase_ts.to_rfc3339();
-            for (id, _ns, agent) in &deleted {
-                let kind = if erased_set.contains(id) {
-                    crate::storage::ErasureKind::KeyDestroyed
-                } else {
-                    crate::storage::ErasureKind::RowDeletedTombstoned
-                };
-                let actor = agent
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(crate::storage::CRYPTO_ERASE_ACTOR_FORGET);
-                let signable =
-                    crate::storage::crypto_erase_signable_bytes(id, kind, actor, &erase_ts_str);
-                let ph = crate::signed_events::payload_hash(&signable);
-                let event = crate::signed_events::SignedEvent::with_daemon_signature(
-                    ph,
-                    actor.to_string(),
-                    crate::signed_events::event_types::SUBSTRATE_CRYPTO_ERASE.to_string(),
-                    erase_ts_str.clone(),
-                    None,
-                );
-                pg_append_signed_event_with_chain_in_tx(
-                    &mut tx,
-                    PgSignedEventInsert {
-                        id: &event.id,
-                        agent_id: &event.agent_id,
-                        event_type: &event.event_type,
-                        payload_hash: &event.payload_hash,
-                        signature: event.signature.as_deref(),
-                        attest_level: &event.attest_level,
-                        timestamp: erase_ts,
-                        cause_hash: None,
-                    },
-                )
-                .await
-                .map_err(|e| to_store_err("forget crypto_erase attestation", e))?;
-            }
-
-            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
-            // append ONE identity-only FORGET leaf per deleted id IN THIS
-            // tx (the cascade DELETE already ran with RETURNING, so a
-            // rollback discards leaf + delete together). Reuses the same
-            // victim set as the W2.3 tombstones above; the leaf NEVER
-            // carries content — destruction stays the right-to-be-forgotten
-            // path.
-            if crate::config::append_only_enabled() {
-                for ((id, ns), agent) in ids.iter().zip(&namespaces).zip(&agents) {
-                    pg_emit_revision_leaf_if_enabled(
-                        &mut tx,
-                        id,
-                        crate::revisions::RecordKind::Forget,
-                        None,
-                        ns,
-                        agent.as_deref(),
-                        &now,
-                    )
+        // v1.0.0 #3520 — routed through the shared bounded-retry funnel. This
+        // funnel touches the same relation set as `run_gc` / `size_gc`
+        // (archive-copy + link snapshot + cascade DELETE), so a concurrent
+        // bootstrap's relation-level ShareLock can make PostgreSQL pick it as
+        // the deadlock victim. `now` / `tier_str` are pinned OUTSIDE the loop so
+        // every attempt archives under the SAME stamp and the same filter; the
+        // block below has no effect outside the transaction.
+        let mut retry = tx_retry::TxRetry::new("forget archive+delete tx");
+        let deleted_count: usize = loop {
+            let attempt: StoreResult<usize> = async {
+                let mut tx = self
+                    .pool
+                    .begin()
                     .await
-                    .map_err(|e| to_store_err("append forget revision leaf", e))?;
+                    .map_err(|e| to_store_err("forget begin tx", e))?;
+
+                if archive {
+                    // Insert matching rows into archived_memories before deletion.
+                    sqlx::query(&format!(
+                        "INSERT INTO archived_memories (
+                            id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, archived_at, archive_reason, metadata,
+                            embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
+                            -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            -- #2196 - carry lifecycle_state so a non-open archived state
+                            -- survives the archive->restore round-trip (restore no longer
+                            -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        )
+                        SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                               source, access_count, created_at, updated_at, last_accessed_at,
+                               expires_at, $4::timestamptz, 'forget', metadata,
+                               embedding, embedding_dim, embedding_space, tier, expires_at,
+                               reflection_depth, atomised_into, atom_of, memory_kind,
+                               entity_id, persona_version, citations, source_uri, source_span,
+                               confidence_source, confidence_signals, confidence_decayed_at,
+                               mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        FROM memories
+                        WHERE ($1::text IS NULL OR namespace = $1)
+                          AND ($2::text IS NULL OR tier = $2)
+                          AND ($3::text IS NULL
+                               OR tsv @@ plainto_tsquery('english', $3))
+                        -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                        {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+                    ))
+                    .bind(namespace)
+                    .bind(tier_str.as_deref())
+                    .bind(pattern)
+                    .bind(parse_rfc3339_required(&now)?)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("forget archive copy", e))?;
                 }
+
+                // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
+                // memories' `memory_links` into `archived_memory_links` BEFORE the
+                // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
+                // CASCADE`). Reuse the IDENTICAL forget predicate as a victim
+                // subquery so the snapshot and the delete pin to the same row set
+                // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
+                // twin of the SQLite `archive_links_for_memory` snapshot.
+                //
+                // #2313 — runs ONLY when `archive`, matching the sqlite contract
+                // ("Runs only when `archive` so a hard (non-recoverable) forget
+                // keeps its documented edge-loss", src/storage/mod.rs). Pre-fix
+                // this INSERT ran unconditionally, so an erasure-intent hard
+                // forget (archive = false) permanently retained the victims' edge
+                // topology (relation, observed_by, signature, valid intervals) as
+                // orphan rows no code path ever reaps — with no archived_memories
+                // row, restore could never consume them and archive_purge never
+                // touches archived_memory_links.
+                if archive {
+                    sqlx::query(
+                        "INSERT INTO archived_memory_links (
+                             source_id, target_id, relation, created_at, valid_from,
+                             valid_until, observed_by, signature, attest_level, archived_at,
+                             source_cid, target_cid
+                         )
+                         SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                                ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                                ml.attest_level, now(), ml.source_cid, ml.target_cid
+                         FROM memory_links ml
+                         WHERE ml.source_id IN (
+                                   SELECT id FROM memories
+                                   WHERE ($1::text IS NULL OR namespace = $1)
+                                     AND ($2::text IS NULL OR tier = $2)
+                                     AND ($3::text IS NULL
+                                          OR tsv @@ plainto_tsquery('english', $3)))
+                            OR ml.target_id IN (
+                                   SELECT id FROM memories
+                                   WHERE ($1::text IS NULL OR namespace = $1)
+                                     AND ($2::text IS NULL OR tier = $2)
+                                     AND ($3::text IS NULL
+                                          OR tsv @@ plainto_tsquery('english', $3)))
+                         ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+                    )
+                    .bind(namespace)
+                    .bind(tier_str.as_deref())
+                    .bind(pattern)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("forget snapshot links", e))?;
+                }
+
+                // v0.9.0 G8 (#1825) T7 — erasure invariant (postgres parity/defence):
+                // NULL the `cid_genesis` pre-image for every row this forget will
+                // reap, BEFORE the delete, mirroring the sqlite `forget_scrub_cid_genesis`.
+                // The DELETE below hard-deletes the row so this scrub is belt-and-braces
+                // (a rollback discards both); it keeps the erase-the-pre-image contract
+                // explicit and correct should this path ever become a soft-delete. The
+                // predicate matches the DELETE's victim set EXACTLY.
+                sqlx::query(
+                    "UPDATE memories SET cid_genesis = NULL
+                     WHERE cid_genesis IS NOT NULL
+                       AND ($1::text IS NULL OR namespace = $1)
+                       AND ($2::text IS NULL OR tier = $2)
+                       AND ($3::text IS NULL
+                            OR tsv @@ plainto_tsquery('english', $3))",
+                )
+                .bind(namespace)
+                .bind(tier_str.as_deref())
+                .bind(pattern)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
+
+                // #1956 [R56] — CRYPTO-ERASE the per-record envelope key for every
+                // encrypted (0x03) row this forget will reap, BEFORE the delete
+                // (postgres parity with the sqlite `crypto_erase_record_envelope`).
+                // Overwriting the envelope with the destroy marker destroys the
+                // embedded wrapped DEK so the ciphertext is cryptographically
+                // unrecoverable even by a holder of the master KEK; the marker
+                // propagates to replicas / WAL as an UPDATE ahead of the tombstoning
+                // delete. `get_byte(...,0) = 3` selects only per-record envelopes —
+                // legacy 0x02 per-agent rows have no per-record key to destroy (the
+                // honest limit) and are left for row-delete + tombstone only. The
+                // predicate matches the DELETE's victim set EXACTLY. RETURNING id so
+                // the erasure-kind of each victim is known for the attestation below.
+                let erased_ids: Vec<(String,)> = sqlx::query_as(
+                    "UPDATE memories SET encrypted_envelope = $4
+                     WHERE encrypted_envelope IS NOT NULL
+                       AND get_byte(encrypted_envelope, 0) = 3
+                       AND ($1::text IS NULL OR namespace = $1)
+                       AND ($2::text IS NULL OR tier = $2)
+                       AND ($3::text IS NULL
+                            OR tsv @@ plainto_tsquery('english', $3))
+                     RETURNING id",
+                )
+                .bind(namespace)
+                .bind(tier_str.as_deref())
+                .bind(pattern)
+                .bind(crate::encryption::crypto_erase_marker())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;
+                let erased_set: std::collections::HashSet<String> =
+                    erased_ids.into_iter().map(|(id,)| id).collect();
+
+                // #1783 — RETURNING id so the deleted set is known for AGE
+                // unprojection in THIS tx (the projection commits atomically with
+                // the cascade delete; ghost edges never appear).
+                // W2.3 — RETURNING namespace + agent_id too so the FORGET tombstones
+                // can be recorded in THIS tx (the rows are gone after the DELETE).
+                let deleted: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                    "DELETE FROM memories
+                     WHERE ($1::text IS NULL OR namespace = $1)
+                       AND ($2::text IS NULL OR tier = $2)
+                       AND ($3::text IS NULL
+                            OR tsv @@ plainto_tsquery('english', $3))
+                     RETURNING id, namespace, metadata->>'agent_id'",
+                )
+                .bind(namespace)
+                .bind(tier_str.as_deref())
+                .bind(pattern)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget delete", e))?;
+
+                if matches!(self.kg_backend, KgBackend::Age) {
+                    for (id, _, _) in &deleted {
+                        unproject_memory_from_age(&mut tx, id).await?;
+                    }
+                }
+
+                // v0.8.1 W2 (#1821 / gap G30) — postgres parity for the sqlite
+                // `purge_and_tombstone_forget`: purge the non-cascaded derived-store
+                // leaks (`federation_push_dlq` cleartext, `transcript_line_dedup`
+                // hash-oracle) AND record a FORGET tombstone per deleted id, all in
+                // THIS tx. 5-agent vote 4d3ea1c5.
+                if !deleted.is_empty() {
+                    let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
+                    // #3286 — route through the shared SSOT so this forget reap and the
+                    // delete / evict primitives cannot drift on which remanence tables
+                    // a crypto-erase purges.
+                    pg_purge_dlq_dedup_in_tx(&mut tx, &ids)
+                        .await
+                        .map_err(|e| to_store_err("forget purge dlq/dedup remanence", e))?;
+                    // W2.3 SIGNED tombstones — bulk insert via UNNEST. Identity + time
+                    // + owner only (NO content). Each signs the canonical
+                    // {memory_id, namespace, forgotten_at} bytes with the daemon audit
+                    // key (unsigned when absent) — parity with the sqlite path.
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let namespaces: Vec<String> = deleted.iter().map(|(_, ns, _)| ns.clone()).collect();
+                    let agents: Vec<Option<String>> = deleted.iter().map(|(_, _, a)| a.clone()).collect();
+                    let forgotten: Vec<String> = vec![now.clone(); deleted.len()];
+                    let signatures: Vec<Option<Vec<u8>>> = deleted
+                        .iter()
+                        .map(|(id, ns, _)| {
+                            let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now);
+                            crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
+                        })
+                        .collect();
+                    sqlx::query(
+                        "INSERT INTO forget_tombstones \
+                             (memory_id, namespace, forgotten_at, agent_id, signature) \
+                         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[]) \
+                         ON CONFLICT (memory_id) DO NOTHING",
+                    )
+                    .bind(&ids)
+                    .bind(&namespaces)
+                    .bind(&forgotten)
+                    .bind(&agents)
+                    .bind(&signatures)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("forget record tombstones", e))?;
+
+                    // #1956 [R56] — signed `substrate.crypto_erase` erasure attestation
+                    // per victim IN THIS tx (postgres parity with the sqlite
+                    // `emit_crypto_erase_attestation`). Commits {id, erasure-kind,
+                    // actor, timestamp}: `key-destroyed` when the row's per-record
+                    // envelope key was destroyed above, else `row-deleted-tombstoned`
+                    // (the honest plaintext / legacy-0x02 limit). Chained + verified by
+                    // `verify_audit_trail` like every other signed event.
+                    let erase_ts = chrono::Utc::now();
+                    let erase_ts_str = erase_ts.to_rfc3339();
+                    for (id, _ns, agent) in &deleted {
+                        let kind = if erased_set.contains(id) {
+                            crate::storage::ErasureKind::KeyDestroyed
+                        } else {
+                            crate::storage::ErasureKind::RowDeletedTombstoned
+                        };
+                        let actor = agent
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(crate::storage::CRYPTO_ERASE_ACTOR_FORGET);
+                        let signable =
+                            crate::storage::crypto_erase_signable_bytes(id, kind, actor, &erase_ts_str);
+                        let ph = crate::signed_events::payload_hash(&signable);
+                        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+                            ph,
+                            actor.to_string(),
+                            crate::signed_events::event_types::SUBSTRATE_CRYPTO_ERASE.to_string(),
+                            erase_ts_str.clone(),
+                            None,
+                        );
+                        pg_append_signed_event_with_chain_in_tx(
+                            &mut tx,
+                            PgSignedEventInsert {
+                                id: &event.id,
+                                agent_id: &event.agent_id,
+                                event_type: &event.event_type,
+                                payload_hash: &event.payload_hash,
+                                signature: event.signature.as_deref(),
+                                attest_level: &event.attest_level,
+                                timestamp: erase_ts,
+                                cause_hash: None,
+                            },
+                        )
+                        .await
+                        .map_err(|e| to_store_err("forget crypto_erase attestation", e))?;
+                    }
+
+                    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+                    // append ONE identity-only FORGET leaf per deleted id IN THIS
+                    // tx (the cascade DELETE already ran with RETURNING, so a
+                    // rollback discards leaf + delete together). Reuses the same
+                    // victim set as the W2.3 tombstones above; the leaf NEVER
+                    // carries content — destruction stays the right-to-be-forgotten
+                    // path.
+                    if crate::config::append_only_enabled() {
+                        for ((id, ns), agent) in ids.iter().zip(&namespaces).zip(&agents) {
+                            pg_emit_revision_leaf_if_enabled(
+                                &mut tx,
+                                id,
+                                crate::revisions::RecordKind::Forget,
+                                None,
+                                ns,
+                                agent.as_deref(),
+                                &now,
+                            )
+                            .await
+                            .map_err(|e| to_store_err("append forget revision leaf", e))?;
+                        }
+                    }
+                }
+
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("forget commit tx", e))?;
+                Ok(deleted.len())
             }
-        }
+            .await;
+            match attempt {
+                Ok(v) => break v,
+                Err(e) => retry.consider(e).await?,
+            }
+        };
 
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("forget commit tx", e))?;
-
-        Ok(deleted.len())
+        Ok(deleted_count)
     }
 
     async fn forget_distinct_namespaces(
@@ -29957,184 +30068,203 @@ impl MemoryStore for PostgresStore {
         // Pinned by `tests/store_parity_gaps.rs::run_gc_is_transactional_1026`
         // (crash-injection: drop tx mid-flow, assert no orphans).
         let now = chrono::Utc::now();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("gc begin tx", e))?;
+        // v1.0.0 #3520 — routed through the shared bounded-retry funnel:
+        // this is the `size_gc` twin (archive-copy + link snapshot +
+        // cascade DELETE + AGE unprojection in one tx), so it races a
+        // concurrent bootstrap's relation-level ShareLock the same way and
+        // can be picked as the deadlock victim. `now` is pinned OUTSIDE the
+        // loop on purpose: every attempt evaluates the SAME `expires_at <
+        // $1` horizon, so a retry cannot widen the eviction set. Nothing in
+        // the block below has an effect outside the transaction.
+        let mut retry = tx_retry::TxRetry::new("run_gc sweep tx");
+        let evicted_count: usize = loop {
+            let attempt: StoreResult<usize> = async {
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| to_store_err("gc begin tx", e))?;
 
-        if archive {
-            sqlx::query(&format!(
-                "INSERT INTO archived_memories (
-                    id, tier, namespace, title, content, tags, priority, confidence,
-                    source, access_count, created_at, updated_at, last_accessed_at,
-                    expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                    -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
-                    reflection_depth, atomised_into, atom_of, memory_kind,
-                    entity_id, persona_version, citations, source_uri, source_span,
-                    confidence_source, confidence_signals, confidence_decayed_at,
-                    -- #2196 - carry lifecycle_state through the TTL archive so a
-                    -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                if archive {
+                    sqlx::query(&format!(
+                        "INSERT INTO archived_memories (
+                            id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, archived_at, archive_reason, metadata,
+                            embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
+                            -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            -- #2196 - carry lifecycle_state through the TTL archive so a
+                            -- non-open state survives archive->restore (postgres parity).
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        )
+                        SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                               source, access_count, created_at, updated_at, last_accessed_at,
+                               expires_at, $1::timestamptz, 'ttl_expired', metadata,
+                               embedding, embedding_dim, embedding_space, tier, expires_at,
+                               reflection_depth, atomised_into, atom_of, memory_kind,
+                               entity_id, persona_version, citations, source_uri, source_span,
+                               confidence_source, confidence_signals, confidence_decayed_at,
+                               mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        FROM memories
+                        WHERE expires_at IS NOT NULL AND expires_at < $1
+                        -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                        {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+                    ))
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("gc archive copy", e))?;
+
+                    // #3161 (v1.0.0) — DATA-LOSS CLOSE, postgres twin of the SQLite
+                    // `storage::gc` snapshot. The archive copy above moves only the
+                    // memory ROW; `memory_links` carries an `ON DELETE CASCADE` FK on
+                    // both endpoints, so the RETURNING DELETE below reaps every edge of
+                    // every TTL-evicted row and `archive_restore` used to bring the row
+                    // back with an EMPTY edge graph — while `archive_by_ids` (the
+                    // manual/forget funnel) has snapshotted them since #1771. Set-based
+                    // over the SAME expiry predicate the DELETE uses, inside the SAME
+                    // tx, BEFORE the delete. Idempotent via the PK `ON CONFLICT DO
+                    // NOTHING`, so an edge already snapshotted by another funnel is
+                    // left untouched.
+                    sqlx::query(
+                        "INSERT INTO archived_memory_links (
+                             source_id, target_id, relation, created_at, valid_from,
+                             valid_until, observed_by, signature, attest_level, archived_at,
+                             source_cid, target_cid
+                         )
+                         SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                                ml.valid_from, ml.valid_until, ml.observed_by,
+                                ml.signature, ml.attest_level, $1::timestamptz,
+                                ml.source_cid, ml.target_cid
+                         FROM memory_links ml
+                         WHERE ml.source_id IN (
+                                   SELECT id FROM memories
+                                   WHERE expires_at IS NOT NULL AND expires_at < $1)
+                            OR ml.target_id IN (
+                                   SELECT id FROM memories
+                                   WHERE expires_at IS NOT NULL AND expires_at < $1)
+                         ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+                    )
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("gc snapshot links", e))?;
+                }
+
+                // v1.0.0 #3177 [data-integrity/security, BLOCKING] — MANDATORY
+                // tombstone + crypto-erase on the HARD-DELETE (non-archive) eviction
+                // path, BEFORE the DELETE, in THIS tx.
+                //
+                // `grep -rn evict_tombstone_and_erase src/` matched the sqlite gc /
+                // size_gc callers ONLY: the postgres twins DELETEd outright. Two
+                // consequences, both prime-directive-class:
+                //   * a TTL-evicted ENCRYPTED row left its per-record envelope key
+                //     intact, so the retention/erasure claim held on sqlite and not on
+                //     postgres — a backend-dependent erasure guarantee;
+                //   * the eviction left NO forget-tombstone, so a federated peer's
+                //     copy of the evicted row was accepted straight back by
+                //     `apply_remote_memory` under LWW. On sqlite the tombstone refuses
+                //     it. "Evicted" that silently un-evicts is data the operator
+                //     believes is gone.
+                //
+                // When `archive` is true the row is COPIED to `archived_memories`
+                // first — a recoverable MOVE, not an erasure — so no tombstone/erase
+                // there, exactly as the sqlite twin reasons; the archive reaper is the
+                // erasure point for archived rows.
+                //
+                // The victim set is read `FOR UPDATE` with the IDENTICAL predicate the
+                // DELETE below uses, inside this one transaction, so the erased +
+                // tombstoned set and the deleted set cannot diverge.
+                let tombstoned: Option<Vec<String>> = if archive {
+                    None
+                } else {
+                    let victims: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                        "SELECT id, namespace, metadata->>'agent_id' FROM memories \
+                         WHERE expires_at IS NOT NULL AND expires_at < $1 \
+                         FOR UPDATE",
+                    )
+                    .bind(now)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("gc read evict victims", e))?;
+                    crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(&mut tx, &victims, now)
+                        .await?;
+                    Some(victims.into_iter().map(|(id, _, _)| id).collect())
+                };
+
+                // #1783 — RETURNING id so the TTL-evicted set is known for AGE
+                // unprojection in THIS tx. gc is the most common delete path; the
+                // v70 "don't snapshot auto-eviction" restore-rationale never
+                // transferred to a SECONDARY query index — a gc-evicted memory still
+                // leaves a ghost :Memory node/edges that kg_query would return. (That
+                // rationale is now retired outright: #3161 snapshots the edge graph
+                // on this funnel too, immediately above.)
+                //
+                // v1.0.0 #3177 — on the HARD-DELETE path the DELETE is PINNED to the
+                // exact id set that was just tombstoned + crypto-erased, rather than
+                // re-evaluating `expires_at < $1` a second time. Postgres runs this tx
+                // at READ COMMITTED, so a row committed by a concurrent writer between
+                // the `FOR UPDATE` victim read and this statement — a fresh row that is
+                // ALREADY expired, which `store` accepts — would otherwise satisfy the
+                // predicate and be deleted with NO tombstone and NO erase: precisely
+                // the #3177 defect, reintroduced through a race. The sqlite twin cannot
+                // hit this because `BEGIN IMMEDIATE` holds the single writer lock for
+                // the whole sweep; on postgres the id pin is the equivalent guarantee.
+                // Such a row is simply left for the next gc tick, which tombstones it
+                // properly. `archive = true` binds NULL and keeps the original
+                // predicate: that path is a recoverable MOVE with no erasure to pair.
+                let evicted: Vec<(String, String)> = sqlx::query_as(
+                    "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
+                       AND ($2::text[] IS NULL OR id = ANY($2)) \
+                     RETURNING id, namespace",
                 )
-                SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                       source, access_count, created_at, updated_at, last_accessed_at,
-                       expires_at, $1::timestamptz, 'ttl_expired', metadata,
-                       embedding, embedding_dim, embedding_space, tier, expires_at,
-                       reflection_depth, atomised_into, atom_of, memory_kind,
-                       entity_id, persona_version, citations, source_uri, source_span,
-                       confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                FROM memories
-                WHERE expires_at IS NOT NULL AND expires_at < $1
-                -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
-                {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
-            ))
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("gc archive copy", e))?;
-
-            // #3161 (v1.0.0) — DATA-LOSS CLOSE, postgres twin of the SQLite
-            // `storage::gc` snapshot. The archive copy above moves only the
-            // memory ROW; `memory_links` carries an `ON DELETE CASCADE` FK on
-            // both endpoints, so the RETURNING DELETE below reaps every edge of
-            // every TTL-evicted row and `archive_restore` used to bring the row
-            // back with an EMPTY edge graph — while `archive_by_ids` (the
-            // manual/forget funnel) has snapshotted them since #1771. Set-based
-            // over the SAME expiry predicate the DELETE uses, inside the SAME
-            // tx, BEFORE the delete. Idempotent via the PK `ON CONFLICT DO
-            // NOTHING`, so an edge already snapshotted by another funnel is
-            // left untouched.
-            sqlx::query(
-                "INSERT INTO archived_memory_links (
-                     source_id, target_id, relation, created_at, valid_from,
-                     valid_until, observed_by, signature, attest_level, archived_at,
-                     source_cid, target_cid
-                 )
-                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                        ml.valid_from, ml.valid_until, ml.observed_by,
-                        ml.signature, ml.attest_level, $1::timestamptz,
-                        ml.source_cid, ml.target_cid
-                 FROM memory_links ml
-                 WHERE ml.source_id IN (
-                           SELECT id FROM memories
-                           WHERE expires_at IS NOT NULL AND expires_at < $1)
-                    OR ml.target_id IN (
-                           SELECT id FROM memories
-                           WHERE expires_at IS NOT NULL AND expires_at < $1)
-                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
-            )
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("gc snapshot links", e))?;
-        }
-
-        // v1.0.0 #3177 [data-integrity/security, BLOCKING] — MANDATORY
-        // tombstone + crypto-erase on the HARD-DELETE (non-archive) eviction
-        // path, BEFORE the DELETE, in THIS tx.
-        //
-        // `grep -rn evict_tombstone_and_erase src/` matched the sqlite gc /
-        // size_gc callers ONLY: the postgres twins DELETEd outright. Two
-        // consequences, both prime-directive-class:
-        //   * a TTL-evicted ENCRYPTED row left its per-record envelope key
-        //     intact, so the retention/erasure claim held on sqlite and not on
-        //     postgres — a backend-dependent erasure guarantee;
-        //   * the eviction left NO forget-tombstone, so a federated peer's
-        //     copy of the evicted row was accepted straight back by
-        //     `apply_remote_memory` under LWW. On sqlite the tombstone refuses
-        //     it. "Evicted" that silently un-evicts is data the operator
-        //     believes is gone.
-        //
-        // When `archive` is true the row is COPIED to `archived_memories`
-        // first — a recoverable MOVE, not an erasure — so no tombstone/erase
-        // there, exactly as the sqlite twin reasons; the archive reaper is the
-        // erasure point for archived rows.
-        //
-        // The victim set is read `FOR UPDATE` with the IDENTICAL predicate the
-        // DELETE below uses, inside this one transaction, so the erased +
-        // tombstoned set and the deleted set cannot diverge.
-        let tombstoned: Option<Vec<String>> = if archive {
-            None
-        } else {
-            let victims: Vec<(String, String, Option<String>)> = sqlx::query_as(
-                "SELECT id, namespace, metadata->>'agent_id' FROM memories \
-                 WHERE expires_at IS NOT NULL AND expires_at < $1 \
-                 FOR UPDATE",
-            )
-            .bind(now)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("gc read evict victims", e))?;
-            crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(&mut tx, &victims, now)
-                .await?;
-            Some(victims.into_iter().map(|(id, _, _)| id).collect())
-        };
-
-        // #1783 — RETURNING id so the TTL-evicted set is known for AGE
-        // unprojection in THIS tx. gc is the most common delete path; the
-        // v70 "don't snapshot auto-eviction" restore-rationale never
-        // transferred to a SECONDARY query index — a gc-evicted memory still
-        // leaves a ghost :Memory node/edges that kg_query would return. (That
-        // rationale is now retired outright: #3161 snapshots the edge graph
-        // on this funnel too, immediately above.)
-        //
-        // v1.0.0 #3177 — on the HARD-DELETE path the DELETE is PINNED to the
-        // exact id set that was just tombstoned + crypto-erased, rather than
-        // re-evaluating `expires_at < $1` a second time. Postgres runs this tx
-        // at READ COMMITTED, so a row committed by a concurrent writer between
-        // the `FOR UPDATE` victim read and this statement — a fresh row that is
-        // ALREADY expired, which `store` accepts — would otherwise satisfy the
-        // predicate and be deleted with NO tombstone and NO erase: precisely
-        // the #3177 defect, reintroduced through a race. The sqlite twin cannot
-        // hit this because `BEGIN IMMEDIATE` holds the single writer lock for
-        // the whole sweep; on postgres the id pin is the equivalent guarantee.
-        // Such a row is simply left for the next gc tick, which tombstones it
-        // properly. `archive = true` binds NULL and keeps the original
-        // predicate: that path is a recoverable MOVE with no erasure to pair.
-        let evicted: Vec<(String, String)> = sqlx::query_as(
-            "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
-               AND ($2::text[] IS NULL OR id = ANY($2)) \
-             RETURNING id, namespace",
-        )
-        .bind(now)
-        .bind(tombstoned.as_deref())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("gc delete", e))?;
-
-        if matches!(self.kg_backend, KgBackend::Age) {
-            for (id, _) in &evicted {
-                unproject_memory_from_age(&mut tx, id).await?;
-            }
-        }
-
-        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
-        // ONE identity-only EXPIRE leaf per TTL-evicted id IN THIS tx (the
-        // DELETE ran with RETURNING, so a rollback discards leaf + delete
-        // together). Gated so flag-OFF appends nothing.
-        if crate::config::append_only_enabled() {
-            let now_str = now.to_rfc3339();
-            for (id, ns) in &evicted {
-                pg_emit_revision_leaf_if_enabled(
-                    &mut tx,
-                    id,
-                    crate::revisions::RecordKind::Expire,
-                    None,
-                    ns,
-                    None,
-                    &now_str,
-                )
+                .bind(now)
+                .bind(tombstoned.as_deref())
+                .fetch_all(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("append expire revision leaf", e))?;
-            }
-        }
+                .map_err(|e| to_store_err("gc delete", e))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("gc commit", e))?;
+                if matches!(self.kg_backend, KgBackend::Age) {
+                    for (id, _) in &evicted {
+                        unproject_memory_from_age(&mut tx, id).await?;
+                    }
+                }
+
+                // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
+                // ONE identity-only EXPIRE leaf per TTL-evicted id IN THIS tx (the
+                // DELETE ran with RETURNING, so a rollback discards leaf + delete
+                // together). Gated so flag-OFF appends nothing.
+                if crate::config::append_only_enabled() {
+                    let now_str = now.to_rfc3339();
+                    for (id, ns) in &evicted {
+                        pg_emit_revision_leaf_if_enabled(
+                            &mut tx,
+                            id,
+                            crate::revisions::RecordKind::Expire,
+                            None,
+                            ns,
+                            None,
+                            &now_str,
+                        )
+                        .await
+                        .map_err(|e| to_store_err("append expire revision leaf", e))?;
+                    }
+                }
+
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("gc commit", e))?;
+                Ok(evicted.len())
+            }
+            .await;
+            match attempt {
+                Ok(n) => break n,
+                Err(e) => retry.consider(e).await?,
+            }
+        };
 
         // #2503 — best-effort HEAL of namespace_meta dangling references.
         // This sweep used to DELETE the dangling row, which made it the back
@@ -30188,7 +30318,7 @@ impl MemoryStore for PostgresStore {
             );
         }
 
-        Ok(evicted.len())
+        Ok(evicted_count)
     }
 
     async fn size_gc(
@@ -30248,105 +30378,127 @@ impl MemoryStore for PostgresStore {
             // One transaction per victim: archive-INSERT + live-DELETE, the
             // same atomicity contract `run_gc` holds per-#1026 so a crash
             // mid-flow never leaves a row in both tables.
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| to_store_err("size_gc begin tx", e))?;
-
-            if archive {
-                sqlx::query(&format!(
-                    "INSERT INTO archived_memories (
-                        id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, archived_at, archive_reason, metadata,
-                        embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                    )
-                    SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                           source, access_count, created_at, updated_at, last_accessed_at,
-                           expires_at, now(), 'size_gc', metadata,
-                           embedding, embedding_dim, embedding_space, tier, expires_at,
-                           reflection_depth, atomised_into, atom_of, memory_kind,
-                           entity_id, persona_version, citations, source_uri, source_span,
-                           confidence_source, confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                    FROM memories
-                    WHERE id = $1
-                    -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
-                    {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
-                ))
-                .bind(&id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("size_gc archive copy", e))?;
-                // v1.0.0 #3177 / #3161 — snapshot the victim's `memory_links`
-                // into `archived_memory_links` BEFORE the same-tx cascade
-                // DELETE reaps them (FK `ON DELETE CASCADE`). Release already
-                // inlined this SQL (#3161); this cluster routes it through
-                // the `postgres_parity` helper so `forget` / `archive_by_ids`
-                // / `size_gc` share one snapshot funnel.
-                crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, &id).await?;
-            } else {
-                // v1.0.0 #3177 [data-integrity/security, BLOCKING] —
-                // MANDATORY tombstone + crypto-erase on the byte-cap
-                // HARD-DELETE eviction, BEFORE the DELETE, in THIS tx. Same
-                // defect and same reasoning as the `run_gc` twin above: the
-                // sqlite `size_gc` has called `evict_tombstone_and_erase`
-                // unconditionally on this branch since #1956, the postgres
-                // twin DELETEd outright — leaving an encrypted row's key
-                // intact and no federation resurrection guard.
-                let evict_agent: Option<String> =
-                    sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
-                        .bind(&id)
-                        .fetch_optional(&mut *tx)
+            //
+            // v1.0.0 #3520 — routed through the shared bounded-retry
+            // funnel. A concurrent bootstrap's `CREATE INDEX IF NOT
+            // EXISTS` takes a relation-level ShareLock, so PostgreSQL can
+            // pick THIS transaction as the deadlock victim — the observed
+            // `size_gc delete victim: ... deadlock detected`. That abort
+            // is a FULL rollback, and the block below has no effect
+            // outside the transaction (`evicted` / `corpus` advance only
+            // after the commit returns), so re-running it is a first
+            // attempt against an unchanged database, never a partial
+            // replay.
+            let mut retry = tx_retry::TxRetry::new("size_gc victim tx");
+            loop {
+                let attempt: StoreResult<()> = async {
+                    let mut tx = self
+                        .pool
+                        .begin()
                         .await
-                        .map_err(|e| to_store_err("size_gc read evict agent", e))?
-                        .flatten();
-                let victim = [(id.clone(), namespace.to_string(), evict_agent)];
-                crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(
-                    &mut tx,
-                    &victim,
-                    chrono::Utc::now(),
-                )
-                .await?;
-            }
+                        .map_err(|e| to_store_err("size_gc begin tx", e))?;
 
-            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
-            // append ONE identity-only EVICT leaf for this victim IN THIS
-            // tx BEFORE the delete. The inline literal is routed through the
-            // SQL_DELETE_MEMORY_BY_ID SSOT (#1823 worklist). Gated so
-            // flag-OFF appends nothing.
-            if crate::config::append_only_enabled() {
-                pg_emit_revision_leaf_if_enabled(
-                    &mut tx,
-                    &id,
-                    crate::revisions::RecordKind::Evict,
-                    None,
-                    namespace,
-                    None,
-                    &chrono::Utc::now().to_rfc3339(),
-                )
-                .await
-                .map_err(|e| to_store_err("append evict revision leaf", e))?;
-            }
-            sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-                .bind(&id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("size_gc delete victim", e))?;
+                    if archive {
+                        sqlx::query(&format!(
+                            "INSERT INTO archived_memories (
+                                id, tier, namespace, title, content, tags, priority, confidence,
+                                source, access_count, created_at, updated_at, last_accessed_at,
+                                expires_at, archived_at, archive_reason, metadata,
+                                embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
+                                reflection_depth, atomised_into, atom_of, memory_kind,
+                                entity_id, persona_version, citations, source_uri, source_span,
+                                confidence_source, confidence_signals, confidence_decayed_at,
+                                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                            )
+                            SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                                   source, access_count, created_at, updated_at, last_accessed_at,
+                                   expires_at, now(), 'size_gc', metadata,
+                                   embedding, embedding_dim, embedding_space, tier, expires_at,
+                                   reflection_depth, atomised_into, atom_of, memory_kind,
+                                   entity_id, persona_version, citations, source_uri, source_span,
+                                   confidence_source, confidence_signals, confidence_decayed_at,
+                                   mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                            FROM memories
+                            WHERE id = $1
+                            -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                            {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+                        ))
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("size_gc archive copy", e))?;
+                        // v1.0.0 #3177 / #3161 — snapshot the victim's `memory_links`
+                        // into `archived_memory_links` BEFORE the same-tx cascade
+                        // DELETE reaps them (FK `ON DELETE CASCADE`). Release already
+                        // inlined this SQL (#3161); this cluster routes it through
+                        // the `postgres_parity` helper so `forget` / `archive_by_ids`
+                        // / `size_gc` share one snapshot funnel.
+                        crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, &id).await?;
+                    } else {
+                        // v1.0.0 #3177 [data-integrity/security, BLOCKING] —
+                        // MANDATORY tombstone + crypto-erase on the byte-cap
+                        // HARD-DELETE eviction, BEFORE the DELETE, in THIS tx. Same
+                        // defect and same reasoning as the `run_gc` twin above: the
+                        // sqlite `size_gc` has called `evict_tombstone_and_erase`
+                        // unconditionally on this branch since #1956, the postgres
+                        // twin DELETEd outright — leaving an encrypted row's key
+                        // intact and no federation resurrection guard.
+                        let evict_agent: Option<String> =
+                            sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
+                                .bind(&id)
+                                .fetch_optional(&mut *tx)
+                                .await
+                                .map_err(|e| to_store_err("size_gc read evict agent", e))?
+                                .flatten();
+                        let victim = [(id.clone(), namespace.to_string(), evict_agent)];
+                        crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(
+                            &mut tx,
+                            &victim,
+                            chrono::Utc::now(),
+                        )
+                        .await?;
+                    }
 
-            // #1783 — remove the evicted victim's AGE projection in this tx.
-            if matches!(self.kg_backend, KgBackend::Age) {
-                unproject_memory_from_age(&mut tx, &id).await?;
-            }
+                    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+                    // append ONE identity-only EVICT leaf for this victim IN THIS
+                    // tx BEFORE the delete. The inline literal is routed through the
+                    // SQL_DELETE_MEMORY_BY_ID SSOT (#1823 worklist). Gated so
+                    // flag-OFF appends nothing.
+                    if crate::config::append_only_enabled() {
+                        pg_emit_revision_leaf_if_enabled(
+                            &mut tx,
+                            &id,
+                            crate::revisions::RecordKind::Evict,
+                            None,
+                            namespace,
+                            None,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                        .await
+                        .map_err(|e| to_store_err("append evict revision leaf", e))?;
+                    }
+                    sqlx::query(SQL_DELETE_MEMORY_BY_ID)
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("size_gc delete victim", e))?;
 
-            tx.commit()
-                .await
-                .map_err(|e| to_store_err("size_gc commit", e))?;
+                    // #1783 — remove the evicted victim's AGE projection in this tx.
+                    if matches!(self.kg_backend, KgBackend::Age) {
+                        unproject_memory_from_age(&mut tx, &id).await?;
+                    }
+
+                    tx.commit()
+                        .await
+                        .map_err(|e| to_store_err("size_gc commit", e))?;
+                    Ok(())
+                }
+                .await;
+                match attempt {
+                    Ok(()) => break,
+                    Err(e) => retry.consider(e).await?,
+                }
+            }
 
             evicted += 1;
             corpus -= row_bytes;
@@ -30363,375 +30515,402 @@ impl MemoryStore for PostgresStore {
 
     async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop().await?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin archive_restore tx", e))?;
-
-        // v1.0.0 #3271 (SECURITY-high) — SAL-side caller-owns gate, the
-        // archive-RESTORE sibling of the #3193 `archive_by_ids` gate. Pre-fix
-        // this funnel discarded its `_ctx` and matched on `WHERE id = $1` with
-        // NO owner predicate, so on a postgres-backed daemon ANY authenticated
-        // tenant could `POST /api/v1/archive/{victim's id}/restore` and pull a
-        // DIFFERENT tenant's deliberately-archived row back into the live set —
-        // and the 200-vs-404 split was an enumeration oracle over other
-        // tenants' archived ids (the sqlite twin has refused via
-        // `db::restore_archived_for_caller` since #940; #3193 fixed only the
-        // archive side of this class). The existence probe now carries the
-        // three-way owner predicate (owner OR inbox-target), so a non-owner
-        // sees the SAME `Ok(false)` a truly-absent id gives → the handler's
-        // 404 `NOT_FOUND_IN_ARCHIVE`, no oracle. Admin/operator lanes
-        // (`ctx.bypass_visibility`) round-trip regardless of ownership, exactly
-        // as they do on update / delete / archive.
-        let exists: Option<(String,)> = if ctx.bypass_visibility {
-            sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_restore lookup", e))?
-        } else {
-            sqlx::query_as(
-                // Owner OR inbox-target OR the legacy-unowned carve-out
-                // (unstamped rows are restorable by anyone — the
-                // single-operator default; exact parity with the sqlite
-                // `db::restore_archived_for_caller` #940/#3124 predicate). Only
-                // a row owned by a DIFFERENT, NAMED agent is refused.
-                "SELECT id FROM archived_memories \
-                 WHERE id = $1 \
-                   AND (metadata->>'agent_id' = $2 \
-                        OR metadata->>'target_agent_id' = $2 \
-                        OR metadata->>'agent_id' IS NULL \
-                        OR metadata->>'agent_id' = '')",
-            )
-            .bind(id)
-            .bind(ctx.effective_principal())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive_restore owner lookup", e))?
-        };
-        if exists.is_none() {
-            return Ok(false);
-        }
-
-        // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
-        // the OPERATOR un-forget path, so NO tombstone gate here — an authorized
-        // restore round-trips per #1771.
-        //
-        // #3075 — the ORIGINAL justification for that omission was "federation
-        // /sync/push restores[] are sqlite-only per federation_signing_check.rs,
-        // never PostgresStore". That premise is RETIRED: the postgres receiver
-        // now applies `restores[]`. The omission stands anyway, on the #1771
-        // reasoning alone — but the G30 gate the federated lane needs is no
-        // longer absent, it MOVED: it lives on `apply_remote_restore`
-        // (`postgres/federation_3075.rs`), which runs it BEFORE composing this
-        // method. Do NOT "fix" the two by merging them: gating here would break
-        // the documented operator un-forget capability on both backends.
-
-        // Reject if the id is already in active memories.
-        let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive_restore active lookup", e))?;
-        if active.is_some() {
-            return Err(StoreError::Conflict { id: id.to_string() });
-        }
-
-        // FX-C5 — substrate governance pre-write hook parity. Restoring
-        // an archived row mints a fresh live row via a raw INSERT...SELECT
-        // that bypasses `PostgresStore::store(..)` (which is where ARCH-1
-        // wired in the `consult_governance_pre_write_pg` adapter at
-        // line 7001). Without this call, an operator's signed governance
-        // rule could be bypassed by restoring a row whose `(title,
-        // namespace)` would otherwise be refused on a direct write.
-        // Load the archived row shaped as a `Memory` and fire the hook
-        // BEFORE the INSERT lands.
-        let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
-        consult_governance_pre_write_pg(&candidate)?;
-        // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
-        // funnel. Advisory-only (never refuses): a legacy archived row that
-        // predates the covenant must stay restorable even under
-        // AI_MEMORY_REQUIRE_WHY_TRACE=1 (postgres parity with the sqlite
-        // `restore_archived` inbound gate).
-        crate::storage::consult_why_trace_gate_inbound(&candidate);
-
-        // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
-        // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the
-        // archived envelope when present, falling back to the stored content
-        // on any decrypt error) so the restored live row carries the same
-        // `b3:` address it held before archival. created_at / title /
-        // namespace / kind are the ORIGINAL archived values (via `candidate`),
-        // NOT NOW(). Mirrors the sqlite `restored_cid_stamp` path.
-        let restored_cid = {
-            let agent_id = candidate
-                .metadata
-                .get("agent_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let (raw_content, envelope): (String, Option<Vec<u8>>) = sqlx::query_as(
-                "SELECT content, encrypted_envelope FROM archived_memories WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive_restore load plaintext for cid", e))?;
-            let plaintext = match envelope {
-                Some(env) => {
-                    crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content)
-                }
-                None => raw_content,
-            };
-            crate::identity::cid::stamp_cid(
-                &agent_id,
-                &candidate.namespace,
-                &candidate.title,
-                candidate.memory_kind.as_str(),
-                &candidate.created_at,
-                &plaintext,
-            )
-        };
-
-        let now = chrono::Utc::now();
-        // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
-        // archive→restore. Pre-#1025 the SELECT pulled only 17 columns
-        // from archived_memories, so the restored row landed in
-        // memories with reflection_depth=0, memory_kind='observation'
-        // (the live-table DEFAULT), citations=[], version=1, etc. —
-        // silent loss of provenance + persona + confidence calibration.
-        // Now copies all 26 v0.7.0 fields (with COALESCE defaults for
-        // pre-#1025 archived rows where the columns are NULL).
-        sqlx::query(
-            "INSERT INTO memories (
-                id, tier, namespace, title, content, tags, priority, confidence,
-                source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, embedding, embedding_dim, embedding_space,
-                reflection_depth, atomised_into, atom_of, memory_kind,
-                entity_id, persona_version, citations, source_uri, source_span,
-                confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis, kind_provenance, valid_from, valid_until
-            )
-            SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
-                   tags, priority, confidence, source, access_count, created_at,
-                   $1::timestamptz, last_accessed_at, original_expires_at, metadata,
-                   -- v1.0.0 #2167 (S8) restore/migrate HEAL (postgres twin):
-                   -- keep the archived vector ONLY when its space matches the
-                   -- live active space ($5); a foreign- or NULL-space vector
-                   -- has its whole trio NULLed so the boot backfill re-embeds
-                   -- from the durable text under the LIVE space (self-heal).
-                   -- $5 NULL (no active embedder in this process) keeps any
-                   -- STAMPED vector but still drops an unverifiable NULL one.
-                   CASE WHEN embedding_space IS NOT NULL
-                             AND ($5::text IS NULL OR embedding_space = $5)
-                        THEN embedding ELSE NULL END,
-                   CASE WHEN embedding_space IS NOT NULL
-                             AND ($5::text IS NULL OR embedding_space = $5)
-                        THEN embedding_dim ELSE NULL END,
-                   CASE WHEN embedding_space IS NOT NULL
-                             AND ($5::text IS NULL OR embedding_space = $5)
-                        THEN embedding_space ELSE NULL END,
-                   COALESCE(reflection_depth, 0),
-                   atomised_into,
-                   atom_of,
-                   COALESCE(memory_kind, 'observation'),
-                   entity_id, persona_version,
-                   COALESCE(citations, '[]'),
-                   source_uri, source_span,
-                   COALESCE(confidence_source, 'caller_provided'),
-                   confidence_signals, confidence_decayed_at,
-                   mentioned_entity_id,
-                   COALESCE(version, 1),
-                   COALESCE(lifecycle_state, 'open'),
-                   encrypted_envelope,
-                   -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
-                   -- `archived_memories` had no cid columns, so restore
-                   -- unconditionally bound the re-mint ($3/$4) recomputed from six
-                   -- reconstructed inputs (agent_id / namespace / title / kind /
-                   -- created_at / decrypted plaintext) — and a decrypt failure
-                   -- there falls back to the CIPHERTEXT placeholder. Any drift
-                   -- silently re-addressed the durable row and dangled every
-                   -- `memory_links.source_cid` / `target_cid` mirror. The v90
-                   -- columns make the identity a CARRIED fact; the re-mint is now
-                   -- the legacy fallback for pre-v90 archive rows only.
-                   -- The PAIR is selected atomically (the #2395 lesson applied
-                   -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
-                   -- mixing a carried address with a re-derived pre-image would
-                   -- produce a row whose own verify disagrees with itself.
-                   CASE WHEN cid IS NOT NULL THEN cid ELSE $3::text END,
-                   CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE $4::bytea END,
-                   -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
-                   -- back on restore; legacy pre-v87 archive rows re-derive
-                   -- it from the metadata carrier, vocab-guarded (sqlite twin).
-                   COALESCE(kind_provenance,
-                            CASE WHEN metadata->>'kind_provenance' IN
-                                      ('declared','channel_derived','regex','llm')
-                                 THEN metadata->>'kind_provenance' END),
-                   valid_from, valid_until
-            FROM archived_memories WHERE id = $2
-              -- v1.0.0 #3271 — owner-predicated write (defense-in-depth with
-              -- the owner probe above; same predicate). $6 bypass
-              -- short-circuits the owner/inbox/legacy arms so operator lanes
-              -- still round-trip any row. The legacy-unowned carve-out
-              -- (agent_id NULL / '') keeps unstamped rows restorable, matching
-              -- the sqlite `db::restore_archived_for_caller` predicate.
-              AND ($6::bool
-                   OR metadata->>'agent_id' = $7
-                   OR metadata->>'target_agent_id' = $7
-                   OR metadata->>'agent_id' IS NULL
-                   OR metadata->>'agent_id' = '')",
-        )
-        .bind(now)
-        .bind(id)
-        .bind(&restored_cid.cid)
-        .bind(&restored_cid.genesis)
-        // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
-        // this process resolved no embedder) driving the restore heal above.
-        .bind(crate::embeddings::active_embedding_space())
-        .bind(ctx.bypass_visibility)
-        .bind(ctx.effective_principal())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("archive_restore insert", e))?;
-
-        // #1771 (5-agent vote 4d3ea1c5) — re-insert this memory's preserved
-        // `archived_memory_links` edges back into `memory_links`, AFTER the
-        // memory row is restored above and within the same tx. Only edges
-        // whose BOTH endpoints currently exist in `memories` are restored —
-        // `memory_links` carries an `ON DELETE CASCADE` FK on both
-        // endpoints, so an edge whose OTHER endpoint is permanently gone
-        // would be rejected (and is correctly skipped here). Idempotent via
-        // the PK `ON CONFLICT`. Postgres twin of the SQLite
-        // `restore_links_for_memory` re-insert.
-        // #2315 — RETURNING the actually-restored edges so they can be
-        // re-projected into the AGE graph below (only edges this INSERT
-        // landed; ON CONFLICT skips report nothing, which is correct —
-        // an already-present edge is already projected or queued).
-        // #2377 (FIX #9) — RETURNING carries `valid_from`/`valid_until` too so a
-        // restored already-invalidated edge re-projects into AGE ALREADY-carrying
-        // its validity (else the current-view Cypher reads would serve it as VALID).
-        let restored_edges: Vec<(
-            String,
-            String,
-            String,
-            Option<DateTime<Utc>>,
-            Option<DateTime<Utc>>,
-        )> = sqlx::query_as(
-            "INSERT INTO memory_links (
-                 source_id, target_id, relation, created_at, valid_from,
-                 valid_until, observed_by, signature, attest_level,
-                 source_cid, target_cid
-             )
-             SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
-                    aml.valid_from, aml.valid_until, aml.observed_by,
-                    aml.signature, aml.attest_level,
-                    aml.source_cid, aml.target_cid
-             FROM archived_memory_links aml
-             WHERE (aml.source_id = $1 OR aml.target_id = $1)
-               AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
-               AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
-             ON CONFLICT (source_id, target_id, relation) DO NOTHING
-             RETURNING source_id, target_id, relation, valid_from, valid_until",
-        )
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("archive_restore restore links", e))?;
-
-        // #2315 — re-PROJECT the restored edges into the AGE `memory_graph`.
-        // Every delete path unprojects (forget / delete / consolidate / gc /
-        // size_gc / archive_by_ids), but restore previously re-inserted the
-        // relational rows WITHOUT re-projecting, so an AGE-routed kg_query
-        // permanently missed restored edges (the CTE fallback fires only on
-        // AGE runtime failure, never on a valid-but-empty result) — a
-        // split-brain with no self-heal. Deferred mode enqueues the outbox
-        // rows in THIS tx (the drainer's existence re-check tolerates any
-        // later delete); sync mode MERGEs via a SAVEPOINT so an AGE runtime
-        // failure degrades to a WARN instead of failing the relational
-        // restore (#700/#1542 posture — the graph is derived data; the
-        // restore of the durable rows must never be blocked by it).
-        if matches!(self.kg_backend, KgBackend::Age) {
-            for (src, dst, rel, valid_from, valid_until) in &restored_edges {
-                if matches!(
-                    crate::config::age_projection_mode(),
-                    crate::config::AgeProjectionMode::Deferred
-                ) {
-                    // Deferred: the drainer re-reads validity from memory_links
-                    // (#2377 FIX #9) at drain time, so no validity is threaded here.
-                    sqlx::query(
-                        "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
-                         VALUES ($1, $2, $3)",
-                    )
-                    .bind(src)
-                    .bind(dst)
-                    .bind(rel)
-                    .execute(&mut *tx)
+        // v1.0.0 #3520 — routed through the shared bounded-retry funnel. Restore
+        // is the archive family's inverse (archived-row read + live INSERT +
+        // preserved-edge re-insert + archive DELETE), so it holds the same
+        // multi-relation lock set that a concurrent bootstrap's
+        // `CREATE INDEX IF NOT EXISTS` deadlocks against. An early `return`
+        // inside the block exits THIS attempt with that verdict, which the loop
+        // then yields unchanged — a not-found restore is still `Ok(false)`.
+        let mut retry = tx_retry::TxRetry::new("archive_restore tx");
+        let restored: bool = loop {
+            let attempt: StoreResult<bool> = async {
+                let mut tx = self
+                    .pool
+                    .begin()
                     .await
-                    .map_err(|e| to_store_err("archive_restore enqueue kg_projection_outbox", e))?;
-                } else {
-                    sqlx::query("SAVEPOINT age_restore_projection")
-                        .execute(&mut *tx)
+                    .map_err(|e| to_store_err("begin archive_restore tx", e))?;
+
+                // v1.0.0 #3271 (SECURITY-high) — SAL-side caller-owns gate, the
+                // archive-RESTORE sibling of the #3193 `archive_by_ids` gate. Pre-fix
+                // this funnel discarded its `_ctx` and matched on `WHERE id = $1` with
+                // NO owner predicate, so on a postgres-backed daemon ANY authenticated
+                // tenant could `POST /api/v1/archive/{victim's id}/restore` and pull a
+                // DIFFERENT tenant's deliberately-archived row back into the live set —
+                // and the 200-vs-404 split was an enumeration oracle over other
+                // tenants' archived ids (the sqlite twin has refused via
+                // `db::restore_archived_for_caller` since #940; #3193 fixed only the
+                // archive side of this class). The existence probe now carries the
+                // three-way owner predicate (owner OR inbox-target), so a non-owner
+                // sees the SAME `Ok(false)` a truly-absent id gives → the handler's
+                // 404 `NOT_FOUND_IN_ARCHIVE`, no oracle. Admin/operator lanes
+                // (`ctx.bypass_visibility`) round-trip regardless of ownership, exactly
+                // as they do on update / delete / archive.
+                let exists: Option<(String,)> = if ctx.bypass_visibility {
+                    sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
                         .await
-                        .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
-                    // #2377 (FIX #9) — carry the restored edge's validity.
-                    let vf_str = valid_from.map(|t| t.to_rfc3339());
-                    let vu_str = valid_until.map(|t| t.to_rfc3339());
-                    match project_link_into_age(
-                        &mut tx,
-                        src,
-                        dst,
-                        rel,
-                        vf_str.as_deref(),
-                        vu_str.as_deref(),
+                        .map_err(|e| to_store_err("archive_restore lookup", e))?
+                } else {
+                    sqlx::query_as(
+                        // Owner OR inbox-target OR the legacy-unowned carve-out
+                        // (unstamped rows are restorable by anyone — the
+                        // single-operator default; exact parity with the sqlite
+                        // `db::restore_archived_for_caller` #940/#3124 predicate). Only
+                        // a row owned by a DIFFERENT, NAMED agent is refused.
+                        "SELECT id FROM archived_memories \
+                         WHERE id = $1 \
+                           AND (metadata->>'agent_id' = $2 \
+                                OR metadata->>'target_agent_id' = $2 \
+                                OR metadata->>'agent_id' IS NULL \
+                                OR metadata->>'agent_id' = '')",
                     )
+                    .bind(id)
+                    .bind(ctx.effective_principal())
+                    .fetch_optional(&mut *tx)
                     .await
-                    {
-                        Ok(()) => {
-                            sqlx::query("RELEASE SAVEPOINT age_restore_projection")
+                    .map_err(|e| to_store_err("archive_restore owner lookup", e))?
+                };
+                if exists.is_none() {
+                    return Ok(false);
+                }
+
+                // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
+                // the OPERATOR un-forget path, so NO tombstone gate here — an authorized
+                // restore round-trips per #1771.
+                //
+                // #3075 — the ORIGINAL justification for that omission was "federation
+                // /sync/push restores[] are sqlite-only per federation_signing_check.rs,
+                // never PostgresStore". That premise is RETIRED: the postgres receiver
+                // now applies `restores[]`. The omission stands anyway, on the #1771
+                // reasoning alone — but the G30 gate the federated lane needs is no
+                // longer absent, it MOVED: it lives on `apply_remote_restore`
+                // (`postgres/federation_3075.rs`), which runs it BEFORE composing this
+                // method. Do NOT "fix" the two by merging them: gating here would break
+                // the documented operator un-forget capability on both backends.
+
+                // Reject if the id is already in active memories.
+                let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore active lookup", e))?;
+                if active.is_some() {
+                    return Err(StoreError::Conflict { id: id.to_string() });
+                }
+
+                // FX-C5 — substrate governance pre-write hook parity. Restoring
+                // an archived row mints a fresh live row via a raw INSERT...SELECT
+                // that bypasses `PostgresStore::store(..)` (which is where ARCH-1
+                // wired in the `consult_governance_pre_write_pg` adapter at
+                // line 7001). Without this call, an operator's signed governance
+                // rule could be bypassed by restoring a row whose `(title,
+                // namespace)` would otherwise be refused on a direct write.
+                // Load the archived row shaped as a `Memory` and fire the hook
+                // BEFORE the INSERT lands.
+                let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
+                consult_governance_pre_write_pg(&candidate)?;
+                // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
+                // funnel. Advisory-only (never refuses): a legacy archived row that
+                // predates the covenant must stay restorable even under
+                // AI_MEMORY_REQUIRE_WHY_TRACE=1 (postgres parity with the sqlite
+                // `restore_archived` inbound gate).
+                crate::storage::consult_why_trace_gate_inbound(&candidate);
+
+                // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
+                // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the
+                // archived envelope when present, falling back to the stored content
+                // on any decrypt error) so the restored live row carries the same
+                // `b3:` address it held before archival. created_at / title /
+                // namespace / kind are the ORIGINAL archived values (via `candidate`),
+                // NOT NOW(). Mirrors the sqlite `restored_cid_stamp` path.
+                let restored_cid = {
+                    let agent_id = candidate
+                        .metadata
+                        .get("agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let (raw_content, envelope): (String, Option<Vec<u8>>) = sqlx::query_as(
+                        "SELECT content, encrypted_envelope FROM archived_memories WHERE id = $1",
+                    )
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore load plaintext for cid", e))?;
+                    let plaintext = match envelope {
+                        Some(env) => {
+                            crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content)
+                        }
+                        None => raw_content,
+                    };
+                    crate::identity::cid::stamp_cid(
+                        &agent_id,
+                        &candidate.namespace,
+                        &candidate.title,
+                        candidate.memory_kind.as_str(),
+                        &candidate.created_at,
+                        &plaintext,
+                    )
+                };
+
+                let now = chrono::Utc::now();
+                // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
+                // archive→restore. Pre-#1025 the SELECT pulled only 17 columns
+                // from archived_memories, so the restored row landed in
+                // memories with reflection_depth=0, memory_kind='observation'
+                // (the live-table DEFAULT), citations=[], version=1, etc. —
+                // silent loss of provenance + persona + confidence calibration.
+                // Now copies all 26 v0.7.0 fields (with COALESCE defaults for
+                // pre-#1025 archived rows where the columns are NULL).
+                sqlx::query(
+                    "INSERT INTO memories (
+                        id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, metadata, embedding, embedding_dim, embedding_space,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
+                        cid, cid_genesis, kind_provenance, valid_from, valid_until
+                    )
+                    SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+                           tags, priority, confidence, source, access_count, created_at,
+                           $1::timestamptz, last_accessed_at, original_expires_at, metadata,
+                           -- v1.0.0 #2167 (S8) restore/migrate HEAL (postgres twin):
+                           -- keep the archived vector ONLY when its space matches the
+                           -- live active space ($5); a foreign- or NULL-space vector
+                           -- has its whole trio NULLed so the boot backfill re-embeds
+                           -- from the durable text under the LIVE space (self-heal).
+                           -- $5 NULL (no active embedder in this process) keeps any
+                           -- STAMPED vector but still drops an unverifiable NULL one.
+                           CASE WHEN embedding_space IS NOT NULL
+                                     AND ($5::text IS NULL OR embedding_space = $5)
+                                THEN embedding ELSE NULL END,
+                           CASE WHEN embedding_space IS NOT NULL
+                                     AND ($5::text IS NULL OR embedding_space = $5)
+                                THEN embedding_dim ELSE NULL END,
+                           CASE WHEN embedding_space IS NOT NULL
+                                     AND ($5::text IS NULL OR embedding_space = $5)
+                                THEN embedding_space ELSE NULL END,
+                           COALESCE(reflection_depth, 0),
+                           atomised_into,
+                           atom_of,
+                           COALESCE(memory_kind, 'observation'),
+                           entity_id, persona_version,
+                           COALESCE(citations, '[]'),
+                           source_uri, source_span,
+                           COALESCE(confidence_source, 'caller_provided'),
+                           confidence_signals, confidence_decayed_at,
+                           mentioned_entity_id,
+                           COALESCE(version, 1),
+                           COALESCE(lifecycle_state, 'open'),
+                           encrypted_envelope,
+                           -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
+                           -- `archived_memories` had no cid columns, so restore
+                           -- unconditionally bound the re-mint ($3/$4) recomputed from six
+                           -- reconstructed inputs (agent_id / namespace / title / kind /
+                           -- created_at / decrypted plaintext) — and a decrypt failure
+                           -- there falls back to the CIPHERTEXT placeholder. Any drift
+                           -- silently re-addressed the durable row and dangled every
+                           -- `memory_links.source_cid` / `target_cid` mirror. The v90
+                           -- columns make the identity a CARRIED fact; the re-mint is now
+                           -- the legacy fallback for pre-v90 archive rows only.
+                           -- The PAIR is selected atomically (the #2395 lesson applied
+                           -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
+                           -- mixing a carried address with a re-derived pre-image would
+                           -- produce a row whose own verify disagrees with itself.
+                           CASE WHEN cid IS NOT NULL THEN cid ELSE $3::text END,
+                           CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE $4::bytea END,
+                           -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
+                           -- back on restore; legacy pre-v87 archive rows re-derive
+                           -- it from the metadata carrier, vocab-guarded (sqlite twin).
+                           COALESCE(kind_provenance,
+                                    CASE WHEN metadata->>'kind_provenance' IN
+                                              ('declared','channel_derived','regex','llm')
+                                         THEN metadata->>'kind_provenance' END),
+                           valid_from, valid_until
+                    FROM archived_memories WHERE id = $2
+                      -- v1.0.0 #3271 — owner-predicated write (defense-in-depth with
+                      -- the owner probe above; same predicate). $6 bypass
+                      -- short-circuits the owner/inbox/legacy arms so operator lanes
+                      -- still round-trip any row. The legacy-unowned carve-out
+                      -- (agent_id NULL / '') keeps unstamped rows restorable, matching
+                      -- the sqlite `db::restore_archived_for_caller` predicate.
+                      AND ($6::bool
+                           OR metadata->>'agent_id' = $7
+                           OR metadata->>'target_agent_id' = $7
+                           OR metadata->>'agent_id' IS NULL
+                           OR metadata->>'agent_id' = '')",
+                )
+                .bind(now)
+                .bind(id)
+                .bind(&restored_cid.cid)
+                .bind(&restored_cid.genesis)
+                // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
+                // this process resolved no embedder) driving the restore heal above.
+                .bind(crate::embeddings::active_embedding_space())
+                .bind(ctx.bypass_visibility)
+                .bind(ctx.effective_principal())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_restore insert", e))?;
+
+                // #1771 (5-agent vote 4d3ea1c5) — re-insert this memory's preserved
+                // `archived_memory_links` edges back into `memory_links`, AFTER the
+                // memory row is restored above and within the same tx. Only edges
+                // whose BOTH endpoints currently exist in `memories` are restored —
+                // `memory_links` carries an `ON DELETE CASCADE` FK on both
+                // endpoints, so an edge whose OTHER endpoint is permanently gone
+                // would be rejected (and is correctly skipped here). Idempotent via
+                // the PK `ON CONFLICT`. Postgres twin of the SQLite
+                // `restore_links_for_memory` re-insert.
+                // #2315 — RETURNING the actually-restored edges so they can be
+                // re-projected into the AGE graph below (only edges this INSERT
+                // landed; ON CONFLICT skips report nothing, which is correct —
+                // an already-present edge is already projected or queued).
+                // #2377 (FIX #9) — RETURNING carries `valid_from`/`valid_until` too so a
+                // restored already-invalidated edge re-projects into AGE ALREADY-carrying
+                // its validity (else the current-view Cypher reads would serve it as VALID).
+                let restored_edges: Vec<(
+                    String,
+                    String,
+                    String,
+                    Option<DateTime<Utc>>,
+                    Option<DateTime<Utc>>,
+                )> = sqlx::query_as(
+                    "INSERT INTO memory_links (
+                         source_id, target_id, relation, created_at, valid_from,
+                         valid_until, observed_by, signature, attest_level,
+                         source_cid, target_cid
+                     )
+                     SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
+                            aml.valid_from, aml.valid_until, aml.observed_by,
+                            aml.signature, aml.attest_level,
+                            aml.source_cid, aml.target_cid
+                     FROM archived_memory_links aml
+                     WHERE (aml.source_id = $1 OR aml.target_id = $1)
+                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
+                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
+                     ON CONFLICT (source_id, target_id, relation) DO NOTHING
+                     RETURNING source_id, target_id, relation, valid_from, valid_until",
+                )
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_restore restore links", e))?;
+
+                // #2315 — re-PROJECT the restored edges into the AGE `memory_graph`.
+                // Every delete path unprojects (forget / delete / consolidate / gc /
+                // size_gc / archive_by_ids), but restore previously re-inserted the
+                // relational rows WITHOUT re-projecting, so an AGE-routed kg_query
+                // permanently missed restored edges (the CTE fallback fires only on
+                // AGE runtime failure, never on a valid-but-empty result) — a
+                // split-brain with no self-heal. Deferred mode enqueues the outbox
+                // rows in THIS tx (the drainer's existence re-check tolerates any
+                // later delete); sync mode MERGEs via a SAVEPOINT so an AGE runtime
+                // failure degrades to a WARN instead of failing the relational
+                // restore (#700/#1542 posture — the graph is derived data; the
+                // restore of the durable rows must never be blocked by it).
+                if matches!(self.kg_backend, KgBackend::Age) {
+                    for (src, dst, rel, valid_from, valid_until) in &restored_edges {
+                        if matches!(
+                            crate::config::age_projection_mode(),
+                            crate::config::AgeProjectionMode::Deferred
+                        ) {
+                            // Deferred: the drainer re-reads validity from memory_links
+                            // (#2377 FIX #9) at drain time, so no validity is threaded here.
+                            sqlx::query(
+                                "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
+                                 VALUES ($1, $2, $3)",
+                            )
+                            .bind(src)
+                            .bind(dst)
+                            .bind(rel)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                to_store_err("archive_restore enqueue kg_projection_outbox", e)
+                            })?;
+                        } else {
+                            sqlx::query("SAVEPOINT age_restore_projection")
                                 .execute(&mut *tx)
                                 .await
-                                .map_err(|e| {
-                                    to_store_err("release savepoint age_restore_projection", e)
-                                })?;
+                                .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
+                            // #2377 (FIX #9) — carry the restored edge's validity.
+                            let vf_str = valid_from.map(|t| t.to_rfc3339());
+                            let vu_str = valid_until.map(|t| t.to_rfc3339());
+                            match project_link_into_age(
+                                &mut tx,
+                                src,
+                                dst,
+                                rel,
+                                vf_str.as_deref(),
+                                vu_str.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    sqlx::query("RELEASE SAVEPOINT age_restore_projection")
+                                        .execute(&mut *tx)
+                                        .await
+                                        .map_err(|e| {
+                                            to_store_err(
+                                                "release savepoint age_restore_projection",
+                                                e,
+                                            )
+                                        })?;
+                                }
+                                Err(e) if is_age_runtime_failure(&e) => {
+                                    sqlx::query("ROLLBACK TO SAVEPOINT age_restore_projection")
+                                        .execute(&mut *tx)
+                                        .await
+                                        .map_err(|e2| {
+                                            to_store_err(
+                                                "rollback savepoint age_restore_projection",
+                                                e2,
+                                            )
+                                        })?;
+                                    tracing::warn!(
+                                        target: TRACE_TARGET_KG,
+                                        source_id = %src,
+                                        target_id = %dst,
+                                        relation = %rel,
+                                        err = %e,
+                                        "AGE projection skipped on archive_restore — \
+                                         relational memory_links row still committed. \
+                                         kg_query/kg_timeline over this edge may see a \
+                                         stale AGE projection until it is rebuilt; \
+                                         find_paths reads memory_links via the CTE and \
+                                         stays correct."
+                                    );
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
-                        Err(e) if is_age_runtime_failure(&e) => {
-                            sqlx::query("ROLLBACK TO SAVEPOINT age_restore_projection")
-                                .execute(&mut *tx)
-                                .await
-                                .map_err(|e2| {
-                                    to_store_err("rollback savepoint age_restore_projection", e2)
-                                })?;
-                            tracing::warn!(
-                                target: TRACE_TARGET_KG,
-                                source_id = %src,
-                                target_id = %dst,
-                                relation = %rel,
-                                err = %e,
-                                "AGE projection skipped on archive_restore — \
-                                 relational memory_links row still committed. \
-                                 kg_query/kg_timeline over this edge may see a \
-                                 stale AGE projection until it is rebuilt; \
-                                 find_paths reads memory_links via the CTE and \
-                                 stays correct."
-                            );
-                        }
-                        Err(e) => return Err(e),
                     }
                 }
+
+                sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore delete", e))?;
+
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("archive_restore commit", e))?;
+                Ok(true)
             }
-        }
+            .await;
+            match attempt {
+                Ok(v) => break v,
+                Err(e) => retry.consider(e).await?,
+            }
+        };
 
-        sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive_restore delete", e))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("archive_restore commit", e))?;
-        Ok(true)
+        Ok(restored)
     }
 
     async fn archive_purge(
@@ -30827,7 +31006,6 @@ impl MemoryStore for PostgresStore {
         if ids.is_empty() {
             return Ok(0);
         }
-        let mut moved = 0usize;
         let now = chrono::Utc::now();
         // Parity finding #1 (2026-08) — the reason-less default was
         // `"manual"` here while BOTH sqlite funnels
@@ -30839,198 +31017,218 @@ impl MemoryStore for PostgresStore {
         // value pinned by the long-standing sqlite unit test
         // `archive_memory_default_reason_is_archive`.
         let archive_reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin archive_by_ids tx", e))?;
+        // v1.0.0 #3520 — routed through the shared bounded-retry funnel: the
+        // explicit-archive twin of `forget` / `run_gc`, holding the same
+        // multi-relation lock set a concurrent bootstrap's
+        // `CREATE INDEX IF NOT EXISTS` deadlocks against. `moved` is declared
+        // INSIDE the block on purpose — it was an accumulator outside the
+        // transaction, and a retry would have double-counted rows the rolled-back
+        // attempt never archived. `now` / `archive_reason` stay outside so every
+        // attempt stamps identically.
+        let mut retry = tx_retry::TxRetry::new("archive_by_ids tx");
+        let moved_count: usize = loop {
+            let attempt: StoreResult<usize> = async {
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| to_store_err("begin archive_by_ids tx", e))?;
+                let mut moved = 0usize;
 
-        // v1.0.0 #3296 A6 (CONCURRENCY-04) — lock rows in a GLOBAL order. The
-        // per-id `FOR UPDATE` owner probe below (`SQL_SELECT_MEMORY_ROW_BY_ID`
-        // gained `FOR UPDATE` in the same PR that shares the const across
-        // update/delete/archive) locks in the CALLER-SUPPLIED id order, so two
-        // overlapping batches submitted in opposite order can deadlock. Locking
-        // the id set in a fixed (sorted) order breaks the cycle. Sorting only
-        // reorders the work; `moved` and the all-or-nothing tx are unchanged.
-        let mut ordered: Vec<&str> = ids.iter().map(String::as_str).collect();
-        ordered.sort_unstable();
+                // v1.0.0 #3296 A6 (CONCURRENCY-04) — lock rows in a GLOBAL order. The
+                // per-id `FOR UPDATE` owner probe below (`SQL_SELECT_MEMORY_ROW_BY_ID`
+                // gained `FOR UPDATE` in the same PR that shares the const across
+                // update/delete/archive) locks in the CALLER-SUPPLIED id order, so two
+                // overlapping batches submitted in opposite order can deadlock. Locking
+                // the id set in a fixed (sorted) order breaks the cycle. Sorting only
+                // reorders the work; `moved` and the all-or-nothing tx are unchanged.
+                let mut ordered: Vec<&str> = ids.iter().map(String::as_str).collect();
+                ordered.sort_unstable();
 
-        for id in ordered {
-            // #3193 (SECURITY-high, 2026-08-22) — SAL-side caller-owns gate,
-            // the archive-verb sibling of the #1412/#1628 gates on the trait
-            // `update` / `delete`. Pre-fix this funnel discarded its
-            // `_ctx: &CallerContext` entirely and the INSERT..SELECT below
-            // matched on `WHERE id = $3` with NO owner predicate, so ANY
-            // authenticated tenant on a postgres-backed daemon could
-            // bulk-soft-delete up to `max_batch` of ANOTHER tenant's live
-            // rows through `POST /api/v1/archive` (links cascaded; the rows
-            // vanished from get/list/search/recall). The sqlite branch has
-            // refused since #940 via `db::archive_memory_for_caller`; #3115
-            // fixed only that side of this class.
-            //
-            // Runs INSIDE the batch transaction (`FOR UPDATE` owner+inbox
-            // probe). A genuinely-absent id is `NotFound` → silent
-            // `continue` (the count-delta contract the handler relies on;
-            // not an existence oracle). A LIVE row owned by someone else
-            // raises `PermissionDenied`. Inbox-target (`metadata.target_agent_id`
-            // == caller) is permitted — sqlite #940 parity (Fable #3243
-            // item 1). Admin/operator lanes (`ctx.bypass_visibility`) skip
-            // the gate, exactly as they do on update/delete.
-            match Self::assert_caller_owns_for_mutation_on(
-                &mut *tx,
-                ctx,
-                id,
-                "archive",
-                REASON_UNSTAMPED_TENANT_ARCHIVE,
-                true,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(StoreError::NotFound { .. }) => continue,
-                Err(e) => return Err(e),
-            }
-            let insert_result = sqlx::query(&format!(
-                "INSERT INTO archived_memories (
-                    id, tier, namespace, title, content, tags, priority, confidence,
-                    source, access_count, created_at, updated_at, last_accessed_at,
-                    expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                    -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
-                    reflection_depth, atomised_into, atom_of, memory_kind,
-                    entity_id, persona_version, citations, source_uri, source_span,
-                    confidence_source, confidence_signals, confidence_decayed_at,
-                    -- #2196 - carry lifecycle_state through the manual archive so a
-                    -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                )
-                SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                       source, access_count, created_at, updated_at, last_accessed_at,
-                       expires_at, $1::timestamptz, $2::text, metadata,
-                       embedding, embedding_dim, embedding_space, tier, expires_at,
-                       reflection_depth, atomised_into, atom_of, memory_kind,
-                       entity_id, persona_version, citations, source_uri, source_span,
-                       confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                FROM memories WHERE id = $3
-                  AND ($4::bool
-                       OR metadata->>'agent_id' = $5
-                       OR metadata->>'target_agent_id' = $5)
-                -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
-                -- $4 bypass / $5 caller: owner-predicated write so a concurrent
-                -- re-own cannot archive a row the FOR UPDATE probe no longer owns
-                -- (Fable #3243 item 4). Bypass short-circuits the owner/inbox arms.
-                {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
-            ))
-            .bind(now)
-            .bind(archive_reason)
-            .bind(id)
-            .bind(ctx.bypass_visibility)
-            .bind(ctx.effective_principal())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive_by_ids insert", e))?;
-            // v1.0.0 #3296 A2 — only count an id whose live row was ACTUALLY
-            // archived. On the `bypass_visibility` (admin/CLI) lane
-            // `assert_caller_owns_for_mutation_on` returns `Ok(())` immediately
-            // WITHOUT proving the row exists, so a nonexistent id reached here
-            // and `moved += 1` ran even though the owner-predicated
-            // INSERT..SELECT matched 0 live rows — contradicting the trait
-            // contract ("an id with no live row is skipped and not counted").
-            // Skipping on a zero-row insert also protects the non-bypass lane
-            // against a concurrent delete between the probe and this write. The
-            // link snapshot / namespace sever / delete / AGE unprojection below
-            // are all no-ops for an id with no live row, so `continue` is safe.
-            if insert_result.rows_affected() == 0 {
-                continue;
-            }
-            // #1771 (5-agent vote 4d3ea1c5) — snapshot this memory's
-            // `memory_links` into `archived_memory_links` BEFORE the
-            // same-tx cascade delete reaps them (FK `ON DELETE CASCADE`).
-            // Postgres twin of the SQLite `archive_links_for_memory`
-            // snapshot wired into `archive_memory_no_tx`. Idempotent via
-            // the PK `ON CONFLICT`.
-            //
-            // v1.0.0 #3177 — the statement moved to
-            // [`crate::store::postgres_parity::archive_links_for_memory_in_tx`]
-            // and this call site now SHARES it with the `size_gc` archive
-            // branch. That branch had a hand-absent twin (it snapshotted
-            // nothing), which is exactly the failure mode a second copy of a
-            // statement invites; one definition means the next archiving path
-            // cannot forget the edges.
-            crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, id).await?;
-            // #2503 — SEVER any namespace_meta binding pointing at this row,
-            // parity with BOTH sqlite archive funnels (`archive_memory_no_tx`
-            // / `archive_memory_for_caller`), which have mirrored `delete`'s
-            // cleanup since #1642. This pg funnel never did: archiving a
-            // standard memory on postgres left the binding pointing at a row
-            // that is no longer in `memories` — another arm of the #2493
-            // class, in the same direction as `apply_remote_deletion`. Runs
-            // INSIDE the per-batch tx so the sever commits atomically with the
-            // archive+delete it accompanies.
-            //
-            // #3290 — route through the shared helper so this archive funnel
-            // emits the WARN + signed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED`
-            // event, at parity with the sqlite archive twins
-            // (`archive_memory_no_tx` / `archive_memory_for_caller`, which both
-            // call `sever_namespace_standards`) — previously a bare, silent
-            // UPDATE.
-            pg_sever_namespace_standards_in_tx(&mut tx, id)
-                .await
-                .map_err(|e| to_store_err("archive_by_ids: namespace_meta sever", e))?;
-            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
-            // append ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the
-            // delete (the cold-storage copy already landed above). Gated →
-            // flag-OFF unchanged.
-            if crate::config::append_only_enabled()
-                && let Some((ns, ver)) =
-                    sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
-                        .bind(id)
-                        .fetch_optional(&mut *tx)
+                for id in ordered {
+                    // #3193 (SECURITY-high, 2026-08-22) — SAL-side caller-owns gate,
+                    // the archive-verb sibling of the #1412/#1628 gates on the trait
+                    // `update` / `delete`. Pre-fix this funnel discarded its
+                    // `_ctx: &CallerContext` entirely and the INSERT..SELECT below
+                    // matched on `WHERE id = $3` with NO owner predicate, so ANY
+                    // authenticated tenant on a postgres-backed daemon could
+                    // bulk-soft-delete up to `max_batch` of ANOTHER tenant's live
+                    // rows through `POST /api/v1/archive` (links cascaded; the rows
+                    // vanished from get/list/search/recall). The sqlite branch has
+                    // refused since #940 via `db::archive_memory_for_caller`; #3115
+                    // fixed only that side of this class.
+                    //
+                    // Runs INSIDE the batch transaction (`FOR UPDATE` owner+inbox
+                    // probe). A genuinely-absent id is `NotFound` → silent
+                    // `continue` (the count-delta contract the handler relies on;
+                    // not an existence oracle). A LIVE row owned by someone else
+                    // raises `PermissionDenied`. Inbox-target (`metadata.target_agent_id`
+                    // == caller) is permitted — sqlite #940 parity (Fable #3243
+                    // item 1). Admin/operator lanes (`ctx.bypass_visibility`) skip
+                    // the gate, exactly as they do on update/delete.
+                    match Self::assert_caller_owns_for_mutation_on(
+                        &mut *tx,
+                        ctx,
+                        id,
+                        "archive",
+                        REASON_UNSTAMPED_TENANT_ARCHIVE,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(StoreError::NotFound { .. }) => continue,
+                        Err(e) => return Err(e),
+                    }
+                    let insert_result = sqlx::query(&format!(
+                        "INSERT INTO archived_memories (
+                            id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, archived_at, archive_reason, metadata,
+                            embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
+                            -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            -- #2196 - carry lifecycle_state through the manual archive so a
+                            -- non-open state survives archive->restore (postgres parity).
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        )
+                        SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                               source, access_count, created_at, updated_at, last_accessed_at,
+                               expires_at, $1::timestamptz, $2::text, metadata,
+                               embedding, embedding_dim, embedding_space, tier, expires_at,
+                               reflection_depth, atomised_into, atom_of, memory_kind,
+                               entity_id, persona_version, citations, source_uri, source_span,
+                               confidence_source, confidence_signals, confidence_decayed_at,
+                               mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        FROM memories WHERE id = $3
+                          AND ($4::bool
+                               OR metadata->>'agent_id' = $5
+                               OR metadata->>'target_agent_id' = $5)
+                        -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                        -- $4 bypass / $5 caller: owner-predicated write so a concurrent
+                        -- re-own cannot archive a row the FOR UPDATE probe no longer owns
+                        -- (Fable #3243 item 4). Bypass short-circuits the owner/inbox arms.
+                        {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+                    ))
+                    .bind(now)
+                    .bind(archive_reason)
+                    .bind(id)
+                    .bind(ctx.bypass_visibility)
+                    .bind(ctx.effective_principal())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_by_ids insert", e))?;
+                    // v1.0.0 #3296 A2 — only count an id whose live row was ACTUALLY
+                    // archived. On the `bypass_visibility` (admin/CLI) lane
+                    // `assert_caller_owns_for_mutation_on` returns `Ok(())` immediately
+                    // WITHOUT proving the row exists, so a nonexistent id reached here
+                    // and `moved += 1` ran even though the owner-predicated
+                    // INSERT..SELECT matched 0 live rows — contradicting the trait
+                    // contract ("an id with no live row is skipped and not counted").
+                    // Skipping on a zero-row insert also protects the non-bypass lane
+                    // against a concurrent delete between the probe and this write. The
+                    // link snapshot / namespace sever / delete / AGE unprojection below
+                    // are all no-ops for an id with no live row, so `continue` is safe.
+                    if insert_result.rows_affected() == 0 {
+                        continue;
+                    }
+                    // #1771 (5-agent vote 4d3ea1c5) — snapshot this memory's
+                    // `memory_links` into `archived_memory_links` BEFORE the
+                    // same-tx cascade delete reaps them (FK `ON DELETE CASCADE`).
+                    // Postgres twin of the SQLite `archive_links_for_memory`
+                    // snapshot wired into `archive_memory_no_tx`. Idempotent via
+                    // the PK `ON CONFLICT`.
+                    //
+                    // v1.0.0 #3177 — the statement moved to
+                    // [`crate::store::postgres_parity::archive_links_for_memory_in_tx`]
+                    // and this call site now SHARES it with the `size_gc` archive
+                    // branch. That branch had a hand-absent twin (it snapshotted
+                    // nothing), which is exactly the failure mode a second copy of a
+                    // statement invites; one definition means the next archiving path
+                    // cannot forget the edges.
+                    crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, id).await?;
+                    // #2503 — SEVER any namespace_meta binding pointing at this row,
+                    // parity with BOTH sqlite archive funnels (`archive_memory_no_tx`
+                    // / `archive_memory_for_caller`), which have mirrored `delete`'s
+                    // cleanup since #1642. This pg funnel never did: archiving a
+                    // standard memory on postgres left the binding pointing at a row
+                    // that is no longer in `memories` — another arm of the #2493
+                    // class, in the same direction as `apply_remote_deletion`. Runs
+                    // INSIDE the per-batch tx so the sever commits atomically with the
+                    // archive+delete it accompanies.
+                    //
+                    // #3290 — route through the shared helper so this archive funnel
+                    // emits the WARN + signed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED`
+                    // event, at parity with the sqlite archive twins
+                    // (`archive_memory_no_tx` / `archive_memory_for_caller`, which both
+                    // call `sever_namespace_standards`) — previously a bare, silent
+                    // UPDATE.
+                    pg_sever_namespace_standards_in_tx(&mut tx, id)
                         .await
-                        .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
-            {
-                pg_emit_revision_leaf_if_enabled(
-                    &mut tx,
-                    id,
-                    crate::revisions::RecordKind::Archive,
-                    Some(ver),
-                    &ns,
-                    None,
-                    &now.to_rfc3339(),
-                )
-                .await
-                .map_err(|e| to_store_err("append archive revision leaf", e))?;
-            }
-            sqlx::query(
-                "DELETE FROM memories WHERE id = $1 \
-                 AND ($2::bool \
-                      OR metadata->>'agent_id' = $3 \
-                      OR metadata->>'target_agent_id' = $3)",
-            )
-            .bind(id)
-            .bind(ctx.bypass_visibility)
-            .bind(ctx.effective_principal())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive_by_ids delete", e))?;
-            // #2315 — AGE unprojection parity. This was the ONLY hard-delete
-            // path that skipped `unproject_memory_from_age` (delete / forget /
-            // apply_remote_deletion / consolidate / run_gc / size_gc all call
-            // it), so a manually-archived memory left a ghost `:Memory` node +
-            // incident edges in the `memory_graph` projection that AGE-routed
-            // kg_query kept returning — a live-looking edge to a non-live
-            // memory. Same-tx DETACH DELETE, mirroring the forget() shape.
-            if matches!(self.kg_backend, KgBackend::Age) {
-                unproject_memory_from_age(&mut tx, id).await?;
-            }
-            moved += 1;
-        }
+                        .map_err(|e| to_store_err("archive_by_ids: namespace_meta sever", e))?;
+                    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+                    // append ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the
+                    // delete (the cold-storage copy already landed above). Gated →
+                    // flag-OFF unchanged.
+                    if crate::config::append_only_enabled()
+                        && let Some((ns, ver)) =
+                            sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
+                                .bind(id)
+                                .fetch_optional(&mut *tx)
+                                .await
+                                .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
+                    {
+                        pg_emit_revision_leaf_if_enabled(
+                            &mut tx,
+                            id,
+                            crate::revisions::RecordKind::Archive,
+                            Some(ver),
+                            &ns,
+                            None,
+                            &now.to_rfc3339(),
+                        )
+                        .await
+                        .map_err(|e| to_store_err("append archive revision leaf", e))?;
+                    }
+                    sqlx::query(
+                        "DELETE FROM memories WHERE id = $1 \
+                         AND ($2::bool \
+                              OR metadata->>'agent_id' = $3 \
+                              OR metadata->>'target_agent_id' = $3)",
+                    )
+                    .bind(id)
+                    .bind(ctx.bypass_visibility)
+                    .bind(ctx.effective_principal())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_by_ids delete", e))?;
+                    // #2315 — AGE unprojection parity. This was the ONLY hard-delete
+                    // path that skipped `unproject_memory_from_age` (delete / forget /
+                    // apply_remote_deletion / consolidate / run_gc / size_gc all call
+                    // it), so a manually-archived memory left a ghost `:Memory` node +
+                    // incident edges in the `memory_graph` projection that AGE-routed
+                    // kg_query kept returning — a live-looking edge to a non-live
+                    // memory. Same-tx DETACH DELETE, mirroring the forget() shape.
+                    if matches!(self.kg_backend, KgBackend::Age) {
+                        unproject_memory_from_age(&mut tx, id).await?;
+                    }
+                    moved += 1;
+                }
 
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("archive_by_ids commit", e))?;
-        Ok(moved)
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("archive_by_ids commit", e))?;
+                Ok(moved)
+            }
+            .await;
+            match attempt {
+                Ok(v) => break v,
+                Err(e) => retry.consider(e).await?,
+            }
+        };
+        Ok(moved_count)
     }
 
     async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
@@ -34201,6 +34399,7 @@ fn downcast_postgres(store: &std::sync::Arc<dyn MemoryStore>) -> StoreResult<&Po
     any.downcast_ref::<PostgresStore>()
         .ok_or_else(|| StoreError::BackendUnavailable {
             backend: "postgres".to_string(),
+            sqlstate: None,
             detail: "active store is not a PostgresStore".to_string(),
         })
 }
@@ -35245,6 +35444,7 @@ mod tests {
         for detail in contention {
             let e = StoreError::BackendUnavailable {
                 backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                sqlstate: None,
                 detail: detail.to_string(),
             };
             assert!(
@@ -35264,6 +35464,7 @@ mod tests {
         for detail in permanent {
             let e = StoreError::BackendUnavailable {
                 backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                sqlstate: None,
                 detail: detail.to_string(),
             };
             assert!(
@@ -35285,6 +35486,7 @@ mod tests {
         // crash-loop it also refuses to create.
         let exhausted = StoreError::BackendUnavailable {
             backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+            sqlstate: None,
             detail: format!(
                 "{DDL_BUDGET_EXHAUSTED_MARKER} REFUSING to boot: schema migration v57 \
                  could not acquire the ACCESS EXCLUSIVE lock on `memories` after 3 \
@@ -36084,6 +36286,7 @@ mod tests {
         // "AGE backend unreachable" degradation it was laundered into.
         let rejected = StoreError::BackendUnavailable {
             backend: "postgres".to_string(),
+            sqlstate: None,
             detail: "cypher kg_query: error returned from database: third \
                      argument of cypher function must be a parameter"
                 .to_string(),
@@ -36107,6 +36310,7 @@ mod tests {
         ] {
             let outage = StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
+                sqlstate: None,
                 detail: detail.to_string(),
             };
             assert!(

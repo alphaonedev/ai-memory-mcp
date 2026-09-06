@@ -1201,6 +1201,86 @@ the acquire timeout are exposed via three env vars (each resolved by
 
 Non-positive / unparseable values fall through to the compiled default.
 
+### Deadlock handling — SQLSTATE `40P01` / `40001` ([#3520](https://github.com/alphaonedev/ai-memory-mcp/issues/3520))
+
+A PostgreSQL-backed fleet has two kinds of session touching the same
+relations at the same time: ordinary **writers** (a `size_gc` eviction, a
+`forget`, an `archive`, a `delete` — each one transaction spanning several
+tables) and **booting daemons**, because `PostgresStore::connect` replays the
+bundled idempotent schema on every start and self-heal. Those two can take
+the same two relation locks in opposite orders, and PostgreSQL resolves the
+cycle by aborting one side. Before v1.0.0 #3520 the aborted side was the
+writer, and the store surfaced the abort verbatim:
+
+```
+BackendUnavailable { backend: "postgres",
+  detail: "size_gc delete victim: error returned from database: deadlock detected" }
+```
+
+Two independent changes address it, and they compose:
+
+**1. The bootstrap no longer takes relation-level DDL locks on a migrated
+database.** `CREATE INDEX IF NOT EXISTS` takes a `ShareLock` on the table
+*before* it discovers the index already exists — so ~70 such statements
+locked ~40 relations on every boot, for nothing, and `ShareLock` conflicts
+with the `RowExclusiveLock` every writer holds. `connect` now asks the
+catalog once (`pg_class` / `pg_extension` — catalog reads only, no relation
+locks) which of the script's objects already exist, and replays only the
+statements whose object is genuinely absent. On a fully-migrated database no
+`CREATE TABLE` and no `CREATE INDEX` survives, so **connecting takes no
+relation-level DDL lock at all**. The script stays idempotent and
+self-healing (a missing index is still created), the migration ladder is
+untouched, and a fresh database still receives every statement.
+Definition-carrying statements (`CREATE OR REPLACE VIEW` / `FUNCTION`, the
+`DO` corruption-refusal block) are never skipped — existence does not imply
+currency — and they are not part of this class: replacing a view takes
+`AccessExclusiveLock` on the *view*, and only `AccessShareLock` on the tables
+it reads, which does not conflict with a writer's `RowExclusiveLock`. A
+catalog probe that itself fails degrades to replaying the full script, i.e.
+exactly the pre-#3520 boot.
+
+**2. A writer that still loses a race is retried, not failed.** On `40P01`
+(`deadlock_detected`) and `40001` (`serialization_failure`) PostgreSQL has
+already rolled the whole transaction back atomically, so re-running it is a
+first attempt against an unchanged database, never a partial replay. The
+store's destructive transaction funnels — `size_gc`, `run_gc`, `forget`,
+`archive_by_ids`, `archive_restore`, `delete` — route through one shared
+bounded-retry driver:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `TX_RETRY_MAX_ATTEMPTS` | `3` | total attempts, first try included |
+| `TX_RETRY_BASE_BACKOFF_MS` | `20` | backoff before the first retry, doubled per attempt |
+| `TX_RETRY_MAX_BACKOFF_MS` | `320` | ceiling for the doubling backoff |
+| `TX_RETRY_JITTER_PERCENT` | `50` | symmetric jitter, so a fleet's victims do not re-collide |
+
+There is no env knob: the budget is a few tens of milliseconds and a
+deployment that needs it tuned has a different problem. Every retry logs at
+`WARN` under the `store::postgres::tx_retry` target with the SQLSTATE and the
+attempt number, so `RUST_LOG=store::postgres::tx_retry=warn` shows exactly
+how often a fleet is colliding:
+
+```
+WARN store::postgres::tx_retry: #3520: postgres rolled this transaction back as a
+     concurrency victim; retrying op="size_gc victim tx" sqlstate="40P01" attempt=1
+     max_attempts=3 backoff_ms=27
+```
+
+Two properties are load-bearing and deliberate:
+
+* **Classification is structural, never textual.** The decision reads the
+  SQLSTATE the driver reported (now carried on
+  `StoreError::BackendUnavailable`), not the rendered message. Message text
+  is an operator-facing rendering that changes across server versions and
+  locales; branching control flow on it is how a transient abort gets
+  mistaken for a permanent one.
+* **The budget is bounded and the terminal state is fail-CLOSED.** After
+  three attempts the original `BackendUnavailable` is returned unchanged, so
+  a genuinely wedged database still produces a prompt, honest refusal — never
+  a silent partial application and never an unbounded stall. Only these two
+  SQLSTATEs are retried: `55P03` (`lock_not_available`), a constraint
+  violation, or a disk-full each fail on the first attempt, as they should.
+
 ## Troubleshooting
 
 ### AGE not installed

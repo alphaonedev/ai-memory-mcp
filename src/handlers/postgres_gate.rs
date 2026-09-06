@@ -1936,6 +1936,7 @@ mod transport_postgres_gate_tests {
 
         let r = store_err_to_response(StoreError::BackendUnavailable {
             backend: "p".to_string(),
+            sqlstate: None,
             detail: "d".to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);

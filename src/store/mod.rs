@@ -305,8 +305,30 @@ pub enum StoreError {
         reason: String,
     },
 
+    /// The backend refused or could not serve the operation.
+    ///
+    /// v1.0.0 #3520 — `sqlstate` carries the backend's OWN machine-readable
+    /// error code (on postgres, the five-character `SQLSTATE` the driver
+    /// reports for a database error), or `None` when the failure did not come
+    /// from a database error at all (a connect/config/pool fault, or a
+    /// non-postgres backend). It exists so retry and fleet-triage decisions
+    /// are made on a STRUCTURAL code rather than by substring-matching the
+    /// rendered `detail` — the message text is an operator-facing rendering
+    /// that is free to change, and classifying control flow on it is how a
+    /// transient abort gets mistaken for a permanent one (or the reverse).
+    /// It is deliberately NOT part of [`std::fmt::Display`]: nothing about the
+    /// operator-facing message changes when it is populated.
+    ///
+    /// The postgres adapter's `tx_retry` module is the one consumer that
+    /// branches on it (v1.0.0 #3520).
     #[error("backend unavailable: {backend}: {detail}")]
-    BackendUnavailable { backend: String, detail: String },
+    BackendUnavailable {
+        backend: String,
+        detail: String,
+        /// Backend-native error code (postgres `SQLSTATE`), when the error
+        /// came from a database error. Never rendered in `Display`.
+        sqlstate: Option<String>,
+    },
 
     #[error("invalid input: {detail}")]
     InvalidInput { detail: String },
@@ -6408,6 +6430,7 @@ mod tests {
         assert!(e.to_string().contains("FOO"));
         let e = StoreError::BackendUnavailable {
             backend: "postgres".to_string(),
+            sqlstate: None,
             detail: "connection refused".to_string(),
         };
         assert!(e.to_string().contains("postgres"));
@@ -7346,6 +7369,7 @@ mod tests {
 
         let unavailable = StoreError::BackendUnavailable {
             backend: "postgres".to_string(),
+            sqlstate: None,
             detail: "connection refused".to_string(),
         };
         assert!(unavailable.to_string().contains("postgres"));
