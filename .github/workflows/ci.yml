@@ -710,7 +710,9 @@ jobs:
             runner: '["self-hosted","linux-fed"]'
             node: linux-fed
             tier: enterprise-fed
-            timeout: 80
+            # #3525: compile (~6 min) + the 4800 s full-suite watchdog + the
+            # ephemeral-db setup/teardown must fit inside this outer bound.
+            timeout: 100
           - leg: macos-fed,sqlite
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
@@ -720,7 +722,9 @@ jobs:
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: enterprise-fed
-            timeout: 80
+            # #3525: compile (~6 min) + the 4800 s full-suite watchdog + the
+            # ephemeral-db setup/teardown must fit inside this outer bound.
+            timeout: 100
     steps:
       # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
       # checked out on a self-hosted node (f2 = the operator's home gateway,
@@ -1109,7 +1113,14 @@ jobs:
           if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
             FEAT="--features sal-postgres"
             TAIL="-- --test-threads=1"
-            WATCHDOG_SECS=3300
+            # 2026-09-06 (#3525): the FULL-impact enterprise-fed suite measured
+            # ~55 min on macos-fed at 6e4fa771 (unittests 640 s + 769
+            # integration binaries, killed by the previous 3300 s cap at the
+            # alphabetically LAST suite with zero failures) and ~57 min on
+            # linux-fed. 4800 s keeps ~30 % headroom over that baseline while
+            # still bounding a genuine hang well inside the job cap. Re-derive
+            # whenever the measured full run comes within 20 % of this value.
+            WATCHDOG_SECS=4800
             echo "::notice::[enterprise-fed] cargo test $FEAT ... $TAIL (watchdog ${WATCHDOG_SECS}s)"
           else
             # #3461 — macos-fed sqlite is NODE-aware on top of the tier. On
