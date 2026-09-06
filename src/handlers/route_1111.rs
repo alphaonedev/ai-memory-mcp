@@ -854,15 +854,100 @@ fn atomise_http_via_store(app: &AppState, body: &Value) -> axum::response::Respo
     }
 }
 
+/// v1.0.0 #3507 — the resolved calibration principal for one HTTP request.
+///
+/// `principal` + `is_admin` are only read on the `sal` postgres arm (they
+/// build the [`crate::store::CallerContext`] the SAL method gates on); the
+/// sqlite arm consumes `audience` directly.
+struct CalibrateHttpCaller {
+    #[cfg_attr(not(feature = "sal"), allow(dead_code))]
+    principal: String,
+    #[cfg_attr(not(feature = "sal"), allow(dead_code))]
+    is_admin: bool,
+    audience: crate::confidence::calibrate::CalibrationAudience,
+}
+
+/// v1.0.0 #3507 — resolve WHOSE rows this request's calibration may
+/// aggregate, or return the refusal response the handler short-circuits on.
+///
+/// The ladder, fail-closed at every rung:
+///
+/// 1. `X-Agent-Id` MUST be present and non-empty. Without it
+///    `resolve_caller_agent_id` synthesises a per-request
+///    `anonymous:req-<uuid8>` that owns no rows, so an unauthenticated
+///    caller would get an aggregate over exactly the world-readable
+///    namespaces — a smaller disclosure than the pre-#3507 global sweep but
+///    still a cross-namespace one. Refuse instead.
+/// 2. A malformed header is a `400` from the shared resolver, never the
+///    `anonymous:invalid` sentinel.
+/// 3. An ADMIN caller — admitted by
+///    [`crate::handlers::admin_role::is_admin_caller_trusted`], which
+///    requires BOTH the allow-list AND request authn (#1570) AND the #2093
+///    per-agent-key attestation — keeps the GLOBAL aggregate. This is the
+///    ONLY admin arm on any surface, and it reuses the existing predicate
+///    rather than introducing a `for_admin` privacy-bypass construction.
+/// 4. Everyone else is scoped to their own principal.
+fn resolve_calibrate_http_caller(
+    app: &AppState,
+    headers: &HeaderMap,
+) -> Result<CalibrateHttpCaller, axum::response::Response> {
+    let header_present = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    if !header_present {
+        return Err(forbidden_calibrate_caller());
+    }
+    let principal = crate::handlers::parity::resolve_caller_agent_id(None, headers, None)
+        .map_err(err_response)?;
+    let is_admin = crate::handlers::admin_role::is_admin_caller_trusted(app, headers, &principal);
+    let audience = if is_admin {
+        crate::confidence::calibrate::CalibrationAudience::admin()
+    } else {
+        crate::confidence::calibrate::CalibrationAudience::for_caller(&principal)
+            .map_err(|_| forbidden_calibrate_caller())?
+    };
+    Ok(CalibrateHttpCaller {
+        principal,
+        is_admin,
+        audience,
+    })
+}
+
+/// The `403` envelope for a calibration request with no usable caller.
+fn forbidden_calibrate_caller() -> axum::response::Response {
+    tracing::warn!(
+        target: "handlers::route_1111",
+        "memory_calibrate_confidence refused: no resolvable caller identity (#3507)"
+    );
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": crate::confidence::calibrate::CALLER_REQUIRED_REFUSAL,
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /api/v1/memory_calibrate_confidence` — Form 5 calibration
 /// driver. Reads `confidence_shadow_observations`, emits per-
 /// (namespace, source) baselines over the window. Read-only over the
-/// shadow-observations table.
+/// shadow-observations table for a caller-scoped sweep; the admin sweep
+/// additionally rides the `recall_outcome` ledger backfill.
+///
+/// v1.0.0 #3507 — the report is a CALLER-SCOPED aggregate. The caller is
+/// resolved from `X-Agent-Id` BEFORE any substrate access, on BOTH the
+/// sqlite and the postgres arm, so neither backend can serve the pre-#3507
+/// cross-namespace global sweep to an ordinary caller.
 pub async fn handle_calibrate_confidence_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    let caller = match resolve_calibrate_http_caller(&app, &headers) {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
     // #3064 lane L-PGP family F3 — postgres SAL dispatch through
     // `MemoryStore::calibrate_confidence_report`. Pre-fix this route took
     // `app.db.lock()` unconditionally, so on a postgres daemon it would have
@@ -870,10 +955,10 @@ pub async fn handle_calibrate_confidence_http(
     // if it were the corpus's — which is why the gate refused it outright.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return calibrate_confidence_http_via_store(&app, &body).await;
+        return calibrate_confidence_http_via_store(&app, &caller, &body).await;
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_calibrate_confidence(&lock.0, &body);
+    let result = crate::mcp::handle_calibrate_confidence(&lock.0, &body, &caller.audience);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -895,9 +980,17 @@ pub async fn handle_calibrate_confidence_http(
 ///
 /// The substrate-error prefix is preserved verbatim so an operator's log
 /// greps match across backends.
+///
+/// v1.0.0 #3507 — `caller` carries the ALREADY-RESOLVED principal + admin
+/// verdict from [`resolve_calibrate_http_caller`], so this arm cannot admit
+/// a caller the sqlite arm would refuse. The [`crate::store::CallerContext`]
+/// is built with `for_admin_checked`, which forces the admin bool into the
+/// type signature (#1062) rather than constructing a privacy bypass
+/// unconditionally.
 #[cfg(feature = "sal")]
 async fn calibrate_confidence_http_via_store(
     app: &AppState,
+    caller: &CalibrateHttpCaller,
     body: &Value,
 ) -> axum::response::Response {
     let days = body
@@ -913,9 +1006,11 @@ async fn calibrate_confidence_http_via_store(
             crate::validate::MAX_DURATION_DAYS
         ));
     }
+    let ctx =
+        crate::store::CallerContext::for_admin_checked(caller.principal.clone(), caller.is_admin);
     match app
         .store
-        .calibrate_confidence_report(days, chrono::Utc::now())
+        .calibrate_confidence_report(&ctx, days, chrono::Utc::now())
         .await
     {
         Ok(report) => (StatusCode::OK, Json(json!({ "report": report }))).into_response(),
