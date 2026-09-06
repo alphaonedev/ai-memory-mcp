@@ -153,6 +153,50 @@ mod d1_5_986_tests {
 // and reads `message.content`. The client's blocking nature is bridged
 // through `tokio::task::spawn_blocking`.
 // =====================================================================
+/// v1.0.0 #3523 — TEST-ONLY public entry for the own-binary `*_3387` suite
+/// (`tests/detect_contradiction_3387.rs`).
+///
+/// # Why the tests moved out of this file
+///
+/// `src/**/*.rs` compiles into ONE `cargo test --lib` binary whose `#[test]`
+/// functions run in PARALLEL THREADS. The five `*_3387` cases pass an
+/// EXPLICIT caller (`Some("ai:attacker")`) and assert an existence-hiding
+/// REFUSAL, so they are precisely the #3517 VICTIM shape: any concurrent
+/// sibling that installs `AI_MEMORY_AGENT_ID` steers every reader in the
+/// process, and a refusal test that silently starts passing for the wrong
+/// reason is worse than one that fails. Per the #3475 pattern the cure is
+/// PROCESS isolation — a `tests/*.rs` file is its own binary, so nothing the
+/// lib cohort does to the environment can reach it under any scheduling.
+///
+/// The five cases moved BYTE-FOR-BYTE (only the handler name and the
+/// `crate::` -> `ai_memory::` paths changed); their assertions are unchanged.
+///
+/// # Why a wrapper rather than widening the handler
+///
+/// [`handle_detect_contradiction`] stays `pub(super)` in every build. This
+/// wrapper is `cfg(any(test, feature = "test-support"))`, so it is absent
+/// from `cargo build --release` (default features) entirely — the seam is
+/// STRUCTURAL, not a runtime flag. It adds no logic: it forwards its four
+/// arguments verbatim, so the own-binary suite exercises the same code path
+/// the MCP dispatch does.
+///
+/// # Errors
+///
+/// Returns whatever [`handle_detect_contradiction`] returns: the tier-gating
+/// message when `llm` is `None`, a validation message for a malformed id,
+/// the existence-hiding [`NOT_FOUND_A`] / [`NOT_FOUND_B`] refusal when an id
+/// resolves to no row OR to a row `caller` may not see, or the upstream
+/// model error.
+#[cfg(any(test, feature = "test-support"))]
+pub fn handle_detect_contradiction_for_tests(
+    conn: &rusqlite::Connection,
+    llm: Option<&OllamaClient>,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
+    handle_detect_contradiction(conn, llm, params, caller)
+}
+
 #[cfg(test)]
 mod tests {
     use super::handle_detect_contradiction;
@@ -539,224 +583,5 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["contradicts"], json!(false));
-    }
-
-    // =================================================================
-    // v1.0.0 #3387 — cross-tenant read-oracle regression.
-    //
-    // Pre-#3387 this tool did an UNSCOPED `db::get` on both ids: a caller
-    // who gets a bare not-found from `memory_get` on either id still got
-    // that row's TITLE back in the response AND had its full body shipped
-    // to the external LLM endpoint. Both the denied and the allowed path
-    // are pinned below; the denied path additionally asserts ZERO egress.
-    // =================================================================
-
-    /// Mount a chat endpoint that would answer "yes" if it were ever
-    /// reached, so a regression shows up as a SUCCESSFUL response rather
-    /// than an incidental transport error.
-    async fn mount_chat_yes(server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes"},
-            })))
-            .mount(server)
-            .await;
-    }
-
-    /// Count POSTs that actually reached the model endpoint.
-    async fn chat_calls(server: &MockServer) -> usize {
-        server
-            .received_requests()
-            .await
-            .expect("request recording enabled")
-            .iter()
-            .filter(|r| r.url.path() == "/api/chat")
-            .count()
-    }
-
-    /// #3387 DENIED (id_a): a non-owner caller is refused with the same
-    /// message an absent row yields, and NO LLM call is made.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn non_owner_refused_on_id_a_with_no_llm_call_3387() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        mount_chat_yes(&server).await;
-        let uri = server.uri();
-        let err = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id_a = seed_owned(&conn, "victim-title-a", "victim body a", "ai:victim");
-            let id_b = seed_owned(&conn, "victim-title-b", "victim body b", "ai:victim");
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_detect_contradiction(
-                &conn,
-                Some(&client),
-                &json!({"id_a": id_a, "id_b": id_b}),
-                Some("ai:attacker"),
-            )
-            .err()
-            .unwrap_or_default()
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            err, "memory A not found",
-            "non-owner must get the existence-hiding refusal, got: {err}"
-        );
-        assert_eq!(
-            chat_calls(&server).await,
-            0,
-            "refused caller must cause ZERO egress of either memory body"
-        );
-    }
-
-    /// #3387 DENIED (id_b): id_a is the caller's own row, id_b is another
-    /// tenant's — refusal must land on B, still with no LLM call, so the
-    /// gate cannot be side-stepped by pairing a readable id with a
-    /// victim id.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn non_owner_refused_on_id_b_with_no_llm_call_3387() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        mount_chat_yes(&server).await;
-        let uri = server.uri();
-        let err = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id_a = seed_owned(&conn, "own-title", "own body", "ai:attacker");
-            let id_b = seed_owned(&conn, "victim-title-b", "victim body b", "ai:victim");
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_detect_contradiction(
-                &conn,
-                Some(&client),
-                &json!({"id_a": id_a, "id_b": id_b}),
-                Some("ai:attacker"),
-            )
-            .err()
-            .unwrap_or_default()
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            err, "memory B not found",
-            "non-owner must get the existence-hiding refusal on B, got: {err}"
-        );
-        assert_eq!(
-            chat_calls(&server).await,
-            0,
-            "refused caller must cause ZERO egress of either memory body"
-        );
-    }
-
-    /// #3387 DENIED, existence-hiding: the refusal for a row that EXISTS
-    /// but is invisible is byte-identical to the refusal for a row that
-    /// does not exist, so the tool is not a presence oracle.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn invisible_and_absent_refusals_are_identical_3387() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        mount_chat_yes(&server).await;
-        let uri = server.uri();
-        let (invisible, absent) = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id_a = seed_owned(&conn, "victim-title-a", "victim body a", "ai:victim");
-            let id_b = seed_owned(&conn, "own-title", "own body", "ai:attacker");
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            let invisible = handle_detect_contradiction(
-                &conn,
-                Some(&client),
-                &json!({"id_a": id_a, "id_b": id_b}),
-                Some("ai:attacker"),
-            )
-            .err()
-            .unwrap_or_default();
-            let absent = handle_detect_contradiction(
-                &conn,
-                Some(&client),
-                &json!({
-                    "id_a": "00000000-0000-0000-0000-000000000000",
-                    "id_b": id_b
-                }),
-                Some("ai:attacker"),
-            )
-            .err()
-            .unwrap_or_default();
-            (invisible, absent)
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            invisible, absent,
-            "existing-but-invisible and absent must be indistinguishable"
-        );
-        assert_eq!(chat_calls(&server).await, 0, "no egress on either refusal");
-    }
-
-    /// #3387 ALLOWED: the owner still gets the full result — the gate
-    /// degrades nothing for an entitled caller.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn owner_caller_still_gets_verdict_3387() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        mount_chat_yes(&server).await;
-        let uri = server.uri();
-        let out = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id_a = seed_owned(&conn, "title-a", "the sky is blue", "ai:owner");
-            let id_b = seed_owned(&conn, "title-b", "the sky is green", "ai:owner");
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_detect_contradiction(
-                &conn,
-                Some(&client),
-                &json!({"id_a": id_a, "id_b": id_b}),
-                Some("ai:owner"),
-            )
-            .expect("owner must be allowed")
-        })
-        .await
-        .unwrap();
-        assert_eq!(out["contradicts"], json!(true));
-        assert_eq!(out["memory_a"]["title"], "title-a");
-        assert_eq!(out["memory_b"]["title"], "title-b");
-        assert_eq!(chat_calls(&server).await, 1, "owner reaches the model once");
-    }
-
-    /// #3387 ALLOWED: a `collective`-scope row stays readable by any
-    /// caller — the gate is the canonical `is_visible_to_caller`
-    /// predicate, not a blanket owner-equality check.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn collective_scope_row_readable_by_other_caller_3387() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        mount_chat_yes(&server).await;
-        let uri = server.uri();
-        let out = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id_a = seed_scoped(
-                &conn,
-                "shared-a",
-                "the sky is blue",
-                "ai:owner",
-                Some("collective"),
-            );
-            let id_b = seed_scoped(
-                &conn,
-                "shared-b",
-                "the sky is green",
-                "ai:owner",
-                Some("collective"),
-            );
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_detect_contradiction(
-                &conn,
-                Some(&client),
-                &json!({"id_a": id_a, "id_b": id_b}),
-                Some("ai:stranger"),
-            )
-            .expect("collective rows are visible to every caller")
-        })
-        .await
-        .unwrap();
-        assert_eq!(out["contradicts"], json!(true));
-        assert_eq!(chat_calls(&server).await, 1);
     }
 }
