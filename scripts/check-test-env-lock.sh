@@ -353,7 +353,22 @@ guard_wrapper_names () {
     ' "$1" 2>/dev/null | sort -u
 }
 
-# naked_home_mutations <file> <guard-tokens-newline-list> <mut-linenos-csv>
+# naked_home_mutations <file> <guard-tokens-COMMA-list> <mut-linenos-csv>
+#
+# SEPARATOR (#3523): the guard-token list is COMMA-separated, not
+# newline-separated. `awk -v name=value` with a value containing a real
+# NEWLINE is rejected outright by one-true-awk (`awk: newline in string ...`,
+# exit 2) — the awk macOS ships and therefore the awk every local `--self-test`
+# run used — while gawk/mawk (Linux, CI) accept it. The old newline form made
+# this whole function exit 2 and emit NOTHING for any file whose
+# `guard_wrapper_names` returned a name (i.e. whenever a delegate wrapper
+# exists at all: `src/config.rs`, `src/recover/transcript_paths.rs`, and every
+# self-test fixture that pairs a compliant test with a naked one). The caller
+# consumed it through `< <(...)`, which discards the exit status, so arm (c)
+# reported CLEAN while doing nothing — the #2444 shape, inside the gate built
+# to catch that shape. Guard-token values are Rust identifiers, so a comma can
+# never occur inside one. The caller now also CHECKS the exit status, so a
+# future detector failure fails the gate instead of passing silently.
 # Arm (c) -- the fn-scoped naked-mutation detector (issue #2163). For each
 # brace-balanced `#[test]`-attributed fn body that contains a $HOME mutation
 # line (linenos passed in from the caller's grep so the mutation forms stay
@@ -387,7 +402,7 @@ guard_wrapper_names () {
 naked_home_mutations () {
     awk -v tokens="$2" -v muts="$3" '
     BEGIN {
-        ntok = split(tokens, T, "\n")
+        ntok = split(tokens, T, ",")
         nm = split(muts, M, ",")
         for (i = 1; i <= nm; i++) if (M[i] != "") is_mut[M[i] + 0] = 1
     }
@@ -849,13 +864,25 @@ while IFS= read -r -d '' f; do
     # delegate tests are NOT false-positived. Lines flagged here that arm
     # (b) also flags are de-duplicated below.
     guard_tokens="$LOCK_TOKEN"
-    wrapper_names="$(guard_wrapper_names "$f")"
-    [[ -n "$wrapper_names" ]] && guard_tokens="${guard_tokens}"$'\n'"${wrapper_names}"
+    # COMMA-joined, never newline-joined -- see the #3523 SEPARATOR note on
+    # `naked_home_mutations`. Guard tokens are Rust identifiers, so a comma
+    # cannot occur inside one.
+    wrapper_names="$(guard_wrapper_names "$f" | paste -sd, -)"
+    [[ -n "$wrapper_names" ]] && guard_tokens="${guard_tokens},${wrapper_names}"
     mut_csv="$(printf '%s\n' "$home_lines" | cut -d: -f1 | paste -sd, -)"
+    # The detector's exit status is CHECKED, not discarded: the pre-#3523
+    # `< <(...)` form swallowed it, so a detector that failed to start looked
+    # exactly like a file with no violations.
+    naked_rc=0
+    naked_flagged="$(naked_home_mutations "$f" "$guard_tokens" "$mut_csv")" || naked_rc=$?
+    if (( naked_rc != 0 )); then
+        echo "Test-env-lock gate arm (c): the naked-mutation detector FAILED on ${rel} (exit ${naked_rc}) -- refusing to report a clean arm (c)" >&2
+        home_fail=1
+    fi
     while IFS= read -r flagged; do
         [[ -z "$flagged" ]] && continue
         violations+="${rel}:${flagged}"$'\n'
-    done < <(naked_home_mutations "$f" "$guard_tokens" "$mut_csv")
+    done <<< "$naked_flagged"
 
     # Arm (b): module-local-lock adjacency (issue #2153b). Only reached
     # for files that PASSED arm (a) -- i.e. the file references the
