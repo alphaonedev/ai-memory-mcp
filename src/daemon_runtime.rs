@@ -82,6 +82,7 @@ use crate::cli::update::UpdateArgs;
 use crate::cli::verify::VerifyChainArgs;
 use crate::cli::verify_signed_events::VerifySignedEventsChainArgs;
 use crate::cli::wake_hub::WakeHubArgs;
+use crate::cli::wake_listen::WakeListenArgs;
 use crate::cli::watch::WatchArgs;
 use crate::cli::wrap::WrapArgs;
 use crate::config::{AppConfig, FeatureTier};
@@ -660,6 +661,27 @@ pub enum Command {
     /// `a2a-hub/join/v1` delegation lands in #3468, and there is deliberately
     /// no flag to substitute a permissive one. See [`crate::wake_hub`].
     WakeHub(WakeHubArgs),
+    /// v1.0.0 #3470 (EPIC #3466) — `ai-memory wake-listen`: the long-lived
+    /// wake-hub CLIENT that replaces the fleet's three-minute inbox poll.
+    ///
+    /// It loads the scoped `a2a-hub/join/v1` delegation bundle
+    /// `ai-memory identity delegate --scope a2a-hub` wrote into the key
+    /// directory — never a second identity root, never an enrolled `.priv` —
+    /// keeps ONE authenticated session on the hub's 0600 socket (checked for
+    /// owner-only mode and ownership before it is dialled), and turns each
+    /// content-free hint into exactly ONE catch-up inbox read through the
+    /// same `memory_inbox` funnel `ai-memory inbox` uses. It honours the
+    /// welcome's `lagged` flag, treats a `seq_high_watermark` gap as one more
+    /// catch-up read, and reconnects with jittered exponential backoff capped
+    /// at the backstop.
+    ///
+    /// A bounded `<=60 s` poll (`wake_sink::BACKSTOP_POLL_MAX`) is ALWAYS
+    /// armed, hub or no hub, so a hub that is down, refusing, or was never
+    /// deployed costs wake LATENCY and nothing else. On each wake it prints
+    /// one line (`--json`) or runs an exec hook (`--exec`) whose wake
+    /// metadata rides in environment variables — never the body, which the
+    /// plane structurally never carried.
+    WakeListen(WakeListenArgs),
     /// v0.7.0 WT-1-F — operator-side wrapper over the atomisation
     /// engine ([`crate::atomisation::Atomiser`]). Decomposes one
     /// long-form memory into atomic propositions; surfaces every
@@ -2643,6 +2665,12 @@ pub async fn run(
                 code => std::process::exit(code),
             }
         }
+        Command::WakeListen(a) => {
+            // A long-lived console command: its `tracing` output IS the
+            // operator's channel for reconnects and hook failures.
+            init_tracing();
+            cli::wake_listen::dispatch(&db_path, &a, app_config, cli_agent_id.as_deref()).await
+        }
         Command::Atomise(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -2913,12 +2941,17 @@ pub async fn run(
             cli::commands::notify::cmd_notify(&db_path, &a, app_config, &mut out)
         }
         Command::Inbox(a) => {
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::inbox::cmd_inbox(&db_path, &a, &mut out)
+            // v1.0.0 #3470 — `--wait` blocks on the wake plane (the hub when
+            // one is configured, else the bounded backstop poll) and THEN
+            // renders exactly what `inbox` renders today. The read itself is
+            // unchanged: one funnel, one shape, whether or not you waited.
+            cli::commands::inbox::cmd_inbox_waiting(
+                &db_path,
+                &a,
+                app_config,
+                cli_agent_id.as_deref(),
+            )
+            .await
         }
         Command::IngestMultistep(a) => {
             let stdout = std::io::stdout();
@@ -7621,7 +7654,11 @@ pub async fn bootstrap_serve(
 fn command_installs_console_subscriber(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Serve(_) | Command::Curator(_) | Command::Watch(_) | Command::WakeHub(_)
+        Command::Serve(_)
+            | Command::Curator(_)
+            | Command::Watch(_)
+            | Command::WakeHub(_)
+            | Command::WakeListen(_)
     )
 }
 

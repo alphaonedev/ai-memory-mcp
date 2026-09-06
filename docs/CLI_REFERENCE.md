@@ -1634,6 +1634,117 @@ Operator knobs live in the `[wake_hub]` config block (see
 [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)); a CLI flag beats the config block,
 which beats the compiled bound. Opt-in: nothing starts a hub implicitly.
 
+### `wake-listen` — the long-lived wake-hub client (v1.0.0, #3470 / EPIC #3466)
+
+```bash
+ai-memory wake-listen --agent-id ai:alice --json
+ai-memory wake-listen --agent-id ai:alice --exec 'my-notifier'
+ai-memory wake-listen --agent-id ai:alice --once      # exit after one catch-up read
+ai-memory wake-listen --agent-id ai:alice --no-hub    # backstop poll only
+ai-memory wake-listen --socket /run/x.sock --hub-id my-hub --poll-secs 30
+```
+
+Replaces the fleet's three-minute `ai-memory inbox` cron with ONE long-lived
+session. It loads the scoped `a2a-hub/join/v1` delegation bundle
+`ai-memory identity delegate --scope a2a-hub` wrote into the key directory
+(`<key-dir>/<agent-id>.a2a-hub.json`, mode 0600) — never a second identity
+root, never an enrolled `.priv` — connects to the hub's Unix domain socket,
+performs the hello handshake, and verifies the welcome.
+
+It performs **exactly one** catch-up inbox read per event, through the same
+`memory_inbox` funnel `ai-memory inbox` uses: one on the welcome, one on each
+wake, one when the welcome reports `lagged`, and one when a wake's
+`seq_high_watermark` skips (wakes happened that this listener did not see).
+Reconnects use jittered exponential backoff capped at the backstop.
+
+A bounded poll — at most 60 s, `wake_sink::BACKSTOP_POLL_MAX` — is **always**
+armed, hub or no hub. A hub that is down, refusing, or was never deployed
+therefore costs wake LATENCY and nothing else; the ai-memory inbox row remains
+the durable record.
+
+| Flag | Meaning |
+|---|---|
+| `--agent-id <ID>` | whose inbox to watch; falls back to the global `--agent-id` / `AI_MEMORY_AGENT_ID` |
+| `--socket <PATH>` | hub socket; overrides `[wake_hub].socket` |
+| `--hub-id <ID>` | hub identifier bound into the handshake; overrides `[wake_hub].hub_id` |
+| `--key-dir <PATH>` | key directory holding the delegation bundle |
+| `--bundle <PATH>` | explicit bundle path |
+| `--poll-secs <SECS>` | backstop interval; **refused above 60** rather than clamped |
+| `--unread-only` / `--limit <N>` | shape the catch-up read, exactly as `inbox` does |
+| `--json` | one JSON line per wake |
+| `--exec <CMD>` | run `sh -c CMD` per wake with the metadata in the environment |
+| `--once` | exit after the first catch-up read |
+| `--no-hub` | do not dial a hub; the bounded poll is the delivery mechanism |
+
+**The exec hook receives metadata, never a body.** The hub structurally carries
+no message body, so neither does the hook: it gets the row id to read and the
+digest to verify what it read. The metadata rides in the ENVIRONMENT rather
+than on the command line, so wire-sourced values never reach `ps` output or
+shell word-splitting.
+
+| Variable | Meaning |
+|---|---|
+| `AI_MEMORY_WAKE_REASON` | `welcome` \| `lagged` \| `wake` \| `gap` \| `backstop` |
+| `AI_MEMORY_WAKE_AGENT_ID` | the listening agent |
+| `AI_MEMORY_WAKE_HUB_ID` | the hub this session joined |
+| `AI_MEMORY_WAKE_INBOX_ROW_ID` | the durable row the hint names (empty when none) |
+| `AI_MEMORY_WAKE_NAMESPACE` | namespace the row landed in |
+| `AI_MEMORY_WAKE_SENDER` | agent that wrote the row |
+| `AI_MEMORY_WAKE_DIGEST` | lowercase hex SHA-256 **of the body** — never the body |
+| `AI_MEMORY_WAKE_SEQ` | the producer's wake watermark at mint time |
+| `AI_MEMORY_WAKE_MISSED` | wakes this listener demonstrably did not see |
+| `AI_MEMORY_WAKE_PENDING` | wakes the hub coalesced while this agent was offline |
+| `AI_MEMORY_WAKE_INBOX_COUNT` | messages the catch-up read returned |
+
+These are EMITTED into the hook's environment; they are not knobs the substrate
+reads, so they carry no precedence ladder and appear in no `AI_MEMORY_*`
+resolution table. A hook is bounded at 30 s and killed past it — a hung
+notifier must never become a listener that stops reading its inbox.
+
+Every identity check fails closed and there is no flag that skips one: a bundle
+that is not mode 0600, not owned by the caller, reached through a symlink,
+minted for another hub, whose private key is not the one its certificate
+authorises, whose certificate does not verify under the agent's enrolled key in
+the same key directory, or whose window has passed, is refused BEFORE the socket
+is dialled. The socket itself is checked the way the hub hardened it: an
+owner-only (0700) directory holding an owner-only (0600) socket, both owned by
+the caller.
+
+### `inbox --wait` — block until there is mail (v1.0.0, #3470 / EPIC #3466)
+
+```bash
+ai-memory inbox --wait --agent-id ai:alice
+ai-memory inbox --wait --timeout 300 --agent-id ai:alice --json
+```
+
+Blocks on the wake plane — the hub when `[wake_hub].socket` names one,
+otherwise the bounded backstop poll — and then performs and prints the inbox
+read exactly as a plain `ai-memory inbox` does. Waiting changes WHEN the read
+happens, never WHAT it returns.
+
+`--timeout <SECS>` bounds the wait; on expiry the command still performs the
+read and prints the result, because a timeout means "nothing arrived in that
+window", never "skip the durable truth". **Omitting `--timeout` does not mean
+waiting forever:** the backstop tick is itself a return, so a wait without it
+lasts at most one poll interval (`<= 60 s`, `wake_sink::BACKSTOP_POLL_MAX`).
+A welcome carrying no offline backlog does not end the wait (on a healthy hub
+every session is welcomed at once, so returning there would make `--wait` an
+alias for `inbox`); a welcome that reports coalesced wakes, or one flagged
+`lagged`, does.
+
+When the hub CREDENTIAL will not load — a host that never ran
+`ai-memory identity delegate`, an expired bundle, one minted for another hub —
+the command logs that refusal once at `WARN` with its full cause chain (so the
+re-mint remediation is visible) and then **waits on the bounded backstop poll
+anyway**, which is what "otherwise the bounded backstop poll" above means. It
+does NOT read immediately: a `--wait` that returned at once on a credential
+error would turn the `sleep 180; ai-memory inbox` replacement into a hot loop
+of immediate reads. `ai-memory wake-listen` keeps the hard refusal instead —
+an operator who started the listener explicitly asked for a hub session and
+needs to see why it will not open. Only a failure to start the hub-LESS
+stream (an invalid poll interval, no runtime) makes the command read at once,
+because neither is recoverable by waiting.
+
 ## Shell, completions, man
 
 ```bash

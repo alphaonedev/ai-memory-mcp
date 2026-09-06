@@ -60,7 +60,10 @@ use super::{BACKSTOP_POLL_MAX, SinkMetrics, build_substrate_wake, record_refusal
 use crate::identity::sentinels::WAKE_HUB_PRODUCER;
 use crate::inbox_wake::{InboxEvent, InboxWakeSink};
 use crate::wake_hub::codec::codec;
-use crate::wake_hub::frame::{Frame, HelloPayload, Kind, decode_error};
+use crate::wake_hub::frame::{
+    CTX_DECODING_HUB_FRAME, CTX_HUB_CLOSED, CTX_UNPARSEABLE_REFUSAL, DEBUG_FIELD_DELEGATION_BYTES,
+    Frame, HelloPayload, Kind, decode_error,
+};
 use crate::wake_hub::identity::{hello_transcript, topics_hash};
 use crate::wake_hub::limits::{
     DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_RECIPIENT_QUEUE_FRAMES, DEFAULT_RECONNECT_BASE_MS,
@@ -114,7 +117,7 @@ impl std::fmt::Debug for HelloCredential {
         f.debug_struct("HelloCredential")
             .field("pubkey_bytes", &self.pubkey.len())
             .field("signature_bytes", &self.signature.len())
-            .field("delegation_bytes", &self.delegation.len())
+            .field(DEBUG_FIELD_DELEGATION_BYTES, &self.delegation.len())
             .finish()
     }
 }
@@ -451,7 +454,7 @@ async fn connect_and_pump(
             biased;
             incoming = reader.next() => {
                 match incoming {
-                    None => bail!("the hub closed the connection"),
+                    None => bail!(CTX_HUB_CLOSED),
                     // The codec refuses an over-ceiling length prefix BEFORE a
                     // byte of body is buffered, so an oversize declaration
                     // lands here rather than in an allocation.
@@ -528,7 +531,7 @@ async fn handshake(
         Kind::Welcome => Ok(()),
         Kind::Error => {
             let (code, reason) =
-                decode_error(&reply.payload).unwrap_or((0, "unparseable refusal".to_owned()));
+                decode_error(&reply.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
             bail!("the hub refused the handshake: {code} {reason}");
         }
         other => bail!("the hub answered the hello with {other}, not a welcome"),
@@ -538,7 +541,7 @@ async fn handshake(
 /// Frames the hub sends US. The forwarder consumes nothing but liveness and
 /// refusals; it is a producer, not a recipient.
 async fn handle_hub_frame(body: &[u8], write_half: &mut OwnedWriteHalf) -> Result<()> {
-    let frame = Frame::decode(body).context("decoding a frame from the hub")?;
+    let frame = Frame::decode(body).context(CTX_DECODING_HUB_FRAME)?;
     match frame.kind {
         Kind::Ping => {
             let pong = Frame::new(Kind::Pong, WAKE_HUB_PRODUCER, frame.from, Bytes::new())
@@ -548,7 +551,7 @@ async fn handle_hub_frame(body: &[u8], write_half: &mut OwnedWriteHalf) -> Resul
         }
         Kind::Error => {
             let (code, reason) =
-                decode_error(&frame.payload).unwrap_or((0, "unparseable refusal".to_owned()));
+                decode_error(&frame.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
             // A refusal is terminal for THIS connection: the hub has told us a
             // frame was rejected, and continuing to push into a session it may
             // have torn down would silently lose wakes.
@@ -572,9 +575,9 @@ async fn read_one(
         bail!("timed out");
     };
     match next {
-        None => bail!("the hub closed the connection"),
+        None => bail!(CTX_HUB_CLOSED),
         Some(Err(e)) => bail!("framing error: {e}"),
-        Some(Ok(body)) => Frame::decode(&body).context("decoding a frame from the hub"),
+        Some(Ok(body)) => Frame::decode(&body).context(CTX_DECODING_HUB_FRAME),
     }
 }
 

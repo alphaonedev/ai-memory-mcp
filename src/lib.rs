@@ -516,8 +516,11 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 84;
 /// operator command, bumping 91 → 92; v1.0.0 #3467 (EPIC #3466) added
 /// `WakeHub` for the `ai-memory wake-hub` same-host CONTENT-FREE agent wake
 /// plane (a 0600 Unix-domain-socket wake switch that carries a bounded hint
-/// and never a message body), bumping 92 → 93.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 94;
+/// and never a message body), bumping 92 → 93; v1.0.0 #3470 (EPIC #3466)
+/// added `WakeListen` for the `ai-memory wake-listen` long-lived wake-hub
+/// CLIENT (one authenticated session, one catch-up inbox read per hint, a
+/// bounded `<=60 s` backstop poll), bumping 93 → 94.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 95;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -541,8 +544,10 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 94;
 /// #3322 (#3266 MVG) added `SwarmRewind` (atomic cascade-rewind operator
 /// command), bumping 93 → 94; v1.0.0 #3467 (EPIC #3466) added `WakeHub`
 /// (same-host CONTENT-FREE agent wake plane over a 0600 Unix domain socket),
-/// bumping 94 → 95.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 96;
+/// bumping 94 → 95; v1.0.0 #3470 (EPIC #3466) added `WakeListen` (the
+/// long-lived wake-hub client behind `ai-memory wake-listen`), bumping
+/// 95 → 96.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 97;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
@@ -978,6 +983,15 @@ pub mod visibility;
 /// and nothing else. Identity verification is a trait boundary whose shipped
 /// default REFUSES every hello until the scoped `a2a-hub/join/v1` delegation
 /// lands in #3468.
+/// v1.0.0 #3470 (EPIC #3466) — the wake-hub CLIENT half: bundle loading,
+/// one authenticated UDS session, and the state machine that turns a hint
+/// into exactly ONE catch-up inbox read. Loads the scoped delegation
+/// `identity delegate --scope a2a-hub` wrote and NEVER a second identity
+/// root; refuses a bundle that is not 0600, not this hub's, not signed by
+/// the agent's enrolled key, or outside its window — with no flag that skips
+/// any of it. The `<=60 s` backstop poll is always armed, so a hub that is
+/// down, refusing, or absent costs LATENCY and nothing else.
+pub mod wake_client;
 pub mod wake_hub;
 /// v1.0.0 #3469 (EPIC #3466) — the bridge from the #3465 `agent_notified`
 /// wake bus to the #3467 wake-hub: an in-process sink when the hub is
