@@ -25,7 +25,7 @@
 4 6 src/cli/recall.rs
 0 6 src/cli/rules.rs
 0 5 src/cli/store.rs
-0 2 src/cli/test_utils.rs
+0 1 src/cli/test_utils.rs
 0 4 src/cli/verify.rs
 0 3 src/confidence/decay.rs
 0 4 src/confidence/mod.rs
@@ -57,6 +57,7 @@
 0 3 src/identity/keypair.rs
 0 6 src/identity/lineage.rs
 12 45 src/identity/mod.rs
+0 1 src/identity/test_key_dir.rs
 0 11 src/llm.rs
 0 3 src/main.rs
 0 9 src/mcp/mod.rs
