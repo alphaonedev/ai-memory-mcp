@@ -570,14 +570,33 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         next.namespace, TEST_NS,
         "action_next returns an action in the requested namespace"
     );
-    // The unowned action is reachable for an arbitrary caller too.
+    // #3359 — the SAL create funnel now attributes every action to the
+    // resolved actor exactly as the MCP path always did (an omitted
+    // `agent_id` resolves to the ambient identity so the write is
+    // quota-charged), so there is no such thing as an unowned action any
+    // more on either backend. The `agent_id`-narrowed `next` therefore
+    // returns the row for its attributed actor and NOTHING for a different
+    // caller; both halves are pinned so the attribution and the narrowing
+    // cannot drift apart again.
+    let attributed = next
+        .agent_id
+        .clone()
+        .expect("#3359 attributes every created action to an actor");
     let next_owned = store
-        .action_next(&ctx, TEST_NS, Some("sal-cov-some-agent"))
+        .action_next(&ctx, TEST_NS, Some(attributed.as_str()))
         .await
         .expect("action_next owned ok");
     assert!(
         next_owned.is_some(),
-        "the unowned action is visible to any caller"
+        "the attributed actor sees its own action in the narrowed frontier"
+    );
+    let next_other = store
+        .action_next(&ctx, TEST_NS, Some("sal-cov-some-other-agent"))
+        .await
+        .expect("action_next other ok");
+    assert!(
+        next_other.is_none(),
+        "a different caller is narrowed away from an action attributed to another actor"
     );
 
     // #1709 Pillar 1 — signal_send / signal_get / signal_inbox / signal_ack
