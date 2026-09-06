@@ -148,7 +148,6 @@ fn expired_cache_and_future_cache_are_refused() {
     }
 }
 
-#[cfg(feature = "sal-postgres")]
 /// The database segment of a `postgres://…/<db>?…` URL (empty when absent).
 fn database_name(url: &str) -> &str {
     url.split('/')
@@ -201,6 +200,7 @@ fn shared_live_store_guard_cases() {
     assert_eq!(port_of("postgres://u:p@h/db"), None);
 }
 
+#[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_proven_root_and_revocation_match_sqlite_and_audit_the_decisions() {
     use ai_memory::identity::pubkey_bind::{PossessionProof, sign_bind_challenge};
