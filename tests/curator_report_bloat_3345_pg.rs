@@ -162,7 +162,7 @@ async fn prune_curator_reports_is_dry_run_then_idempotent_pg() {
         }
     }
 
-    let outcome = async {
+    async {
         let dry = store
             .prune_curator_reports(&admin, false)
             .await
@@ -249,7 +249,6 @@ async fn prune_curator_reports_is_dry_run_then_idempotent_pg() {
         .bind(CURATOR_REPORTS_DAILY_NAMESPACE)
         .execute(store.pool())
         .await;
-    outcome;
 }
 
 /// The collapse rewrites substrate rows across every owner, so a non-admin
