@@ -276,7 +276,7 @@ The canonical implementation ships in `alphaonedev/ai-memory-mcp` at v0.7.0:
 - Capabilities advertisement: in `src/mcp/tools/capabilities.rs`.
 - Dedup table: schema v52 — see `migrations/sqlite/0044_v52_transcript_line_dedup.sql` + the postgres twin in `src/store/postgres.rs::migrate_v52`.
 - Regression test: `tests/capture_turn_idempotent.rs`.
-- Perf-budget test: `tests/capture_layers_perf_budget.rs` (pins L4 at <10ms p95; see issue `#1394`).
+- Perf-budget test: `tests/capture_layers_perf_budget.rs` (pins L4 at <10ms p95; see issue `#1394`). The L4 wall-clock p95 assertion is enforced unconditionally in a **release** build; in a **debug** build it is enforced only when the test-harness knob `AI_MEMORY_PERF_BUDGET=1` is set, because a debug binary's wall clock on a shared, saturated host measures the host rather than the code (issue `#3509`). The default debug path still drives every call, asserts the behavioural contract, and records the measured p95.
 - Reference host integration (Claude Code): `docs/integrations/claude-code-capture-v1.md` + `clients/host-adapter-shim/bash/claude-code-capture-turn.sh`.
 
 ## Acknowledgements
