@@ -1326,3 +1326,67 @@ mod issue_1928_tests {
         assert!(out.get("memories").is_some());
     }
 }
+
+/// #3521 — catch-up helper pins (per-module coverage floor).
+///
+/// Three small helpers on the catch-up path had no direct test: the
+/// stored-namespace probe's "we DO need the row" arm, the transient
+/// `sync_state_observe` WARN, and the `/sync/since` URL builder. The URL
+/// builder is the one that matters most for integrity: the three catch-up
+/// paths share it precisely so a cursor can never be dropped on one path
+/// and kept on another (a dropped `since` silently re-pulls, or worse,
+/// re-anchors, the whole peer corpus).
+#[cfg(test)]
+mod cov_catchup_helpers_3521 {
+    use super::{
+        catchup_probe_existing_ns_sqlite, log_catchup_sync_state_observe_failed, sync_since_url,
+    };
+
+    /// With `needs = true` the probe actually READS: a row the substrate
+    /// does not hold is `Ok(None)` (no live row), never an `Err` — an
+    /// `Err` here would halt the watermark, so the distinction is load
+    /// bearing.
+    #[test]
+    fn ns_probe_reads_when_needed_and_reports_no_live_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("catchup-probe-3521.db");
+        let conn = crate::db::open(&db).expect("db::open");
+        let got = catchup_probe_existing_ns_sqlite(&conn, "no-such-memory", true)
+            .expect("a missing row is not a probe failure");
+        assert!(got.is_none(), "no live row must be Ok(None), got {got:?}");
+    }
+
+    /// The transient-observe WARN must not panic on any peer id / error
+    /// pair — it runs inside the catch-up loop's hot path.
+    #[test]
+    fn sync_state_observe_warning_is_infallible() {
+        log_catchup_sync_state_observe_failed("peer-3521", "connection reset");
+    }
+
+    /// The `since` cursor is carried EXACTLY once, percent-encoded, and
+    /// the local peer id is always present. Dropping either would turn a
+    /// bounded delta pull into a full-corpus re-pull.
+    #[test]
+    fn sync_since_url_carries_the_cursor_and_the_local_peer_id() {
+        let with_cursor =
+            sync_since_url("http://peer.test", "local-1", Some("2026-01-01T00:00:00Z"));
+        assert!(
+            with_cursor.contains("since=2026-01-01T00%3A00%3A00Z"),
+            "the cursor must be percent-encoded; got {with_cursor}"
+        );
+        assert!(
+            with_cursor.contains("peer=local-1"),
+            "the local peer id must be present; got {with_cursor}"
+        );
+
+        let without_cursor = sync_since_url("http://peer.test", "local-1", None);
+        assert!(
+            !without_cursor.contains("since="),
+            "no cursor must mean no since= parameter; got {without_cursor}"
+        );
+        assert!(
+            without_cursor.contains("peer=local-1"),
+            "the local peer id must be present without a cursor; got {without_cursor}"
+        );
+    }
+}

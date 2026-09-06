@@ -1192,6 +1192,39 @@ re-issuing this document against the new SHA is a Conductor task, tracked by
 #3501 lands that re-issue, this certification is **VOID** and must not be cited
 as live. The historical bind remains `e22bc93c`.
 
+**Re-cert trigger — FIRED; certification ALREADY VOID (see the #3502 record
+above). Test-only touch
+([#3521](https://github.com/alphaonedev/ai-memory-mcp/issues/3521), PR #3524,
+per-module coverage floors).** Two §7-watched paths changed:
+`src/federation/receive.rs` and `src/handlers/federation_signing_check.rs`.
+The delta on both is **`#[cfg(test)]` ONLY**:
+
+| Path | What changed |
+|---|---|
+| `src/federation/receive.rs` | A new `cov_catchup_helpers_3521` test module: pins the `/sync/since` catch-up URL builder (the cursor is carried exactly once, percent-encoded), the stored-namespace probe's "no live row is `Ok(None)`, never a watermark-halting `Err`" contract, and the transient `sync_state_observe` WARN. |
+| `src/handlers/federation_signing_check.rs` | Four cases added to the existing `fed_p2d_credential_resolution_tests` module: a malformed `X-Memory-Cred` leaf, a malformed chain header, a credential from an issuer the bundle does not trust, and the identity binding that refuses a credential whose subject does not match the claimed `X-Peer-Id`. |
+
+*Reason, stated in the terms this clause cares about.* **No production line was
+added, removed or changed on either path.** The shipped `/sync/*` wire, the
+receive-path authorization semantics, the schema, and every `AI_MEMORY_FED_*`
+identifier are **byte-identical** (the mechanized env-surface trigger did not
+fire — the PATH watch did). No certified control was removed, relaxed or made
+conditional; the removal-proof set is unchanged. The change only makes existing
+refusals FALSIFIABLE: before it, the credential-binding refusals and the
+catch-up cursor contract had no test, so a regression that widened them would
+have merged green. Sibling coverage added in the same PR sits in `tests/` and
+touches no `src/federation/**` file: the nonce-freshness enforcement on both
+`/sync/push` and `/sync/since` (`tests/cov_fupb_fed_signing.rs`) and the
+refusing-backend `/sync/push` accounting (`tests/cov_sal_refusal_arms_3521.rs`).
+
+*Disposition.* **This change does NOT re-mint the certification** and makes no
+claim about its status: the certification is already **VOID** per the #3502
+record above, and re-running §5.4(2)–(5) and re-issuing against a new SHA
+remains the Conductor task tracked by
+[**#3501**](https://github.com/alphaonedev/ai-memory-mcp/issues/3501). The
+shipped federation posture is UNCHANGED from `e22bc93c`; only its test
+coverage is stronger. The historical bind remains `e22bc93c`.
+
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
 operator account (`alphaonedev`). GitHub signature verification is

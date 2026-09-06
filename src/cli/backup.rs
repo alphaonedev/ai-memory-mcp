@@ -2468,3 +2468,66 @@ mod tests {
         manifest
     }
 }
+
+/// #3521 — durability-verb refusal arms (per-module coverage floor).
+///
+/// `restore` REPLACES the live database, so both of the guards below are
+/// data-integrity gates rather than ergonomics:
+///
+/// * [`refuse_if_target_in_use`] refuses only on a POSITIVE liveness
+///   signal. Its two other arms — the target cannot be opened at all, and
+///   the probe was inconclusive — must WARN and PROCEED, because
+///   restoring over a database nothing can open any more is exactly the
+///   disaster-recovery case the verb exists for. A regression that turned
+///   either into a refusal would strand an operator mid-recovery.
+/// The sibling `resolve_sqlite_store` ambiguity refusals live in
+/// `tests/cov_backup_store_url_3521.rs`: they mutate the process-global
+/// store-URL environment, which `scripts/check-test-env-lock.sh` arm (d)
+/// (issue #3475) requires to happen in its OWN test binary rather than in
+/// the shared lib test binary whose cases run on parallel threads.
+#[cfg(test)]
+mod cov_backup_refusal_arms_3521 {
+    use super::{CliOutput, refuse_if_target_in_use};
+
+    fn capture<T>(f: impl FnOnce(&mut CliOutput<'_>) -> T) -> (T, String) {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let value = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            f(&mut out)
+        };
+        (value, String::from_utf8_lossy(&stderr).into_owned())
+    }
+
+    /// A target that EXISTS but cannot be opened read-write (here: a
+    /// directory) is WARNed about and allowed through. Refusing would
+    /// block the recovery this verb exists for.
+    #[test]
+    fn unopenable_target_warns_and_proceeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target-is-a-directory.db");
+        std::fs::create_dir(&target).expect("mkdir");
+        let (res, stderr) = capture(|out| refuse_if_target_in_use(&target, out));
+        res.expect("an unopenable target must not refuse the restore");
+        assert!(
+            stderr.contains("cannot open") && stderr.contains("proceeding"),
+            "the operator must be told the probe could not run; stderr was: {stderr}"
+        );
+    }
+
+    /// A target that opens but is not a SQLite database at all makes the
+    /// liveness probe INCONCLUSIVE (not `SQLITE_BUSY`). Same contract:
+    /// warn, proceed — never a false "in use" refusal.
+    #[test]
+    fn inconclusive_probe_warns_and_proceeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("not-a-database.db");
+        std::fs::write(&target, b"this is not a sqlite header at all\n").expect("write");
+        let (res, stderr) = capture(|out| refuse_if_target_in_use(&target, out));
+        res.expect("an inconclusive probe must not refuse the restore");
+        assert!(
+            stderr.contains("inconclusive") && stderr.contains("proceeding"),
+            "the operator must be told the probe was inconclusive; stderr was: {stderr}"
+        );
+    }
+}

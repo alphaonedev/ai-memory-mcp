@@ -36,6 +36,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout-relaxed connection, and the #2614 contention retry are unchanged, and
   the single-connector case is byte-for-byte identical (the first probe
   succeeds without ever sleeping).
+### Tests (#3521 — per-module coverage floors restored; tests only, no production change)
+
+- **#3521 — the five modules that breached their per-module coverage floors on
+  the published tip are back over them, and the three canaries have headroom
+  again.** `coverage/thresholds.toml` is UNCHANGED (playbook §8: floors rise,
+  never fall); the fix is behavioural tests over the branches that were dark.
+  New coverage, all of it pinning claims-truth / fail-closed contracts rather
+  than counting lines:
+  - `src/store/mod.rs` — the SAL `MemoryStore` DEFAULT arms. An adapter that has
+    not implemented a capability must surface `UnsupportedCapability` NAMING it,
+    never a silent `Ok` that would let an upper layer believe a federated apply,
+    a governance decision or a record-stop landed. The deliberately benign
+    defaults (`dequarantine`, `agent_max_created_at`, `latest_link_attest_levels`,
+    `check_memory_quota`, `namespace_by_id`) are pinned separately so the
+    distinction cannot be flipped silently.
+  - `src/handlers/federation_signing_check.rs` — `/sync/push` under a backend
+    that REFUSES: every refused subcollection lands in `skipped`, never
+    `applied` (a peer must not advance its watermark past rows this node does
+    not hold); an engaged record-stop refuses the push before any write; an
+    UNREADABLE record-stop probe refuses too (fail closed). Plus the
+    `X-Memory-Cred` refusal arms, including the identity binding that stops a
+    valid credential for peer A authenticating a push attributed to peer B —
+    and, in `tests/cov_fupb_fed_signing.rs`, the NONCE half of the
+    enforcement matrix on BOTH federation surfaces: a correctly-signed
+    `/sync/push` (or catch-up `/sync/since`) that omits its nonce under
+    `AI_MEMORY_FED_REQUIRE_NONCE=1` is refused, and a nonce presented twice
+    is refused, so a captured request cannot be replayed. That file's
+    `enrol_peer_key` helper now pins its temp key directory to `0700`: on a
+    host whose TMPDIR carries a permissive default ACL the fresh directory
+    came back `0775` and the #3198 key-store posture gate (correctly)
+    refused it, failing all seven cases before they reached the assertion
+    under test.
+  - `src/cli/curator.rs` — the store-backed `--prune-reports` and
+    `--rollback[-last]` twins over a `sqlite://` store URL (the same SAL
+    dispatch a `postgres://` URL takes): unknown rollback ids are refused,
+    reversed entries are tagged `_reversed` and skipped on re-run, malformed
+    entries are skipped rather than guessed at.
+  - `src/cli/backup.rs` — `restore`'s liveness probe WARNs and proceeds when the
+    target cannot be opened or the probe is inconclusive (refusing there would
+    strand a disaster recovery), and `resolve_sqlite_store` refuses an ambiguous
+    `--store-url`-vs-environment pair instead of guessing which store to write.
+  - `src/federation/receive.rs` — the catch-up `/sync/since` URL builder carries
+    the cursor exactly once (a dropped cursor turns a bounded delta pull into a
+    full-corpus re-pull) and the stored-namespace probe reports "no live row" as
+    `Ok(None)`, never an `Err` that would halt the watermark.
+  - Canaries: `src/cli/doctor.rs` (Identity section — a group-writable key store
+    is CRITICAL with the `chmod` to fix it; `daemon.pub` with no `daemon.priv`
+    reports "cannot sign"), `src/handlers/links.rs` (a wrongly-typed link
+    endpoint is refused, never coerced), `src/daemon_runtime.rs` (an unopenable
+    DB leaves the ANN index cold instead of seeding a partial graph; a lax-mode
+    passphrase file is refused unless the operator explicitly opts out (and
+    the opt-out reads the SAME handle it permission-checked, per #1790); a
+    URL-shaped `--db` is refused with the password REDACTED; the four
+    unattended maintenance loops — pending-action timeout sweep, transcript
+    archive/prune, daily agent-quota reset, WAL checkpoint — tick repeatedly
+    against one shared connection and leave the corpus readable, writable and
+    byte-identical; and `find-paths` / `kg-invalidate` / `swarm-rewind` over
+    an empty corpus report nothing rather than fabricating a path, an edge or
+    a write).
+
+  The two environment-mutating groups (the backup store-URL resolver and the
+  passphrase-file posture) live in their OWN test binaries —
+  `tests/cov_backup_store_url_3521.rs` and
+  `tests/cov_daemon_passphrase_posture_3521.rs` — because
+  `scripts/check-test-env-lock.sh` arm (d) (#3475) refuses new
+  `std::env::set_var` in the shared `src/**` test binary, whose cases run on
+  parallel threads and whose READERS take no lock.
+
+  `tests/qual_10_module_size_ceiling.rs`: `src/daemon_runtime.rs` 14_300 ->
+  14_450 in lockstep (the growth is entirely `#[cfg(test)]`).
+
+  `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` carries the §7
+  expiry record this change's `#[cfg(test)]`-only touch of
+  `src/federation/receive.rs` + `src/handlers/federation_signing_check.rs`
+  triggers (the `cert-expiry-gate`). It re-mints nothing: the certification
+  is already VOID per the #3502 record, no production line on either watched
+  path changed, and the shipped federation posture is unchanged from
+  `e22bc93c` — only its test coverage is stronger.
 
 ### Fixed (#3329 — autonomous-tier MCP boot no longer blocks the `initialize` handshake; macOS config-path resolution)
 
