@@ -83,6 +83,31 @@ pub const MAX_TOPIC_BYTES: usize = 64;
 /// tries to exceed it gets `403`, never a silently-truncated subscription.
 pub const MAX_TOPICS_PER_SESSION: usize = 32;
 
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// hard ceiling on the PROVEN readable-PREFIX set the derived allowlist
+/// snapshot carries for ONE agent.
+///
+/// DEFINED as `crate::visibility::NAMESPACE_READ_SCOPE_DEPTH`, not merely
+/// equal to it: the snapshot carries the store's own #1921 `team` / `unit` /
+/// `org` prefixes, so the hub's ceiling and the derivation are ONE number and
+/// cannot drift into a hub that refuses a set the store considers legitimate.
+///
+/// It is a ceiling on PREFIXES, deliberately not on expanded namespaces. An
+/// exact list would grow with the CORPUS — an org-level agent over a few
+/// hundred namespaces would exceed any fixed cap, and refusing the export then
+/// publishes NOTHING, which after the snapshot TTL makes the hub refuse every
+/// hello: a fleet-wide availability failure caused by the corpus growing. The
+/// prefix set is a property of the agent's own id, so it is O(1) forever.
+pub const MAX_READABLE_PREFIXES: usize = crate::visibility::NAMESPACE_READ_SCOPE_DEPTH;
+
+/// v1.0.0 #3505 — longest prefix a proven-read entry may carry, in bytes.
+///
+/// A topic is `#` + the namespace and is itself bounded by
+/// [`MAX_TOPIC_BYTES`]; a prefix longer than that could only ever admit
+/// namespaces no session could subscribe to, so carrying one would be dead
+/// weight the hub must still parse on every hello.
+pub const MAX_READABLE_PREFIX_BYTES: usize = MAX_TOPIC_BYTES - 1;
+
 /// Length of the hub-issued handshake nonce, in bytes.
 pub const HELLO_NONCE_BYTES: usize = 32;
 

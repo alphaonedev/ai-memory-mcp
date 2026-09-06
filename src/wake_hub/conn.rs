@@ -68,6 +68,14 @@ struct Conn {
     nonce: [u8; HELLO_NONCE_BYTES],
     agent: Option<VerifiedAgent>,
     session_hello: Option<HelloPayload>,
+    /// v1.0.0 #3505 — the topics this session currently holds in the router.
+    ///
+    /// The hello payload alone is NOT this set: a later `subscribe` frame adds
+    /// topics that never appear in `session_hello`, and before #3505 nothing
+    /// re-checked those. Tracking them here is what lets the one-second
+    /// revalidation re-verify EVERY live subscription rather than only the
+    /// ones the handshake named.
+    subscribed: Vec<String>,
     bucket: TokenBucket,
     preauth: TokenBucket,
 }
@@ -114,6 +122,7 @@ pub(super) async fn run(
         nonce: state.new_nonce(),
         agent: None,
         session_hello: None,
+        subscribed: Vec::new(),
         bucket: TokenBucket::new(state.cfg.rate_per_sec, state.cfg.rate_burst, now),
         preauth: TokenBucket::new(state.cfg.preauth_rate_per_sec, state.cfg.preauth_burst, now),
         state: Arc::clone(&state),
@@ -182,8 +191,19 @@ async fn read_loop(
 }
 
 impl Conn {
-    /// Recheck expiry and the refreshed public root even for idle recipients.
-    fn revalidate(&self) -> bool {
+    /// Recheck expiry, the refreshed public root, and — since #3505 — every
+    /// topic this session currently holds, even for idle recipients.
+    fn revalidate(&mut self) -> bool {
+        if !self.reverify_identity() {
+            return false;
+        }
+        self.drop_unproven_topics();
+        true
+    }
+
+    /// The identity half of [`Self::revalidate`]: the full `hello` chain, run
+    /// again against the CURRENT snapshot.
+    fn reverify_identity(&self) -> bool {
         let (Some(agent), Some(payload)) = (&self.agent, &self.session_hello) else {
             return false;
         };
@@ -204,6 +224,61 @@ impl Conn {
                 false
             }
         }
+    }
+
+    /// v1.0.0 #3505 — drop any live subscription the CURRENT snapshot no
+    /// longer proves.
+    ///
+    /// This is the load-bearing revocation property for namespace topics: an
+    /// operator who narrows an agent's read scope and republishes the snapshot
+    /// gets the subscription dropped within the one-second revalidation, with
+    /// no reconnect and no cooperation from the client.
+    ///
+    /// It NARROWS rather than closing the session, deliberately. A session
+    /// whose PRINCIPAL lost authority is already gone — [`Self::revalidate`]
+    /// returns `false` before this runs, and that includes a hello topic that
+    /// lost its proof, because `verify` re-checks the hello topic set. What is
+    /// left here is a topic a later `subscribe` frame added, and killing the
+    /// whole session for it would also take away the agent's own inbox and
+    /// send a well-behaved client into a reconnect loop presenting the same
+    /// topics. Fewer subscriptions is a degrade; a reconnect storm across a
+    /// fleet is an outage.
+    fn drop_unproven_topics(&mut self) {
+        let Some(agent) = self.agent.as_ref().map(|agent| agent.agent_id.clone()) else {
+            return;
+        };
+        if self.subscribed.is_empty() {
+            return;
+        }
+        let verifier = &self.state.deps.verifier;
+        if verifier.verify_topics(&agent, &self.subscribed).is_ok() {
+            return;
+        }
+        // The batch was refused, so at least one topic lost its proof. Re-ask
+        // per topic to find which — the batch check is the fast path and this
+        // runs only on the rare narrowing.
+        let (kept, dropped): (Vec<String>, Vec<String>) =
+            self.subscribed.iter().cloned().partition(|topic| {
+                verifier
+                    .verify_topics(&agent, std::slice::from_ref(topic))
+                    .is_ok()
+            });
+        // Fail CLOSED on disagreement: if the whole set is refused while every
+        // single topic is admitted, the verifier is telling us something this
+        // code does not model, so drop everything rather than keep everything.
+        let dropped = if dropped.is_empty() {
+            std::mem::take(&mut self.subscribed)
+        } else {
+            self.subscribed = kept;
+            dropped
+        };
+        self.state.router.unsubscribe(&agent, &dropped);
+        tracing::info!(
+            agent = %agent,
+            dropped = dropped.len(),
+            remaining = self.subscribed.len(),
+            "wake-hub: dropped subscriptions the refreshed snapshot no longer proves"
+        );
     }
 
     /// Handle one decoded body. Returns `false` when the connection must close.
@@ -293,6 +368,9 @@ impl Conn {
             let _ = self.send_error(ErrorCode::Forbidden, "too many topics for one session");
             return false;
         }
+        // #3505 — mirror what the router now holds, so the one-second
+        // revalidation re-verifies it.
+        self.subscribed = topics.to_vec();
         if !self.state.router.note_known(&agent) {
             tracing::warn!(
                 agent = %agent,
@@ -402,6 +480,63 @@ impl Conn {
             return self.send_error(ErrorCode::UnknownDestination, "empty destination");
         }
 
+        // v1.0.0 #3505 — SEND gate on NAMESPACE-topic wakes.
+        //
+        // Subscribe was never the only door onto a topic. Before this lane
+        // nobody could SUBSCRIBE to `#<namespace>`, so an ungated
+        // topic-addressed SEND fanned out to nobody and cost nothing. Now that
+        // a proven namespace is subscribable, an ungated send would let ANY
+        // authenticated peer — outside the subtree, or carrying no proven
+        // prefixes at all — publish fabricated hints (row id, sender, digest)
+        // to every subscriber of a team namespace, forcing catch-up reads
+        // fleet-wide while paying only its own token bucket.
+        //
+        // The gate is the SAME proof the subscription takes, so a sender may
+        // address exactly the namespace topics it could itself subscribe to.
+        // Consequently the reserved `wake-hub-producer` — a flat id carrying
+        // an EMPTY prefix set by design (#3469) — cannot publish to a
+        // namespace topic at all, and an out-of-scope send is refused rather
+        // than silently delivered to nobody, so the sender learns its scope
+        // instead of guessing.
+        //
+        // SCOPE: a SUBSTRATE topic (`#_inbox/<agent>` and the rest of #3348)
+        // is deliberately NOT gated here, and that is not a hole. It is the
+        // pre-#3505 own-inbox addressing, and it is ADDRESS-EQUIVALENT to the
+        // direct `to = <agent-id>` wake, which is ungated and always has been:
+        // the ONLY substrate subscription the verifier ever grants is a
+        // principal's own inbox, so such a topic has at most ONE subscriber
+        // and there is no fan-out amplification to charge. Gating it would
+        // refuse one spelling of a wake while leaving the identical direct
+        // spelling open — no security gained, and every peer-to-peer inbox
+        // wake broken. The authority #3505 CREATED is the namespace topic, and
+        // that is exactly what this gate covers.
+        //
+        // `Forbidden`, not `Unauthorized`: this is one refused frame on an
+        // otherwise valid session (`send_error` keeps the connection open for
+        // `Forbidden` and closes it for `Unauthorized`), and closing a
+        // producer's session over one mis-addressed wake would convert an
+        // authorization refusal into a reconnect storm.
+        if let Some(namespace) = frame.to.strip_prefix('#')
+            && !crate::visibility::is_substrate_namespace(namespace)
+            && let Err(reason) = self
+                .state
+                .deps
+                .verifier
+                .verify_topics(&agent.agent_id, std::slice::from_ref(&frame.to))
+        {
+            self.state.metrics.denied_forged_from();
+            tracing::debug!(
+                agent = %agent.agent_id,
+                topic = %frame.to,
+                reason = ?reason,
+                "wake-hub: refused a topic wake outside the sender's proven scope"
+            );
+            return self.send_error(
+                ErrorCode::Forbidden,
+                "topic outside the sender's proven read scope",
+            );
+        }
+
         let recipients = if frame.to_is_topic() {
             self.state
                 .router
@@ -508,12 +643,21 @@ impl Conn {
                 return self.send_error(reason.wire_code(), reason.wire_reason());
             }
             if self.state.router.subscribe(&agent.agent_id, &topics) {
+                // #3505 — the router took them, so the revalidation must see
+                // them. Topics added HERE are precisely the ones the pre-#3505
+                // revalidation never re-checked.
+                for topic in topics {
+                    if !self.subscribed.contains(&topic) {
+                        self.subscribed.push(topic);
+                    }
+                }
                 true
             } else {
                 self.send_error(ErrorCode::Forbidden, "too many topics for one session")
             }
         } else {
             self.state.router.unsubscribe(&agent.agent_id, &topics);
+            self.subscribed.retain(|held| !topics.contains(held));
             true
         }
     }

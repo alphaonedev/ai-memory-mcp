@@ -647,10 +647,10 @@ fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes, caller: Option<&str>)
 }
 
 fn matches_subtree(namespace: &str, prefix: Option<&str>) -> bool {
-    match prefix {
-        None => false,
-        Some(p) => namespace == p || namespace.starts_with(&format!("{p}/")),
-    }
+    // #3505 — ONE definition of the #1921 containment test, shared with
+    // `crate::visibility::scope_subtree_visible` and the wake-hub topic
+    // derivation. Byte-identical to the expression this replaced.
+    prefix.is_some_and(|p| crate::visibility::namespace_subtree_contains(p, namespace))
 }
 
 /// Generate the visibility WHERE-clause fragment starting at placeholder `start`.

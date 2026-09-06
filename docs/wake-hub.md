@@ -84,10 +84,117 @@ A wake payload is exactly:
 
 A substrate wake is addressed DIRECTLY to the recipient agent id and never to a
 `#topic`. The hub's route table is keyed by the identity a hello authenticated,
-so a wake for `X` can only ever land on a session that authenticated AS `X` —
-own-inbox only, which is exactly the scope #3468's delegation verifier grants
-until #3505 widens it. A topic-shaped, reserved, empty or over-long recipient is
-refused and counted; it is never coerced into something routable.
+so a wake for `X` can only ever land on a session that authenticated AS `X`.
+A topic-shaped, reserved, empty or over-long recipient is refused and counted;
+it is never coerced into something routable.
+
+### Which topics a session may subscribe to (#3505)
+
+The verifier admits exactly two topic shapes and nothing else:
+
+1. `#_inbox/<agent-id>` for the principal that authenticated — the
+   unconditional own-inbox proof #3468 shipped.
+2. `#<namespace>` for a namespace the CURRENT snapshot PROVES that principal
+   reads.
+
+The proof is derived out of band, by `ai-memory identity hub-cache`, from the
+SAME predicate the store applies for namespace read scope: the #1921 team /
+unit / org ancestors of the agent's own id. There is no second copy of that
+predicate — `crate::visibility::namespace_read_scope_prefixes` is the one
+definition, and both the sqlite and the postgres exporter call it.
+
+What the snapshot carries is those PREFIXES (at most three), not an expanded
+list of namespaces. The hub then admits `#<namespace>` when
+`crate::visibility::namespace_subtree_contains` — the store's own containment
+test, the same one `crate::storage::matches_subtree` and
+`scope_subtree_visible` route through — places the namespace inside one carried
+prefix, AND the namespace is not a #3348 substrate namespace (`_inbox/`,
+`_messages/`, `_agents`, …).
+
+Four properties follow, and each is load-bearing:
+
+* **The hub still opens no database.** Verify time is the shared containment
+  test applied to material the hub already holds.
+* **The hub applies the store's own subtree containment against
+  exporter-proven prefixes.** It is not a bare `starts_with`: `acme/eng` admits
+  `acme/eng/x` and never `acme/engineering`, because the shared predicate is
+  segment-wise. Reusing it is what stops the hub from re-widening a scope the
+  store would narrow — the hub is the component with the least information
+  about what the store would allow, so it must not carry its own rule.
+* **The export cannot grow with the corpus.** The set is a property of the
+  agent's ID, so it is fixed-size forever and derived with no query. An
+  expanded namespace list would instead grow as namespaces are created: an
+  org-level agent in a corpus of a few hundred namespaces would exceed any
+  fixed per-agent ceiling, the refresher would then publish NOTHING, and once
+  the snapshot aged out the hub would refuse EVERY hello — a fleet-wide
+  availability failure caused by ordinary corpus growth.
+* **Narrowing takes effect within one second.** Every session's live
+  subscription set — the hello topics AND anything a later `subscribe` frame
+  added — is re-verified on the one-second revalidation. Drop a prefix from the
+  next snapshot and the already-open subscription is dropped, with no reconnect
+  and no cooperation from the client. The session itself survives: losing a
+  scope costs subscriptions, not the agent's own inbox, because a fleet that
+  reconnects on every scope change is an outage where fewer subscriptions is a
+  degrade.
+
+The prefix set is bounded per agent by `MAX_READABLE_PREFIXES`, which IS
+`crate::visibility::NAMESPACE_READ_SCOPE_DEPTH` — one number, so the hub's
+ceiling can never disagree with the derivation. The exporter cannot produce an
+oversize set, so a file that carries one is evidence it is not what it claims
+to be and the hub REFUSES to load it — never a truncation, because which of an
+agent's prefixes survived would then depend on ordering.
+
+### Sending to a topic (#3505)
+
+**A topic has two doors, and both take the same proof.** `Frame.to =
+#<namespace>` on a `wake` is gated by the SAME `verify_topics` check a
+`subscribe` takes, so a session may address exactly the topics it could itself
+subscribe to. An out-of-scope topic send is refused with `403 forbidden` and
+fans out to nobody.
+
+Without that gate the widening would have been one-sided: before #3505 nobody
+could subscribe to `#<namespace>`, so an ungated topic send reached nobody and
+cost nothing — but the moment a proven namespace became subscribable, any
+authenticated peer, in any tenant, could have published fabricated hints (row
+id, sender, digest) to every subscriber of a team namespace and forced
+catch-up reads fleet-wide while paying only its own token bucket.
+
+`403 forbidden`, not `401 unauthorized`: this refuses ONE frame on an otherwise
+valid session (the hub closes the connection on `unauthorized` and keeps it on
+`forbidden`), so a mis-addressed wake never becomes a fleet-wide reconnect
+storm.
+
+**This is the boundary the producer follow-up must cross deliberately.** The
+reserved `wake-hub-producer` (#3469) is a flat id with no team / unit / org
+ancestor, so it carries an EMPTY prefix set by design and therefore cannot
+publish to a namespace topic at all. Its DIRECT, own-inbox wakes are unchanged
+— that is the whole authority the sink was ever granted. Making the substrate
+emit a TOPIC wake therefore cannot be done by wiring alone: it requires an
+explicit, reviewed decision to grant that principal a namespace scope, which is
+exactly the deliberation a broadcast authority deserves.
+
+**Snapshot format.** `readable_prefixes` is an ADDITIVE field and
+`ALLOWLIST_FILE_VERSION` deliberately stayed at `2`. Both mismatch directions
+already fail in the right direction: a NEWER hub reading an OLDER snapshot sees
+no field, defaults the set to EMPTY and admits own-inbox only (never
+"everything") — which a version bump would have turned into an outright refusal
+of every older file, so upgrading the hub before the exporter would take the
+fleet down; an OLDER hub reading a NEWER snapshot refuses the file whole through
+`deny_unknown_fields`, so it can never part-honour a grant it does not
+understand. The version stays reserved for a change to the meaning of an
+EXISTING field.
+
+**Not in this lane — the producer half.** Nothing in the substrate publishes a
+TOPIC-addressed wake yet. The #3469 sink emits DIRECT wakes only
+(`Frame.to = <agent-id>`), so today a namespace topic is subscribable and is
+fed only by another authenticated session that PROVES the namespace sending
+`wake` to `#<namespace>`. Making the substrate emit a topic wake when a
+shared-namespace row lands is a separate, deliberate change to
+`src/wake_sink/` and its `agent_notified` producer — it needs its own decision
+about which namespaces are worth broadcasting, how the fan-out is charged, and
+(per the send gate above) whether the reserved producer principal should be
+granted a namespace scope at all. It is tracked as a follow-up rather than
+smuggled in behind a verifier widening.
 
 Wakes are never sourced from the webhook lane. That lane is operator egress,
 with a global dispatch semaphore and a subscription-scan ceiling; sourcing an
