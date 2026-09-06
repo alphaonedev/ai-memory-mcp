@@ -486,6 +486,20 @@ mod tests {
     }
 
     fn build_config(peers: Vec<String>, w: usize, timeout_ms: u64) -> FederationConfig {
+        // #3515 — every peer POST built from this config runs through the
+        // `NetworkRequest` governance gate in `sync::build_governed_peer_post`,
+        // which FAILS CLOSED while the process-wide `GOVERNANCE_PRE_ACTION`
+        // `OnceLock` is still empty. Whether it is empty is process-global
+        // state shared with the rest of the `--lib` binary (the
+        // `daemon_runtime::tests::test_bootstrap_serve_*` tests install the
+        // real hook as a side effect), so at default parallelism the quorum /
+        // id-drift / retry assertions below were deciding a scheduling race,
+        // not the broadcast contract. Seeding the gate here makes the outcome
+        // the peer mock's every time; see
+        // `governance::wire_check::ensure_installed_for_test` for why a
+        // save/restore RAII guard is structurally impossible on a one-shot
+        // `OnceLock` and must not be invented.
+        crate::governance::wire_check::ensure_installed_for_test();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
@@ -513,6 +527,29 @@ mod tests {
             signing_key: None,
             dlq_sink: None,
         }
+    }
+
+    /// #3515 — pin the fixture invariant itself. Every quorum / id-drift /
+    /// retry test in this module reaches a peer through
+    /// `sync::build_governed_peer_post`, which consults
+    /// `governance::wire_check::check_governed` and REFUSES with
+    /// `HOOK_NOT_INSTALLED_REASON` while the process-wide
+    /// `GOVERNANCE_PRE_ACTION` `OnceLock` is empty. That refusal surfaces as
+    /// an ordinary peer miss (`AckOutcome::Fail`), so a regression here does
+    /// not announce itself — it silently turns the whole module back into a
+    /// coin-flip on whichever sibling test installed the hook first. Assert
+    /// the post-condition directly so removing the seed from `build_config`
+    /// fails loudly instead.
+    #[test]
+    fn build_config_seeds_the_wire_action_gate_3515() {
+        let _cfg = build_config(Vec::new(), 1, 100);
+        assert!(
+            crate::governance::wire_check::GOVERNANCE_PRE_ACTION
+                .get()
+                .is_some(),
+            "build_config must leave a wire-action hook installed, or every \
+             governed peer POST in this module fails closed (#3515)"
+        );
     }
 
     #[tokio::test]

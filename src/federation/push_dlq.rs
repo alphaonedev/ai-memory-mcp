@@ -2053,6 +2053,12 @@ mod replay_arm_tests {
     }
 
     fn cfg_with_peer(peer_id: &str, url: &str) -> FederationConfig {
+        // #3515 — same process-global `GOVERNANCE_PRE_ACTION` race as
+        // `federation::tests::build_config`: the DLQ replay push is governed
+        // egress, so it fails closed unless some sibling test happened to
+        // install the hook first. Seed it so replay outcomes are decided by
+        // the peer mock, not by test scheduling.
+        crate::governance::wire_check::ensure_installed_for_test();
         FederationConfig {
             policy: QuorumPolicy::new(1, 1, Duration::from_millis(200), Duration::from_secs(30))
                 .unwrap(),
