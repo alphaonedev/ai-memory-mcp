@@ -154,13 +154,67 @@
 # freely and never rise. Its full rationale sits with the code, below the
 # arms (a)-(c) main loop.
 #
+# ARM (e) -- issue #3523 (2026-09-06). Arm (d) counts LITERAL
+# `set_var(` / `remove_var(` LINES per file, so an env write routed through
+# a CROSS-FILE HELPER is invisible to it: the file spells neither verb, its
+# count stays 0, and a file that mutates the environment on every test can
+# be absent from the arm (d) baseline entirely. That is not hypothetical --
+# `src/log_paths.rs` (73 helper-routed writes) and `src/encryption/mod.rs`
+# route every mutation through `crate::test_support::EnvGuard` and neither
+# appears in the arm (d) baseline at all.
+#
+# ENUMERATION (the #3523 ask: grep `set_var` under src/ and list every
+# wrapper). ~50 non-`#[test]` functions in `src/` call `std::env::set_var`
+# or `remove_var`. They split cleanly:
+#
+#   * FILE-LOCAL wrappers (the large majority) -- `clear_witness_env`,
+#     `scrub_llm_env`, `clear_posture_env`, `set_fully_hardened_env`,
+#     `with_mult`, `with_hatch`, `clear_llm_env_1143`, and the many
+#     per-module RAII `set` / `drop` pairs (`src/cli/store.rs`,
+#     `src/cli/doctor.rs`, `src/mcp/tools/capture_turn.rs`,
+#     `src/handlers/federation_receive.rs`,
+#     `src/federation/identity/resolver.rs`,
+#     `src/recover/transcript_paths.rs`, ...). These need NO new arm: the
+#     wrapper's own `set_var` line lives in the SAME file as its callers, so
+#     arm (d) already counts the file. Arm (e) would only re-count them.
+#
+#   * CROSS-FILE helpers -- the wrapper is defined in one file and called
+#     from others, so the CALLING file carries no countable line. These are
+#     what arm (e) exists for. Counted:
+#       - `crate::test_support::EnvGuard` (`capture` / `set` / `unset`) --
+#         the #3523 subject; writes a CALLER-CHOSEN value to a
+#         CALLER-CHOSEN key.
+#       - `identity::agent_id_env_set_guard` / `agent_id_env_unset_guard` --
+#         the #3475 caller principal (the set guard is ALSO counted by arm
+#         (d)'s AGENT_ID_INSTALL_PATTERN; double duty is harmless in a
+#         ratchet).
+#       - `identity::attest::permissive_attestation_for_lib_tests` and
+#         `handlers::tests::install_security_bypass_for_legacy_tests` --
+#         fixed-value, but they RELAX a security posture process-wide, so a
+#         new call site is exactly what a reviewer should see.
+#
+#   * DOCUMENTED-EXEMPT cross-file fixtures -- `identity::test_key_dir`
+#     (`install` / `arm`) and `cli::test_utils::ensure_no_config_env`. Both
+#     write a FIXED, isolation-PRESERVING value (a per-process test key
+#     directory; `AI_MEMORY_NO_CONFIG=1`) and both are near-mandatory
+#     boilerplate on new tests. Counting them would make arm (e) fire on
+#     almost every added test -- the shape that gets a gate switched off
+#     within a week -- while catching nothing an operator would act on.
+#     They are named here so the exemption is a decision, not an oversight.
+#
+# Like arm (d) this is a per-file CENSUS RATCHET, against its OWN baseline
+# (scripts/qc-allowlists/test-env-helper-mutation-baseline.txt) so the
+# #3475 baseline stays byte-identical: counts may fall freely and never
+# rise. Seeded at the #3523 commit, which is why it is green on a tree that
+# already carries 26 helper-routed files.
+#
 # Usage:
 #   scripts/check-test-env-lock.sh
-#     - exit 0 on clean, exit 1 on any violation (arms (a)-(d))
+#     - exit 0 on clean, exit 1 on any violation (arms (a)-(e))
 #   scripts/check-test-env-lock.sh --update-baseline
-#     - rewrite the arm (d) census baseline. Any number it RAISES is a
-#       deliberate widening of the #3475 control and must be justified in
-#       review; lowering one is always safe.
+#     - rewrite BOTH census baselines (arm (d) #3475, arm (e) #3523). Any
+#       number it RAISES is a deliberate widening of the control and must be
+#       justified in review; lowering one is always safe.
 #   scripts/check-test-env-lock.sh --self-test
 #     - injects: a violating fixture ($HOME mutation, zero test_env_lock
 #       reference anywhere in the file), a compliant fixture (same
@@ -378,8 +432,16 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # dot-prefixed basenames (they can never be a compiled Rust module), so a
     # `.`-named fixture could not exercise it.
     probe_arm_d="${ROOT}/src/check_test_env_arm_d_probe_3475.rs"
+    # Arm (e) (#3523) probes. Also NOT dot-prefixed, for the same reason.
+    # The VIOLATOR routes its env write through `crate::test_support::EnvGuard`
+    # and spells NEITHER `set_var` NOR `remove_var`, so it is invisible to
+    # arms (a)-(d) by construction -- that invisibility IS the defect.
+    # The EXEMPT probe uses the documented-exempt isolation fixture and must
+    # be SPARED, so the exemption is proven deliberate rather than accidental.
+    probe_arm_e="${ROOT}/src/check_test_env_arm_e_probe_3523.rs"
+    probe_arm_e_exempt="${ROOT}/src/check_test_env_arm_e_exempt_probe_3523.rs"
 
-    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d"; do
+    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run -- remove manually)" >&2
@@ -638,12 +700,46 @@ fn contrived_agent_id_env_install() {
 }
 EOF
 
+    # Case 9 (arm (e), issue #3523): a WHOLLY-NEW src/** file that mutates the
+    # process environment ENTIRELY through the cross-file
+    # `crate::test_support::EnvGuard` helper. It spells neither `set_var` nor
+    # `remove_var`, so arms (a)-(d) see NOTHING -- its arm (d) count is 0 and
+    # it never appears in that census at all. Arm (e) must flag it.
+    cat > "$probe_arm_e" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-env-lock.sh --self-test.
+// Mutates the process-global environment through the cross-file EnvGuard
+// helper and spells no literal mutation verb -- the issue #3523 bypass.
+use crate::test_support::{EnvGuard, env_lock};
+#[test]
+fn contrived_helper_routed_env_install() {
+    let _g = env_lock();
+    let guard = EnvGuard::capture("AI_MEMORY_CONTRIVED_3523");
+    guard.set("contrived");
+    guard.unset();
+}
+EOF
+
+    # Case 10 (arm (e) NEAR MISS): the documented-exempt isolation fixture.
+    # `test_key_dir::install()` writes a FIXED, isolation-PRESERVING value and
+    # is near-mandatory boilerplate on new tests, so counting it would fire on
+    # almost every added test. It must be SPARED -- a gate that flags this is
+    # over-widened and will be switched off.
+    cat > "$probe_arm_e_exempt" <<'EOF'
+// CONTRIVED COMPLIANT FIXTURE for scripts/check-test-env-lock.sh
+// --self-test. Uses ONLY the documented-exempt isolation fixture; arm (e)
+// must NOT flag it.
+#[test]
+fn contrived_exempt_isolation_fixture() {
+    let _ = crate::identity::test_key_dir::install();
+}
+EOF
+
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d"
+    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt"
     printf '%s\n' "$gate_output"
 
     # PASS requires: non-zero exit, ALL SIX violators reported (no-lock,
@@ -660,6 +756,7 @@ EOF
     printf '%s' "$gate_output" | grep -q 'contrived_handrolled_second_test\|\.check_home_lock_arm_b_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_naked_second_test\|\.check_home_lock_naked_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'check_test_env_arm_d_probe_3475\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'check_test_env_arm_e_probe_3523\.rs' || ok=0
     if printf '%s' "$gate_output" | grep -q '\.check_home_lock_compliant_probe\.rs'; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: the compliant fixture was flagged)" >&2
@@ -680,9 +777,14 @@ EOF
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (c) false-positived the config.rs delegate-wrapper carve-out)" >&2
         exit 1
     fi
+    if printf '%s' "$gate_output" | grep -q 'check_test_env_arm_e_exempt_probe_3523\.rs'; then
+        echo "" >&2
+        echo "Test-env-lock gate self-test: FAIL (over-widened: arm (e) flagged the documented-exempt isolation fixture -- a gate that fires on test_key_dir::install() will be switched off)" >&2
+        exit 1
+    fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-env-lock gate self-test: PASS (caught all six contrived violations -- five \$HOME shapes plus the #3475 arm (d) AI_MEMORY_AGENT_ID install -- and spared both compliant fixtures; exit=${gate_exit})"
+        echo "Test-env-lock gate self-test: PASS (caught all seven contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, and the #3523 arm (e) helper-routed bypass -- and spared all three compliant fixtures; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
@@ -927,6 +1029,48 @@ env_mutation_census () {
     done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k3,3
 }
 
+# ---------------------------------------------------------------------
+# ARM (e) -- issue #3523. Helper-routed env mutation census.
+# See the arm (e) header block for the full wrapper enumeration and the
+# rationale for what is counted and what is documented-exempt.
+# ---------------------------------------------------------------------
+
+# CROSS-FILE env-mutating helpers whose CALL SITES arm (d) cannot see,
+# because the `set_var` line lives in the helper's own (different) file.
+# `test_key_dir::install` / `::arm` and `ensure_no_config_env` are
+# DELIBERATELY absent -- see the header's DOCUMENTED-EXEMPT paragraph.
+HELPER_MUTATION_PATTERN='EnvGuard::(capture|set|unset)\(|agent_id_env_set_guard\(|agent_id_env_unset_guard\(|permissive_attestation_for_lib_tests\(|install_security_bypass_for_legacy_tests\('
+
+# `EnvGuard`'s mutating METHODS are called on a bound guard
+# (`guard.set("/x")`), so the receiver's type is not on the line. Counting
+# a bare `.set(` / `.unset(` ONLY inside files that name `EnvGuard` at all
+# keeps the over-approximation confined to the ~5 files that use the guard,
+# where over-counting merely pins a higher (harmless) ratchet number --
+# counts may always fall.
+HELPER_GUARD_METHOD_PATTERN='\.(set|unset)\('
+
+HELPER_BASELINE_FILE="${ROOT}/scripts/qc-allowlists/test-env-helper-mutation-baseline.txt"
+
+# helper_mutation_census
+# Emits `<helper_mutations> <path>` for every src/**/*.rs file with at
+# least one helper-routed env mutation, sorted by path.
+helper_mutation_census () {
+    while IFS= read -r -d '' f; do
+        local base="${f##*/}"
+        case "$base" in .*) continue ;; esac
+        local named guard total rel
+        named="$(grep -cE "$HELPER_MUTATION_PATTERN" "$f" 2>/dev/null || true)"
+        guard=0
+        if grep -q 'EnvGuard' "$f" 2>/dev/null; then
+            guard="$(grep -cE "$HELPER_GUARD_METHOD_PATTERN" "$f" 2>/dev/null || true)"
+        fi
+        total=$(( ${named:-0} + ${guard:-0} ))
+        [[ "$total" -eq 0 ]] && continue
+        rel="${f#"${ROOT}/"}"
+        printf '%s %s\n' "$total" "$rel"
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k2,2
+}
+
 if [[ "${1:-}" == "--update-baseline" ]]; then
     {
         echo "# scripts/qc-allowlists/test-env-mutation-baseline.txt -- issue #3475 ratchet baseline."
@@ -940,7 +1084,24 @@ if [[ "${1:-}" == "--update-baseline" ]]; then
         env_mutation_census
     } > "$BASELINE_FILE"
     echo "Test-env-lock gate: baseline rewritten -> ${BASELINE_FILE#"${ROOT}/"}"
-    # Propagate an arms-(a)-(c) failure: rewriting the arm (d) baseline must
+    {
+        echo "# scripts/qc-allowlists/test-env-helper-mutation-baseline.txt -- issue #3523 ratchet baseline."
+        echo "#"
+        echo "# Format: <helper-routed env mutations> <path>"
+        echo "#"
+        echo "# Arm (d) counts LITERAL set_var/remove_var lines, so an env write"
+        echo "# routed through a CROSS-FILE helper (crate::test_support::EnvGuard,"
+        echo "# identity::agent_id_env_*_guard, ...) is invisible to it. This is the"
+        echo "# sibling census that closes that bypass. Regenerate with:"
+        echo "#   scripts/check-test-env-lock.sh --update-baseline"
+        echo "# A regenerated baseline that RAISES any number is a deliberate,"
+        echo "# reviewable widening -- justify it in review."
+        echo "# See the arm (e) header in scripts/check-test-env-lock.sh for the"
+        echo "# full wrapper enumeration and the documented-exempt fixtures."
+        helper_mutation_census
+    } > "$HELPER_BASELINE_FILE"
+    echo "Test-env-lock gate: helper baseline rewritten -> ${HELPER_BASELINE_FILE#"${ROOT}/"}"
+    # Propagate an arms-(a)-(c) failure: rewriting the census baselines must
     # never launder a $HOME-serialization violation into a green exit.
     exit "$home_fail"
 fi
@@ -1005,7 +1166,69 @@ else
     echo "Test-env-lock gate arm (d): PASS (no src/** file gained env mutation over the #3475 baseline)"
 fi
 
-if (( home_fail != 0 || arm_d_fail != 0 )); then
+# ---------------------------------------------------------------------
+# ARM (e) -- issue #3523. Helper-routed env mutation ratchet.
+# ---------------------------------------------------------------------
+
+if [[ ! -f "$HELPER_BASELINE_FILE" ]]; then
+    echo "Test-env-lock gate arm (e): missing baseline ${HELPER_BASELINE_FILE#"${ROOT}/"}" >&2
+    echo "(regenerate with: scripts/check-test-env-lock.sh --update-baseline)" >&2
+    exit 1
+fi
+
+arm_e_report="$(
+    helper_mutation_census | awk -v baseline="$HELPER_BASELINE_FILE" '
+    BEGIN {
+        while ((getline line < baseline) > 0) {
+            if (line ~ /^[[:space:]]*(#|$)/) continue
+            split(line, F, /[[:space:]]+/)
+            known[F[2]] = 1; base_helper[F[2]] = F[1] + 0
+        }
+        close(baseline)
+    }
+    {
+        helper = $1 + 0; path = $2
+        if (!(path in known)) {
+            print "  NEW OFFENDER  " path " (helper-routed env mutations=" helper ")"
+            next
+        }
+        if (helper > base_helper[path])
+            print "  helper-routed env mutations INCREASED  " path "  " base_helper[path] " -> " helper
+    }
+    '
+)"
+
+if [[ -n "${arm_e_report//[[:space:]]/}" ]]; then
+    {
+        echo "New HELPER-ROUTED env mutation in the LIB TEST BINARY (issue #3523):"
+        printf '%s\n' "$arm_e_report"
+        echo ""
+        echo "Arm (d) counts LITERAL set_var/remove_var lines, so a write routed"
+        echo "through a CROSS-FILE helper -- crate::test_support::EnvGuard,"
+        echo "identity::agent_id_env_set_guard/_unset_guard, and the two"
+        echo "security-posture installers -- leaves the calling file's arm (d)"
+        echo "count at zero. That is the bypass this arm closes: the mutation is"
+        echo "just as process-global, and every concurrently-running reader in"
+        echo "the SAME lib test binary sees it."
+        echo ""
+        echo "Put the test in its OWN test binary instead (own process):"
+        echo ""
+        echo "  tests/<name>.rs   -- see tests/mcp_agent_id_env_isolation_3475.rs"
+        echo ""
+        echo "If this really is a deliberate, reviewed addition, the baseline"
+        echo "bump is an explicit widening:"
+        echo ""
+        echo "  scripts/check-test-env-lock.sh --update-baseline"
+        echo ""
+    } >&2
+    echo "Test-env-lock gate arm (e): FAIL" >&2
+    arm_e_fail=1
+else
+    arm_e_fail=0
+    echo "Test-env-lock gate arm (e): PASS (no src/** file gained helper-routed env mutation over the #3523 baseline)"
+fi
+
+if (( home_fail != 0 || arm_d_fail != 0 || arm_e_fail != 0 )); then
     echo "" >&2
     echo "Test-env-lock gate: FAIL" >&2
     exit 1
