@@ -48,6 +48,7 @@ from swarm.openrouter import OpenRouterError
 from swarm.audit import AgentAssessment, parse_assessment
 from swarm.config import DEFAULT_ASSESS_CONCURRENCY
 from swarm.toolset import dispatch
+from swarm.wake import wait_for_mail
 
 _RUN = uuid.uuid4().hex[:8]
 
@@ -126,6 +127,11 @@ async def producer_consumer(swarm: Swarm, agents: list[SwarmAgent] | None = None
                           "signal_type": "request", "body": {"work": 1}})
     swarm.coverage.record(sig)
 
+    # #3470: WAIT for the wake instead of racing the write (or, as the fleet
+    # used to, polling every three minutes). Inert with no hub configured, in
+    # which case this is byte-identical to the pre-#3470 immediate read — the
+    # durable inbox row is the record either way.
+    await wait_for_mail(b.identity.agent_id)
     got = await dispatch(b.client, b.identity, "inbox", {"unread_only": True, "limit": 10})
     swarm.coverage.record(got)
     # Inspect the FULL result, never the 160-char display summary (a long
@@ -595,6 +601,11 @@ async def cross_module_handoff(swarm: Swarm, groups: dict[str, list[SwarmAgent]]
                           {"to_agent": b.identity.agent_id, "subject": subject,
                            "body": "cross-module handoff probe"})
     swarm.coverage.record(send)
+    # #3470: wait for the wake where one is configured. This lane asserts in
+    # BOTH directions, so the wait must never be load-bearing for the negative
+    # case — an unconfigured or unreachable hub returns immediately and the
+    # read below is unchanged.
+    await wait_for_mail(b.identity.agent_id)
     got = await dispatch(b.client, b.identity, "inbox", {"unread_only": True, "limit": 10})
     swarm.coverage.record(got)
     crossed = got.ok and subject in json.dumps(got.result, default=str)

@@ -34,6 +34,7 @@
 //! | `cli::wrap::build_command_for_strategy` | wrapped agent | [`CALLER_CLI_WRAP_AGENT`] |
 //! | `hooks::executor` exec path | hook command | [`CALLER_HOOK_EXEC`] |
 //! | `hooks::executor` daemon path | hook command | [`CALLER_HOOK_DAEMON`] |
+//! | `cli::wake_listen::run_exec_hook` | `/bin/sh -c <hook>` | [`CALLER_CLI_WAKE_LISTEN_HOOK`] |
 //!
 //! # Keyless-context handling (#1937 design guidance, M-PANIC-IS-STOP)
 //!
@@ -99,6 +100,15 @@ pub const CALLER_HOOK_EXEC: &str = "hooks::executor::exec_fire";
 /// Caller slug for the long-lived daemon-mode hook-command spawn in
 /// `crate::hooks::executor` (`DaemonExecutor`).
 pub const CALLER_HOOK_DAEMON: &str = "hooks::executor::daemon_connect";
+
+/// Caller slug for the `ai-memory wake-listen --exec` hook spawn in
+/// `crate::cli::wake_listen::run_exec_hook` (#3470).
+///
+/// Distinct from [`CALLER_HOOK_EXEC`] on purpose: that one is the governance
+/// hook chain, this one is an operator-supplied wake notifier, and an auditor
+/// reading a spawn row must be able to tell which authority launched a shell
+/// without decoding argv.
+pub const CALLER_CLI_WAKE_LISTEN_HOOK: &str = "cli::wake_listen::run_exec_hook";
 
 /// Field separator for the canonical spawn-audit pre-image. A single ASCII
 /// `|` mirrors the [`crate::egress::emit_inference_egress_refusal`] pre-image

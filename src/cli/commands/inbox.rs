@@ -33,6 +33,29 @@ pub struct InboxArgs {
     /// Emit the raw JSON envelope.
     #[arg(long)]
     pub json: bool,
+
+    /// v1.0.0 #3470 (EPIC #3466) — block until a wake arrives, then read.
+    ///
+    /// Waits on the wake plane: the `ai-memory wake-hub` socket when one is
+    /// configured, otherwise the bounded `<=60 s` backstop poll, which is the
+    /// documented degraded mode and not an error. The read and its rendering
+    /// are byte-identical to a plain `ai-memory inbox` — waiting changes WHEN
+    /// the read happens, never WHAT it returns.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Longest time `--wait` will block, in seconds.
+    ///
+    /// Omitting it does NOT mean waiting forever: the backstop tick is itself
+    /// a return, so a wait without `--timeout` lasts at most one poll interval
+    /// (`<= 60 s`, `wake_sink::BACKSTOP_POLL_MAX`). Pass it to bound the wait
+    /// tighter than that.
+    ///
+    /// On expiry the command still performs the read and prints the result,
+    /// so a timeout is "nothing arrived in that window", never a failure and
+    /// never a reason to skip the durable truth.
+    #[arg(long, value_name = "SECS", requires = "wait")]
+    pub timeout: Option<u64>,
 }
 
 /// `ai-memory inbox` dispatch entry.
@@ -88,6 +111,84 @@ pub fn cmd_inbox(
     Ok(())
 }
 
+/// `ai-memory inbox --wait` — block on the wake plane, then render exactly
+/// what [`cmd_inbox`] renders.
+///
+/// Without `--wait` this is a straight delegate, so the non-waiting path is
+/// byte-identical to pre-#3470.
+///
+/// A hub CREDENTIAL that will not load is deliberately NOT an error here: it
+/// is logged once at WARN and the wait falls through to the bounded backstop
+/// poll (see [`crate::cli::wake_listen::wait_for_wake_or_backstop`]). A
+/// `--wait` that returned immediately on a missing bundle would turn the
+/// documented `sleep 180; ai-memory inbox` replacement into a hot loop.
+///
+/// # Errors
+///
+/// Refusals from the wake-listener RESOLUTION — a missing agent id, an
+/// unresolvable key directory, a poll interval over the normative bound —
+/// plus every failure [`cmd_inbox`] can produce.
+pub async fn cmd_inbox_waiting(
+    db_path: &std::path::Path,
+    args: &InboxArgs,
+    app_config: &crate::config::AppConfig,
+    cli_agent_id: Option<&str>,
+) -> Result<()> {
+    if args.wait {
+        let listen = crate::cli::wake_listen::WakeListenArgs {
+            agent_id: args.agent_id.clone(),
+            socket: None,
+            hub_id: None,
+            key_dir: None,
+            bundle: None,
+            poll_secs: None,
+            unread_only: args.unread_only,
+            limit: args.limit,
+            json: args.json,
+            exec: None,
+            once: true,
+            // No hub configured is NOT an error: the bounded backstop poll
+            // is then the delivery mechanism, which is exactly the contract
+            // this plane advertises.
+            no_hub: false,
+        };
+        let resolved = crate::cli::wake_listen::resolve(&listen, app_config, cli_agent_id)?;
+        let timeout = args.timeout.map(std::time::Duration::from_secs);
+        // `wait_for_wake_or_backstop`, never `wait_for_wake`: a host that
+        // never ran `ai-memory identity delegate` — or whose bundle expired,
+        // or was minted for another hub — must still WAIT on the bounded
+        // poll. Returning the credential error here would make `--wait` read
+        // immediately, and the fleet recipe that swaps `sleep 180;
+        // ai-memory inbox` for this command would become a hot loop of
+        // immediate reads with a warning per iteration.
+        match crate::cli::wake_listen::wait_for_wake_or_backstop(&resolved, timeout).await {
+            Ok(Some(signal)) => {
+                tracing::debug!(reason = signal.reason.label(), "inbox --wait: woken");
+            }
+            Ok(None) => {
+                tracing::debug!("inbox --wait: timed out; reading anyway");
+            }
+            Err(e) => {
+                // Only an invalid poll interval or a missing runtime reaches
+                // here, and neither is recoverable by waiting. Degrade, never
+                // refuse: the durable rows are readable whether or not the
+                // wake plane is, and refusing would make an inbox read depend
+                // on a latency optimisation.
+                tracing::warn!(
+                    "inbox --wait: the wake plane could not be started ({e:#}); reading \
+                     immediately"
+                );
+            }
+        }
+    }
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut so = stdout.lock();
+    let mut se = stderr.lock();
+    let mut out = CliOutput::from_std(&mut so, &mut se);
+    cmd_inbox(db_path, args, &mut out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +203,8 @@ mod tests {
             unread_only: false,
             limit: None,
             json: true,
+            wait: false,
+            timeout: None,
         };
         {
             let mut out = env.output();
@@ -123,6 +226,8 @@ mod tests {
             unread_only: false,
             limit: Some(10),
             json: false,
+            wait: false,
+            timeout: None,
         };
         {
             let mut out = env.output();
@@ -145,6 +250,8 @@ mod tests {
             unread_only: true,
             limit: None,
             json: true,
+            wait: false,
+            timeout: None,
         };
         {
             let mut out = env.output();

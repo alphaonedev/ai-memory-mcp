@@ -5,7 +5,8 @@
 > (the bus), [#3467](https://github.com/alphaonedev/ai-memory-mcp/issues/3467)
 > (the hub), [#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)
 > (identity), [#3469](https://github.com/alphaonedev/ai-memory-mcp/issues/3469)
-> (this page: the bus sink).
+> (the bus sink), [#3470](https://github.com/alphaonedev/ai-memory-mcp/issues/3470)
+> (this page: the client).
 
 ## What the wake plane is for
 
@@ -22,6 +23,7 @@ Three pieces:
 | `crate::inbox_wake` | the in-process `agent_notified` broadcast bus, one frame per committed notify |
 | `crate::wake_sink` | the bridge from that bus to the hub — in-process, or over the hub's socket |
 | `crate::wake_hub` | the same-host Unix-domain-socket switch that pushes the hint to connected agents |
+| `crate::wake_client` | the CLIENT: one long-lived session, one catch-up inbox read per hint, and the bounded poll that makes losing the hub cost latency only |
 
 ## NORMATIVE: keep polling
 
@@ -240,6 +242,159 @@ credential file to steal and nothing to rotate.
 call and is exercised by the test suite, but nothing in `serve` hosts a hub in
 this build — `ai-memory wake-hub` runs the hub as its own process. When a
 `serve`-hosted hub lands, wiring it is one line at the same boot site.
+
+## The client: `ai-memory wake-listen`
+
+The plane is only useful if something listens on it. `ai-memory wake-listen`
+(#3470) is that something, and it is what replaces the fleet's three-minute
+`ai-memory inbox` cron: one process, one session, one inbox read per event
+instead of one process boot per poll.
+
+```bash
+# once, per agent, on the host that will listen
+ai-memory identity delegate --scope a2a-hub --agent-id ai:alice --hub-id ai-memory-wake-hub
+
+# then, long-lived
+ai-memory wake-listen --agent-id ai:alice --json
+ai-memory wake-listen --agent-id ai:alice --exec 'my-notifier'
+
+# or, for a one-shot "block until there is mail, then print it"
+ai-memory inbox --wait --timeout 300 --agent-id ai:alice
+```
+
+### What it reads, and how often
+
+Exactly ONE catch-up inbox read per event, through the same `memory_inbox`
+funnel every other surface uses — never a read per queued hint:
+
+| Event | Why it reads |
+|---|---|
+| welcome | mail may have arrived while this agent was offline |
+| welcome with `lagged` | the hub's offline id set overflowed, so its id list cannot be trusted |
+| `wake` | a hint arrived naming a row |
+| `wake` with a `seq_high_watermark` gap | wakes happened that this listener did not see |
+| backstop tick | the bounded poll, always armed |
+
+The backstop's clock is reset by every catch-up read, hub-driven or not, so the
+guarantee is "at most `BACKSTOP_POLL_MAX` since the LAST read" rather than a
+fixed schedule that fires right after a wake. A healthy hub therefore costs at
+most one idle read per minute per agent, not one per wake plus one per minute.
+
+`--poll-secs` is REFUSED above 60 rather than clamped: a listener that silently
+polled less often than the plane's own contract would be reporting a guarantee
+it does not provide.
+
+### One identity root, and every check fails closed
+
+The listener loads the bundle `ai-memory identity delegate --scope a2a-hub`
+wrote — `<key-dir>/<agent-id>.a2a-hub.json`, mode 0600 — which holds a
+DELEGATED private key and never the enrolled one. There is no second identity
+root and no second enrolment ceremony; the agent's enrolled key is still the
+sole authority, and the delegation is a short-lived certificate it minted.
+
+Before a byte reaches the wire the listener refuses a bundle that is:
+
+* not mode 0600, not owned by the caller, or reached through a symlink;
+* a version this build does not understand;
+* minted for a different hub, or for a different agent than the one being
+  watched;
+* holding a private key that is not the one its certificate authorises;
+* carrying a certificate that does not verify under the agent's ENROLLED public
+  key in the same key directory;
+* outside its validity window (refused locally, with the re-mint command in the
+  message, rather than as an opaque `401` after a reconnect ladder).
+
+It also checks the socket the way the hub hardened it: an owner-only (`0700`)
+directory holding an owner-only (`0600`) socket, both owned by the caller.
+Dialling a socket another local user could have created would be handing the
+handshake to whoever won that race.
+
+There is deliberately no flag that skips any of this — the same reasoning that
+keeps `--insecure` off `ai-memory wake-hub`.
+
+### Degrade, never corrupt
+
+Every failure mode here costs LATENCY:
+
+* **No hub configured, hub down, hub refusing.** The bounded poll IS the
+  delivery mechanism. That is the documented degraded mode, not an error.
+* **Reconnects.** Jittered exponential backoff capped at the backstop, with the
+  ladder resetting only after a session that actually lasted — so a hub that
+  accepts and instantly drops cannot become a hot loop, and a fleet restart
+  cannot produce a synchronised reconnect blast.
+* **A slow consumer.** Signals cross to the consumer through a bounded channel
+  using `try_send`. A full channel means a catch-up read is already queued and
+  will see every row a dropped signal referred to, so the drop coalesces reads
+  rather than losing them — and it is counted, because a listener that silently
+  stopped reading must not look like a quiet inbox.
+* **A failed catch-up read.** Logged; the row is already committed and the next
+  signal — at worst the backstop — reads it again.
+* **A hung `--exec` hook.** Bounded at 30 s and killed, so one slow notifier
+  cannot become a listener that stops reading.
+
+### The exec hook carries metadata, never a body
+
+`--exec` runs `sh -c <cmd>` with the wake hint in the ENVIRONMENT (never on the
+command line, so wire-sourced values reach neither `ps` output nor shell
+word-splitting):
+
+`AI_MEMORY_WAKE_REASON`, `_AGENT_ID`, `_HUB_ID`, `_INBOX_ROW_ID`, `_NAMESPACE`,
+`_SENDER`, `_DIGEST` (lowercase hex SHA-256 **of the body**), `_SEQ`,
+`_MISSED`, `_PENDING`, `_INBOX_COUNT`.
+
+`_DIGEST` is what lets a hook verify what it later reads without the hub ever
+having seen it. There is no body variable because there is no body on the wire.
+These variables are EMITTED by the listener, not read by the substrate, so they
+carry no precedence ladder and appear in no `AI_MEMORY_*` resolution table.
+
+### Replacing a polling fleet
+
+A fleet that coordinates through `memory_notify` + `ai-memory inbox` on a timer
+converts to the wake plane one agent at a time, and never all at once:
+
+```bash
+# 1. once per agent, on the host that will listen
+ai-memory identity delegate --scope a2a-hub --agent-id <agent> --hub-id ai-memory-wake-hub
+
+# 2. replace `sleep 180; ai-memory inbox --agent-id <agent> --json`
+ai-memory inbox --wait --timeout 180 --agent-id <agent> --json
+
+# 3. or, for a long-lived worker, replace the loop entirely
+ai-memory wake-listen --agent-id <agent> --exec 'my-handler'
+```
+
+Nothing about the durable side changes: the same rows, the same read, the same
+output. What changes is that the read happens when there is mail rather than
+every three minutes — and, because the `<=60 s` backstop is always armed, an
+agent whose hub is unreachable is strictly no worse off than the poller it
+replaced.
+
+The `sdk/python/swarm` acceptance harness converts the same way: set
+`SWARM_WAKE_HUB_SOCKET` + `SWARM_WAKE_HUB_BUNDLE_DIR` and its consumer lanes
+wait for the wake instead of racing the write. Leaving them unset keeps the
+harness byte-identical to its pre-#3470 behaviour, which is what makes the
+switch safe to roll out per fleet rather than per release.
+
+### `ai-memory inbox --wait`
+
+The one-shot form: block on the wake plane, then perform and print the read
+exactly as `ai-memory inbox` does. `--timeout` bounds the wait, and on expiry
+the read STILL happens — a timeout means "nothing arrived in that window",
+never "skip the durable truth". **Omitting `--timeout` does not mean waiting
+forever:** the backstop tick is itself a return, so a wait without it lasts at
+most one poll interval (`<= 60 s`, `wake_sink::BACKSTOP_POLL_MAX`).
+
+A hub that is merely DOWN is already covered by the always-armed backstop: the
+credential loads, the session loop backs off, and the poll returns on schedule.
+When the CREDENTIAL itself will not load — no `ai-memory identity delegate` was
+ever run on this host, the bundle expired, or it was minted for another hub —
+`--wait` logs that refusal once at `WARN` with its cause chain and then waits
+on the bounded poll anyway. That is deliberate: `--wait` is the drop-in for
+`sleep 180; ai-memory inbox`, and a version that returned immediately on a
+credential error would replace a paced poll with a hot loop. `ai-memory
+wake-listen` keeps the hard refusal, because an operator who started the
+listener explicitly asked for a hub session and needs to see why it will not
+open.
 
 ## Operating the hub
 

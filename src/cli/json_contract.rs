@@ -123,6 +123,12 @@ pub fn json_support(command: &Command) -> JsonSupport {
         // envelope through `WakeHubArgs::json`; the serving mode has no
         // JSON form and refuses nothing (no output channel to protect).
         | Command::WakeHub(..)
+        // #3470 (EPIC #3466): `wake-listen --json` emits ONE JSON LINE PER
+        // WAKE, not a single terminal envelope — it is a stream, and the
+        // whole point is that it never ends. That is a different contract
+        // from the one this table describes, so it is declared here rather
+        // than pretended into the enveloped set.
+        | Command::WakeListen(..)
         | Command::Atomise(..)
         | Command::Persona(..)
         | Command::Skill(..)

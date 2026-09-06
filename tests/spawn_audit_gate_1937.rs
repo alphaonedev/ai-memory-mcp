@@ -19,7 +19,7 @@
 //! construction.
 //!
 //! [`every_known_production_site_routes_through_the_chokepoint`] complements
-//! the perma-ban with a POSITIVE enumeration: each of the five wired
+//! the perma-ban with a POSITIVE enumeration: each of the six wired
 //! production spawn sites references the audited helper + its caller const, so
 //! a refactor that silently drops the audit from a site is also caught.
 //!
@@ -39,8 +39,8 @@
 
 use ai_memory::signed_events::{event_types::PROCESS_SPAWN_AUDITED, verify_audit_trail};
 use ai_memory::spawn_audit::{
-    self, CALLER_CLI_DOCTOR_GPU, CALLER_CLI_NAMESPACE_GIT, CALLER_CLI_WRAP_AGENT,
-    CALLER_HOOK_DAEMON, CALLER_HOOK_EXEC,
+    self, CALLER_CLI_DOCTOR_GPU, CALLER_CLI_NAMESPACE_GIT, CALLER_CLI_WAKE_LISTEN_HOOK,
+    CALLER_CLI_WRAP_AGENT, CALLER_HOOK_DAEMON, CALLER_HOOK_EXEC,
 };
 use std::path::{Path, PathBuf};
 
@@ -170,6 +170,14 @@ fn every_known_production_site_routes_through_the_chokepoint() {
             "audited_tokio_command",
             "CALLER_HOOK_DAEMON",
         ),
+        // #3470 — the `ai-memory wake-listen --exec` wake hook. A long-lived
+        // listener launching an operator-supplied shell is exactly the shape
+        // this audit exists for.
+        (
+            "src/cli/wake_listen.rs",
+            "audited_tokio_command",
+            "CALLER_CLI_WAKE_LISTEN_HOOK",
+        ),
     ];
     for (rel, helper, caller_const) in cases {
         let src =
@@ -255,6 +263,10 @@ fn caller_slugs_are_stable_wire_values() {
     );
     assert_eq!(CALLER_HOOK_EXEC, "hooks::executor::exec_fire");
     assert_eq!(CALLER_HOOK_DAEMON, "hooks::executor::daemon_connect");
+    assert_eq!(
+        CALLER_CLI_WAKE_LISTEN_HOOK,
+        "cli::wake_listen::run_exec_hook"
+    );
     assert_eq!(PROCESS_SPAWN_AUDITED, "process.spawn_audited");
 }
 

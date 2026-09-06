@@ -114,6 +114,46 @@ The mocked dry-run (`tests/test_agent_loop_mock.py`) proves the loop dispatches
 tools and records coverage using an `httpx.MockTransport` daemon and a
 hand-built model decision — no network, no API key.
 
+## Waiting for mail instead of polling for it (#3470)
+
+Where the harness needed to see another agent's mail it used to do what the
+fleet did: read the inbox and hope the write had landed, or poll again — the
+standing fleet instruction was literally *"poll every 3 minutes"*.
+`swarm/wake.py` replaces that with a WAIT on the wake plane
+(`ai-memory wake-hub`, EPIC #3466): the consumer lanes
+(`producer_consumer`, `cross_module_handoff`) now block until the recipient is
+TOLD it has mail, then perform the read they were going to perform anyway.
+
+Three env vars, all optional. Missing any one leaves the gate **inert**, and
+inert is byte-identical to the pre-#3470 behaviour — adding this gate can make
+a lane deterministic, never flaky, and never a new dependency:
+
+| Variable | Meaning |
+|---|---|
+| `SWARM_WAKE_HUB_SOCKET` | the `ai-memory wake-hub` Unix domain socket |
+| `SWARM_WAKE_HUB_BUNDLE_DIR` | directory of per-agent `a2a-hub` delegation bundles |
+| `SWARM_WAKE_HUB_ID` | hub id (default `ai-memory-wake-hub`) |
+
+Mint one bundle per participating agent, into that directory:
+
+```bash
+ai-memory identity delegate --scope a2a-hub \
+    --agent-id <agent> --hub-id ai-memory-wake-hub \
+    --out "$SWARM_WAKE_HUB_BUNDLE_DIR/<agent>.a2a-hub.json"
+```
+
+Each bundle holds a DELEGATED key and never an enrolled one, so the harness
+mints no identity of its own and embeds no second identity root.
+
+Every wait is bounded (`swarm.wake.DEFAULT_WAIT_SECS`, inside the normative
+`wake_sink::BACKSTOP_POLL_MAX`), and a hub that is down, refusing or absent
+returns immediately and the lane reads anyway. The durable inbox row is the
+record; the wake is only ever an optimisation over reading it.
+
+For a human or a one-shot script the equivalent is
+`ai-memory inbox --wait --timeout <secs> --agent-id <you>`, which blocks on the
+same plane and then prints exactly what `ai-memory inbox` prints.
+
 ## Data-integrity posture (North Star)
 
 * **Own the write.** Each agent signs every store with its **own** Ed25519 key;
