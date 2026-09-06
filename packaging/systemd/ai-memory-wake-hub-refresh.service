@@ -1,0 +1,73 @@
+[Unit]
+Description=ai-memory wake-hub — refresh the derived public identity snapshot
+Documentation=https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/wake-hub.md
+# The hub REFUSES every hello once the snapshot is older than 60 s
+# (identity::hub_cache::MAX_CACHE_AGE_SECS), so this unit is what keeps the
+# hub admitting anyone at all. It is deliberately a SEPARATE unit from
+# ai-memory-wake-hub.service: this one opens the store, and the hub process
+# must never do that.
+#
+# /run is a tmpfs, so after a reboot the snapshot is GONE and the hub admits
+# nobody until this unit has run once. That is what OnBootSec=15s in the
+# companion timer is for: the first refresh after boot is what lets the hub
+# admit anyone at all.
+After=ai-memory.service
+
+[Service]
+Type=oneshot
+User=ai-memory
+Group=ai-memory
+
+# Derives the snapshot from the durable v97 identity root, audits the
+# allow/revoke decisions onto the signed_events spine, and publishes it
+# atomically (temp file + rename in the same directory, mode 0600 on the new
+# inode). A failed derivation publishes NOTHING: the previous snapshot stays
+# in place and ages out, which refuses hellos rather than admitting a stale
+# or partial one.
+#
+# EDIT THE PRINCIPAL LIST. Every agent that may join the hub is named with its
+# own --include-agent; omitting one on the next refresh REVOKES it, which is
+# the intended revocation mechanism. Add --daemon-producer only if this host's
+# daemon pushes wakes (see docs/wake-hub.md).
+ExecStart=/usr/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db \
+    identity hub-cache \
+    --include-agent REPLACE_AGENT_ID \
+    --out /run/ai-memory/hub-allow.json
+
+# --- hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @swap @reboot @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The snapshot is the ONLY thing this unit writes, and it writes it where the
+# HUB reads it: /run/ai-memory/hub-allow.json is the $ALLOWLIST that
+# ai-memory-wake-hub.service passes to --allowlist (#3471). That unit creates
+# the runtime directory 0700 (RuntimeDirectory=ai-memory,
+# RuntimeDirectoryMode=0700, RuntimeDirectoryPreserve=yes) and both units run
+# as the same User=, so this one writes into it without creating or chmod-ing
+# anything. The file names every agent permitted to join, so the hub refuses to
+# read it unless it is an owner-only 0600 regular file.
+ReadWritePaths=/run/ai-memory
+ReadWritePaths=/var/lib/ai-memory/ai-memory.db
+
+# Bounded so a wedged run cannot pile up behind the next timer tick. The hub
+# tolerates a missed refresh by refusing hellos, never by admitting stale
+# authority, so failing fast is the safe direction.
+TimeoutStartSec=20s

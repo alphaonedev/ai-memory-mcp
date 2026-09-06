@@ -212,6 +212,39 @@ pub const SLOW_CONSUMER_PERCENT: usize = 50;
 pub const HEALTH_PROBE_TIMEOUT_MS: u64 = 2_000;
 
 // ---------------------------------------------------------------------------
+// Derived allowlist snapshot reuse (#3504)
+// ---------------------------------------------------------------------------
+
+/// How long a PARSED allowlist snapshot may be reused before the hub reads and
+/// re-parses the file, even when the file's identity (device, inode, mtime,
+/// size) has not moved.
+///
+/// # Why a TTL at all, when the inode/mtime key already exists
+///
+/// Every call still opens the file and re-checks owner + exact `0600` +
+/// regular-file through that descriptor, and any change of device, inode,
+/// mtime or size forces a re-read — so a REPLACED snapshot is picked up on the
+/// next call regardless of this value. What the TTL bounds is the one case the
+/// identity key cannot see: an in-place rewrite that lands on the same inode
+/// with a byte-identical size and a timestamp the filesystem did not advance.
+/// That needs write access to a `0600` file already owned by the hub's own
+/// uid, so it is not an escalation — but "trusted forever" is not a property
+/// worth having in an authority path, and two seconds is cheap.
+///
+/// # Why two seconds
+///
+/// It must be well under [`crate::identity::hub_cache::MAX_CACHE_AGE_SECS`]
+/// (60 s), which is the ceiling past which a snapshot is refused outright —
+/// and it is, by 30x. The `refreshed_at` age is re-checked on EVERY call
+/// including a cache hit, so this constant can never extend the life of a
+/// stale snapshot; it only decides how often the JSON is re-parsed. At the
+/// 256-connection ceiling the 1 Hz per-session `Conn::revalidate` was 256
+/// parses/second; keyed reuse with this TTL makes it at most one parse every
+/// two seconds, a ~500x reduction, while a replaced file still takes effect
+/// within the same one-second revalidation it always did.
+pub const ALLOWLIST_CACHE_TTL: Duration = Duration::from_secs(2);
+
+// ---------------------------------------------------------------------------
 // Offline (pending) state
 // ---------------------------------------------------------------------------
 
@@ -420,6 +453,25 @@ mod tests {
         assert_eq!(MAX_WAKE_META_BYTES, 256);
         assert_eq!(MAX_LIVENESS_PAYLOAD_BYTES, 32);
         assert!(MAX_WAKE_META_BYTES < MAX_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn the_allowlist_cache_ttl_stays_well_under_the_snapshot_expiry_3504() {
+        // The TTL governs re-PARSING only. It must stay far below the age at
+        // which a snapshot is refused outright, so that no arrangement of the
+        // two can let an expired snapshot be served from memory.
+        let max_age = u64::try_from(crate::identity::hub_cache::MAX_CACHE_AGE_SECS)
+            .expect("the snapshot expiry is a positive number of seconds");
+        assert!(
+            ALLOWLIST_CACHE_TTL.as_secs() > 0,
+            "a zero TTL would re-parse on every hello, which is the defect #3504 fixes"
+        );
+        assert!(
+            ALLOWLIST_CACHE_TTL.as_secs() * 10 <= max_age,
+            "the reuse TTL ({}s) must stay an order of magnitude under the {max_age}s \
+             snapshot expiry",
+            ALLOWLIST_CACHE_TTL.as_secs()
+        );
     }
 
     #[test]

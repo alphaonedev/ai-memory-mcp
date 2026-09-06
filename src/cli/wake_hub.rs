@@ -40,6 +40,7 @@ use crate::cli::CliOutput;
 use crate::config::AppConfig;
 use std::sync::Arc;
 
+use crate::wake_hub::allowlist_reload::SnapshotFreshness;
 use crate::wake_hub::delegation_verifier::{
     AllowlistCache, ReloadingAllowlist, ScopedDelegationVerifier,
 };
@@ -160,6 +161,11 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
                 .allowlist_path
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            // #3504 — the hub refuses every hello once the snapshot passes
+            // MAX_CACHE_AGE_SECS, so the operator must be able to see the
+            // refresher fall behind before the agents do.
+            "allowlist_snapshot": SnapshotFreshness::observe(cfg.allowlist_path.as_deref())
+                .to_json(),
             // #3471 ops surface.
             "drain_deadline_ms": DRAIN_DEADLINE_MS,
             "slow_consumer_percent": SLOW_CONSUMER_PERCENT,
@@ -233,6 +239,11 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
             || "<none configured>".to_string(),
             |p| p.display().to_string()
         )
+    )?;
+    writeln!(
+        out.stdout,
+        "  allowlist snapshot:    {}",
+        SnapshotFreshness::observe(cfg.allowlist_path.as_deref()).summary()
     )?;
     // #3471 ops block.
     let fd = fd_budget_facts(cfg);

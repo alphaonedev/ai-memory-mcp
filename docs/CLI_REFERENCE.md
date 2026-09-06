@@ -1532,6 +1532,29 @@ so a peer cannot distinguish "unknown agent" from "bad signature" from
 reports which verifier a configuration installs (`deny-all` or
 `delegation/v1`).
 
+`--posture` also reports the **snapshot age** — how many seconds old the
+configured allowlist is, and whether that is still inside the 60-second ceiling
+past which the hub refuses every hello
+([#3504](https://github.com/alphaonedev/ai-memory-mcp/issues/3504)). The human
+rendering prints one line (`allowlist snapshot: 12 s old (ceiling 60 s)`, or
+`... OUTSIDE the 60 s ceiling; every hello is REFUSED until it is refreshed`)
+and the JSON rendering carries the same facts under `allowlist_snapshot`
+(`age_secs`, `max_age_secs`, `within_max_age`). It is a read-only observation:
+`--posture` still binds nothing and admits nobody. An unreadable snapshot
+reports no age and `within_max_age: false` — a snapshot the hub cannot read is
+not a fresh one. Keep the refresher below (`identity hub-cache` on a timer)
+running, and alert on `within_max_age` rather than waiting for agents to notice
+they can no longer join.
+
+The hub REUSES the parsed snapshot between identity checks (#3504) instead of
+re-parsing the JSON on every hello and every one-second per-session recheck.
+Reuse is keyed on the file's device, inode, mtime and size and expires after two
+seconds, and it changes only the COST: the owner-only 0600 regular-file check
+runs on every single check, the `refreshed_at` age is re-tested on every single
+check, and a replaced snapshot is honoured on the very next one. A mode-widened,
+removed, expired or replaced-by-symlink snapshot is refused immediately, warm
+parse or not.
+
 **Operating it**
 ([#3471](https://github.com/alphaonedev/ai-memory-mcp/issues/3471)).
 `--health` probes the configured socket **as an ordinary client**: it connects,
@@ -1617,9 +1640,24 @@ public snapshot. Omitted or revoked principals lose admission. Audit failure or
 record-stop prevents publication. `--store-url` selects PostgreSQL with the same
 contract as SQLite; the hub itself never opens either store.
 
-Refresh the complete snapshot more often than every 60 seconds. A stale,
-future-dated, unreadable or malformed snapshot refuses admission; active sessions
-are rechecked each second, including idle listeners. Delegations retain their
+Refresh the complete snapshot more often than every 60 seconds — this is not
+optional, and it is not a thing to do by hand. Ship it as a job:
+`packaging/systemd/ai-memory-wake-hub-refresh.service` + its companion `.timer`
+(every 30 s, jittered, no catch-up) on Linux, or
+`scripts/templates/dev.alphaone.ai-memory.wake-hub-refresh.plist` on macOS
+([#3504](https://github.com/alphaonedev/ai-memory-mcp/issues/3504)). Both run
+exactly this command, and both write to the path the #3471 hub units READ —
+`/run/ai-memory/hub-allow.json` on Linux (the `$ALLOWLIST` that
+`ai-memory-wake-hub.service` passes to `--allowlist`) and
+`~/.ai-memory/hub-allow.json` on macOS. Pointing the refresher anywhere else
+leaves a hub reading a file nobody writes. Because `/run` is a tmpfs the
+snapshot does not survive a reboot, so the first post-boot refresh
+(`OnBootSec=15s` / `RunAtLoad`) is what lets the hub admit anyone at all. Both
+are deliberately SEPARATE units from the hub itself, because the refresher
+opens the store and the hub never may. Confirm the loop is
+alive with `ai-memory wake-hub --posture`, which prints the snapshot's age. A
+stale, future-dated, unreadable or malformed snapshot refuses admission; active
+sessions are rechecked each second, including idle listeners. Delegations retain their
 bounded lifetime (at most 12 hours). Cache revocation is visible on the next
 identity check; a failed refresh cannot extend authority beyond the cache window.
 Audit rows describe publication intent: a subsequent filesystem failure may leave
