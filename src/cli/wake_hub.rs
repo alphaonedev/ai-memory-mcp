@@ -12,7 +12,18 @@
 //! ai-memory wake-hub --socket /run/x.sock # explicit socket path
 //! ai-memory wake-hub --posture            # print the resolved posture, bind nothing
 //! ai-memory wake-hub --posture --json     # machine-readable posture
+//! ai-memory wake-hub --health             # probe the socket; exit 0 / 2 (#3471)
+//! ai-memory wake-hub --health --json      # machine-readable reachability
 //! ```
+//!
+//! # The health probe is an ORDINARY client (#3471)
+//!
+//! `--health` connects to the configured socket, waits for the hub's opening
+//! challenge, and closes. It is deliberately NOT a privileged side channel, NOT
+//! a bypass of the peer-credential gate, and NOT an authenticated session: it
+//! presents no identity and sends no frame, so it needs no credential and can
+//! enumerate nothing. It proves liveness only because it takes the same road
+//! every agent takes.
 //!
 //! # There is no `--insecure` flag, and there never will be
 //!
@@ -32,7 +43,11 @@ use std::sync::Arc;
 use crate::wake_hub::delegation_verifier::{
     AllowlistCache, ReloadingAllowlist, ScopedDelegationVerifier,
 };
-use crate::wake_hub::{HubConfig, HubDeps, WakeHub, startup};
+use crate::wake_hub::limits::{
+    DESIRED_NOFILE, DRAIN_DEADLINE_MS, HEALTH_PROBE_TIMEOUT_MS, SLOW_CONSUMER_PERCENT,
+};
+use crate::wake_hub::metrics::MetricsSnapshot;
+use crate::wake_hub::{HubConfig, HubDeps, WakeHub, health, startup};
 
 #[derive(Args, Debug, Clone)]
 pub struct WakeHubArgs {
@@ -58,6 +73,12 @@ pub struct WakeHubArgs {
     /// exit WITHOUT binding. Safe to run against a host already serving a hub.
     #[arg(long)]
     pub posture: bool,
+    /// Probe the configured socket as an ORDINARY client and report whether the
+    /// hub is reachable. Binds nothing, presents no identity, sends no frame.
+    /// Exits non-zero when the hub is unreachable, so it is usable as a systemd
+    /// `ExecStartPost` / watchdog or a launchd health check.
+    #[arg(long)]
+    pub health: bool,
     /// Emit machine-readable JSON instead of a human-readable report.
     #[arg(long)]
     pub json: bool,
@@ -117,8 +138,8 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
     if args.json {
         let doc = serde_json::json!({
             "socket": cfg.socket_path.display().to_string(),
-            "socket_mode": format!("{:04o}", startup::SOCKET_MODE),
-            "socket_dir_mode": format!("{:04o}", startup::SOCKET_DIR_MODE),
+            (health::KEY_SOCKET_MODE): format!("{:04o}", startup::SOCKET_MODE),
+            (health::KEY_SOCKET_DIR_MODE): format!("{:04o}", startup::SOCKET_DIR_MODE),
             "hub_id": cfg.hub_id,
             "max_connections": cfg.max_connections,
             "queue_bytes_per_recipient": cfg.queue_bytes,
@@ -139,6 +160,18 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
                 .allowlist_path
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            // #3471 ops surface.
+            "drain_deadline_ms": DRAIN_DEADLINE_MS,
+            "slow_consumer_percent": SLOW_CONSUMER_PERCENT,
+            "health_probe_timeout_ms": HEALTH_PROBE_TIMEOUT_MS,
+            "fd_budget": fd_budget_json(cfg),
+            "socket_posture": health::SocketPosture::read(&cfg.socket_path).to_json(),
+            // The STABLE metric shape, at rest. `--posture` binds nothing, so
+            // there are no live counters to report — publishing the schema is
+            // the honest thing a non-binding verb CAN offer, and it lets an
+            // exporter be written against a documented contract instead of
+            // against whatever a running hub happened to emit.
+            "metrics_schema": MetricsSnapshot::default().to_json(),
         });
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&doc)?)?;
         return Ok(());
@@ -201,8 +234,147 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
             |p| p.display().to_string()
         )
     )?;
+    // #3471 ops block.
+    let fd = fd_budget_facts(cfg);
+    writeln!(
+        out.stdout,
+        "  fd budget:             soft {} / hard {} (wants {DESIRED_NOFILE}, needs >= {}){}",
+        fd.soft,
+        fd.hard,
+        startup::FdBudget::minimum_soft_nofile(),
+        if fd.soft >= DESIRED_NOFILE {
+            ""
+        } else {
+            " — BELOW the desired budget; set LimitNOFILE= / NumberOfFiles"
+        }
+    )?;
+    writeln!(
+        out.stdout,
+        "  drain deadline:        {DRAIN_DEADLINE_MS} ms (SIGTERM/SIGINT; nothing content-bearing is emitted)"
+    )?;
+    writeln!(
+        out.stdout,
+        "  slow-consumer mark:    {SLOW_CONSUMER_PERCENT}% of the per-recipient byte cap"
+    )?;
+    writeln!(
+        out.stdout,
+        "  health probe budget:   {HEALTH_PROBE_TIMEOUT_MS} ms (ai-memory wake-hub --health)"
+    )?;
+    let on_disk = health::SocketPosture::read(&cfg.socket_path);
+    writeln!(
+        out.stdout,
+        "  socket on disk:        {}",
+        describe_socket_posture(&on_disk)
+    )?;
     writeln!(out.stdout, "  {}", posture.note())?;
     Ok(())
+}
+
+/// One-line human summary of what is actually on disk at the socket path.
+fn describe_socket_posture(p: &health::SocketPosture) -> String {
+    match (p.socket_mode, p.dir_mode) {
+        (None, _) => "absent (the hub is not running, or binds elsewhere)".to_string(),
+        (Some(sock), dir) => format!(
+            "mode {} (dir {}){}",
+            health::fmt_mode(sock),
+            dir.map_or_else(|| "?".to_string(), health::fmt_mode),
+            if p.is_hardened() {
+                ", owner-only"
+            } else {
+                " — NOT owner-only; run `ai-memory doctor`"
+            }
+        ),
+    }
+}
+
+/// The process's current `RLIMIT_NOFILE`, read WITHOUT raising it.
+///
+/// `--posture` binds nothing and must change nothing, so it reports the
+/// inherited limit rather than calling [`startup::configure_fd_limit`], which
+/// would mutate the process it is describing.
+fn fd_budget_facts(_cfg: &HubConfig) -> FdLimitFacts {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes into a fully-owned, correctly-typed local and
+    // reads no pointer of ours. Same call shape as `startup::configure_fd_limit`.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rl) };
+    if rc == 0 {
+        FdLimitFacts {
+            soft: u64::from(rl.rlim_cur),
+            hard: u64::from(rl.rlim_max),
+        }
+    } else {
+        FdLimitFacts { soft: 0, hard: 0 }
+    }
+}
+
+/// The inherited file-descriptor limits, as reported by `--posture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FdLimitFacts {
+    soft: u64,
+    hard: u64,
+}
+
+/// JSON view of [`fd_budget_facts`].
+fn fd_budget_json(cfg: &HubConfig) -> serde_json::Value {
+    let fd = fd_budget_facts(cfg);
+    serde_json::json!({
+        "soft": fd.soft,
+        "hard": fd.hard,
+        "desired": DESIRED_NOFILE,
+        "minimum_to_bind": startup::FdBudget::minimum_soft_nofile(),
+        "meets_desired": fd.soft >= DESIRED_NOFILE,
+        "headroom_reserved": crate::wake_hub::limits::FD_HEADROOM,
+    })
+}
+
+/// Run the `--health` probe and render it.
+///
+/// # Errors
+///
+/// Propagates write failures from `out`. A probe that could not reach the hub
+/// is NOT an error — it is a report with a non-zero exit code, because a
+/// supervisor needs the exit status and the reason, not a stack of context.
+pub async fn run_health(cfg: &HubConfig, json: bool, out: &mut CliOutput<'_>) -> Result<i32> {
+    let report = health::probe(&cfg.socket_path).await;
+    if json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::to_string_pretty(&report.to_json())?
+        )?;
+        return Ok(report.exit_code());
+    }
+    writeln!(out.stdout, "ai-memory wake-hub health")?;
+    writeln!(
+        out.stdout,
+        "  socket:                {}",
+        report.socket.display()
+    )?;
+    writeln!(
+        out.stdout,
+        "  status:                {}",
+        if report.status.is_reachable() {
+            "REACHABLE"
+        } else {
+            "UNREACHABLE"
+        }
+    )?;
+    writeln!(out.stdout, "  detail:                {}", report.status)?;
+    if let Some(ms) = report.latency_ms {
+        writeln!(out.stdout, "  challenge latency:     {ms} ms")?;
+    }
+    writeln!(
+        out.stdout,
+        "  socket on disk:        {}",
+        describe_socket_posture(&report.posture)
+    )?;
+    if !report.status.is_reachable() {
+        writeln!(out.stderr, "  fix: {}", report.status.remedy())?;
+    }
+    Ok(report.exit_code())
 }
 
 /// The one place the "identity is not wired yet" wording lives, so the JSON
@@ -260,20 +432,32 @@ impl IdentityPosture {
     }
 }
 
-/// Bind and serve until SIGINT / SIGTERM.
+/// Bind and serve until SIGINT / SIGTERM, or run one of the non-binding
+/// reporting modes.
+///
+/// Returns the process exit code: `0` for a clean serve or a healthy probe,
+/// [`health::EXIT_UNREACHABLE`] when `--health` could not reach the hub.
 ///
 /// # Errors
 ///
-/// Propagates every start-up refusal from [`WakeHub::bind`].
-pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<()> {
+/// Propagates every start-up refusal from [`WakeHub::bind`], and write failures
+/// from the reporting modes.
+pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32> {
     let cfg = resolve_config(args, app_config)?;
-    if args.posture {
+    if args.posture || args.health {
         let stdout = std::io::stdout();
         let stderr = std::io::stderr();
         let mut so = stdout.lock();
         let mut se = stderr.lock();
         let mut out = CliOutput::from_std(&mut so, &mut se);
-        return print_posture(&cfg, args, &mut out);
+        // `--posture` wins when both are given: it is the strictly
+        // non-interacting one, and reporting the resolved configuration before
+        // probing anything is the order an operator debugs in.
+        if args.posture {
+            print_posture(&cfg, args, &mut out)?;
+            return Ok(0);
+        }
+        return run_health(&cfg, args.json, &mut out).await;
     }
 
     // Resolve the posture and BUILD THE VERIFIER before `cfg` is consumed, so
@@ -307,7 +491,11 @@ pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<()> 
         }
     };
     let hub = WakeHub::bind(cfg, deps)?;
-    hub.serve(shutdown_signal()).await
+    // A completed drain is a SUCCESSFUL shutdown: exit 0, so `systemctl stop`
+    // and `launchctl bootout` do not record a failure for the thing they asked
+    // for (#3471).
+    hub.serve(shutdown_signal()).await?;
+    Ok(0)
 }
 
 /// Resolve on SIGINT or, on unix, SIGTERM — so `systemctl stop`, `docker stop`
@@ -351,6 +539,7 @@ mod tests {
             max_connections: None,
             allowlist: None,
             posture: false,
+            health: false,
             json: false,
         }
     }
@@ -484,5 +673,99 @@ mod tests {
             cfg.allowlist_path,
             Some(PathBuf::from("/tmp/from-flag.json"))
         );
+    }
+
+    /// #3471 — the ops facts are part of the posture contract: an operator who
+    /// cannot see the fd budget, the drain deadline and the metric schema from
+    /// `--posture` has to read the source to write an alert rule.
+    #[test]
+    fn the_posture_reports_the_ops_budgets_and_the_metric_schema() {
+        let mut a = args();
+        a.socket = Some(PathBuf::from("/tmp/never-bound-3471.sock"));
+        a.posture = true;
+        a.json = true;
+        let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
+        let mut so = Vec::new();
+        let mut se = Vec::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        print_posture(&cfg, &a, &mut out).expect("posture");
+        let doc: serde_json::Value = serde_json::from_slice(&so).expect("valid JSON");
+
+        assert_eq!(doc["drain_deadline_ms"], DRAIN_DEADLINE_MS);
+        assert_eq!(doc["slow_consumer_percent"], SLOW_CONSUMER_PERCENT);
+        assert_eq!(doc["health_probe_timeout_ms"], HEALTH_PROBE_TIMEOUT_MS);
+        assert_eq!(doc["fd_budget"]["desired"], DESIRED_NOFILE);
+        assert_eq!(
+            doc["fd_budget"]["minimum_to_bind"],
+            startup::FdBudget::minimum_soft_nofile()
+        );
+        assert!(doc["fd_budget"]["soft"].as_u64().is_some());
+        // The metric schema is present and shaped, and reads as "no traffic"
+        // rather than as "everything is instantaneous".
+        assert_eq!(doc["metrics_schema"]["connections_current"], 0);
+        assert!(doc["metrics_schema"]["queue"].is_object());
+        assert!(doc["metrics_schema"]["drops"].is_object());
+        assert!(doc["metrics_schema"]["fanout_latency_us"]["p99"].is_null());
+        // A posture run binds NOTHING.
+        assert!(!std::path::Path::new("/tmp/never-bound-3471.sock").exists());
+    }
+
+    #[test]
+    fn the_human_posture_names_the_drain_and_the_fd_budget() {
+        let mut a = args();
+        a.socket = Some(PathBuf::from("/tmp/never-bound-3471b.sock"));
+        a.posture = true;
+        let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
+        let mut so = Vec::new();
+        let mut se = Vec::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        print_posture(&cfg, &a, &mut out).expect("posture");
+        let text = String::from_utf8(so).expect("utf8");
+        assert!(text.contains("drain deadline"), "{text}");
+        assert!(text.contains("fd budget"), "{text}");
+        assert!(text.contains("slow-consumer mark"), "{text}");
+        assert!(text.contains("socket on disk"), "{text}");
+    }
+
+    /// #3471 — the DENIED half of the health probe: an unreachable hub exits
+    /// non-zero and says why. This is the property a supervisor depends on.
+    #[tokio::test]
+    async fn the_health_probe_exits_non_zero_when_the_hub_is_unreachable() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut a = args();
+        a.socket = Some(tmp.path().join("absent.sock"));
+        a.health = true;
+        a.json = true;
+        let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
+        let mut so = Vec::new();
+        let mut se = Vec::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let code = run_health(&cfg, true, &mut out).await.expect("render");
+        assert_eq!(code, health::EXIT_UNREACHABLE);
+        let doc: serde_json::Value = serde_json::from_slice(&so).expect("valid JSON");
+        assert_eq!(doc["reachable"], false);
+        assert_eq!(doc["status"], "socket_missing");
+        assert!(
+            doc["remedy"].as_str().is_some_and(|s| !s.is_empty()),
+            "an unreachable report must carry a remedy"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_human_health_report_names_the_socket_and_the_fix() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut a = args();
+        a.socket = Some(tmp.path().join("absent.sock"));
+        a.health = true;
+        let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
+        let mut so = Vec::new();
+        let mut se = Vec::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let code = run_health(&cfg, false, &mut out).await.expect("render");
+        assert_eq!(code, health::EXIT_UNREACHABLE);
+        let text = String::from_utf8(so).expect("utf8");
+        let err = String::from_utf8(se).expect("utf8");
+        assert!(text.contains("UNREACHABLE"), "{text}");
+        assert!(err.contains("fix:"), "{err}");
     }
 }
