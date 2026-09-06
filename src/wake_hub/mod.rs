@@ -77,6 +77,11 @@ use metrics::{HubCensus, HubMetrics, MetricsSnapshot};
 use pending::PendingStore;
 use routing::Router;
 
+/// v1.0.0 #3504 — the live hub's store-free allowlist resolver: the
+/// permission-checked, inode/mtime-keyed reuse of the parsed snapshot that
+/// [`delegation_verifier::AllowlistCache`] represents, plus the snapshot-age
+/// posture `wake-hub --posture` reports.
+pub mod allowlist_reload;
 pub mod codec;
 mod conn;
 /// v1.0.0 #3468 — the scoped `a2a-hub/join/v1` delegation verifier that

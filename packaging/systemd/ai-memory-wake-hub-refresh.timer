@@ -1,0 +1,24 @@
+[Unit]
+Description=ai-memory wake-hub — refresh the identity snapshot every 30 s
+Documentation=https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/wake-hub.md
+
+[Timer]
+# The budget is the hub's own refusal threshold: a snapshot older than 60 s
+# (identity::hub_cache::MAX_CACHE_AGE_SECS) is refused outright. Worst case
+# here is 30 s (interval) + 3 s (jitter) + the run itself, which leaves better
+# than 2x headroom under that ceiling.
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=1s
+# Small, per-host jitter so a fleet restarted together does not derive its
+# snapshots in lockstep against a shared PostgreSQL store. Kept far below the
+# headroom above — a large randomized delay here would trade a thundering herd
+# for hubs that periodically refuse every hello.
+RandomizedDelaySec=3s
+# Deliberately NOT Persistent=true. A missed window is not worth catching up:
+# a snapshot derived for a past instant is already expired, and the next tick
+# is at most 33 s away.
+Unit=ai-memory-wake-hub-refresh.service
+
+[Install]
+WantedBy=timers.target

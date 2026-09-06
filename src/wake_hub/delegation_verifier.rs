@@ -268,53 +268,10 @@ impl RootKeyResolver for AllowlistCache {
     }
 }
 
-/// Store-free resolver that reloads the derived snapshot on each identity check.
-/// A removed, unreadable, stale or invalid file immediately fails closed.
-#[derive(Debug)]
-pub struct ReloadingAllowlist {
-    path: std::path::PathBuf,
-}
-
-impl ReloadingAllowlist {
-    /// Validate the initial snapshot before arming the runtime verifier.
-    ///
-    /// # Errors
-    /// Refuses an unreadable or invalid snapshot.
-    pub fn new(path: std::path::PathBuf) -> anyhow::Result<Self> {
-        AllowlistCache::load_from_file(&path)?;
-        Ok(Self { path })
-    }
-}
-
-impl RootKeyResolver for ReloadingAllowlist {
-    fn resolve(&self, agent_id: &str) -> Result<EnrolledRoot, DenyReason> {
-        AllowlistCache::load_from_file(&self.path)
-            .map_err(|_| DenyReason::DelegationInvalid)?
-            .resolve(agent_id)
-    }
-
-    fn resolve_delegate(
-        &self,
-        agent_id: &str,
-        key: &[u8; 32],
-        issued: &str,
-    ) -> Result<EnrolledRoot, DenyReason> {
-        AllowlistCache::load_from_file(&self.path)
-            .map_err(|_| DenyReason::DelegationInvalid)?
-            .resolve_delegate(agent_id, key, issued)
-    }
-
-    fn check_delegate(
-        &self,
-        agent_id: &str,
-        key: &[u8; 32],
-        issued: &str,
-    ) -> Result<(), DenyReason> {
-        AllowlistCache::load_from_file(&self.path)
-            .map_err(|_| DenyReason::DelegationInvalid)?
-            .check_delegate(agent_id, key, issued)
-    }
-}
+// The store-free resolver that serves this cache to the live hub lives in
+// [`super::allowlist_reload`] (#3504) and is re-exported here so the path every
+// caller and test already uses keeps working.
+pub use super::allowlist_reload::ReloadingAllowlist;
 
 /// Verifies a scoped `a2a-hub/join/v1` delegation and the hello signature made
 /// under the key it delegates to.
@@ -334,6 +291,18 @@ impl<R: RootKeyResolver> ScopedDelegationVerifier<R> {
             resolver,
             fixed_now: None,
         }
+    }
+
+    /// The root-key resolver this verifier reads.
+    ///
+    /// Observability seam (#3504): a caller that built a
+    /// [`ReloadingAllowlist`] can read its open / parse counters after the
+    /// hub has taken ownership of the verifier, which is what makes
+    /// "an unchanged snapshot is parsed once" provable END TO END over a real
+    /// socket rather than only at the resolver in isolation.
+    #[must_use]
+    pub const fn resolver(&self) -> &R {
+        &self.resolver
     }
 
     /// Pin the clock. Test-only in practice; the validity window is the one
@@ -924,8 +893,30 @@ impl AllowlistCache {
     /// # Errors
     /// Refuses unsafe files, malformed JSON and unsupported versions.
     pub fn read_file(path: &std::path::Path) -> anyhow::Result<AllowlistFile> {
+        let (file, _meta) = Self::open_checked(path)?;
+        Self::read_checked(file, path)
+    }
+
+    /// Open the snapshot and re-prove, through the descriptor that will be
+    /// read, that it is a regular file owned by this uid at EXACTLY mode 0600
+    /// and reached without traversing a symlink.
+    ///
+    /// Split out of [`Self::read_file`] for #3504 so the reuse path in
+    /// [`super::allowlist_reload`] runs this gate on every single call while
+    /// only re-parsing when the file actually changed: a snapshot whose mode is
+    /// widened, whose owner changes, or which is swapped for a symlink is
+    /// refused IMMEDIATELY, never served from a still-fresh parse. The
+    /// [`std::fs::Metadata`] handed back is the one read from that same
+    /// descriptor, so the identity a caller keys reuse on and the permissions
+    /// it checked describe the same inode — there is no second `stat` for a
+    /// replacement to slip between.
+    ///
+    /// # Errors
+    /// Refuses an unopenable, non-regular, foreign-owned or non-0600 file.
+    pub(crate) fn open_checked(
+        path: &std::path::Path,
+    ) -> anyhow::Result<(std::fs::File, std::fs::Metadata)> {
         use anyhow::{Context, bail};
-        use std::io::Read as _;
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
         let file = std::fs::OpenOptions::new()
@@ -943,6 +934,21 @@ impl AllowlistCache {
                 path.display()
             );
         }
+        Ok((file, meta))
+    }
+
+    /// Read and decode a snapshot from an ALREADY permission-checked
+    /// descriptor returned by [`Self::open_checked`].
+    ///
+    /// # Errors
+    /// Refuses an over-long, malformed or wrong-version snapshot.
+    pub(crate) fn read_checked(
+        file: std::fs::File,
+        path: &std::path::Path,
+    ) -> anyhow::Result<AllowlistFile> {
+        use anyhow::{Context, bail};
+        use std::io::Read as _;
+
         const MAX_ALLOWLIST_BYTES: u64 = 1_048_576;
         let mut raw = String::new();
         file.take(MAX_ALLOWLIST_BYTES + 1)
@@ -964,18 +970,48 @@ impl AllowlistCache {
     }
 
     fn from_file(file: AllowlistFile) -> anyhow::Result<Self> {
+        Self::from_file_parts(file).map(|(cache, _refreshed_at)| cache)
+    }
+
+    /// The snapshot's own `refreshed_at`, checked against `now`.
+    ///
+    /// Extracted for #3504 so the age gate is ONE definition run on every
+    /// identity check — including a call served from a still-fresh parse.
+    /// Reusing a parse must never extend the life of an expired snapshot.
+    ///
+    /// # Errors
+    /// Refuses a snapshot older than
+    /// [`crate::identity::hub_cache::MAX_CACHE_AGE_SECS`], and a future-dated
+    /// one (a clock that ran backwards is not evidence of freshness).
+    pub(crate) fn check_snapshot_age(
+        refreshed: chrono::DateTime<chrono::FixedOffset>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        let age = now.signed_duration_since(refreshed);
+        if age < chrono::Duration::zero()
+            || age >= chrono::Duration::seconds(crate::identity::hub_cache::MAX_CACHE_AGE_SECS)
+        {
+            anyhow::bail!("wake-hub: identity cache is expired or future-dated");
+        }
+        Ok(())
+    }
+
+    /// [`Self::from_file`], also handing back the snapshot's `refreshed_at` so
+    /// a caller reusing the parse can re-run [`Self::check_snapshot_age`]
+    /// against it on every later call (#3504).
+    ///
+    /// # Errors
+    /// Every refusal [`Self::from_file`] makes.
+    pub(crate) fn from_file_parts(
+        file: AllowlistFile,
+    ) -> anyhow::Result<(Self, chrono::DateTime<chrono::FixedOffset>)> {
         use anyhow::{Context as _, bail};
         let refreshed = chrono::DateTime::parse_from_rfc3339(
             file.refreshed_at
                 .as_deref()
                 .context("missing cache refresh time")?,
         )?;
-        let age = chrono::Utc::now().signed_duration_since(refreshed);
-        if age < chrono::Duration::zero()
-            || age >= chrono::Duration::seconds(crate::identity::hub_cache::MAX_CACHE_AGE_SECS)
-        {
-            bail!("wake-hub: identity cache is expired or future-dated");
-        }
+        Self::check_snapshot_age(refreshed, chrono::Utc::now())?;
         let mut cache = Self::new();
         for entry in file.agents {
             if entry.agent_id.is_empty() || entry.agent_id.len() > MAX_ID_BYTES {
@@ -1008,6 +1044,6 @@ impl AllowlistCache {
                 },
             );
         }
-        Ok(cache)
+        Ok((cache, refreshed))
     }
 }
