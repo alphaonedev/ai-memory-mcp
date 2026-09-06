@@ -14089,3 +14089,242 @@ mod escalate_producer_2991_tests {
         );
     }
 }
+
+/// #3521 — boot-path DEGRADE arms (per-module coverage floor).
+///
+/// Every arm pinned here is a "the derived artifact is unavailable, keep
+/// the durable corpus serving" decision. The ANN seed set is exactly the
+/// place where a boot that hard-failed (or, worse, seeded a partial graph)
+/// would cost an operator their corpus availability.
+///
+/// The sibling at-rest passphrase-posture pin lives in
+/// `tests/cov_daemon_passphrase_posture_3521.rs`: it mutates the
+/// process-global environment, which `scripts/check-test-env-lock.sh` arm
+/// (d) (issue #3475) requires to happen in its OWN test binary rather than
+/// in the shared lib test binary whose cases run on parallel threads.
+#[cfg(test)]
+mod cov_boot_degrade_arms_3521 {
+    #[cfg(feature = "sal")]
+    use super::build_curator_store;
+    use super::{load_boot_index_entries, reject_url_shaped_db_path};
+    #[cfg(feature = "sal")]
+    use crate::config::AppConfig;
+    use std::path::Path;
+
+    /// `--db` is a SQLite FILE PATH. A URL-shaped value is refused before
+    /// anything is opened or created — and the refusal REDACTS the
+    /// userinfo password (#1579 A3 / CWE-532), because the most likely
+    /// way this fires is an operator pasting a live postgres DSN.
+    #[test]
+    fn url_shaped_db_path_is_refused_with_the_password_redacted() {
+        let err = reject_url_shaped_db_path(Path::new(
+            "postgres://ai_memory:sup3r-s3cret@db.internal:5432/corpus",
+        ))
+        .expect_err("a URL-shaped --db must be refused")
+        .to_string();
+        assert!(
+            !err.contains("sup3r-s3cret"),
+            "the refusal must never echo the password back to the terminal; got: {err}"
+        );
+        assert!(
+            err.contains("--store-url"),
+            "the refusal must name the flag that DOES take a URL; got: {err}"
+        );
+        reject_url_shaped_db_path(Path::new("/var/lib/ai-memory/memory.db"))
+            .expect("an ordinary filesystem path passes through");
+    }
+
+    /// A database the daemon cannot open leaves the semantic index COLD
+    /// (`None`) rather than aborting boot or seeding a partial graph.
+    /// Recall degrades to keyword; nothing is lost, because every vector
+    /// is regenerable from the durable text.
+    #[test]
+    fn unopenable_db_leaves_the_boot_index_cold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A path whose PARENT does not exist: `db::open` cannot create it.
+        let missing = tmp.path().join("no-such-dir").join("cold-3521.db");
+        assert!(
+            load_boot_index_entries(&missing, "sp-3521", 384).is_none(),
+            "an unopenable DB must leave the index cold, never panic or seed"
+        );
+    }
+
+    /// The happy path over an empty corpus yields an EMPTY seed set, not
+    /// `None` — "no rows" and "could not read" are different answers and
+    /// the caller distinguishes them.
+    #[test]
+    fn empty_corpus_yields_an_empty_seed_set_not_a_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("warm-3521.db");
+        let _conn = crate::db::open(&db).expect("db::open");
+        let entries =
+            load_boot_index_entries(&db, "sp-3521", 384).expect("an openable DB must answer");
+        assert!(
+            entries.is_empty(),
+            "an empty corpus seeds nothing; got {} entries",
+            entries.len()
+        );
+    }
+
+    /// The curator's SAL store handle is built with NO embedder, so the
+    /// postgres adapter must take the non-auto-migrate connect path
+    /// (#2567): a curator that auto-migrated the embedding dimension
+    /// would NULL every stored vector with nothing able to regenerate
+    /// them. Skipped when no live Postgres is configured.
+    #[cfg(all(feature = "sal", feature = "sal-postgres"))]
+    #[tokio::test]
+    async fn curator_store_handle_connects_postgres_without_an_embedder() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("AI_MEMORY_TEST_POSTGRES_URL unset — skipping live-pg curator store build");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("curator-handle-3521.db");
+        let cfg = AppConfig::default();
+        let store = build_curator_store(Some(&url), &db, &cfg)
+            .await
+            .expect("curator store handle builds against the configured postgres store");
+        assert!(
+            store
+                .capabilities()
+                .contains(crate::store::Capabilities::DURABLE),
+            "a postgres-backed curator handle must be durable"
+        );
+    }
+
+    /// With no store URL on any channel the curator handle falls back to
+    /// the local SQLite `--db` file — the pre-#1548 behaviour.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn curator_store_handle_falls_back_to_the_local_sqlite_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("curator-sqlite-3521.db");
+        let cfg = AppConfig::default();
+        let store = build_curator_store(None, &db, &cfg)
+            .await
+            .expect("curator store handle builds over the local sqlite file");
+        assert!(
+            store
+                .capabilities()
+                .contains(crate::store::Capabilities::DURABLE),
+            "the sqlite-backed curator handle must be durable"
+        );
+    }
+}
+
+/// #3521 — graph-surface CLI dispatch arms (per-module coverage floor).
+///
+/// `run()`'s `find-paths` / `kg-invalidate` / `swarm-rewind` arms are the
+/// operator's read/repair surface over the provenance graph. Each is pinned
+/// here on an EMPTY corpus, where the only correct answer is "nothing", so a
+/// regression that fabricated a path, invented an edge to invalidate, or let
+/// a `--dry-run` rewind write would surface as a failure rather than as a
+/// plausible-looking report.
+#[cfg(test)]
+mod cov_cli_dispatch_arms_3521 {
+    use super::{Cli, run};
+    use crate::cli::test_utils::TestEnv;
+    use crate::config::AppConfig;
+    use clap::Parser as _;
+
+    fn memory_count(db: &std::path::Path) -> i64 {
+        let conn = crate::db::open(db).expect("db::open");
+        conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .expect("count memories")
+    }
+
+    fn link_count(db: &std::path::Path) -> i64 {
+        let conn = crate::db::open(db).expect("db::open");
+        conn.query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
+            .expect("count links")
+    }
+
+    /// `find-paths` between two ids the corpus does not hold answers with no
+    /// path. A fabricated path would be a provenance claim with nothing
+    /// behind it.
+    #[tokio::test]
+    async fn find_paths_over_an_empty_corpus_reports_no_path() {
+        let _g = crate::config::test_env_lock();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().expect("utf8 db path"),
+            "find-paths",
+            "--source-id",
+            "cov-3521-absent-source",
+            "--target-id",
+            "cov-3521-absent-target",
+            "--json",
+        ])
+        .expect("parse find-paths");
+        run(cli, &cfg, None)
+            .await
+            .expect("find-paths over an empty corpus is not a fault");
+        assert_eq!(
+            memory_count(&env.db_path),
+            0,
+            "a read-only graph query must not create rows"
+        );
+    }
+
+    /// `kg-invalidate` of an edge that does not exist must NOT conjure one.
+    /// Whether it refuses or reports zero, the edge table stays empty — a
+    /// fabricated `valid_until` on an invented edge would be an unfalsifiable
+    /// provenance claim.
+    #[tokio::test]
+    async fn kg_invalidate_of_an_absent_edge_creates_nothing() {
+        let _g = crate::config::test_env_lock();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().expect("utf8 db path"),
+            "kg-invalidate",
+            "--source-id",
+            "cov-3521-absent-source",
+            "--target-id",
+            "cov-3521-absent-target",
+            "--relation",
+            "related_to",
+            "--json",
+        ])
+        .expect("parse kg-invalidate");
+        // Either disposition is acceptable; inventing an edge is not.
+        let _ = run(cli, &cfg, None).await;
+        assert_eq!(
+            link_count(&env.db_path),
+            0,
+            "invalidating an absent edge must never create it"
+        );
+    }
+
+    /// `swarm-rewind --dry-run` is a PREVIEW: zero writes, no audit row.
+    #[tokio::test]
+    async fn swarm_rewind_dry_run_writes_nothing() {
+        let _g = crate::config::test_env_lock();
+        let env = TestEnv::fresh();
+        crate::cli::test_utils::seed_memory(&env.db_path, "cov-3521-rewind", "t", "c");
+        let before = memory_count(&env.db_path);
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().expect("utf8 db path"),
+            "swarm-rewind",
+            "--to",
+            "cov-3521-absent-root",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("parse swarm-rewind");
+        let _ = run(cli, &cfg, None).await;
+        assert_eq!(
+            memory_count(&env.db_path),
+            before,
+            "a dry-run rewind must leave the corpus byte-identical"
+        );
+    }
+}

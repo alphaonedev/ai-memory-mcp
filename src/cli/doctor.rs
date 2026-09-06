@@ -6185,3 +6185,125 @@ mod pg_extensions_verdict_tests_3264 {
         }
     }
 }
+
+/// #3521 — `ai-memory doctor` Identity-section posture arms (per-module
+/// coverage floor).
+///
+/// Both arms below are the ones that tell an operator their substrate can
+/// no longer SIGN — the loudest thing doctor says short of a corrupt
+/// corpus, and the two that had no direct test:
+///
+/// * a key directory another local UID can write is a swap-the-key hazard
+///   (#3198): the daemon would keep signing with a key it does not
+///   control. That must be CRITICAL, with the exact `chmod` to fix it.
+/// * `daemon.pub` present with no `daemon.priv` (#3147) is not transient
+///   and cannot self-heal — a private key is not derivable from a public
+///   one, and regenerating would mint a DIFFERENT identity, orphaning
+///   every signature already in the corpus. Doctor must say "cannot
+///   sign", not "ready".
+#[cfg(test)]
+mod cov_doctor_identity_posture_3521 {
+    use super::{Severity, identity_dir_mode_facts, identity_signing_facts};
+    use std::path::Path;
+
+    fn run_dir_mode(dir: &Path) -> (Vec<(String, String)>, Severity, Vec<String>) {
+        let mut facts = Vec::new();
+        let mut severity = Severity::Info;
+        let mut notes = Vec::new();
+        identity_dir_mode_facts(dir, &mut facts, &mut severity, &mut notes);
+        (facts, severity, notes)
+    }
+
+    fn run_signing(dir: &Path) -> (Vec<(String, String)>, Severity, Vec<String>) {
+        let mut facts = Vec::new();
+        let mut severity = Severity::Info;
+        let mut notes = Vec::new();
+        identity_signing_facts(dir, &mut facts, &mut severity, &mut notes);
+        (facts, severity, notes)
+    }
+
+    /// A group- or world-writable key directory is CRITICAL and the note
+    /// carries the remediation verbatim.
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_key_dir_is_critical_and_names_the_fix() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("keys-3521");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+
+        let (facts, severity, notes) = run_dir_mode(&dir);
+        assert_eq!(
+            severity,
+            Severity::Critical,
+            "a writable-by-others key store must be CRITICAL, not a warning"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("chmod 0700")),
+            "the note must carry the remediation; notes were: {notes:?}"
+        );
+        assert!(
+            facts.iter().any(|(k, _)| k == "key_dir_mode"),
+            "the mode must be reported as a fact; facts were: {facts:?}"
+        );
+    }
+
+    /// A key directory that does not exist yet is NOT a fault — first boot
+    /// creates it `0700`.
+    #[test]
+    fn absent_key_dir_is_not_a_fault() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (facts, severity, notes) = run_dir_mode(&tmp.path().join("does-not-exist"));
+        assert_eq!(severity, Severity::Info, "an absent key dir is not a fault");
+        assert!(notes.is_empty(), "no remediation is due; notes: {notes:?}");
+        assert!(
+            facts
+                .iter()
+                .any(|(k, v)| k == "key_dir_mode" && v.contains("missing")),
+            "facts must say the directory is missing: {facts:?}"
+        );
+    }
+
+    /// `daemon.pub` with no `daemon.priv`: doctor must report that this
+    /// process can verify but can NEVER sign, and warn.
+    #[test]
+    fn public_key_without_private_key_reports_cannot_sign() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let label = crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
+        std::fs::write(tmp.path().join(format!("{label}.pub")), b"public-half\n")
+            .expect("write daemon.pub");
+
+        let (facts, severity, notes) = run_signing(tmp.path());
+        assert_eq!(
+            severity,
+            Severity::Warning,
+            "a can-never-sign identity must be surfaced, not silent"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("can NEVER sign")),
+            "the note must say signing is impossible; notes: {notes:?}"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|(k, v)| k == "signing" && v.contains("cannot sign")),
+            "the signing fact must say it cannot sign: {facts:?}"
+        );
+    }
+
+    /// The both-halves-absent case is a clean first boot, not a fault.
+    #[test]
+    fn absent_identity_is_a_clean_first_boot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (facts, severity, notes) = run_signing(tmp.path());
+        assert_eq!(severity, Severity::Info, "first boot is not a fault");
+        assert!(notes.is_empty(), "no remediation is due; notes: {notes:?}");
+        assert!(
+            facts
+                .iter()
+                .any(|(k, v)| k == "signing" && v.contains("first boot")),
+            "facts must name the first-boot path: {facts:?}"
+        );
+    }
+}

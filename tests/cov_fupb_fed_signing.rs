@@ -106,6 +106,16 @@ fn build_sqlite_router() -> axum::Router {
 /// it removes the files). Caller holds `FED_SIGNING_ENV_LOCK`.
 fn enrol_peer_key(signer: &SigningKey) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
+    // #3198 — the key store must not be group- or world-writable, and
+    // `keypair::save*` refuses one that is. On a host whose TMPDIR carries a
+    // permissive default ACL the fresh temp dir comes back `0775`, so pin
+    // `0700` explicitly rather than depending on the host's umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("tighten the temp key dir to 0700");
+    }
     let kp = AgentKeypair {
         agent_id: PEER_ID.to_string(),
         public: signer.verifying_key(),
@@ -228,5 +238,200 @@ async fn enrolled_peer_omitting_signature_is_rejected_401() {
         status,
         StatusCode::UNAUTHORIZED,
         "an enrolled peer that omits X-Memory-Sig must be refused"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #3521 — the NONCE half of the `(Some sig, Some key)` enforcement matrix.
+//
+// A valid Ed25519 signature over the body proves authorship; it does NOT
+// prove freshness. Without the nonce gate a captured `/sync/push` (or
+// catch-up `/sync/since`) is infinitely REPLAYABLE by anyone who can see the
+// wire, so a peer could be made to re-apply an old federated batch — or to
+// re-serve an old snapshot — long after the sender moved on. These pins cover
+// the two strict arms that had no test: a signed request that omits the nonce
+// under `AI_MEMORY_FED_REQUIRE_NONCE=1`, and a nonce presented twice.
+// ---------------------------------------------------------------------------
+
+/// Turn the nonce gate on for the current (lock-held) test.
+///
+/// SAFETY: every caller holds `FED_SIGNING_ENV_LOCK` for the duration.
+unsafe fn require_nonce_on() {
+    unsafe {
+        std::env::set_var(fed_signing::REQUIRE_NONCE_ENV, "1");
+    }
+}
+
+async fn status_of(router: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let resp = router.clone().oneshot(req).await.expect("oneshot");
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+/// A correctly SIGNED push from an enrolled peer that carries NO nonce is
+/// refused when the nonce gate is on. A signature alone is replayable.
+#[tokio::test]
+async fn signed_push_without_a_nonce_is_refused_when_the_nonce_gate_is_on() {
+    let _g = FED_SIGNING_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let signer = SigningKey::from_bytes(&[21u8; 32]);
+    let _dir = enrol_peer_key(&signer);
+    // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
+    unsafe { require_nonce_on() };
+    let router = build_sqlite_router();
+
+    let body = push_body();
+    let sig = fed_signing::sign_body_header(&signer, &body);
+    let (status, payload) = status_of(&router, build_push_request(&body, Some(&sig))).await;
+    clear_env();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a signed but nonce-less push must be refused under REQUIRE_NONCE=1; body={payload}"
+    );
+    assert_eq!(
+        payload["error"],
+        ai_memory::federation::signing::VerifyError::NonceMissing.tag(),
+        "the refusal must name the missing nonce; body={payload}"
+    );
+}
+
+/// A nonce is single-use. The FIRST signed push carrying it is accepted; an
+/// identical replay of the SAME bytes and the SAME nonce is refused, so a
+/// captured batch cannot be re-applied.
+#[tokio::test]
+async fn a_replayed_nonce_on_a_signed_push_is_refused() {
+    let _g = FED_SIGNING_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let signer = SigningKey::from_bytes(&[22u8; 32]);
+    let _dir = enrol_peer_key(&signer);
+    // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
+    unsafe { require_nonce_on() };
+    let router = build_sqlite_router();
+
+    let body = push_body();
+    let nonce = "cov-3521-nonce-a";
+    let sig = fed_signing::sign_body_with_nonce_header(&signer, &body, nonce);
+    let build = || {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/push")
+            .header("content-type", "application/json")
+            .header("x-peer-id", PEER_ID)
+            .header(fed_signing::SIGNATURE_HEADER, sig.clone());
+        b = b.header(fed_signing::NONCE_HEADER, nonce);
+        b.body(Body::from(body.clone())).expect("request")
+    };
+
+    let (first, first_body) = status_of(&router, build()).await;
+    assert_eq!(
+        first,
+        StatusCode::OK,
+        "the first use of a fresh nonce must be accepted; body={first_body}"
+    );
+    let (second, second_body) = status_of(&router, build()).await;
+    clear_env();
+    assert_eq!(
+        second,
+        StatusCode::UNAUTHORIZED,
+        "an identical replay must be refused; body={second_body}"
+    );
+    assert_eq!(
+        second_body["error"],
+        ai_memory::federation::signing::VerifyError::ReplayedNonce.tag(),
+        "the refusal must name the replay; body={second_body}"
+    );
+}
+
+/// The catch-up GET carries the same contract: a signed `/sync/since`
+/// without a nonce is refused under the nonce gate. A replayable catch-up
+/// GET lets an observer re-drive a peer's snapshot pull.
+#[tokio::test]
+async fn signed_sync_since_without_a_nonce_is_refused_when_the_nonce_gate_is_on() {
+    let _g = FED_SIGNING_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let signer = SigningKey::from_bytes(&[23u8; 32]);
+    let _dir = enrol_peer_key(&signer);
+    // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
+    unsafe { require_nonce_on() };
+    let router = build_sqlite_router();
+
+    let path = "/api/v1/sync/since";
+    let query = format!("peer={PEER_ID}");
+    let canonical = fed_signing::canonical_get_bytes("GET", path, &query);
+    let sig = fed_signing::sign_body_header(&signer, &canonical);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("{path}?{query}"))
+        .header("x-peer-id", PEER_ID)
+        .header(fed_signing::SIGNATURE_HEADER, sig)
+        .body(Body::empty())
+        .expect("request");
+    let (status, payload) = status_of(&router, req).await;
+    clear_env();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a signed but nonce-less catch-up GET must be refused; body={payload}"
+    );
+    assert_eq!(
+        payload["error"],
+        ai_memory::federation::signing::VerifyError::NonceMissing.tag(),
+        "the refusal must name the missing nonce; body={payload}"
+    );
+}
+
+/// A catch-up GET nonce is single-use too.
+#[tokio::test]
+async fn a_replayed_nonce_on_a_signed_sync_since_is_refused() {
+    let _g = FED_SIGNING_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let signer = SigningKey::from_bytes(&[24u8; 32]);
+    let _dir = enrol_peer_key(&signer);
+    // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
+    unsafe { require_nonce_on() };
+    let router = build_sqlite_router();
+
+    let path = "/api/v1/sync/since";
+    let query = format!("peer={PEER_ID}");
+    let canonical = fed_signing::canonical_get_bytes("GET", path, &query);
+    let nonce = "cov-3521-nonce-b";
+    let sig = fed_signing::sign_body_with_nonce_header(&signer, &canonical, nonce);
+    let build = || {
+        Request::builder()
+            .method("GET")
+            .uri(format!("{path}?{query}"))
+            .header("x-peer-id", PEER_ID)
+            .header(fed_signing::SIGNATURE_HEADER, sig.clone())
+            .header(fed_signing::NONCE_HEADER, nonce)
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    let (first, first_body) = status_of(&router, build()).await;
+    assert_eq!(
+        first,
+        StatusCode::OK,
+        "the first use of a fresh catch-up nonce must be accepted; body={first_body}"
+    );
+    let (second, second_body) = status_of(&router, build()).await;
+    clear_env();
+    assert_eq!(
+        second,
+        StatusCode::UNAUTHORIZED,
+        "an identical catch-up replay must be refused; body={second_body}"
+    );
+    assert_eq!(
+        second_body["error"],
+        ai_memory::federation::signing::VerifyError::ReplayedNonce.tag(),
+        "the refusal must name the replay; body={second_body}"
     );
 }

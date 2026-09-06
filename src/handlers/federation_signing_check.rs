@@ -3293,6 +3293,99 @@ mod fed_p2d_credential_resolution_tests {
         headers
     }
 
+    /// #3521 — a malformed `X-Memory-Cred` value falls through to the
+    /// legacy per-peer path (returns `None`); it must never be treated as
+    /// a valid binding, and it must never panic the receive funnel.
+    #[test]
+    fn malformed_credential_header_falls_through_to_legacy() {
+        let issuer = test_issuer();
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+        assert!(
+            verify_credential_pubkey(
+                "not-a-credential",
+                None,
+                Some(TEST_PEER_ID),
+                &bundle,
+                TEST_NOW_UNIX,
+            )
+            .is_none(),
+            "a malformed leaf credential must not bind a key"
+        );
+    }
+
+    /// A well-formed leaf presented with a malformed CHAIN header is also
+    /// refused: a chain that cannot be parsed cannot be verified, and a
+    /// half-verified chain is worse than none.
+    #[test]
+    fn malformed_chain_header_falls_through_to_legacy() {
+        let issuer = test_issuer();
+        let subject_pub = fixed_signing_key(11).verifying_key();
+        let signed = issuer
+            .issue(TEST_PEER_ID, &subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential");
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+        assert!(
+            verify_credential_pubkey(
+                &signed.to_header_value().expect("encode credential"),
+                Some("not-a-chain"),
+                Some(TEST_PEER_ID),
+                &bundle,
+                TEST_NOW_UNIX,
+            )
+            .is_none(),
+            "an unparseable chain header must not bind a key"
+        );
+    }
+
+    /// A structurally valid credential from an issuer the bundle does NOT
+    /// trust is refused. Accepting it would let any self-signed issuer
+    /// mint peers.
+    #[test]
+    fn credential_from_an_untrusted_issuer_is_refused() {
+        let issuer = test_issuer();
+        let subject_pub = fixed_signing_key(12).verifying_key();
+        let signed = issuer
+            .issue(TEST_PEER_ID, &subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential");
+        // Empty bundle: the anchor issuer is not trusted.
+        let bundle = TrustBundle::new();
+        assert!(
+            verify_credential_pubkey(
+                &signed.to_header_value().expect("encode credential"),
+                None,
+                Some(TEST_PEER_ID),
+                &bundle,
+                TEST_NOW_UNIX,
+            )
+            .is_none(),
+            "an untrusted issuer must not bind a key"
+        );
+    }
+
+    /// IDENTITY BINDING: a valid credential for peer A must not
+    /// authenticate a push attributed to peer B. Without this check a
+    /// legitimately-issued credential becomes a universal peer forgery.
+    #[test]
+    fn credential_subject_must_match_the_claimed_peer_id() {
+        let issuer = test_issuer();
+        let subject_pub = fixed_signing_key(13).verifying_key();
+        let signed = issuer
+            .issue(TEST_PEER_ID, &subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential");
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+        assert!(
+            verify_credential_pubkey(
+                &signed.to_header_value().expect("encode credential"),
+                None,
+                Some("host:someone-else"),
+                &bundle,
+                TEST_NOW_UNIX,
+            )
+            .is_none(),
+            "a credential must not authenticate a DIFFERENT claimed peer id"
+        );
+    }
+
     #[test]
     fn credential_path_returns_subject_key_when_issuer_trusted() {
         let issuer = test_issuer();
