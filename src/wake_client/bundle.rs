@@ -20,7 +20,9 @@
 //! `--insecure` / `--skip-verify` counterpart anywhere on the surface:
 //!
 //! * the bundle file must be a regular file (never a symlink) owned by the
-//!   caller, mode 0600 — the same standard the writer enforced;
+//!   caller, mode 0600 — the same standard the writer enforced, proven
+//!   through the ONE `O_NOFOLLOW` descriptor the bytes are then read from, so
+//!   the file that was checked is the file that was parsed (#3522);
 //! * the bundle `version` must be exactly [`DELEGATION_BUNDLE_VERSION`];
 //! * the certificate must carry scope [`A2A_HUB_SCOPE`], the bundle's own
 //!   principal, and the hub id we are about to dial;
@@ -124,8 +126,9 @@ impl HubJoinBundle {
     ///
     /// Every check in the module docs, each as its own actionable refusal.
     pub fn load(path: &Path, hub_id: &str, key_dir: &Path, now_rfc3339: &str) -> Result<Self> {
-        assert_owner_only(path)?;
-        let raw = std::fs::read(path)
+        let mut file = open_owner_only(path)?;
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut raw)
             .with_context(|| format!("cannot read the delegation bundle {}", path.display()))?;
         let bundle: DelegationBundle = serde_json::from_slice(&raw).with_context(|| {
             format!(
@@ -317,29 +320,56 @@ impl HubJoinBundle {
     }
 }
 
-/// Refuse a bundle any other local user could read or replace.
+/// Open a bundle no other local user could read or replace, returning the
+/// descriptor every check was run against.
 ///
-/// `symlink_metadata` deliberately does NOT follow links: a symlink in the key
-/// directory pointing at a world-readable file would otherwise pass a check
-/// performed on the target.
-fn assert_owner_only(path: &Path) -> Result<()> {
+/// The permissions are proven through ONE descriptor and the bytes are then
+/// read from that SAME descriptor, mirroring
+/// `AllowlistCache::open_checked` on the hub side (#3504). A path-based
+/// `symlink_metadata` followed by a path-based read would leave a window in
+/// which the file could be swapped between the check and the read; the key
+/// directory is caller-owned, so that window was only ever reachable by the
+/// caller itself, but there is no reason to keep a stat-then-open pattern in a
+/// credential loader when the descriptor-bound one costs nothing.
+///
+/// `O_NOFOLLOW` refuses a symlink AT THE OPEN, so a link in the key directory
+/// pointing at a world-readable file can never have its permissions checked on
+/// the target. `O_NONBLOCK` keeps a FIFO planted at this path from parking the
+/// process on the open; the regular-file check below then refuses it.
+fn open_owner_only(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let meta = std::fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "no a2a-hub delegation bundle at {}. Mint one with `ai-memory identity delegate \
-             --scope a2a-hub`.",
-            path.display()
-        )
-    })?;
-    if meta.file_type().is_symlink() {
-        bail!(
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        // ELOOP is what O_NOFOLLOW reports for a symlink on Linux and macOS.
+        // Kept as its own refusal so the operator is told what is actually
+        // wrong rather than being handed a bare "too many levels of symlinks".
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => bail!(
             "{} is a symlink. A credential reached through a link is a credential whose \
              permissions were checked on the wrong file.",
             path.display()
-        );
-    }
+        ),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "no a2a-hub delegation bundle at {}. Mint one with `ai-memory identity \
+                     delegate --scope a2a-hub`.",
+                    path.display()
+                )
+            });
+        }
+    };
+
+    // fstat on the descriptor just opened — never a second look at the path.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("cannot stat the delegation bundle {}", path.display()))?;
     if !meta.file_type().is_file() {
         bail!("{} is not a regular file", path.display());
     }
@@ -359,7 +389,7 @@ fn assert_owner_only(path: &Path) -> Result<()> {
             crate::wake_hub::startup::current_euid()
         );
     }
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -567,17 +597,63 @@ mod tests {
         let path = dir.path().join("b.json");
         std::fs::write(&path, b"{}").expect("write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        assert_owner_only(&path).expect("0600 is the standard");
+        open_owner_only(&path).expect("0600 is the standard");
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        let err = assert_owner_only(&path).expect_err("world-readable is refused");
+        let err = open_owner_only(&path).expect_err("world-readable is refused");
         assert!(format!("{err:#}").contains("0644"), "{err:#}");
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         let link = dir.path().join("link.json");
         std::os::unix::fs::symlink(&path, &link).expect("symlink");
-        let err = assert_owner_only(&link).expect_err("a symlinked credential is refused");
+        let err = open_owner_only(&link).expect_err("a symlinked credential is refused");
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    /// The bytes a load parses come from the descriptor the permissions were
+    /// proven on, not from a second look at the path. Replacing the file
+    /// AFTER the check therefore cannot change what is read — the check and
+    /// the read describe one inode.
+    #[test]
+    fn the_bundle_is_read_from_the_descriptor_that_was_checked_3522() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("b.json");
+        std::fs::write(&path, b"{\"checked\":true}").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let mut file = open_owner_only(&path).expect("an owner-only regular file opens");
+
+        // Swap the path out from under the caller after the checks ran. A
+        // path-based read would pick the replacement up; a descriptor-bound
+        // one cannot.
+        let swapped = dir.path().join("swapped.json");
+        std::fs::write(&swapped, b"{\"swapped\":true}").expect("write");
+        std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::fs::rename(&swapped, &path).expect("rename over the checked path");
+
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut raw).expect("read");
+        assert_eq!(
+            raw.as_slice(),
+            b"{\"checked\":true}".as_slice(),
+            "the checked inode is the one that was read"
+        );
+    }
+
+    /// DENIED: a FIFO at the bundle path. O_NONBLOCK keeps the open from
+    /// parking the process, and the regular-file check then refuses it.
+    #[test]
+    fn a_fifo_at_the_bundle_path_is_refused_without_blocking_3522() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("b.json");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: mkfifo takes a NUL-terminated path and a mode; the CString
+        // above owns the buffer for the duration of the call.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+
+        let err = open_owner_only(&path).expect_err("a FIFO is not a credential");
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
     }
 
     /// DENIED: a bundle format this build does not understand.
