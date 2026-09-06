@@ -22731,39 +22731,29 @@ impl MemoryStore for PostgresStore {
                 continue;
             }
             let mem = crate::curator::reports::daily_rollup_memory(&day, &bodies, now);
-            let expires = mem
-                .expires_at
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
-            // Upsert on the SAME `(title, namespace)` key the sqlite insert
-            // upserts on (`memories_title_ns_uidx`), which is what makes a
-            // re-fold of a day replace its summary instead of appending one.
-            sqlx::query(
-                "INSERT INTO memories \
-                   (id, tier, namespace, title, content, source, priority, confidence, \
-                    created_at, updated_at, expires_at, metadata) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11::jsonb) \
-                 ON CONFLICT (title, namespace) DO UPDATE SET \
-                   content = EXCLUDED.content, \
-                   updated_at = EXCLUDED.updated_at, \
-                   expires_at = EXCLUDED.expires_at, \
-                   tier = EXCLUDED.tier",
-            )
-            .bind(&mem.id)
-            .bind(mem.tier.as_str())
-            .bind(&mem.namespace)
-            .bind(&mem.title)
-            .bind(&mem.content)
-            .bind(&mem.source)
-            .bind(mem.priority)
-            .bind(mem.confidence)
-            .bind(now)
-            .bind(expires)
-            .bind(mem.metadata.to_string())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| to_store_err("prune_curator_reports rollup upsert", e))?;
+            // G6 (#1823) — write the summary through the ROUTED create funnel,
+            // never raw SQL. A re-fold of a day is a `(title, namespace)`
+            // collision that REWRITES the prior summary's durable `content` in
+            // place; done as a bare `INSERT … ON CONFLICT … DO UPDATE SET
+            // content = EXCLUDED.content` that annihilates the previous version
+            // OUTSIDE the signed `memory_revisions` ledger — exactly the P4
+            // shape `append_only_spine_guard_g6` forbids, and exactly what the
+            // sqlite twin avoids by going through `db::insert`.
+            //
+            // `Self::store` IS that funnel on this backend: it takes the
+            // COW-supersede probe + ledger leaf, the governance / why_trace
+            // gates, the #1466 expiry backfill and the quota transaction, and
+            // it upserts on the SAME `memories_title_ns_uidx` key — so the
+            // replace-not-append semantics the rollup depends on are preserved
+            // while the ledger finally sees the rewrite. `ctx` is the admin
+            // context this method already requires above, which is what puts
+            // the write on the substrate-origin why_trace path (the sqlite
+            // twin's `db::insert` implies the same posture).
+            //
+            // NOT annotated APPEND-ONLY-SANCTIONED: that marker is for a site
+            // that must destroy content outside the ledger and can justify it.
+            // This one has no such need — it can simply be routed, so it is.
+            self.store(ctx, &mem).await?;
             report.days_rolled_up += 1;
 
             // Stamp ONLY the day just folded, chunked. Scoping the stamp to the
