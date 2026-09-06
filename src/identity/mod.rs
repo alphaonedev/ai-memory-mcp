@@ -181,6 +181,137 @@ pub mod pubkey_bind;
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
 const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 
+/// v1.0.0 #3523 — the ONE read of [`ENV_AGENT_ID`] on the caller-resolution
+/// path, and the only place the test-only injection seam is consulted.
+///
+/// Mirrors `std::env::var`'s signature exactly (including the
+/// `NotPresent` / `NotUnicode` split [`resolve_mcp_read_visibility_caller`]
+/// fails closed on) so the three resolvers below are byte-for-byte the
+/// functions they were, with one call swapped.
+///
+/// # Production builds
+///
+/// Under `cargo build --release` (default features) the `cfg` block below
+/// does not exist, so this function compiles to exactly
+/// `std::env::var(ENV_AGENT_ID)`. The seam is STRUCTURAL, not a runtime
+/// flag: there is no branch to mis-set, no environment variable that arms
+/// it, and no symbol to call.
+fn agent_id_env() -> Result<String, std::env::VarError> {
+    // The `#[cfg]` sits on a BLOCK statement rather than directly on the `if`:
+    // an attribute on a bare expression-statement is still unstable
+    // (`stmt_expr_attributes`), while a block statement takes one on stable.
+    // Under a release build the whole block is stripped before type-checking.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if let Some(override_value) = test_agent_id::current_override() {
+            return override_value.ok_or(std::env::VarError::NotPresent);
+        }
+    }
+    std::env::var(ENV_AGENT_ID)
+}
+
+/// v1.0.0 #3523 — TEST-ONLY injection seam for the caller principal.
+///
+/// # The problem this replaces
+///
+/// `src/**/*.rs` compiles into ONE `cargo test --lib` binary whose `#[test]`
+/// functions run in PARALLEL THREADS, and until #3523 the ONLY way a test
+/// could influence [`resolve_agent_id`] / [`resolve_read_visibility_caller`]
+/// was to write `AI_MEMORY_AGENT_ID` into the PROCESS environment. That
+/// write is (a) unsound under concurrency (rust-1.98 UNSAFE-01/03) and
+/// (b) globally VISIBLE — for as long as it is installed, every
+/// concurrently-running reader in the binary resolves the foreign principal.
+/// That is the #3475 / #3517 flake class, and serializing the mutators does
+/// not fix it because the victims are READERS that take no lock.
+///
+/// # Why a THREAD-LOCAL is the fix, not merely a nicer API
+///
+/// The override lives in a `thread_local!`, so an installed value is
+/// invisible to every other test thread BY CONSTRUCTION. There is no lock to
+/// take, no window to interleave with, and no way for one test to steer
+/// another — the property the process environment cannot provide at any
+/// price. A test that uses this seam needs no serialization at all.
+///
+/// # Bounds (documented, not worked around)
+///
+/// The override does NOT cross a thread boundary: a value installed on the
+/// test thread is not seen inside `std::thread::spawn`,
+/// `tokio::task::spawn_blocking`, or a multi-thread runtime's worker. That
+/// is the same property that makes it safe, so a test whose handler runs on
+/// another thread must pass an EXPLICIT caller (as
+/// `tests/detect_contradiction_3387.rs` does) rather than reach for this.
+///
+/// # Security
+///
+/// The whole module is `cfg(any(test, feature = "test-support"))`. It is
+/// absent from `cargo build --release` — the shipped binary contains neither
+/// the thread-local nor the setter, so there is nothing to reach. In a
+/// `cargo test` build (where `Cargo.toml`'s self dev-dependency unifies
+/// `test-support` into the whole graph, including the `ai-memory` BIN — the
+/// #3516 lesson) the module IS compiled, and its safety then rests on two
+/// properties: the override defaults to `None`, so an unarmed process
+/// behaves byte-identically to one without the seam; and it can only be
+/// armed by calling [`AgentIdOverride::set`] / [`AgentIdOverride::unset`],
+/// which NO production path does.
+/// `tests/agent_id_seam_structural_3523.rs` asserts both — the `cfg` gate
+/// and the absence of any production caller — by source walk, so neither
+/// can erode silently.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_agent_id {
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// `None` = seam DISARMED (fall through to the real environment).
+        /// `Some(None)` = resolve as if `AI_MEMORY_AGENT_ID` were ABSENT.
+        /// `Some(Some(v))` = resolve as if it held `v`.
+        static OVERRIDE: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    }
+
+    /// The current thread's override, if the seam is armed on this thread.
+    pub(super) fn current_override() -> Option<Option<String>> {
+        OVERRIDE.with(|cell| cell.borrow().clone())
+    }
+
+    /// RAII fixture: install a caller principal for the CURRENT THREAD only,
+    /// and restore the previous state on drop (including on unwind, so a
+    /// panicking test cannot leak it into a later test on the same thread).
+    ///
+    /// Nested guards restore correctly because each captures the state it
+    /// replaced.
+    #[must_use = "the override is restored the moment this guard is dropped"]
+    pub struct AgentIdOverride {
+        prev: Option<Option<String>>,
+    }
+
+    impl AgentIdOverride {
+        /// Resolve `value` as the caller principal on this thread.
+        pub fn set(value: &str) -> Self {
+            Self::install(Some(value.to_string()))
+        }
+
+        /// Resolve as if `AI_MEMORY_AGENT_ID` were ABSENT on this thread —
+        /// the single-tenant trust-all read posture — regardless of what the
+        /// real process environment holds.
+        pub fn unset() -> Self {
+            Self::install(None)
+        }
+
+        fn install(value: Option<String>) -> Self {
+            let prev = OVERRIDE.with(|cell| cell.replace(Some(value)));
+            Self { prev }
+        }
+    }
+
+    impl Drop for AgentIdOverride {
+        fn drop(&mut self) {
+            let prev = self.prev.take();
+            OVERRIDE.with(|cell| {
+                *cell.borrow_mut() = prev;
+            });
+        }
+    }
+}
+
 /// Environment variable opt-out for the hostname-revealing default (#198).
 /// When truthy (`1`, `true`, `yes`, `on`), the `host:<hostname>:pid-...`
 /// fallback is skipped and `anonymous:pid-...` is used instead.
@@ -285,7 +416,7 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
     //    boundary — the env-var carve-out does not loosen the wire posture.
     //    Closes #1234 (RCA: this site was missed when #977 introduced
     //    RESERVED_AGENT_IDS + the shape/wire split).
-    if let Ok(v) = std::env::var(ENV_AGENT_ID)
+    if let Ok(v) = agent_id_env()
         && !v.is_empty()
     {
         validate::validate_agent_id_shape(&v)?;
@@ -353,7 +484,7 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
 /// read posture: the handler skips the ownership post-filter entirely.
 #[must_use]
 pub fn resolve_read_visibility_caller() -> Option<String> {
-    let v = std::env::var(ENV_AGENT_ID).ok()?;
+    let v = agent_id_env().ok()?;
     if v.is_empty() {
         return None;
     }
@@ -377,7 +508,7 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
 /// Returns an error when `AI_MEMORY_AGENT_ID` is present but cannot be used as
 /// a stable agent identity.
 pub fn resolve_mcp_read_visibility_caller() -> Result<Option<String>> {
-    let value = match std::env::var(ENV_AGENT_ID) {
+    let value = match agent_id_env() {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
