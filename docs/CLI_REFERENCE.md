@@ -580,9 +580,35 @@ verified, atomic and reversible — in that order:
    (sidecars included). This is a COPY, not a move: the target path
    never goes empty, so an interrupt cannot leave you with no database.
 4. **Stage and verify.** The replacement is written to a temp file in
-   the same directory, fsynced, and must pass `PRAGMA integrity_check`.
-   A partial copy (ENOSPC, interrupt) or a damaged snapshot fails here,
-   the staged file is deleted, and the live database is untouched.
+   the same directory, fsynced, and must pass the whole-database
+   integrity check. A partial copy (ENOSPC, interrupt) or a damaged
+   snapshot fails here, the staged file is deleted, and the live
+   database is untouched.
+
+   Since v1.0.0 that check is `PRAGMA integrity_check` **plus a
+   whole-file page census**, because the pragma alone is no longer
+   sufficient ([#3508](https://github.com/alphaonedev/ai-memory-mcp/issues/3508)
+   / [#3510](https://github.com/alphaonedev/ai-memory-mcp/issues/3510)).
+   SQLite builds the check's root-page list from the schema's table
+   hash; a schema object with no root page of its own — a `VIEW`, a
+   virtual table — contributes root page 0, and a leading zero makes
+   SQLite treat the run as a PARTIAL check that **skips the freelist
+   scan and the "every page is referenced" pass while still answering
+   `ok`**. The ai-memory schema carries two such objects
+   (`memories_fts`, and the schema v98 `inbox_namespace_aliases` view),
+   so `restore` re-asserts the skipped accounting itself: every page the
+   file declares must be reachable from a b-tree, on the freelist, a
+   pointer-map page (auto-vacuum databases only), or the reserved
+   pending-byte page. A snapshot that declares more pages than that is
+   REFUSED, and a build that cannot complete the census — no `dbstat`
+   virtual table, an unreadable auto-vacuum geometry — refuses rather
+   than publishing a replacement it could not verify.
+
+   When the page census is what covered the file, `restore` says so on
+   its own output (`Verified all N pages of … (b-tree … + freelist … +
+   pointer-map … + pending-byte …)`), on stderr under `--json` so the
+   envelope stays a single machine-readable document. A DR gate that
+   cannot tell you what it checked is not a gate you can rely on.
 5. **Swap atomically** with `rename`, then remove the stale
    `-wal` / `-shm` left over from the replaced database.
 6. **Print the rollback path.** Human output ends with
