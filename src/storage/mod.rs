@@ -869,6 +869,13 @@ pub mod schema_guard;
 /// ladder-only relation is absent; this module reports that skip instead
 /// of letting the tail stamp assert integrity controls that never ran.
 pub mod schema_integrity;
+/// v1.0.0 (#3510, extracted from #3508) — the ONE whole-database integrity
+/// verdict for a SQLite corpus. `PRAGMA integrity_check` silently degrades to
+/// a PARTIAL check whenever a root-less schema object (a VIEW, a virtual
+/// table) heads the schema hash; this module re-asserts the whole-file page
+/// accounting SQLite then skips, so every surface that asks "is this database
+/// sound?" gets the same fail-closed answer.
+pub mod sqlite_integrity;
 
 // #1802 S1 — itemized re-export shim for the extracted doctor module
 // (M-NO-GLOB-REEXPORTS: explicit list, so any accidental visibility

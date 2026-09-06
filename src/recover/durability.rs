@@ -34,6 +34,7 @@
 //! on replay. The power-loss harness exercises both the memory-row WAL path
 //! and (optionally) the journal replay path.
 
+use crate::storage::sqlite_integrity::Soundness;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
@@ -110,7 +111,7 @@ pub fn maybe_inject_power_loss(index: usize) {
 /// is a durable, acknowledged write. The power-loss harness spawns this in a
 /// child, lets the injected abort kill it, then re-opens the DB and asserts
 /// exactly the acknowledged prefix survived (no lost acked write, no torn
-/// row, integrity_check clean).
+/// row, whole-database integrity check clean — see [`integrity_verdict`]).
 ///
 /// # Errors
 /// Propagates any insert error.
@@ -174,16 +175,39 @@ fn synth_durability_memory(namespace: &str, i: usize) -> crate::models::Memory {
     }
 }
 
-/// Run SQLite's `PRAGMA integrity_check` and return `true` iff the database
-/// reports `ok` (no corruption) — the post-crash no-corruption assertion.
+/// The post-crash no-corruption VERDICT, with the reason attached when the
+/// database is not sound.
+///
+/// v1.0.0 #3510 — this routes through
+/// [`crate::storage::sqlite_integrity::check`], the ONE whole-database
+/// integrity implementation, rather than asking `PRAGMA integrity_check`
+/// directly. That matters for the durability CLAIM, not merely for tidiness:
+/// on the v98 schema a root-less object (the `inbox_namespace_aliases` VIEW,
+/// `memories_fts`) can downgrade SQLite's own check to a PARTIAL one that
+/// SKIPS the freelist scan and the every-page-referenced pass while still
+/// answering `ok` (#3508). A power-loss harness asserting on that bare verdict
+/// would have reported "no corruption" without ever looking for the
+/// unreferenced pages a torn write is most likely to leave — the claim would
+/// have read stronger than the evidence.
 ///
 /// # Errors
-/// Propagates the query error.
+/// The check could not be COMPLETED (a PRAGMA failed, this build has no
+/// `dbstat`). "Cannot verify" is never reported as "verified".
+pub fn integrity_verdict(conn: &Connection) -> Result<Soundness> {
+    crate::storage::sqlite_integrity::check(conn).context("integrity_check")
+}
+
+/// Run the whole-database integrity check and return `true` iff the database
+/// is sound (no corruption AND every page accounted for) — the post-crash
+/// no-corruption assertion.
+///
+/// Use [`integrity_verdict`] when the caller wants to REPORT why a database
+/// was rejected; this predicate collapses that to a bool.
+///
+/// # Errors
+/// Propagates a check that could not be completed (never a clean verdict).
 pub fn integrity_ok(conn: &Connection) -> Result<bool> {
-    let verdict: String = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .context("integrity_check")?;
-    Ok(verdict.eq_ignore_ascii_case("ok"))
+    Ok(matches!(integrity_verdict(conn)?, Soundness::Sound(_)))
 }
 
 /// Count the rows in `namespace` — the post-reopen "no lost acked write"
