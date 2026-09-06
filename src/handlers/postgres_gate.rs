@@ -1854,13 +1854,16 @@ mod transport_postgres_gate_tests {
             &Method::POST,
             crate::handlers::routes::SHARE
         ));
-        // Same shape — route_1111 family is registered but not
-        // postgres-allowlisted.
+        // The route_1111 family used to be the second example of this
+        // shape; #3064 (lane L-PGP) gave every member a postgres SAL arm,
+        // so it is now registered AND allowlisted — pinned here so a
+        // future allowlist regression on that family fails loudly instead
+        // of silently re-emitting the fabricated 501.
         assert!(path_is_registered_route(
             &Method::POST,
             crate::handlers::routes::MEMORY_SMART_LOAD
         ));
-        assert!(!postgres_endpoint_supported(
+        assert!(postgres_endpoint_supported(
             &Method::POST,
             crate::handlers::routes::MEMORY_SMART_LOAD
         ));
