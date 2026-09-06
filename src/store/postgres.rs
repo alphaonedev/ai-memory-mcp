@@ -88,6 +88,28 @@ use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 /// cannot match; now the real metadata target via `target:`.
 const TRACE_TARGET: &str = "store::postgres";
 
+/// v1.0.0 #3520 (TEST-ONLY) — serialises the bootstrap section of
+/// [`PostgresStore::connect_with_dim`] across the lib-test binary.
+///
+/// The `store::postgres` lib tests share ONE database and run in parallel, so
+/// before #3520 a test's `connect()` could replay the bundled DDL — including
+/// ~70 `CREATE INDEX IF NOT EXISTS`, each taking a relation-level ShareLock —
+/// while a peer test was mid-`size_gc`, and PostgreSQL resolved the resulting
+/// lock cycle by aborting the DML side (`40P01`). That is what the #3519 gate
+/// hit.
+///
+/// The structural half of the fix is the catalog pre-check
+/// ([`bootstrap_ddl`]): after the FIRST connect against a given database, no
+/// later connect emits any relation DDL at all, so there is nothing left to
+/// interleave with. This guard closes the remaining window — the first
+/// bootstrap itself — by making every other `connect()` WAIT rather than
+/// return a store that could start issuing DML mid-DDL. It is `cfg(test)` so
+/// production keeps its concurrent-boot behaviour verbatim (which #3519's
+/// live 8-store regression test exercises, and which the advisory lock, not
+/// this mutex, governs).
+#[cfg(test)]
+static PG_BOOTSTRAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Tracing target for the postgres KG (Apache AGE) subsystem.
 const TRACE_TARGET_KG: &str = "store::postgres::kg";
 
@@ -2851,6 +2873,12 @@ impl PostgresStore {
                 }
             }
 
+            // v1.0.0 #3520 (TEST-ONLY) — see [`PG_BOOTSTRAP_TEST_LOCK`]. Held
+            // across the catalog pre-check AND the DDL replay so a peer test's
+            // `connect()` cannot hand back a store that starts writing while
+            // the first bootstrap is still taking relation locks.
+            #[cfg(test)]
+            let _bootstrap_test_guard = PG_BOOTSTRAP_TEST_LOCK.lock().await;
             let rendered_sql = render_schema_sql(INIT_SCHEMA, dim);
             // v1.0.0 #3520 — CATALOG PRE-CHECK. `CREATE INDEX IF NOT EXISTS`
             // takes a relation-level ShareLock on the table BEFORE it notices
