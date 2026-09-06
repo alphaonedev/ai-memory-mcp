@@ -10353,13 +10353,40 @@ impl AppConfig {
 /// test does not cascade. Callers bind the returned guard to a
 /// `let _guard = ...` local (test-fixture-raii) — never `let _ = ...`, which
 /// would drop it immediately and defeat the serialization.
+///
+/// #3523: this function no longer OWNS the mutex — it acquires
+/// [`test_env_mutex`], the crate's single process-env `Mutex<()>`, which
+/// `crate::test_support::env_lock()` now acquires too. Before #3523 the two
+/// were INDEPENDENT `OnceLock<Mutex<()>>` statics over the same
+/// process-global writes, so a `log_paths` / `encryption` test holding
+/// `test_support::env_lock()` and a `config` / `reranker` / `egress` test
+/// holding this one ran at literally the same instant — the identical
+/// per-module-mutex defect $HOME already suffered three times
+/// (#1998 -> #2115 -> #2127). `tests/env_lock_singleton_gate_3523.rs` pins
+/// the singleton structurally; `test_support::tests` pins it by OBSERVATION
+/// (hold one wrapper, a probe thread must fail to acquire the other).
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    test_env_mutex()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The ONE process-env `Mutex<()>` in this crate (#3523).
+///
+/// Exposed as the raw mutex (not just a guard) so the singleton can be
+/// proven by OBSERVATION rather than only by reading the source: a test may
+/// hold one wrapper and `try_lock()` this from a probe thread, which must
+/// fail. Two independent mutexes would let the probe succeed.
+///
+/// Poison-OK is the CALLER's job (`test_env_lock` recovers via
+/// `PoisonError::into_inner`): one panicking scenario must not wedge every
+/// other env-mutating test.
+#[cfg(test)]
+pub(crate) fn test_env_mutex() -> &'static std::sync::Mutex<()> {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Role env marker for [`run_env_isolated_child_or_spawn`] (#2905).
