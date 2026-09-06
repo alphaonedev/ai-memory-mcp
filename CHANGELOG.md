@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3519 — PostgreSQL bootstrap/migration advisory-lock wait no longer deadlocks concurrent boots)
+
+- **#3519 (SECURITY — data-tier availability at upgrade time) — the migration
+  advisory-lock wait no longer pins a transaction snapshot, so concurrent
+  daemon boots against one PostgreSQL can no longer deadlock the schema
+  ladder.** `PostgresStore::connect` and `migrate()` took the cluster-wide
+  `MIGRATION_ADVISORY_LOCK_KEY` with a BLOCKING `SELECT pg_advisory_lock($1)` on
+  a dedicated connection. A peer that lost the race therefore parked inside an
+  in-flight statement — which holds a transaction snapshot — while the lock
+  HOLDER's bootstrap ran `CREATE INDEX CONCURRENTLY` (the v88 list-order
+  self-heal) on a second pool connection; CIC waits for every snapshot-holding
+  transaction to end, so CIC waited for the waiters, the waiters waited for the
+  session lock, and the holder could not release until its CIC finished. The
+  cycle closes through the APPLICATION, so PostgreSQL's deadlock detector never
+  fires and every process in it hangs FOREVER (reproduced at 8 concurrent boots
+  on a fresh database: 40 minutes, no progress). Both lock paths now POLL
+  `pg_try_advisory_lock` with a bounded doubling backoff (25 ms → 1 s cap), each
+  probe its own short statement that returns immediately, so a waiter pins no
+  snapshot and blocks nothing. The wait is BOUNDED (30 min = one
+  `INDEX_BUILD_TIMEOUT_MS` per v88 index built back-to-back under the lock) and
+  FAIL-CLOSED: exceeding it is a clear, retryable `BackendUnavailable` naming
+  the lock key and the elapsed wait, never a silent hang, and a refusing peer
+  has applied NOTHING (the ladder is idempotent and still runs exactly once
+  under the lock). Progress is logged at WARN every 30 s so a long legitimate
+  wait is distinguishable from a stall. The existing timeout clearing,
+  `pg_advisory_unlock_all()` release, the #3074 close-instead-of-return of the
+  timeout-relaxed connection, and the #2614 contention retry are unchanged, and
+  the single-connector case is byte-for-byte identical (the first probe
+  succeeds without ever sleeping).
+
 ### Fixed (#3329 — autonomous-tier MCP boot no longer blocks the `initialize` handshake; macOS config-path resolution)
 
 - **#3329 — the boot embedding backfill no longer blocks the MCP `initialize`
