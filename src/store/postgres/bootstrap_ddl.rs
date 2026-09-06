@@ -428,3 +428,198 @@ pub(crate) fn wanted(statements: &[Statement]) -> (Vec<String>, Vec<String>) {
     extensions.dedup();
     (relations, extensions)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled script this module has to parse correctly. Parsing the
+    /// REAL artefact (not a fixture) is the point: a future edit that adds a
+    /// statement shape the splitter mishandles fails here.
+    const SCHEMA: &str = include_str!("../postgres_schema.sql");
+
+    fn inv(relations: &[&str], extensions: &[&str]) -> CatalogInventory {
+        CatalogInventory {
+            relations: relations.iter().map(|s| (*s).to_string()).collect(),
+            extensions: extensions.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn dollar_quoted_bodies_are_not_cut_at_their_inner_semicolons_3520() {
+        // The `DO $$ ... $$` block and the `CREATE OR REPLACE FUNCTION`
+        // bodies both contain `;`. A naive split would shatter them into
+        // fragments and the bootstrap would fail on a syntax error — the
+        // loudest possible way to get this wrong, but a way that only shows
+        // up against a live server, so it is pinned here.
+        let sql = "CREATE TABLE IF NOT EXISTS a (x int);\n\
+                   DO $$ BEGIN IF true THEN RAISE NOTICE 'hi; there'; END IF; END $$;\n\
+                   CREATE INDEX IF NOT EXISTS i_a ON a(x);";
+        let out = split_statements(sql);
+        assert_eq!(out.len(), 3, "got {out:#?}");
+        assert!(out[1].starts_with("DO $$"));
+        assert!(out[1].ends_with("$$;"));
+    }
+
+    #[test]
+    fn comments_and_string_literals_never_terminate_a_statement_3520() {
+        let sql = "-- a; comment\n\
+                   CREATE TABLE IF NOT EXISTS t (c text DEFAULT 'a;b''c');\n\
+                   /* block ; comment */ CREATE INDEX IF NOT EXISTS i ON t(c);";
+        let out = split_statements(sql);
+        assert_eq!(out.len(), 2, "got {out:#?}");
+        assert!(out[0].contains("'a;b''c'"));
+    }
+
+    #[test]
+    fn only_if_not_exists_creates_are_classified_as_skippable_3520() {
+        assert_eq!(
+            classify("CREATE INDEX IF NOT EXISTS idx_foo ON foo(bar);"),
+            StatementKind::Relation("idx_foo".to_string())
+        );
+        assert_eq!(
+            classify("CREATE UNIQUE INDEX IF NOT EXISTS uq_foo\n    ON foo(bar);"),
+            StatementKind::Relation("uq_foo".to_string())
+        );
+        assert_eq!(
+            classify("CREATE TABLE IF NOT EXISTS memories (\n id TEXT\n);"),
+            StatementKind::Relation("memories".to_string())
+        );
+        assert_eq!(
+            classify("CREATE EXTENSION IF NOT EXISTS vector;"),
+            StatementKind::Extension("vector".to_string())
+        );
+        // A leading comment must not hide the keyword.
+        assert_eq!(
+            classify("-- note\n-- more\nCREATE TABLE IF NOT EXISTS t (x int);"),
+            StatementKind::Relation("t".to_string())
+        );
+    }
+
+    #[test]
+    fn every_unrecognised_shape_fails_safe_to_always_run_3520() {
+        for stmt in [
+            // No IF NOT EXISTS: not idempotent, so never skipped.
+            "CREATE INDEX idx_foo ON foo(bar);",
+            "CREATE TABLE t (x int);",
+            // Definition-carrying: existence does not imply currency.
+            "CREATE OR REPLACE VIEW kg_query_view AS SELECT 1;",
+            "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;",
+            "DO $$ BEGIN END $$;",
+            // Shapes the probe could not answer faithfully.
+            "CREATE TABLE IF NOT EXISTS public.t (x int);",
+            "CREATE TABLE IF NOT EXISTS \"T\" (x int);",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS x int;",
+            "DROP INDEX IF EXISTS memories_content_fts;",
+        ] {
+            assert_eq!(
+                classify(stmt),
+                StatementKind::AlwaysRun,
+                "must fail safe: {stmt}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bundled_schema_parses_into_whole_statements_3520() {
+        let statements = parse(SCHEMA);
+        assert!(
+            statements.len() > 100,
+            "expected the full bundled script, got {}",
+            statements.len()
+        );
+        // Every statement must be terminated: a truncated tail would mean the
+        // splitter dropped bytes the server needs to see.
+        for st in &statements {
+            assert!(
+                st.text.ends_with(';'),
+                "unterminated statement: {}",
+                &st.text[..st.text.len().min(80)]
+            );
+        }
+        let (relations, extensions) = wanted(&statements);
+        assert!(
+            relations.contains(&"memories".to_string()),
+            "the memories table must be recognised as existence-gated"
+        );
+        assert_eq!(extensions, vec!["vector".to_string()]);
+    }
+
+    #[test]
+    fn a_fully_migrated_database_emits_no_relation_ddl_3520() {
+        let statements = parse(SCHEMA);
+        let (relations, extensions) = wanted(&statements);
+        let present = inv(
+            &relations.iter().map(String::as_str).collect::<Vec<_>>(),
+            &extensions.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let filtered = filter(&statements, &present);
+        assert!(filtered.skipped > 0, "nothing was skippable");
+        assert_eq!(filtered.skipped, relations.len() + extensions.len());
+        // The whole point: no CREATE TABLE / CREATE INDEX survives, so the
+        // boot takes no ShareLock on any application table.
+        for line in filtered.sql.lines() {
+            let upper = line.trim_start().to_ascii_uppercase();
+            assert!(
+                !upper.starts_with("CREATE TABLE")
+                    && !upper.starts_with("CREATE INDEX")
+                    && !upper.starts_with("CREATE UNIQUE INDEX")
+                    && !upper.starts_with("CREATE EXTENSION"),
+                "existence-gated DDL survived the filter: {line}"
+            );
+        }
+        // …but the definition-carrying statements DO survive, so a view whose
+        // body changed is still replaced.
+        assert!(
+            filtered
+                .sql
+                .contains("CREATE OR REPLACE VIEW kg_query_view"),
+            "a view replacement must never be skipped"
+        );
+        assert!(
+            filtered.sql.contains("DO $$"),
+            "the corruption-refusal DO block must never be skipped"
+        );
+    }
+
+    #[test]
+    fn an_empty_catalog_keeps_the_script_whole_3520() {
+        let statements = parse(SCHEMA);
+        let filtered = filter(&statements, &CatalogInventory::default());
+        assert!(filtered.is_unfiltered());
+        assert_eq!(filtered.total, statements.len());
+        // A fresh database must still receive every statement — this is the
+        // "no change to what a fresh database ends up with" invariant.
+        for st in &statements {
+            assert!(
+                filtered.sql.contains(st.text.as_str()),
+                "a fresh install lost a statement: {}",
+                &st.text[..st.text.len().min(80)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_partially_present_schema_still_heals_the_missing_objects_3520() {
+        let statements = parse(SCHEMA);
+        let (relations, _) = wanted(&statements);
+        // Everything present EXCEPT one index: the self-heal must still emit
+        // exactly that statement.
+        let missing = relations
+            .iter()
+            .find(|r| r.starts_with("idx_"))
+            .expect("the bundled script defines idx_* indexes")
+            .clone();
+        let present: Vec<&str> = relations
+            .iter()
+            .filter(|r| **r != missing)
+            .map(String::as_str)
+            .collect();
+        let filtered = filter(&statements, &inv(&present, &["vector"]));
+        assert!(
+            filtered.sql.contains(&missing),
+            "the missing index {missing} was not re-emitted"
+        );
+        assert_eq!(filtered.skipped, relations.len(), "one relation + vector");
+    }
+}
