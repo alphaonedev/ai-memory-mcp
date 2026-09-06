@@ -1,6 +1,22 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// `src/lib.rs` carries a crate-wide `#![allow(clippy::pedantic, clippy::all)]`;
+// an integration-test binary is a SEPARATE crate and inherits nothing, so code
+// moved out of the lib meets `-D clippy::pedantic` for the first time here.
+// These two are allowed rather than edited around, because the load-bearing
+// property of the #3523 move is that the five cases came across BYTE-FOR-BYTE
+// (only `crate::` -> `ai_memory::`, the de-indent, and the wrapper call
+// changed) — rewriting assertions or renaming bindings to satisfy a lint would
+// forfeit exactly the fidelity the move exists to preserve.
+//   * `doc_markdown` — the moved doc comments name `id_a` / `id_b`, the tool's
+//     own wire parameters, unbackticked.
+//   * `similar_names` — `id_a` / `id_b` ARE the two ids under test; the whole
+//     point of every case is that they are treated differently.
+// Both are house-standard here (117 and 30-odd `tests/*.rs` files respectively),
+// and `tests/auto_atomise/core.rs` allows the same pair.
+#![allow(clippy::doc_markdown, clippy::similar_names)]
+
 //! v1.0.0 (issue #3523) — the five `*_3387` cross-tenant read-oracle cases,
 //! moved OUT of the `cargo test --lib` binary and into their own process.
 //!
