@@ -297,7 +297,10 @@ fn exactly_one_owner_in_the_process_env_lock_family_3523() {
         .map(|(f, n)| format!("{f}::{n}"))
         .collect();
 
-    let new_owners: Vec<&String> = observed.difference(&sanctioned).collect();
+    let new_owners: Vec<&str> = observed
+        .difference(&sanctioned)
+        .map(String::as_str)
+        .collect();
     assert!(
         new_owners.is_empty(),
         "NEW process-env mutex owner(s) in the lib test binary (#3523):\n  {}\n\n\
@@ -310,11 +313,7 @@ fn exactly_one_owner_in_the_process_env_lock_family_3523() {
          let _guard = crate::config::test_env_lock();      // the `config` spelling\n  \
          let _guard = crate::test_support::env_lock();     // the delegate spelling\n\n\
          A file-local wrapper that DELEGATES to either is fine.",
-        new_owners
-            .iter()
-            .map(std::string::String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n  ")
+        new_owners.join("\n  ")
     );
 
     // A sanctioned owner that has VANISHED is a sibling lane converting its
