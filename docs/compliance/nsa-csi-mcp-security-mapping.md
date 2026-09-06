@@ -112,8 +112,19 @@ materially for this section, **REVOCATION** — takes effect within that window
 with no restart. That window is therefore the upper bound on how long a leaked
 per-agent key stays live, and `ai-memory doctor` reports it. Enrolling against
 a postgres data tier uses
-`ai-memory agents bind-api-key --store-url <url> …`. Single-operator
-deployments that enrol no per-agent keys are unaffected either way.
+`ai-memory agents bind-api-key --store-url <url> …`. As of v1.0.0 #3474 the
+same enrolment is reachable over the network without shell access to the data
+tier — `POST /api/v1/agents/{id}/api-key` mints or binds and
+`POST /api/v1/agents/{id}/api-key/revoke` revokes, both admin-gated by the
+canonical `require_admin` gate, rate-limited, audited by key fingerprint (never
+by token), refused unless the listener is loopback or in-process TLS, refusing
+an operator-supplied token weaker than the one the mint form would have
+generated, and, for revoking another principal's key or the last enrolled key,
+gated behind the same two-person pending-approval flow the other approval
+funnels use. Without that surface a fleet that mints agents dynamically could
+not reach `enforce` at all, which is the posture this section describes.
+Single-operator deployments that enrol no per-agent keys are unaffected either
+way.
 
 ### 3.2 Insecure context or data serialization (NSA concern b)
 
@@ -157,7 +168,7 @@ The NSA document warns that MCP servers exposed to high-volume or adversarial qu
 
 ### 3.9 Tool parameter injection (NSA concern i, real-world issue)
 
-The NSA document cites tool-parameter injection as a recurring real-world failure class — an attacker embeds adversarial parameters in a tool-invocation payload that the MCP server does not adequately validate. ai-memory's defense is the `RequestValidator` DTO-bundled validation surface introduced under #966 (`pub struct RequestValidator` in `src/validate.rs`). Every wire-entry layer — **98 production HTTP route registrations over 84 unique paths, 104 advertised MCP entries at `--profile full`, 95 CLI subcommands in the default build / 97 under `sal`** (the mechanically-pinned SSOT counts at v1.0.0; this section previously published the stale v0.7.0 figures 89 / 74 / 82 / 80) — routes DTO-bundling validation through `RequestValidator::validate_create`, `validate_update`, `validate_memory`, `validate_link_triple`, `validate_consolidate`, `validate_id_and_namespace`, `validate_owner_write`, `validate_confidence_and_priority`. The typed `ValidationError { field, reason }` carries explicit field attribution while preserving byte-equal wire-side error messages via a `Display` impl that mirrors the legacy `bail!` shape. Single-field free functions (`validate_id`, `validate_namespace`, `validate_agent_id`, `validate_source_uri`, `validate_citation`, `validate_source_span`) remain the lowest-level primitive. Adding a new cross-field invariant is one struct method addition rather than three audited per-surface edits.
+The NSA document cites tool-parameter injection as a recurring real-world failure class — an attacker embeds adversarial parameters in a tool-invocation payload that the MCP server does not adequately validate. ai-memory's defense is the `RequestValidator` DTO-bundled validation surface introduced under #966 (`pub struct RequestValidator` in `src/validate.rs`). Every wire-entry layer — **100 production HTTP route registrations over 86 unique paths, 104 advertised MCP entries at `--profile full`, 95 CLI subcommands in the default build / 97 under `sal`** (the mechanically-pinned SSOT counts at v1.0.0; this section previously published the stale v0.7.0 figures 89 / 74 / 82 / 80) — routes DTO-bundling validation through `RequestValidator::validate_create`, `validate_update`, `validate_memory`, `validate_link_triple`, `validate_consolidate`, `validate_id_and_namespace`, `validate_owner_write`, `validate_confidence_and_priority`. The typed `ValidationError { field, reason }` carries explicit field attribution while preserving byte-equal wire-side error messages via a `Display` impl that mirrors the legacy `bail!` shape. Single-field free functions (`validate_id`, `validate_namespace`, `validate_agent_id`, `validate_source_uri`, `validate_citation`, `validate_source_span`) remain the lowest-level primitive. Adding a new cross-field invariant is one struct method addition rather than three audited per-surface edits.
 
 ### 3.10 Tool invocation path confusion (NSA concern j, real-world issue)
 

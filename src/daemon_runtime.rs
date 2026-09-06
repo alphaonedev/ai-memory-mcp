@@ -6164,6 +6164,20 @@ pub async fn bootstrap_serve(
         Err(reason) => anyhow::bail!("{reason}"),
     }
 
+    // v1.0.0 #3474 — record whether THIS listener may carry a freshly minted
+    // bearer credential. The #2032 M2 guard above only WARNs on a plaintext
+    // non-loopback bind (and `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK=1`
+    // silences even that), which is a survivable posture for content and an
+    // unsurvivable one for handing out a per-agent api-key in the clear. The
+    // mint route consults this marker and refuses; the REVOKE route does not,
+    // because refusing a revocation is strictly worse than performing one over
+    // a channel the operator already accepted. Default is `false` (refuse), so
+    // a router built outside this bootstrap never mints.
+    crate::handlers::agent_api_key::mark_credential_transport_confidential(
+        (args.tls_cert.is_some() && args.tls_key.is_some())
+            || crate::tls::host_is_loopback(args.host.as_str()),
+    );
+
     // #2032 LM3 (v1.0.0) — WARN-carrier for the `[verify] require_nonce`
     // secure-default flip. Fires only when the knob is still at the
     // permissive default; announces the v1.1.0 flip to fail-closed.

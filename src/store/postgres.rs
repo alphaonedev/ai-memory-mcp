@@ -25854,6 +25854,40 @@ impl MemoryStore for PostgresStore {
         pg_row_to_pending_action(&r).map(Some)
     }
 
+    /// v1.0.0 #3474 — postgres twin of `db::queue_pending_action`. Same
+    /// columns + same `'pending'` status as the `enforce_governance_action`
+    /// Pending arm writes, so a row queued here is indistinguishable to every
+    /// existing reader (`list_pending_actions`, `get_pending`, the approve
+    /// funnels).
+    async fn queue_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        action: super::GovernedAction,
+        namespace: &str,
+        memory_id: Option<&str>,
+        requested_by: &str,
+        payload: &serde_json::Value,
+    ) -> StoreResult<String> {
+        self.gate_record_stop().await?;
+        let pending_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO pending_actions \
+             (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')",
+        )
+        .bind(&pending_id)
+        .bind(action.as_str())
+        .bind(memory_id)
+        .bind(namespace)
+        .bind(payload)
+        .bind(requested_by)
+        .bind(chrono::Utc::now())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("queue_pending_action", e))?;
+        Ok(pending_id)
+    }
+
     async fn set_namespace_standard(
         &self,
         _ctx: &CallerContext,
