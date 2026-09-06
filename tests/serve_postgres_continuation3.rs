@@ -385,7 +385,14 @@ async fn notify_lands_in_target_inbox_via_sal() {
         .expect("notify");
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let v: Value = resp.json().await.expect("body");
-    assert_eq!(v["target_agent_id"], target);
+    // #3401 unified the notify receipt across backends to the canonical
+    // `{id, from, to, namespace, tier, delivered_at}` envelope
+    // (`mcp::notify_receipt`); the pre-#3401 postgres-only `target_agent_id`
+    // key is gone on purpose (the SDK fixtures and
+    // `federation_postgres_fanout` assert `to`). This suite is
+    // sal-postgres-gated, so it never ran in the #3401 lane gate; fixed on
+    // the final-tip live gate (2026-09-06).
+    assert_eq!(v["to"], target);
     assert_eq!(v["namespace"], format!("_inbox/{target}"));
     shutdown.notify_one();
     let _ = handle.await;
