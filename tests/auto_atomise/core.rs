@@ -107,6 +107,68 @@ fn test_serial() -> &'static Mutex<()> {
     M.get_or_init(|| Mutex::new(()))
 }
 
+/// v1.0.0 #3523 — INSTALL-FIRST fixture for the store-side governance hook.
+///
+/// # The defect this closes
+///
+/// `db::GOVERNANCE_PRE_WRITE` is a process-wide `OnceLock`: the FIRST `set`
+/// in the binary wins and every later one is a silent no-op. Before #3523
+/// the refusal case installed the hook inside its own body and then
+/// SOFT-SKIPPED its assertions when the insert succeeded, on the theory that
+/// "a prior test installed an Allow-all hook". That made the load-bearing
+/// half of the case — `a refused write must never reach the auto-atomise
+/// funnel` — conditional on TEST ORDERING, which libtest does not promise.
+/// Today no other case in this binary installs a hook, so the skip branch is
+/// dead; but nothing said so, and a case that can quietly stop asserting is
+/// the `#2444` shape (reports success while doing nothing).
+///
+/// # Why install-first rather than an own binary
+///
+/// Every case in this binary already funnels through [`test_serial`], so
+/// arming the hook HERE makes it a precondition of running at all: whichever
+/// case libtest schedules first installs it, and the refusal leg is then
+/// unconditional in every ordering. Moving the case to its own binary would
+/// buy the same determinism at the cost of duplicating the whole private
+/// worker + seeded-policy fixture.
+///
+/// The hook is DISCRIMINATING — it refuses only titles prefixed `refused-`
+/// and allows everything else — so installing it for the whole binary
+/// changes no other case's behaviour.
+fn install_refusal_governance_hook() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let installed = db::GOVERNANCE_PRE_WRITE
+            .set(Box::new(|mem: &Memory| {
+                if mem.title.starts_with("refused-") {
+                    Err("test-policy: refused".to_string())
+                } else {
+                    Ok(())
+                }
+            }))
+            .is_ok();
+        assert!(
+            installed,
+            "#3523: `GOVERNANCE_PRE_WRITE` was already set by something else in \
+             this binary, so the refusal case cannot make its write be refused. \
+             The hook is a process-wide one-shot: route every installer in this \
+             binary through `install_refusal_governance_hook` (or move the case \
+             to its own test binary) rather than restoring the soft-skip, which \
+             is how the assertion silently stopped running."
+        );
+    });
+}
+
+/// The one entry gate every case in this binary takes: install the
+/// governance hook (idempotent, first call wins) and THEN serialise.
+///
+/// Acquiring the lock second is deliberate — the install is idempotent and
+/// `OnceLock`-serialised in its own right, so holding the test mutex across
+/// it would buy nothing and only widen the critical section.
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    install_refusal_governance_hook();
+    test_serial().lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Push a canned curator response onto the queue.
 fn enqueue_atoms(texts: &[&str]) {
     let arc = shared_state();
@@ -373,7 +435,7 @@ fn drain_workers(stable_for: Duration, total_timeout: Duration) {
 
 #[test]
 fn test_auto_atomise_disabled_does_nothing() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -414,7 +476,7 @@ fn test_auto_atomise_disabled_does_nothing() {
 
 #[test]
 fn test_auto_atomise_below_threshold_does_nothing() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -456,7 +518,7 @@ fn test_auto_atomise_below_threshold_does_nothing() {
 
 #[test]
 fn test_auto_atomise_above_threshold_triggers() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -513,7 +575,7 @@ fn test_auto_atomise_above_threshold_triggers() {
 
 #[test]
 fn test_auto_atomise_does_not_block_store_response() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -611,7 +673,7 @@ fn test_auto_atomise_does_not_block_store_response() {
 
 #[test]
 fn test_auto_atomise_inheritance() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -655,7 +717,7 @@ fn test_auto_atomise_inheritance() {
 
 #[test]
 fn test_auto_atomise_child_override() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
@@ -690,7 +752,7 @@ fn test_auto_atomise_child_override() {
 
 #[test]
 fn test_auto_atomise_refused_memory_not_atomised() {
-    let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = test_guard();
     let db_path = shared_db_path().clone();
     let _conn = shared_db_conn();
     let _ = &db_path;
@@ -706,23 +768,11 @@ fn test_auto_atomise_refused_memory_not_atomised() {
     // is not called because the upstream contract pins "post-commit
     // only". Verify the curator never fires.
     let ns = format!("wt1d-refused-{}", uuid::Uuid::new_v4().simple());
-    // Even with an opt-in policy, the hook only runs after a
-    // successful insert. We open a separate connection, install a
-    // refusing GOVERNANCE_PRE_WRITE hook, attempt the insert, and
-    // verify that no atomisation work fires.
-    //
-    // The store-side governance hook is one-shot (`OnceLock::set`).
-    // If a prior test already installed it, this set will be a
-    // no-op — that's fine; we still verify the no-insert ⇒
-    // no-enqueue contract directly.
-    let _ = db::GOVERNANCE_PRE_WRITE.set(Box::new(|mem: &Memory| {
-        if mem.title.starts_with("refused-") {
-            Err("test-policy: refused".to_string())
-        } else {
-            Ok(())
-        }
-    }));
-
+    // #3523: the discriminating `GOVERNANCE_PRE_WRITE` hook is installed by
+    // `test_guard()` — the entry gate EVERY case in this binary takes — so it
+    // is in force whichever case libtest schedules first. The refusal leg
+    // below is therefore unconditional; there is no ordering under which it
+    // silently stops asserting.
     let conn = shared_db_conn();
     seed_policy(&conn, &ns, opt_in_policy(500, 200));
 
@@ -759,43 +809,48 @@ fn test_auto_atomise_refused_memory_not_atomised() {
     };
 
     let insert_result = db::insert(&conn, &mem);
-    // The governance hook is process-wide one-shot; another test
-    // may have installed an Allow-all hook earlier in this binary's
-    // lifetime. In that case the insert succeeds; we treat that as
-    // a soft-skip (the contract being tested is the
-    // refusal-no-enqueue invariant, not the install ordering).
-    let inserted = insert_result.is_ok();
+    // #3523: UNCONDITIONAL. The refusal is a precondition of the case, not a
+    // branch: `test_guard()` installed the discriminating hook before any
+    // case in this binary could write, and this memory's title carries the
+    // `refused-` prefix that hook refuses. A success here means the control
+    // is not in force, which is the defect — not a reason to skip.
+    let refusal = insert_result.expect_err(
+        "#3523: the governance hook installed by `test_guard()` must REFUSE a \
+         `refused-`-prefixed write. An Ok here means the process-wide \
+         `GOVERNANCE_PRE_WRITE` one-shot was claimed by a different hook, so \
+         the no-enqueue invariant below would be asserting nothing.",
+    );
+    assert!(
+        refusal.to_string().contains("test-policy: refused"),
+        "the refusal must come from THIS case's hook, got: {refusal}"
+    );
 
-    if !inserted {
-        // The substrate refused the write. The MCP store handler at
-        // `src/mcp/tools/store.rs` short-circuits in this case
-        // BEFORE reaching `maybe_enqueue_auto_atomise`, so the hook
-        // never runs. We assert that contract by NOT calling the
-        // hook and verifying no atom rows exist for this id.
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            mock_call_count(),
-            0,
-            "curator must not fire when the originating insert was refused"
-        );
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
-                rusqlite::params![mem.id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        assert_eq!(count, 0, "no atoms should exist for a refused memory");
-    } else {
-        // Allow-all hook was already installed: the insert
-        // succeeded. We still verify the negative contract by
-        // checking that calling `maybe_enqueue_auto_atomise` ONLY
-        // happens when the caller (MCP / HTTP / CLI handler)
-        // chooses to invoke it. The contract is one of caller
-        // discipline; this test documents and pins it.
-        eprintln!(
-            "test_auto_atomise_refused_memory_not_atomised: skipping refusal assertion — \
-             prior test installed Allow-all GOVERNANCE_PRE_WRITE hook"
-        );
-    }
+    // The substrate refused the write. The MCP store handler at
+    // `src/mcp/tools/store.rs` short-circuits in this case BEFORE reaching
+    // `maybe_enqueue_auto_atomise`, so the hook never runs. We assert that
+    // contract by NOT calling the hook and verifying no atom rows exist for
+    // this id.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        mock_call_count(),
+        0,
+        "curator must not fire when the originating insert was refused"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+            rusqlite::params![mem.id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(count, 0, "no atoms should exist for a refused memory");
+    // Refusal ledger: the durable row does not exist at all.
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = ?1",
+            rusqlite::params![mem.id],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    assert_eq!(rows, 0, "a refused write must leave no durable row");
 }
