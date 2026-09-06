@@ -243,7 +243,145 @@ this build — `ai-memory wake-hub` runs the hub as its own process. When a
 
 ## Operating the hub
 
-See `docs/CLI_REFERENCE.md` for `ai-memory wake-hub`, including `--posture`
-(resolve and print the socket, directory mode and fd budget without binding
-anything) and `--allowlist` (the derived public snapshot of enrolled agent keys
-that the delegation verifier reads; the hub itself never opens the store).
+> Issue [#3471](https://github.com/alphaonedev/ai-memory-mcp/issues/3471) — the
+> ops surface: metrics, the health probe, the SIGTERM drain, the supervisor
+> units, and the `doctor` posture check.
+
+`ai-memory wake-hub --posture` resolves and prints the socket, directory mode,
+fd budget, drain deadline and identity verifier **without binding anything**,
+so it is safe to run against a host already serving a hub. `--allowlist` names
+the derived public snapshot of enrolled agent keys the delegation verifier
+reads; the hub itself never opens the store. Full flag reference:
+`docs/CLI_REFERENCE.md`.
+
+### Is it up? — `wake-hub --health`
+
+```bash
+ai-memory wake-hub --health          # human report; exit 0 reachable, 2 not
+ai-memory wake-hub --health --json   # machine-readable, same exit codes
+```
+
+The probe is an **ordinary hub client**. It connects to the configured socket,
+waits for the hub's opening challenge frame, and closes. That is the whole
+probe, and the three things it deliberately is NOT are what make it safe:
+
+* **Not a privileged side channel.** There is no admin socket and no status
+  endpoint. A health surface that bypassed the hub's own admission path would
+  be an unauthenticated way to learn its state — and, worse, would stop
+  testing the path that actually matters.
+* **Not a bypass of the peer-credential gate.** The probe is subject to
+  `SO_PEERCRED` / `getpeereid` like any peer. Run as the wrong user it is
+  denied and reports `unreachable`, which is the correct answer: from that
+  user, the hub *is* unreachable.
+* **Not an authenticated session.** It presents no `hello`, holds no key
+  material, and is refused everything past the challenge — so it cannot
+  enumerate agents, join topics or inject a wake, and it needs no credential,
+  which is what makes it runnable from a supervisor where no agent identity
+  exists.
+
+Cost to the hub is one short-lived connection bounded by a 2 s budget, against
+a pre-auth budget of 4 frames/s that the probe never spends (it sends zero
+frames). Every outcome that is not "a well-formed challenge arrived" is
+`unreachable` with a named cause and remedy — `socket_missing`,
+`not_a_socket`, `connection_refused` (a stale socket with no listener),
+`permission_denied`, `timeout`, `unexpected_frame` — because a supervisor that
+reads "healthy" from an inconclusive probe is worse than no probe.
+
+### What it reports — the metrics
+
+The hub's counters, gauges and histograms are read through one stable JSON
+shape (`wake_hub::metrics::MetricsSnapshot::to_json`), published at rest by
+`wake-hub --posture --json` under `metrics_schema` so an exporter can be
+written against a documented contract:
+
+| Family | Answers |
+|---|---|
+| `connections_current`, `recipients_current` | how many agents are attached, and how many hold a route |
+| `queue.queued_bytes_current` / `queued_frames_current` | how much is waiting, under BOTH per-recipient bounds — bytes and frames are different faults with different remedies |
+| `queue.slow_consumers_current` / `slow_consumer_events_total` | who is falling behind, counted BEFORE anything is dropped |
+| `drops.*` | WHY a delivery was refused: `recipient_queue_full` (one slow reader), `global_egress_full` (the hub is saturated), `channel_full` (a burst deeper than the queue), `write_failed` (accepted then unwritable), `offline_unknown` |
+| `denied.*` | peer credential, connection ceiling, hello, malformed, forged `from`, rate limit |
+| `fanout_latency_us`, `wake_latency_us` | `count` / `mean` / `max` / `p50` / `p99` — fan-out is the hub-internal hand-off span, wake latency is mint-to-delivery |
+
+Two properties are load-bearing. The histograms are **fixed-bucket and
+allocation-free** — an observability surface the hub can be made to allocate
+would be a denial-of-service surface, not observability — so a bucketed
+quantile is reported as the containing bucket's UPPER bound, a conservative
+over-estimate that can make the hub look slower than it is and never faster.
+And a quantile with no observations behind it is `null`, never `0`: "no
+traffic yet" and "instantaneous" are different facts and an alert rule must be
+able to tell them apart. Mint-to-delivery crosses a wall-clock boundary, so it
+is advisory: a wake with no stamp records nothing, and a peer whose clock runs
+ahead records `0` rather than an underflowed enormous value.
+
+### Shutting it down — the bounded drain
+
+On `SIGTERM` or `SIGINT`, in this order and no other:
+
+1. **Stop accepting.** The listener closes first, so a peer arriving
+   mid-shutdown is refused by the kernel rather than accepted into a hub that
+   is about to stop reading it.
+2. **Ask every session to go.** Each reader is woken and each writer gets its
+   close sentinel. **Nothing content-bearing is emitted** — no goodbye frame,
+   no last wake. The hub holds no durable truth, so there is nothing it could
+   owe a peer at shutdown; the committed inbox row and the `<=60 s` backstop
+   poll are the guarantee, exactly as at every other moment.
+3. **Wait, bounded.** At most 5 s (`wake_hub::limits::DRAIN_DEADLINE_MS`) for
+   the connection gauge to reach zero, then exit anyway with a WARN naming the
+   residual. An unbounded drain is a hung `systemctl stop` that ends in
+   `SIGKILL` — strictly worse, because the socket then survives the process.
+4. **Unlink our own socket, and only ours.** The path must still be a socket
+   AND carry the `(device, inode)` this process created. Without the inode
+   check, a hub slow to drain while its replacement had already bound a fresh
+   socket at the same path would delete the REPLACEMENT's socket, and every
+   agent on the host would be talking to a live process through a path that no
+   longer exists. When ownership cannot be established the file is left for
+   the next start-up probe, which connects to it before unlinking anything.
+
+The process exits `0` after a completed drain, so `systemctl stop` and
+`launchctl bootout` do not record a failure for the thing they asked for.
+
+### Supervisor units
+
+| Platform | Template |
+|---|---|
+| systemd | `packaging/systemd/ai-memory-wake-hub.service` |
+| launchd | `scripts/templates/dev.alphaone.ai-memory.wake-hub.plist` |
+
+Both pin the file-descriptor budget to `wake_hub::limits::DESIRED_NOFILE`
+(4096) — `LimitNOFILE=` on systemd, `SoftResourceLimits`/`HardResourceLimits`
+`NumberOfFiles` on launchd. **This is the point of the templates:** macOS
+ships a default soft `RLIMIT_NOFILE` of 256, which lands `EMFILE` at exactly
+the 256-agent scale the hub is designed for. At start-up the hub raises its own
+soft limit toward that value where the hard limit allows, sizes its connection
+ceiling from what it actually got (WARNing when that is below the target), and
+REFUSES to bind at all when the budget cannot cover `MIN_CONNECTION_CEILING`
+connections plus `FD_HEADROOM` descriptors — a smaller hub is honest, a hub
+that lies about its capacity is not. The systemd unit additionally restricts
+the address family to `AF_UNIX`: the wake plane is same-host by construction,
+so the kernel enforces that as well as the code. Its `ExecStartPost` runs
+`--health`, so a unit that reports "started" has actually been reached — a
+claim that holds **only because that probe retries**. `Type=simple` lets
+systemd run `ExecStartPost` as soon as it has forked the main process, before
+the hub has bound, and the hub sends no `sd_notify`; the unit therefore retries
+the probe for about five seconds across the bind race and fails the unit only
+if the hub is still unreachable after that. A single-shot probe would fail
+every start and, with `Restart=on-failure`, convert a healthy host into a
+restart loop. The unit also sets `RuntimeDirectoryPreserve=yes`, so the
+allowlist snapshot it tells you to publish at `/run/ai-memory/hub-allow.json`
+survives a stop or restart instead of being deleted with the runtime directory
+— which would leave the restarted hub admitting nobody. `/run` is a tmpfs, so
+that path still does not survive a **reboot**; republish it after boot.
+
+### `ai-memory doctor`
+
+`doctor` carries a **Wake hub (#3471)** section — filesystem and `getrlimit`
+only, no bind, no connect, no database. A live socket whose mode or ownership
+is wrong is **Critical** (that is an exposure on this host right now); a
+file-descriptor budget below the desired value on a host that runs a hub is a
+**Warning**, escalating to Critical only below the floor at which the hub would
+refuse to start; an installed supervisor unit is **informational** and its
+absence is never a finding, because running the hub in the foreground or under
+another supervisor is a legitimate deployment. On a host with no `[wake_hub]`
+configuration and no socket on disk the section reports `configured = no` and
+nothing else.

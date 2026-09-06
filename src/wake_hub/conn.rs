@@ -445,14 +445,34 @@ impl Conn {
             .metrics
             .add_fanout(u64::try_from(recipients.len()).unwrap_or(u64::MAX));
 
+        // #3471 — fan-out latency is measured across the WHOLE hand-off span,
+        // from the first recipient to the last, because that is the quantity
+        // that grows with fan-out width and the one an operator needs a p99
+        // for. It is monotonic (`Instant`), so it is immune to the wall-clock
+        // skew that makes the mint-to-delivery figure below advisory.
+        let fanout_started = Instant::now();
         let mut overflowed = false;
         let mut unknown = false;
+        let mut delivered_any = false;
         for r in &recipients {
             match self.state.router.deliver(r, &encoded, &meta.inbox_row_id) {
-                Delivery::Delivered | Delivery::Coalesced => {}
+                Delivery::Delivered => delivered_any = true,
+                Delivery::Coalesced => {}
                 Delivery::Overflow => overflowed = true,
                 Delivery::DroppedUnknown => unknown = true,
             }
+        }
+        self.state
+            .metrics
+            .record_fanout_latency(fanout_started.elapsed());
+        // Mint-to-delivery is recorded ONCE per routed wake and only when at
+        // least one recipient actually took it: a wake that was coalesced or
+        // dropped was never delivered, and folding those into the latency
+        // series would make a hub that is dropping everything look fast.
+        if delivered_any {
+            self.state
+                .metrics
+                .record_wake_latency_from_mint(frame.ts_ms);
         }
         // Refuse LOUDLY to the sender. Overflow outranks unknown: a full queue
         // is a capacity fact the sender can back off on, an unknown destination
@@ -662,6 +682,11 @@ async fn writer_loop(
         // await point without stranding a reservation.
         queue.release(len);
         if !framed || write_half.write_all(&out).await.is_err() {
+            // #3471 — a frame the hub accepted and then could not put on the
+            // wire IS a drop, and it is the one an operator most needs named:
+            // every budget shows healthy afterwards because the reservation was
+            // already released. Count it before leaving.
+            state.metrics.drop_write_failed();
             break;
         }
         state.metrics.add_frames_out(1);

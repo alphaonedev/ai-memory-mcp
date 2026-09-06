@@ -1502,6 +1502,8 @@ ai-memory wake-hub --max-connections 128    # ceiling (clamped by RLIMIT_NOFILE)
 ai-memory wake-hub --allowlist /run/allow.json  # enrolled-key allowlist (#3468)
 ai-memory wake-hub --posture                # print the resolved posture, bind nothing
 ai-memory wake-hub --posture --json         # machine-readable posture
+ai-memory wake-hub --health                 # probe the socket; exit 0 / 2 (#3471)
+ai-memory wake-hub --health --json          # machine-readable reachability
 ```
 
 A Unix-domain-socket switch (mode **0600**, inside an owner-only **0700**
@@ -1529,6 +1531,35 @@ so a peer cannot distinguish "unknown agent" from "bad signature" from
 "unproven root" by probing; the specific reason goes to the log. `--posture`
 reports which verifier a configuration installs (`deny-all` or
 `delegation/v1`).
+
+**Operating it**
+([#3471](https://github.com/alphaonedev/ai-memory-mcp/issues/3471)).
+`--health` probes the configured socket **as an ordinary client**: it connects,
+waits for the hub's opening challenge, and closes. It presents no identity,
+sends no frame, and has no privileged side channel — run as the wrong user it
+is refused by the same peer-credential gate every agent crosses and correctly
+reports `unreachable`. It exits `0` when reachable and `2` otherwise, so it
+drops straight into a systemd `ExecStartPost` or a launchd health check; the
+whole probe is bounded by a 2 s budget so it can never hang the supervisor it
+reports to. `--posture --json` additionally publishes the file-descriptor
+budget actually in force, the drain deadline, the slow-consumer watermark, and
+`metrics_schema` — the stable JSON shape of the hub's counters, so an exporter
+can be written against a documented contract rather than against whatever a
+running hub happened to emit.
+
+On `SIGTERM` / `SIGINT` the hub stops accepting, asks every session to flush
+what it already holds, waits at most **5 s**
+(`wake_hub::limits::DRAIN_DEADLINE_MS`), unlinks the socket **only if it is
+still the one this process created**, and exits `0`. Nothing content-bearing
+is emitted during the drain — the hub holds no durable truth, so it owes a
+peer nothing at shutdown. Units are shipped for both supervisors:
+`packaging/systemd/ai-memory-wake-hub.service` and
+`scripts/templates/dev.alphaone.ai-memory.wake-hub.plist`; both pin the
+file-descriptor limit to `wake_hub::limits::DESIRED_NOFILE` (4096), which is
+what keeps macOS's default soft limit of 256 from landing `EMFILE` at exactly
+the 256-agent design target. `ai-memory doctor` carries a **Wake hub (#3471)**
+section that checks the socket and directory mode + ownership, the fd budget,
+and whether a supervisor unit is installed.
 
 ### `identity delegate` — mint a scoped hub delegation (v1.0.0, #3468)
 

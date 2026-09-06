@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc};
 
-use super::limits::{EgressBudget, MAX_TOPICS_PER_SESSION, ROUTING_SHARDS};
+use super::limits::{EgressBudget, MAX_TOPICS_PER_SESSION, ROUTING_SHARDS, SLOW_CONSUMER_PERCENT};
 use super::metrics::HubMetrics;
 use super::pending::{PendingSet, PendingStore};
 
@@ -63,9 +63,16 @@ pub enum Delivery {
 }
 
 /// Per-recipient egress accounting handed to that recipient's writer task.
+///
+/// Tracks BOTH bounds the hub enforces per recipient: the byte reservation
+/// (the one that actually caps memory) and the frame count (belt to its
+/// braces). #3471 surfaces the frame count too, because "64 KiB queued" and
+/// "256 frames queued" are different faults with different remedies and an
+/// operator reading one number cannot tell which bound is about to refuse.
 #[derive(Debug)]
 pub struct EgressAccount {
     queued_bytes: AtomicUsize,
+    queued_frames: AtomicUsize,
 }
 
 impl EgressAccount {
@@ -74,6 +81,7 @@ impl EgressAccount {
     pub const fn new() -> Self {
         Self {
             queued_bytes: AtomicUsize::new(0),
+            queued_frames: AtomicUsize::new(0),
         }
     }
 
@@ -83,25 +91,45 @@ impl EgressAccount {
         self.queued_bytes.load(Ordering::Acquire)
     }
 
-    /// Release `n` bytes once written to the peer. Saturating, so an accounting
-    /// slip degrades the cap rather than disabling it.
+    /// Frames currently queued for this recipient (#3471).
+    #[must_use]
+    pub fn queued_frames(&self) -> usize {
+        self.queued_frames.load(Ordering::Acquire)
+    }
+
+    /// Release `n` bytes — and the ONE frame they belonged to — once written to
+    /// the peer. Saturating, so an accounting slip degrades the cap rather than
+    /// disabling it.
+    ///
+    /// Reserve and release are strictly one-frame operations on both sides, so
+    /// the frame gauge cannot drift apart from the byte gauge.
     pub fn release(&self, n: usize) {
         let _ = self
             .queued_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some(cur.saturating_sub(n))
             });
+        let _ = self
+            .queued_frames
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(1))
+            });
     }
 
-    /// Reserve `n` bytes against `cap`. Returns `false` (charging nothing) when
-    /// the reservation would cross the cap.
+    /// Reserve `n` bytes (one frame) against `cap`. Returns `false` (charging
+    /// nothing, on either gauge) when the reservation would cross the cap.
     fn try_reserve(&self, n: usize, cap: usize) -> bool {
-        self.queued_bytes
+        let admitted = self
+            .queued_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 let next = cur.checked_add(n)?;
                 if next > cap { None } else { Some(next) }
             })
-            .is_ok()
+            .is_ok();
+        if admitted {
+            self.queued_frames.fetch_add(1, Ordering::AcqRel);
+        }
+        admitted
     }
 }
 
@@ -161,20 +189,36 @@ impl EgressHandle {
     /// Synchronous by construction: `try_send` never suspends, so this is
     /// callable from inside a lock (`CONCURRENCY-20`).
     pub fn try_enqueue(&self, frame: Bytes) -> bool {
+        self.try_enqueue_classified(frame).is_ok()
+    }
+
+    /// [`Self::try_enqueue`], but naming WHICH bound refused (#3471).
+    ///
+    /// The three bounds fail for different reasons and are fixed differently —
+    /// one slow reader, a hub-wide saturation, or a burst deeper than the
+    /// channel — so collapsing them into one `overflow` counter, as the #3467
+    /// substrate did, told an operator that something was full and nothing
+    /// about what to do. The refusal semantics are unchanged: nothing is
+    /// charged on any gauge when the answer is `Err`.
+    ///
+    /// # Errors
+    ///
+    /// The specific bound that refused the frame.
+    pub fn try_enqueue_classified(&self, frame: Bytes) -> Result<(), EnqueueRefusal> {
         let len = frame.len();
         if !self.account.try_reserve(len, self.cap_bytes) {
-            return false;
+            return Err(EnqueueRefusal::RecipientQueueFull);
         }
         if !self.egress.try_reserve(len) {
             self.account.release(len);
-            return false;
+            return Err(EnqueueRefusal::GlobalEgressFull);
         }
         if self.tx.try_send(Egress::Frame(frame)).is_err() {
             self.account.release(len);
             self.egress.release(len);
-            return false;
+            return Err(EnqueueRefusal::ChannelFull);
         }
-        true
+        Ok(())
     }
 
     /// Ask this connection to flush and close. Best-effort and idempotent.
@@ -194,6 +238,69 @@ impl EgressHandle {
     pub fn queued(&self) -> usize {
         self.account.queued()
     }
+
+    /// Frames currently queued for this connection (#3471).
+    #[must_use]
+    pub fn queued_frames(&self) -> usize {
+        self.account.queued_frames()
+    }
+
+    /// Per-recipient byte ceiling in force for this connection (#3471).
+    #[must_use]
+    pub const fn cap_bytes(&self) -> usize {
+        self.cap_bytes
+    }
+
+    /// Is this recipient at or above the slow-consumer watermark (#3471)?
+    ///
+    /// Integer arithmetic against [`SLOW_CONSUMER_PERCENT`], never a float
+    /// ratio: `PERF-25` bars float comparison from decision logic, and this
+    /// verdict feeds an operator alert.
+    #[must_use]
+    pub fn is_slow_consumer(&self) -> bool {
+        let queued = self.account.queued();
+        queued.saturating_mul(PERCENT_WHOLE) >= self.cap_bytes.saturating_mul(SLOW_CONSUMER_PERCENT)
+    }
+}
+
+/// Which bound refused an enqueue (#3471).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueRefusal {
+    /// The recipient's own byte cap is full: ONE slow reader.
+    RecipientQueueFull,
+    /// The hub-wide egress budget is full: the whole hub is saturated.
+    GlobalEgressFull,
+    /// The recipient's frame-count channel is full: a burst deeper than the
+    /// configured queue depth, even though the byte cap still had room.
+    ChannelFull,
+}
+
+impl EnqueueRefusal {
+    /// Stable label for logs and metrics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RecipientQueueFull => "recipient_queue_full",
+            Self::GlobalEgressFull => "global_egress_full",
+            Self::ChannelFull => "channel_full",
+        }
+    }
+}
+
+/// Whole-percent denominator for the integer slow-consumer comparison.
+const PERCENT_WHOLE: usize = 100;
+
+/// A point-in-time read of every recipient's queue (#3471).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueCensus {
+    /// Recipients holding a live route.
+    pub recipients: usize,
+    /// Bytes queued across all of them.
+    pub queued_bytes: usize,
+    /// Frames queued across all of them.
+    pub queued_frames: usize,
+    /// Recipients at or above the slow-consumer watermark.
+    pub slow_consumers: usize,
 }
 
 /// A live recipient.
@@ -435,19 +542,30 @@ impl Router {
     /// parses a payload.
     pub fn deliver(&self, agent_id: &str, frame: &Bytes, inbox_row_id: &str) -> Delivery {
         // --- route shard: synchronous, no await, released before anything else
+        //
+        // The verdict AND the slow-consumer reading are both taken under the
+        // shard lock and returned by value, so nothing here calls back into the
+        // metrics module while holding a routing lock.
         let online = {
             let shard = lock(&self.routes[shard_of(agent_id)]);
             shard.get(agent_id).map(|route| {
-                if route.handle.try_enqueue(frame.clone()) {
-                    Delivery::Delivered
-                } else {
-                    Delivery::Overflow
+                match route.handle.try_enqueue_classified(frame.clone()) {
+                    Ok(()) => (Delivery::Delivered, None, route.handle.is_slow_consumer()),
+                    Err(refusal) => (Delivery::Overflow, Some(refusal), true),
                 }
             })
         };
-        if let Some(outcome) = online {
-            if outcome == Delivery::Overflow {
+        if let Some((outcome, refusal, slow)) = online {
+            if slow {
+                self.metrics.slow_consumer_events();
+            }
+            if let Some(refusal) = refusal {
                 self.metrics.overflow();
+                match refusal {
+                    EnqueueRefusal::RecipientQueueFull => self.metrics.drop_recipient_queue_full(),
+                    EnqueueRefusal::GlobalEgressFull => self.metrics.drop_global_egress_full(),
+                    EnqueueRefusal::ChannelFull => self.metrics.drop_channel_full(),
+                }
             }
             return outcome;
         }
@@ -483,6 +601,57 @@ impl Router {
     #[must_use]
     pub fn tracked_offline_agents(&self) -> usize {
         lock(&self.pending).tracked_agents()
+    }
+
+    /// Read every live recipient's queue depth in one pass (#3471).
+    ///
+    /// COMPUTED, never retained: the hub keeps no per-agent metrics map, so a
+    /// churn of agent ids cannot grow an observability structure without
+    /// bound. Cost is O(live routes) — bounded by the connection ceiling, so at
+    /// most a few hundred map entries — and each shard is taken and released in
+    /// turn, never two at once, so this cannot introduce a lock order
+    /// (`CONCURRENCY-04`).
+    ///
+    /// Not a consistent cut across shards: traffic continues while the census
+    /// walks. That is the right trade for an ops gauge — the alternative is
+    /// freezing every routing shard at once on the delivery path.
+    #[must_use]
+    pub fn queue_census(&self) -> QueueCensus {
+        let mut census = QueueCensus::default();
+        for shard in &self.routes {
+            let guard = lock(shard);
+            for route in guard.values() {
+                census.recipients = census.recipients.saturating_add(1);
+                census.queued_bytes = census.queued_bytes.saturating_add(route.handle.queued());
+                census.queued_frames = census
+                    .queued_frames
+                    .saturating_add(route.handle.queued_frames());
+                if route.handle.is_slow_consumer() {
+                    census.slow_consumers = census.slow_consumers.saturating_add(1);
+                }
+            }
+        }
+        census
+    }
+
+    /// Ask every live recipient to flush what it already holds and close
+    /// (#3471 SIGTERM drain).
+    ///
+    /// Emits NOTHING content-bearing — it enqueues no frame at all, only the
+    /// [`Egress::Close`] sentinel each writer already understands — and it does
+    /// not remove routes: teardown of each connection does that under the same
+    /// compare-and-remove that protects a replaced session. Returns how many
+    /// sessions were asked, for the drain log.
+    pub fn request_close_all(&self) -> usize {
+        let mut asked = 0usize;
+        for shard in &self.routes {
+            let guard = lock(shard);
+            for route in guard.values() {
+                route.handle.request_close();
+                asked = asked.saturating_add(1);
+            }
+        }
+        asked
     }
 }
 

@@ -161,6 +161,57 @@ pub const DESIRED_NOFILE: u64 = 4_096;
 pub const ROUTING_SHARDS: usize = 16;
 
 // ---------------------------------------------------------------------------
+// Shutdown drain (#3471)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock deadline, in milliseconds, for the SIGTERM/SIGINT drain.
+///
+/// On a shutdown signal the hub stops accepting, asks every session to flush
+/// what it has already queued, and waits AT MOST this long for the connection
+/// gauge to reach zero before exiting 0 regardless. The bound is the point:
+/// an unbounded drain is a hung `systemctl stop` that ends in `SIGKILL`, which
+/// is strictly worse than a bounded one because the operator loses the clean
+/// socket unlink too.
+///
+/// Nothing content-bearing is emitted during the drain — the hub carries no
+/// durable truth, so there is nothing to flush TO. What the deadline buys is
+/// the chance for already-queued hints to land and for peers to observe a
+/// clean close instead of a reset, after which the `<=60 s` backstop poll is
+/// the guarantee exactly as it is at every other moment.
+///
+/// 5 s sits under systemd's default 90 s `TimeoutStopSec` and under launchd's
+/// 20 s `SIGTERM` grace with room to spare, so neither supervisor ever has to
+/// escalate to `SIGKILL`.
+pub const DRAIN_DEADLINE_MS: u64 = 5_000;
+
+/// Poll interval, in milliseconds, while waiting for the drain to complete.
+/// Short enough that a fast drain is not padded to the deadline, long enough
+/// that the wait is not a spin.
+pub const DRAIN_POLL_MS: u64 = 10;
+
+// ---------------------------------------------------------------------------
+// Ops / observability (#3471)
+// ---------------------------------------------------------------------------
+
+/// Percentage of its per-recipient byte cap at or above which a recipient is
+/// counted as a SLOW CONSUMER.
+///
+/// A slow consumer is not yet an error — nothing has been dropped — but it is
+/// the leading indicator of the drop that follows, which is precisely the
+/// signal an operator needs BEFORE the queue overflows. Half the cap is the
+/// point at which one more burst of the same size would refuse.
+pub const SLOW_CONSUMER_PERCENT: usize = 50;
+
+/// Wall-clock budget, in milliseconds, for the whole `wake-hub --health`
+/// probe: connect, read the hub's challenge, close.
+///
+/// Bounded because the probe is what a supervisor runs (`ExecStartPost`, a
+/// launchd watchdog, a monitoring cron); a probe that can hang forever against
+/// a wedged hub would pin the supervisor instead of reporting the fault it
+/// exists to report.
+pub const HEALTH_PROBE_TIMEOUT_MS: u64 = 2_000;
+
+// ---------------------------------------------------------------------------
 // Offline (pending) state
 // ---------------------------------------------------------------------------
 
