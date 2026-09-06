@@ -252,6 +252,24 @@ const SQL_CLEAR_LOCK_TIMEOUT: &str = "SET lock_timeout = 0";
 /// turning a clean wait into a crash-loop across the fleet. A trip is a WARN +
 /// fail-open, retried on the next connect. Calibration on the certified tier:
 /// 3,000,000 rows / 1,520 MB built in 5.24 s plain, 5.57 s CONCURRENTLY.
+///
+/// v1.0.0 #3519 — this budget is also what sizes a PEER's wait for
+/// `MIGRATION_ADVISORY_LOCK_KEY` (see [`MIGRATION_LOCK_WAIT_TIMEOUT_MS`]).
+/// Two assumptions this note used to make silently are now explicit, and both
+/// hold only because of #3519:
+///
+/// 1. `CREATE INDEX CONCURRENTLY` completes in its own time. CIC phase 2/3
+///    waits for EVERY transaction holding a snapshot to end, so a peer parked
+///    inside a blocking `SELECT pg_advisory_lock($1)` — an in-flight
+///    statement, i.e. a live snapshot — made this bound UNREACHABLE: the CIC
+///    could not finish until the waiters ended, and the waiters could not end
+///    until the holder (whose body ran the CIC) finished. The wait is now a
+///    POLL of short `pg_try_advisory_lock` probes
+///    ([`acquire_migration_advisory_lock`]), so a waiter pins no snapshot and
+///    this timeout again measures the BUILD.
+/// 2. A bounded build only bounds the FLEET if the waiters are bounded too.
+///    They now are, so the worst case across a fleet is a clear refusal
+///    rather than a fleet-wide hang.
 const INDEX_BUILD_TIMEOUT_MS: u64 = 900_000;
 
 /// v1.0.0 #2614 — EXPLICIT `lock_timeout` (ms) for a BLOCKING-DDL migrate arm,
@@ -1962,6 +1980,258 @@ const CURRENT_SCHEMA_VERSION: i32 = 98;
 /// Hex breakdown: `0x4149_4D45_4D49_4701` — "AIMEMIG\x01" as ASCII.
 const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4149_4D45_4D49_4701;
 
+/// v1.0.0 #3519 — SQL for ONE non-blocking probe of
+/// [`MIGRATION_ADVISORY_LOCK_KEY`]. Returns `true` when this session now
+/// holds the lock and `false` immediately when someone else does; it NEVER
+/// waits, which is the whole point (see
+/// [`acquire_migration_advisory_lock`]).
+const SQL_TRY_MIGRATION_ADVISORY_LOCK: &str = "SELECT pg_try_advisory_lock($1)";
+
+/// v1.0.0 #3519 (pm-v3.1 literal de-dup) — release EVERY advisory lock held in
+/// this session. Preferred over `pg_advisory_unlock($1)`: it also drops any
+/// lock a migration body acquired on the way through, so a lock connection can
+/// never be closed still holding one.
+const SQL_UNLOCK_ALL_ADVISORY_LOCKS: &str = "SELECT pg_advisory_unlock_all()";
+
+/// v1.0.0 #3519 — `site` label for the BOOTSTRAP acquisition of
+/// [`MIGRATION_ADVISORY_LOCK_KEY`] (held across INIT_SCHEMA + sanity checks +
+/// KG detection + the whole ladder). Names the caller in every wait log line
+/// and in the refusal detail.
+const MIGRATION_LOCK_SITE_BOOTSTRAP: &str = "bootstrap advisory lock";
+
+/// v1.0.0 #3519 — `site` label for [`PostgresStore::migrate`]'s acquisition
+/// of [`MIGRATION_ADVISORY_LOCK_KEY`] (the `ai-memory migrate` CLI path,
+/// which runs the ladder WITHOUT the bootstrap around it).
+const MIGRATION_LOCK_SITE_MIGRATE: &str = "migrate advisory lock";
+
+/// v1.0.0 #3519 — first backoff (ms) between `pg_try_advisory_lock` probes.
+/// Deliberately short: in the overwhelmingly common case (a fresh database,
+/// several daemons or in-process stores booting at once) the holder's ladder
+/// finishes in seconds, and a waiter should pick the lock up promptly rather
+/// than sit out a fixed coarse tick.
+const MIGRATION_LOCK_POLL_BASE_MS: u64 = 25;
+
+/// v1.0.0 #3519 — ceiling (ms) for the doubling probe backoff. Caps the
+/// steady-state probe rate at one trivial `pg_try_advisory_lock` per waiter
+/// per second — negligible even for a large fleet booting together — while
+/// bounding the extra latency between the holder releasing and a waiter
+/// noticing at one second.
+const MIGRATION_LOCK_POLL_MAX_MS: u64 = 1_000;
+
+/// v1.0.0 #3519 — how often (ms) a waiter re-states, at WARN, that it is
+/// still queued behind the migration lock. A boot that legitimately waits out
+/// a long ladder must be OBSERVABLE (an operator has to be able to tell
+/// "queued behind a peer's migration" from "hung"), not a silent stall.
+const MIGRATION_LOCK_WAIT_LOG_INTERVAL_MS: u64 = 30_000;
+
+/// v1.0.0 #3519 — how many full [`INDEX_BUILD_TIMEOUT_MS`] budgets a waiter
+/// must be prepared to out-wait. [`LIST_ORDER_INDEXES`] holds the v88
+/// `CREATE INDEX CONCURRENTLY` builds — the only unbounded-by-row-count work
+/// under this lock — and `ensure_list_order_indexes` builds them back-to-back
+/// on ONE connection carrying ONE [`INDEX_BUILD_TIMEOUT_MS`] statement bound,
+/// so its length is exactly the number of consecutive index budgets a single
+/// holder can legitimately burn.
+///
+/// Written as a literal rather than `LIST_ORDER_INDEXES.len()` so the value is
+/// visible at the definition; the
+/// `the_lock_wait_budget_tracks_the_index_build_budget_3519` unit test pins
+/// the two in lockstep, so adding a v88 index cannot silently under-size the
+/// wait.
+const MIGRATION_LOCK_WAIT_INDEX_BUDGETS: u64 = 2;
+
+/// v1.0.0 #3519 — TOTAL bound (ms) on how long one caller waits for
+/// [`MIGRATION_ADVISORY_LOCK_KEY`] before refusing.
+///
+/// Derived from the CIC design notes above rather than from a supervisor
+/// deadline: everything a HOLDER does under this lock is itself bounded, and
+/// the largest single budget is [`INDEX_BUILD_TIMEOUT_MS`] (900 s per v88
+/// `CREATE INDEX CONCURRENTLY`, calibrated on the certified tier at
+/// 3,000,000 rows / 1,520 MB in 5.57 s). A holder can chain
+/// [`MIGRATION_LOCK_WAIT_INDEX_BUDGETS`] of those, so a waiter that gives up
+/// sooner would refuse a peer that is still making legitimate progress.
+///
+/// Be exact about what this bound does and does not buy, in the same spirit
+/// as [`DDL_STATEMENT_TIMEOUT_MS`]: it is NOT the ladder's absolute worst
+/// case (a multi-minute `GENERATED ... STORED` rewrite stacked on top of both
+/// index budgets can exceed it on a very large corpus). It is the
+/// line past which "waiting" is far more likely to mean a LEAKED holder — a
+/// node killed mid-ladder whose backend has not been reaped, a network
+/// partition holding the session open — than a working one. Crossing it is a
+/// CLEAR, RETRYABLE refusal naming the lock key and the elapsed wait, never a
+/// silent forever-hang: the ladder is idempotent, a refusing peer has applied
+/// NOTHING, and its supervisor's restart re-probes a lock the holder has by
+/// then usually released. Fail closed, never corrupt.
+const MIGRATION_LOCK_WAIT_TIMEOUT_MS: u64 =
+    MIGRATION_LOCK_WAIT_INDEX_BUDGETS * INDEX_BUILD_TIMEOUT_MS;
+
+/// v1.0.0 #3519 — acquire [`MIGRATION_ADVISORY_LOCK_KEY`] on `conn` by
+/// POLLING `pg_try_advisory_lock` with a bounded doubling backoff, instead of
+/// parking inside a single blocking `pg_advisory_lock` call.
+///
+/// # Why the blocking form is a data-tier availability defect
+///
+/// `SELECT pg_advisory_lock($1)` blocks INSIDE an in-flight statement, and an
+/// in-flight statement holds a transaction snapshot for as long as it runs.
+/// The holder's migration body runs `CREATE INDEX CONCURRENTLY` on a
+/// DIFFERENT pool connection, and CIC's phase 2/3 waits for every transaction
+/// holding a snapshot older than its own to end. So: CIC waits for the
+/// waiters, the waiters wait for the session lock, and the holder cannot
+/// release until its body — including that CIC — finishes. The cycle closes
+/// through the APPLICATION, so PostgreSQL's deadlock detector never fires and
+/// every process in it hangs forever. Reproduced on the certified tier
+/// (8 concurrent boots on one fresh database: holder idle, seven peers
+/// `active` in `SELECT pg_advisory_lock($1)`, CIC on
+/// `idx_archived_ns_archived_at` waiting on them; 40 minutes, no progress).
+///
+/// Each `pg_try_advisory_lock` probe is its own short statement that returns
+/// IMMEDIATELY, so a waiter's snapshot lives for microseconds between sleeps
+/// and can never pin CIC. Waiting now costs nothing that another session can
+/// observe.
+///
+/// # Fairness and fail-closed posture
+///
+/// The blocking form queues waiters in the lock manager; polling does not, so
+/// hand-off order is arbitrary. That is acceptable and deliberate: the ladder
+/// is idempotent, every waiter re-reads `schema_version` and skips the arms
+/// already applied, so which peer wins is immaterial — and starvation is
+/// bounded by [`MIGRATION_LOCK_WAIT_TIMEOUT_MS`], after which the caller gets
+/// a clear [`StoreError::BackendUnavailable`] rather than an unbounded stall.
+/// With a SINGLE connector (the overwhelmingly common case) behaviour is
+/// unchanged: the first probe succeeds and the function returns without ever
+/// sleeping.
+///
+/// No jitter is applied to the backoff. Each probe is one uncontended
+/// `pg_try_advisory_lock` — a shared-memory hash lookup, no I/O — and waiters
+/// enter the loop at whatever instant their own bootstrap reached it, so the
+/// probes self-disperse; there is no herd to spread.
+///
+/// # Errors
+///
+/// Returns [`StoreError::BackendUnavailable`] if a probe itself fails, or if
+/// the lock was not obtained within [`MIGRATION_LOCK_WAIT_TIMEOUT_MS`].
+async fn acquire_migration_advisory_lock(
+    conn: &mut sqlx::PgConnection,
+    site: &str,
+) -> StoreResult<()> {
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(MIGRATION_LOCK_WAIT_TIMEOUT_MS);
+    let mut backoff_ms = MIGRATION_LOCK_POLL_BASE_MS;
+    let mut probes: u64 = 0;
+    let mut next_log = std::time::Duration::from_millis(MIGRATION_LOCK_WAIT_LOG_INTERVAL_MS);
+
+    loop {
+        let acquired: bool = sqlx::query_scalar(SQL_TRY_MIGRATION_ADVISORY_LOCK)
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| to_store_err(&format!("{site}: pg_try_advisory_lock probe"), e))?;
+        probes = probes.saturating_add(1);
+        if acquired {
+            if probes > 1 {
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    site,
+                    probes,
+                    waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "#3519: acquired the migration advisory lock after waiting for a peer"
+                );
+            }
+            return Ok(());
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= budget {
+            return Err(StoreError::BackendUnavailable {
+                backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                detail: format!(
+                    "{site}: gave up after {}s waiting for migration advisory lock \
+                     {MIGRATION_ADVISORY_LOCK_KEY} held by another session ({probes} probes). \
+                     Another daemon is running the schema ladder, or a holder leaked the \
+                     session. Nothing was applied by this process; retry the connect, and \
+                     check pg_locks for a stale holder if it repeats",
+                    elapsed.as_secs()
+                ),
+            });
+        }
+        if elapsed >= next_log {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                site,
+                probes,
+                waited_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                budget_ms = MIGRATION_LOCK_WAIT_TIMEOUT_MS,
+                "#3519: still queued behind another session's migration advisory lock"
+            );
+            next_log = elapsed.saturating_add(std::time::Duration::from_millis(
+                MIGRATION_LOCK_WAIT_LOG_INTERVAL_MS,
+            ));
+        }
+
+        // Never sleep past the budget: the refusal must land on time.
+        let remaining = budget.saturating_sub(elapsed);
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms).min(remaining)).await;
+        backoff_ms = backoff_ms.saturating_mul(2).min(MIGRATION_LOCK_POLL_MAX_MS);
+    }
+}
+
+/// v1.0.0 #3519 — relax the one-shot GUCs on a dedicated migration-lock
+/// connection and then take [`MIGRATION_ADVISORY_LOCK_KEY`] on it. Shared by
+/// the bootstrap and [`PostgresStore::migrate`] twins so the two can never
+/// drift apart in either the relaxation or the wait shape.
+///
+/// The relaxations are plain `SET`s (not `SET LOCAL`): `SET LOCAL` is
+/// transaction-scoped and cannot span the NON-transactional advisory-lock
+/// session. That is exactly why a caller MUST route every exit — success or
+/// failure — through [`release_migration_advisory_lock`], which is what
+/// discharges the #3074 obligation not to hand a relaxed connection back to
+/// the pool.
+///
+/// # Errors
+///
+/// Returns [`StoreError::BackendUnavailable`] if a `SET` fails, if a lock
+/// probe fails, or if the lock is not obtained inside
+/// [`MIGRATION_LOCK_WAIT_TIMEOUT_MS`].
+async fn prepare_migration_lock_connection(
+    conn: &mut sqlx::PgConnection,
+    site: &str,
+) -> StoreResult<()> {
+    // Multi-statement SQL would trip sqlx's prepared-statement protocol
+    // ("cannot insert multiple commands into a prepared statement"); split
+    // into two separate executes.
+    sqlx::query(SQL_CLEAR_STATEMENT_TIMEOUT)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| to_store_err(&format!("{site}: clear statement_timeout"), e))?;
+    sqlx::query(SQL_CLEAR_LOCK_TIMEOUT)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| to_store_err(&format!("{site}: clear lock_timeout"), e))?;
+    acquire_migration_advisory_lock(conn, site).await
+}
+
+/// v1.0.0 #3519 — the ONE exit for a connection prepared by
+/// [`prepare_migration_lock_connection`], on every path: success, a failed
+/// ladder, a failed `SET`, and a lock wait that timed out.
+///
+/// Releases every advisory lock held in the session — `pg_advisory_unlock_all`
+/// rather than `pg_advisory_unlock(key)`, which defends against a body that
+/// accidentally acquired further locks — and then CLOSES the connection
+/// instead of returning it to the pool with its GUCs still relaxed (#3074).
+/// Both steps are best-effort: the physical close releases the session's locks
+/// regardless.
+///
+/// Before #3519 the failure paths simply DROPPED this connection, which
+/// re-entered it into the pool permanently outside `after_connect`'s bounded
+/// envelope. That was near-unreachable when the only failure was a dead
+/// connection; a BOUNDED lock wait makes "prepared, then refused" an ordinary
+/// outcome, so the leak is closed here rather than left to widen.
+async fn release_migration_advisory_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    let _ = sqlx::query(SQL_UNLOCK_ALL_ADVISORY_LOCKS)
+        .execute(&mut *conn)
+        .await;
+    close_timeout_relaxed_conn(conn).await;
+}
+
 /// Default embedding column dimension used when the caller doesn't pass
 /// `--embedding-dim` to `ai-memory schema-init`. Matches the v0.7.0
 /// baseline schema (`MiniLmL6V2` embedder = 384). Operators upgrading
@@ -2364,37 +2634,28 @@ impl PostgresStore {
                     detail: format!("acquire bootstrap lock connection: {e}"),
                 })?;
         // v0.7.0 ship-hardening (2026-05-19, QC P0): the per-session
-        // statement_timeout=30s set in `after_connect` would abort
-        // `pg_advisory_lock` itself if a holder takes >30s
-        // (plausible on a busy DB for the full v15→v47 ladder).
-        // `lock_timeout` is no-op for advisory locks per PG docs but
-        // we clear both for clarity. SET LOCAL is session-scoped and
-        // is released when the connection drops back to the pool.
-        // Multi-statement SQL would trip sqlx's prepared-statement
-        // protocol ("cannot insert multiple commands into a prepared
-        // statement"); split into two separate executes.
-        sqlx::query(SQL_CLEAR_STATEMENT_TIMEOUT)
-            .execute(&mut *bootstrap_lock_conn)
-            .await
-            .map_err(|e| StoreError::BackendUnavailable {
-                backend: "postgres".to_string(),
-                detail: format!("clear statement_timeout on bootstrap lock connection: {e}"),
-            })?;
-        sqlx::query(SQL_CLEAR_LOCK_TIMEOUT)
-            .execute(&mut *bootstrap_lock_conn)
-            .await
-            .map_err(|e| StoreError::BackendUnavailable {
-                backend: "postgres".to_string(),
-                detail: format!("clear lock_timeout on bootstrap lock connection: {e}"),
-            })?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(MIGRATION_ADVISORY_LOCK_KEY)
-            .execute(&mut *bootstrap_lock_conn)
-            .await
-            .map_err(|e| StoreError::BackendUnavailable {
-                backend: "postgres".to_string(),
-                detail: format!("acquire bootstrap pg_advisory_lock: {e}"),
-            })?;
+        // statement_timeout=30s set in `after_connect` would abort a
+        // long-running statement on this connection. v1.0.0 #3519 turned the
+        // lock WAIT itself into a poll of short `pg_try_advisory_lock` probes
+        // — each its own statement, so a waiter never pins a snapshot for the
+        // holder's `CREATE INDEX CONCURRENTLY` to wait on — so the clearing is
+        // no longer what keeps the wait alive. It is KEPT deliberately: this
+        // is the connection an operator reaches for when debugging a stuck
+        // ladder, and clearing both keeps ONE relaxed-GUC posture (with its
+        // #3074 close-instead-of-return obligation) across the bootstrap and
+        // migrate twins.
+        if let Err(e) = prepare_migration_lock_connection(
+            &mut bootstrap_lock_conn,
+            MIGRATION_LOCK_SITE_BOOTSTRAP,
+        )
+        .await
+        {
+            // #3074 — the GUC relaxations may already have applied, and a
+            // bounded wait makes this refusal an ordinary outcome; never leave
+            // a relaxed connection in the pool.
+            release_migration_advisory_lock(bootstrap_lock_conn).await;
+            return Err(e);
+        }
 
         // Run the full bootstrap inside an async block so we can
         // ALWAYS release the lock — even if any error propagates.
@@ -2804,18 +3065,10 @@ impl PostgresStore {
         }
         .await;
 
-        // Always release the bootstrap advisory lock, even on the error
-        // path. pg_advisory_unlock_all() releases all locks held in this
-        // session, more robust than pg_advisory_unlock(key) against any
-        // accidental re-acquire inside the bootstrap. Best-effort —
-        // implicit release on connection drop is the backstop.
-        let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
-            .execute(&mut *bootstrap_lock_conn)
-            .await;
-        // v1.0.0 #3074 — this connection had its `statement_timeout` /
-        // `lock_timeout` cleared to 0 above; CLOSE it rather than dropping it
-        // back into the pool UNBOUNDED (see `close_timeout_relaxed_conn`).
-        close_timeout_relaxed_conn(bootstrap_lock_conn).await;
+        // Always release the bootstrap advisory lock, even on the error path
+        // (see `release_migration_advisory_lock`: unlock-all, then the #3074
+        // close of the timeout-relaxed connection).
+        release_migration_advisory_lock(bootstrap_lock_conn).await;
 
         bootstrap_result
     }
@@ -3326,9 +3579,11 @@ impl PostgresStore {
         //
         // The lock is acquired on a dedicated connection held for the
         // entire migration ladder. Other callers (other processes OR
-        // in-process parallel connects) block on pg_advisory_lock
-        // until release, then re-read schema_version inside
-        // migrate_locked() and skip via the early-return when
+        // in-process parallel connects) POLL for it (v1.0.0 #3519 — a
+        // blocking `pg_advisory_lock` wait pins a snapshot and deadlocks
+        // the holder's `CREATE INDEX CONCURRENTLY`; see
+        // `acquire_migration_advisory_lock`), then re-read schema_version
+        // inside migrate_locked() and skip via the early-return when
         // current_version >= CURRENT_SCHEMA_VERSION. The session-scoped
         // lock is released explicitly via pg_advisory_unlock_all() and
         // implicitly when the dedicated connection drops.
@@ -3339,40 +3594,27 @@ impl PostgresStore {
             .map_err(|e| to_store_err("acquire migration lock connection", e))?;
 
         // QC P0: clear statement_timeout / lock_timeout on the lock
-        // connection so the `pg_advisory_lock` wait itself isn't
-        // aborted under contention (per-session default is 30s from
-        // `after_connect`). Split into two separate executes — sqlx
-        // prepared-statement protocol rejects multi-statement SQL.
-        sqlx::query(SQL_CLEAR_STATEMENT_TIMEOUT)
-            .execute(&mut *lock_conn)
-            .await
-            .map_err(|e| to_store_err("clear statement_timeout on migration lock connection", e))?;
-        sqlx::query(SQL_CLEAR_LOCK_TIMEOUT)
-            .execute(&mut *lock_conn)
-            .await
-            .map_err(|e| to_store_err("clear lock_timeout on migration lock connection", e))?;
-
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(MIGRATION_ADVISORY_LOCK_KEY)
-            .execute(&mut *lock_conn)
-            .await
-            .map_err(|e| to_store_err("acquire pg_advisory_lock", e))?;
+        // connection (per-session default is 30s from `after_connect`).
+        // v1.0.0 #3519 — the wait is now a poll of short
+        // `pg_try_advisory_lock` probes, each of which finishes far inside
+        // 30 s, so the clearing no longer keeps the WAIT alive; it is kept to
+        // hold the relaxed-GUC posture identical to the bootstrap twin (and
+        // with it the #3074 close-instead-of-return).
+        if let Err(e) =
+            prepare_migration_lock_connection(&mut lock_conn, MIGRATION_LOCK_SITE_MIGRATE).await
+        {
+            release_migration_advisory_lock(lock_conn).await;
+            return Err(e);
+        }
 
         // Run the migration body, capturing the result so we can always
         // release the lock even on a per-migration failure.
         let result = self.migrate_locked_with_contention_retry().await;
 
-        // Release ALL advisory locks held in this session (more robust
-        // than pg_advisory_unlock(key) — defends against the body
-        // accidentally acquiring further locks). Best-effort: a failure
-        // to unlock would still release implicitly on connection close.
-        let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
-            .execute(&mut *lock_conn)
-            .await;
-        // v1.0.0 #3074 — CLOSE the timeout-relaxed lock connection instead of
-        // returning it to the pool with `statement_timeout = 0` (see
-        // `close_timeout_relaxed_conn`).
-        close_timeout_relaxed_conn(lock_conn).await;
+        // Release ALL advisory locks held in this session and CLOSE the
+        // timeout-relaxed connection rather than returning it to the pool with
+        // `statement_timeout = 0` (see `release_migration_advisory_lock`).
+        release_migration_advisory_lock(lock_conn).await;
 
         result
     }
@@ -35052,6 +35294,47 @@ mod tests {
         assert!(
             !is_lock_contention_store_err(&exhausted),
             "an exhausted blocking-DDL budget must terminate the ladder, not restart it"
+        );
+    }
+
+    /// v1.0.0 #3519 — the bounded advisory-lock wait must stay sized to the
+    /// work a HOLDER can legitimately do under the lock. The dominant term is
+    /// the v88 `CREATE INDEX CONCURRENTLY` self-heal, whose per-statement
+    /// budget is `INDEX_BUILD_TIMEOUT_MS` and which runs once per
+    /// `LIST_ORDER_INDEXES` entry on one connection. Adding a v88 index
+    /// without widening the wait would make a waiter refuse a peer that is
+    /// still making progress — so pin the two in lockstep here rather than
+    /// leaving the coupling to prose.
+    #[test]
+    fn the_lock_wait_budget_tracks_the_index_build_budget_3519() {
+        assert_eq!(
+            usize::try_from(MIGRATION_LOCK_WAIT_INDEX_BUDGETS).expect("budget count fits usize"),
+            LIST_ORDER_INDEXES.len(),
+            "the wait must cover one INDEX_BUILD_TIMEOUT_MS per v88 index built \
+             back-to-back under the lock; bump MIGRATION_LOCK_WAIT_INDEX_BUDGETS in \
+             lockstep with LIST_ORDER_INDEXES"
+        );
+        assert!(
+            MIGRATION_LOCK_WAIT_TIMEOUT_MS > INDEX_BUILD_TIMEOUT_MS,
+            "a waiter must out-wait at least ONE full index build, or a peer refuses a \
+             holder that is making legitimate progress"
+        );
+        assert!(
+            MIGRATION_LOCK_WAIT_TIMEOUT_MS > 0,
+            "the wait must be BOUNDED and non-zero: 0 would refuse instantly under any \
+             contention, and an unbounded wait is the #3519 hang itself"
+        );
+        // The backoff must actually back off, and must not out-run the budget.
+        assert!(
+            MIGRATION_LOCK_POLL_BASE_MS > 0
+                && MIGRATION_LOCK_POLL_BASE_MS <= MIGRATION_LOCK_POLL_MAX_MS,
+            "the probe backoff must start positive and grow toward its cap"
+        );
+        assert!(
+            MIGRATION_LOCK_POLL_MAX_MS < MIGRATION_LOCK_WAIT_LOG_INTERVAL_MS
+                && MIGRATION_LOCK_WAIT_LOG_INTERVAL_MS < MIGRATION_LOCK_WAIT_TIMEOUT_MS,
+            "a long wait must log progress several times before it refuses, or the \
+             refusal is the operator's FIRST signal"
         );
     }
 
