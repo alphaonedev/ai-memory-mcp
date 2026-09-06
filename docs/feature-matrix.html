@@ -12,7 +12,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Feature Matrix — every tool, endpoint, command</title>
-<meta name="description" content="Complete surface-area atlas: 103 MCP tools at --profile full (102 callable + always-on capabilities; 7 at --profile core), 98 HTTP routes (84 unique paths) at /api/v1/, 91 CLI subcommands (default build) / 93 with --features sal; canonical counts on the evidence page. Every operation cross-referenced across the three protocol fronts.">
+<meta name="description" content="Complete surface-area atlas: 103 MCP tools at --profile full (102 callable + always-on capabilities; 7 at --profile core), 100 HTTP routes (86 unique paths) at /api/v1/, 91 CLI subcommands (default build) / 93 with --features sal; canonical counts on the evidence page. Every operation cross-referenced across the three protocol fronts.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/feature-matrix.html">
 <style>
@@ -324,7 +324,7 @@ footer a{color:var(--text-muted)}
   </p>
   <div class="pill-row">
     <span class="pill"><strong>103</strong>MCP tools (<code>--profile full</code>; 102 callable)</span>
-    <span class="pill"><strong>98</strong>HTTP routes (84 unique paths)</span>
+    <span class="pill"><strong>100</strong>HTTP routes (86 unique paths)</span>
     <span class="pill"><strong>90</strong>CLI subcommands (92 w/ <code>--features sal</code>)</span>
     <span class="pill"><strong>4</strong>operational modes</span>
   </div>
@@ -635,7 +635,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">98 HTTP Routes</span>
     <h2>REST surface for services + federation peers.</h2>
-    <p class="lede">Axum-served. mTLS-aware. CORS layer. Prometheus metrics at <code>/metrics</code>. Body limit 2 MiB. Trace spans on every request. The same operations as MCP, plus federation-private peer endpoints. <strong>98 production <code>.route(...)</code> registrations / 84 unique URL paths</strong> (the table below lists a representative subset; v0.8.0 added the coordination write surfaces <code>POST /api/v1/actions/{id}/transition</code> + <code>POST /api/v1/signals</code>; v0.9.0 #1859 G13-mem added <code>GET /api/v1/memories/{id}/lineage</code>).</p>
+    <p class="lede">Axum-served. mTLS-aware. CORS layer. Prometheus metrics at <code>/metrics</code>. Body limit 2 MiB. Trace spans on every request. The same operations as MCP, plus federation-private peer endpoints. <strong>100 production <code>.route(...)</code> registrations / 86 unique URL paths</strong> (the table below lists a representative subset; v0.8.0 added the coordination write surfaces <code>POST /api/v1/actions/{id}/transition</code> + <code>POST /api/v1/signals</code>; v0.9.0 #1859 G13-mem added <code>GET /api/v1/memories/{id}/lineage</code>).</p>
 
     <p class="lede" style="border-left:3px solid var(--gold);padding-left:1rem"><strong>Backend scope — read before integrating.</strong> This table describes the <strong>SQLite</strong> surface. The two backends are <strong>not</strong> one identical API: <strong>61 of the 82 unique production paths are served on PostgreSQL; the remaining 21 fail closed with a uniform <code>501 NOT IMPLEMENTED</code></strong> on every HTTP method — never a silent read/write against the wrong database. The fully-501 set is the Agent Skills surface (<code>/api/v1/skill/*</code>), <code>/api/v1/share</code>, the legacy <code>/api/v1/find_paths</code> alias (use <code>/api/v1/kg/find_paths</code>, which <em>is</em> supported), and the <code>memory_*</code> MCP-parity routes with no Postgres SAL trait method yet. Core CRUD, recall, search, links, KG, archive, federation sync, coordination and governance writes are all pg-supported. The allowlist is <code>postgres_endpoint_supported()</code> in <code>src/handlers/postgres_gate.rs</code>, pinned by <code>tests/pg_supported_route_inventory_gate_2799.rs</code>. MCP stdio is structurally SQLite-only — Postgres deployments serve MCP clients through this HTTP daemon.</p>
 
