@@ -307,12 +307,12 @@ fn the_seam_is_thread_local_and_cannot_steer_a_sibling_3523() {
 /// ships in the release binary.
 #[test]
 fn detector_catches_an_ungated_seam_module_3523() {
-    let src = r#"
+    let src = r"
 /// Some prose.
 pub mod test_agent_id {
     // ...
 }
-"#;
+";
     assert_eq!(
         line_is_cfg_gated(src, SEAM_MODULE_DECL),
         Some(false),
