@@ -447,6 +447,40 @@ pub fn substrate_exclusion_sql(column: &str) -> String {
     format!(" AND NOT ({})", substrate_match_sql(column))
 }
 
+/// v1.0.0 #3507 — bound-parameter dialect for a visibility SQL fragment that
+/// BOTH backends splice into their own queries.
+///
+/// The visibility predicate itself (`crate::storage::visibility_clause`) is
+/// engine-agnostic: it reads only the `scope_idx` / `agent_id_idx` /
+/// `target_agent_id_idx` generated columns and `namespace`, all of which are
+/// declared with the SAME projection expressions in the sqlite migration
+/// ladder (v10 / v14 / v67) and in `src/store/postgres_schema.sql`. The one
+/// thing that is NOT portable is how a bound parameter is spelled, so that —
+/// and only that — is what this enum selects. Keeping ONE generator with a
+/// dialect knob is the #951 rule applied to SQL: a second, hand-written pg
+/// copy of the predicate is exactly the drift this project treats as a defect.
+///
+/// `Postgres` renders an explicit `::text` cast because a bare `$n` in an
+/// `IS NULL` / `replace(...)` position gives the planner no type to infer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlParamStyle {
+    /// `?n` — SQLite / `rusqlite` positional parameters.
+    Sqlite,
+    /// `$n::text` — PostgreSQL / `sqlx` numbered parameters.
+    Postgres,
+}
+
+impl SqlParamStyle {
+    /// Render bound TEXT parameter number `n` in this dialect.
+    #[must_use]
+    pub fn text_param(self, n: usize) -> String {
+        match self {
+            Self::Sqlite => format!("?{n}"),
+            Self::Postgres => format!("${n}::text"),
+        }
+    }
+}
+
 /// v1.0.0 #3348 — is `ns` a substrate-owned namespace?
 #[must_use]
 pub fn is_substrate_namespace(ns: &str) -> bool {
@@ -1099,5 +1133,73 @@ mod substrate_sql_3345_tests {
              re-open the ambient listing this closes"
         );
         assert!(!substrate_listing_requested(None));
+    }
+}
+
+#[cfg(test)]
+mod sql_param_style_3507_tests {
+    //! v1.0.0 #3507 — the ONE visibility-clause generator serves both
+    //! backends, and only the parameter dialect differs.
+    //!
+    //! Two properties are load-bearing and neither is obvious from reading
+    //! the generator:
+    //!
+    //! 1. the SQLite rendering is BYTE-IDENTICAL to the pre-#3507 literal, so
+    //!    adding the dialect knob cannot have silently changed what `recall`,
+    //!    `search`, `list` and the source-uri paths admit;
+    //! 2. the PostgreSQL rendering differs from it ONLY by substituting `?n`
+    //!    with `$n::text` — if a future edit spelled the pg predicate
+    //!    differently in any other way, the two backends would start
+    //!    disagreeing about visibility, which is the #951 drift this crate
+    //!    treats as a defect.
+
+    use super::SqlParamStyle;
+
+    /// The verbatim pre-#3507 SQLite rendering for `(start = 4, caller = 8,
+    /// alias = "m")` — the shape `crate::storage::list_by_source_uri` binds.
+    /// Frozen as a literal on purpose: deriving it from the generator would
+    /// make the assertion a tautology.
+    const FROZEN_SQLITE_4_8_M: &str = "AND (\
+            ?4 IS NULL \
+            OR m.scope_idx = 'collective' \
+            OR (m.scope_idx = 'private' AND ?8 IS NOT NULL AND (m.agent_id_idx = ?8 OR m.target_agent_id_idx = ?8)) \
+            OR (m.scope_idx = 'team' AND ?5 IS NOT NULL AND (m.namespace = ?5 OR m.namespace LIKE replace(replace(?5, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR (m.scope_idx = 'unit' AND ?6 IS NOT NULL AND (m.namespace = ?6 OR m.namespace LIKE replace(replace(?6, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR (m.scope_idx = 'org'  AND ?7  IS NOT NULL AND (m.namespace = ?7  OR m.namespace LIKE replace(replace(?7, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
+        )";
+
+    #[test]
+    fn sqlite_rendering_is_byte_identical_to_the_pre_3507_literal() {
+        assert_eq!(
+            crate::storage::visibility_clause(SqlParamStyle::Sqlite, 4, 8, "m"),
+            FROZEN_SQLITE_4_8_M,
+            "#3507: the dialect knob must not have changed the SQLite predicate — \
+             every existing recall/search/list call site renders through it"
+        );
+    }
+
+    #[test]
+    fn postgres_rendering_differs_only_in_parameter_dialect() {
+        let sqlite = crate::storage::visibility_clause(SqlParamStyle::Sqlite, 4, 8, "m");
+        let postgres = crate::storage::visibility_clause(SqlParamStyle::Postgres, 4, 8, "m");
+        assert_ne!(sqlite, postgres, "the two dialects must not be identical");
+        // Rewrite the sqlite form into the pg dialect and demand equality.
+        // Highest index first so `?4` cannot be rewritten before `?8`.
+        let mut rewritten = sqlite;
+        for n in (4..=8).rev() {
+            rewritten = rewritten.replace(&format!("?{n}"), &format!("${n}::text"));
+        }
+        assert_eq!(
+            rewritten, postgres,
+            "#3507: the postgres predicate must differ from the sqlite one ONLY by \
+             the bound-parameter spelling — any other divergence makes the two \
+             backends disagree about who can read what"
+        );
+    }
+
+    #[test]
+    fn text_param_renders_each_dialect() {
+        assert_eq!(SqlParamStyle::Sqlite.text_param(3), "?3");
+        assert_eq!(SqlParamStyle::Postgres.text_param(3), "$3::text");
     }
 }

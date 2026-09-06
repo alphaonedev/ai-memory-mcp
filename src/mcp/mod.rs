@@ -2792,8 +2792,42 @@ fn dispatch_memory_persona_generate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, 
     )
 }
 
+/// v1.0.0 #3507 — resolve the calibration audience for the MCP surface.
+///
+/// The sweep is a caller-scoped aggregate, so the tool must name a principal.
+/// The ladder is the #1557/#3356 `memory_inbox` precedent, applied verbatim:
+///
+/// 1. the enforced multi-tenant caller
+///    ([`crate::identity::resolve_mcp_read_visibility_caller`]) when
+///    `AI_MEMORY_AGENT_ID` is configured — a present-but-unusable value
+///    REFUSES here rather than degrading to the unset posture (#3356);
+/// 2. otherwise the SAME process-derived identity the MCP write path stamps
+///    ([`crate::identity::resolve_agent_id`] with no explicit override —
+///    `ai:<client>@<host>` / `host:<host>`, pid-free and durable since
+///    #1720 B1). Binding to it keeps the single-operator flow working while
+///    still scoping the aggregate to rows that principal can read.
+///
+/// There is deliberately NO admin arm and no `[mcp] single_tenant_trust_all`
+/// arm on this surface: MCP stdio has no authenticated admin gate, and that
+/// knob is documented as an inbox-specific legacy opt-in, so honouring it
+/// here would silently restore the pre-#3507 GLOBAL aggregate — the exact
+/// disclosure this gate closes.
+fn calibrate_audience_for_mcp(
+    ctx: &ToolDispatchCtx<'_>,
+) -> Result<crate::confidence::calibrate::CalibrationAudience, String> {
+    let principal = match crate::identity::resolve_mcp_read_visibility_caller()
+        .map_err(|error| error.to_string())?
+    {
+        Some(caller) => caller,
+        None => crate::identity::resolve_agent_id(None, ctx.mcp_client)
+            .map_err(|error| error.to_string())?,
+    };
+    crate::confidence::calibrate::CalibrationAudience::for_caller(&principal)
+}
+
 fn dispatch_memory_calibrate_confidence(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_calibrate_confidence(ctx.conn, ctx.arguments)
+    let audience = calibrate_audience_for_mcp(ctx)?;
+    handle_calibrate_confidence(ctx.conn, ctx.arguments, &audience)
 }
 
 fn dispatch_memory_dependents_of_invalidated(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

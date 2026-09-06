@@ -3060,18 +3060,28 @@ impl MemoryStore for SqliteStore {
         quotas::list_status(&conn, Some(namespace)).map_err(box_err)
     }
 
-    /// #3064 lane L-PGP family F3 — delegates VERBATIM to the sqlite SSOT
+    /// #3064 lane L-PGP family F3 — delegates to the sqlite SSOT
     /// `crate::confidence::calibrate::calibrate_from_shadow`, so the wire
-    /// bytes on this backend are byte-for-byte what `memory_calibrate_confidence`
-    /// has always emitted (bounded-window refusal, two-pass streaming
-    /// aggregation, `recall_outcome` backfill, and all).
+    /// bytes on this backend are what `memory_calibrate_confidence` emits
+    /// (bounded-window refusal, two-pass streaming aggregation,
+    /// `recall_outcome` backfill on the admin sweep, and all).
+    ///
+    /// v1.0.0 #3507 — `ctx` selects the audience through the SHARED
+    /// [`CallerContext::calibration_audience`], the same helper the postgres
+    /// adapter calls, so the caller gate cannot drift between backends. An
+    /// unusable principal is refused as `InvalidInput`, never widened.
     async fn calibrate_confidence_report(
         &self,
+        ctx: &CallerContext,
         days: i64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
+        let audience = ctx
+            .calibration_audience()
+            .map_err(|detail| StoreError::InvalidInput { detail })?;
         let conn = self.state.lock().await;
-        crate::confidence::calibrate::calibrate_from_shadow(&conn, days, now).map_err(box_err)
+        crate::confidence::calibrate::calibrate_from_shadow(&conn, days, now, &audience)
+            .map_err(box_err)
     }
 
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {

@@ -31984,10 +31984,11 @@ impl MemoryStore for PostgresStore {
     /// beside its siblings there rather than behind a private ceiling bump).
     async fn calibrate_confidence_report(
         &self,
+        ctx: &CallerContext,
         days: i64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
-        self.calibrate_confidence_report_pg(days, now).await
+        self.calibrate_confidence_report_pg(ctx, days, now).await
     }
 
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {

@@ -167,6 +167,38 @@ clamped to `[0.0, 1.0]`. At `age == half_life`, the value collapses to
 computes the decayed value, UPDATEs `memories.confidence`, sets
 `confidence_source = 'decayed'`, and stamps `confidence_decayed_at`.
 
+## Who the report covers — caller-scoped aggregate (v1.0.0, #3507)
+
+The report NAMES namespaces and reports per-namespace statistics, so it is
+gated like any other read: **the sweep aggregates only rows the calling
+principal can read**, on BOTH backends.
+
+* The predicate is the store's own, not a second copy — the
+  `crate::storage::visibility_clause` fragment (the #1921 team/unit/org
+  subtree arms plus the #1720 owner-keyed `scope=private` arm), the #3348
+  substrate exclusion, and the fail-closed lifecycle allow-list. SQLite and
+  PostgreSQL render it from the SAME generator; only the bound-parameter
+  dialect differs.
+* **ADMIN keeps the global sweep.** On HTTP that is the existing admin
+  allow-list gate (`is_admin_caller_trusted`: an allow-listed id, request
+  authentication, and per-agent-key attestation where enrolled); at the SAL
+  boundary it is a `CallerContext` with `bypass_visibility`. The MCP and CLI
+  surfaces have no authenticated admin gate, so they have no admin arm.
+* **No resolvable caller is a REFUSAL, never "everything."** `POST
+  /api/v1/memory_calibrate_confidence` answers `403` when `X-Agent-Id` is
+  absent; the SAL method refuses an empty, shape-invalid or synthetic
+  `anonymous:` principal. MCP and the CLI bind to the process-derived
+  identity the write path stamps when `AI_MEMORY_AGENT_ID` is unset, so a
+  single-operator install keeps working.
+* **Two documented consequences of the scoped sweep, both fail-closed.** An
+  ORPHAN observation (its source memory was CASCADE-deleted) has no row whose
+  visibility can be evaluated, so it is dropped — the orphan tolerance
+  described above survives only for the admin sweep. And a scoped sweep is
+  strictly READ-ONLY: the `recall_outcome` backfill below runs for the admin
+  sweep only, so `consumption_utility` / `consume_access_divergence` may stay
+  `null` for rows nothing has backfilled — the honest "no evidence yet",
+  never a wrong number.
+
 ## Calibration workflow
 
 1. Operator turns on shadow mode for a window:

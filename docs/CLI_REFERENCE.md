@@ -1029,6 +1029,19 @@ Per-source baseline calibration:
 baselines. Backs `memory_calibrate_confidence`.
 See [`docs/confidence-calibration.md`](confidence-calibration.html).
 
+**Caller-scoped aggregate (#3507).** The report is computed only over rows
+the calling principal can read — the same visibility predicates every other
+read funnel applies (subtree scopes, owner-keyed `scope=private`, substrate
+exclusion), so a baseline can only name a namespace you can read. The CLI has
+no admin arm: it runs as the principal `--agent-id` names (clap also folds
+`AI_MEMORY_AGENT_ID` into that slot), and with neither set it binds to the
+same process-derived identity `ai-memory store` stamps, so a single-operator
+install is unaffected. A principal that cannot be resolved refuses with exit
+code `2` rather than falling back to a corpus-wide sweep. Under a scoped
+caller the sweep is strictly read-only — the `recall_outcome` ledger backfill
+runs on the admin sweep only, so `consumption_utility` may report `n/a` for
+rows nothing has backfilled yet.
+
 ### `export-reflections` — QW-1 file-backed export
 
 Walks the reflection-chain and writes Markdown to

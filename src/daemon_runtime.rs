@@ -2682,7 +2682,12 @@ pub async fn run(
             // subcommands (e.g. `calibrate recall`) layer on alongside.
             match a.subcommand {
                 cli::commands::calibrate_confidence::CalibrateSubcommand::Confidence(ref conf) => {
-                    match cli::commands::calibrate_confidence::run(&db_path, conf, &mut out)? {
+                    match cli::commands::calibrate_confidence::run(
+                        &db_path,
+                        conf,
+                        cli_agent_id.as_deref(),
+                        &mut out,
+                    )? {
                         0 => Ok(()),
                         code => std::process::exit(code),
                     }

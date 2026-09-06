@@ -578,14 +578,14 @@ pub fn consult_authorship_immutable_gate(
 /// Computed 4-tuple of visibility prefixes for an agent position (Task 1.5).
 /// Index 0 = agent's own namespace (private), 1 = parent (team),
 /// 2 = grandparent (unit), 3 = great-grandparent (org). Missing = `None`.
-type VisibilityPrefixes = (
+pub(crate) type VisibilityPrefixes = (
     Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
 );
 
-fn compute_visibility_prefixes(as_agent: Option<&str>) -> VisibilityPrefixes {
+pub(crate) fn compute_visibility_prefixes(as_agent: Option<&str>) -> VisibilityPrefixes {
     let Some(ns) = as_agent else {
         return (None, None, None, None);
     };
@@ -782,20 +782,43 @@ fn is_archived_source(mem: &Memory) -> bool {
 /// unidentified caller (NULL — no stable env identity) matches NO
 /// private rows. The `?start IS NULL` sentinel (trust-all, no
 /// filtering) is unchanged.
-fn visibility_clause(start: usize, caller_ph: usize, table_alias: &str) -> String {
-    let private_ph = start;
-    let team_ph = start + 1;
-    let unit_ph = start + 2;
-    let org_ph = start + 3;
+///
+/// v1.0.0 #3507 — `style` selects ONLY how a bound parameter is spelled
+/// ([`crate::visibility::SqlParamStyle`]). The predicate body is engine-
+/// agnostic: `scope_idx` / `agent_id_idx` / `target_agent_id_idx` are declared
+/// with the SAME projection expressions by the sqlite migration ladder
+/// (v10 / v14 / v67) and by `src/store/postgres_schema.sql`, and `replace` /
+/// `||` / `LIKE ... ESCAPE` are the intersection of both engines. This is the
+/// ONE generator both backends use (#951): the postgres caller-scoped
+/// calibration sweep (`src/store/postgres/parity_3064.rs`) renders the same
+/// fragment with [`crate::visibility::SqlParamStyle::Postgres`] rather than
+/// carrying a hand-written copy that could drift from this one.
+///
+/// One documented dialect asymmetry: SQLite's `LIKE` is ASCII-case-INSENSITIVE
+/// by default while PostgreSQL's is case-SENSITIVE, so the subtree arms are
+/// strictly NARROWER on postgres. That is the fail-closed direction (fewer
+/// rows admitted, never more) and it is the pre-existing sqlite semantics that
+/// stay byte-identical here.
+pub(crate) fn visibility_clause(
+    style: crate::visibility::SqlParamStyle,
+    start: usize,
+    caller_ph: usize,
+    table_alias: &str,
+) -> String {
+    let private_ph = style.text_param(start);
+    let team_ph = style.text_param(start + 1);
+    let unit_ph = style.text_param(start + 2);
+    let org_ph = style.text_param(start + 3);
+    let caller_ph = style.text_param(caller_ph);
     let ta = table_alias;
     format!(
         "AND (\
-            ?{private_ph} IS NULL \
+            {private_ph} IS NULL \
             OR {ta}.scope_idx = 'collective' \
-            OR ({ta}.scope_idx = 'private' AND ?{caller_ph} IS NOT NULL AND ({ta}.agent_id_idx = ?{caller_ph} OR {ta}.target_agent_id_idx = ?{caller_ph})) \
-            OR ({ta}.scope_idx = 'team' AND ?{team_ph} IS NOT NULL AND ({ta}.namespace = ?{team_ph} OR {ta}.namespace LIKE replace(replace(?{team_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
-            OR ({ta}.scope_idx = 'unit' AND ?{unit_ph} IS NOT NULL AND ({ta}.namespace = ?{unit_ph} OR {ta}.namespace LIKE replace(replace(?{unit_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
-            OR ({ta}.scope_idx = 'org'  AND ?{org_ph}  IS NOT NULL AND ({ta}.namespace = ?{org_ph}  OR {ta}.namespace LIKE replace(replace(?{org_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
+            OR ({ta}.scope_idx = 'private' AND {caller_ph} IS NOT NULL AND ({ta}.agent_id_idx = {caller_ph} OR {ta}.target_agent_id_idx = {caller_ph})) \
+            OR ({ta}.scope_idx = 'team' AND {team_ph} IS NOT NULL AND ({ta}.namespace = {team_ph} OR {ta}.namespace LIKE replace(replace({team_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR ({ta}.scope_idx = 'unit' AND {unit_ph} IS NOT NULL AND ({ta}.namespace = {unit_ph} OR {ta}.namespace LIKE replace(replace({unit_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR ({ta}.scope_idx = 'org'  AND {org_ph}  IS NOT NULL AND ({ta}.namespace = {org_ph}  OR {ta}.namespace LIKE replace(replace({org_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
         )"
     )
 }
@@ -7600,7 +7623,7 @@ pub fn search_with_source_uri(
                    THEN {soft_loser_factor} ELSE 1.0 END)
            DESC
          LIMIT ?9",
-        vis = visibility_clause(11, 15, "m"),
+        vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 11, 15, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
         // v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight factor.
@@ -7712,7 +7735,7 @@ pub fn list_by_source_uri(
            {lifecycle_vis}
          ORDER BY m.created_at ASC
          LIMIT ?3",
-        vis = visibility_clause(4, 8, "m"),
+        vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 4, 8, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     );
@@ -8232,7 +8255,7 @@ pub fn recall(
            {lifecycle_vis}
          ORDER BY score DESC
          LIMIT ?7",
-        vis = visibility_clause(8, 12, "m"),
+        vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 8, 12, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list: hides
         // Tombstoned/Quarantined (and any unknown state) from recall.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
@@ -19477,7 +19500,7 @@ fn fts_keyword_phase(
         // (no as-of) admits every row.
         fts_valid_at_fragment = "AND (?13 IS NULL OR ((m.valid_from IS NULL OR m.valid_from <= ?13) \
              AND (m.valid_until IS NULL OR m.valid_until > ?13)))",
-        vis = visibility_clause(8, 12, "m"),
+        vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 8, 12, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // hybrid-recall FTS branch.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
@@ -19905,7 +19928,7 @@ fn semantic_phase(
         sem_valid_at_fragment =
             "AND (?11 IS NULL OR ((valid_from IS NULL OR valid_from <= ?11) \
              AND (valid_until IS NULL OR valid_until > ?11)))",
-        vis = visibility_clause(6, 10, "memories"),
+        vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 6, 10, "memories"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // semantic linear-scan branch (unqualified `memories` columns).
         lifecycle_vis = crate::models::lifecycle_visible_clause("memories"),

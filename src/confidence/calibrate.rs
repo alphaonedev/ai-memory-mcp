@@ -63,6 +63,17 @@
 //! (#1707) consume-vs-access divergence evidence (`access_count`); it is
 //! a LEFT join with `COALESCE(access_count, 0)`, so orphan rows still
 //! surface (as access 0) and the orphan-tolerant contract above holds.
+//!
+//! # Caller gate (v1.0.0 #3507)
+//!
+//! The report NAMES namespaces, so the sweep is CALLER-SCOPED: see
+//! [`CalibrationAudience`] and [`calibrate_from_shadow`]. The
+//! orphan-tolerance paragraph above describes the ADMIN sweep. A
+//! caller-scoped sweep promotes that `LEFT JOIN` to an INNER JOIN and
+//! applies the store's visibility predicate to the joined row, so an orphan
+//! observation — whose visibility cannot be evaluated at all — is dropped
+//! rather than counted. That is the fail-closed direction: a scoped report
+//! may show FEWER rows than exist, never rows the caller cannot read.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -72,6 +83,93 @@ use serde::Serialize;
 /// Default sweep window. The Form 5 brief calls for 30 days; tunable
 /// per call via the CLI `--days N` flag and the MCP `days` parameter.
 pub const DEFAULT_WINDOW_DAYS: i64 = 30;
+
+/// v1.0.0 #3507 — refusal emitted by every surface that cannot resolve a
+/// caller identity for the calibration sweep.
+///
+/// Declared once (pm-v3.1 no-scattered-literal) and referenced by name from
+/// the MCP dispatch, the HTTP route and the CLI driver, so the three surfaces
+/// cannot drift apart on what a fail-closed refusal says.
+pub const CALLER_REQUIRED_REFUSAL: &str = "memory_calibrate_confidence requires a resolvable caller identity: the report is a \
+     caller-scoped aggregate (#3507), so it is refused rather than computed over rows the \
+     caller may not read. Set AI_MEMORY_AGENT_ID (MCP/CLI), send X-Agent-Id (HTTP), or call \
+     as a configured admin";
+
+/// v1.0.0 #3507 — WHOSE rows a calibration sweep may aggregate.
+///
+/// `memory_calibrate_confidence` returns per-`(namespace, source)` baselines,
+/// so the response NAMES namespaces and discloses aggregate statistics over
+/// their rows. Before #3507 the sweep had no caller gate on either backend:
+/// every caller that reached the route got the GLOBAL aggregate, which is a
+/// cross-namespace disclosure of the #3171/#3348 residual class.
+///
+/// The inner discriminant is PRIVATE so a `Caller` audience cannot be
+/// constructed anywhere from an unvalidated string — [`Self::for_caller`] is
+/// the only door, and it refuses the identities that are not real principals
+/// (ERRORS-09: make the illegal state unrepresentable rather than validated at
+/// each of the three call sites).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationAudience(Audience);
+
+/// Private discriminant of [`CalibrationAudience`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Audience {
+    /// Operator/admin sweep — aggregates EVERY observation, the pre-#3507
+    /// behaviour, reachable only through an authenticated admin gate.
+    Admin,
+    /// Caller-scoped sweep — aggregates only rows `caller` may read.
+    Caller(String),
+}
+
+impl CalibrationAudience {
+    /// The GLOBAL sweep. Reserved for a caller that an authenticated admin
+    /// gate has already admitted (`handlers::admin_role::is_admin_caller_trusted`
+    /// on HTTP, `CallerContext::bypass_visibility` at the SAL boundary).
+    #[must_use]
+    pub fn admin() -> Self {
+        Self(Audience::Admin)
+    }
+
+    /// The caller-scoped sweep for `caller`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses (fail-closed) when `caller` is not a usable principal: empty,
+    /// shape-invalid, or one of the synthetic `anonymous:` sentinels
+    /// ([`crate::identity::sentinels::ANONYMOUS_REQ_PREFIX`] /
+    /// [`crate::identity::sentinels::ANONYMOUS_INVALID`]). Those are minted
+    /// PER REQUEST when no identity resolved, so they own no rows and are the
+    /// substrate's spelling of "no caller" — treating one as a principal would
+    /// turn the gate into a rubber stamp that still discloses every
+    /// world-readable namespace.
+    pub fn for_caller(caller: &str) -> Result<Self, String> {
+        let trimmed = caller.trim();
+        if trimmed.is_empty()
+            || trimmed == crate::identity::sentinels::ANONYMOUS_INVALID
+            || trimmed.starts_with(crate::identity::sentinels::ANONYMOUS_REQ_PREFIX)
+        {
+            return Err(CALLER_REQUIRED_REFUSAL.to_string());
+        }
+        crate::validate::validate_agent_id_shape(trimmed)
+            .map_err(|_| CALLER_REQUIRED_REFUSAL.to_string())?;
+        Ok(Self(Audience::Caller(trimmed.to_string())))
+    }
+
+    /// `true` when this audience aggregates every row.
+    #[must_use]
+    pub fn is_admin(&self) -> bool {
+        matches!(self.0, Audience::Admin)
+    }
+
+    /// The scoped principal, or `None` for [`Self::admin`].
+    #[must_use]
+    pub fn caller(&self) -> Option<&str> {
+        match &self.0 {
+            Audience::Admin => None,
+            Audience::Caller(caller) => Some(caller.as_str()),
+        }
+    }
+}
 
 /// `tracing` target for this module's shadow-mode calibration logs. One
 /// named const referenced at every emit site (pm-v3.1 no-scattered-literal).
@@ -153,11 +251,81 @@ pub struct CalibrationReport {
     pub baselines: Vec<PerSourceBaseline>,
 }
 
+/// v1.0.0 #3507 — the extra WHERE fragments a CALLER-SCOPED sweep splices
+/// onto both passes, and the bind values the visibility clause needs.
+///
+/// Built from [`crate::storage::visibility_clause`] +
+/// [`crate::storage::compute_visibility_prefixes`] +
+/// [`crate::visibility::substrate_exclusion_sql`] +
+/// [`crate::models::lifecycle_visible_clause`] — the SAME generators the
+/// recall / search / list funnels use, never a second predicate that could
+/// drift (#951). `vis_start` / `caller_ph` are the placeholder indices the
+/// host query reserved.
+struct ScopedFragments {
+    /// The four namespace prefixes (private/team/unit/org) for the caller.
+    prefixes: crate::storage::VisibilityPrefixes,
+    /// `AND (...)` visibility predicate over the joined `memories m`.
+    visibility: String,
+    /// Fail-closed lifecycle allow-list + the #3348 substrate exclusion over
+    /// BOTH the reported observation namespace and the row's live namespace.
+    lifecycle_and_substrate: String,
+}
+
+impl ScopedFragments {
+    fn build(caller: &str, vis_start: usize, caller_ph: usize) -> Self {
+        Self {
+            prefixes: crate::storage::compute_visibility_prefixes(Some(caller)),
+            visibility: crate::storage::visibility_clause(
+                crate::visibility::SqlParamStyle::Sqlite,
+                vis_start,
+                caller_ph,
+                "m",
+            ),
+            lifecycle_and_substrate: format!(
+                "{lifecycle}{sub_o}{sub_m}",
+                lifecycle = crate::models::lifecycle_visible_clause("m"),
+                // The report GROUPS BY `o.namespace`, so that is the name a
+                // baseline would disclose; `m.namespace` is what the scope
+                // arms judge. Excluding substrate on BOTH means neither the
+                // reported nor the live namespace can be substrate-owned.
+                sub_o = crate::visibility::substrate_exclusion_sql("o.namespace"),
+                sub_m = crate::visibility::substrate_exclusion_sql("m.namespace"),
+            ),
+        }
+    }
+}
+
 /// Compute the calibration report by scanning shadow observations from
 /// the last `days` days.
 ///
 /// `now` is parameterised so tests can pin a deterministic clock. The
 /// production CLI/MCP wrappers pass `Utc::now()`.
+///
+/// # Caller gate (v1.0.0 #3507)
+///
+/// `audience` decides WHOSE observations are aggregated, and it is a required
+/// argument precisely so no surface can forget it:
+///
+/// * [`CalibrationAudience::admin`] reproduces the pre-#3507 GLOBAL sweep
+///   byte-for-byte — same LEFT JOIN, same predicates, same orphan tolerance.
+/// * A caller-scoped audience INNER-JOINs `memories` and applies the store's
+///   own visibility machinery to the joined row, so a baseline can only name a
+///   namespace the caller can read and can only count rows it can read. Three
+///   consequences are deliberate and all fail CLOSED:
+///   1. an ORPHAN observation (source memory CASCADE-deleted) has no row to
+///      judge, so it is EXCLUDED — the audit-honest orphan tolerance the
+///      module doc describes survives only for the admin sweep, because a row
+///      whose visibility cannot be evaluated must not be counted;
+///   2. substrate namespaces (#3348) are excluded — the sweep takes no
+///      `namespace` argument, so it is an AMBIENT read and can never be the
+///      explicit opt-in that predicate reserves;
+///   3. the sweep is strictly READ-ONLY for a scoped caller: the
+///      `recall_outcome` backfill (the one write in the admin sweep) is
+///      SKIPPED, so a non-admin can never drive a corpus-wide UPDATE over
+///      rows it cannot read. The optional `consumption_utility` /
+///      `consume_access_divergence` evidence then degrades to `None` for
+///      un-backfilled rows — an honest "no evidence yet", never a wrong
+///      number.
 ///
 /// # Errors
 ///
@@ -168,6 +336,7 @@ pub fn calibrate_from_shadow(
     conn: &Connection,
     days: i64,
     now: chrono::DateTime<Utc>,
+    audience: &CalibrationAudience,
 ) -> Result<CalibrationReport> {
     // #3384 — caller-controlled windows must never reach chrono's panicking
     // `Duration::days` / `DateTime - Duration` operators. Keep the bound and
@@ -184,13 +353,21 @@ pub fn calibrate_from_shadow(
     // `crate::storage::recall`. Skip-with-WARN (item 4) is handled
     // inside `backfill_recall_outcomes` itself, so this call never fails
     // the report just because the ledger is absent.
-    let backfilled = crate::confidence::shadow::backfill_recall_outcomes(conn)?;
-    if backfilled > 0 {
-        tracing::info!(
-            target: LOG_TARGET,
-            backfilled,
-            "shadow sweep: backfilled recall_outcome from the recall_observations ledger"
-        );
+    //
+    // v1.0.0 #3507 — the backfill runs for the ADMIN sweep only. It is a
+    // corpus-wide UPDATE over rows a scoped caller may not read, so a
+    // caller-scoped calibration stays strictly READ-ONLY; the optional
+    // evidence fields degrade to `None` rather than a non-admin driving a
+    // write it cannot see the subjects of.
+    if audience.is_admin() {
+        let backfilled = crate::confidence::shadow::backfill_recall_outcomes(conn)?;
+        if backfilled > 0 {
+            tracing::info!(
+                target: LOG_TARGET,
+                backfilled,
+                "shadow sweep: backfilled recall_outcome from the recall_observations ledger"
+            );
+        }
     }
 
     // Pass 1: per-group count + mean + consumption tallies, computed
@@ -202,8 +379,18 @@ pub fn calibrate_from_shadow(
     // rows, so the report carries the consume-vs-access divergence evidence
     // the #1707 gate requires. Still SHADOW MODE (log/report only); the JOIN
     // is read-only and `crate::storage::recall` is untouched.
-    let mut stmt = conn.prepare(
-        "SELECT o.namespace, o.source, COUNT(*), AVG(o.derived_confidence),
+    //
+    // v1.0.0 #3507 — the SCOPED arm promotes the LEFT JOIN to an INNER JOIN
+    // (an orphan row has no visibility to evaluate, so it fails closed) and
+    // splices the store's own visibility + lifecycle + substrate fragments.
+    // Placeholder layout: ?1 = since, ?2..?5 = visibility prefixes, ?6 =
+    // caller. The admin arm is the pre-#3507 statement verbatim.
+    let pass1_scoped = audience
+        .caller()
+        .map(|caller| ScopedFragments::build(caller, 2, 6));
+    let pass1_sql = pass1_scoped.as_ref().map_or_else(
+        || {
+            "SELECT o.namespace, o.source, COUNT(*), AVG(o.derived_confidence),
                 SUM(CASE WHEN o.recall_outcome = 'consumed' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN o.recall_outcome IS NOT NULL THEN 1 ELSE 0 END),
                 SUM(CASE WHEN o.recall_outcome = 'consumed'
@@ -214,22 +401,64 @@ pub fn calibrate_from_shadow(
          LEFT JOIN memories m ON m.id = o.memory_id
          WHERE o.observed_at >= ?1
          GROUP BY o.namespace, o.source
+         ORDER BY o.namespace, o.source"
+                .to_string()
+        },
+        |scoped| {
+            format!(
+                "SELECT o.namespace, o.source, COUNT(*), AVG(o.derived_confidence),
+                SUM(CASE WHEN o.recall_outcome = 'consumed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN o.recall_outcome IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN o.recall_outcome = 'consumed'
+                         THEN COALESCE(m.access_count, 0) ELSE 0 END),
+                SUM(CASE WHEN o.recall_outcome = 'unconsumed'
+                         THEN COALESCE(m.access_count, 0) ELSE 0 END)
+         FROM confidence_shadow_observations o
+         JOIN memories m ON m.id = o.memory_id
+         WHERE o.observed_at >= ?1
+           {vis}
+           {rest}
+         GROUP BY o.namespace, o.source
          ORDER BY o.namespace, o.source",
-    )?;
-    let groups: Vec<(String, String, i64, f64, i64, i64, i64, i64)> = stmt
-        .query_map(params![since.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+                vis = scoped.visibility,
+                rest = scoped.lifecycle_and_substrate,
+            )
+        },
+    );
+    let mut stmt = conn.prepare(&pass1_sql)?;
+    type GroupTuple = (String, String, i64, f64, i64, i64, i64, i64);
+    let read_group = |row: &rusqlite::Row<'_>| -> rusqlite::Result<GroupTuple> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+        ))
+    };
+    let groups: Vec<GroupTuple> = match &pass1_scoped {
+        None => stmt
+            .query_map(params![since.as_str()], read_group)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        Some(scoped) => {
+            let (p, t, u, o) = &scoped.prefixes;
+            stmt.query_map(
+                params![
+                    since.as_str(),
+                    p,
+                    t,
+                    u,
+                    o,
+                    audience.caller(), // ?6
+                ],
+                read_group,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        }
+    };
     drop(stmt);
 
     let total_observations: u64 = groups.iter().map(|(_, _, c, ..)| *c as u64).sum();
@@ -239,12 +468,37 @@ pub fn calibrate_from_shadow(
     // schema v40 makes the WHERE filter cheap; the per-group result
     // set is bounded by the group size (typically thousands, not
     // millions) so the streaming Vec<f64> stays small.
-    let mut median_stmt = conn.prepare(
-        "SELECT derived_confidence
+    //
+    // v1.0.0 #3507 — the scoped arm repeats pass 1's join + predicates so the
+    // median and the histogram are computed over EXACTLY the rows pass 1
+    // counted. Placeholder layout: ?1 = since, ?2 = namespace, ?3 = source,
+    // ?4..?7 = visibility prefixes, ?8 = caller.
+    let pass2_scoped = audience
+        .caller()
+        .map(|caller| ScopedFragments::build(caller, 4, 8));
+    let pass2_sql = pass2_scoped.as_ref().map_or_else(
+        || {
+            "SELECT derived_confidence
          FROM confidence_shadow_observations
          WHERE observed_at >= ?1 AND namespace = ?2 AND source = ?3
-         ORDER BY derived_confidence ASC",
-    )?;
+         ORDER BY derived_confidence ASC"
+                .to_string()
+        },
+        |scoped| {
+            format!(
+                "SELECT o.derived_confidence
+         FROM confidence_shadow_observations o
+         JOIN memories m ON m.id = o.memory_id
+         WHERE o.observed_at >= ?1 AND o.namespace = ?2 AND o.source = ?3
+           {vis}
+           {rest}
+         ORDER BY o.derived_confidence ASC",
+                vis = scoped.visibility,
+                rest = scoped.lifecycle_and_substrate,
+            )
+        },
+    );
+    let mut median_stmt = conn.prepare(&pass2_sql)?;
 
     let mut baselines: Vec<PerSourceBaseline> = Vec::with_capacity(groups.len());
     for (
@@ -262,8 +516,24 @@ pub fn calibrate_from_shadow(
             continue;
         }
         let count = count_i64 as u64;
-        let mut rows =
-            median_stmt.query(params![since.as_str(), namespace.as_str(), source.as_str()])?;
+        let mut rows = match &pass2_scoped {
+            None => {
+                median_stmt.query(params![since.as_str(), namespace.as_str(), source.as_str()])?
+            }
+            Some(scoped) => {
+                let (p, t, u, o) = &scoped.prefixes;
+                median_stmt.query(params![
+                    since.as_str(),
+                    namespace.as_str(),
+                    source.as_str(),
+                    p,
+                    t,
+                    u,
+                    o,
+                    audience.caller(), // ?8
+                ])?
+            }
+        };
         let mut buckets = [0_u64; 10];
         // #1905 — the median needs only the value(s) at the central
         // index/indices; `count` is already known from Pass 1, so we
@@ -413,7 +683,8 @@ mod tests {
         observe(&conn, "m2", "ns", "user", 0.9, 0.7, &signals(), None).unwrap();
         observe(&conn, "m3", "ns", "claude", 0.9, 0.3, &signals(), None).unwrap();
 
-        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+            .expect("calibrate");
         assert_eq!(report.total_observations, 3);
         assert_eq!(report.baselines.len(), 2);
         let user = report
@@ -479,7 +750,8 @@ mod tests {
             .unwrap();
         }
 
-        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+            .expect("calibrate");
         let odd = report
             .baselines
             .iter()
@@ -512,7 +784,8 @@ mod tests {
         for v in &[0.05, 0.25, 0.45, 0.55, 0.95] {
             observe(&conn, "m1", "ns", "user", 0.9, *v, &signals(), None).unwrap();
         }
-        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+            .expect("calibrate");
         let b = &report.baselines[0];
         // One value in each of buckets 0, 2, 4, 5, 9
         assert_eq!(b.buckets[0], 1);
@@ -537,7 +810,8 @@ mod tests {
         )
         .unwrap();
         observe(&conn, "m1", "ns", "user", 0.9, 0.7, &signals(), None).unwrap();
-        let report = calibrate_from_shadow(&conn, 1, Utc::now()).expect("calibrate");
+        let report = calibrate_from_shadow(&conn, 1, Utc::now(), &CalibrationAudience::admin())
+            .expect("calibrate");
         // Old row outside the 1-day window drops out.
         assert_eq!(report.total_observations, 1);
         let b = &report.baselines[0];
@@ -547,7 +821,8 @@ mod tests {
     #[test]
     fn calibrate_empty_table_returns_empty_report() {
         let (conn, _dir) = open_tmp();
-        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+            .expect("calibrate");
         assert_eq!(report.total_observations, 0);
         assert!(report.baselines.is_empty());
     }
@@ -561,7 +836,8 @@ mod tests {
         seed_mem(&conn, "m1", "ns", "user");
         observe(&conn, "m1", "ns", "user", 0.9, 0.5, &signals(), None).unwrap();
 
-        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+            .expect("calibrate");
         let b = &report.baselines[0];
         assert_eq!(
             b.consumption_utility, None,
@@ -605,7 +881,8 @@ mod tests {
         // Only m1 gets cited downstream — m2 was recalled but unused.
         crate::observations::mark_consumed(&conn, "r1", &["m1"], "consumer").unwrap();
 
-        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+            .expect("calibrate");
         let b = &report.baselines[0];
         assert_eq!(b.source, "user");
         // 1 of 2 judged rows consumed ⇒ 0.5.

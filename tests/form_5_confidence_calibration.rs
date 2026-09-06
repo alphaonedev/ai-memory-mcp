@@ -39,7 +39,7 @@
 //!    `recall()` output is byte-identical before/after the sweep runs
 //!    (the key honesty guarantee — SHADOW mode, zero ranking change).
 
-use ai_memory::confidence::calibrate::calibrate_from_shadow;
+use ai_memory::confidence::calibrate::{CalibrationAudience, calibrate_from_shadow};
 use ai_memory::confidence::decay::decayed;
 use ai_memory::confidence::shadow::{backfill_recall_outcomes, observations_since, observe};
 use ai_memory::confidence::{DEFAULT_HALF_LIFE_DAYS, DeriveContext, derive};
@@ -257,7 +257,8 @@ fn calibration_produces_per_source_baselines_from_shadow() {
     observe(&conn, &m2.id, "ns", "user", 0.95, 0.65, &s, None).unwrap();
     observe(&conn, &m3.id, "ns", FIXTURE_SOURCE, 0.95, 0.30, &s, None).unwrap();
 
-    let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+    let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate");
     assert_eq!(report.total_observations, 3);
     assert_eq!(report.baselines.len(), 2);
     let user = report
@@ -503,8 +504,13 @@ fn mcp_handler_calibrate_confidence_returns_baselines_envelope() {
     // It's `pub(super)`, so we exercise it through the public registry
     // wrapper: the same dispatch surface a real MCP client hits via
     // stdio JSON-RPC. The `report` envelope is identical.
-    let report = ai_memory::confidence::calibrate::calibrate_from_shadow(&conn, 30, Utc::now())
-        .expect("calibrate");
+    let report = ai_memory::confidence::calibrate::calibrate_from_shadow(
+        &conn,
+        30,
+        Utc::now(),
+        &CalibrationAudience::admin(),
+    )
+    .expect("calibrate");
 
     // Envelope shape: every documented field is present and typed.
     assert_eq!(report.window_days, 30);
@@ -742,7 +748,8 @@ fn calibrate_with_days_1_returns_single_day_window() {
     )
     .expect("backdate stale");
 
-    let report = calibrate_from_shadow(&conn, 1, Utc::now()).expect("calibrate");
+    let report = calibrate_from_shadow(&conn, 1, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate");
     assert_eq!(report.window_days, 1, "window_days echoes the input");
     assert_eq!(
         report.total_observations, 1,
@@ -779,7 +786,8 @@ fn calibrate_with_days_3650_clamps_at_max() {
     )
     .expect("insert old observation");
 
-    let report = calibrate_from_shadow(&conn, 3650, Utc::now()).expect("calibrate");
+    let report = calibrate_from_shadow(&conn, 3650, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate");
     assert_eq!(
         report.window_days, 3650,
         "window_days is echoed verbatim (no clamp)",
@@ -796,7 +804,8 @@ fn calibrate_with_days_3650_clamps_at_max() {
     // Sanity: the same observation falls OUT of a tighter window so the
     // assertion above genuinely exercises the wide-window code path
     // (rather than tautologically passing because the SQL ignores days).
-    let tight = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate tight");
+    let tight = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate tight");
     assert_eq!(
         tight.total_observations, 0,
         "9-year-old observation must fall outside a 30-day window",
@@ -818,7 +827,8 @@ fn calibrate_with_days_0_rejects_or_returns_empty() {
     // A real observation stamped a few seconds ago.
     observe(&conn, &m.id, "ns-cov16-zero", "user", 0.9, 0.55, &s, None).expect("observe");
 
-    let report = calibrate_from_shadow(&conn, 0, Utc::now()).expect("calibrate days=0");
+    let report = calibrate_from_shadow(&conn, 0, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate days=0");
     assert_eq!(report.window_days, 0, "window_days echoes the input");
     assert_eq!(
         report.total_observations, 0,
@@ -1032,7 +1042,8 @@ fn divergence_stat_reports_consume_vs_access_1707() {
         .expect("mark_consumed");
 
     // The sweep backfills recall_outcome then computes the divergence.
-    let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+    let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate");
     let baseline = report
         .baselines
         .iter()
@@ -1062,7 +1073,8 @@ fn divergence_stat_none_without_ledger_correlation_1707() {
     // Observed but never recalled/consumed ⇒ recall_outcome stays NULL.
     observe(&conn, &m.id, "ns-1707b", "user", 0.9, 0.5, &s, None).expect("observe");
 
-    let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+    let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate");
     let baseline = report
         .baselines
         .iter()
@@ -1112,7 +1124,7 @@ fn calibrate_from_shadow_skips_gracefully_when_ledger_table_absent_1706() {
     )
     .expect("seed shadow row directly (no `source` column on this bare schema)");
 
-    let report = calibrate_from_shadow(&conn, 30, Utc::now())
+    let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
         .expect("sweep must not error when the ledger table is absent");
     assert_eq!(report.total_observations, 1);
     assert_eq!(
@@ -1206,7 +1218,8 @@ fn recall_output_byte_identical_around_1706_shadow_sweep() {
     // The #1706 offline sweep under test: backfill recall_outcome +
     // compute consumption_utility. Writes ONLY into
     // confidence_shadow_observations — never `memories` / `memories_fts`.
-    let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+    let report = calibrate_from_shadow(&conn, 30, Utc::now(), &CalibrationAudience::admin())
+        .expect("calibrate");
     assert!(
         report
             .baselines

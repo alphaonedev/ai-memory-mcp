@@ -695,6 +695,27 @@ impl CallerContext {
         self
     }
 
+    /// v1.0.0 #3507 — the calibration audience this context authorises.
+    ///
+    /// Sited on `CallerContext` (not duplicated per adapter) so the sqlite
+    /// and postgres arms of [`MemoryStore::calibrate_confidence_report`]
+    /// cannot disagree about who sees what — the #951 one-predicate rule
+    /// applied to the gate itself.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::confidence::calibrate::CalibrationAudience::for_caller`]'s
+    /// fail-closed refusal when the effective principal is not a usable
+    /// identity.
+    pub fn calibration_audience(
+        &self,
+    ) -> Result<crate::confidence::calibrate::CalibrationAudience, String> {
+        if self.bypass_visibility {
+            return Ok(crate::confidence::calibrate::CalibrationAudience::admin());
+        }
+        crate::confidence::calibrate::CalibrationAudience::for_caller(self.effective_principal())
+    }
+
     /// v0.7.0 #1062 (Agent-2 #9) — admin-context constructor that
     /// REQUIRES the caller to thread an `is_admin` bool. Returns
     /// the admin-bypass context when `is_admin` is true and a
@@ -4446,28 +4467,42 @@ pub trait MemoryStore: Send + Sync {
     /// on it, so a skipped backfill DEGRADES the report's optional evidence
     /// fields to `None` and never yields a wrong number.
     ///
-    /// # Caller gate
+    /// # Caller gate (v1.0.0 #3507 — CLOSED on both adapters)
     ///
-    /// There is NONE, on either adapter, and that is deliberate for the
-    /// #3064 port: the sqlite sweep this method was lifted from applies no
-    /// caller filter, so the aggregation spans every namespace and the
-    /// returned baselines disclose per-namespace names plus aggregate
-    /// confidence statistics to any caller that reaches the route.
-    /// Reproducing that verbatim kept the two backends equal rather than
-    /// silently diverging; it did not WIDEN the exposure, since a sqlite
-    /// daemon already served the same report. The gap itself is tracked in
-    /// #3507 and must be closed on BOTH adapters together — an
-    /// implementor adding a caller filter to only one of them would
-    /// reintroduce exactly the cross-backend divergence this method exists
-    /// to prevent.
+    /// The #3064 port shipped with NO caller gate on either adapter, because
+    /// the sqlite sweep it was lifted from had none: the aggregation spanned
+    /// every namespace and the baselines disclosed per-namespace names plus
+    /// aggregate confidence statistics to any caller that reached the route.
+    /// #3507 closes that on BOTH adapters together, through `ctx`:
+    ///
+    /// * `ctx.bypass_visibility` (the admin / operator posture the HTTP
+    ///   admin allow-list admits, `CallerContext::for_admin_checked`) keeps
+    ///   the GLOBAL aggregate, byte-identical to the pre-#3507 report;
+    /// * every other context is CALLER-SCOPED to
+    ///   [`CallerContext::effective_principal`] — the sweep joins `memories`
+    ///   and applies the store's own visibility predicate (#1921 subtree
+    ///   scopes, #1720 owner-keyed private), the #3348 substrate exclusion
+    ///   and the fail-closed lifecycle allow-list, so a baseline can only
+    ///   name a namespace the caller can read;
+    /// * an UNUSABLE principal (empty / shape-invalid / a synthetic
+    ///   `anonymous:` sentinel) is REFUSED with
+    ///   [`StoreError::InvalidInput`] rather than silently widened — the
+    ///   fail-closed direction, since "no caller" must never mean "every
+    ///   row".
+    ///
+    /// Both adapters derive the audience through the SAME
+    /// [`CallerContext::calibration_audience`] helper, so a future edit
+    /// cannot gate one backend and leave the other open — the cross-backend
+    /// divergence this method exists to prevent.
     ///
     /// # Errors
     ///
     /// [`StoreError::InvalidInput`] when `days` is outside `0..=36500` (the
-    /// bounded-window refusal), or a backend error. Default returns
-    /// `UnsupportedCapability`.
+    /// bounded-window refusal) or the caller cannot be resolved, or a
+    /// backend error. Default returns `UnsupportedCapability`.
     async fn calibrate_confidence_report(
         &self,
+        _ctx: &CallerContext,
         _days: i64,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {

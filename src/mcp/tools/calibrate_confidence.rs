@@ -14,7 +14,9 @@
 
 use serde_json::{Value, json};
 
-use crate::confidence::calibrate::{DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
+use crate::confidence::calibrate::{
+    CalibrationAudience, DEFAULT_WINDOW_DAYS, calibrate_from_shadow,
+};
 
 /// Wire shape:
 ///
@@ -31,6 +33,15 @@ use crate::confidence::calibrate::{DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
 /// }
 /// ```
 ///
+/// `audience` (v1.0.0 #3507) is the caller gate: the report is a
+/// CALLER-SCOPED aggregate, so the substrate needs to be told whose rows it
+/// may aggregate. It is a required argument rather than something resolved
+/// inside this function because the two surfaces that reach here resolve a
+/// caller differently — MCP from `AI_MEMORY_AGENT_ID`
+/// (`identity::resolve_mcp_read_visibility_caller`), HTTP from `X-Agent-Id`
+/// plus the admin allow-list — and a hidden default here would silently
+/// re-open the global sweep on whichever surface forgot.
+///
 /// Errors:
 /// * `days must be non-negative` — caller passed `days < 0`.
 /// * `days must not exceed 36500 days` — caller exceeded the bounded
@@ -39,6 +50,7 @@ use crate::confidence::calibrate::{DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
 pub fn handle_calibrate_confidence(
     conn: &rusqlite::Connection,
     params: &Value,
+    audience: &CalibrationAudience,
 ) -> Result<Value, String> {
     let days = params
         .get("days")
@@ -54,7 +66,7 @@ pub fn handle_calibrate_confidence(
         ));
     }
 
-    let report = calibrate_from_shadow(conn, days, chrono::Utc::now())
+    let report = calibrate_from_shadow(conn, days, chrono::Utc::now(), audience)
         .map_err(|e| format!("memory_calibrate_confidence substrate error: {e}"))?;
 
     Ok(json!({ "report": report }))
@@ -148,7 +160,8 @@ mod tests {
     #[test]
     fn empty_db_returns_empty_baselines() {
         let (conn, _dir) = open_tmp();
-        let v = handle_calibrate_confidence(&conn, &json!({})).expect("ok");
+        let v = handle_calibrate_confidence(&conn, &json!({}), &CalibrationAudience::admin())
+            .expect("ok");
         assert_eq!(v["report"]["total_observations"], 0);
         assert!(v["report"]["baselines"].as_array().unwrap().is_empty());
     }
@@ -157,14 +170,16 @@ mod tests {
     fn rejects_negative_days() {
         let (conn, _dir) = open_tmp();
         let err =
-            handle_calibrate_confidence(&conn, &json!({"days": -1})).expect_err("must reject");
+            handle_calibrate_confidence(&conn, &json!({"days": -1}), &CalibrationAudience::admin())
+                .expect_err("must reject");
         assert!(err.contains("non-negative"));
     }
 
     #[test]
     fn default_days_used_when_omitted() {
         let (conn, _dir) = open_tmp();
-        let v = handle_calibrate_confidence(&conn, &json!({})).expect("ok");
+        let v = handle_calibrate_confidence(&conn, &json!({}), &CalibrationAudience::admin())
+            .expect("ok");
         assert_eq!(
             v["report"]["window_days"].as_i64().unwrap(),
             DEFAULT_WINDOW_DAYS
@@ -174,18 +189,24 @@ mod tests {
     #[test]
     fn bounded_days_refuse_huge_and_allow_maximum_3384() {
         let (conn, _dir) = open_tmp();
-        let err = handle_calibrate_confidence(&conn, &json!({"days": i64::MAX}))
-            .expect_err("huge calibration window must be refused without panicking");
+        let err = handle_calibrate_confidence(
+            &conn,
+            &json!({"days": i64::MAX}),
+            &CalibrationAudience::admin(),
+        )
+        .expect_err("huge calibration window must be refused without panicking");
         assert!(err.contains("must not exceed 36500"), "got: {err}");
 
-        let zero = handle_calibrate_confidence(&conn, &json!({"days": 0}))
-            .expect("zero is the documented empty-window calibration shape");
+        let zero =
+            handle_calibrate_confidence(&conn, &json!({"days": 0}), &CalibrationAudience::admin())
+                .expect("zero is the documented empty-window calibration shape");
         assert_eq!(zero["report"]["window_days"].as_i64(), Some(0));
         assert_eq!(zero["report"]["total_observations"].as_u64(), Some(0));
 
         let value = handle_calibrate_confidence(
             &conn,
             &json!({"days": crate::validate::MAX_DURATION_DAYS}),
+            &CalibrationAudience::admin(),
         )
         .expect("maximum bounded window remains valid");
         assert_eq!(

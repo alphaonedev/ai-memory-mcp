@@ -26,7 +26,9 @@ use clap::{Args, ValueEnum};
 use rusqlite::Connection;
 
 use crate::cli::CliOutput;
-use crate::confidence::calibrate::{CalibrationReport, DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
+use crate::confidence::calibrate::{
+    CalibrationAudience, CalibrationReport, DEFAULT_WINDOW_DAYS, calibrate_from_shadow,
+};
 
 /// Output format for the calibration report.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -81,12 +83,29 @@ pub struct CalibrateConfidenceArgs {
 /// Returns `Ok(0)` on success and a non-zero exit code on a validated
 /// failure mode (DB unavailable, sweep error).
 ///
+/// # Caller gate (v1.0.0 #3507)
+///
+/// The report is a CALLER-SCOPED aggregate on every surface, this one
+/// included, so the sweep runs as a named principal rather than as an
+/// implicit operator. `cli_agent_id` is the global `--agent-id` flag (clap
+/// also folds `AI_MEMORY_AGENT_ID` into that slot); when it is absent the
+/// principal is the SAME process-derived identity `ai-memory store` stamps
+/// ([`crate::identity::resolve_agent_id`]), so a single-operator install
+/// keeps working and still only aggregates rows that identity can read.
+/// There is no admin arm here: the CLI has no authenticated admin gate, and
+/// minting one from the local process would be a bypass rather than a gate.
+///
 /// # Errors
 ///
 /// Propagates DB and serialisation errors. The shadow observation
 /// table is created by the v39 migration; running the sweep against a
 /// pre-v39 DB surfaces the SQL error from the substrate.
-pub fn run(db_path: &Path, args: &CalibrateConfidenceArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+pub fn run(
+    db_path: &Path,
+    args: &CalibrateConfidenceArgs,
+    cli_agent_id: Option<&str>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     if !args.from_shadow {
         writeln!(
             out.stderr,
@@ -107,7 +126,18 @@ pub fn run(db_path: &Path, args: &CalibrateConfidenceArgs, out: &mut CliOutput<'
     // v1.0.0 #2445 — raw-open WRITE funnel (`calibrate_from_shadow` UPDATEs
     // `confidence_shadow_observations`).
     crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
-    let report = calibrate_from_shadow(&conn, args.days, chrono::Utc::now())?;
+    // v1.0.0 #3507 — resolve the sweep's principal BEFORE touching the
+    // substrate. A resolution failure refuses the command (exit 2) rather
+    // than falling back to the pre-#3507 global aggregate.
+    let principal = crate::identity::resolve_agent_id(cli_agent_id, None)?;
+    let audience = match CalibrationAudience::for_caller(&principal) {
+        Ok(audience) => audience,
+        Err(refusal) => {
+            writeln!(out.stderr, "calibrate confidence: {refusal}")?;
+            return Ok(2);
+        }
+    };
+    let report = calibrate_from_shadow(&conn, args.days, chrono::Utc::now(), &audience)?;
 
     let buf = match args.output_format {
         OutputFormat::Json => serde_json::to_string_pretty(&report)?,
@@ -179,7 +209,7 @@ mod tests {
         };
         let code = {
             let mut out = env.output();
-            run(&db, &args, &mut out).expect("ok")
+            run(&db, &args, Some("ai:calibrate-cli-test"), &mut out).expect("ok")
         };
         assert_eq!(code, 2);
         assert!(env.stderr_str().contains("--from-shadow"));
@@ -199,7 +229,7 @@ mod tests {
         };
         let code = {
             let mut out = env.output();
-            run(&db, &args, &mut out).expect("ok")
+            run(&db, &args, Some("ai:calibrate-cli-test"), &mut out).expect("ok")
         };
         assert_eq!(code, 0);
         let parsed: serde_json::Value =
@@ -220,7 +250,7 @@ mod tests {
         };
         let code = {
             let mut out = env.output();
-            run(&db, &args, &mut out).expect("ok")
+            run(&db, &args, Some("ai:calibrate-cli-test"), &mut out).expect("ok")
         };
         assert_eq!(code, 0);
         assert!(env.stdout_str().contains("CONFIDENCE CALIBRATION REPORT"));

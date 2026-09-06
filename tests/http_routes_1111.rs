@@ -295,8 +295,24 @@ async fn atomise_http_route_1111() {
 async fn calibrate_confidence_http_route_1111() {
     let _dir = fresh_dir();
     let (router, _f) = build_router_fixture();
-    // No params → substrate uses default window; 200 OK with empty
-    // confidence-shadow table.
+    // v1.0.0 #3507 — the report is a CALLER-SCOPED aggregate, so the route
+    // requires an `X-Agent-Id`. With one, no params → substrate uses the
+    // default window; 200 OK over an empty confidence-shadow table.
+    let (status, body) = post_json_with_agent(
+        &router,
+        "/api/v1/memory_calibrate_confidence",
+        serde_json::json!({}),
+        "ai:calibrate-1111",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "#1111: calibrate_confidence with default window must 200 OK; got {status} {body}"
+    );
+
+    // DENIED half (#3507): no caller header ⇒ refused, never the pre-#3507
+    // cross-namespace global sweep.
     let (status, body) = post_json(
         &router,
         "/api/v1/memory_calibrate_confidence",
@@ -305,8 +321,15 @@ async fn calibrate_confidence_http_route_1111() {
     .await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "#1111: calibrate_confidence with default window must 200 OK; got {status} {body}"
+        StatusCode::FORBIDDEN,
+        "#3507: calibrate_confidence without X-Agent-Id must refuse; got {status} {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("caller-scoped aggregate"),
+        "#3507: the refusal must name the caller-scoped posture: {body}"
     );
 }
 
