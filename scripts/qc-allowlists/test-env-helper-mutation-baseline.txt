@@ -1,0 +1,38 @@
+# scripts/qc-allowlists/test-env-helper-mutation-baseline.txt -- issue #3523 ratchet baseline.
+#
+# Format: <helper-routed env mutations> <path>
+#
+# Arm (d) counts LITERAL set_var/remove_var lines, so an env write
+# routed through a CROSS-FILE helper (crate::test_support::EnvGuard,
+# identity::agent_id_env_*_guard, ...) is invisible to it. This is the
+# sibling census that closes that bypass. Regenerate with:
+#   scripts/check-test-env-lock.sh --update-baseline
+# A regenerated baseline that RAISES any number is a deliberate,
+# reviewable widening -- justify it in review.
+# See the arm (e) header in scripts/check-test-env-lock.sh for the
+# full wrapper enumeration and the documented-exempt fixtures.
+2 src/cli/agents.rs
+2 src/cli/doctor.rs
+11 src/cli/recall.rs
+1 src/cli/test_utils.rs
+1 src/coordination_guard.rs
+7 src/encryption/mod.rs
+3 src/federation/identity/resolver.rs
+4 src/handlers/federation_receive.rs
+3 src/handlers/tests.rs
+1 src/identity/attest.rs
+1 src/identity/mod.rs
+73 src/log_paths.rs
+7 src/mcp/mod.rs
+1 src/mcp/param_numeric_3374_tests.rs
+9 src/mcp/tools/action.rs
+2 src/mcp/tools/check_agent_action.rs
+10 src/mcp/tools/link.rs
+7 src/mcp/tools/namespace.rs
+4 src/mcp/tools/notify.rs
+1 src/mcp/tools/pending.rs
+11 src/mcp/tools/replay.rs
+7 src/mcp/tools/store/tests.rs
+45 src/mcp/tools/update.rs
+12 src/storage/connection.rs
+4 src/test_support.rs

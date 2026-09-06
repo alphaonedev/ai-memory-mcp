@@ -1046,7 +1046,13 @@ but new public operations live on the trait.
 
 Twelve numbered script-based lint gates run in CI alongside the four
 cargo gates (fmt / clippy / test / audit) and the two test-guard jobs
-(`test-stdin-gate` #1989, `test-env-lock-gate` #2146). All are
+(`test-stdin-gate` #1989, `test-env-lock-gate` #2146 — whose census now
+runs FIVE arms: (a)-(c) police how a `$HOME` mutation is serialized,
+(d) #3475 ratchets literal `set_var`/`remove_var` lines per `src/**`
+file, and (e) #3523 ratchets the CROSS-FILE-HELPER writes arm (d)
+cannot see, because a mutation routed through
+`crate::test_support::EnvGuard` spells neither verb and leaves the
+calling file's arm (d) count at zero). All are
 HARD-BLOCK. Eleven are wired into `.github/workflows/c8-precheck.yml`,
 whose TWENTY-TWO jobs are `c8-precheck`, `vendor-literal-gate`,
 `l3-boundary-gate`, `hardcoded-literal-gate`, `docs-vs-ssot-drift`,
