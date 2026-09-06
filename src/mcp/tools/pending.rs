@@ -858,6 +858,15 @@ mod tests {
     // full reflect payload.
     #[test]
     fn pending_approve_reaches_execute_step() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: the wire `agent_id: "ai:approver"` reaches
+        // `resolve_governance_subject`, so a concurrently installed principal
+        // mismatches it and the call refuses instead of executing.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = queue_pending_promote_unbound(&conn, "ai:tester");
         let result = handle_pending_approve(
@@ -895,6 +904,15 @@ mod tests {
     // handle_pending_approve — unknown id returns rejected.
     #[test]
     fn pending_approve_unknown_id_rejected() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: it reaches `resolve_governance_subject` with no wire
+        // principal, so no mismatch is possible TODAY. Guarded anyway so a future
+        // reorder of the handler cannot make it env-sensitive silently.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_pending_approve(
             &conn,
@@ -910,6 +928,14 @@ mod tests {
     // handle_pending_reject — happy path with session remember label.
     #[test]
     fn pending_reject_happy_path() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: wire `agent_id: "ai:rejecter"` — the same mismatch shape
+        // as the sibling below that lane #3515 actually caught.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = queue_pending(&conn, "ai:tester");
         let resp = handle_pending_reject(
@@ -925,6 +951,16 @@ mod tests {
     // handle_pending_reject — once remember default emits "once".
     #[test]
     fn pending_reject_default_remember_is_once() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: OBSERVED by lane #3515 in a full `--lib` run — failed with
+        // `agent_id mismatch: caller 'ai:bob'` while the siblings that install
+        // `ai:bob` (`pending_reject_allows_registered_non_requester_3388`,
+        // `promote.rs::cross_owner_promote_refused_1786`) were running.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = queue_pending(&conn, "ai:tester");
         let resp =
@@ -944,6 +980,14 @@ mod tests {
     // handle_pending_reject — unknown id (already-decided contract).
     #[test]
     fn pending_reject_unknown_id_errors() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: reaches `resolve_governance_subject`; guarded for the same
+        // durability reason as the approve twin.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_pending_reject(
             &conn,

@@ -747,6 +747,16 @@ mod tests {
     /// the write-reserved `_peer_head_entanglement` target is refused.
     #[test]
     fn issue_2357_promote_rejects_reserved_to_namespace() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: the row is owned by `ai:alice`, so an installed foreign
+        // principal makes the #1786 owner gate refuse with
+        // CALLER_DOES_NOT_OWN_MEMORY *before* the reserved-namespace check this
+        // test asserts.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = open_conn();
         let id = insert_owned(&conn, "issue-2357-promote", "promo-2357", "ai:alice");
         let err = handle_promote(
