@@ -435,7 +435,23 @@ name; a refresher pointed anywhere else leaves a hub reading a file nobody
 writes, which looks like a working install right up to the moment every hello
 is refused. On Linux the runtime directory is created `0700` by the hub unit
 (`RuntimeDirectory=ai-memory`, `RuntimeDirectoryPreserve=yes`) and both units
-run as the same `User=`, so the refresher needs only `ReadWritePaths=/run/ai-memory`.
+run as the same `User=`, so the refresher writes into it without creating or
+chmod-ing anything.
+
+**Grant the database's DIRECTORY, not the database file.** The systemd
+refresher runs under `ProtectSystem=strict`, so every path it writes has to be
+named in a `ReadWritePaths=`. SQLite runs the store in WAL mode, and WAL mode
+creates and locks `ai-memory.db-wal` and `ai-memory.db-shm` BESIDE the
+database — a reader opens them too, and `identity hub-cache` is not even a
+pure reader, since it audits its allow/revoke decisions onto the signed_events
+spine. Naming only `/var/lib/ai-memory/ai-memory.db` would leave those side
+files on a read-only parent: the run fails, nothing is published, and the
+previous snapshot ages past the 60 s ceiling into refusal — fail-closed, but a
+hub that admits nobody. The shipped unit therefore grants
+`ReadWritePaths=/var/lib/ai-memory`, the same directory grant
+`ai-memory.service` uses ("Only touch `AI_MEMORY_DB`'s parent"); if you keep
+the database somewhere else, name THAT directory here instead. The macOS
+launchd job carries no path allowlist, so it needs no equivalent.
 
 **After a reboot the snapshot is gone.** `/run` is a tmpfs, so the hub starts
 admitting nobody and stays that way until the refresher has run once — which is
