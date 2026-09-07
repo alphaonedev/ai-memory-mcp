@@ -303,6 +303,22 @@ triggers re-cert** (see §7).
 > pending the #3502 re-validation and re-issue tracked by #3501.**
 > Historical bind remains `e22bc93c`.
 >
+> **Amendment (2026-09-07, #3472 — wake-plane DISCLOSURE, not a §7
+> trigger).** §6 now names the v1.0.0 wake plane (EPIC #3466) as
+> transport-only, content-free, and outside this certification, and §4's
+> live-harness reconciliation records the `wake_backstop_always_armed_3472`
+> removability row (14 -> 15 live rows). **Documentation and one harness MAP
+> row only — no production line changed.** No §7-watched federation-wire
+> path was touched, no `AI_MEMORY_FED_*` identifier was added, removed or
+> renamed, no schema rung was cut, and no certified control was removed or
+> weakened. The wake plane consults no federation verdict and no federation
+> verdict consults it, so the coverage claims in §1-§4 are unaffected: the
+> entry NARROWS what a reader may bet on rather than widening it. **This
+> amendment does NOT re-mint the certification** (bind remains `e22bc93c`;
+> the 2026-08-12 5-agent adversarial ratification stands, and the #3502
+> expiry record above is untouched — re-issue remains the #3501 Conductor
+> task).
+>
 ---
 
 ## 1. The trust boundary (what is certified)
@@ -893,7 +909,7 @@ control is the SOLE decisive gate.
 
 > **Live-harness reconciliation (a reader running the harness today sees
 > MORE than the confinement subset).** `scripts/check-cert-removal-proof.sh`
-> at the current release tip carries **14 control rows**, not the six
+> at the current release tip carries **15 control rows**, not the six
 > tabulated above: the confinement subset here PLUS controls the
 > forensic-audit-trail wave (`compute_signature_verdict` / L4,
 > `audit_watermark_exoneration_authenticated` / L7,
@@ -904,16 +920,36 @@ control is the SOLE decisive gate.
 > (`consolidate_confidence_floor_2935`,
 > `consolidate_derived_kind_2935` / #2935), and the GA Wave-2 cluster
 > (`admin_header_trust_boot_refusal` / #3065,
-> `consume_execution_exemption` / #2991) added AFTER the §5.4(5)
+> `consume_execution_exemption` / #2991), and the v1.0.0 wake-plane
+> REMOVABILITY row (`wake_backstop_always_armed_3472` / #3472, EPIC
+> #3466 — see §6), all added AFTER the §5.4(5)
 > capture. Those additions span `src/signed_events.rs`,
 > `src/governance/audit.rs`, `src/storage/mod.rs`,
-> `src/handlers/admin_role.rs`, and `src/approvals.rs` — so the statement
+> `src/handlers/admin_role.rs`, `src/approvals.rs` and
+> `src/wake_client/mod.rs` — so the statement
 > elsewhere in this section that "the harness MAP covers only these
 > `receive_auth` confinement controls" describes the **captured** map,
 > not the live one. The additions are strictly-stronger (each is a
 > load-bearing integrity control the harness now proves); none removes or
 > weakens a certified confinement control, and the confinement subset the
-> determination rested on is unchanged. Reproducing the exact `7/7` figure
+> determination rested on is unchanged. The #3472 row is DIRECTIONALLY
+> different from every other row and is called out so a reader does not
+> mistake it for a coverage claim: it proves a control the certification
+> does **not** cover is REMOVABLE — mutating
+> `wake_client::WakeStream::start` so the bounded backstop poll is no
+> longer armed unconditionally turns
+> `tests/wake_client_3470.rs::inbox_wait_returns_on_the_bounded_backstop_with_no_hub_3470`
+> RED, which is the executable form of the §6 statement that the POLL, not
+> the wake hub, is the load-bearing delivery mechanism. #3472 EXECUTED
+> the row on the branch tip before merging it — broken -> **RED**
+> (`rc=101`, the guard test panicking on `the backstop must fire inside
+> its own bound`), restored -> **GREEN** (`rc=0`, 1 passed), harness
+> verdict `[PROVEN] … overall: PASS`. As with every row, the pair lands
+> under the untracked `.local-runs/cert-54-evidence/`, so **no capture
+> for it is committed**; a reader reproduces it with
+> `scripts/check-cert-removal-proof.sh wake_backstop_always_armed_3472`.
+> `docs/compliance/evidence/cert-54/` remains the 2026-08-13
+> confinement-subset capture and is unchanged. Reproducing the exact `7/7` figure
 > requires the cert-54 evidence bundle at the captured tree; reproducing
 > "every cited control is load-bearing" requires only running the live
 > harness (which will report a larger PROVEN count).
@@ -1009,6 +1045,39 @@ following should **not** treat v1.0.0 as sufficient:
   proof-format ships. Runtime detection/eviction of an equivocating
   peer is **v1.x-deferred**
   ([#2002](https://github.com/alphaonedev/ai-memory-mcp/issues/2002)).
+- **The wake plane is TRANSPORT-ONLY, and this certification does not
+  extend to it.** v1.0.0 ships a same-host agent wake plane (EPIC
+  [#3466](https://github.com/alphaonedev/ai-memory-mcp/issues/3466);
+  `src/inbox_wake.rs`, `src/wake_sink/`, `src/wake_hub/`,
+  `src/wake_client/`; `docs/wake-hub.md`). It federates **nothing**: it is
+  reachable only over a mode-`0600` Unix-domain socket on ONE host, never
+  between peers, and no `/sync/push` verdict, no `receive_auth` control and
+  no envelope or signature gate cited in §1-§4 consults it. Three properties
+  keep this document's claims true without extending them to it, and each is
+  recorded here as a LIMIT, not a guarantee. (a) **Content-free** — a wake
+  frame carries exactly `{inbox_row_id, namespace, sender, digest,
+  seq_high_watermark}` (`wake_sink::wake_meta_for`), with no body and no
+  title field on the bus frame or on the wire, so a hub process observes no
+  memory content and the plaintext-to-peer exposure disclosed in the first
+  entry of this section is UNCHANGED by it. (b) **Loss degrades LATENCY
+  only** — the ai-memory inbox row is committed BEFORE any hint is minted
+  and remains the durable truth; every bound in the plane may drop a hint,
+  and a normative `<= 60 s` backstop inbox poll
+  (`wake_sink::BACKSTOP_POLL_MAX`) is always armed, hub or no hub, so a hub
+  that is slow, full, absent or deleted costs wake latency and a counter,
+  never a committed notify and never a row. (c) **NOT covered, concretely**
+  — no wake-latency SLO, no delivery / ordering / at-least-once guarantee
+  for a hint, no MEASURED hub scale envelope (its bounds are architected per
+  the EPIC, exactly like the agent dimension in the scale-envelope entry
+  above), and no authority derived from a hint: what a woken recipient may
+  read is decided by the ordinary inbox read it then performs, not by the
+  wake. The hub is **provably removable**, mechanically rather than by
+  assertion: `scripts/check-cert-removal-proof.sh` carries the
+  `wake_backstop_always_armed_3472` row (§4), which disarms the
+  always-armed backstop in `wake_client::WakeStream::start` and asserts the
+  no-hub lane test turns RED — the POLL, not the hub, is the load-bearing
+  delivery mechanism. Deleting the wake plane outright would cost wake
+  latency and no correctness property this document certifies.
 
 ---
 
