@@ -16,6 +16,7 @@
 11 src/cli/recall.rs
 1 src/cli/test_utils.rs
 1 src/coordination_guard.rs
+1 src/daemon_runtime.rs
 7 src/encryption/mod.rs
 3 src/federation/identity/resolver.rs
 4 src/handlers/federation_receive.rs
@@ -28,11 +29,17 @@
 9 src/mcp/tools/action.rs
 2 src/mcp/tools/check_agent_action.rs
 10 src/mcp/tools/link.rs
+3 src/mcp/tools/list.rs
 7 src/mcp/tools/namespace.rs
 4 src/mcp/tools/notify.rs
-1 src/mcp/tools/pending.rs
+10 src/mcp/tools/pending.rs
+1 src/mcp/tools/promote.rs
 11 src/mcp/tools/replay.rs
+4 src/mcp/tools/search.rs
+1 src/mcp/tools/session_start.rs
 7 src/mcp/tools/store/tests.rs
+1 src/mcp/tools/subscribe.rs
 45 src/mcp/tools/update.rs
 12 src/storage/connection.rs
+1 src/storage/migrations.rs
 4 src/test_support.rs
