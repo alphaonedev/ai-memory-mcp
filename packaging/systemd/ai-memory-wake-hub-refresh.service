@@ -65,7 +65,18 @@ AmbientCapabilities=
 # anything. The file names every agent permitted to join, so the hub refuses to
 # read it unless it is an owner-only 0600 regular file.
 ReadWritePaths=/run/ai-memory
-ReadWritePaths=/var/lib/ai-memory/ai-memory.db
+# The DIRECTORY, not the database file, exactly as ai-memory.service grants it
+# ("Only touch AI_MEMORY_DB's parent"). SQLite runs the store in WAL mode, and
+# WAL mode creates and locks `ai-memory.db-wal` and `ai-memory.db-shm` BESIDE
+# the database — a reader opens them too, and this unit is not even a pure
+# reader: `identity hub-cache` audits its allow/revoke decisions onto the
+# signed_events spine. Granting only the .db file leaves the parent read-only
+# under ProtectSystem=strict, so the run fails, publishes nothing, the previous
+# snapshot ages past the hub's 60 s ceiling and the hub refuses every hello.
+# Fail-closed, but a dead deployment. Keep the directory, and keep the
+# database's parent 0750 ai-memory:ai-memory (the package installer's mode).
+# An operator who keeps the database elsewhere names THAT directory here.
+ReadWritePaths=/var/lib/ai-memory
 
 # Bounded so a wedged run cannot pile up behind the next timer tick. The hub
 # tolerates a missed refresh by refusing hellos, never by admitting stale
