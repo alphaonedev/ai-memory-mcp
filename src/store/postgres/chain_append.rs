@@ -575,3 +575,319 @@ pub(super) async fn append_revision_leaf_row(
         retry.lost()?;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CHAIN_APPEND_MAX_ATTEMPTS, SQL_INSERT_REVISION_LEAF, SQL_INSERT_SIGNED_EVENT,
+        SQLSTATE_UNIQUE_VIOLATION, SequenceChain, exhausted_detail, retries_total,
+    };
+
+    /// The `ON CONFLICT` arbiter clause both chain INSERTs must carry. Written
+    /// once so the two structural assertions below cannot drift from each other
+    /// while both still passing.
+    const ARBITER_CLAUSE: &str = "ON CONFLICT (sequence) DO NOTHING";
+
+    /// The #3527 fix in one assertion: the conflict arbiter is SCOPED to
+    /// `sequence`.
+    ///
+    /// A bare `ON CONFLICT DO NOTHING` would absorb a conflict on EVERY unique
+    /// index — including the `id` PRIMARY KEY — which would silently turn a
+    /// genuinely replayed audit event into a no-op that the caller could not
+    /// distinguish from a successful append. Naming the arbiter is what keeps
+    /// the general "a unique violation is permanent" rule intact for caller
+    /// data while letting the substrate-derived `sequence` be re-derived.
+    #[test]
+    fn both_chain_inserts_scope_the_conflict_arbiter_to_sequence_3527() {
+        for sql in [SQL_INSERT_SIGNED_EVENT, SQL_INSERT_REVISION_LEAF] {
+            assert!(
+                sql.contains(ARBITER_CLAUSE),
+                "the chain INSERT must name `sequence` as its conflict arbiter: {sql}"
+            );
+            assert!(
+                !sql.contains("ON CONFLICT DO NOTHING"),
+                "an UNSCOPED arbiter would swallow a replayed `id` on the PRIMARY \
+                 KEY, making a permanent violation look like a successful append: {sql}"
+            );
+        }
+    }
+
+    /// The two chains must name DIFFERENT unique indexes and DIFFERENT tables.
+    /// A copy-paste that pointed the revision ledger at the audit chain's index
+    /// would make the operator-facing WARN name the wrong table on every
+    /// contention event.
+    #[test]
+    fn the_two_chains_are_distinctly_labelled_3527() {
+        assert_ne!(
+            SequenceChain::SignedEvents.sequence_index(),
+            SequenceChain::MemoryRevisions.sequence_index()
+        );
+        assert_ne!(
+            SequenceChain::SignedEvents.table(),
+            SequenceChain::MemoryRevisions.table()
+        );
+        // Each chain's INSERT targets its own table.
+        assert!(SQL_INSERT_SIGNED_EVENT.contains(SequenceChain::SignedEvents.table()));
+        assert!(SQL_INSERT_REVISION_LEAF.contains(SequenceChain::MemoryRevisions.table()));
+    }
+
+    /// The fail-closed refusal must be greppable: it names the table, the
+    /// index, the attempt count and the SQLSTATE class an operator who has
+    /// seen the pre-#3527 failures would search for.
+    #[test]
+    fn the_exhaustion_refusal_names_the_chain_index_and_sqlstate_3527() {
+        let detail = exhausted_detail(SequenceChain::SignedEvents, CHAIN_APPEND_MAX_ATTEMPTS);
+        assert!(
+            detail.contains(SequenceChain::SignedEvents.table()),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(SequenceChain::SignedEvents.sequence_index()),
+            "{detail}"
+        );
+        assert!(detail.contains(SQLSTATE_UNIQUE_VIOLATION), "{detail}");
+        assert!(
+            detail.contains(&CHAIN_APPEND_MAX_ATTEMPTS.to_string()),
+            "{detail}"
+        );
+        // It must read as a REFUSAL, never as a fallback that wrote something.
+        assert!(detail.contains("refusing"), "{detail}");
+    }
+
+    /// The budget must leave room for a realistic burst of concurrent
+    /// appenders while staying bounded. A budget of 1 would be no retry at
+    /// all; an unbounded one would trade a prompt refusal for a stall.
+    #[test]
+    fn the_attempt_budget_is_bounded_and_greater_than_one_3527() {
+        assert!(CHAIN_APPEND_MAX_ATTEMPTS > 1);
+        assert!(CHAIN_APPEND_MAX_ATTEMPTS <= 64);
+    }
+
+    /// The counter is monotonic and readable without a database.
+    #[test]
+    fn retries_total_is_readable_and_monotonic_3527() {
+        let a = retries_total();
+        let b = retries_total();
+        assert!(b >= a);
+    }
+
+    // ------------------------------------------------------------------
+    // Live-Postgres regression tests for #3527.
+    //
+    // Run iff AI_MEMORY_TEST_POSTGRES_URL is set; otherwise they skip
+    // cleanly so the default `cargo test` flow stays offline.
+    // ------------------------------------------------------------------
+
+    use super::super::{
+        PgSignedEventInsert, PostgresStore, pg_append_signed_event_with_chain_in_tx,
+    };
+
+    fn postgres_url() -> Option<String> {
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
+    }
+
+    /// Appends ONE unsigned `signed_events` row with the caller's `id` inside
+    /// `tx`, and returns the sequence it claimed.
+    async fn append_probe_row(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: &str,
+    ) -> Result<i64, sqlx::Error> {
+        pg_append_signed_event_with_chain_in_tx(
+            tx,
+            PgSignedEventInsert {
+                id,
+                agent_id: "ai:chain-append-3527",
+                event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED,
+                payload_hash: &[0_u8; 32],
+                signature: None,
+                attest_level: crate::models::AttestLevel::Unsigned.as_str(),
+                timestamp: chrono::Utc::now(),
+                cause_hash: None,
+            },
+        )
+        .await?;
+        sqlx::query_scalar("SELECT sequence FROM signed_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await
+    }
+
+    /// Polls `pg_stat_activity` until backend `pid` is WAITING on a lock, so
+    /// the provocation is deterministic rather than timing-hopeful: we only
+    /// release the blocker once the victim is provably parked on it.
+    async fn await_backend_blocked_on_lock(pool: &sqlx::PgPool, pid: i32) {
+        for _ in 0..600_u32 {
+            let waiting: Option<String> =
+                sqlx::query_scalar("SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1")
+                    .bind(pid)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("probe pg_stat_activity")
+                    .flatten();
+            if waiting.as_deref() == Some("Lock") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "backend {pid} never blocked on a lock: the provocation did not reproduce the \
+             #3527 collision, so this run proves nothing"
+        );
+    }
+
+    /// #3527 — the DETERMINISTIC collision. Two sessions read the SAME chain
+    /// head and both try to claim `head + 1`; the loser must re-derive and
+    /// land on a distinct sequence with the hash chain intact, instead of
+    /// failing the caller's whole write with SQLSTATE 23505.
+    ///
+    /// Determinism comes from postgres' own semantics, not from sleeps: while
+    /// A holds its speculative insert uncommitted, B's insert of the same
+    /// `sequence` MUST block; we wait for that block to be observable in
+    /// `pg_stat_activity` before committing A, at which point B's arbiter
+    /// absorbs the conflict and the retry fires.
+    #[tokio::test]
+    async fn a_lost_sequence_race_re_derives_and_keeps_the_chain_intact_3527() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let pool = store.pool.clone();
+        let retries_before = retries_total();
+
+        // Session A claims a sequence and HOLDS it uncommitted.
+        let mut tx_a = pool.begin().await.expect("begin A");
+        let id_a = format!("se-3527-a-{}", uuid::Uuid::new_v4());
+        let seq_a = append_probe_row(&mut tx_a, &id_a).await.expect("append A");
+
+        // Session B, on its own connection, reads the SAME head (A is
+        // uncommitted, so invisible) and blocks trying to claim seq_a.
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+        let pool_b = pool.clone();
+        let id_b = format!("se-3527-b-{}", uuid::Uuid::new_v4());
+        let id_b_for_task = id_b.clone();
+        let b = tokio::spawn(async move {
+            let mut tx_b = pool_b.begin().await.expect("begin B");
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx_b)
+                .await
+                .expect("B backend pid");
+            pid_tx.send(pid).expect("report B pid");
+            let seq = append_probe_row(&mut tx_b, &id_b_for_task)
+                .await
+                .expect("append B must SUCCEED by re-deriving, not fail with 23505");
+            tx_b.commit().await.expect("commit B");
+            seq
+        });
+
+        let pid_b = pid_rx.await.expect("receive B pid");
+        await_backend_blocked_on_lock(&pool, pid_b).await;
+
+        // Releasing A turns B's block into an absorbed conflict.
+        tx_a.commit().await.expect("commit A");
+        let seq_b = b.await.expect("join B");
+
+        assert!(
+            seq_b > seq_a,
+            "the loser must land on a DISTINCT, later sequence (a={seq_a}, b={seq_b})"
+        );
+        assert!(
+            retries_total() > retries_before,
+            "the append must have been RETRIED; a run where the collision never \
+             happened would prove nothing about #3527"
+        );
+
+        // Chain continuity: B's prev_hash must be the canonical hash of the
+        // row that now sits immediately below it.
+        let prev_row: (
+            String,
+            String,
+            String,
+            Vec<u8>,
+            Option<Vec<u8>>,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            Option<i64>,
+            Option<Vec<u8>>,
+        ) = sqlx::query_as(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, sequence, cause_hash \
+             FROM signed_events WHERE sequence = $1",
+        )
+        .bind(seq_b - 1)
+        .fetch_one(&pool)
+        .await
+        .expect("read the row below B");
+        let expected_prev = {
+            use sha2::{Digest, Sha256};
+            let ev = crate::signed_events::SignedEvent {
+                id: prev_row.0,
+                agent_id: prev_row.1,
+                event_type: prev_row.2,
+                payload_hash: prev_row.3,
+                signature: prev_row.4,
+                attest_level: prev_row.5,
+                timestamp: prev_row.6.to_rfc3339(),
+                prev_hash: Vec::new(),
+                sequence: prev_row.7.unwrap_or(0),
+                cause_hash: prev_row.8,
+            };
+            let mut h = Sha256::new();
+            h.update(crate::signed_events::canonical_chain_bytes(&ev));
+            h.finalize().to_vec()
+        };
+        let stored_prev: Vec<u8> =
+            sqlx::query_scalar("SELECT prev_hash FROM signed_events WHERE id = $1")
+                .bind(&id_b)
+                .fetch_one(&pool)
+                .await
+                .expect("read B prev_hash");
+        assert_eq!(
+            stored_prev, expected_prev,
+            "the re-derived row must link to the head it actually landed on — a \
+             retry that kept a losing attempt's prev_hash would BREAK the chain"
+        );
+    }
+
+    /// #3527 — the negative half. A genuinely REPLAYED event id must still
+    /// fail PERMANENTLY, on its first attempt, on the PRIMARY KEY. The retry
+    /// exists only for the substrate-derived `sequence`; widening it to the
+    /// whole `23505` class would let a replayed audit event be silently
+    /// absorbed, which is the failure this fix must not introduce.
+    #[tokio::test]
+    async fn a_replayed_event_id_still_fails_permanently_3527() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let pool = store.pool.clone();
+
+        let id = format!("se-3527-replay-{}", uuid::Uuid::new_v4());
+        let mut tx = pool.begin().await.expect("begin first");
+        append_probe_row(&mut tx, &id).await.expect("first append");
+        tx.commit().await.expect("commit first");
+
+        let mut tx2 = pool.begin().await.expect("begin replay");
+        let err = append_probe_row(&mut tx2, &id)
+            .await
+            .expect_err("a replayed event id MUST NOT be absorbed");
+        drop(tx2);
+
+        let db = err.as_database_error().expect(
+            "a replayed id must surface as a DATABASE error, never as the \
+                     retry-budget refusal",
+        );
+        assert_eq!(
+            db.code().as_deref(),
+            Some(SQLSTATE_UNIQUE_VIOLATION),
+            "expected the permanent unique violation: {err}"
+        );
+        assert_ne!(
+            db.constraint(),
+            Some(SequenceChain::SignedEvents.sequence_index()),
+            "the replay must fail on the PRIMARY KEY, not on the sequence index \
+             the arbiter covers: {err}"
+        );
+    }
+}
