@@ -2694,6 +2694,81 @@ mod tests {
             .expect("bind json ok");
     }
 
+    /// v1.0.0 #3535 — CLI parity with the HTTP route on the SAL
+    /// (`--store-url`) path: a digest already enrolled to a DIFFERENT agent is
+    /// REFUSED and nothing moves, while re-asserting the SAME pair stays an
+    /// idempotent success. Before #3535 the second bind silently re-pointed a
+    /// live bearer credential from `alice` to `bob`.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn run_bind_api_key_refuses_a_digest_bound_to_another_agent_3535() {
+        let env = TestEnv::fresh();
+        let store = sal_store(&env.db_path);
+        let rt = rt();
+        let token = "shared-token-3535";
+        let hash = crate::handlers::identity_binding::api_key_sha256_hex(token);
+
+        rt.block_on(run_bind_api_key(&store, "alice", token, false))
+            .expect("first bind ok");
+        let err = rt
+            .block_on(run_bind_api_key(&store, "bob", token, false))
+            .expect_err("re-pointing a bound digest must refuse");
+        assert!(
+            err.to_string()
+                .contains("already enrolled to a different agent"),
+            "unexpected refusal text: {err}"
+        );
+        assert!(
+            !err.to_string().contains("alice"),
+            "the refusal must not name the incumbent: {err}"
+        );
+        assert_eq!(
+            rt.block_on(store.agent_id_for_api_key(&hash))
+                .expect("resolve"),
+            Some("alice".to_string()),
+            "a refused re-bind must leave the incumbent binding as it was"
+        );
+        // The same pair is still an idempotent success.
+        rt.block_on(run_bind_api_key(&store, "alice", token, false))
+            .expect("re-asserting the same pair must succeed");
+    }
+
+    /// The sqlite dispatch arm of the same verb — the path an operator takes
+    /// with a plain `--db`, which must refuse identically.
+    #[test]
+    fn bind_api_key_cli_sqlite_arm_refuses_a_repoint_3535() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let token = "shared-token-3535-sqlite-arm";
+        let bind = |agent: &str| AgentsArgs {
+            action: Some(AgentsAction::BindApiKey {
+                agent_id: agent.to_string(),
+                token: token.to_string(),
+                store_url: None,
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, bind("alice"), false, &mut out).expect("first bind ok");
+        }
+        let err = {
+            let mut out = env.output();
+            run_agents(&db, bind("bob"), false, &mut out).expect_err("re-point must refuse")
+        };
+        assert!(
+            err.to_string()
+                .contains("already enrolled to a different agent"),
+            "unexpected refusal text: {err}"
+        );
+        let conn = crate::db::open(&db).expect("open");
+        let hash = crate::handlers::identity_binding::api_key_sha256_hex(token);
+        assert_eq!(
+            crate::db::agent_id_for_api_key(&conn, &hash).expect("resolve"),
+            Some("alice".to_string()),
+            "a refused re-bind must leave the incumbent binding as it was"
+        );
+    }
+
     #[cfg(feature = "sal")]
     #[test]
     fn run_bind_api_key_empty_token_errors_2095() {

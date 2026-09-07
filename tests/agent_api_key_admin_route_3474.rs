@@ -33,6 +33,9 @@
 //! * the TARGET must be a REGISTERED agent — both forms refuse an id the
 //!   `_agents` roster does not know, nothing is bound, and registering that
 //!   very id makes the identical call succeed;
+//! * a token whose digest is already enrolled to ANOTHER agent is a `409` that
+//!   changes nothing, while re-asserting the SAME (agent, digest) pair stays an
+//!   idempotent success;
 
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
@@ -43,7 +46,8 @@ use std::sync::{Arc, Mutex};
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::agent_api_key::{
     MIN_SUPPLIED_TOKEN_BYTES, MINT_RATE_LIMIT_PER_WINDOW, RATE_LIMITED, TARGET_NOT_REGISTERED,
-    TOKEN_TOO_SHORT, TRANSPORT_REFUSAL, approval_subject, mark_credential_transport_confidential,
+    TOKEN_ALREADY_BOUND, TOKEN_TOO_SHORT, TRANSPORT_REFUSAL, approval_subject,
+    mark_credential_transport_confidential,
 };
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -1249,4 +1253,94 @@ async fn revoke_is_not_gated_on_target_registration_3535() {
         body["error"], TARGET_NOT_REGISTERED,
         "revoke must never refuse on registration: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3535 (#3474 advisory 3) — one digest, one agent.
+// ---------------------------------------------------------------------------
+
+/// DENIED — binding a token that is already enrolled to ANOTHER agent is a
+/// `409` that changes nothing; ALLOWED — re-binding the SAME pair is still an
+/// idempotent success.
+///
+/// The defect this pins: `agent_api_keys` is keyed by `sha256(token)`, so the
+/// pre-#3535 upsert overwrote the row's `agent_id` — one LIVE bearer
+/// credential silently stopped authenticating as ALICE and started
+/// authenticating as BOB, with no signal to either and nothing on the signed
+/// chain saying a binding had moved.
+#[tokio::test]
+async fn a_digest_bound_to_another_agent_is_refused_not_repointed_3535() {
+    const ADMIN: &str = "ai:key-admin-repoint";
+    const BOB: &str = "ai:key-bob-repoint";
+    let _g = serial().await;
+    let fx = fixture("repoint", &[ADMIN]);
+    register_target(&fx, BOB);
+
+    let token = "operator-supplied-token-3535-shared-between-two-agents-attempt";
+    let digest = api_key_sha256_hex(token);
+    let (status, _, body) = call(
+        &fx.router,
+        mint_req(ADMIN, ALICE, &json!({ "token": token })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string())
+    );
+
+    // The re-point attempt.
+    let (status, _, body) =
+        call(&fx.router, mint_req(ADMIN, BOB, &json!({ "token": token }))).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "re-pointing a bound digest must be refused: {body}"
+    );
+    assert_eq!(body["error"], TOKEN_ALREADY_BOUND, "{body}");
+    assert!(
+        !body.to_string().contains(token),
+        "the refusal must not echo the token: {body}"
+    );
+    assert!(
+        !body.to_string().contains(ALICE),
+        "the refusal must not name the incumbent principal: {body}"
+    );
+
+    // NOTHING changed: the durable row, the live registry and what the token
+    // actually authenticates as are all untouched.
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string()),
+        "a refused re-bind must leave the incumbent binding exactly as it was"
+    );
+    assert_eq!(fx.registry.len(), 1);
+    assert!(token_authenticates(&fx.router, token).await);
+
+    // ALLOWED — the SAME (agent, digest) pair is an idempotent success, so the
+    // refusal above is a conflict rule and not a ban on retrying an enrolment.
+    let (status, _, body) = call(
+        &fx.router,
+        mint_req(ADMIN, ALICE, &json!({ "token": token })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a re-assertion must succeed: {body}"
+    );
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string())
+    );
+    assert_eq!(fx.registry.len(), 1);
 }
