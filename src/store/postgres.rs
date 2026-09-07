@@ -58,6 +58,9 @@ mod parity_3064;
 // subcollections that were bucketed `unsupported_on_postgres`. Own module for
 // the same qual_10 budget reason as `parity_3064` above.
 mod federation_3075;
+// #3529 — the transactional "revoke unless this is the last enrolled key"
+// seam. Own module for the same qual_10 budget reason as `parity_3064` above.
+mod api_key_revoke_3529;
 mod pubkey_history;
 
 use crate::models::field_names;
@@ -26820,6 +26823,17 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("revoke_agent_api_key", e))?;
         Ok(usize::try_from(res.rows_affected()).unwrap_or(usize::MAX))
+    }
+
+    async fn revoke_agent_api_key_unless_last(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+    ) -> StoreResult<crate::storage::RevokeUnlessLastOutcome> {
+        // The record-stop gate + the whole transaction live in the submodule
+        // (qual_10 budget; B7' keeps the gate on the function that owns the
+        // DELETE).
+        self.revoke_agent_api_key_unless_last_pg(agent_id).await
     }
 
     async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
