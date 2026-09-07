@@ -107,10 +107,15 @@ fn test_serial() -> &'static Mutex<()> {
     M.get_or_init(|| Mutex::new(()))
 }
 
-/// Push a canned curator response onto the queue.
+/// Push a canned curator response onto the SUITE-WIDE queue.
 fn enqueue_atoms(texts: &[&str]) {
-    let arc = shared_state();
-    let mut s = arc.lock().unwrap();
+    enqueue_atoms_into(&shared_state(), texts);
+}
+
+/// Push a canned curator response onto an EXPLICIT mock state — the
+/// suite-wide one, or a case-private one (see [`private_worker`]).
+fn enqueue_atoms_into(state: &Arc<Mutex<MockState>>, texts: &[&str]) {
+    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
     s.responses.push(Ok(texts
         .iter()
         .map(|t| Atom {
@@ -174,6 +179,80 @@ fn shared_queue() -> &'static AtomiseQueue {
 
 fn wiring() -> AtomiseWiring<'static> {
     AtomiseWiring::new(Some(shared_atomiser()), Some(shared_queue()))
+}
+
+/// v1.0.0 #3509 — a CASE-PRIVATE curator + bounded worker, handed back
+/// with the consumer's `JoinHandle` so the case can await quiescence
+/// **deterministically**.
+///
+/// # Why this exists
+///
+/// [`shared_queue`] is a process-lifetime `OnceLock`: its in-flight
+/// jobs can never be awaited, only guessed at. [`drain_workers`] guesses
+/// by watching the suite-wide call counter hold still for a wall-clock
+/// window — so on a saturated host a previous case's jobs are still
+/// running when that window expires, and their curator calls land AFTER
+/// the next case's `reset_mock()`. That is the #3509 flake verbatim:
+/// `curator must not fire when the originating insert was refused —
+/// left: 2, right: 0`, where the 2 were another case's leftovers.
+///
+/// `spawn_joinable` is the substrate's own quiescence signal (#2986):
+/// dropping the last [`AtomiseQueue`] closes the channel, the consumer's
+/// `recv()` returns `Err` only AFTER every buffered job has drained, so
+/// `handle.join()` is "await full drain" with no deadline to lose under
+/// load. Pairing it with a private curator also makes the observed call
+/// count ATTRIBUTABLE to this case — nothing else in the binary can
+/// reach this counter.
+fn private_worker() -> (
+    Arc<Mutex<MockState>>,
+    Arc<Atomiser>,
+    AtomiseQueue,
+    std::thread::JoinHandle<()>,
+) {
+    let state = Arc::new(Mutex::new(MockState {
+        responses: Vec::new(),
+        calls: 0,
+    }));
+    let atomiser = Arc::new(Atomiser::new(
+        Box::new(MockCurator {
+            state: Arc::clone(&state),
+        }),
+        None,
+        AtomiserConfig::default(),
+        FeatureTier::Smart,
+    ));
+    // The provider captures ONLY the atomiser — never anything that
+    // transitively owns the queue, or the sender would keep itself
+    // alive and the join below would hang forever (the `spawn_joinable`
+    // contract).
+    let provider = Arc::clone(&atomiser);
+    let (queue, handle) =
+        ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
+            Some(Arc::clone(&provider))
+        }))
+        .expect("private atomise worker spawns");
+    (state, atomiser, queue, handle)
+}
+
+/// The PRODUCTION caller's sequence, in one place: commit the durable
+/// row FIRST, then — and only then — offer the committed id to the
+/// auto-atomise funnel.
+///
+/// Returns `None` when the substrate REFUSED the write, else the
+/// COMMITTED primary key (never the caller-supplied one) paired with
+/// the funnel's outcome. The `?` on `db::insert(..).ok()` is the point
+/// of the helper: for a refused write the funnel below is unreachable
+/// **by construction**, not because a test politely declined to call
+/// it. Inverting these two statements in a production write path is
+/// exactly the defect this case pins.
+fn store_then_maybe_enqueue(
+    conn: &Connection,
+    mem: &Memory,
+    wiring: AtomiseWiring<'_>,
+) -> Option<(String, AutoAtomisationOutcome)> {
+    let id = db::insert(conn, mem).ok()?;
+    let outcome = maybe_enqueue_auto_atomise(conn, shared_db_path(), mem, &id, "ai:test", wiring);
+    Some((id, outcome))
 }
 
 /// The dispatch's `db_path` is fixed at install time. Every test must
@@ -286,13 +365,17 @@ fn long_body(target_tokens: usize) -> String {
     unit.repeat(n)
 }
 
-fn insert_memory(conn: &Connection, ns: &str, content: &str) -> Memory {
+/// Build (but do NOT insert) a Mid-tier memory. `title` is load-bearing
+/// for the #3509 case: the governance hook it installs refuses exactly
+/// the titles prefixed `refused-`, so the same builder produces both the
+/// allowed control write and the refused write.
+fn build_memory(ns: &str, title: &str, content: &str) -> Memory {
     let now = Utc::now().to_rfc3339();
-    let mem = Memory {
+    Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: ns.to_string(),
-        title: format!("payload-{}", uuid::Uuid::new_v4().simple()),
+        title: title.to_string(),
         content: content.to_string(),
         tags: vec![],
         priority: 5,
@@ -316,7 +399,15 @@ fn insert_memory(conn: &Connection, ns: &str, content: &str) -> Memory {
         confidence_decayed_at: None,
         version: 1,
         ..Memory::default()
-    };
+    }
+}
+
+fn insert_memory(conn: &Connection, ns: &str, content: &str) -> Memory {
+    let mem = build_memory(
+        ns,
+        &format!("payload-{}", uuid::Uuid::new_v4().simple()),
+        content,
+    );
     let id = db::insert(conn, &mem).expect("insert");
     Memory { id, ..mem }
 }
@@ -688,33 +779,42 @@ fn test_auto_atomise_child_override() {
 // Test 7 — governance-refused memory must not enqueue atomisation
 // ===========================================================================
 
+/// A refused write must never reach the auto-atomise funnel.
+///
+/// # #3509 — why this case owns a private worker
+///
+/// This assertion used to read the SUITE-WIDE `mock_call_count()` after
+/// a 300 ms sleep. Both halves were wrong on a loaded host: the counter
+/// is incremented by every case in the binary (via one process-lifetime
+/// worker whose in-flight jobs cannot be awaited), and the sleep is a
+/// guess, not a synchronisation. On the 2026-09-05 gate host it read
+/// `left: 2, right: 0` — two of ANOTHER case's queued jobs completing
+/// after this case's `reset_mock()`.
+///
+/// The case now owns a private curator and a private
+/// [`spawn_joinable`](ai_memory::background::atomise_worker::spawn_joinable)
+/// worker, so:
+///
+/// * the observed call count is ATTRIBUTABLE — no other case can reach
+///   this counter; and
+/// * quiescence is a `drop(queue)` + `join()`, the substrate's own
+///   "every buffered job has drained" signal — no sleep, no poll, no
+///   wall-clock deadline that host load can blow through.
+///
+/// A POSITIVE CONTROL runs first through the same wiring, so the
+/// negative leg cannot pass vacuously: a harness that could never
+/// observe a curator fire would prove nothing by observing none.
 #[test]
 fn test_auto_atomise_refused_memory_not_atomised() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
-    let _conn = shared_db_conn();
+    let conn = shared_db_conn();
     let _ = &db_path;
-    reset_mock();
 
-    // The substrate guarantees that when `db::insert` returns Err
-    // (governance refusal), the post-insert path that would call
-    // `maybe_enqueue_auto_atomise` is never reached. We model that
-    // contract directly by NOT calling the hook when the insert
-    // failed.
-    //
-    // Direct exercise: build a memory but never insert it; the hook
-    // is not called because the upstream contract pins "post-commit
-    // only". Verify the curator never fires.
-    let ns = format!("wt1d-refused-{}", uuid::Uuid::new_v4().simple());
-    // Even with an opt-in policy, the hook only runs after a
-    // successful insert. We open a separate connection, install a
-    // refusing GOVERNANCE_PRE_WRITE hook, attempt the insert, and
-    // verify that no atomisation work fires.
-    //
     // The store-side governance hook is one-shot (`OnceLock::set`).
-    // If a prior test already installed it, this set will be a
-    // no-op — that's fine; we still verify the no-insert ⇒
-    // no-enqueue contract directly.
+    // If a prior test already installed one, this set is a no-op — the
+    // refused leg then soft-skips (see below); the control leg still
+    // runs.
     let _ = db::GOVERNANCE_PRE_WRITE.set(Box::new(|mem: &Memory| {
         if mem.title.starts_with("refused-") {
             Err("test-policy: refused".to_string())
@@ -723,79 +823,103 @@ fn test_auto_atomise_refused_memory_not_atomised() {
         }
     }));
 
-    let conn = shared_db_conn();
+    let (curator_state, atomiser, queue, worker) = private_worker();
+    let ns = format!("wt1d-refused-{}", uuid::Uuid::new_v4().simple());
     seed_policy(&conn, &ns, opt_in_policy(500, 200));
-
     let body = long_body(900);
-    let now = Utc::now().to_rfc3339();
-    let mem = Memory {
-        id: uuid::Uuid::new_v4().to_string(),
-        tier: Tier::Mid,
-        namespace: ns.clone(),
-        title: format!("refused-{}", uuid::Uuid::new_v4().simple()),
-        content: body,
-        tags: vec![],
-        priority: 5,
-        confidence: 1.0,
-        source: "test".to_string(),
-        access_count: 0,
-        created_at: now.clone(),
-        updated_at: now,
-        last_accessed_at: None,
-        expires_at: None,
-        metadata: serde_json::json!({"agent_id": "ai:test"}),
-        reflection_depth: 0,
-        memory_kind: MemoryKind::Observation,
-        entity_id: None,
-        persona_version: None,
-        citations: Vec::new(),
-        source_uri: None,
-        source_span: None,
-        confidence_source: ConfidenceSource::CallerProvided,
-        confidence_signals: None,
-        confidence_decayed_at: None,
-        version: 1,
-        ..Memory::default()
-    };
 
-    let insert_result = db::insert(&conn, &mem);
-    // The governance hook is process-wide one-shot; another test
-    // may have installed an Allow-all hook earlier in this binary's
-    // lifetime. In that case the insert succeeds; we treat that as
-    // a soft-skip (the contract being tested is the
-    // refusal-no-enqueue invariant, not the install ordering).
-    let inserted = insert_result.is_ok();
+    // --- Positive control: an ALLOWED write DOES reach the funnel ----
+    enqueue_atoms_into(
+        &curator_state,
+        &[
+            "Atom one: canary instances health-check before traffic shifts.",
+            "Atom two: failures roll back the deployment within 30 seconds.",
+        ],
+    );
+    let allowed = build_memory(
+        &ns,
+        &format!("allowed-{}", uuid::Uuid::new_v4().simple()),
+        &body,
+    );
+    let control = store_then_maybe_enqueue(
+        &conn,
+        &allowed,
+        AtomiseWiring::new(Some(&atomiser), Some(&queue)),
+    );
+    let (control_id, control_outcome) = control.expect("positive control write must commit");
+    assert!(
+        matches!(control_outcome, AutoAtomisationOutcome::Enqueued { .. }),
+        "positive control must enqueue through the private wiring, got {control_outcome:?}"
+    );
 
-    if !inserted {
-        // The substrate refused the write. The MCP store handler at
-        // `src/mcp/tools/store.rs` short-circuits in this case
-        // BEFORE reaching `maybe_enqueue_auto_atomise`, so the hook
-        // never runs. We assert that contract by NOT calling the
-        // hook and verifying no atom rows exist for this id.
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            mock_call_count(),
-            0,
-            "curator must not fire when the originating insert was refused"
-        );
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
-                rusqlite::params![mem.id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        assert_eq!(count, 0, "no atoms should exist for a refused memory");
-    } else {
-        // Allow-all hook was already installed: the insert
-        // succeeded. We still verify the negative contract by
-        // checking that calling `maybe_enqueue_auto_atomise` ONLY
-        // happens when the caller (MCP / HTTP / CLI handler)
-        // chooses to invoke it. The contract is one of caller
-        // discipline; this test documents and pins it.
-        eprintln!(
-            "test_auto_atomise_refused_memory_not_atomised: skipping refusal assertion — \
-             prior test installed Allow-all GOVERNANCE_PRE_WRITE hook"
-        );
+    // --- Negative leg: a REFUSED write must not reach the funnel -----
+    let refused = build_memory(
+        &ns,
+        &format!("refused-{}", uuid::Uuid::new_v4().simple()),
+        &body,
+    );
+    let outcome = store_then_maybe_enqueue(
+        &conn,
+        &refused,
+        AtomiseWiring::new(Some(&atomiser), Some(&queue)),
+    );
+
+    // DETERMINISTIC QUIESCENCE (#3509). Dropping the only sender closes
+    // the channel; the consumer's `recv()` returns `Err` only after
+    // every buffered job has been drained, so this join is "await full
+    // drain" — it cannot be raced by host load the way a sleep can.
+    drop(queue);
+    worker.join().expect("private atomise worker joins");
+    let calls = curator_state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .calls;
+
+    // The control fired and its atoms landed — proving this harness CAN
+    // observe a curator fire, which is what makes the `== 1` below a
+    // real negative result rather than a vacuous one.
+    let control_atoms = read_atomised_into(&conn, &control_id).unwrap_or(0);
+    assert!(
+        control_atoms >= 2,
+        "positive control must have minted atoms by the time the worker joined (got {control_atoms})"
+    );
+
+    match outcome {
+        None => {
+            // The substrate refused the write. `store_then_maybe_enqueue`
+            // short-circuited, so the funnel was never offered the row.
+            assert_eq!(
+                calls, 1,
+                "curator must not fire when the originating insert was refused \
+                 (1 = the positive control, and nothing else)"
+            );
+            // Refusal ledger: the durable row does not exist at all …
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE id = ?1",
+                    rusqlite::params![refused.id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            assert_eq!(rows, 0, "a refused write must leave no durable row");
+            // … and therefore no atoms were derived from it.
+            let atoms: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+                    rusqlite::params![refused.id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            assert_eq!(atoms, 0, "no atoms should exist for a refused memory");
+        }
+        Some(_) => {
+            // A prior test installed an Allow-all hook, so the write was
+            // not refused and there is no refusal to assert about. The
+            // positive control above still ran.
+            eprintln!(
+                "test_auto_atomise_refused_memory_not_atomised: skipping refusal assertion — \
+                 prior test installed Allow-all GOVERNANCE_PRE_WRITE hook"
+            );
+        }
     }
 }
