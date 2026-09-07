@@ -137,6 +137,7 @@
 //! [#3418]: https://github.com/alphaonedev/ai-memory-mcp/issues/3418
 //! [#3474]: https://github.com/alphaonedev/ai-memory-mcp/issues/3474
 //! [#3529]: https://github.com/alphaonedev/ai-memory-mcp/issues/3529
+//! [#3530]: https://github.com/alphaonedev/ai-memory-mcp/issues/3530
 
 use axum::Json;
 use axum::body::Bytes;
@@ -950,6 +951,23 @@ pub async fn mint_agent_api_key(
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    // v1.0.0 #3529/#3530 (#3474 advisory A2) — VALIDATE the path segment
+    // BEFORE the transport check, so no audit row can carry a raw,
+    // never-validated `{id}`. The audit chain is signed and append-only:
+    // unbounded caller-controlled bytes do not belong on it, and the only
+    // reason they reached it was the order of two independent refusals. The
+    // 400 discloses nothing this route did not already disclose — it depends
+    // on the SHAPE of the id alone, never on whether the target exists and
+    // never on the transport posture, so reordering cannot turn it into an
+    // enumeration oracle. (`require_admin` still runs first, so an
+    // unauthenticated caller learns nothing at all.)
+    if let Err(e) = crate::validate::validate_agent_id(&agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
+        )
+            .into_response();
+    }
     if !credential_transport_confidential() {
         audit(
             &caller,
@@ -965,13 +983,6 @@ pub async fn mint_agent_api_key(
              minted bearer token would cross the wire in cleartext. Bind to loopback, configure \
              --tls-cert/--tls-key, or enrol from the CLI on the data tier.",
         );
-    }
-    if let Err(e) = crate::validate::validate_agent_id(&agent_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-        )
-            .into_response();
     }
     let parsed: MintApiKeyBody = match parse_body(&body) {
         Ok(b) => b,
