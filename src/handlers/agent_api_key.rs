@@ -98,6 +98,21 @@
 //! so "revoke one agent" and "disarm the fleet's identity binding" are the
 //! same keystroke unless someone else looks.
 //!
+//! **Last-key atomicity ([#3529]).** The last-key rule is ENFORCED in the
+//! store, not by the pre-check that shapes the 202. [`revoke_requires_approval`]
+//! reads a snapshot; two concurrent self-revokes by the last two key-holders
+//! each saw the other's key, each concluded they were not the last, and both
+//! applied — emptying the registry with no second approver. The revoke now
+//! goes through [`crate::storage::revoke_agent_api_key_unless_last`] (and its
+//! postgres twin), which counts and deletes inside ONE transaction, so at most
+//! one of them can win; the loser is parked for approval instead of refused,
+//! because that is the answer it would have got a millisecond later. The
+//! approval APPLIER re-checks the same way, and refuses when an approval that
+//! was granted for "revoke that agent's key" would now be the thing that
+//! empties the registry — the queued row records
+//! [`FIELD_EMPTIES_REGISTRY`], so an approver is only ever held to what they
+//! were actually told.
+//!
 //! **Governance.** The namespace policy for the identity namespace is
 //! consulted READ-ONLY ([`crate::store::MemoryStore::resolve_governance_policy`]
 //! / [`crate::db::resolve_governance_policy`]) rather than through the
@@ -121,6 +136,8 @@
 //! [#2044]: https://github.com/alphaonedev/ai-memory-mcp/issues/2044
 //! [#3418]: https://github.com/alphaonedev/ai-memory-mcp/issues/3418
 //! [#3474]: https://github.com/alphaonedev/ai-memory-mcp/issues/3474
+//! [#3529]: https://github.com/alphaonedev/ai-memory-mcp/issues/3529
+//! [#3530]: https://github.com/alphaonedev/ai-memory-mcp/issues/3530
 
 use axum::Json;
 use axum::body::Bytes;
@@ -181,8 +198,42 @@ pub const FIELD_EFFECTIVE: &str = "effective";
 /// live registry means there is no refresh window to wait out.
 pub const EFFECTIVE_IMMEDIATELY: &str = "immediately";
 
+/// Queue reason: the target is not the caller, so the two-person rule applies.
+pub const REASON_ANOTHER_PRINCIPAL: &str = "another_principal";
+
+/// Queue reason: the identity namespace's governance policy resolves to
+/// `Approve` for this action class — the operator said so.
+pub const REASON_NAMESPACE_POLICY: &str = "namespace_policy";
+
+/// Queue reason: applying the revoke would leave ZERO enrolled keys, which
+/// makes the identity gate inert in every mode ([#1985]).
+pub const REASON_LAST_ENROLLED_KEY: &str = "last_enrolled_key";
+
+/// Pending-payload + 202 field naming WHY an action was parked. One const, so
+/// the value [`queue_revoke`] writes and the one [`apply_approved_revoke`]
+/// reads back cannot drift apart.
+pub const FIELD_REASON: &str = "reason";
+
+/// Pending-payload + 202 field: `true` when applying this revoke was ALREADY
+/// known, AT QUEUE TIME, to empty the enrolled registry.
+///
+/// v1.0.0 [#3529] — this is what the applier reads to tell "a second
+/// principal approved DISARMING the fleet's identity binding, and was told so"
+/// apart from "a second principal approved revoking ONE agent's key, and the
+/// registry has since shrunk to just that agent". The first must apply; the
+/// second must not, because nobody authorised the consequence it now has.
+pub const FIELD_EMPTIES_REGISTRY: &str = "empties_registry";
+
 /// Audit outcome token for a supplied token refused on strength.
 const OUTCOME_TOKEN_TOO_SHORT: &str = "supplied_token_too_short";
+
+/// Audit outcome: the pre-check said "not the last key", the ATOMIC store
+/// re-check disagreed, and the revoke was parked instead of applied.
+const OUTCOME_REVOKE_REQUEUED_LAST_KEY: &str = "revoke_requeued_last_enrolled_key";
+
+/// Audit outcome: an APPROVED revoke was refused at apply time because the
+/// target had become the last enrolled key since the approval was granted.
+const OUTCOME_APPLY_REFUSED_LAST_KEY: &str = "apply_refused_last_enrolled_key";
 
 /// Audit outcome token for a durable-store failure on either verb.
 const OUTCOME_STORE_ERROR: &str = "store_error";
@@ -255,6 +306,10 @@ pub const TRANSPORT_REFUSAL: &str = "credential_transport_not_confidential";
 
 /// Wire error for a rate-limited mint.
 pub const RATE_LIMITED: &str = "rate_limited";
+
+/// Wire error for an APPROVED revoke refused at apply time because it would
+/// now empty the enrolled registry ([#3529]).
+pub const REVOKE_WOULD_EMPTY_REGISTRY: &str = "revoke_would_empty_registry";
 
 /// The once-only disclosure warning that rides the mint response, so the
 /// caller is told by the SERVER — not only by the docs — that the token is
@@ -506,6 +561,12 @@ fn mint_token() -> String {
 /// Returns `None` when the revoke may apply immediately. Revoking your OWN key
 /// while others remain enrolled is always immediate: a principal that believes
 /// its credential is compromised must not be made to find a second operator.
+///
+/// v1.0.0 [#3529] — the `enrolled_total` / `target_key_count` inputs come from
+/// a snapshot read in an earlier step, so this decides the SHAPE of the answer
+/// and is not the enforcement point for the last-key rule.
+/// [`crate::storage::revoke_agent_api_key_unless_last`] is, and it counts and
+/// deletes in one transaction.
 #[must_use]
 pub fn revoke_requires_approval(
     target_agent_id: &str,
@@ -515,15 +576,35 @@ pub fn revoke_requires_approval(
     policy_requires_approval: bool,
 ) -> Option<&'static str> {
     if target_agent_id != caller {
-        return Some("another_principal");
+        return Some(REASON_ANOTHER_PRINCIPAL);
     }
     if policy_requires_approval {
-        return Some("namespace_policy");
+        return Some(REASON_NAMESPACE_POLICY);
     }
-    if target_key_count > 0 && enrolled_total.saturating_sub(target_key_count) == 0 {
-        return Some("last_enrolled_key");
+    if revoke_would_empty_registry(enrolled_total, target_key_count) {
+        return Some(REASON_LAST_ENROLLED_KEY);
     }
     None
+}
+
+/// Whether applying a revoke of `target_key_count` of `enrolled_total` keys
+/// leaves the enrolled registry EMPTY.
+///
+/// v1.0.0 [#3529] — split out of [`revoke_requires_approval`] because the two
+/// questions it used to answer together are needed apart. Which reason WINS
+/// decides the 202 envelope; whether the revoke EMPTIES THE REGISTRY is what
+/// the approver is actually consenting to, and it must be recorded on the
+/// queued row ([`FIELD_EMPTIES_REGISTRY`]) even when a different reason parked
+/// it — otherwise an approval granted for "revoke that agent's key" silently
+/// becomes an approval for "disarm the fleet's identity binding".
+///
+/// This is a HINT, not the enforcement point: it is computed from a snapshot
+/// read before the write, so the authoritative check is the store's
+/// [`crate::storage::revoke_agent_api_key_unless_last`], which counts and
+/// deletes in ONE transaction.
+#[must_use]
+pub fn revoke_would_empty_registry(enrolled_total: usize, target_key_count: usize) -> bool {
+    target_key_count > 0 && enrolled_total.saturating_sub(target_key_count) == 0
 }
 
 /// `true` when a resolved governance level demands a second principal's
@@ -641,6 +722,36 @@ async fn store_revoke(app: &AppState, caller: &str, agent_id: &str) -> Result<us
     let _ = caller;
     let lock = app.db.lock().await;
     db::revoke_agent_api_key(&lock.0, agent_id)
+        .map_err(|e| crate::handlers::errors::handler_error_500(&e))
+}
+
+/// v1.0.0 [#3529] — revoke every key bound to `agent_id`, but ONLY if that
+/// leaves at least one key enrolled somewhere on the deployment.
+///
+/// This is the ENFORCEMENT point for the "last enrolled key" rule.
+/// [`revoke_requires_approval`] runs on a snapshot read in an earlier step, so
+/// two concurrent self-revokes by the last two key-holders could each observe
+/// the other's key, each decide they were not the last, and both apply —
+/// emptying the registry with no second approver ([#1985], [#3474] advisory
+/// A1). The store counts and deletes inside ONE transaction, so at most one of
+/// them can win and the loser is told to queue instead.
+async fn store_revoke_unless_last(
+    app: &AppState,
+    caller: &str,
+    agent_id: &str,
+) -> Result<crate::storage::RevokeUnlessLastOutcome, Response> {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let ctx = crate::store::CallerContext::for_agent(caller.to_string());
+        return app
+            .store
+            .revoke_agent_api_key_unless_last(&ctx, agent_id)
+            .await
+            .map_err(super::store_err_to_response);
+    }
+    let _ = caller;
+    let lock = app.db.lock().await;
+    db::revoke_agent_api_key_unless_last(&lock.0, agent_id)
         .map_err(|e| crate::handlers::errors::handler_error_500(&e))
 }
 
@@ -840,6 +951,23 @@ pub async fn mint_agent_api_key(
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    // v1.0.0 #3529/#3530 (#3474 advisory A2) — VALIDATE the path segment
+    // BEFORE the transport check, so no audit row can carry a raw,
+    // never-validated `{id}`. The audit chain is signed and append-only:
+    // unbounded caller-controlled bytes do not belong on it, and the only
+    // reason they reached it was the order of two independent refusals. The
+    // 400 discloses nothing this route did not already disclose — it depends
+    // on the SHAPE of the id alone, never on whether the target exists and
+    // never on the transport posture, so reordering cannot turn it into an
+    // enumeration oracle. (`require_admin` still runs first, so an
+    // unauthenticated caller learns nothing at all.)
+    if let Err(e) = crate::validate::validate_agent_id(&agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
+        )
+            .into_response();
+    }
     if !credential_transport_confidential() {
         audit(
             &caller,
@@ -855,13 +983,6 @@ pub async fn mint_agent_api_key(
              minted bearer token would cross the wire in cleartext. Bind to loopback, configure \
              --tls-cert/--tls-key, or enrol from the CLI on the data tier.",
         );
-    }
-    if let Err(e) = crate::validate::validate_agent_id(&agent_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-        )
-            .into_response();
     }
     let parsed: MintApiKeyBody = match parse_body(&body) {
         Ok(b) => b,
@@ -963,7 +1084,8 @@ pub async fn mint_agent_api_key(
                     "queued_pending_approval",
                     payload_digest,
                 );
-                queued_response(&pending_id, &agent_id, "namespace_policy")
+                // A MINT never empties the enrolled registry.
+                queued_response(&pending_id, &agent_id, REASON_NAMESPACE_POLICY, false)
             }
             Err(resp) => resp,
         };
@@ -1045,6 +1167,10 @@ pub async fn revoke_agent_api_key(
         Ok(l) => l,
         Err(resp) => return resp,
     };
+    // Recorded on the queued row whichever reason wins, so the applier can
+    // tell an approval that KNOWINGLY empties the registry from one that only
+    // has that effect because the state moved underneath it (#3529).
+    let empties_registry = revoke_would_empty_registry(enrolled.len(), target_key_count);
     if let Some(reason) = revoke_requires_approval(
         &agent_id,
         &caller,
@@ -1052,37 +1178,11 @@ pub async fn revoke_agent_api_key(
         target_key_count,
         level_requires_approval(&level),
     ) {
-        let payload = json!({
-            "kind": PENDING_PAYLOAD_KIND,
-            "op": OP_REVOKE,
-            (crate::models::field_names::TARGET_AGENT_ID): agent_id,
-            "reason": reason,
-        });
-        return match store_queue(
-            &app,
-            crate::models::GovernedAction::Delete,
-            &caller,
-            &payload,
-        )
-        .await
-        {
-            Ok(pending_id) => {
-                audit(
-                    &caller,
-                    "allow",
-                    REVOKE_ENDPOINT,
-                    &agent_id,
-                    "queued_pending_approval",
-                    None,
-                );
-                queued_response(&pending_id, &agent_id, reason)
-            }
-            Err(resp) => resp,
-        };
+        return queue_revoke(&app, &caller, &agent_id, reason, empties_registry).await;
     }
 
-    match store_revoke(&app, &caller, &agent_id).await {
-        Ok(removed) => {
+    match store_revoke_unless_last(&app, &caller, &agent_id).await {
+        Ok(crate::storage::RevokeUnlessLastOutcome::Revoked { bindings_removed }) => {
             refresh_registry(&app, None, Some(&agent_id)).await;
             audit(
                 &caller,
@@ -1097,10 +1197,28 @@ pub async fn revoke_agent_api_key(
                 json!({
                     "agent_id": agent_id,
                     "revoked": true,
-                    (FIELD_BINDINGS_REMOVED): removed,
+                    (FIELD_BINDINGS_REMOVED): bindings_removed,
                     (FIELD_EFFECTIVE): EFFECTIVE_IMMEDIATELY,
                 }),
             )
+        }
+        // #3529 — the snapshot the pre-check read still had another
+        // key-holder in it; the ATOMIC store re-check did not. Nothing was
+        // removed. Park the revoke exactly as if the pre-check had seen this
+        // state: the operator's intent survives as a `pending_actions` row, a
+        // second principal can still apply it, and the answer is the SAME 202
+        // envelope the non-racing caller gets, so a client has one shape to
+        // handle rather than two.
+        Ok(crate::storage::RevokeUnlessLastOutcome::WouldEmptyRegistry) => {
+            audit(
+                &caller,
+                "refuse",
+                REVOKE_ENDPOINT,
+                &agent_id,
+                OUTCOME_REVOKE_REQUEUED_LAST_KEY,
+                None,
+            );
+            queue_revoke(&app, &caller, &agent_id, REASON_LAST_ENROLLED_KEY, true).await
         }
         Err(resp) => {
             audit(
@@ -1116,15 +1234,62 @@ pub async fn revoke_agent_api_key(
     }
 }
 
+/// Park a revoke for a second registered approver.
+///
+/// ONE queueing site for both callers — the pre-check's decision and the
+/// atomic store re-check's refusal — so the payload the applier reads and the
+/// 202 the caller sees cannot drift apart depending on which of the two
+/// parked it.
+async fn queue_revoke(
+    app: &AppState,
+    caller: &str,
+    agent_id: &str,
+    reason: &str,
+    empties_registry: bool,
+) -> Response {
+    let payload = json!({
+        "kind": PENDING_PAYLOAD_KIND,
+        "op": OP_REVOKE,
+        (crate::models::field_names::TARGET_AGENT_ID): agent_id,
+        (FIELD_REASON): reason,
+        (FIELD_EMPTIES_REGISTRY): empties_registry,
+    });
+    match store_queue(app, crate::models::GovernedAction::Delete, caller, &payload).await {
+        Ok(pending_id) => {
+            audit(
+                caller,
+                "allow",
+                REVOKE_ENDPOINT,
+                agent_id,
+                "queued_pending_approval",
+                None,
+            );
+            queued_response(&pending_id, agent_id, reason, empties_registry)
+        }
+        Err(resp) => resp,
+    }
+}
+
 /// The 202 envelope for an action parked awaiting a second principal.
-fn queued_response(pending_id: &str, agent_id: &str, reason: &str) -> Response {
+///
+/// `empties_registry` is disclosed to the CALLER as well as recorded on the
+/// row (#3529): "approve this and the deployment has no enrolled keys left"
+/// is a materially different ask from "approve revoking one agent's key", and
+/// an approver who is not told cannot consent to it.
+fn queued_response(
+    pending_id: &str,
+    agent_id: &str,
+    reason: &str,
+    empties_registry: bool,
+) -> Response {
     no_store(
         StatusCode::ACCEPTED,
         json!({
             "agent_id": agent_id,
             "status": "pending_approval",
             (crate::models::field_names::PENDING_ID): pending_id,
-            "reason": reason,
+            (FIELD_REASON): reason,
+            (FIELD_EMPTIES_REGISTRY): empties_registry,
             "message": "a DIFFERENT registered approver must approve this action; re-POST to \
                         this route with {\"approve_pending_id\": \"<id>\"} plus the K10 \
                         X-AI-Memory-Signature over the body. Self-approval is refused.",
@@ -1273,7 +1438,7 @@ async fn apply_approved(
                         (crate::models::field_names::PENDING_ID): pending_id,
                         "votes": votes,
                         "quorum": quorum,
-                        "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
+                        (FIELD_REASON): crate::errors::msg::CONSENSUS_NOT_REACHED,
                     }),
                 );
             }
@@ -1315,30 +1480,7 @@ async fn apply_approved(
     }
 
     if revoke {
-        return match store_revoke(app, caller, agent_id).await {
-            Ok(removed) => {
-                refresh_registry(app, None, Some(agent_id)).await;
-                audit(
-                    caller,
-                    "allow",
-                    endpoint,
-                    agent_id,
-                    "revoked_after_approval",
-                    None,
-                );
-                no_store(
-                    StatusCode::OK,
-                    json!({
-                        "agent_id": agent_id,
-                        "revoked": true,
-                        (FIELD_BINDINGS_REMOVED): removed,
-                        (crate::models::field_names::PENDING_ID): pending_id,
-                        (FIELD_EFFECTIVE): EFFECTIVE_IMMEDIATELY,
-                    }),
-                )
-            }
-            Err(resp) => resp,
-        };
+        return apply_approved_revoke(app, caller, agent_id, pending_id, endpoint, &pending).await;
     }
 
     // Mint/bind apply. A queued MINT carries no digest — the token is minted
@@ -1377,6 +1519,109 @@ async fn apply_approved(
         Some(&digest),
     );
     mint_response(agent_id, &digest, raw_token.as_deref())
+}
+
+/// Apply the REVOKE half of an approved row, re-checking at APPLY time that
+/// the revoke is still the one the approver consented to.
+///
+/// v1.0.0 [#3529] ([#3474] advisory A1). The approval gate parks a revoke for
+/// one of three reasons, and only ONE of them tells the approver that
+/// applying it leaves the deployment with no enrolled keys at all — which
+/// makes the identity gate inert in every mode ([#1985]). An approval granted
+/// while another key-holder existed must not become the thing that disarms the
+/// fleet after that holder goes away, so:
+///
+/// * when the queued row DISCLOSED [`FIELD_EMPTIES_REGISTRY`], the approver
+///   consented to exactly that and the revoke applies unconditionally;
+/// * otherwise it goes through the atomic
+///   [`store_revoke_unless_last`], and a target that has BECOME the last key
+///   is refused with a `409`, audited, and nothing is removed.
+///
+/// The refusal spends the approval — the row is already `approved` by the time
+/// the store is touched, because "one approval applies exactly once, in the
+/// call that decides it" is what stops a standing approved row from becoming
+/// an unbounded revoke. That is the safe direction and nothing durable is
+/// lost: the registry is untouched, the refusal is on the signed chain, and
+/// re-issuing the revoke queues a fresh approval that DISCLOSES the emptying.
+/// The alternative — re-checking before the approve transition — would put a
+/// second, non-authoritative "is this the last key" decision back into the
+/// flow, which is the drift this issue exists to remove.
+async fn apply_approved_revoke(
+    app: &AppState,
+    caller: &str,
+    agent_id: &str,
+    pending_id: &str,
+    endpoint: &'static str,
+    pending: &PendingAction,
+) -> Response {
+    let authorised_to_empty = pending
+        .payload
+        .get(FIELD_EMPTIES_REGISTRY)
+        .and_then(serde_json::Value::as_bool)
+        // Rows queued before #3529 carry no such field. Their `reason` is the
+        // only disclosure their approver ever saw, so read it rather than
+        // refusing every approval that was already in flight at upgrade.
+        .unwrap_or_else(|| {
+            pending
+                .payload
+                .get(FIELD_REASON)
+                .and_then(serde_json::Value::as_str)
+                == Some(REASON_LAST_ENROLLED_KEY)
+        });
+    let bindings_removed = if authorised_to_empty {
+        match store_revoke(app, caller, agent_id).await {
+            Ok(removed) => removed,
+            Err(resp) => return resp,
+        }
+    } else {
+        match store_revoke_unless_last(app, caller, agent_id).await {
+            Ok(crate::storage::RevokeUnlessLastOutcome::Revoked { bindings_removed }) => {
+                bindings_removed
+            }
+            Ok(crate::storage::RevokeUnlessLastOutcome::WouldEmptyRegistry) => {
+                audit(
+                    caller,
+                    "deny",
+                    endpoint,
+                    agent_id,
+                    OUTCOME_APPLY_REFUSED_LAST_KEY,
+                    None,
+                );
+                return no_store(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": REVOKE_WOULD_EMPTY_REGISTRY,
+                        (crate::models::field_names::PENDING_ID): pending_id,
+                        "message": "this approval was granted while another principal still \
+                                    held an enrolled key; applying it now would leave the \
+                                    deployment with NO enrolled keys, which makes the identity \
+                                    gate inert in every mode. Nothing was revoked. Re-issue the \
+                                    revoke to queue a fresh approval that discloses this.",
+                    }),
+                );
+            }
+            Err(resp) => return resp,
+        }
+    };
+    refresh_registry(app, None, Some(agent_id)).await;
+    audit(
+        caller,
+        "allow",
+        endpoint,
+        agent_id,
+        "revoked_after_approval",
+        None,
+    );
+    no_store(
+        StatusCode::OK,
+        json!({
+            "agent_id": agent_id,
+            "revoked": true,
+            (FIELD_BINDINGS_REMOVED): bindings_removed,
+            (crate::models::field_names::PENDING_ID): pending_id,
+            (FIELD_EFFECTIVE): EFFECTIVE_IMMEDIATELY,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -1473,6 +1718,38 @@ mod tests {
         assert_eq!(
             revoke_requires_approval("alice", "alice", 0, 0, false),
             None
+        );
+    }
+
+    /// #3529 — whether a revoke EMPTIES the registry is a separate question
+    /// from which reason parks it, and the queued row has to record the
+    /// former even when the latter is `another_principal` or
+    /// `namespace_policy`. An approver told only "another principal's key"
+    /// has not consented to disarming the fleet's identity gate.
+    #[test]
+    fn emptying_the_registry_is_recorded_independently_of_the_winning_reason() {
+        // The target holds every enrolled key.
+        assert!(revoke_would_empty_registry(2, 2));
+        assert!(revoke_would_empty_registry(1, 1));
+        // Someone else still holds one.
+        assert!(!revoke_would_empty_registry(3, 2));
+        // A no-op revoke empties nothing, even from an empty registry.
+        assert!(!revoke_would_empty_registry(0, 0));
+        assert!(!revoke_would_empty_registry(5, 0));
+
+        // …and the two questions genuinely disagree: revoking ANOTHER
+        // principal's only key parks for `another_principal`, while still
+        // being the thing that empties the registry.
+        assert_eq!(
+            revoke_requires_approval("bob", "alice", 1, 1, false),
+            Some(REASON_ANOTHER_PRINCIPAL)
+        );
+        assert!(revoke_would_empty_registry(1, 1));
+
+        // Same for a namespace policy that parks every revoke.
+        assert_eq!(
+            revoke_requires_approval("alice", "alice", 1, 1, true),
+            Some(REASON_NAMESPACE_POLICY)
         );
     }
 
