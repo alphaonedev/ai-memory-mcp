@@ -642,6 +642,13 @@ ai-memory restore --from /var/backups/ai-memory --yes
 | `--prune-reports` | bool | — | #3345: collapse the historical `_curator/reports` backlog. **Dry run** unless `--apply`. |
 | `--apply` | bool | — | Apply `--prune-reports`. Requires `--prune-reports`. |
 
+Both rollback flags verify their own work (#3526): after each write the
+reversal re-reads the durable row and compares it to the value it intended to
+restore. A write the substrate did not take is REFUSED — `rollback <id>: not
+applied (…)` on stdout, a non-zero exit, an `Error`-outcome audit event, and the
+rollback-log row left untagged so the entry remains reversible. `applied` is
+printed only for a reversal that is present on the durable row.
+
 ```bash
 # Once with JSON report
 ai-memory curator --once --max-ops 50 --json
