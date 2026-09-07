@@ -1304,6 +1304,92 @@ ai-memory serve --tls-cert server.pem --tls-key server.key
 
 Reverse proxy termination still works if you prefer it (nginx / Caddy / Traefik). For most deployments, the native TLS path removes a moving part.
 
+### Minting an api-key behind a TLS-terminating reverse proxy ([#3474](https://github.com/alphaonedev/ai-memory-mcp/issues/3474) / [#3531](https://github.com/alphaonedev/ai-memory-mcp/issues/3531))
+
+`POST /api/v1/agents/{id}/api-key` hands a **bearer secret to the wire**, so it
+is refused unless the daemon's OWN listener is confidential. The daemon records
+that posture once at boot, from exactly two facts it can verify about itself:
+
+```
+confidential = (--tls-cert AND --tls-key are both set)  OR  (the bind host is loopback)
+```
+
+The default is `false` — refuse. Nothing else feeds it.
+
+**A same-host proxy already works, and needs no configuration.** The usual
+nginx / Caddy / Traefik deployment terminates TLS and proxies to the daemon on
+`127.0.0.1`. That daemon's bind host IS loopback, so the marker is confidential
+and the mint route is available: the network hop is the proxy's TLS and the
+plaintext hop is a loopback socket on one host.
+
+**A daemon bound to a NON-loopback address without in-process TLS is refused.**
+That is the proxy-on-another-host topology (and any `--host 0.0.0.0` bind
+without `--tls-cert`/`--tls-key`). The mint route answers `403`:
+
+```json
+{
+  "error": "credential_transport_not_confidential",
+  "message": "this daemon's listener is neither loopback nor TLS-terminated in-process, so a minted bearer token would cross the wire in cleartext. Bind to loopback, configure --tls-cert/--tls-key, or enrol from the CLI on the data tier."
+}
+```
+
+**This is the intended posture, not a gap.** The daemon cannot verify a claim
+about a hop it did not terminate; the only evidence available to it would be a
+request header, and a header is exactly what an attacker who can reach the
+plaintext port also controls. There is deliberately **no trust-the-proxy
+header, env var or config key** — adding one would turn the control into a
+self-assertion, and what is being handed over is a live credential.
+(`AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` acknowledges cleartext off-host
+serving for CONTENT; it does not, and will not, unlock minting.)
+
+Three supported ways to enrol in that topology:
+
+**1. Enrol from the CLI on the host that owns the data tier.** The pre-#3474
+path, unchanged, and the one to reach for when the daemon is not going to be
+reconfigured:
+
+```bash
+# sqlite data tier (run on the host holding the database file)
+ai-memory agents bind-api-key --agent-id svc-indexer --token "$TOKEN"
+ai-memory agents revoke-api-key --agent-id svc-indexer
+
+# postgres data tier — prefer the AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE
+# channel over --store-url: a URL on argv is world-readable via /proc/<pid>/cmdline
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory agents bind-api-key \
+  --agent-id svc-indexer --token "$TOKEN"
+```
+
+You generate the token; the CLI stores only its SHA-256 digest and never the
+token. Make it at least 32 bytes — the HTTP route refuses anything shorter, and
+a weaker secret is no better for being typed on a shell. Enrolment and
+revocation reach a RUNNING daemon within `AI_MEMORY_AGENT_KEY_REFRESH_SECS`
+(default 15 s) with no restart, so this is not a "restart to pick it up" path.
+
+**2. Bind the daemon to loopback and put the proxy in front of it on the same
+host.** This is the smallest change and it makes the marker confidential for
+the reason above. An admin who is not on that host reaches the loopback
+listener through a tunnel that terminates on it:
+
+```bash
+ssh -L 9077:127.0.0.1:9077 daemon-host
+```
+
+then POST `/api/v1/agents/{id}/api-key` at `127.0.0.1:9077` with the
+`x-api-key` and `X-Agent-Id` headers from any admin client.
+
+**3. Give the daemon its own TLS listener.** `serve --tls-cert … --tls-key …`
+makes the listener confidential in-process, wherever it binds, so the mint
+route is available even off-host. The proxy may still front it (TLS-to-TLS):
+
+```bash
+ai-memory serve --tls-cert server.pem --tls-key server.key
+```
+
+Revocation is deliberately **not** transport-gated: refusing a revocation is
+strictly worse than performing one over a channel the operator already
+accepted, and a revoke returns no secret.
+`POST /api/v1/agents/{id}/api-key/revoke` therefore works in every topology.
+
 ### Peer-mesh security (v0.6.0+) — MUST READ before deploying sync
 
 The peer-to-peer sync mesh introduces new trust assumptions. Disclosed gaps and required mitigations:
