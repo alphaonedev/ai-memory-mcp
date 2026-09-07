@@ -637,6 +637,13 @@ mod tests {
     // distinguish this from "id doesn't exist".
     #[test]
     fn subscription_replay_cross_tenant_returns_not_found_1115() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         crate::config::set_active_hooks_hmac_secret(None);
         let conn = fresh_conn();
         // Seed alice's subscription with explicit created_by.

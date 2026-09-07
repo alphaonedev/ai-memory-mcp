@@ -735,6 +735,13 @@ mod tests {
     // handle_subscription_dlq_list — empty list, count=0, limit echoed.
     #[test]
     fn subscription_dlq_list_empty() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let resp = handle_subscription_dlq_list(&conn, &json!({}), None).expect("ok");
         assert_eq!(resp["count"].as_u64(), Some(0));
@@ -744,6 +751,9 @@ mod tests {
     // handle_subscription_dlq_list — limit clamped to [1, 1000].
     #[test]
     fn subscription_dlq_list_limit_clamped() {
+        // #3517 — same env-first caller resolution as its siblings; pin the
+        // unset posture (the #1874 fixture).
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let resp = handle_subscription_dlq_list(&conn, &json!({"limit": 0u64}), None).expect("ok");
         // limit=0 clamps to 1; 0 is below the min so it should not error.
@@ -753,6 +763,13 @@ mod tests {
     // handle_subscription_dlq_list — subscription_id filter is propagated.
     #[test]
     fn subscription_dlq_list_with_filter() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let resp = handle_subscription_dlq_list(&conn, &json!({"subscription_id": "sub-x"}), None)
             .expect("ok");
@@ -764,6 +781,13 @@ mod tests {
     // sub_id and receives the empty envelope.
     #[test]
     fn subscription_dlq_list_cross_tenant_refused_1118() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         db::register_agent(&conn, "ai:alice", "test", &[]).expect("register alice");
         let sid = crate::subscriptions::insert(
@@ -834,6 +858,15 @@ mod tests {
     // full reflect payload.
     #[test]
     fn pending_approve_reaches_execute_step() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: the wire `agent_id: "ai:approver"` reaches
+        // `resolve_governance_subject`, so a concurrently installed principal
+        // mismatches it and the call refuses instead of executing.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = queue_pending_promote_unbound(&conn, "ai:tester");
         let result = handle_pending_approve(
@@ -871,6 +904,15 @@ mod tests {
     // handle_pending_approve — unknown id returns rejected.
     #[test]
     fn pending_approve_unknown_id_rejected() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: it reaches `resolve_governance_subject` with no wire
+        // principal, so no mismatch is possible TODAY. Guarded anyway so a future
+        // reorder of the handler cannot make it env-sensitive silently.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_pending_approve(
             &conn,
@@ -886,6 +928,14 @@ mod tests {
     // handle_pending_reject — happy path with session remember label.
     #[test]
     fn pending_reject_happy_path() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: wire `agent_id: "ai:rejecter"` — the same mismatch shape
+        // as the sibling below that lane #3515 actually caught.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = queue_pending(&conn, "ai:tester");
         let resp = handle_pending_reject(
@@ -901,6 +951,16 @@ mod tests {
     // handle_pending_reject — once remember default emits "once".
     #[test]
     fn pending_reject_default_remember_is_once() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: OBSERVED by lane #3515 in a full `--lib` run — failed with
+        // `agent_id mismatch: caller 'ai:bob'` while the siblings that install
+        // `ai:bob` (`pending_reject_allows_registered_non_requester_3388`,
+        // `promote.rs::cross_owner_promote_refused_1786`) were running.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = queue_pending(&conn, "ai:tester");
         let resp =
@@ -920,6 +980,14 @@ mod tests {
     // handle_pending_reject — unknown id (already-decided contract).
     #[test]
     fn pending_reject_unknown_id_errors() {
+        // #3517 — VICTIM, not a mutator: this test depends on `AI_MEMORY_AGENT_ID`
+        // being UNSET. The handler resolves the caller from the env FIRST, and this
+        // test takes no lock, so a sibling's install silently steers it. Pin the
+        // posture with the #1874 fixture.
+        //
+        // Why this one: reaches `resolve_governance_subject`; guarded for the same
+        // durability reason as the approve twin.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_pending_reject(
             &conn,

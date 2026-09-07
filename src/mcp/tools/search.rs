@@ -303,6 +303,13 @@ mod visibility_1468_tests {
 
     #[test]
     fn non_owner_excludes_cross_agent_private() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         seed(&conn);
         let out = handle_search(&conn, &json!({"query": "needle"}), Some("ai:carol")).expect("ok");
@@ -312,6 +319,13 @@ mod visibility_1468_tests {
 
     #[test]
     fn owner_sees_own_private_and_shared() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         seed(&conn);
         let out = handle_search(&conn, &json!({"query": "needle"}), Some("ai:alice")).expect("ok");
@@ -369,6 +383,13 @@ mod visibility_1468_tests {
 
     #[test]
     fn naming_the_inbox_namespace_still_reaches_your_own_mail_3348() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mut mail = mem_in("_messages/ai:carol", "ai:bob", None);
         mail.metadata[crate::META_KEY_TARGET_AGENT_ID] = json!("ai:carol");
@@ -408,6 +429,13 @@ mod visibility_1468_tests {
     /// cross-agent private row.
     #[test]
     fn source_uri_only_branch_excludes_cross_agent_private() {
+        // #3517 — this test asserts an EXPLICIT-caller path, but the handler
+        // resolves the caller from `AI_MEMORY_AGENT_ID` FIRST. A sibling test
+        // installing a principal concurrently silently overrides the caller
+        // passed here (`subscription_dlq_list_cross_tenant_refused_1118`
+        // reproduced at 4/10 under `--test-threads=4`). Pin the unset posture
+        // this test depends on — the #1874 fixture exists for exactly this.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         // Build the fixture URI from the validator's accepted-scheme
         // SSOT so the test can't rot if the scheme set changes.
         let uri = format!(
