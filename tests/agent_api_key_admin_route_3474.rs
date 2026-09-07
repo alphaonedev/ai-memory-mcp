@@ -36,6 +36,8 @@
 //! * a token whose digest is already enrolled to ANOTHER agent is a `409` that
 //!   changes nothing, while re-asserting the SAME (agent, digest) pair stays an
 //!   idempotent success;
+//! * a MINT parked by namespace policy returns NO token in its `202` — the
+//!   token is minted at APPLY time and lands in the APPROVER's response.
 
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
@@ -1338,6 +1340,117 @@ async fn a_digest_bound_to_another_agent_is_refused_not_repointed_3535() {
     assert_eq!(
         fx.store
             .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string())
+    );
+    assert_eq!(fx.registry.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3535 (#3474 advisory 2) — a queued MINT's token goes to the APPROVER.
+// ---------------------------------------------------------------------------
+
+/// Put an `Approve` WRITE level on the identity namespace, so the mint form
+/// parks instead of acting.
+///
+/// The governance blob is flattened into `metadata.governance` exactly as the
+/// namespace-standard surface writes it, so this drives the SAME
+/// `resolve_governance_policy` the handler consults rather than a test-only
+/// shortcut.
+fn seed_identity_namespace_write_approve(fx: &Fixture, owner: &str) {
+    use ai_memory::handlers::agent_api_key::IDENTITY_NAMESPACE;
+    let conn = ai_memory::db::open(&fx.db_path).expect("reopen for governance seed");
+    let now = chrono::Utc::now().to_rfc3339();
+    let standard = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: format!("_standards-{IDENTITY_NAMESPACE}"),
+        title: format!("standard for {IDENTITY_NAMESPACE}"),
+        content: "#3535 identity-namespace write policy".to_string(),
+        source: "test".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: json!({ "agent_id": owner, "governance": { "write": "approve" } }),
+        ..ai_memory::models::Memory::default()
+    };
+    let std_id = ai_memory::db::insert(&conn, &standard).expect("insert standard");
+    ai_memory::db::set_namespace_standard(&conn, IDENTITY_NAMESPACE, &std_id, None)
+        .expect("set_namespace_standard");
+}
+
+/// A signed `{"approve_pending_id": …}` POST to the MINT route — the same K10
+/// envelope `revoke_req` builds, on the other verb.
+fn mint_approve_req(caller: &str, target: &str, pending_id: &str) -> Request<Body> {
+    let body = json!({ "approve_pending_id": pending_id });
+    let raw = serde_json::to_string(&body).expect("serialise");
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let subject = approval_subject(pending_id, caller);
+    let sig = common::sign_canonical_envelope(HMAC_SECRET, &ts, "POST", &subject, &raw);
+    Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{target}/api-key"))
+        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_AGENT_ID, caller)
+        .header(ai_memory::HEADER_AI_MEMORY_SIGNATURE, sig)
+        .header(ai_memory::HEADER_AI_MEMORY_TIMESTAMP, ts)
+        .header("content-type", "application/json")
+        .body(Body::from(raw))
+        .expect("build mint approve request")
+}
+
+/// The documented, deliberately surprising consequence of never persisting a
+/// raw token: when namespace policy parks a MINT, the requester's `202`
+/// carries NO token — there is none yet — and the token is minted at APPLY
+/// time, so it appears exactly once, in the APPROVER's `200`.
+///
+/// Pinned because it is the shape an operator would otherwise go looking for
+/// in the wrong response, and because "the requester never sees it" is a
+/// property of the flow, not an accident of this test.
+#[tokio::test]
+async fn a_queued_mint_returns_its_token_to_the_approver_not_the_requester_3535() {
+    const REQUESTER: &str = "ai:key-admin-queuedmint";
+    const APPROVER: &str = "ai:key-admin-queuedmint-2";
+    let _g = serial().await;
+    let fx = fixture("queuedmint", &[REQUESTER, APPROVER]);
+    seed_identity_namespace_write_approve(&fx, REQUESTER);
+
+    // The REQUESTER's mint is parked, and its 202 carries no secret.
+    let (status, queued, _) = mint(&fx.router, REQUESTER, ALICE).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "an Approve write level must park the mint: {queued}"
+    );
+    assert_eq!(queued["status"], "pending_approval", "{queued}");
+    assert!(
+        queued.get("token").is_none(),
+        "the requester's 202 must carry NO token — none has been minted yet: {queued}"
+    );
+    assert_eq!(fx.registry.len(), 0, "a queued mint enrols nothing");
+    let pending_id = queued["pending_id"]
+        .as_str()
+        .expect("pending_id")
+        .to_string();
+
+    // The APPROVER's call is what mints, and the token appears in ITS response.
+    let (status, _, applied) =
+        call(&fx.router, mint_approve_req(APPROVER, ALICE, &pending_id)).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    let token = applied["token"]
+        .as_str()
+        .expect("the approver's response carries the minted token")
+        .to_string();
+    assert_eq!(applied["agent_id"], ALICE, "{applied}");
+
+    // …and it is a real credential for the TARGET, not a placeholder.
+    assert!(
+        token_authenticates(&fx.router, &token).await,
+        "the token handed to the approver must authenticate"
+    );
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&api_key_sha256_hex(&token))
             .await
             .expect("resolve"),
         Some(ALICE.to_string())
