@@ -359,12 +359,12 @@ async fn postgres_derivation_carries_the_same_proven_set_3505() {
 
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .expect("live isolated PostgreSQL URL required; never skip");
-    let database = url.split('/').next_back().unwrap_or_default();
-    let database = database.split('?').next().unwrap_or_default();
-    assert_ne!(
-        database, "ai_memory_test",
-        "refusing to run against the shared live store; point \
-         AI_MEMORY_TEST_POSTGRES_URL at this lane's own isolated database"
+    // Name AND port (#3468 rule): the coverage workflow's throwaway service
+    // container is also named `ai_memory_test`, on :5432, and must be usable.
+    assert!(
+        !wake_hub_harness::is_shared_live_store(&url),
+        "refusing to run against the shared live store (ai_memory_test on the certified \
+         tier's port); point AI_MEMORY_TEST_POSTGRES_URL at this lane's own isolated database"
     );
 
     let store = ai_memory::store::postgres::PostgresStore::connect(&url)

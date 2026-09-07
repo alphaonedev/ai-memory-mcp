@@ -447,3 +447,63 @@ impl Client {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared live-store guard (#3468 rule, applied to every pg cell of the wake-hub
+// suites after the 3017ea05 coverage red)
+// ---------------------------------------------------------------------------
+
+/// The database segment of a `postgres://user:pass@host:port/db?params` URL.
+pub fn database_name(url: &str) -> &str {
+    url.split('/')
+        .next_back()
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+}
+
+/// The port segment of a `postgres://user:pass@host:port/db` URL, if any.
+pub fn port_of(url: &str) -> Option<u16> {
+    let authority = url.split("//").nth(1)?.split('/').next()?;
+    let host_port = authority.rsplit('@').next()?;
+    host_port.rsplit(':').next()?.parse().ok()
+}
+
+/// The certified tier's port on both nodes; the `:9077` test-fleet daemon's
+/// shared `ai_memory_test` database lives there and nowhere else.
+pub const SHARED_LIVE_STORE_PORT: u16 = 5445;
+
+/// True only for the shared live store: the `ai_memory_test` database on the
+/// certified tier's port. A same-named database on any other port — the CI
+/// coverage workflow's throwaway service container on `:5432` — is not the
+/// live store and may be used. A guard on the NAME alone can never run in
+/// that workflow (seen on the `3017ea05` campaign), so this is the one
+/// predicate every pg cell in these suites must use.
+pub fn is_shared_live_store(url: &str) -> bool {
+    database_name(url) == "ai_memory_test" && port_of(url) == Some(SHARED_LIVE_STORE_PORT)
+}
+
+#[test]
+fn shared_live_store_guard_cases() {
+    assert!(is_shared_live_store(
+        "postgres://ai_memory:pw@127.0.0.1:5445/ai_memory_test?sslmode=verify-full"
+    ));
+    assert!(is_shared_live_store(
+        "postgres://ai_memory:pw@localhost:5445/ai_memory_test"
+    ));
+    // CI coverage service container: same name, throwaway port — ALLOWED.
+    assert!(!is_shared_live_store(
+        "postgres://ai_memory:ai_memory_test@127.0.0.1:5432/ai_memory_test"
+    ));
+    // Isolated lane / gate databases on the certified tier — ALLOWED.
+    assert!(!is_shared_live_store(
+        "postgres://ai_memory:pw@127.0.0.1:5445/ai_memory_gate_if1c?sslmode=verify-full"
+    ));
+    assert_eq!(
+        database_name("postgres://u:p@h:5445/ai_memory_test?x=1"),
+        "ai_memory_test"
+    );
+    assert_eq!(port_of("postgres://u:p@h:5445/db"), Some(5445));
+    assert_eq!(port_of("postgres://u:p@h/db"), None);
+}
