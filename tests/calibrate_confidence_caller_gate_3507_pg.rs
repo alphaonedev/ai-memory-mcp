@@ -387,9 +387,7 @@ async fn http_route_is_caller_scoped_on_postgres_3507() {
         "#3507(pg-http): the admin sweep spans every seeded namespace: {body}"
     );
     assert!(
-        admin_groups
-            .iter()
-            .any(|(ns, _)| ns == &seeded.substrate),
+        admin_groups.iter().any(|(ns, _)| ns == &seeded.substrate),
         "#3507(pg-http): only the admin sweep reaches a substrate namespace: {body}"
     );
     assert!(
