@@ -27,6 +27,12 @@
 //! * revoking your OWN key is immediate;
 //! * a mint over a transport the daemon has not promised is confidential is
 //!   refused, and binds nothing.
+//!
+//! v1.0.0 #3535 adds the four #3474 advisories to the same discipline:
+//!
+//! * the TARGET must be a REGISTERED agent — both forms refuse an id the
+//!   `_agents` roster does not know, nothing is bound, and registering that
+//!   very id makes the identical call succeed;
 
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
@@ -36,8 +42,8 @@ use std::sync::{Arc, Mutex};
 
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::agent_api_key::{
-    MIN_SUPPLIED_TOKEN_BYTES, MINT_RATE_LIMIT_PER_WINDOW, RATE_LIMITED, TOKEN_TOO_SHORT,
-    TRANSPORT_REFUSAL, approval_subject, mark_credential_transport_confidential,
+    MIN_SUPPLIED_TOKEN_BYTES, MINT_RATE_LIMIT_PER_WINDOW, RATE_LIMITED, TARGET_NOT_REGISTERED,
+    TOKEN_TOO_SHORT, TRANSPORT_REFUSAL, approval_subject, mark_credential_transport_confidential,
 };
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -98,6 +104,7 @@ struct Fixture {
     router: axum::Router,
     store: Arc<dyn MemoryStore>,
     registry: Arc<EnrolledAgentKeys>,
+    db_path: PathBuf,
     _dir: TempDir,
 }
 
@@ -114,9 +121,16 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
     {
         // Register every admin so the approver-eligibility gate (which
         // requires a REGISTERED approver on the HTTP surface) can admit one.
+        //
+        // v1.0.0 #3535 — ALICE, the canonical TARGET, is registered here for
+        // the OTHER half of the same rule: the mint/bind form now refuses a
+        // target that is not on the `_agents` roster, so a fixture that left
+        // the target unregistered would be testing the refusal, not the
+        // control under test. `register_target` adds any further target a
+        // single test needs.
         let conn = ai_memory::db::open(&db_path).expect("db::open");
-        for a in admins {
-            ai_memory::db::register_agent(&conn, a, "human", &[]).expect("register admin");
+        for a in admins.iter().copied().chain(std::iter::once(ALICE)) {
+            ai_memory::db::register_agent(&conn, a, "human", &[]).expect("register agent");
         }
     }
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -175,8 +189,19 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
         router: ai_memory::build_router(api_key_state, app_state),
         store,
         registry,
+        db_path,
         _dir: dir,
     }
+}
+
+/// v1.0.0 #3535 — put an extra agent on the `_agents` roster.
+///
+/// The mint/bind form refuses an unregistered target, so a test whose subject
+/// is some OTHER control has to register the target it mints for; a test whose
+/// subject IS the refusal deliberately does not.
+fn register_target(fx: &Fixture, agent_id: &str) {
+    let conn = ai_memory::db::open(&fx.db_path).expect("reopen for register");
+    ai_memory::db::register_agent(&conn, agent_id, "human", &[]).expect("register target");
 }
 
 async fn call(
@@ -474,6 +499,13 @@ async fn the_rate_limiter_admits_the_budget_and_refuses_the_next_mint_3474() {
     const ADMIN: &str = "ai:key-admin-ratelimit";
     let _g = serial().await;
     let fx = fixture("ratelimit", &[ADMIN]);
+
+    // #3535 — every burst target is on the roster, INCLUDING the N+1th, so
+    // the refusal below can only be the limiter and not the registration gate.
+    for i in 0..MINT_RATE_LIMIT_PER_WINDOW {
+        register_target(&fx, &format!("ai:key-burst-{i}"));
+    }
+    register_target(&fx, "ai:key-burst-over");
 
     for i in 0..MINT_RATE_LIMIT_PER_WINDOW {
         let target = format!("ai:key-burst-{i}");
@@ -1084,5 +1116,134 @@ async fn a_well_formed_id_over_a_non_confidential_transport_still_refuses_3530()
         status,
         StatusCode::OK,
         "the refusal above must be the control, not a broken route: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3535 (#3474 advisory 1) — the TARGET must be a registered agent.
+// ---------------------------------------------------------------------------
+
+/// DENIED — neither form of the enrolment route will create a credential for a
+/// principal the `_agents` roster does not know, and the SAME call succeeds the
+/// moment the target is registered, so the refusal is a gate and not a broken
+/// route.
+///
+/// The defect this pins: a typo'd `{id}` used to mint a LIVE bearer token for
+/// an agent that does not exist. `enforce` would then bind an `X-Agent-Id` to
+/// that id while `is_registered_agent` — the same predicate the governance
+/// `registered` level and every approver-eligibility gate consult — says there
+/// is no such agent, which is two identity subsystems disagreeing about who
+/// exists.
+#[tokio::test]
+async fn an_unregistered_target_is_refused_on_both_forms_and_binds_nothing_3535() {
+    const ADMIN: &str = "ai:key-admin-unregistered";
+    const GHOST: &str = "ai:key-ghost-typo";
+    let _g = serial().await;
+    let fx = fixture("unregistered", &[ADMIN]);
+
+    let supplied = "operator-supplied-token-3535-long-enough-to-be-a-credential";
+    for body in [json!({}), json!({ "token": supplied })] {
+        let (status, _, resp) = call(&fx.router, mint_req(ADMIN, GHOST, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unregistered target must be refused: {resp}"
+        );
+        assert_eq!(resp["error"], TARGET_NOT_REGISTERED, "{resp}");
+        assert!(
+            !resp.to_string().contains(supplied),
+            "the refusal must not echo the supplied token: {resp}"
+        );
+        assert!(
+            resp.get("token").is_none(),
+            "a refused mint must not return a token: {resp}"
+        );
+    }
+
+    // Nothing durable and nothing live: no binding for the ghost, and the
+    // operator-supplied token does not authenticate.
+    assert_eq!(fx.registry.len(), 0, "a refused mint must enrol nothing");
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&api_key_sha256_hex(supplied))
+            .await
+            .expect("resolve"),
+        None
+    );
+    assert!(!token_authenticates(&fx.router, supplied).await);
+
+    // ALLOWED — register the very same id and the very same call works, in one
+    // extra call by the SAME principal.
+    register_target(&fx, GHOST);
+    let (status, body, _) = mint(&fx.router, ADMIN, GHOST).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "registering the target must make the refused call succeed: {body}"
+    );
+    let token = body["token"].as_str().expect("minted token").to_string();
+    assert!(token_authenticates(&fx.router, &token).await);
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&api_key_sha256_hex(&token))
+            .await
+            .expect("resolve"),
+        Some(GHOST.to_string())
+    );
+}
+
+/// The refusal is NOT reachable without admin, so it adds no enumeration
+/// oracle: an unregistered target and a registered one are still the same
+/// generic `403` for a non-admin.
+#[tokio::test]
+async fn the_unregistered_target_refusal_is_behind_the_admin_gate_3535() {
+    const ADMIN: &str = "ai:key-admin-ghostoracle";
+    const GHOST: &str = "ai:key-ghost-oracle";
+    let _g = serial().await;
+    let fx = fixture("ghostoracle", &[ADMIN]);
+
+    for target in [ALICE, GHOST] {
+        let (status, _, body) = call(&fx.router, mint_req(MALLORY, target, &json!({}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{target}: {body}");
+        assert_eq!(
+            body,
+            json!({"error": "admin role required"}),
+            "{target} must not reveal whether the agent is registered"
+        );
+    }
+}
+
+/// REVOKE is deliberately NOT gated on registration: refusing a revocation is
+/// strictly worse than performing one, and revoking a key bound to an
+/// unregistered id is exactly the cleanup an operator needs for a binding that
+/// predates this rule.
+#[tokio::test]
+async fn revoke_is_not_gated_on_target_registration_3535() {
+    const ADMIN: &str = "ai:key-admin-revokeghost";
+    const GHOST: &str = "ai:key-ghost-legacy";
+    let _g = serial().await;
+    let fx = fixture("revokeghost", &[ADMIN]);
+
+    // A binding that predates the rule: enrolled directly at the store seam,
+    // the way `ai-memory agents bind-api-key` would have.
+    let legacy = "legacy-enrolled-token-3535-that-predates-the-registration-rule";
+    let digest = api_key_sha256_hex(legacy);
+    {
+        let conn = ai_memory::db::open(&fx.db_path).expect("reopen");
+        ai_memory::db::bind_agent_api_key(&conn, GHOST, &digest).expect("legacy bind");
+    }
+    // A second holder, so the revoke is not the last enrolled key.
+    let (status, body, _) = mint(&fx.router, ADMIN, ADMIN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = call(&fx.router, revoke_req(ADMIN, GHOST, &json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "revoking ANOTHER principal's key is parked, not refused for being unregistered: {body}"
+    );
+    assert_ne!(
+        body["error"], TARGET_NOT_REGISTERED,
+        "revoke must never refuse on registration: {body}"
     );
 }
