@@ -172,7 +172,8 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
         "PRUNE_CURATOR_REPORTS",
     );
     refused(
-        s.calibrate_confidence_report(30, chrono::Utc::now()).await,
+        s.calibrate_confidence_report(&ctx, 30, chrono::Utc::now())
+            .await,
         "CALIBRATE_CONFIDENCE",
     );
 
