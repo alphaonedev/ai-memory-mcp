@@ -999,3 +999,90 @@ async fn an_approved_revoke_that_became_the_last_key_is_refused_at_apply_3529() 
         "the refused apply must be audited: {audit_text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3530 — validate the path segment BEFORE the transport refusal is audited.
+// ---------------------------------------------------------------------------
+
+/// A malformed `{id}` over a NON-confidential transport is a `400` that writes
+/// NO audit row, while a well-formed one over the same transport still writes
+/// the transport refusal — so the ordering, not a broken audit sink, is what
+/// keeps the unvalidated segment off the signed chain.
+#[tokio::test]
+async fn a_malformed_agent_id_is_refused_before_any_audit_row_is_written_3530() {
+    const ADMIN: &str = "ai:key-admin-a2order";
+    let _g = serial().await;
+    let fx = fixture("a2order", &[ADMIN]);
+    let audit_dir = scratch("audit-a2order");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+
+    // Unbounded caller-controlled content: 600 bytes, far past the 128-byte
+    // agent-id ceiling. This is exactly the value that used to be JSON-encoded
+    // onto an append-only, signed chain before anything had validated it.
+    let malformed = "z".repeat(600);
+    mark_credential_transport_confidential(false);
+    let (status, _, body) = call(&fx.router, mint_req(ADMIN, &malformed, &json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a malformed agent_id must be refused on shape alone: {body}"
+    );
+    assert!(
+        !body.to_string().contains(&malformed),
+        "the refusal must not echo the raw segment back: {body}"
+    );
+
+    // Same transport posture, a WELL-FORMED id: the transport refusal and its
+    // audit row are unchanged.
+    let (status, _, body) = call(&fx.router, mint_req(ADMIN, ALICE, &json!({}))).await;
+    mark_credential_transport_confidential(true);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], TRANSPORT_REFUSAL);
+
+    let audit_text = forensic_text(&audit_dir);
+    // Non-vacuous: the well-formed refusal DID land, with its target.
+    assert!(
+        audit_text.contains("transport_not_confidential"),
+        "the transport refusal must still be audited, else this assertion is \
+         vacuous: {audit_text}"
+    );
+    assert!(
+        audit_text.contains(ALICE),
+        "the audited refusal must name the (validated) target agent"
+    );
+    // …and the never-validated segment reached no row at all.
+    assert!(
+        !audit_text.contains(&malformed),
+        "an unvalidated {{id}} must never reach the signed audit chain"
+    );
+}
+
+/// The transport refusal itself is UNCHANGED by the reordering: a well-formed
+/// id over a non-confidential transport is still `403`
+/// `credential_transport_not_confidential`, still binds nothing, and the same
+/// call still succeeds once the posture is confidential.
+#[tokio::test]
+async fn a_well_formed_id_over_a_non_confidential_transport_still_refuses_3530() {
+    const ADMIN: &str = "ai:key-admin-a2unchanged";
+    let _g = serial().await;
+    let fx = fixture("a2unchanged", &[ADMIN]);
+
+    mark_credential_transport_confidential(false);
+    let (status, _, body) = call(&fx.router, mint_req(ADMIN, ALICE, &json!({}))).await;
+    mark_credential_transport_confidential(true);
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], TRANSPORT_REFUSAL);
+    assert_eq!(
+        fx.registry.len(),
+        0,
+        "a transport-refused mint must not enrol anything"
+    );
+
+    let (status, body, _) = mint(&fx.router, ADMIN, ALICE).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refusal above must be the control, not a broken route: {body}"
+    );
+}
