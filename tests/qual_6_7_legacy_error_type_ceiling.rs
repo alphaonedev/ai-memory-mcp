@@ -176,7 +176,20 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // behavioural suite (it self-jails each export at the requested folder's own
 // parent instead of mutating process-global env) MUST mirror the same
 // envelope. Net acknowledged: +2 (one production seam, one test-only shim).
-const QUAL_6_CEILING: usize = 127;
+// 2026-09-06 (#3523 own-binary `*_3387` suite) — raised 127 -> 128 for the
+// TEST-ONLY `handle_detect_contradiction_for_tests` wrapper in
+// `src/mcp/tools/detect_contradiction.rs`. Same wire/trusted-split precedent
+// as the #3171 `handle_namespace_clear_standard` + `_trusted` + `_inner`
+// entry above and the #3357 `handle_skill_export_in_root` seam: the wrapper
+// MUST mirror the `Result<Value, String>` MCP-dispatch envelope of the
+// `pub(super) handle_detect_contradiction` it forwards to VERBATIM, so it is
+// that type by construction — no new error contract. It exists so the five
+// `*_3387` cross-tenant refusal cases can run in their OWN PROCESS
+// (`tests/detect_contradiction_3387.rs`) instead of as #3517 victims inside
+// the shared `cargo test --lib` binary, and it is
+// `#[cfg(any(test, feature = "test-support"))]` — absent from a release
+// build entirely. Net acknowledged: +1.
+const QUAL_6_CEILING: usize = 128;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

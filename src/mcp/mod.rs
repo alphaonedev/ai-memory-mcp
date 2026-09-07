@@ -891,6 +891,15 @@ pub mod tools {
         pub use super::super::skill_register::{SkillRegisterRequest, handle_skill_register};
     }
 
+    // v1.0.0 #3523 — re-export the TEST-ONLY entry to the caller-scoped
+    // contradiction handler so the five `*_3387` cases can run in their OWN
+    // PROCESS (`tests/detect_contradiction_3387.rs`) per the #3475 pattern,
+    // instead of as victims inside the shared `cargo test --lib` binary.
+    // `cfg`-gated on both sides, so `cargo build --release` compiles neither
+    // the wrapper nor this re-export.
+    #[cfg(any(test, feature = "test-support"))]
+    pub use super::detect_contradiction::handle_detect_contradiction_for_tests;
+
     // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator
     // handler + bundle. Integration test at
     // `tests/form_3_multistep_ingest.rs` drives the handler directly
