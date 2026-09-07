@@ -70,10 +70,15 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
     );
 
     // --- ALLOWED: enroll, then let the refresh observe it. ----------------
-    store
-        .bind_agent_api_key(&ctx, agent, &digest)
-        .await
-        .expect("bind_agent_api_key");
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx, agent, &digest)
+            .await
+            .expect("bind_agent_api_key"),
+        ai_memory::storage::BindApiKeyOutcome::Bound,
+        "#3535 — a fresh digest enrols; the outcome is typed so a refused \
+         re-point cannot read as a successful enrolment"
+    );
     let rows = store.list_agent_api_keys().await.map_err(|e| e.to_string());
     let outcome = apply_agent_key_refresh(&registry, rows);
     assert!(

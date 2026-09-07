@@ -35,6 +35,7 @@ use ai_memory::handlers::agent_api_key::{
 };
 use ai_memory::handlers::identity_binding::api_key_sha256_hex;
 use ai_memory::models::AgentRegistration;
+use ai_memory::storage::BindApiKeyOutcome;
 use ai_memory::store::{ApproveOutcome, CallerContext, GovernedAction, MemoryStore};
 use serde_json::json;
 
@@ -83,10 +84,13 @@ async fn admin_api_key_seam_parity(store: &Arc<dyn MemoryStore>, suffix: &str) {
     // --- bind / resolve / revoke, digest-keyed ---------------------------
     let token = format!("minted-token-{suffix}");
     let digest = api_key_sha256_hex(&token);
-    store
-        .bind_agent_api_key(&ctx, &target, &digest)
-        .await
-        .expect("bind_agent_api_key");
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx, &target, &digest)
+            .await
+            .expect("bind_agent_api_key"),
+        BindApiKeyOutcome::Bound
+    );
     assert_eq!(
         store
             .agent_id_for_api_key(&digest)
@@ -327,14 +331,20 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
 
     let digest_a = api_key_sha256_hex(&format!("token-a-{suffix}"));
     let digest_b = api_key_sha256_hex(&format!("token-b-{suffix}"));
-    store
-        .bind_agent_api_key(&ctx_a, &a, &digest_a)
-        .await
-        .expect("bind a");
-    store
-        .bind_agent_api_key(&ctx_b, &b, &digest_b)
-        .await
-        .expect("bind b");
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_a, &a, &digest_a)
+            .await
+            .expect("bind a"),
+        BindApiKeyOutcome::Bound
+    );
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_b, &b, &digest_b)
+            .await
+            .expect("bind b"),
+        BindApiKeyOutcome::Bound
+    );
 
     // The ONE snapshot both in-flight requests observe. Each holder sees the
     // other's key, so each pre-check says "apply immediately" — the exact
@@ -418,10 +428,13 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
     // ALLOWED — with another holder present the same call revokes, so the
     // refusal above is the control and not a broken seam.
     let digest_c = api_key_sha256_hex(&format!("token-c-{suffix}"));
-    store
-        .bind_agent_api_key(&ctx_c, &c, &digest_c)
-        .await
-        .expect("bind c");
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_c, &c, &digest_c)
+            .await
+            .expect("bind c"),
+        BindApiKeyOutcome::Bound
+    );
     match store
         .revoke_agent_api_key_unless_last(&ctx_b, &b)
         .await
@@ -517,3 +530,4 @@ async fn postgres_revoke_unless_last_atomicity_3529() {
     let suffix = format!("pg{}", uuid::Uuid::new_v4().simple());
     revoke_unless_last_atomicity_parity(&store, &suffix).await;
 }
+

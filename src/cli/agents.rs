@@ -114,7 +114,12 @@ pub enum AgentsAction {
     /// enrolled set on a bounded cadence, so this takes effect within that
     /// refresh window with NO restart (`AI_MEMORY_AGENT_KEY_REFRESH_SECS`,
     /// default 15s; `0` restores the pre-#3418 restart-required behaviour).
-    /// Re-binding the same token rotates the mapping in place.
+    ///
+    /// v1.0.0 #3535 — re-binding the same token to the SAME agent is an
+    /// idempotent no-op; re-binding it to a DIFFERENT agent is REFUSED and
+    /// nothing changes. It used to rotate the mapping in place, which meant a
+    /// paste error silently re-pointed a live bearer credential at another
+    /// principal — and silently deleted the enrolment it replaced.
     BindApiKey {
         /// Agent identifier the presenting caller is bound to.
         #[arg(long)]
@@ -520,7 +525,21 @@ pub fn run_agents(
                 anyhow::bail!("api-key token must not be empty");
             }
             let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
-            db::bind_agent_api_key(&conn, &agent_id, &token_sha256)?;
+            // v1.0.0 #3535 — CLI PARITY with the HTTP route: a digest already
+            // enrolled to a DIFFERENT agent is REFUSED, never re-pointed.
+            // Re-asserting the same pair stays an idempotent success. The
+            // refusal names no incumbent (the store outcome does not carry
+            // one), so a paste error cannot be turned into a lookup of whose
+            // key a token is.
+            if matches!(
+                db::bind_agent_api_key(&conn, &agent_id, &token_sha256)?,
+                crate::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent
+            ) {
+                anyhow::bail!(
+                    "{}",
+                    crate::errors::msg::api_key_digest_bound_to_another_agent(&agent_id)
+                );
+            }
             if json_out {
                 writeln!(
                     out.stdout,
@@ -961,9 +980,19 @@ pub async fn run_bind_api_key(
     }
     let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
     let ctx = crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
-    store
-        .bind_agent_api_key(&ctx, agent_id, &token_sha256)
-        .await?;
+    // v1.0.0 #3535 — the SAL twin of the sqlite arm above: conflict-refuse,
+    // never a silent re-point, on whichever backend `--store-url` selected.
+    if matches!(
+        store
+            .bind_agent_api_key(&ctx, agent_id, &token_sha256)
+            .await?,
+        crate::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent
+    ) {
+        anyhow::bail!(
+            "{}",
+            crate::errors::msg::api_key_digest_bound_to_another_agent(agent_id)
+        );
+    }
     if json_out {
         println!(
             "{}",

@@ -1230,7 +1230,10 @@ async fn revoke_is_not_gated_on_target_registration_3535() {
     let digest = api_key_sha256_hex(legacy);
     {
         let conn = ai_memory::db::open(&fx.db_path).expect("reopen");
-        ai_memory::db::bind_agent_api_key(&conn, GHOST, &digest).expect("legacy bind");
+        assert_eq!(
+            ai_memory::db::bind_agent_api_key(&conn, GHOST, &digest).expect("legacy bind"),
+            ai_memory::storage::BindApiKeyOutcome::Bound
+        );
     }
     // A second holder, so the revoke is not the last enrolled key.
     let (status, body, _) = mint(&fx.router, ADMIN, ADMIN).await;

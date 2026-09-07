@@ -1434,6 +1434,27 @@ is strictly worse than performing one, and revoking a key bound to an
 unregistered id is exactly the cleanup needed for a binding that predates this
 rule.
 
+**One digest, one agent.** Binding a token whose `sha256` is already
+enrolled to a *different* agent is refused with `409`:
+
+```json
+{ "error": "api_key_already_bound", "key_fingerprint": "9f2c4a1b7e05" }
+```
+
+and nothing changes. `agent_api_keys` is keyed by the token digest, so the
+previous behaviour was to overwrite the row's agent: one live bearer
+credential silently stopped authenticating as A and started authenticating as
+B, with no signal to either and nothing on the audit chain saying a binding
+had moved — and the enrolment it replaced was silently deleted. The refusal
+deliberately does **not** name the incumbent (you supplied the token; a
+refusal must not tell you whose credential it is). Re-binding the **same**
+`(agent, token)` pair is still an idempotent success, and is a true no-op — the
+recorded `bound_at` does not move, so a retried enrolment cannot rewrite when
+the key was enrolled. The same rules apply to `ai-memory agents bind-api-key`,
+which exits non-zero with the same disposition. To move a token deliberately:
+revoke the incumbent binding first, or (better) mint a fresh token for the new
+agent.
+
 ### Peer-mesh security (v0.6.0+) — MUST READ before deploying sync
 
 The peer-to-peer sync mesh introduces new trust assumptions. Disclosed gaps and required mitigations:
