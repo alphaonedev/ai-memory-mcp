@@ -16292,6 +16292,7 @@ impl crate::store::MemoryStore for B17B2FaultStore {
         if self.get_fault {
             return Err(crate::store::StoreError::BackendUnavailable {
                 backend: "mock".into(),
+                sqlstate: None,
                 detail: "injected fault".into(),
             });
         }
@@ -16393,6 +16394,7 @@ impl crate::store::MemoryStore for B17B2FaultStore {
         if self.probe_fault {
             Err(crate::store::StoreError::BackendUnavailable {
                 backend: "mock".into(),
+                sqlstate: None,
                 detail: "injected fault".into(),
             })
         } else {
