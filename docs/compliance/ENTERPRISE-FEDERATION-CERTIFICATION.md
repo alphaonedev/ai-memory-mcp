@@ -283,6 +283,26 @@ triggers re-cert** (see §7).
 > [**#3501**](https://github.com/alphaonedev/ai-memory-mcp/issues/3501).
 > Historical bind remains `e22bc93c`.
 >
+> **Amendment (2026-09-07, #3515 — test-fixture seeding, not a §7 wire
+> change; Conductor record on the READY #4 chain merge).** Two §7-watched
+> paths changed, `src/federation/mod.rs` (+37) and
+> `src/federation/push_dlq.rs` (+6), and BOTH deltas live entirely inside
+> `#[cfg(test)]` modules (`federation::tests` and
+> `push_dlq::replay_arm_tests`): the test fixtures now seed the process-wide
+> `GOVERNANCE_PRE_ACTION` wire-action hook via
+> `governance::wire_check::ensure_installed_for_test()` so the quorum /
+> id-drift / retry / DLQ-replay assertions stop deciding a scheduling race
+> under `--features sal,sal-postgres --lib` parallelism, plus one structural
+> pin (`build_config_seeds_the_wire_action_gate_3515`) that fails loudly if
+> the seed is removed. **No shipped code path changed:** nothing outside a
+> test module, no wire/schema change, no `AI_MEMORY_FED_*` identifier was
+> added, removed or renamed (set-diff empty at the merge-base and at HEAD),
+> no certified control was removed or weakened, and the test-support seam is
+> `cfg(test)`-only. This amendment discharges the §7 trigger for the #3515
+> touches. **It does NOT re-mint the certification**, which remains **VOID
+> pending the #3502 re-validation and re-issue tracked by #3501.**
+> Historical bind remains `e22bc93c`.
+>
 ---
 
 ## 1. The trust boundary (what is certified)
