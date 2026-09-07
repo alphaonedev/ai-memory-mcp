@@ -49,11 +49,40 @@
 //! invisible-equals-absent equality, the `chat_calls == 0` egress pins and
 //! the two ALLOWED cases — is unchanged.
 //!
+//! v1.0.0 #3523 follow-up — the mock client is built with the TEST-ONLY
+//! [`OllamaClient::new_for_tests_without_probe`] rather than
+//! `new_with_url(..).unwrap()`. The latter runs a `GET /api/tags` health
+//! probe through the sync->async bridge under a 10 s construction budget
+//! (`src/llm.rs`), and on the chain gate that probe timed out under
+//! concurrent build load — 4/5 cases in the default leg and
+//! `collective_scope_row_readable_by_other_caller_3387` in the
+//! `sal,sal-postgres` leg, every failure `llm bridge budget 10s exceeded`.
+//! That is the #3509 LOAD-FLAKE class, not a logic failure: the same five
+//! cases pass 5/5 when run alone. The probe proves nothing these cases
+//! assert — they pin the refusal strings and the `/api/chat` call counts —
+//! so removing it removes a failure mode without weakening a single
+//! assertion. The door the tests take is STRUCTURALLY test-only —
+//! `cfg(any(test, feature = "test-support"))`, the same gating as the #3523
+//! caller-principal seam, with no production caller (pinned by
+//! `tests/agent_id_seam_structural_3523.rs`). It delegates to the shipped
+//! `new_with_url_no_health_check`, which stays an ordinary production API
+//! because it HAS production callers (`new_with_url_async` among them) and
+//! therefore could not itself be gated. The `GET /api/tags` mock went with it: after this change
+//! NOTHING under test calls that endpoint, and `chat_calls` filters strictly
+//! on `/api/chat`, so no count can shift.
+//!
 //! # Concurrency
 //!
 //! Each case drives the synchronous handler through
 //! `tokio::task::spawn_blocking` and awaits it, so no blocking
 //! `MutexGuard` is ever held across an `.await` (rust-1.98 CONCURRENCY-20).
+//! The `multi_thread` flavor and the `spawn_blocking` hand-off are RETAINED,
+//! not incidental: `owner_caller_still_gets_verdict_3387` and
+//! `collective_scope_row_readable_by_other_caller_3387` each assert
+//! `chat_calls == 1`, so the synchronous handler really does reach the model
+//! and really does cross the bridge. Only the CONSTRUCTION-time probe is
+//! gone; the chat round-trip still bridges, under `GENERATE_TIMEOUT` rather
+//! than the tighter 10 s construction budget.
 //! Nothing here mutates the environment, so this binary needs no lock of its
 //! own: the whole point is that it shares its process with nothing.
 
@@ -124,14 +153,6 @@ fn seed_scoped(
     db::insert(conn, &mem).expect("insert")
 }
 
-async fn mount_tags_ok(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path("/api/tags"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
-        .mount(server)
-        .await;
-}
-
 // =================================================================
 // v1.0.0 #3387 — cross-tenant read-oracle regression.
 //
@@ -171,14 +192,13 @@ async fn chat_calls(server: &MockServer) -> usize {
 #[tokio::test(flavor = "multi_thread")]
 async fn non_owner_refused_on_id_a_with_no_llm_call_3387() {
     let server = MockServer::start().await;
-    mount_tags_ok(&server).await;
     mount_chat_yes(&server).await;
     let uri = server.uri();
     let err = tokio::task::spawn_blocking(move || {
         let (conn, _tmp) = fresh_db();
         let id_a = seed_owned(&conn, "victim-title-a", "victim body a", "ai:victim");
         let id_b = seed_owned(&conn, "victim-title-b", "victim body b", "ai:victim");
-        let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+        let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
         handle_detect_contradiction_for_tests(
             &conn,
             Some(&client),
@@ -208,14 +228,13 @@ async fn non_owner_refused_on_id_a_with_no_llm_call_3387() {
 #[tokio::test(flavor = "multi_thread")]
 async fn non_owner_refused_on_id_b_with_no_llm_call_3387() {
     let server = MockServer::start().await;
-    mount_tags_ok(&server).await;
     mount_chat_yes(&server).await;
     let uri = server.uri();
     let err = tokio::task::spawn_blocking(move || {
         let (conn, _tmp) = fresh_db();
         let id_a = seed_owned(&conn, "own-title", "own body", "ai:attacker");
         let id_b = seed_owned(&conn, "victim-title-b", "victim body b", "ai:victim");
-        let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+        let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
         handle_detect_contradiction_for_tests(
             &conn,
             Some(&client),
@@ -244,14 +263,13 @@ async fn non_owner_refused_on_id_b_with_no_llm_call_3387() {
 #[tokio::test(flavor = "multi_thread")]
 async fn invisible_and_absent_refusals_are_identical_3387() {
     let server = MockServer::start().await;
-    mount_tags_ok(&server).await;
     mount_chat_yes(&server).await;
     let uri = server.uri();
     let (invisible, absent) = tokio::task::spawn_blocking(move || {
         let (conn, _tmp) = fresh_db();
         let id_a = seed_owned(&conn, "victim-title-a", "victim body a", "ai:victim");
         let id_b = seed_owned(&conn, "own-title", "own body", "ai:attacker");
-        let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+        let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
         let invisible = handle_detect_contradiction_for_tests(
             &conn,
             Some(&client),
@@ -287,14 +305,13 @@ async fn invisible_and_absent_refusals_are_identical_3387() {
 #[tokio::test(flavor = "multi_thread")]
 async fn owner_caller_still_gets_verdict_3387() {
     let server = MockServer::start().await;
-    mount_tags_ok(&server).await;
     mount_chat_yes(&server).await;
     let uri = server.uri();
     let out = tokio::task::spawn_blocking(move || {
         let (conn, _tmp) = fresh_db();
         let id_a = seed_owned(&conn, "title-a", "the sky is blue", "ai:owner");
         let id_b = seed_owned(&conn, "title-b", "the sky is green", "ai:owner");
-        let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+        let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
         handle_detect_contradiction_for_tests(
             &conn,
             Some(&client),
@@ -317,7 +334,6 @@ async fn owner_caller_still_gets_verdict_3387() {
 #[tokio::test(flavor = "multi_thread")]
 async fn collective_scope_row_readable_by_other_caller_3387() {
     let server = MockServer::start().await;
-    mount_tags_ok(&server).await;
     mount_chat_yes(&server).await;
     let uri = server.uri();
     let out = tokio::task::spawn_blocking(move || {
@@ -336,7 +352,7 @@ async fn collective_scope_row_readable_by_other_caller_3387() {
             "ai:owner",
             Some("collective"),
         );
-        let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+        let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
         handle_detect_contradiction_for_tests(
             &conn,
             Some(&client),
