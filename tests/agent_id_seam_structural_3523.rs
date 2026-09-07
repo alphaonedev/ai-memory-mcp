@@ -81,6 +81,21 @@ const SEAM_DEFINITION_FILE: &str = "src/identity/mod.rs";
 
 /// Tokens that ARM the seam. A production call site of any of these would
 /// make a test-only override reachable from a shipped code path.
+/// v1.0.0 #3523 follow-up (#3509 load-flake class) — the TEST-ONLY probe-free
+/// LLM constructor the five `*_3387` cases take. It carries the SAME structural
+/// contract as the caller-principal seam below: `cfg`-gated, and never called
+/// from production.
+///
+/// It exists because `new_with_url`'s `GET /api/tags` probe crosses the
+/// sync->async bridge under a 10 s construction budget and times out under
+/// concurrent build load. The shipped `new_with_url_no_health_check` could NOT
+/// be gated in its place — it has production callers (`new_with_url_async`,
+/// `handlers::http`, `atomisation::curator`) — so the gated door delegates to
+/// it rather than duplicating the builder.
+const PROBE_FREE_CTOR_DECL: &str = "pub fn new_for_tests_without_probe(";
+const PROBE_FREE_CTOR_TOKEN: &str = "new_for_tests_without_probe";
+const PROBE_FREE_DEFINITION_FILE: &str = "src/llm.rs";
+
 const SEAM_ARMING_TOKENS: [&str; 3] = [
     "AgentIdOverride::set",
     "AgentIdOverride::unset",
@@ -143,6 +158,21 @@ fn line_is_cfg_gated(source: &str, needle: &str) -> Option<bool> {
 ///
 /// Factored out of the filesystem walk so the self-tests can drive it over
 /// synthetic buffers.
+/// Call sites of the TEST-ONLY probe-free constructor, in the shape
+/// [`arming_call_sites`] uses, so the walk is unit-testable over a synthetic
+/// buffer rather than only over the tree it happens to find.
+fn probe_free_call_sites(rel: &str, source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let trimmed = line.trim_start();
+            !is_comment_line(trimmed) && line.contains(PROBE_FREE_CTOR_TOKEN)
+        })
+        .map(|(i, line)| format!("{rel}:{}: {}", i + 1, line.trim()))
+        .collect()
+}
+
 fn arming_call_sites(rel: &str, source: &str) -> Vec<String> {
     source
         .lines()
@@ -217,6 +247,66 @@ fn no_production_code_arms_the_agent_id_seam_3523() {
          (the #3516 lesson), so the module IS compiled there.\n\n\
          A test that needs a specific caller should build the guard in its own test \
          module, or pass an EXPLICIT caller argument.",
+        violations.join("\n  ")
+    );
+}
+
+/// STRUCTURE 3 (#3509 hardening). The probe-free constructor is gated with the
+/// SAME attribute as the seam, so a release build compiles neither it nor any
+/// call to it.
+#[test]
+fn probe_free_ctor_is_cfg_gated_to_test_builds_3523() {
+    let path = manifest_dir().join(PROBE_FREE_DEFINITION_FILE);
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(
+        source.contains(PROBE_FREE_CTOR_DECL),
+        "`{PROBE_FREE_CTOR_DECL}` is missing from {PROBE_FREE_DEFINITION_FILE}: the \
+         `*_3387` cases construct their mock client through it (#3523/#3509)"
+    );
+    assert_eq!(
+        line_is_cfg_gated(&source, PROBE_FREE_CTOR_DECL),
+        Some(true),
+        "the probe-free constructor MUST carry `{SEAM_CFG}` immediately above it. \
+         Ungated, it becomes a production API that silently skips the health \
+         probe — the opposite of what the shipped, deliberately UNGATED \
+         `new_with_url_no_health_check` documents about itself."
+    );
+}
+
+/// STRUCTURE 4 (#3509 hardening). No production path calls it. This is the
+/// invariant the `cfg` gate alone cannot carry: every `cargo test` unifies
+/// `test-support` into the whole build INCLUDING the `ai-memory` BIN (the
+/// #3516 lesson), so the fn IS compiled there and a stray call would link.
+#[test]
+fn no_production_code_calls_the_probe_free_ctor_3523() {
+    let manifest = manifest_dir();
+    let mut files = Vec::new();
+    collect_rs_files(&manifest.join("src"), &mut files);
+    assert!(!files.is_empty(), "no src/**/*.rs files found");
+
+    let mut violations = Vec::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(&manifest)
+            .unwrap_or(file.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == PROBE_FREE_DEFINITION_FILE {
+            continue;
+        }
+        let source = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        violations.extend(probe_free_call_sites(&rel, &source));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "the TEST-ONLY probe-free LLM constructor is called from `src/` (#3523):\n  {}\n\n\
+         `new_for_tests_without_probe` exists ONLY so the `*_3387` cases can skip a \
+         health probe that flakes under build load. A production path that wants to \
+         defer the probe already has a supported, documented door: \
+         `new_with_url_no_health_check`. Call that instead.",
         violations.join("\n  ")
     );
 }
@@ -412,4 +502,46 @@ pub fn handle_something() {}
         arming_call_sites("src/contrived.rs", src).is_empty(),
         "a commented-out mention must not be flagged"
     );
+}
+
+/// The STRUCTURE 4 walk is not vacuous: it catches a production call planted
+/// in a synthetic buffer.
+#[test]
+fn detector_catches_a_production_probe_free_call_3523() {
+    let src = r#"
+pub fn build_llm() -> OllamaClient {
+    OllamaClient::new_for_tests_without_probe("http://127.0.0.1:11434", "m").unwrap()
+}
+"#;
+    let hits = probe_free_call_sites("src/oops.rs", src);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a production call to the test-only constructor must be caught, got {hits:?}"
+    );
+}
+
+/// ... and does not fire on the SHIPPED production door, whose whole purpose
+/// is to let production skip the probe legitimately. Confusing the two would
+/// make the gate unusable: `new_with_url_no_health_check` has many production
+/// callers by design.
+#[test]
+fn detector_spares_the_shipped_no_health_check_ctor_3523() {
+    let src = r#"
+pub fn build_llm() -> OllamaClient {
+    OllamaClient::new_with_url_no_health_check("http://127.0.0.1:11434", "m").unwrap()
+}
+"#;
+    assert!(
+        probe_free_call_sites("src/fine.rs", src).is_empty(),
+        "the shipped `new_with_url_no_health_check` is a production API and must \
+         never be flagged by the test-only-constructor gate"
+    );
+}
+
+/// A commented-out mention is not a call.
+#[test]
+fn detector_spares_a_commented_out_probe_free_mention_3523() {
+    let src = "    // OllamaClient::new_for_tests_without_probe(&uri, \"m\");\n";
+    assert!(probe_free_call_sites("src/doc.rs", src).is_empty());
 }
