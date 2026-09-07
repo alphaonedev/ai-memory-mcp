@@ -60,10 +60,13 @@ impl PostgresStore {
     /// [`RevokeUnlessLastOutcome::WouldEmptyRegistry`] WITHOUT deleting
     /// anything when the target holds every enrolled key.
     ///
-    /// Wave-2 B7' — the record-stop gate is taken HERE, in the function that
+    /// Wave-2 B7 — the record-stop gate is taken HERE, in the function that
     /// owns the `DELETE`, so the structural scan sees it on the write and the
     /// sqlite twin (which gates inside the `crate::storage` SSOT) and this one
-    /// refuse the same writes.
+    /// refuse the same writes. The trait wrapper in `postgres.rs` takes it
+    /// AGAIN, because the #3175 B8 parity scan reads that file only and cannot
+    /// see a gate that lives in a submodule; the gate is an idempotent read,
+    /// so both scans are satisfied without either trusting the other's file.
     ///
     /// # Errors
     ///

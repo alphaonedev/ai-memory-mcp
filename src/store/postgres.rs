@@ -26791,9 +26791,14 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         agent_id: &str,
     ) -> StoreResult<crate::storage::RevokeUnlessLastOutcome> {
-        // The record-stop gate + the whole transaction live in the submodule
-        // (qual_10 budget; B7' keeps the gate on the function that owns the
-        // DELETE).
+        // Gate taken HERE **and** in the submodule: the #3175 B8 parity scan
+        // reads this file (it cannot see a gate that lives in a submodule),
+        // and the Wave-2 B7 structural scan reads the write site — the
+        // function that owns the DELETE. The gate is an idempotent read, so
+        // taking it twice costs a cached atomic load and closes both scans
+        // without either one having to trust the other's file. The
+        // transaction itself stays in the submodule (qual_10 budget).
+        self.gate_record_stop().await?;
         self.revoke_agent_api_key_unless_last_pg(agent_id).await
     }
 
