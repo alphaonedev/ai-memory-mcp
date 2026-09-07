@@ -195,6 +195,46 @@ pub fn install_for_test(hook: WireCheckHook) -> std::result::Result<(), ()> {
     GOVERNANCE_PRE_ACTION.set(hook).map_err(|_| ())
 }
 
+/// Test-only helper: guarantee that SOME wire-action hook is installed in
+/// this test process, so every [`check_governed`] sink behaves
+/// deterministically under the default multi-threaded test harness.
+///
+/// # Why this exists (#3515)
+///
+/// [`GOVERNANCE_PRE_ACTION`] is a process-wide, ONE-SHOT `OnceLock`. That is
+/// a deliberate integrity property (rationale 1 in the module comment): there
+/// is no reset, no override and no production-reachable escape hatch. A
+/// per-test RAII guard that saves and restores the previous hook is therefore
+/// structurally impossible here, and inventing one would punch exactly the
+/// bypass seam the operator directive forbids.
+///
+/// The consequence is that "has the hook been installed yet?" is process-
+/// global state shared by every test in the `--lib` binary:
+/// `daemon_runtime::tests::test_bootstrap_serve_*` installs the real hook as
+/// a side effect of `bootstrap_serve`, while the federation egress tests hit
+/// [`check_governed`] and fail closed with [`HOOK_NOT_INSTALLED_REASON`] if
+/// they win the scheduling race instead. At default parallelism the outcome
+/// is a coin-flip, which is what made the quorum / id-drift / retry tests in
+/// `federation::tests` flaky (#3515).
+///
+/// Calling this from a test fixture removes the race WITHOUT weakening the
+/// gate: the gate is still consulted on every action; the test merely
+/// supplies the allow-all verdict a booted daemon's rule engine returns for
+/// an action no operator rule matches. The fail-closed unset-hook contract
+/// itself stays pinned by `tests/governance_wire_check_fail_closed.rs` — a
+/// SEPARATE cargo test binary whose `OnceLock` is independent of this one.
+///
+/// First-write-wins: when a sibling test (or `bootstrap_serve`) already
+/// installed the real hook, that hook stays active and this is a no-op. The
+/// helper is therefore safe to call from every test and in any order.
+#[doc(hidden)]
+#[cfg(test)]
+pub fn ensure_installed_for_test() {
+    // Deliberate discard (ERRORS-19): `Err(())` means a hook is already
+    // installed, which IS the post-condition this helper promises.
+    let _ = install_for_test(Box::new(|_| Ok(())));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
