@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dev.alphaone.ai-memory.wake-hub.plist - macOS launchd template for the
+  ai-memory wake hub (issue #3471, EPIC #3466).
+
+  The wake hub is a same-host, CONTENT-FREE agent wake plane: a 0600 Unix
+  domain socket inside an owner-only 0700 directory that pushes a bounded
+  {inbox_row_id, namespace, sender, digest, seq_high_watermark} HINT to
+  agents on this host. It carries no message bodies and opens no database,
+  so losing it degrades wake LATENCY and nothing else - the ai-memory inbox
+  row stays the record and the <=60 s backstop poll stays the guarantee.
+
+  THE FILE-DESCRIPTOR LIMIT IS THE POINT OF THIS TEMPLATE.
+  macOS ships a default soft RLIMIT_NOFILE of 256, which lands EMFILE at
+  exactly the 256-agent scale the hub is designed for. The two ResourceLimits
+  keys below raise it to 4096, matching wake_hub::limits::DESIRED_NOFILE and
+  the LimitNOFILE= in packaging/systemd/ai-memory-wake-hub.service. The hub
+  also raises its own soft limit toward that value at start-up and sizes its
+  connection ceiling from whatever it actually got, so a smaller limit here
+  produces a SMALLER hub rather than a broken one - but it will be smaller,
+  and `ai-memory wake-hub --posture` will say so.
+
+  Pre-flight:
+    1. Publish the allowlist of agents permitted to join (public keys only):
+         ai-memory identity hub-cache --include-agent ai:worker \
+             --out ~/.ai-memory/hub-allow.json
+       WITHOUT --allowlist the hub admits NOBODY. That is the fail-closed
+       default, not a misconfiguration.
+    2. Choose a SHORT socket path. AF_UNIX sun_path is 104 bytes on macOS
+       and the hub REFUSES an over-long path rather than letting bind(2)
+       silently truncate it.
+
+  Install:
+    cp scripts/templates/dev.alphaone.ai-memory.wake-hub.plist \
+       ~/Library/LaunchAgents/
+    sed -i.bak 's|/Users/YOU|'"$HOME"'|g' \
+       ~/Library/LaunchAgents/dev.alphaone.ai-memory.wake-hub.plist
+    launchctl bootstrap "gui/$(id -u)" \
+       ~/Library/LaunchAgents/dev.alphaone.ai-memory.wake-hub.plist
+
+  Operations:
+    launchctl print "gui/$(id -u)/dev.alphaone.ai-memory.wake-hub" | grep state
+    ai-memory wake-hub --posture                 # resolved config, binds nothing
+    ai-memory wake-hub --health                  # is it reachable? exit 0/2
+    ai-memory doctor --json | jq '.sections[] | select(.name|test("Wake hub"))'
+    tail -f ~/Library/Logs/ai-memory/wake-hub.log
+    launchctl bootout "gui/$(id -u)/dev.alphaone.ai-memory.wake-hub"
+
+  Shutdown: launchd sends SIGTERM. The hub stops accepting, asks every
+  session to flush what it already holds, waits at most 5 s
+  (wake_hub::limits::DRAIN_DEADLINE_MS), unlinks its own socket and exits 0 -
+  comfortably inside launchd's 20 s SIGTERM grace, so it is never SIGKILLed.
+
+  Linux operators: use packaging/systemd/ai-memory-wake-hub.service.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.alphaone.ai-memory.wake-hub</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/.local/bin/ai-memory</string>
+        <string>wake-hub</string>
+        <string>--socket</string>
+        <string>/Users/YOU/.ai-memory/wake-hub.sock</string>
+        <string>--allowlist</string>
+        <string>/Users/YOU/.ai-memory/hub-allow.json</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/YOU</string>
+        <key>RUST_LOG</key>
+        <string>ai_memory=info</string>
+    </dict>
+
+    <key>RunAtLoad</key><true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+        <key>Crashed</key><true/>
+    </dict>
+
+    <key>ThrottleInterval</key><integer>10</integer>
+
+    <!--
+      File-descriptor budget. MUST match wake_hub::limits::DESIRED_NOFILE
+      (4096) and the systemd unit's LimitNOFILE=. The macOS default soft
+      limit of 256 is exactly the scale at which the hub would start
+      refusing connections.
+    -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key><integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key><integer>4096</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/ai-memory/wake-hub.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/ai-memory/wake-hub.log</string>
+
+    <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>

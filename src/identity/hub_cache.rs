@@ -25,6 +25,7 @@ pub fn entry(
     agent_id: &str,
     history: &[crate::storage::AgentPubkeyVersion],
     mut revoked_keys: Vec<String>,
+    readable_prefixes: Vec<String>,
     now: &str,
 ) -> Result<AllowlistEntry> {
     super::hub_authority::current_issuer(agent_id, history, now)?;
@@ -37,7 +38,44 @@ pub fn entry(
         bind_authority: current.bind_authority.clone(),
         bound_at: current.bound_at.clone(),
         revoked_keys,
+        readable_prefixes,
     })
+}
+
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// the read PREFIXES `agent_id` PROVABLY holds.
+///
+/// The derivation is [`crate::visibility::namespace_read_scope_prefixes`],
+/// which is the store's OWN #1921 read scope expressed as its `team` / `unit`
+/// / `org` ancestors. It is reused, never re-derived: a second copy of a
+/// visibility predicate is the #951 defect this codebase has already paid for
+/// twice. The hub then admits a namespace with the store's own containment
+/// test ([`crate::visibility::namespace_subtree_contains`]) plus the #3348
+/// substrate exclusion, so the two halves of the proof are both the shared
+/// predicate and nothing re-widens.
+///
+/// # Why prefixes, and not an expanded list
+///
+/// The set is a property of the agent's OWN ID — at most
+/// [`crate::wake_hub::limits::MAX_READABLE_PREFIXES`] entries, forever. An
+/// expanded list would instead be a property of the CORPUS: it would grow as
+/// namespaces are created, an org-level agent would eventually exceed any
+/// fixed ceiling, and refusing that export would publish NOTHING — after which
+/// the snapshot ages out and the hub refuses EVERY hello. That is a
+/// fleet-wide availability failure caused by ordinary corpus growth, so the
+/// bound has to be one the corpus cannot move. This function issues no query
+/// and so cannot fail.
+#[must_use]
+pub fn readable_prefixes_for(agent_id: &str) -> Vec<String> {
+    // Already bounded by construction: `namespace_read_scope_prefixes` takes
+    // `NAMESPACE_READ_SCOPE_DEPTH`, which IS the hub's ceiling. Sorted +
+    // deduplicated so the snapshot is byte-stable across refreshes that
+    // changed nothing — an unstable ordering would republish a new inode every
+    // cycle and defeat #3504's reuse.
+    let mut prefixes = crate::visibility::namespace_read_scope_prefixes(agent_id);
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
 }
 
 /// v1.0.0 #3469 — the store-free `wake-hub-producer` row, derived from this
@@ -90,6 +128,13 @@ pub fn daemon_producer_entry(key_dir: &Path, now: &str) -> Result<AllowlistEntry
         // stamping it now — never backdating — keeps that ordering meaningful.
         bound_at: now.to_owned(),
         revoked_keys: Vec::new(),
+        // #3505 — the reserved producer's id carries no `/`, so it has no
+        // team / unit / org ancestor and proves no namespace read scope. Its
+        // only authority stays "may deliver a content-free wake hint addressed
+        // to an agent's own inbox": with an empty prefix set it cannot
+        // SUBSCRIBE to a namespace topic and — since the send gate applies the
+        // same proof — cannot ADDRESS one either.
+        readable_prefixes: Vec::new(),
     })
 }
 
@@ -102,6 +147,10 @@ pub fn derive_sqlite(conn: &rusqlite::Connection, agents: &[String]) -> Result<A
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let now = chrono::Utc::now().to_rfc3339();
+    // #3505 — the proven read scope is derived from each agent's OWN ID, so
+    // this export issues NO corpus-wide namespace scan: the refresher runs
+    // every 30 s, and a `GROUP BY namespace` over `memories` on that cadence
+    // is a cost that grows with the corpus for a result that does not.
     let mut entries = Vec::with_capacity(agents.len());
     for agent in agents {
         crate::validate::validate_agent_id_shape(agent)?;
@@ -115,7 +164,8 @@ pub fn derive_sqlite(conn: &rusqlite::Connection, agents: &[String]) -> Result<A
             .filter(|cert| cert.revoked)
             .map(|cert| URL_SAFE_NO_PAD.encode(cert.instance_key_id))
             .collect();
-        entries.push(entry(agent, &history, revoked, &now)?);
+        let readable = readable_prefixes_for(agent);
+        entries.push(entry(agent, &history, revoked, readable, &now)?);
     }
     Ok(AllowlistFile {
         version: ALLOWLIST_FILE_VERSION,
@@ -159,6 +209,12 @@ pub fn events(
                 new.agent_id == entry.agent_id
                     && new.pubkey_b64 == entry.pubkey_b64
                     && new.revoked_keys == entry.revoked_keys
+                    // #3505 — a NARROWED proven-prefix set is a revocation of
+                    // topic authority, so it rides the same audit spine as a
+                    // revoked key. Without this the removal side would be
+                    // silent while the grant side (struct equality, below)
+                    // already fires.
+                    && new.readable_prefixes == entry.readable_prefixes
             }) {
                 events.push(crate::signed_events::SignedEvent::with_daemon_signature(
                     hash.clone(),

@@ -24,7 +24,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
@@ -47,11 +47,38 @@ pub struct FdBudget {
     pub soft: u64,
     /// Hard `RLIMIT_NOFILE`.
     pub hard: u64,
+    /// The soft limit the hub asked for: [`DESIRED_NOFILE`] (#3471). Reported
+    /// so an operator can see at a glance whether the unit file's
+    /// `LimitNOFILE=` / plist `SoftResourceLimits` actually took effect.
+    pub desired: u64,
     /// Connections the hub will admit, after reserving [`FD_HEADROOM`].
     pub connection_ceiling: usize,
     /// `true` when the configured ceiling had to be lowered to fit the fd
     /// budget. The hub still starts — degraded but honest — and says so.
     pub clamped: bool,
+}
+
+impl FdBudget {
+    /// Did the process reach the soft limit the hub asked for (#3471)?
+    ///
+    /// `false` means the supervisor did not grant [`DESIRED_NOFILE`] — the
+    /// macOS default 256 is the case the issue names — so the hub is running at
+    /// a smaller ceiling than its design target. Not a refusal: a smaller hub
+    /// is honest, a hub that lies about its capacity is not.
+    #[must_use]
+    pub const fn meets_desired(self) -> bool {
+        self.soft >= self.desired
+    }
+
+    /// The smallest soft `RLIMIT_NOFILE` at which the hub will bind at all:
+    /// [`MIN_CONNECTION_CEILING`] connections plus [`FD_HEADROOM`] (#3471).
+    #[must_use]
+    pub fn minimum_soft_nofile() -> u64 {
+        // `PERF-07`: no `as` narrowing. A `MIN_CONNECTION_CEILING` that did not
+        // fit `u64` would mean the hub can never start, which saturating to
+        // `u64::MAX` states exactly.
+        FD_HEADROOM.saturating_add(u64::try_from(MIN_CONNECTION_CEILING).unwrap_or(u64::MAX))
+    }
 }
 
 /// Read this process's effective uid.
@@ -235,21 +262,52 @@ pub fn configure_fd_limit(configured_max_connections: usize) -> Result<FdBudget>
     }
 
     let usable = usize::try_from(soft.saturating_sub(FD_HEADROOM)).unwrap_or(usize::MAX);
-    let connection_ceiling = configured_max_connections.min(usable);
-    if connection_ceiling < MIN_CONNECTION_CEILING {
+    // #3471 — the two ways the ceiling can be too small have DIFFERENT
+    // remedies, so they get different refusals. Conflating them (as the #3467
+    // substrate did) told an operator who had typed `--max-connections 4` to go
+    // raise their file-descriptor limit.
+    let minimum_soft = FdBudget::minimum_soft_nofile();
+    if usable < MIN_CONNECTION_CEILING {
         bail!(
-            "wake-hub: RLIMIT_NOFILE soft limit {soft} leaves room for only \
-             {connection_ceiling} connections (< {MIN_CONNECTION_CEILING}). Raise the \
-             file-descriptor limit for this process (macOS defaults to 256, which \
-             lands EMFILE at exactly the 256-agent design target) and start again."
+            "wake-hub: RLIMIT_NOFILE soft limit {soft} leaves room for only {usable} \
+             connections after reserving {FD_HEADROOM} descriptors of headroom, which is \
+             below the {MIN_CONNECTION_CEILING}-connection floor. The hub needs a soft \
+             limit of at least {minimum_soft} to bind at all, and asks for \
+             {DESIRED_NOFILE}. Raise it for this process — `LimitNOFILE=` in the systemd \
+             unit, `SoftResourceLimits`/`HardResourceLimits` NumberOfFiles in the launchd \
+             plist (macOS defaults to 256, which lands EMFILE at exactly the 256-agent \
+             design target) — and start again."
         );
     }
-    Ok(FdBudget {
+    if configured_max_connections < MIN_CONNECTION_CEILING {
+        bail!(
+            "wake-hub: the CONFIGURED connection ceiling is {configured_max_connections}, \
+             below the {MIN_CONNECTION_CEILING}-connection floor. The file-descriptor \
+             budget is fine (soft limit {soft} allows {usable}); raise \
+             `--max-connections` / `[wake_hub].max_connections` instead. A hub that can \
+             hold fewer connections than that is not serving, it is pretending to."
+        );
+    }
+    let connection_ceiling = configured_max_connections.min(usable);
+    let budget = FdBudget {
         soft,
         hard,
+        desired: DESIRED_NOFILE,
         connection_ceiling,
         clamped: connection_ceiling < configured_max_connections,
-    })
+    };
+    if !budget.meets_desired() {
+        tracing::warn!(
+            soft,
+            hard,
+            desired = DESIRED_NOFILE,
+            ceiling = connection_ceiling,
+            "wake-hub: running BELOW the desired file-descriptor budget; the supervisor \
+             did not grant it (set LimitNOFILE= in the systemd unit or NumberOfFiles in \
+             the launchd plist). The hub is smaller than its design target, not broken."
+        );
+    }
+    Ok(budget)
 }
 
 /// Verify (or create) the socket's parent directory and clear the path.
@@ -320,44 +378,90 @@ pub fn prepare_socket_path(path: &Path) -> Result<()> {
 }
 
 /// Create the parent directory 0700, or verify an existing one.
+///
+/// # The creation window (#3471, from the #3467 review)
+///
+/// The leaf is created with [`fs::DirBuilder::mode`], NOT with `create_dir_all`
+/// followed by a `chmod`. The pair leaves a window — however brief — in which
+/// the directory that is about to hold a 0600 socket exists at the process
+/// umask, typically 0755. Anything that can `open` the directory in that window
+/// wins a handle whose access rights are fixed at open time, so the later chmod
+/// does not take it away. `mkdir(2)` applies the mode atomically at creation,
+/// so the directory NEVER exists at umask mode.
+///
+/// `DirBuilder::mode` is still subject to the umask (`mode & !umask`), so it can
+/// only ever make the directory MORE private than 0700, never less. The verify
+/// pass below re-reads the mode and refuses anything group- or other-accessible,
+/// which is what closes the remaining case: a restrictive umask that produced,
+/// say, 0500 is fine, and any umask that could produce 0755 could not have got
+/// there through this path at all.
 fn prepare_socket_dir(dir: &Path) -> Result<()> {
-    match fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(dir).with_context(|| {
+    if let Err(e) = fs::symlink_metadata(dir) {
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(e).with_context(|| {
                 format!(
-                    "wake-hub: could not create socket directory {}",
+                    "wake-hub: could not stat socket directory {}",
+                    dir.display()
+                )
+            });
+        }
+        // Ancestors may legitimately be shared (e.g. `/run/user/1000`); only
+        // the LEAF holds the socket and only the leaf is created owner-only.
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "wake-hub: could not create the parent of the socket directory {}",
                     dir.display()
                 )
             })?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(SOCKET_DIR_MODE))
-                .with_context(|| format!("wake-hub: could not set 0700 on {}", dir.display()))?;
-            Ok(())
         }
-        Err(e) => Err(e).with_context(|| {
-            format!(
-                "wake-hub: could not stat socket directory {}",
-                dir.display()
-            )
-        }),
-        Ok(meta) => {
-            if !meta.is_dir() {
-                bail!(
-                    "wake-hub: socket directory {} is not a directory",
-                    dir.display()
-                );
+        match fs::DirBuilder::new()
+            .recursive(false)
+            .mode(SOCKET_DIR_MODE)
+            .create(dir)
+        {
+            Ok(()) => {}
+            // Lost a race with another starter: fall through to the verify
+            // pass, which is the authority on whether the mode is acceptable.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "wake-hub: could not create socket directory {} with mode \
+                         {SOCKET_DIR_MODE:04o}",
+                        dir.display()
+                    )
+                });
             }
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                bail!(
-                    "wake-hub: socket directory {} is mode {mode:04o}; it must be \
-                     {SOCKET_DIR_MODE:04o} (owner-only). The 0600 socket inside it is \
-                     only as private as the directory that holds it.",
-                    dir.display()
-                );
-            }
-            Ok(())
         }
     }
+
+    // VERIFY, always — for a directory we just created as much as for one we
+    // found. A filesystem that ignores permission bits would let `mkdir` report
+    // success while leaving the directory world-readable, and the socket's
+    // confidentiality rests entirely on this mode.
+    let meta = fs::symlink_metadata(dir).with_context(|| {
+        format!(
+            "wake-hub: could not stat socket directory {}",
+            dir.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        bail!(
+            "wake-hub: socket directory {} is not a directory",
+            dir.display()
+        );
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "wake-hub: socket directory {} is mode {mode:04o}; it must be \
+             {SOCKET_DIR_MODE:04o} (owner-only). The 0600 socket inside it is \
+             only as private as the directory that holds it.",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Set 0600 on the bound socket and verify it took.
@@ -497,6 +601,80 @@ mod tests {
         assert!(path.exists(), "the socket file outlives the listener");
         prepare_socket_path(&path).expect("stale socket is clearable");
         assert!(!path.exists());
+    }
+
+    /// #3471 (from the #3467 review) — the leaf socket directory must NEVER
+    /// exist at umask mode, not even for the instant between `mkdir` and
+    /// `chmod`. Run under a deliberately PERMISSIVE umask (0o022, which is what
+    /// the CI pool uses and what would produce a 0755 directory), so a
+    /// regression to `create_dir_all` + `set_permissions` would still leave the
+    /// end state at 0700 — the test therefore also asserts the ANCESTOR is not
+    /// what is being measured, by creating a nested leaf.
+    #[test]
+    fn the_socket_directory_leaf_is_created_owner_only_under_a_permissive_umask() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join("nested").join("run");
+        prepare_socket_dir(&dir).expect("prepare");
+        let mode = fs::symlink_metadata(&dir)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, SOCKET_DIR_MODE,
+            "the leaf must be owner-only; got {mode:04o}"
+        );
+        assert_eq!(mode & 0o077, 0, "no group or other bits may survive");
+    }
+
+    /// #3471 — the verify pass runs on a directory we just created too, so a
+    /// filesystem that ignored the mode is caught rather than trusted.
+    #[test]
+    fn an_existing_owner_only_directory_is_accepted_unchanged() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join("run");
+        fs::DirBuilder::new()
+            .mode(SOCKET_DIR_MODE)
+            .create(&dir)
+            .expect("mkdir 0700");
+        prepare_socket_dir(&dir).expect("accepted");
+        let mode = fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, SOCKET_DIR_MODE);
+    }
+
+    /// #3471 — a soft `RLIMIT_NOFILE` below the floor is a REFUSAL that names
+    /// the fd budget, and a too-small configured ceiling is a DIFFERENT refusal
+    /// that names the configuration. Conflating them sent operators to fix the
+    /// wrong thing.
+    #[test]
+    fn a_too_small_configured_ceiling_names_the_configuration_not_the_fd_limit() {
+        let err = configure_fd_limit(MIN_CONNECTION_CEILING - 1).expect_err("must refuse");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("CONFIGURED connection ceiling"),
+            "unexpected: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Raise it for this process"),
+            "must not send the operator to raise RLIMIT_NOFILE: {rendered}"
+        );
+    }
+
+    /// #3471 — the fd budget reports what it ASKED for alongside what it got,
+    /// so an operator can see whether the unit's `LimitNOFILE=` took effect.
+    #[test]
+    fn the_fd_budget_reports_the_desired_limit_and_the_binding_floor() {
+        let b = configure_fd_limit(MIN_CONNECTION_CEILING).expect("budget");
+        assert_eq!(b.desired, DESIRED_NOFILE);
+        assert_eq!(b.meets_desired(), b.soft >= DESIRED_NOFILE);
+        assert_eq!(
+            FdBudget::minimum_soft_nofile(),
+            FD_HEADROOM + u64::try_from(MIN_CONNECTION_CEILING).expect("fits"),
+        );
+        assert!(
+            b.soft >= FdBudget::minimum_soft_nofile(),
+            "a hub that bound must be above its own binding floor"
+        );
     }
 
     #[test]

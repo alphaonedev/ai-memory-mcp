@@ -1,0 +1,106 @@
+[Unit]
+Description=ai-memory wake-hub — same-host, content-free agent wake plane
+Documentation=https://github.com/alphaonedev/ai-memory-mcp
+Documentation=file:/usr/share/doc/ai-memory/wake-hub.md
+# The hub is store-free and daemon-independent: it opens NO database and
+# talks to no other ai-memory process, so it does not require
+# ai-memory.service. It is ordered AFTER it only so a co-hosted deployment
+# has the daemon's runtime directory in place first.
+After=ai-memory.service
+Wants=ai-memory.service
+
+[Service]
+Type=simple
+User=ai-memory
+Group=ai-memory
+# Socket path + allowlist are per-deployment. Set via drop-in or env file:
+#   /etc/ai-memory/wake-hub.env
+#     SOCKET=/run/ai-memory/wake-hub.sock
+#     ALLOWLIST=/run/ai-memory/hub-allow.json
+#
+# WITHOUT --allowlist the hub admits NOBODY (fail-closed by design). Publish
+# the derived public snapshot with:
+#   ai-memory identity hub-cache --include-agent <id> --out /run/ai-memory/hub-allow.json
+EnvironmentFile=-/etc/ai-memory/wake-hub.env
+Environment=RUST_LOG=ai_memory=info
+ExecStart=/bin/sh -c '/usr/bin/ai-memory wake-hub --socket "$SOCKET" --allowlist "$ALLOWLIST" $EXTRA_ARGS'
+
+# ExecStartPost proves the hub is actually REACHABLE, not merely running.
+# `--health` connects as an ordinary client (same peer-credential gate, same
+# challenge, no privileged side channel) and exits non-zero when it is not.
+#
+# It RETRIES, and the retry is load-bearing rather than defensive padding.
+# With Type=simple systemd runs ExecStartPost as soon as it has FORKED the
+# main process -- before the hub has bound its socket. A single-shot probe
+# would find no socket, exit 2, mark the unit failed, and Restart=on-failure
+# would turn a healthy host into a RestartSec restart loop. The hub does not
+# call sd_notify (that would need a new crate, which this lane may not add),
+# so a bounded retry is how the unit spans the bind race: 20 attempts at
+# 0.25 s is about 5 s, comfortably inside TimeoutStartSec. The final probe is
+# deliberately NOT --json so a genuine failure leaves a diagnosable line in
+# the journal rather than a bare exit code.
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 20); do /usr/bin/ai-memory wake-hub --socket "$SOCKET" --health --json >/dev/null 2>&1 && exit 0; sleep 0.25; done; /usr/bin/ai-memory wake-hub --socket "$SOCKET" --health; exit 2'
+
+Restart=on-failure
+RestartSec=5s
+# The hub's own bounded drain deadline is 5 s (wake_hub::limits::DRAIN_DEADLINE_MS)
+# and it exits 0 afterwards, so systemd never needs to escalate to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# --- hardening (mirrors ai-memory-sync.service) ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectProc=invisible
+# AF_UNIX ONLY. The wake plane is same-host by construction — it never opens a
+# network socket — so the kernel enforces that here as well as the code.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @swap @reboot @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=-/etc/ai-memory
+# The socket's parent directory. The hub creates the leaf 0700 (owner-only)
+# with mkdir(2) itself and forces the socket to 0600, verifying both.
+RuntimeDirectory=ai-memory
+RuntimeDirectoryMode=0700
+# CHOSEN: keep the allowlist in /run and PRESERVE the directory across stops.
+# Without this, systemd removes /run/ai-memory when the unit stops, deleting
+# the very allowlist snapshot the comments above tell the operator to publish
+# at /run/ai-memory/hub-allow.json -- and a hub that starts with no allowlist
+# admits NOBODY. So the ONE allowlist path for this unit is
+#   /run/ai-memory/hub-allow.json
+# and that is the path #3504's refresher timer must write.
+# Honest bound: /run is a tmpfs, so `preserve` survives a stop/restart but NOT
+# a reboot. Publishing the snapshot after boot is exactly what the refresher
+# covers; until it exists, re-run `ai-memory identity hub-cache ... --out
+# /run/ai-memory/hub-allow.json` after a reboot.
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/ai-memory
+
+# MUST match wake_hub::limits::DESIRED_NOFILE. The hub raises its own soft
+# limit toward this value at start-up and sizes its connection ceiling from
+# whatever it actually got, so a smaller limit here yields a SMALLER hub, not
+# a broken one — but the 256-agent design target needs this budget.
+# `ai-memory wake-hub --posture` reports what is actually in force.
+LimitNOFILE=4096
+MemoryMax=256M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

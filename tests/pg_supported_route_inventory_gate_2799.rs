@@ -84,6 +84,9 @@ fn all_registered_paths() -> Vec<&'static str> {
         routes::AGENTS_ID_PUBKEY,
         // v1.0.0 #3464 — the proof-of-possession bind challenge.
         routes::AGENTS_ID_PUBKEY_CHALLENGE,
+        // v1.0.0 #3474 — the admin per-agent api-key enrolment pair.
+        routes::AGENTS_ID_API_KEY,
+        routes::AGENTS_ID_API_KEY_REVOKE,
         routes::APPROVALS_PENDING_ID,
         routes::APPROVALS_STREAM,
         routes::ARCHIVE,
@@ -343,9 +346,19 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // answer: it implied the route works on a sqlite daemon, which it does not.
 // Proof: `tests/pg_parity_3064.rs::f5_atomise_tier_locked_{sqlite,postgres}`
 // asserts the SAME envelope, byte for byte, on both backends.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 71;
+// v1.0.0 #3474 — +2 pg-supported / +2 total (501 count UNCHANGED):
+// `/api/v1/agents/{id}/api-key` + `/api/v1/agents/{id}/api-key/revoke`, the
+// admin per-agent api-key enrolment pair. Every store touch on that lane
+// (bind / revoke / list / queue-pending / approve / resolve-policy) rides a
+// `MemoryStore` trait method BOTH adapters implement, so there is no `app.db`
+// scratch-read hazard; refusing them on postgres would make credential
+// enrolment unreachable on the certified tier, which is the #3418 defect
+// again. Re-derived from the ACTUAL 71 / 13 / 84 on the rebase base — the
+// pre-rebase branch read 68 / 17 / 85 against a base that has since moved,
+// and adding a delta to a moved base is how this inventory drifts.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 73;
 const EXPECTED_FULLY_501_PATHS: usize = 13;
-const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 84;
+const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 86;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
 /// names the allow-list body references. A silent match-arm add/remove
@@ -425,6 +438,10 @@ const EXPECTED_ALLOWLIST_HELPERS: &[&str] = &[
     "actions_transition_path",
     // v1.0.0 #2402 — /api/v1/admin/quarantine/{id}/release
     "admin_quarantine_release_path",
+    // v1.0.0 #3474 — /api/v1/agents/{id}/api-key and
+    // /api/v1/agents/{id}/api-key/revoke (admin per-agent api-key enrolment).
+    "agents_api_key_path",
+    "agents_api_key_revoke_path",
     "agents_pubkey_challenge_path",
     "agents_pubkey_path",
     "approvals_decide_path",

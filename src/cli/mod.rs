@@ -30,6 +30,9 @@ pub mod consolidate;
 pub mod crud;
 pub mod curator;
 pub mod doctor;
+/// v1.0.0 #3471 — the `ai-memory doctor` wake-hub posture section (socket and
+/// directory mode + ownership, file-descriptor budget, supervisor unit).
+pub mod doctor_wake_hub;
 pub mod epoch_apply;
 /// v0.7.0 L2-5 (issue #670) — `ai-memory export-forensic-bundle` and
 /// `ai-memory verify-forensic-bundle` subcommands.
@@ -125,6 +128,14 @@ pub mod wake_hub;
 /// substrate poll-based filesystem-watcher capture daemon
 /// (`crate::recover::watcher`). Opt-in; mirrors the `curator`
 /// `--once` / `--daemon` split.
+/// v1.0.0 #3470 (EPIC #3466) — `ai-memory wake-listen`: the long-lived
+/// wake-hub CLIENT. Loads the scoped `a2a-hub/join/v1` delegation bundle
+/// `identity delegate` wrote, keeps ONE authenticated session on the hub's
+/// socket, and turns each content-free hint into exactly ONE catch-up inbox
+/// read through the existing inbox path — with a bounded `<=60 s` backstop
+/// poll so a lost hub degrades wake LATENCY and nothing else. Also hosts the
+/// `wait_for_wake` engine behind `ai-memory inbox --wait`.
+pub mod wake_listen;
 pub mod watch;
 pub mod wrap;
 

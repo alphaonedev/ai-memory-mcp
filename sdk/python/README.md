@@ -170,6 +170,57 @@ teardown appeared to fail safe while leaving the decommissioned endpoint
 receiving signed deliveries indefinitely. The method signature is unchanged;
 check the returned `deleted` flag.
 
+## Waking instead of polling (#3470)
+
+`ai_memory.wake` is a minimal client for the same-host `ai-memory wake-hub`
+wake plane. Instead of polling `GET /api/v1/inbox` on a timer, keep one
+authenticated session on the hub's Unix domain socket and read the inbox when
+there is something to read:
+
+```python
+from ai_memory import AiMemoryClient
+from ai_memory.wake import DelegationBundle, WakeListener
+
+bundle = DelegationBundle.load(
+    "/home/alice/.config/ai-memory/keys/ai:alice.a2a-hub.json",
+    hub_id="ai-memory-wake-hub",
+)
+client = AiMemoryClient(base_url="http://localhost:9077")
+
+def catch_up(signal):
+    # EXACTLY ONE inbox read per signal — never one per queued hint.
+    for message in client.inbox(agent_id=bundle.agent_id, unread_only=True):
+        handle(message)
+
+WakeListener("/run/user/1000/ai-memory/wake-hub.sock", bundle, catch_up).run()
+```
+
+**The hint is not the message.** A wake carries
+`{inbox_row_id, namespace, sender, digest, seq_high_watermark}` and never a
+body — the v1 protocol has no kind that admits one. The durable ai-memory
+inbox row is the record, and `digest` is the SHA-256 you can verify what you
+read against without the hub ever having seen it.
+
+**One identity root.** The client embeds no identity. It loads the scoped
+`a2a-hub/join/v1` delegation bundle that
+`ai-memory identity delegate --scope a2a-hub` wrote into the key directory —
+a DELEGATED key, never the agent's enrolled one. Every check is a refusal
+with no flag that skips it: mode 0600, caller-owned, not a symlink, a version
+this build understands, scope `a2a-hub`, this hub's id, a private key that is
+the one the certificate authorises, and a window that contains now. The
+certificate's issuer signature is verified authoritatively by the HUB; this
+SDK does not reproduce that pre-image, which is a degrade (it may present a
+bundle the hub refuses) and never a widening.
+
+**The backstop is always armed.** A bounded poll — at most 60 s
+(`wake_sink::BACKSTOP_POLL_MAX`) — runs whether or not the hub is reachable,
+so a hub that is down, refusing, or was never deployed costs LATENCY and
+nothing else. A `poll_interval` above that bound is REFUSED rather than
+clamped. Reconnects use jittered exponential backoff capped at the same bound.
+
+Requires `cryptography` (`pip install "ai-memory-mcp[attestation]"`) to sign
+the hello.
+
 ## Webhook verification
 
 ```python

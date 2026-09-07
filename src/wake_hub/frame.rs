@@ -119,6 +119,28 @@ impl fmt::Display for ErrorCode {
 /// `notify` = 13). They are refused by number so a pre-vote client gets a
 /// legible refusal instead of silence, and so a future contributor cannot
 /// reuse the number for something else and make an old client's body route.
+// ---------------------------------------------------------------------------
+// Shared peer-facing wording
+// ---------------------------------------------------------------------------
+//
+// Every process that speaks this wire — the #3469 producer forwarder and the
+// #3470 listener alike — reports the same three conditions, and an operator
+// grepping a fleet's logs for one of them must find every occurrence. One
+// definition site is also what keeps the pm-v3.1 no-duplicated-literal gate
+// honest: the alternative is the same sentence drifting apart across modules.
+
+/// Context for a frame that arrived from the hub but would not decode.
+pub const CTX_DECODING_HUB_FRAME: &str = "decoding a frame from the hub";
+
+/// The peer went away. Terminal for the session, never for the durable row.
+pub const CTX_HUB_CLOSED: &str = "the hub closed the connection";
+
+/// Stand-in when an `error` frame's own payload will not decode.
+pub const CTX_UNPARSEABLE_REFUSAL: &str = "unparseable refusal";
+
+/// `Debug` field naming the SIZE of a presented delegation — never its bytes.
+pub const DEBUG_FIELD_DELEGATION_BYTES: &str = "delegation_bytes";
+
 pub const RESERVED_PAYLOAD_KINDS: [u8; 3] = [11, 12, 13];
 
 /// Every frame kind the v1 hub understands.

@@ -174,11 +174,44 @@ sections.
   nodes; CPU-only nodes use API backends. See the
   [enterprise reference architectures](../reference-architecture/enterprise-cpu-memory.md).
 
+### Wake hub (#3471)
+
+Renders on every local run; reads only the filesystem and this process's own
+`RLIMIT_NOFILE` — it never binds, never connects, and never opens a database
+(the wake hub has none).
+
+- `configured` — `yes` when a `[wake_hub]` block is present OR a socket is
+  actually on disk. A host running neither reports `no` and nothing else, so
+  `doctor` does not start warning about an optional subsystem nobody enabled.
+- `socket`, `socket_present`, `socket_mode`, `socket_dir_mode`,
+  `socket_owner_is_self`, `socket_dir_owner_is_self` — the on-disk posture.
+  **Critical** when a socket is PRESENT and is not `0600`, is not owned by
+  this user, or sits in a group/other-accessible directory: a 0600 socket is
+  only as private as the directory holding it, and either fault is a live
+  exposure of every agent's wake plane to any local user. A socket that is
+  simply ABSENT is not a finding — the hub may not be running.
+- `rlimit_nofile_soft` / `_hard` / `_desired` / `_floor`,
+  `fd_headroom_reserved` — the file-descriptor budget. On a host that runs a
+  hub: **Warning** below `_desired` (4096; the hub runs at a smaller
+  connection ceiling and says so at start-up), **Critical** below `_floor`
+  (the hub would refuse to bind at all). macOS's default soft limit of 256 is
+  the case this exists to surface. Fix with `LimitNOFILE=` in the systemd unit
+  or `SoftResourceLimits`/`HardResourceLimits` `NumberOfFiles` in the launchd
+  plist.
+- `supervisor_unit` — where a shipped unit is installed, or `not installed`.
+  **Info always**: running the hub in the foreground or under another
+  supervisor is a legitimate deployment, so an absent unit is never a finding.
+
+Reachability is a separate question with its own verb: `ai-memory wake-hub
+--health` connects as an ordinary client and exits non-zero when the hub
+cannot be reached. `doctor` deliberately does not connect — it must never be
+able to hang against a wedged hub.
+
 ## Severity rules (initial)
 
 | Severity | Trigger |
 |----------|---------|
-| **Critical** | `dim_violations > 0`; pending action older than 24h; sync skew > 600s; HNSW evictions > 0 |
+| **Critical** | `dim_violations > 0`; pending action older than 24h; sync skew > 600s; HNSW evictions > 0; a live wake-hub socket that is not owner-only (#3471) |
 | **Warning**  | Capabilities v2 reports a silent-degrade flag (`recall_mode_active != hybrid` on a capable tier); subscription delivery success < 95% |
 | **Info**     | Anything else worth surfacing |
 | **N/A**      | The section can't be queried in this mode (raw SQL section in `--remote`, P2/P3-only fields on a pre-P2/P3 schema) |

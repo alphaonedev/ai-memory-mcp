@@ -581,6 +581,10 @@ fn recipient_row(
         bind_authority: "possession_proof".to_owned(),
         bound_at: "2026-01-01T00:00:00Z".to_owned(),
         revoked_keys: Vec::new(),
+        // #3505 — a wake RECIPIENT needs no namespace topic: the sink
+        // addresses wakes DIRECTLY to the agent, so own-inbox stays the whole
+        // proof this row carries.
+        readable_prefixes: Vec::new(),
     }
 }
 

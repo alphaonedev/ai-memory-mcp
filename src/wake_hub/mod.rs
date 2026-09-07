@@ -48,7 +48,9 @@
 //! | [`startup`] | the peer-pid probe, the fd budget, the socket posture |
 //! | [`server`] | listener, accept loop, drain |
 //! | `conn` | one connection's state machine |
-//! | [`metrics`] | counters for every refusal path |
+//! | [`metrics`] | counters, gauges and latency histograms for every refusal and delivery path |
+//! | [`histogram`] | the fixed-bucket, allocation-free latency histogram those read |
+//! | [`health`] | the `--health` probe: an ordinary client that reads the challenge and leaves |
 //!
 //! # Testing
 //!
@@ -71,10 +73,15 @@ use limits::{
     DEFAULT_RECONNECT_BASE_MS, DEFAULT_RECONNECT_JITTER_MS, EgressBudget, HELLO_NONCE_BYTES,
     PREAUTH_RATE_BURST, PREAUTH_RATE_TOKENS_PER_SEC,
 };
-use metrics::{HubMetrics, MetricsSnapshot};
+use metrics::{HubCensus, HubMetrics, MetricsSnapshot};
 use pending::PendingStore;
 use routing::Router;
 
+/// v1.0.0 #3504 — the live hub's store-free allowlist resolver: the
+/// permission-checked, inode/mtime-keyed reuse of the parsed snapshot that
+/// [`delegation_verifier::AllowlistCache`] represents, plus the snapshot-age
+/// posture `wake-hub --posture` reports.
+pub mod allowlist_reload;
 pub mod codec;
 mod conn;
 /// v1.0.0 #3468 — the scoped `a2a-hub/join/v1` delegation verifier that
@@ -83,6 +90,13 @@ mod conn;
 /// audit-spine events provide revocation.
 pub mod delegation_verifier;
 pub mod frame;
+/// v1.0.0 #3471 — the `wake-hub --health` probe. An ordinary client that reads
+/// the hub's opening challenge and leaves; deliberately NOT a privileged side
+/// channel and NOT a bypass of the peer-credential gate.
+pub mod health;
+/// v1.0.0 #3471 — fixed-bucket, allocation-free latency histograms. The ops
+/// surface must not be something the hub can be made to allocate.
+pub mod histogram;
 pub mod identity;
 pub mod limits;
 pub mod metrics;
@@ -262,10 +276,21 @@ impl HubState {
         nonce
     }
 
-    /// Snapshot every counter, including the hub-wide egress reservation.
+    /// Snapshot every counter, gauge and histogram.
+    ///
+    /// The per-recipient gauges are COMPUTED here from the routing table
+    /// (#3471) rather than maintained as a side table, so the hub keeps no
+    /// per-agent metrics structure that a churn of agent ids could grow.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
-        self.metrics.snapshot(self.router.egress().used())
+        let census = self.router.queue_census();
+        self.metrics.snapshot_with(HubCensus {
+            egress_bytes_current: self.router.egress().used(),
+            recipients_current: census.recipients,
+            queued_bytes_current: census.queued_bytes,
+            queued_frames_current: census.queued_frames,
+            slow_consumers_current: census.slow_consumers,
+        })
     }
 
     /// The configuration in force.

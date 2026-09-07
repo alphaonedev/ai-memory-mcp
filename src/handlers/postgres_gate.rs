@@ -148,6 +148,12 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // replica can therefore consume a challenge issued by another
         // replica; there is no `app.db` scratch-read hazard.
         ("POST", p) if agents_pubkey_challenge_path(p) => true,
+        // v1.0.0 #3474 — the admin per-agent api-key enrolment pair. Supported
+        // on postgres because every store touch (bind / revoke / list /
+        // queue-pending / approve / resolve-policy) rides a `MemoryStore`
+        // trait method both adapters implement; there is no `app.db` scratch
+        // read on this lane.
+        ("POST", p) if agents_api_key_path(p) || agents_api_key_revoke_path(p) => true,
         // Wave-3 continuation — list_namespaces (read-only).
         ("GET", super::routes::NAMESPACES) => {
             // GET /api/v1/namespaces with no query string lists namespaces.
@@ -414,6 +420,14 @@ fn memory_lineage_path(p: &str) -> bool {
     rest.ends_with("/lineage") && rest.split('/').count() == 2
 }
 
+/// v1.0.0 #3474 — the ONE spelling of the agents collection prefix every
+/// `/api/v1/agents/{id}/...` matcher below strips. Four matchers shared the
+/// literal; a fifth would have made a typo in one of them a silent
+/// never-matches, which on this gate reads as "route not supported on
+/// postgres".
+#[cfg(feature = "sal")]
+const AGENTS_PATH_PREFIX: &str = "/api/v1/agents/";
+
 /// Path matcher for `/api/v1/links/{id}`.
 #[cfg(feature = "sal")]
 fn links_id_path(p: &str) -> bool {
@@ -426,7 +440,7 @@ fn links_id_path(p: &str) -> bool {
 /// #1539 — `PUT /api/v1/agents/{id}/pubkey` (attestation pubkey bind).
 #[cfg(feature = "sal")]
 fn agents_pubkey_path(p: &str) -> bool {
-    let Some(rest) = p.strip_prefix("/api/v1/agents/") else {
+    let Some(rest) = p.strip_prefix(AGENTS_PATH_PREFIX) else {
         return false;
     };
     rest.strip_suffix("/pubkey")
@@ -443,10 +457,36 @@ fn agents_pubkey_path(p: &str) -> bool {
 /// without the gate this is dead code on the default / vectorlite legs.
 #[cfg(feature = "sal")]
 fn agents_pubkey_challenge_path(p: &str) -> bool {
-    let Some(rest) = p.strip_prefix("/api/v1/agents/") else {
+    let Some(rest) = p.strip_prefix(AGENTS_PATH_PREFIX) else {
         return false;
     };
     rest.strip_suffix("/pubkey/challenge")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// v1.0.0 #3474 — matches `POST /api/v1/agents/{id}/api-key` (the admin
+/// per-agent api-key MINT/BIND surface), where `{id}` is a single non-empty,
+/// non-slash path segment. Suffix-matches `/api-key` EXACTLY, so it never
+/// matches the sibling `/api-key/revoke` path.
+#[cfg(feature = "sal")]
+fn agents_api_key_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix(AGENTS_PATH_PREFIX) else {
+        return false;
+    };
+    rest.strip_suffix("/api-key")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// v1.0.0 #3474 — matches `POST /api/v1/agents/{id}/api-key/revoke` (the admin
+/// per-agent api-key REVOKE surface). DISTINCT from [`agents_api_key_path`]
+/// for the same reason `agents_pubkey_challenge_path` is distinct from
+/// `agents_pubkey_path`.
+#[cfg(feature = "sal")]
+fn agents_api_key_revoke_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix(AGENTS_PATH_PREFIX) else {
+        return false;
+    };
+    rest.strip_suffix("/api-key/revoke")
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
@@ -581,6 +621,9 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         // allowlist would make the middleware answer 404 for a route the router
         // really does serve, instead of the truthful 501 (#1410 / #1052).
         ("POST", p) if agents_pubkey_challenge_path(p) => true,
+        // v1.0.0 #3474 — the admin per-agent api-key enrolment pair, for the
+        // same two-registries-must-agree reason as the challenge above.
+        ("POST", p) if agents_api_key_path(p) || agents_api_key_revoke_path(p) => true,
         // Pending governance.
         ("GET", super::routes::PENDING) => true,
         // Approvals SSE stream (path form not parameterised).

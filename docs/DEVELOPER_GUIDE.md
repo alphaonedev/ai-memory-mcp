@@ -6,14 +6,14 @@
 
 1. **MCP tool server** -- stdio JSON-RPC server exposing 104 advertised entries at `--profile full` (103 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 98 route registrations / 84 unique URL paths (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 100 route registrations / 86 unique URL paths (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
 All three interfaces share the same storage layer (`src/storage/`, exposed as the `db` alias) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
 ```
-main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (95 subcommands with --features sal, 94 in the default build)
+main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (97 subcommands with --features sal, 95 in the default build)
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
 models/            -- Data structures: Memory (30 fields at v1.0.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs, plus per-surface modules: recall.rs, memories.rs, admin.rs, kg.rs, …); Axum extractors + JSON responses; error sanitization. Route-path SSOT in handlers/routes.rs (#1558 batch 4 — one const per production route path; lib.rs registers them, the postgres gate / federation receiver / doctor match on them)
@@ -63,13 +63,13 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 ### `src/main.rs`
 
 - `Cli` struct with `clap` derive -- defines all CLI commands and global flags (`--db`, `--json`). Lives in `src/daemon_runtime.rs` (W6 refactor moved it off `src/main.rs`).
-- `Command` enum (in `src/daemon_runtime.rs`) -- at v1.0.0 the enum carries **95 unique variants** under `--features sal` (94 in the default build — the gap is the two sal-gated variants `Migrate` + `SchemaInit`; SSOT: `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=94` / `EXPECTED_CLI_SUBCOMMANDS_SAL=95` in `src/lib.rs`, pinned by `tests/cli_subcommand_count_invariant.rs`): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Config`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`), the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`, `Share`, `Expand`, `Reembed` (#1598)), the FX-12/FX-C3 MCP↔CLI parity batch (`KgQuery`, `FindPaths`, `RecallObservations`, `CheckDuplicate`, `Replay`, `Reflect`, `Subscribe`, `Unsubscribe`, `ListSubscriptions`, `SubscriptionReplay`, `SubscriptionDlqList`, `Notify`, `Inbox`, `IngestMultistep`, `KgInvalidate`, `KgTimeline`, `EntityRegister`, `EntityGetByAlias`, `DependentsOfInvalidated`, `ReflectionOrigin`, `QuotaStatus`), the #1389 L2 `RecoverPreviousSession`, the v0.8.0 #1720 B2 `Reown` + PE-8 `VerifyAuditTrail`, the v0.8.0 #1727 `UndoEdit` (non-destructive in-place-edit undo), the v0.9.0 #1859 `Lineage`, the v0.9.0 #1827 `Capability` (macaroon capability-token keygen/mint/attenuate/inspect/verify), the v1.0.0 #1978 `Watch` (L3 substrate poll-based filesystem-watcher capture daemon), and the v1.0.0 #2402 `Quarantine` (`list` / `release <id>` — the operator route OUT of the #1948 federation quarantine, with a `--store-url postgres://…` SAL path). Run `ai-memory --help` for the live list.
+- `Command` enum (in `src/daemon_runtime.rs`) -- at v1.0.0 the enum carries **97 unique variants** under `--features sal` (95 in the default build — the gap is the two sal-gated variants `Migrate` + `SchemaInit`; SSOT: `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=95` / `EXPECTED_CLI_SUBCOMMANDS_SAL=97` in `src/lib.rs`, pinned by `tests/cli_subcommand_count_invariant.rs`): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Config`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`), the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`, `Share`, `Expand`, `Reembed` (#1598)), the FX-12/FX-C3 MCP↔CLI parity batch (`KgQuery`, `FindPaths`, `RecallObservations`, `CheckDuplicate`, `Replay`, `Reflect`, `Subscribe`, `Unsubscribe`, `ListSubscriptions`, `SubscriptionReplay`, `SubscriptionDlqList`, `Notify`, `Inbox`, `IngestMultistep`, `KgInvalidate`, `KgTimeline`, `EntityRegister`, `EntityGetByAlias`, `DependentsOfInvalidated`, `ReflectionOrigin`, `QuotaStatus`), the #1389 L2 `RecoverPreviousSession`, the v0.8.0 #1720 B2 `Reown` + PE-8 `VerifyAuditTrail`, the v0.8.0 #1727 `UndoEdit` (non-destructive in-place-edit undo), the v0.9.0 #1859 `Lineage`, the v0.9.0 #1827 `Capability` (macaroon capability-token keygen/mint/attenuate/inspect/verify), the v1.0.0 #1978 `Watch` (L3 substrate poll-based filesystem-watcher capture daemon), and the v1.0.0 #2402 `Quarantine` (`list` / `release <id>` — the operator route OUT of the #1948 federation quarantine, with a `--store-url postgres://…` SAL path). Run `ai-memory --help` for the live list.
 - `StoreArgs` includes `--expires-at` and `--ttl-secs` flags for custom expiration
 - `UpdateArgs` includes `--expires-at` flag for setting expiration on existing memories
 - `ListArgs` includes `--offset` flag for pagination
 - `auto_namespace()` -- detects namespace from git remote URL or directory name
 - `human_age()` -- formats ISO timestamps as "2h ago", "3d ago" for CLI output
-- `serve()` -- starts the Axum server with all routes (**98 production `.route(...)` registrations / 84 unique URL paths** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync, the v0.9.0 #1859 lineage read endpoint), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
+- `serve()` -- starts the Axum server with all routes (**100 production `.route(...)` registrations / 86 unique URL paths** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync, the v0.9.0 #1859 lineage read endpoint), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
 - `cmd_*()` functions -- one per CLI command, each opens the DB directly
 
 ### `src/models/`
@@ -164,7 +164,7 @@ Structured error types for the HTTP API:
 
 ### `src/handlers/`
 
-All HTTP handlers for the **98 production `.route(...)` registrations / 84 unique URL paths** (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
+All HTTP handlers for the **100 production `.route(...)` registrations / 86 unique URL paths** (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
 
 Key handlers:
 - `create_memory` / `bulk_create` -- memory creation with deduplication (bulk limited to 1,000 items)
@@ -547,7 +547,7 @@ Base URL: `http://127.0.0.1:9077/api/v1`
 
 All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
 
-The HTTP API exposes **98 production `.route(...)` registrations / 84 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The HTTP API exposes **100 production `.route(...)` registrations / 86 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Health Check
 
@@ -840,7 +840,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (98 route registrations / 84 unique URL paths).
+Start the HTTP daemon (100 route registrations / 86 unique URL paths).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077

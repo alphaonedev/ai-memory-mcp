@@ -83,6 +83,31 @@ pub const MAX_TOPIC_BYTES: usize = 64;
 /// tries to exceed it gets `403`, never a silently-truncated subscription.
 pub const MAX_TOPICS_PER_SESSION: usize = 32;
 
+/// v1.0.0 [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) —
+/// hard ceiling on the PROVEN readable-PREFIX set the derived allowlist
+/// snapshot carries for ONE agent.
+///
+/// DEFINED as `crate::visibility::NAMESPACE_READ_SCOPE_DEPTH`, not merely
+/// equal to it: the snapshot carries the store's own #1921 `team` / `unit` /
+/// `org` prefixes, so the hub's ceiling and the derivation are ONE number and
+/// cannot drift into a hub that refuses a set the store considers legitimate.
+///
+/// It is a ceiling on PREFIXES, deliberately not on expanded namespaces. An
+/// exact list would grow with the CORPUS — an org-level agent over a few
+/// hundred namespaces would exceed any fixed cap, and refusing the export then
+/// publishes NOTHING, which after the snapshot TTL makes the hub refuse every
+/// hello: a fleet-wide availability failure caused by the corpus growing. The
+/// prefix set is a property of the agent's own id, so it is O(1) forever.
+pub const MAX_READABLE_PREFIXES: usize = crate::visibility::NAMESPACE_READ_SCOPE_DEPTH;
+
+/// v1.0.0 #3505 — longest prefix a proven-read entry may carry, in bytes.
+///
+/// A topic is `#` + the namespace and is itself bounded by
+/// [`MAX_TOPIC_BYTES`]; a prefix longer than that could only ever admit
+/// namespaces no session could subscribe to, so carrying one would be dead
+/// weight the hub must still parse on every hello.
+pub const MAX_READABLE_PREFIX_BYTES: usize = MAX_TOPIC_BYTES - 1;
+
 /// Length of the hub-issued handshake nonce, in bytes.
 pub const HELLO_NONCE_BYTES: usize = 32;
 
@@ -159,6 +184,90 @@ pub const DESIRED_NOFILE: u64 = 4_096;
 /// Shard count for the routing and topic tables. Power of two; sized so 256
 /// connections spread thinly enough that a shard lock is never a queue.
 pub const ROUTING_SHARDS: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Shutdown drain (#3471)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock deadline, in milliseconds, for the SIGTERM/SIGINT drain.
+///
+/// On a shutdown signal the hub stops accepting, asks every session to flush
+/// what it has already queued, and waits AT MOST this long for the connection
+/// gauge to reach zero before exiting 0 regardless. The bound is the point:
+/// an unbounded drain is a hung `systemctl stop` that ends in `SIGKILL`, which
+/// is strictly worse than a bounded one because the operator loses the clean
+/// socket unlink too.
+///
+/// Nothing content-bearing is emitted during the drain — the hub carries no
+/// durable truth, so there is nothing to flush TO. What the deadline buys is
+/// the chance for already-queued hints to land and for peers to observe a
+/// clean close instead of a reset, after which the `<=60 s` backstop poll is
+/// the guarantee exactly as it is at every other moment.
+///
+/// 5 s sits under systemd's default 90 s `TimeoutStopSec` and under launchd's
+/// 20 s `SIGTERM` grace with room to spare, so neither supervisor ever has to
+/// escalate to `SIGKILL`.
+pub const DRAIN_DEADLINE_MS: u64 = 5_000;
+
+/// Poll interval, in milliseconds, while waiting for the drain to complete.
+/// Short enough that a fast drain is not padded to the deadline, long enough
+/// that the wait is not a spin.
+pub const DRAIN_POLL_MS: u64 = 10;
+
+// ---------------------------------------------------------------------------
+// Ops / observability (#3471)
+// ---------------------------------------------------------------------------
+
+/// Percentage of its per-recipient byte cap at or above which a recipient is
+/// counted as a SLOW CONSUMER.
+///
+/// A slow consumer is not yet an error — nothing has been dropped — but it is
+/// the leading indicator of the drop that follows, which is precisely the
+/// signal an operator needs BEFORE the queue overflows. Half the cap is the
+/// point at which one more burst of the same size would refuse.
+pub const SLOW_CONSUMER_PERCENT: usize = 50;
+
+/// Wall-clock budget, in milliseconds, for the whole `wake-hub --health`
+/// probe: connect, read the hub's challenge, close.
+///
+/// Bounded because the probe is what a supervisor runs (`ExecStartPost`, a
+/// launchd watchdog, a monitoring cron); a probe that can hang forever against
+/// a wedged hub would pin the supervisor instead of reporting the fault it
+/// exists to report.
+pub const HEALTH_PROBE_TIMEOUT_MS: u64 = 2_000;
+
+// ---------------------------------------------------------------------------
+// Derived allowlist snapshot reuse (#3504)
+// ---------------------------------------------------------------------------
+
+/// How long a PARSED allowlist snapshot may be reused before the hub reads and
+/// re-parses the file, even when the file's identity (device, inode, mtime,
+/// size) has not moved.
+///
+/// # Why a TTL at all, when the inode/mtime key already exists
+///
+/// Every call still opens the file and re-checks owner + exact `0600` +
+/// regular-file through that descriptor, and any change of device, inode,
+/// mtime or size forces a re-read — so a REPLACED snapshot is picked up on the
+/// next call regardless of this value. What the TTL bounds is the one case the
+/// identity key cannot see: an in-place rewrite that lands on the same inode
+/// with a byte-identical size and a timestamp the filesystem did not advance.
+/// That needs write access to a `0600` file already owned by the hub's own
+/// uid, so it is not an escalation — but "trusted forever" is not a property
+/// worth having in an authority path, and two seconds is cheap.
+///
+/// # Why two seconds
+///
+/// It must be well under [`crate::identity::hub_cache::MAX_CACHE_AGE_SECS`]
+/// (60 s), which is the ceiling past which a snapshot is refused outright —
+/// and it is, by 30x. The `refreshed_at` age is re-checked on EVERY call
+/// including a cache hit, so this constant can never extend the life of a
+/// stale snapshot; it only decides how often the JSON is re-parsed. At the
+/// 256-connection ceiling the 1 Hz per-session `Conn::revalidate` was 256
+/// parses/second; keyed reuse with this TTL makes it at most one parse every
+/// two seconds, a ~500x reduction, while a replaced file still takes effect
+/// within the same one-second revalidation it always did.
+pub const ALLOWLIST_CACHE_TTL: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Offline (pending) state
@@ -369,6 +478,25 @@ mod tests {
         assert_eq!(MAX_WAKE_META_BYTES, 256);
         assert_eq!(MAX_LIVENESS_PAYLOAD_BYTES, 32);
         assert!(MAX_WAKE_META_BYTES < MAX_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn the_allowlist_cache_ttl_stays_well_under_the_snapshot_expiry_3504() {
+        // The TTL governs re-PARSING only. It must stay far below the age at
+        // which a snapshot is refused outright, so that no arrangement of the
+        // two can let an expired snapshot be served from memory.
+        let max_age = u64::try_from(crate::identity::hub_cache::MAX_CACHE_AGE_SECS)
+            .expect("the snapshot expiry is a positive number of seconds");
+        assert!(
+            ALLOWLIST_CACHE_TTL.as_secs() > 0,
+            "a zero TTL would re-parse on every hello, which is the defect #3504 fixes"
+        );
+        assert!(
+            ALLOWLIST_CACHE_TTL.as_secs() * 10 <= max_age,
+            "the reuse TTL ({}s) must stay an order of magnitude under the {max_age}s \
+             snapshot expiry",
+            ALLOWLIST_CACHE_TTL.as_secs()
+        );
     }
 
     #[test]

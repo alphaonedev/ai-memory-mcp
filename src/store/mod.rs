@@ -3185,6 +3185,39 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #3474 — QUEUE a `pending_actions` row directly, without going
+    /// through the `enforce_governance_action` decision funnel.
+    ///
+    /// **Why this is a separate seam.** `enforce_governance_action` queues a
+    /// row only as the `Pending` arm of a namespace-policy decision, and the
+    /// row it writes is destined for `execute_pending_action`'s MEMORY
+    /// dispatch (`store` / `delete` / `promote` / `reflect`). A surface whose
+    /// approved action is NOT a memory mutation — the #3474 admin api-key
+    /// enrolment is the first — needs to park an approval WITHOUT claiming its
+    /// payload can be executed by that dispatch. Queueing its own row and
+    /// applying it in its own handler keeps ONE applier per payload shape.
+    ///
+    /// `memory_id` is `None` for such a row, which is also what makes the
+    /// generic executor's behaviour on it a benign no-op rather than a
+    /// corrupting one.
+    ///
+    /// Default returns `UnsupportedCapability` so an adapter that has not
+    /// wired the governance queue fails loudly rather than silently dropping
+    /// an approval the caller believes is parked.
+    async fn queue_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        _action: GovernedAction,
+        _namespace: &str,
+        _memory_id: Option<&str>,
+        _requested_by: &str,
+        _payload: &serde_json::Value,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_QUEUE_PENDING".to_string(),
+        })
+    }
+
     /// Set the namespace standard memory id, optionally with an
     /// explicit parent namespace for the inheritance chain. Adapters
     /// validate that `standard_id` references an existing memory.

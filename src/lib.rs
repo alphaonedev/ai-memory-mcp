@@ -427,7 +427,17 @@ pub const META_KEY_FAMILY: &str = "family";
 // stream `GET /api/v1/inbox/stream` (`handlers::inbox_sse`) — SSE over
 // the in-process `inbox_wake` broadcast bus. A new PATH, so
 // EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 1 as well.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 98;
+// 2026-09-06 (#3474) — bumped 98 → 100: the admin per-agent api-key enrolment
+// pair `POST /api/v1/agents/{id}/api-key` (`handlers::agent_api_key::
+// mint_agent_api_key` — mint-or-bind, the minted token returned exactly once)
+// and `POST /api/v1/agents/{id}/api-key/revoke`
+// (`handlers::agent_api_key::revoke_agent_api_key` — immediate for your own
+// key, approval-gated for another principal's or the last enrolled key). Both
+// are new PATHS, so EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 2 as well.
+// Re-derived from the ACTUAL count on the rebase base rather than carried
+// forward: the pre-rebase branch read 99/85 against a 97/83 base, and adding
+// its own delta to a moved base is exactly how a route-count SSOT drifts.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 100;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -464,7 +474,10 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/agents/{id}/pubkey/challenge` (proof-of-possession bind challenge).
 // 2026-09-05 (#3465) — bumped 83 → 84: the new unique path
 // `/api/v1/inbox/stream` (agent-facing inbox wake stream).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 84;
+// 2026-09-06 (#3474) — bumped 84 → 86: the two new unique paths
+// `/api/v1/agents/{id}/api-key` (admin mint/bind) and
+// `/api/v1/agents/{id}/api-key/revoke` (admin revoke, approval-gated).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 86;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -516,8 +529,11 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 84;
 /// operator command, bumping 91 → 92; v1.0.0 #3467 (EPIC #3466) added
 /// `WakeHub` for the `ai-memory wake-hub` same-host CONTENT-FREE agent wake
 /// plane (a 0600 Unix-domain-socket wake switch that carries a bounded hint
-/// and never a message body), bumping 92 → 93.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 94;
+/// and never a message body), bumping 92 → 93; v1.0.0 #3470 (EPIC #3466)
+/// added `WakeListen` for the `ai-memory wake-listen` long-lived wake-hub
+/// CLIENT (one authenticated session, one catch-up inbox read per hint, a
+/// bounded `<=60 s` backstop poll), bumping 93 → 94.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 95;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -541,8 +557,10 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 94;
 /// #3322 (#3266 MVG) added `SwarmRewind` (atomic cascade-rewind operator
 /// command), bumping 93 → 94; v1.0.0 #3467 (EPIC #3466) added `WakeHub`
 /// (same-host CONTENT-FREE agent wake plane over a 0600 Unix domain socket),
-/// bumping 94 → 95.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 96;
+/// bumping 94 → 95; v1.0.0 #3470 (EPIC #3466) added `WakeListen` (the
+/// long-lived wake-hub client behind `ai-memory wake-listen`), bumping
+/// 95 → 96.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 97;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
@@ -978,6 +996,15 @@ pub mod visibility;
 /// and nothing else. Identity verification is a trait boundary whose shipped
 /// default REFUSES every hello until the scoped `a2a-hub/join/v1` delegation
 /// lands in #3468.
+/// v1.0.0 #3470 (EPIC #3466) — the wake-hub CLIENT half: bundle loading,
+/// one authenticated UDS session, and the state machine that turns a hint
+/// into exactly ONE catch-up inbox read. Loads the scoped delegation
+/// `identity delegate --scope a2a-hub` wrote and NEVER a second identity
+/// root; refuses a bundle that is not 0600, not this hub's, not signed by
+/// the agent's enrolled key, or outside its window — with no flag that skips
+/// any of it. The `<=60 s` backstop poll is always armed, so a hub that is
+/// down, refusing, or absent costs LATENCY and nothing else.
+pub mod wake_client;
 pub mod wake_hub;
 /// v1.0.0 #3469 (EPIC #3466) — the bridge from the #3465 `agent_notified`
 /// wake bus to the #3467 wake-hub: an in-process sink when the hub is
@@ -1373,6 +1400,18 @@ pub fn build_router_with_timeout(
         .route(
             handlers::routes::AGENTS_ID_PUBKEY_CHALLENGE,
             post(handlers::bind_agent_pubkey_challenge),
+        )
+        // v1.0.0 #3474 — admin-gated per-agent api-key enrolment. Both routes
+        // are POST: the mint returns a bearer secret exactly once (never
+        // cacheable, never a GET whose URL a proxy could log) and the revoke
+        // carries an optional approval body.
+        .route(
+            handlers::routes::AGENTS_ID_API_KEY,
+            post(handlers::agent_api_key::mint_agent_api_key),
+        )
+        .route(
+            handlers::routes::AGENTS_ID_API_KEY_REVOKE,
+            post(handlers::agent_api_key::revoke_agent_api_key),
         )
         .route(handlers::routes::PENDING, get(handlers::list_pending))
         .route(
