@@ -374,9 +374,27 @@ write via the fault-injection knob `AI_MEMORY_TEST_ABORT_AFTER_COMMIT`
 (SSOT: `src/recover/durability.rs`). The parent then re-opens the
 crashed DB and asserts:
 
-- **no corruption** — `PRAGMA integrity_check` returns `ok`; and
+- **no corruption** — the WHOLE-DATABASE integrity check
+  (`ai_memory::storage::sqlite_integrity::check`) answers `Sound`; and
 - **no lost acknowledged write** — every fsync'd (`Ok`-returning) commit
   in the acknowledged prefix survives the abort.
+
+That first assertion used to read `PRAGMA integrity_check` returns `ok`,
+and on the current schema that claim was weaker than it sounded
+([#3508](https://github.com/alphaonedev/ai-memory-mcp/issues/3508) /
+[#3510](https://github.com/alphaonedev/ai-memory-mcp/issues/3510)).
+SQLite builds the check's root-page list from the schema's table hash,
+and a schema object with no root page of its own — a `VIEW`, a virtual
+table — contributes root page 0; a leading zero makes SQLite treat the
+run as a PARTIAL check that **skips the freelist scan and the "every
+page is referenced" pass while still answering `ok`**. The ai-memory
+schema carries two such objects (`memories_fts`, and the schema v98
+`inbox_namespace_aliases` view), and unreferenced pages are precisely
+what a torn write leaves behind — so the harness now routes through
+`recover::durability::integrity_verdict`, which re-asserts the whole-file
+page census SQLite skipped (every declared page reachable from a b-tree,
+on the freelist, a pointer-map page, or the reserved pending-byte page).
+A check that cannot be COMPLETED is an error, never a pass.
 
 **Proven vs unproven boundary (honest scope).**
 

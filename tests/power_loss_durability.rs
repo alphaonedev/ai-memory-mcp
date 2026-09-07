@@ -12,9 +12,11 @@
 //!
 //! - **PROVEN here:** `SQLite` WAL crash-consistency across an unclean process
 //!   exit — every fsync'd (`Ok`-returning, `synchronous=FULL`) commit survives
-//!   the abort, `PRAGMA integrity_check` is clean on reopen, and the surviving
-//!   row count equals the acknowledged prefix. Also the deferred-audit
-//!   journal's torn-trailing-record discard on replay.
+//!   the abort, the whole-database integrity check (`PRAGMA integrity_check`
+//!   PLUS the #3508/#3510 page accounting SQLite silently skips on this
+//!   schema) is clean on reopen, and the surviving row count equals the
+//!   acknowledged prefix. Also the deferred-audit journal's
+//!   torn-trailing-record discard on replay.
 //! - **NOT proven (out of scope — needs a hardware power-cut rig):** that a
 //!   consumer SSD / OS honours fsync under a REAL power cut (the "fsync lie").
 //!   `abort()`/SIGKILL do not drop the OS page cache the way a power cut does;
@@ -114,10 +116,23 @@ fn power_loss_kill_preserves_acked_writes_and_no_corruption() {
     // Re-open the crashed DB with a fresh connection (no clean shutdown ran).
     let conn = ai_memory::db::open(&db_path).expect("reopen crashed db");
 
-    // 1) No corruption.
+    // 1) No corruption. v1.0.0 #3510 — the verdict comes from the shared
+    //    `storage::sqlite_integrity` helper, so a `Sound` answer means SQLite's
+    //    own check passed AND every page in the file is accounted for. On the
+    //    v98 schema a root-less object downgrades `PRAGMA integrity_check` to a
+    //    PARTIAL check that answers `ok` without ever looking for unreferenced
+    //    pages (#3508) — exactly the damage a torn write leaves — so asserting
+    //    on the bare verdict would have made this durability claim read
+    //    stronger than its evidence. Asserted through `integrity_verdict` (not
+    //    the bool predicate) so a failure NAMES the unaccounted pages.
+    let verdict =
+        ai_memory::recover::durability::integrity_verdict(&conn).expect("integrity check runs");
     assert!(
-        ai_memory::recover::durability::integrity_ok(&conn).expect("integrity_check"),
-        "reopened DB after a mid-write abort must pass integrity_check"
+        matches!(
+            verdict,
+            ai_memory::storage::sqlite_integrity::Soundness::Sound(_)
+        ),
+        "reopened DB after a mid-write abort must be sound: {verdict:?}"
     );
 
     // 2) No lost ACKNOWLEDGED write: rows 0..=ABORT_AFTER were each committed
