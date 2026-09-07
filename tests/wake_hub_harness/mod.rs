@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory::wake_hub::frame::{
-    Frame, HelloPayload, Kind, WakeMeta, decode_error, encode_topics,
+    Frame, HelloPayload, Kind, WakeMeta, decode_error, decode_topics, encode_topics,
 };
 use ai_memory::wake_hub::identity::{
     DenyReason, HelloRequest, HelloVerifier, MembershipRequest, PeerAuthorizer, SameUidAuthorizer,
@@ -47,6 +47,10 @@ use tokio::net::UnixStream;
 #[derive(Debug, Default)]
 pub struct TestVerifier {
     allow: HashMap<String, VerifyingKey>,
+    /// When set, `verify_topics` refuses EVERY topic — the shape of the
+    /// #3468/#3505 scope gate turning a subscribe down, isolated from the
+    /// handshake gate. Off by default, so an existing suite is unaffected.
+    refuse_topics: bool,
 }
 
 impl TestVerifier {
@@ -57,6 +61,12 @@ impl TestVerifier {
 
     pub fn allow(&mut self, agent_id: &str, key: &SigningKey) -> &mut Self {
         self.allow.insert(agent_id.to_string(), key.verifying_key());
+        self
+    }
+
+    /// Refuse every topic this verifier is asked about (#3532).
+    pub fn refuse_topics(&mut self) -> &mut Self {
+        self.refuse_topics = true;
         self
     }
 }
@@ -84,6 +94,9 @@ impl HelloVerifier for TestVerifier {
     }
 
     fn verify_topics(&self, _agent_id: &str, _topics: &[String]) -> Result<(), DenyReason> {
+        if self.refuse_topics {
+            return Err(DenyReason::UnknownAgent);
+        }
         Ok(())
     }
 
@@ -312,6 +325,61 @@ impl Client {
         let from = self.agent_id.clone();
         self.send(Frame::new(Kind::Subscribe, from, "", payload))
             .await;
+    }
+
+    /// Send a `subscribe` and WAIT for the hub's #3532 acknowledgement,
+    /// returning the topics it acknowledged.
+    ///
+    /// This is the deterministic replacement for "subscribe, then round-trip a
+    /// ping so the router is known to have processed it": the hub registers
+    /// the topics BEFORE it mints the ack, so when this returns, a wake any
+    /// peer addresses to those topics is routed against a table that already
+    /// contains this session. No sleeps, no ping, no ordering assumption
+    /// beyond the one the connection itself guarantees.
+    ///
+    /// STRICT on purpose: it asserts the ack is the very NEXT frame. A wake
+    /// for a topic this session already held could legitimately arrive first
+    /// on a live hub, so a production client must drain while it waits (see
+    /// `SessionEvent::Subscribed`) — but a test that hits that case has a
+    /// peer racing its own subscribe, and failing loudly is the right answer
+    /// there.
+    ///
+    /// # Panics
+    ///
+    /// On a topic-list encoding failure, a timeout, or an answer that is not
+    /// the matching acknowledgement.
+    pub async fn subscribe_acked(&mut self, topics: &[String]) -> Vec<String> {
+        self.subscription_acked(Kind::Subscribe, topics).await
+    }
+
+    /// Send an `unsubscribe` and wait for its acknowledgement.
+    ///
+    /// The dual guarantee: once this returns, no further wake for those topics
+    /// will be routed to this session.
+    ///
+    /// # Panics
+    ///
+    /// As [`Client::subscribe_acked`].
+    pub async fn unsubscribe_acked(&mut self, topics: &[String]) -> Vec<String> {
+        self.subscription_acked(Kind::Unsubscribe, topics).await
+    }
+
+    async fn subscription_acked(&mut self, kind: Kind, topics: &[String]) -> Vec<String> {
+        let payload = encode_topics(topics).expect("topics");
+        let from = self.agent_id.clone();
+        self.send(Frame::new(kind, from, "", payload)).await;
+        let ack = self.expect_frame().await;
+        assert_eq!(
+            ack.kind, kind,
+            "#3532: a {kind} the hub applied is acknowledged with a {kind}, got {}",
+            ack.kind
+        );
+        let acked = decode_topics(&ack.payload).expect("the ack carries a topic list");
+        assert_eq!(
+            acked, topics,
+            "#3532: the ack must name exactly the topics that were applied"
+        );
+        acked
     }
 
     /// Send a `wake` to `to` referencing `inbox_row_id`.

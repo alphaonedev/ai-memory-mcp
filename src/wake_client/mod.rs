@@ -507,6 +507,18 @@ async fn run_session(
                     return Ok(());
                 }
             }
+            // #3532 — the hub confirmed a subscription change. This listener
+            // asserts NO topics (own-inbox only, see `session`'s module docs),
+            // so it never asks for one; logging rather than ignoring keeps an
+            // operator's picture of the session honest if a future caller of
+            // `Session::send_subscribe` runs through this loop.
+            SessionEvent::Subscribed(topics) => {
+                tracing::debug!(
+                    agent = bundle.agent_id(),
+                    topics = topics.len(),
+                    "wake listener: the hub acknowledged a subscription change"
+                );
+            }
             SessionEvent::Idle => {}
         }
     }

@@ -38,6 +38,8 @@ from ai_memory.wake import (
     WakeReason,
     Welcome,
     backoff_for,
+    decode_topics,
+    encode_topics,
     hello_transcript,
     topics_hash,
 )
@@ -473,6 +475,103 @@ def test_an_unknown_frame_kind_is_ignored_rather_than_ending_the_session() -> No
     with pytest.raises(WakeError):
         listener(signals.append).pump(transport)
     assert [s.reason for s in signals] == [WakeReason.WELCOME, WakeReason.WAKE]
+
+
+# ---------------------------------------------------------------------------
+# #3532 — the subscribe acknowledgement
+# ---------------------------------------------------------------------------
+
+
+def ack_frame(kind: Kind, topics: tuple[str, ...]) -> bytes:
+    return Frame(kind, "hub", AGENT_ID, encode_topics(topics)).encode()
+
+
+def test_topic_lists_round_trip_and_refuse_a_smuggled_body() -> None:
+    topics = ("#hive", "#swarm")
+    assert decode_topics(encode_topics(topics)) == topics
+    assert decode_topics(encode_topics(())) == ()
+    with pytest.raises(WakeError, match="trailing"):
+        decode_topics(encode_topics(topics) + b"body")
+    with pytest.raises(WakeError, match="not a valid topic"):
+        encode_topics(("no-hash",))
+    with pytest.raises(WakeError, match="at most"):
+        encode_topics(tuple(f"#t{i}" for i in range(9)))
+
+
+def test_a_subscription_is_reported_live_only_when_the_hub_acknowledges_it_3532() -> None:
+    """#3532 — the WRITE is not the guarantee; the ack is.
+
+    A peer's topic wake sent between the write and the hub's router mutation
+    fans out to nobody, so a client that reported liveness on the write would
+    be reporting a subscription that does not yet exist.
+    """
+    signals = []
+    listen = listener(signals.append, topics=("#hive",))
+    transport = MockTransport(
+        [challenge_frame(), welcome_frame(), ack_frame(Kind.SUBSCRIBE, ("#hive",))]
+    )
+    with pytest.raises(WakeError, match="closed the connection"):
+        listen.pump(transport)
+
+    assert [f.kind for f in transport.sent] == [Kind.HELLO, Kind.SUBSCRIBE]
+    assert decode_topics(transport.sent[1].payload) == ("#hive",)
+    assert [s.reason for s in signals] == [WakeReason.WELCOME, WakeReason.SUBSCRIBED]
+    assert signals[1].topics == ("#hive",)
+    assert listen.subscribed == ("#hive",)
+    # A liveness fact, not mail: a callback that reads unconditionally can
+    # branch on this rather than on the reason string.
+    assert not WakeReason.SUBSCRIBED.is_hub_driven
+
+
+def test_no_subscribe_is_sent_when_no_topic_was_asked_for_3532() -> None:
+    """The default listener is own-inbox only, so it asks for nothing."""
+    signals = []
+    transport = MockTransport([challenge_frame(), welcome_frame()])
+    with pytest.raises(WakeError):
+        listener(signals.append).pump(transport)
+    assert [f.kind for f in transport.sent] == [Kind.HELLO]
+
+
+def test_an_unparseable_acknowledgement_is_ignored_rather_than_fatal_3532() -> None:
+    """DEGRADE, never corrupt: the subscription stays UNACKNOWLEDGED.
+
+    A caller waiting on liveness keeps waiting rather than being told a lie,
+    the session survives, and the durable inbox row is untouched either way.
+    """
+    signals = []
+    listen = listener(signals.append, topics=("#hive",))
+    bad = Frame(Kind.SUBSCRIBE, "hub", AGENT_ID, b"\x01\x40").encode()
+    transport = MockTransport([challenge_frame(), welcome_frame(), bad, wake_frame("row-z", 1)])
+    with pytest.raises(WakeError):
+        listen.pump(transport)
+    assert [s.reason for s in signals] == [WakeReason.WELCOME, WakeReason.WAKE]
+    assert listen.subscribed == ()
+
+
+def test_an_unsubscribe_acknowledgement_clears_the_live_topics_3532() -> None:
+    signals = []
+    listen = listener(signals.append, topics=("#hive",))
+    transport = MockTransport(
+        [
+            challenge_frame(),
+            welcome_frame(),
+            ack_frame(Kind.SUBSCRIBE, ("#hive",)),
+            ack_frame(Kind.UNSUBSCRIBE, ("#hive",)),
+        ]
+    )
+    with pytest.raises(WakeError):
+        listen.pump(transport)
+    assert [s.reason for s in signals] == [
+        WakeReason.WELCOME,
+        WakeReason.SUBSCRIBED,
+        WakeReason.SUBSCRIBED,
+    ]
+    assert listen.subscribed == ()
+
+
+def test_a_bad_topic_is_refused_at_construction_not_mid_session_3532() -> None:
+    with pytest.raises(WakeError, match="not a valid topic"):
+        listener(lambda _s: None, topics=("hive",))
 
 
 def test_an_idle_session_fires_the_backstop_without_dropping_the_session() -> None:

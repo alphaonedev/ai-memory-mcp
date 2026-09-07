@@ -203,6 +203,61 @@ recipient's wake latency. The `agent_notified` event still fires there for
 operator subscribers — the two lanes are fed from the same emitter and are
 independent of one another.
 
+### Knowing when a subscription is live (#3532)
+
+**An applied `subscribe` is acknowledged, and the acknowledgement is a
+promise about the router, not about the frame.** The hub adds the topics to
+its routing table FIRST and mints the ack only after that returned. Because
+one connection's frames are read, handled and written in order, a client that
+has OBSERVED the ack knows the route already existed when the ack was
+minted — so any topic wake a peer addresses after that point is routed against
+a table containing this session. `unsubscribe` is acknowledged the same way,
+with the dual guarantee: once the ack is observed, no further wake for those
+topics will be routed there.
+
+Before this, an accepted `subscribe` was answered with nothing at all. A client
+could not know when its subscription went live, and a peer's hint sent inside
+that window fanned out to nobody. The inbox row is the durable truth and the
+`<=60 s` backstop still finds it, so the cost was LATENCY and never loss — but
+it was UNOBSERVABLE latency, and a fleet cannot manage what it cannot observe.
+It was also why every wake-hub test had to round-trip a `ping` after
+subscribing before any peer addressed the topic; the ack replaces that
+workaround with the property itself.
+
+**The hello already had this.** Topics asserted in the `hello` are registered
+before the `welcome` is sent, so the welcome has always been their
+acknowledgement. #3532 extends the same guarantee to a subscription taken
+later in the session.
+
+**The ack is an echo, and that is deliberate.** It is the SAME kind as the
+request (`subscribe` -> `subscribe`, `unsubscribe` -> `unsubscribe`), stamped
+`from` the hub, carrying the request's own topic-list bytes. It does not
+consume a new wire number, for a reason that is about other people's clients
+rather than about elegance: the frame parser REFUSES an unknown kind byte (so
+does the Python SDK reader), so a hub that unilaterally started emitting a new
+`subscribed` kind would have ENDED the session of every client written before
+it, instead of being ignored by one. Kinds 5 and 6 are already in every
+reader's table, and every client in this tree ignores a frame kind it has no
+opinion about — so the ack is inert for an old client and meaningful to a new
+one, which is what "additive" has to mean on a wire other people have already
+implemented. `hello` is already bidirectional with a different payload per
+direction, so a direction-disambiguated kind is the protocol's existing idiom.
+
+Three properties follow, and each is pinned by
+`tests/wake_hub_subscribe_ack_3532.rs`:
+
+* **Acknowledged means applied.** A REFUSED subscribe — out of scope, or past
+  `MAX_TOPICS_PER_SESSION` — is answered with its `error` and never with an
+  ack. There is no frame that says "listening" for a topic the hub did not
+  take.
+* **The ack carries nothing new.** Its payload is the request's own bytes, so
+  it cannot smuggle a body, an identity claim or an authority the client did
+  not itself send. The wake-only posture is unchanged.
+* **A wake may still precede the ack.** If the session already held the topic,
+  a wake for it can legitimately arrive between the request and its
+  acknowledgement. A client waits for the ack while dispatching whatever
+  arrives first; it must not assume the ack is the next frame.
+
 ## The two deployment shapes
 
 ### Co-hosted with the daemon
@@ -392,6 +447,35 @@ most one idle read per minute per agent, not one per wake plus one per minute.
 `--poll-secs` is REFUSED above 60 rather than clamped: a listener that silently
 polled less often than the plane's own contract would be reporting a guarantee
 it does not provide.
+
+### Subscribing, and waiting for the acknowledgement (#3532)
+
+`wake-listen` itself asserts NO topics: a substrate wake is addressed directly
+to the recipient, so its own-inbox scope needs no subscription and its
+`welcome` is already the acknowledgement of everything it asked for. A client
+that DOES want a namespace topic (#3505) asks for it after the welcome, and the
+rule is the same in all three client libraries:
+
+**Send the `subscribe`, then treat the subscription as live only when the
+acknowledgement arrives — never when the write returns.** A client that reports
+liveness on the write reintroduces exactly the race #3532 closed.
+
+* **Rust** — `Session::send_subscribe` / `send_unsubscribe` only WRITE;
+  liveness is `Session::next_event` yielding `SessionEvent::Subscribed`.
+  Keeping the ack in the one ordered event stream is what lets a wake that
+  arrives before it be delivered rather than swallowed.
+* **Python** — pass `topics=` to `WakeListener`; the pump sends the
+  `subscribe` after the welcome and emits a `WakeReason.SUBSCRIBED` signal
+  when the hub acknowledges. `listener.subscribed` holds the acknowledged
+  topics and is empty until then.
+* **TypeScript** — pass `topics` to `WakeStateMachine` / `WakeListener`; the
+  machine emits a `subscribed` signal on the ack and exposes
+  `subscribedTopics`.
+
+All three IGNORE an acknowledgement they cannot parse rather than dropping the
+session over it: the subscription simply stays unacknowledged, so a caller
+waiting on liveness keeps waiting instead of being told a lie, and the durable
+inbox row is untouched either way.
 
 ### One identity root, and every check fails closed
 
