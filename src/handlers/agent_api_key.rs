@@ -114,7 +114,12 @@
 //! [`MINT_RATE_LIMIT_WINDOW_SECS`] per admitted caller, in a BOUNDED table
 //! ([`RATE_LIMIT_MAX_TRACKED_CALLERS`]) that refuses rather than admits when
 //! it is full of live windows — a limiter that fails OPEN under memory
-//! pressure is not a limiter.
+//! pressure is not a limiter. The window is FIXED, not sliding, so a caller
+//! straddling a boundary can issue up to 2N — twenty mints — across two
+//! adjacent seconds ([#3535]); that is a burst-shaping property, not a bypass
+//! of the cap, and the fixed window is what keeps the table bounded and each
+//! decision auditable from one `(window_start, count)` pair. A sliding window
+//! is deliberately NOT used.
 //!
 //! **Approval gate.** Revoking ANOTHER principal's key, or the LAST enrolled
 //! key on the deployment, queues a `pending_actions` row instead of acting;

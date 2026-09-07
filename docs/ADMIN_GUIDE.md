@@ -1467,6 +1467,14 @@ approver to hand the token to the agent, or to the requester out of band; do
 not go looking for it in the `202`. (A queued BIND has no such wrinkle — its
 payload already carries the digest of a token you hold.)
 
+**The mint rate limit is a FIXED window, so the real bound is 2N at a
+boundary.** Ten mints per sixty seconds per admitted caller means a caller
+straddling a window edge can issue up to **twenty** across two adjacent
+seconds. That is burst shaping, not a bypass of the cap: the fixed window is
+what keeps the limiter's table bounded and each decision auditable from one
+`(window_start, count)` pair, and a sliding window is deliberately not used.
+Size any alerting on mints-per-minute accordingly.
+
 ### Peer-mesh security (v0.6.0+) — MUST READ before deploying sync
 
 The peer-to-peer sync mesh introduces new trust assumptions. Disclosed gaps and required mitigations:
