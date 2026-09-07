@@ -14,19 +14,39 @@
 //! These cases mutate the process-global environment, so per
 //! `scripts/check-test-env-lock.sh` arm (d) (#3475) they live in their own
 //! test binary rather than in the shared lib test binary whose cases run on
-//! parallel threads.
+//! parallel threads. A separate binary is not enough on its own: libtest
+//! still runs THIS binary's cases on parallel threads, so the opt-out case
+//! could flip the flag while the refusal case is reading it (seen once on the
+//! macOS CI leg at 5ebf6906). Every case therefore also serialises behind
+//! the file-local `ALLOW_LAX_ENV_LOCK`, the same pattern as
+//! `cov_backup_store_url_3521.rs`.
 
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ai_memory::daemon_runtime::passphrase_from_file;
 
 const ALLOW_LAX_ENV: &str = "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS";
 const SECRET: &str = "correct horse battery staple";
 
-/// SAFETY: this binary's cases are the only writers of this variable and
-/// they run in one process; each clears it before returning.
+/// Serialises every case that touches `ALLOW_LAX_ENV`: libtest runs the
+/// cases of one binary on parallel threads, and the variable is process
+/// global.
+static ALLOW_LAX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take the env lock, tolerating a poison left by an earlier panicking case:
+/// the guarded state is re-established by every case before it reads.
+fn env_lock() -> MutexGuard<'static, ()> {
+    ALLOW_LAX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// SAFETY: this binary's cases are the only writers of this variable, they
+/// run in one process, and every caller holds `ALLOW_LAX_ENV_LOCK` for the
+/// whole case; each clears it before returning.
 unsafe fn set_allow_lax(on: bool) {
     unsafe {
         if on {
@@ -47,6 +67,7 @@ fn write_passphrase(dir: &std::path::Path, mode: u32) -> std::path::PathBuf {
 /// A `0400` file is the intended posture and reads back exactly, trimmed.
 #[test]
 fn a_tight_passphrase_file_is_accepted() {
+    let _g = env_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = write_passphrase(tmp.path(), 0o400);
     // SAFETY: see the helper's contract.
@@ -59,6 +80,7 @@ fn a_tight_passphrase_file_is_accepted() {
 /// the posture problem rather than failing opaquely.
 #[test]
 fn a_lax_passphrase_file_is_refused_by_default() {
+    let _g = env_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = write_passphrase(tmp.path(), 0o644);
     // SAFETY: see the helper's contract.
@@ -76,6 +98,7 @@ fn a_lax_passphrase_file_is_refused_by_default() {
 /// bytes of the handle it checked, not of a path re-opened afterwards.
 #[test]
 fn the_legacy_opt_out_accepts_a_lax_passphrase_file() {
+    let _g = env_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = write_passphrase(tmp.path(), 0o644);
     // SAFETY: see the helper's contract.
