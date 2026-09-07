@@ -26,7 +26,7 @@ use ai_memory::wake_hub::frame::{
 use ai_memory::wake_hub::identity::{
     DenyReason, HelloRequest, HelloVerifier, SameUidAuthorizer, VerifiedAgent,
 };
-use ai_memory::wake_hub::limits::{MAX_FRAME_BYTES, MAX_ID_BYTES};
+use ai_memory::wake_hub::limits::{MAX_FRAME_BYTES, MAX_ID_BYTES, MAX_TOPICS_PER_SESSION};
 use ai_memory::wake_hub::{HubConfig, HubDeps};
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
@@ -615,28 +615,47 @@ async fn denied_a_subscription_over_the_session_cap_changes_nothing() {
     client.hello("agent-a", &key_a, &[]).await;
     assert_eq!(client.expect_frame().await.kind, Kind::Welcome);
 
-    // MAX_TOPICS_PER_SESSION is 32 and MAX_TOPICS_PER_FRAME is 8, so five full
-    // frames take the session one topic past its cap.
-    let mut refused = false;
-    for round in 0..5 {
+    // MAX_TOPICS_PER_SESSION is 32 and MAX_TOPICS_PER_FRAME is 8, so four full
+    // frames fill the session exactly and a fifth is one frame past its cap.
+    //
+    // #3532 — every ACCEPTED subscribe is acknowledged and the refused one is
+    // answered with its error, so this is now a frame-for-frame assertion
+    // instead of a 200 ms "did anything arrive?" probe that scored an empty
+    // stream as acceptance.
+    for round in 0..4 {
         let topics: Vec<String> = (0..8).map(|idx| format!("#t{round}-{idx}")).collect();
-        let payload = encode_topics(&topics).expect("topics");
-        client
-            .send(Frame::new(Kind::Subscribe, "agent-a", "", payload))
-            .await;
-        if let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(200), client.read_frame()).await
-        {
-            assert_eq!(frame.kind, Kind::Error);
-            let (code, _) = decode_error(&frame.payload).expect("error payload");
-            assert_eq!(code, ErrorCode::Forbidden.as_u16());
-            refused = true;
-        }
+        let acked = client.subscribe_acked(&topics).await;
+        assert_eq!(
+            acked, topics,
+            "an accepted subscribe acknowledges exactly the topics it applied"
+        );
     }
+
+    let over: Vec<String> = (0..8).map(|idx| format!("#over-{idx}")).collect();
+    let payload = encode_topics(&over).expect("topics");
+    client
+        .send(Frame::new(Kind::Subscribe, "agent-a", "", payload))
+        .await;
+    let reason = client.expect_error(ErrorCode::Forbidden.as_u16()).await;
     assert!(
-        refused,
+        reason.contains("too many topics"),
+        "the sender is told which bound it hit: {reason}"
+    );
+
+    // Refused WHOLE, and never acknowledged: the router still holds exactly the
+    // 32 topics it accepted and none of the refused frame's, so a client can
+    // never be left believing it listens to a topic the hub dropped.
+    assert_eq!(
+        hub.router().subscription_count("agent-a"),
+        MAX_TOPICS_PER_SESSION,
         "a subscription past the cap must be refused whole, never silently truncated"
     );
+    for topic in &over {
+        assert!(
+            hub.router().topic_recipients(topic, "").is_empty(),
+            "no topic from a refused frame may be routable"
+        );
+    }
     hub.stop().await;
 }
 
