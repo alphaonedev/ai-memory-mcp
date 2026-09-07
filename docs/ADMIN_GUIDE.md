@@ -1390,6 +1390,50 @@ strictly worse than performing one over a channel the operator already
 accepted, and a revoke returns no secret.
 `POST /api/v1/agents/{id}/api-key/revoke` therefore works in every topology.
 
+### Enrolling a per-agent api-key: dispositions that will surprise you ([#3535](https://github.com/alphaonedev/ai-memory-mcp/issues/3535))
+
+These properties of `POST /api/v1/agents/{id}/api-key` are deliberate, are easy
+to hit on a first enrolment, and each answers with a distinct status.
+
+**The target must already be a registered agent.** An id the `_agents`
+roster does not know is refused:
+
+```json
+{ "error": "agent_not_registered", "agent_id": "svc-indexr" }
+```
+
+with `404`, and nothing is bound. A key bound to an id nothing registered is a
+credential for a principal that does not exist: under the `enforce` identity
+posture the presented key would bind an `X-Agent-Id` to that id, while the
+governance `registered` level, the pending-action approver gate and
+`agents bind-key` all consult the roster and see no such agent. A typo'd id
+would otherwise mint a live bearer secret none of those controls can see. The
+fix is one extra call by the same admin:
+
+```bash
+curl -sS -X POST https://daemon/api/v1/agents \
+  -H "x-api-key: $KEY" -H "X-Agent-Id: $ADMIN" \
+  -H 'content-type: application/json' \
+  -d '{"agent_id":"svc-indexer","agent_type":"service"}'
+# then enrol its key
+curl -sS -X POST https://daemon/api/v1/agents/svc-indexer/api-key \
+  -H "x-api-key: $KEY" -H "X-Agent-Id: $ADMIN" -d '{}'
+```
+
+This includes minting a key for **yourself**: the rule is about the target, not
+the caller, so register the admin principal too. A deployment that uses the
+approval gate has to anyway — approving a parked revoke requires a *registered*
+approver — and `POST /api/v1/agents` with your own `agent_id` is a
+self-registration that needs no admin role.
+
+Two deliberate asymmetries. **`ai-memory agents bind-api-key` is NOT gated
+this way** — it is a shell on the host that owns the data tier, where the
+operator can already write the table directly, and it stays the bootstrap and
+recovery path. **Revoke is not gated this way either**: refusing a revocation
+is strictly worse than performing one, and revoking a key bound to an
+unregistered id is exactly the cleanup needed for a binding that predates this
+rule.
+
 ### Peer-mesh security (v0.6.0+) — MUST READ before deploying sync
 
 The peer-to-peer sync mesh introduces new trust assumptions. Disclosed gaps and required mitigations:
