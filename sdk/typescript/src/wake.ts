@@ -95,6 +95,8 @@ const HELLO_NONCE_BYTES = 32;
 const SIGNATURE_BYTES = 64;
 const WAKE_DIGEST_BYTES = 32;
 const MAX_WAKE_META_BYTES = 256;
+const MAX_TOPICS_PER_FRAME = 8;
+const MAX_TOPIC_BYTES = 64;
 const WELCOME_BYTES = 4 + 8 + 4 + 1 + 4 + 4;
 const HELLO_TRANSCRIPT_DOMAIN = Buffer.from("a2a/v1/hello", "ascii");
 const A2A_HUB_SCOPE = "a2a-hub";
@@ -118,7 +120,14 @@ export class WakeError extends Error {
   }
 }
 
-/** Frame kinds the v1 protocol admits. There is no body kind. */
+/**
+ * Frame kinds the v1 protocol admits. There is no body kind.
+ *
+ * Three kinds travel in BOTH directions: `Hello` (the hub's challenge, then
+ * the client's signed answer), `Ping`/`Pong`, and — since #3532 —
+ * `Subscribe` / `Unsubscribe`, whose hub-to-client form is the
+ * acknowledgement that the router has APPLIED the change.
+ */
 export const Kind = {
   Hello: 1,
   Welcome: 2,
@@ -306,6 +315,59 @@ export function decodeWelcome(buf: Buffer): Welcome {
     reconnectBaseMs: buf.readUInt32BE(17),
     reconnectJitterMs: buf.readUInt32BE(21),
   };
+}
+
+/**
+ * Encode a topic list as `count(u8)` then `len(u8) || bytes` per topic.
+ *
+ * Mirrors `wake_hub::frame::encode_topics`; every bound is checked here so a
+ * client cannot construct a frame the hub would refuse.
+ */
+export function encodeTopics(topics: readonly string[]): Buffer {
+  if (topics.length > MAX_TOPICS_PER_FRAME) {
+    throw new WakeError(
+      `at most ${MAX_TOPICS_PER_FRAME} topics per frame, got ${topics.length}`,
+    );
+  }
+  const parts: Buffer[] = [Buffer.from([topics.length])];
+  for (const t of topics) {
+    const raw = Buffer.from(t, "utf8");
+    if (!t.startsWith("#") || raw.length < 2 || raw.length > MAX_TOPIC_BYTES) {
+      throw new WakeError(`${JSON.stringify(t)} is not a valid topic`);
+    }
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(t)) {
+      throw new WakeError("a topic may not carry a control character");
+    }
+    parts.push(Buffer.from([raw.length]), raw);
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * Decode a topic list written by {@link encodeTopics}.
+ *
+ * Trailing bytes are REFUSED, so a body can never ride along behind an
+ * otherwise valid topic list.
+ */
+export function decodeTopics(buf: Buffer): string[] {
+  if (buf.length === 0) throw new WakeError("topic list ended mid-field");
+  const count = buf[0]!;
+  if (count > MAX_TOPICS_PER_FRAME) {
+    throw new WakeError(`topic list declares ${count} topics`);
+  }
+  const out: string[] = [];
+  let off = 1;
+  for (let i = 0; i < count; i += 1) {
+    if (off >= buf.length) throw new WakeError("topic list ended mid-field");
+    const len = buf[off]!;
+    off += 1;
+    if (buf.length - off < len) throw new WakeError("topic list ended mid-field");
+    out.push(buf.subarray(off, off + len).toString("utf8"));
+    off += len;
+  }
+  if (off !== buf.length) throw new WakeError("topic list carried trailing bytes");
+  return out;
 }
 
 /** SHA-256 over the canonical topic list (`wake_hub::identity`). */
@@ -588,11 +650,28 @@ export class DelegationBundle {
  * fired" — the second silently replacing the first is exactly what a broken
  * wake plane looks like.
  */
-export type WakeReason = "welcome" | "lagged" | "wake" | "gap" | "backstop";
+export type WakeReason =
+  | "welcome"
+  | "lagged"
+  | "wake"
+  | "gap"
+  | "backstop"
+  /**
+   * #3532 — the hub ACKNOWLEDGED a subscription change: it applied the change
+   * to its router BEFORE minting this, so any topic wake a peer addresses from
+   * now on is routed against a table containing this session. A liveness fact,
+   * not a reason to read the inbox.
+   */
+  | "subscribed";
 
-/** `true` when this signal came from the hub rather than from the poll. */
+/**
+ * `true` when this signal came from the hub rather than from the poll.
+ *
+ * `subscribed` is excluded: it reports liveness, not mail, so a callback that
+ * reads unconditionally can branch on this rather than on the reason string.
+ */
 export function isHubDriven(reason: WakeReason): boolean {
-  return reason !== "backstop";
+  return reason !== "backstop" && reason !== "subscribed";
 }
 
 /** One "read your inbox now" signal. */
@@ -602,6 +681,8 @@ export interface WakeSignal {
   meta?: WakeMeta;
   pendingCount: number;
   missed: number;
+  /** Topics the hub acknowledged, on a `subscribed` signal. */
+  topics?: string[];
 }
 
 /**
@@ -690,12 +771,37 @@ export interface Step {
 export class WakeStateMachine {
   private state: "challenge" | "welcome" | "live" = "challenge";
   private readonly seq = new SeqTracker();
+  private acked: string[] = [];
 
-  constructor(private readonly bundle: DelegationBundle) {}
+  /**
+   * @param bundle the scoped `a2a-hub` delegation this session presents.
+   * @param topics namespace topics (#3505) to ask for after the welcome.
+   *   EMPTY by default: a substrate wake is addressed directly to the
+   *   recipient, so own-inbox delivery needs no subscription at all.
+   */
+  constructor(
+    private readonly bundle: DelegationBundle,
+    private readonly topics: readonly string[] = [],
+  ) {
+    // Validated here, so a bad topic is a construction error rather than a
+    // refusal from the hub mid-session.
+    encodeTopics(topics);
+  }
 
   /** `true` once the hub has welcomed this session. */
   get isLive(): boolean {
     return this.state === "live";
+  }
+
+  /**
+   * Topics the hub has ACKNOWLEDGED for this session (#3532).
+   *
+   * Empty until the ack arrives. The `subscribe` having been WRITTEN is not
+   * the guarantee: a peer's topic wake sent between the write and the hub's
+   * router mutation would fan out to nobody, which is the race the ack closes.
+   */
+  get subscribedTopics(): readonly string[] {
+    return this.acked;
   }
 
   onFrame(frame: Frame): Step {
@@ -738,6 +844,21 @@ export class WakeStateMachine {
         }
         const welcome = decodeWelcome(frame.payload);
         this.state = "live";
+        // #3532 — ask for the namespace topics only AFTER admission, and do
+        // not report them live until the hub acknowledges them below.
+        const send =
+          this.topics.length > 0
+            ? [
+                lengthPrefixed(
+                  encodeFrame({
+                    kind: Kind.Subscribe,
+                    from: this.bundle.agentId,
+                    to: "",
+                    payload: encodeTopics(this.topics),
+                  }),
+                ),
+              ]
+            : [];
         return {
           signals: [
             {
@@ -746,7 +867,7 @@ export class WakeStateMachine {
               missed: 0,
             },
           ],
-          send: [],
+          send,
         };
       }
       default: {
@@ -775,6 +896,27 @@ export class WakeStateMachine {
             ],
           };
         }
+        if (frame.kind === Kind.Subscribe || frame.kind === Kind.Unsubscribe) {
+          // #3532 — the hub applied a subscription change and is saying so. An
+          // ack that will not decode is IGNORED, never fatal: the subscription
+          // simply stays unacknowledged, so a caller waiting on liveness keeps
+          // waiting rather than being told a lie, and the durable inbox row is
+          // untouched either way.
+          let topics: string[];
+          try {
+            topics = decodeTopics(frame.payload);
+          } catch {
+            return { signals: [], send: [] };
+          }
+          this.acked =
+            frame.kind === Kind.Subscribe
+              ? topics
+              : this.acked.filter((t) => !topics.includes(t));
+          return {
+            signals: [{ reason: "subscribed", pendingCount: 0, missed: 0, topics }],
+            send: [],
+          };
+        }
         if (frame.kind === Kind.Error) {
           throw new WakeError(`the hub refused this session: ${errorText(frame.payload)}`);
         }
@@ -800,6 +942,12 @@ export interface WakeListenerOptions {
   reconnectJitterMs?: number;
   /** Injectable for deterministic tests; defaults to `Math.random`. */
   random?: () => number;
+  /**
+   * Namespace topics (#3505) to subscribe to after the welcome. The
+   * subscription is reported live only when the hub acknowledges it (#3532),
+   * as a `subscribed` signal.
+   */
+  topics?: readonly string[];
 }
 
 /**
@@ -807,6 +955,11 @@ export interface WakeListenerOptions {
  *
  * `onSignal` is called EXACTLY ONCE per event and is where you perform your
  * catch-up inbox read.
+ *
+ * One signal is NOT a read trigger: `subscribed` (#3532) reports that the hub
+ * has applied a subscription change, so a caller waiting for a namespace
+ * subscription to go live waits for that signal rather than for a timer.
+ * {@link isHubDriven} is `false` for it.
  */
 export class WakeListener {
   readonly metrics = { signals: 0, sessions: 0, reconnects: 0 };
@@ -820,6 +973,7 @@ export class WakeListener {
   private readonly reconnectBaseMs: number;
   private readonly reconnectJitterMs: number;
   private readonly random: () => number;
+  private readonly topics: readonly string[];
   private stopped = false;
   private socket: Socket | null = null;
   private backstop: NodeJS.Timeout | null = null;
@@ -841,6 +995,9 @@ export class WakeListener {
     this.reconnectBaseMs = opts.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS;
     this.reconnectJitterMs = opts.reconnectJitterMs ?? DEFAULT_RECONNECT_JITTER_MS;
     this.random = opts.random ?? Math.random;
+    this.topics = opts.topics ?? [];
+    // Refuse a bad topic at construction rather than mid-session.
+    encodeTopics(this.topics);
   }
 
   private emit(signal: WakeSignal): void {
@@ -900,7 +1057,7 @@ export class WakeListener {
 
   private session(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const machine = new WakeStateMachine(this.bundle);
+      const machine = new WakeStateMachine(this.bundle, this.topics);
       const frames = new FrameBuffer();
       const socket = netConnect(this.socketPath);
       this.socket = socket;
