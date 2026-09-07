@@ -1455,6 +1455,18 @@ which exits non-zero with the same disposition. To move a token deliberately:
 revoke the incumbent binding first, or (better) mint a fresh token for the new
 agent.
 
+**When a queued MINT is approved, the token goes to the APPROVER.** If the
+identity namespace (`_agents`) carries a governance policy whose `write` level
+is `approve`, a mint is parked and the requester receives a `202` with a
+`pending_id` and **no token** — none has been minted yet. A token cannot be
+produced at queue time and delivered later without persisting it in raw form,
+which this surface never does, so the mint happens at APPLY time: the approving
+principal's `{"approve_pending_id": "<id>"}` request is what mints, and the
+`200` it receives is the only place that token ever appears. Plan for the
+approver to hand the token to the agent, or to the requester out of band; do
+not go looking for it in the `202`. (A queued BIND has no such wrinkle — its
+payload already carries the digest of a token you hold.)
+
 ### Peer-mesh security (v0.6.0+) — MUST READ before deploying sync
 
 The peer-to-peer sync mesh introduces new trust assumptions. Disclosed gaps and required mitigations:

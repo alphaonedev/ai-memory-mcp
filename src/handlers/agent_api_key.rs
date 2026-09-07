@@ -129,6 +129,20 @@
 //! so "revoke one agent" and "disarm the fleet's identity binding" are the
 //! same keystroke unless someone else looks.
 //!
+//! **A queued MINT's token goes to the APPROVER, not the requester
+//! ([#3535]).** When the identity namespace's policy parks a mint, the 202
+//! carries a `pending_id` and NO token — there is none yet. A token cannot be
+//! produced at queue time and delivered later without persisting it in raw
+//! form, which is the one thing this surface never does, so the mint is
+//! DEFERRED to the apply step: the approver's own `{"approve_pending_id":
+//! …}` request is what mints, and the `200` it receives is the ONLY place
+//! that token ever appears. The requester must therefore obtain it from the
+//! approver out of band, or (the usual shape) the approver hands it to the
+//! agent directly. The queued BIND form has no such wrinkle — its payload
+//! already carries the digest of a token the operator holds. Documented on
+//! the route rows and in the admin guide so an operator does not go looking
+//! for a token in the 202.
+//!
 //! **Last-key atomicity ([#3529]).** The last-key rule is ENFORCED in the
 //! store, not by the pre-check that shapes the 202. [`revoke_requires_approval`]
 //! reads a snapshot; two concurrent self-revokes by the last two key-holders
