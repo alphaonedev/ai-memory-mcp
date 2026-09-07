@@ -403,6 +403,16 @@ certificate's issuer signature is verified authoritatively by the HUB; this
 SDK does not reproduce that pre-image, which is a degrade (it may present a
 bundle the hub refuses) and never a widening.
 
+**A subscription is live when the hub says so, not when you asked.** Pass
+`{ topics: ["#acme/eng"] }` to subscribe to a namespace topic your agent
+provably reads. The listener sends the `subscribe` after the welcome and
+reports the subscription live only when the hub ACKNOWLEDGES it — a
+`"subscribed"` signal, after which `machine.subscribedTopics` names the
+acknowledged topics. The hub registers the topics before minting that ack, so
+once you have seen it any topic wake a peer addresses reaches you. Treating the
+write as liveness would lose a peer's hint sent in the gap. `"subscribed"` is a
+liveness fact, not mail: `isHubDriven("subscribed")` is `false`.
+
 **The backstop is always armed.** A bounded poll — at most 60 s
 (`wake_sink::BACKSTOP_POLL_MAX`) — runs whether or not the hub is reachable,
 so a hub that is down, refusing, or was never deployed costs LATENCY and
