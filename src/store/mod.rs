@@ -62,6 +62,13 @@ pub mod postgres;
 #[cfg(feature = "sal-postgres")]
 pub(crate) mod postgres_parity;
 
+/// v1.0.0 #3525 — the probe ladder for the migration advisory lock, hosted
+/// beside `postgres` (which is at its QUAL-10 size ceiling) so the wait
+/// schedule #3519 introduced is testable as data rather than as literals
+/// buried in the acquire loop.
+#[cfg(feature = "sal-postgres")]
+pub(crate) mod pg_migration_lock;
+
 /// #1955 [P1][R45] — substrate record-stop actuator + signed
 /// stop-attestation. Backend-agnostic flag/attestation logic + the
 /// per-DB sqlite flag registry.

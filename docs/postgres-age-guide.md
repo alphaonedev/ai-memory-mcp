@@ -1201,6 +1201,49 @@ the acquire timeout are exposed via three env vars (each resolved by
 
 Non-positive / unparseable values fall through to the compiled default.
 
+### Migration advisory lock — connect latency under contention (#3519 / #3525)
+
+Every `PostgresStore::connect` takes a session-scoped advisory lock before it
+reads `schema_version`, so that only one process runs the schema ladder at a
+time. Before v1.0.0 that wait was a blocking `SELECT pg_advisory_lock($1)`,
+which is a data-tier availability defect: a waiter blocks *inside* an in-flight
+statement and therefore holds a transaction snapshot, while the holder's ladder
+runs `CREATE INDEX CONCURRENTLY`, whose phase 2/3 waits for exactly those
+snapshots to end. The cycle closes through the application, so PostgreSQL's
+deadlock detector never fires and every process in it hangs indefinitely —
+reproduced on the certified tier with as few as **four** concurrent boots
+against one fresh database. #3519 replaced the blocking wait with a poll of
+short `pg_try_advisory_lock` probes, each its own immediately-returning
+statement, so a waiter pins no snapshot and can never stall a peer's index
+build. If you are diagnosing a stuck bootstrap, `pg_locks` (`locktype =
+'advisory'`) plus `pg_stat_activity` will show the holder and the queue.
+
+Polling trades wake-up latency for that snapshot safety — a waiter learns the
+lock is free at its next probe, not the instant it is released — so what matters
+is not when the first probe happens but the RATIO between consecutive probes,
+because that ratio bounds how far past the actual release a waiter can sleep.
+The probe gap is therefore a fraction of the wait already served:
+`sleep = clamp(elapsed / 8, 5 ms, 1000 ms)` (#3525). The first probe is
+immediate, so a single connector never sleeps at all; the first re-probe follows
+after 5 ms; and the gap widens with the wait, bounding the overshoot at ~12.5 %
+of the elapsed wait rather than the ~100 % a doubling ladder allows. Once a wait
+passes ~8 s the gap is one probe per second and stays there, so the steady-state
+cost is one trivial `pg_try_advisory_lock` per waiter per second even when a
+whole fleet boots together. A waiter that rides the entire wait budget issues
+roughly 1,845 probes, about 41 more than the previous doubling schedule — each a
+shared-memory lock-table check with no I/O.
+
+Measured on the certified tier at 4-way concurrency against an already-migrated
+database, this returns the median contended connect to within ~3 % of its
+pre-#3519 latency (p90 within ~10 %) without reintroducing the blocking wait.
+The residual is the price of polling and is not zero.
+
+The **total** wait is bounded and independent of this schedule: a caller that
+does not obtain the lock within `MIGRATION_LOCK_WAIT_TIMEOUT_MS` (two full
+`INDEX_BUILD_TIMEOUT_MS` budgets, i.e. the longest legitimate ladder a holder
+can run) fails closed with a clear, retryable refusal naming the lock key and
+the elapsed wait. It never hangs, and a refusing peer has applied nothing.
+
 ## Troubleshooting
 
 ### AGE not installed

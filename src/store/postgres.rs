@@ -2004,19 +2004,10 @@ const MIGRATION_LOCK_SITE_BOOTSTRAP: &str = "bootstrap advisory lock";
 /// which runs the ladder WITHOUT the bootstrap around it).
 const MIGRATION_LOCK_SITE_MIGRATE: &str = "migrate advisory lock";
 
-/// v1.0.0 #3519 — first backoff (ms) between `pg_try_advisory_lock` probes.
-/// Deliberately short: in the overwhelmingly common case (a fresh database,
-/// several daemons or in-process stores booting at once) the holder's ladder
-/// finishes in seconds, and a waiter should pick the lock up promptly rather
-/// than sit out a fixed coarse tick.
-const MIGRATION_LOCK_POLL_BASE_MS: u64 = 25;
-
-/// v1.0.0 #3519 — ceiling (ms) for the doubling probe backoff. Caps the
-/// steady-state probe rate at one trivial `pg_try_advisory_lock` per waiter
-/// per second — negligible even for a large fleet booting together — while
-/// bounding the extra latency between the holder releasing and a waiter
-/// noticing at one second.
-const MIGRATION_LOCK_POLL_MAX_MS: u64 = 1_000;
+// v1.0.0 #3525 — the probe backoff constants and the ladder that walks them
+// now live in `store::pg_migration_lock` (this module is at its QUAL-10 size
+// ceiling, and the sequence needed to be pinnable as data by a unit test).
+use crate::store::pg_migration_lock::migration_lock_probe_delay_ms;
 
 /// v1.0.0 #3519 — how often (ms) a waiter re-states, at WARN, that it is
 /// still queued behind the migration lock. A boot that legitimately waits out
@@ -2115,7 +2106,6 @@ async fn acquire_migration_advisory_lock(
 ) -> StoreResult<()> {
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(MIGRATION_LOCK_WAIT_TIMEOUT_MS);
-    let mut backoff_ms = MIGRATION_LOCK_POLL_BASE_MS;
     let mut probes: u64 = 0;
     let mut next_log = std::time::Duration::from_millis(MIGRATION_LOCK_WAIT_LOG_INTERVAL_MS);
 
@@ -2167,10 +2157,14 @@ async fn acquire_migration_advisory_lock(
             ));
         }
 
-        // Never sleep past the budget: the refusal must land on time.
+        // Never sleep past the budget: the refusal must land on time. The
+        // ladder only decides WHEN inside the budget the next probe happens;
+        // this clamp is what keeps the bounded fail-closed wait intact.
         let remaining = budget.saturating_sub(elapsed);
-        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms).min(remaining)).await;
-        backoff_ms = backoff_ms.saturating_mul(2).min(MIGRATION_LOCK_POLL_MAX_MS);
+        let delay = std::time::Duration::from_millis(migration_lock_probe_delay_ms(
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        ));
+        tokio::time::sleep(delay.min(remaining)).await;
     }
 }
 
@@ -35307,6 +35301,9 @@ mod tests {
     /// leaving the coupling to prose.
     #[test]
     fn the_lock_wait_budget_tracks_the_index_build_budget_3519() {
+        use crate::store::pg_migration_lock::{
+            MIGRATION_LOCK_POLL_MAX_MS, MIGRATION_LOCK_POLL_MIN_MS,
+        };
         assert_eq!(
             usize::try_from(MIGRATION_LOCK_WAIT_INDEX_BUDGETS).expect("budget count fits usize"),
             LIST_ORDER_INDEXES.len(),
@@ -35326,8 +35323,8 @@ mod tests {
         );
         // The backoff must actually back off, and must not out-run the budget.
         assert!(
-            MIGRATION_LOCK_POLL_BASE_MS > 0
-                && MIGRATION_LOCK_POLL_BASE_MS <= MIGRATION_LOCK_POLL_MAX_MS,
+            MIGRATION_LOCK_POLL_MIN_MS > 0
+                && MIGRATION_LOCK_POLL_MIN_MS <= MIGRATION_LOCK_POLL_MAX_MS,
             "the probe backoff must start positive and grow toward its cap"
         );
         assert!(
