@@ -220,12 +220,15 @@ async fn store_backed_rollback_of_an_unknown_id_refuses() {
 /// tags the log row `_reversed`, and re-running it does not move the row
 /// again.
 ///
-/// The adjustment reversed here RAISES the priority back (4 -> 9). The
-/// substrate's `(title, namespace)` upsert-merge resolves `priority` with
-/// `MAX(existing, incoming)`, so a store-backed reversal that would LOWER a
-/// priority is currently a silent no-op that still prints `applied` — see
-/// the residual-risk note on #3521; this test deliberately does not pin
-/// that behaviour as correct.
+/// The adjustment reversed here RAISES the priority back (4 -> 9). When this
+/// pin was written the LOWERING direction was broken: the reversal wrote
+/// through the create funnel, whose `(title, namespace)` upsert-merge resolves
+/// `priority` with `MAX(existing, incoming)`, so a store-backed reversal that
+/// had to LOWER a priority was a silent no-op that still printed `applied`.
+/// This test deliberately did not pin that behaviour as correct; #3526 fixed it
+/// (the reversal now writes through the explicit `MemoryStore::update` funnel
+/// and verifies the durable row), and `tests/rollback_priority_claims_truth_3526.rs`
+/// pins BOTH directions on BOTH backends.
 #[tokio::test]
 async fn store_backed_rollback_by_id_applies_then_is_idempotent() {
     let (_dir, db) = tmp_db();
