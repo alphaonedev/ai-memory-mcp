@@ -45,7 +45,7 @@ use ai_memory::wake_hub::delegation_verifier::{
     ALLOWLIST_FILE_VERSION, AllowlistCache, AllowlistEntry, AllowlistFile, ReloadingAllowlist,
     RootKeyResolver as _, ScopedDelegationVerifier,
 };
-use ai_memory::wake_hub::frame::{ErrorCode, Kind};
+use ai_memory::wake_hub::frame::{ErrorCode, Frame, Kind};
 use ai_memory::wake_hub::identity::SameUidAuthorizer;
 use ai_memory::wake_hub::limits::MAX_READABLE_PREFIXES;
 use bytes::Bytes;
@@ -468,6 +468,32 @@ async fn postgres_derivation_carries_the_same_proven_set_3505() {
     }
 }
 
+/// Subscribe and PROVE the hub has processed it before any peer addresses the
+/// topic.
+///
+/// A `subscribe` the hub accepts answers with nothing, so the only way to know
+/// the router now holds the topic is a round-trip on the SAME connection: the
+/// hub handles one connection's frames in order, so the `pong` arriving means
+/// the `subscribe` before it was handled. Without this, a peer's topic wake
+/// sent right after can be routed first — fan-out to nobody, no error frame,
+/// so the subscriber waits forever. Linux's readiness ordering made that the
+/// DETERMINISTIC outcome (8/8 on the 157d4fda merge gate) while macOS hid it;
+/// `wake_hub_allowed_3467` sequences its unsubscribe the same way.
+async fn subscribe_synced(client: &mut wake_hub_harness::Client, topic: &str) {
+    client
+        .subscribe(std::slice::from_ref(&topic.to_string()))
+        .await;
+    let from = client.agent_id.clone();
+    client
+        .send(Frame::new(Kind::Ping, from, "", Bytes::new()))
+        .await;
+    assert_eq!(
+        client.expect_frame().await.kind,
+        Kind::Pong,
+        "the subscribe round-trip must answer with a pong"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Verification — over a real socket
 // ---------------------------------------------------------------------------
@@ -491,11 +517,11 @@ async fn allowed_a_proven_namespace_topic_delivers_a_wake_3505() {
     let mut bob = join(&hub, BOB, 23, 24).await;
 
     let topic = format!("#{SHARED}");
-    alice.subscribe(std::slice::from_ref(&topic)).await;
-    // A `subscribe` the hub accepts answers with nothing, so prove acceptance
-    // by the delivery below rather than by an absent error frame. The same
-    // delivery is the ALLOWED half of the #3505 SEND gate: BOB's row proves
-    // the namespace, so his topic-addressed wake is admitted and fans out.
+    // The pong proves the subscription is live before BOB addresses it; the
+    // delivery below is then the ALLOWED half of the #3505 SEND gate: BOB's
+    // row proves the namespace, so his topic-addressed wake is admitted and
+    // fans out.
+    subscribe_synced(&mut alice, &topic).await;
     bob.wake(&topic, "row-3505-a").await;
 
     let wake = alice.expect_frame().await;
@@ -719,7 +745,7 @@ async fn a_namespace_removed_by_a_refresh_drops_the_subscription_3505() {
     let mut bob = join(&hub, BOB, 43, 44).await;
 
     let topic = format!("#{SHARED}");
-    alice.subscribe(std::slice::from_ref(&topic)).await;
+    subscribe_synced(&mut alice, &topic).await;
     bob.wake(&topic, "row-3505-before").await;
     assert_eq!(
         alice.expect_frame().await.kind,
