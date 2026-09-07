@@ -1503,6 +1503,26 @@ impl OllamaClient {
         })
     }
 
+    /// v1.0.0 #3523 — TEST-ONLY probe-free constructor (#3509 load-flake
+    /// class): `new_with_url`'s `GET /api/tags` probe crosses the sync->async
+    /// bridge under a 10 s budget and times out under concurrent build load,
+    /// failing tests that assert nothing about it.
+    ///
+    /// STRUCTURAL, never a runtime flag: `cfg(any(test, feature =
+    /// "test-support"))` means a release build compiles neither this fn nor
+    /// any call to it. DELEGATES to [`Self::new_with_url_no_health_check`] so
+    /// the construction path cannot drift — that fn keeps PRODUCTION callers
+    /// (e.g. [`Self::new_with_url_async`]) and is deliberately NOT gated.
+    /// The no-production-caller invariant is pinned by
+    /// `tests/agent_id_seam_structural_3523.rs`.
+    ///
+    /// # Errors
+    /// Propagates a `reqwest` client build failure.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_tests_without_probe(base_url: &str, model: &str) -> Result<Self> {
+        Self::new_with_url_no_health_check(base_url, model)
+    }
+
     /// v0.7.0 F6 — observe the breaker's state without acquiring it for
     /// long; if poisoned, treat as closed (fail open) so a poisoned mutex
     /// can never wedge the LLM path entirely.
