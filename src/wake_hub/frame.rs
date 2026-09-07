@@ -44,6 +44,23 @@
 //! Every reserved field is CHECKED, not ignored: a non-zero `flags` or
 //! `reserved` byte is a `400`, so the bytes stay available for a future
 //! version instead of being quietly accepted by today's parser.
+//!
+//! # Which kinds travel in which direction
+//!
+//! Most kinds have one direction, but three do not, and that is deliberate:
+//! `hello` (the hub's challenge, then the client's signed answer),
+//! `ping`/`pong` (either side may probe), and — since v1.0.0 #3532 —
+//! `subscribe` / `unsubscribe`, whose hub-to-client form is the
+//! ACKNOWLEDGEMENT that the router has applied the change.
+//!
+//! An ack was spelled as an echo rather than as a new wire number ON PURPOSE.
+//! [`Kind::from_u8`] REFUSES an unknown byte (so does the Python SDK reader),
+//! which means a brand-new kind would have ended the session of every client
+//! that predates it instead of being ignored by it. Kinds 5 and 6 are already
+//! in every reader's table, and every client in this tree ignores a frame kind
+//! it has no opinion about — so the ack is inert for an old client and
+//! meaningful to a new one, which is what "additive" has to mean on a wire
+//! other people have already implemented.
 
 use std::fmt;
 
@@ -158,9 +175,16 @@ pub enum Kind {
     /// Client -> hub: signed, nonce-bound membership end. Disconnect is NOT
     /// depart.
     Depart,
-    /// Client -> hub: add topics to this session's subscription set.
+    /// Add topics to this session's subscription set, in BOTH directions.
+    /// Client -> hub is the request; hub -> client is the #3532
+    /// ACKNOWLEDGEMENT, echoing the topic-list bytes the router actually took.
+    /// The hub emits it only AFTER the router holds the topics, so a client
+    /// that has observed it knows any later peer wake is routed against a
+    /// table containing this session.
     Subscribe,
-    /// Client -> hub: remove topics from this session's subscription set.
+    /// Remove topics from this session's subscription set, in BOTH directions.
+    /// Client -> hub is the request; hub -> client is the #3532
+    /// acknowledgement, emitted only after the router has dropped them.
     Unsubscribe,
     /// The wake hint itself. Payload is a [`WakeMeta`], never a body.
     Wake,

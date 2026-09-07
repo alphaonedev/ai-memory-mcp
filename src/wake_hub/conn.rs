@@ -624,7 +624,52 @@ impl Conn {
         true
     }
 
-    /// Add or remove topics.
+    /// Add or remove topics, and ACKNOWLEDGE the change (#3532).
+    ///
+    /// # The ordering rule is the guarantee
+    ///
+    /// Before #3532 a `subscribe` was answered with NOTHING on success, so a
+    /// client had no way to learn when its subscription became live and a
+    /// peer's topic wake sent inside that window fanned out to nobody. Wakes
+    /// are hints and the inbox row is the durable truth, so that was latency
+    /// rather than loss — but it was UNOBSERVABLE latency, which is the part a
+    /// fleet cannot manage.
+    ///
+    /// The hub now echoes the request back: same `kind`, the same topic-list
+    /// bytes, stamped `from` the hub to the authenticated agent. The rule that
+    /// gives it force is the ORDER, not the frame: the router mutation happens
+    /// FIRST and the ack is enqueued only after it returned. Because one
+    /// connection's frames are read, handled and written in order, a client
+    /// that has OBSERVED the ack knows the router already held the
+    /// subscription when the ack was minted — so any topic wake a peer
+    /// addresses after that point is routed against a table that contains
+    /// this session. (Its dual holds for `unsubscribe`: once the ack is
+    /// observed, no further wake for those topics will be routed here.)
+    ///
+    /// # Why an echo of kinds 5/6 and not a new `subscribed` kind
+    ///
+    /// The frame vocabulary must stay append-only AND fail-open for clients
+    /// that predate the ack — and those two pull against each other for a NEW
+    /// wire number. Both non-TypeScript readers in this tree REFUSE an unknown
+    /// kind byte rather than skipping it (`Kind::from_u8` returns
+    /// [`super::frame::FrameError::UnknownKind`], and the Python SDK raises on
+    /// `Kind(raw)`), so a hub that unilaterally emitted kind 14 would END the
+    /// session of every client built before this change instead of being
+    /// ignored by it — the exact opposite of additive. Kinds 5 and 6 are
+    /// already in every reader's table and every client already ignores a
+    /// frame kind it has no opinion about, so the echo is inert for an old
+    /// client and legible to a new one. `hello` is already bidirectional with
+    /// a different payload per direction, so a direction-disambiguated kind is
+    /// the protocol's existing idiom, not a new one.
+    ///
+    /// The payload is the request's own bytes, cloned rather than re-encoded:
+    /// [`decode_topics`] has already refused trailing bytes, so the echo is
+    /// byte-identical to a fresh `encode_topics` of the same list and CANNOT
+    /// carry a claim the client did not itself send. No payload, no identity,
+    /// no new authority — the #3466 wake-only posture is unchanged.
+    ///
+    /// A refused `subscribe` is answered with its `error` and NEVER with an
+    /// ack, so "acknowledged" can only ever mean "applied".
     fn handle_subscription(&mut self, agent: &VerifiedAgent, frame: &Frame) -> bool {
         let topics = match decode_topics(&frame.payload) {
             Ok(t) => t,
@@ -651,15 +696,24 @@ impl Conn {
                         self.subscribed.push(topic);
                     }
                 }
-                true
+                self.ack_subscription(agent, frame)
             } else {
                 self.send_error(ErrorCode::Forbidden, "too many topics for one session")
             }
         } else {
             self.state.router.unsubscribe(&agent.agent_id, &topics);
             self.subscribed.retain(|held| !topics.contains(held));
-            true
+            self.ack_subscription(agent, frame)
         }
+    }
+
+    /// Echo an APPLIED subscription change back to its sender (#3532).
+    ///
+    /// Called only after the router mutation returned — see
+    /// [`Self::handle_subscription`] for why that order is the whole
+    /// guarantee.
+    fn ack_subscription(&self, agent: &VerifiedAgent, frame: &Frame) -> bool {
+        self.send(frame.kind, agent.agent_id.clone(), frame.payload.clone())
     }
 
     /// Nonce-bound `join` / `depart`.
