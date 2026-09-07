@@ -743,6 +743,44 @@ sqlite-coupled fed-tracker state); postgres operators relying on
 multi-node consistency for these subcollections should poll peers
 or pin to sqlite for v0.7.0.
 
+### Concurrent audit-chain appends (#3527)
+
+The postgres `signed_events` chain allocates each row's `sequence` by
+reading the current chain head and inserting `head + 1`. Under
+postgres' default READ COMMITTED isolation those are two statements
+with two snapshots, so two agents appending at the same moment derive
+the same `sequence` and the UNIQUE index
+`idx_signed_events_sequence` refuses one of them.
+
+That refusal is what makes a silent chain break impossible, and it is
+kept. What changed at v1.0.0 is who absorbs it: the append names
+`sequence` as its `ON CONFLICT` arbiter, so the losing appender inserts
+zero rows and simply re-derives `sequence` from a fresh head read,
+rather than aborting the caller's entire transaction. An ordinary
+write (`apply_remote_deletion`, `forget`, and every other funnel that
+appends an audit row in-tx) no longer fails because a second agent
+happened to append at the same instant.
+
+The general rule that a unique violation is PERMANENT is unchanged and
+still enforced: only `sequence` — a value the substrate derives, and
+re-derives per attempt — is absorbed. A replayed event `id` conflicts
+on the primary key, which is not the arbiter, and still fails at once.
+
+Contention is bounded and visible. After eight lost races the append
+REFUSES rather than writing an unchained row, and every re-derivation
+emits a WARN under the `store::postgres::chain_append` target carrying
+the table, the index and the SQLSTATE `23505` class an operator would
+grep for:
+
+```
+RUST_LOG=store::postgres::chain_append=warn ai-memory serve --store-url postgres://...
+```
+
+Sustained WARNs mean genuine audit-append contention on that database,
+not a defect. The identical treatment applies to the `memory_revisions`
+revision ledger, which carries the same allocation shape and the same
+kind of UNIQUE index.
+
 The audit module is file-based with no SQLite coupling, so
 `ai-memory audit verify --audit-dir <path>` works on a
 postgres-backed daemon's log unchanged. The F2 fix

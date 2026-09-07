@@ -59,6 +59,12 @@ mod parity_3064;
 // the same qual_10 budget reason as `parity_3064` above.
 mod federation_3075;
 mod pubkey_history;
+// #3527 — the single funnel that allocates a hash-chain `sequence` and
+// appends the row claiming it, for BOTH postgres chains. Own module for the
+// same qual_10 budget reason as `parity_3064` above, and because the
+// read-then-insert allocation discipline is one idea that must not be
+// re-derived per call site.
+mod chain_append;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -14795,9 +14801,11 @@ impl PostgresStore {
         };
         // v34 (#698 V-4 closeout) — compute the cross-row chain
         // (prev_hash, sequence) and INSERT all in one transaction so
-        // the read MAX(sequence) → INSERT race is closed. The UNIQUE
-        // INDEX on `sequence` makes the worst case a constraint
-        // violation rather than a silent chain break.
+        // the read MAX(sequence) → INSERT race is closed against a
+        // ROLLBACK. v1.0.0 #3527 — against a CONCURRENT appender it is
+        // closed by re-deriving the sequence (see `chain_append`); the
+        // UNIQUE INDEX on `sequence` still makes a silent chain break
+        // impossible, it is simply no longer the caller's problem.
         let insert_row = PgSignedEventInsert {
             id: &id,
             agent_id,
@@ -15123,6 +15131,15 @@ pub(crate) struct PgSignedEventInsert<'a> {
 /// we wrap in a transaction so the read+insert pair is atomic
 /// against rollback.
 ///
+/// v1.0.0 #3527 — the read-then-insert pair is not atomic against a
+/// CONCURRENT appender either (two READ COMMITTED snapshots read the same
+/// head), so the allocation runs through
+/// [`chain_append::append_with_sequence_retry`]: the losing appender
+/// re-derives `sequence` from a fresh head read instead of failing the
+/// caller's whole write. Availability restored; the chain's
+/// one-row-per-sequence invariant is still enforced by the same UNIQUE
+/// index, which is now the ARBITER of the retry rather than its trigger.
+///
 /// # Errors
 ///
 /// Returns the underlying `sqlx::Error` wrapped in `StoreError` on
@@ -15294,17 +15311,19 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: PgSignedEventInsert<'_>,
 ) -> Result<(), sqlx::Error> {
+    // Every field is `Copy`, so this reads the row without consuming it —
+    // `row` is handed to the #3527 allocation funnel below by reference.
     let PgSignedEventInsert {
         id,
         agent_id,
         event_type,
         payload_hash,
-        signature,
+        signature: _,
         attest_level,
         timestamp,
         cause_hash,
     } = row;
-    use crate::signed_events::{ZERO_HASH, canonical_chain_bytes};
+    use crate::signed_events::canonical_chain_bytes;
     use sha2::{Digest, Sha256};
 
     // v1.0.0 #2203 (CWE-354) — normalize the anchor-side timestamp to the
@@ -15319,111 +15338,18 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     // construction (mirrors the `link_internal` G3 truncate-before-sign discipline).
     let timestamp = truncate_to_microseconds(timestamp);
 
-    // Read the chain head — including its cause_hash so the next row's
-    // prev_hash commits to the head's present-only cause fold (v73).
-    let head: Option<(
-        String,
-        String,
-        String,
-        Vec<u8>,
-        Option<Vec<u8>>,
-        String,
-        chrono::DateTime<chrono::Utc>,
-        Option<i64>,
-        Option<Vec<u8>>,
-    )> = sqlx::query_as(
-        "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
-                sequence, cause_hash \
-         FROM signed_events \
-         ORDER BY COALESCE(sequence, 0) DESC, ctid DESC \
-         LIMIT 1",
-    )
-    .fetch_optional(&mut **tx)
-    .await?;
-
-    let (next_seq, prev_hash) = match head {
-        None => (1_i64, ZERO_HASH.to_vec()),
-        Some((h_id, h_agent, h_type, h_payload, h_sig, h_attest, h_ts, h_seq, h_cause)) => {
-            let seq = h_seq.unwrap_or(0);
-            let event = crate::signed_events::SignedEvent {
-                id: h_id,
-                agent_id: h_agent,
-                event_type: h_type,
-                payload_hash: h_payload,
-                signature: h_sig,
-                attest_level: h_attest,
-                timestamp: h_ts.to_rfc3339(),
-                prev_hash: Vec::new(),
-                sequence: seq,
-                cause_hash: h_cause,
-            };
-            let canon = canonical_chain_bytes(&event);
-            let mut hasher = Sha256::new();
-            hasher.update(&canon);
-            let mut digest = [0u8; 32];
-            digest.copy_from_slice(&hasher.finalize());
-            (seq + 1, digest.to_vec())
-        }
-    };
-
-    // v1.0.0 L4 (PR-3) / #1925 (CWE-347) — POSTGRES identity-binding parity.
-    // Re-sign a daemon-signed row over the identity-bearing tuple now that
-    // `sequence` is assigned, EXACTLY like the sqlite chokepoint
-    // `crate::signed_events::append_signed_event_no_tx`. The pre-image
-    // (`daemon_row_signing_input`) commits to `timestamp`, so it MUST be the
-    // ALREADY-TRUNCATED microsecond value the TIMESTAMPTZ column durably stores
-    // (`truncate_to_microseconds`, the #2203 fix applied above) — otherwise the
-    // signed bytes would commit to the in-memory NANOSECOND `Utc::now()` while a
-    // verifier recomputes the pre-image from the microsecond readback, and the
-    // identity-bound signature would false-fail on essentially every pg row.
-    // Signing over the truncated timestamp makes signed-bytes == stored-bytes by
-    // construction. Only when a daemon key is installed AND the row is
-    // daemon-signed; recorder/lineage/unsigned rows keep their distinct-role
-    // signatures untouched. A verify-only pg process with no key keeps the
-    // caller's payload-only signature (the verifier's payload-only fallback still
-    // validates it), so this is additive + fail-closed, closing the pg half of
-    // the #1925 head-identity-tamper gap the audit pin now makes load-bearing.
-    let resigned: Option<Vec<u8>> =
-        if attest_level == crate::models::AttestLevel::DaemonSigned.as_str() && signature.is_some()
-        {
-            let row_view = crate::signed_events::SignedEvent {
-                id: id.to_string(),
-                agent_id: agent_id.to_string(),
-                event_type: event_type.to_string(),
-                payload_hash: payload_hash.to_vec(),
-                signature: signature.map(<[u8]>::to_vec),
-                attest_level: attest_level.to_string(),
-                timestamp: timestamp.to_rfc3339(),
-                prev_hash: Vec::new(),
-                sequence: next_seq,
-                cause_hash: cause_hash.map(<[u8]>::to_vec),
-            };
-            let input = crate::signed_events::daemon_row_signing_input(&row_view);
-            crate::governance::audit::try_sign_audit_payload(&input)
-                .map(|(sig, _)| sig)
-                .or_else(|| signature.map(<[u8]>::to_vec))
-        } else {
-            signature.map(<[u8]>::to_vec)
-        };
-
-    sqlx::query(
-        "INSERT INTO signed_events \
-            (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
-             prev_hash, sequence, cause_hash) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-    )
-    .bind(id)
-    .bind(agent_id)
-    .bind(event_type)
-    .bind(payload_hash)
-    .bind(resigned.clone())
-    .bind(attest_level)
-    .bind(timestamp)
-    .bind(&prev_hash)
-    .bind(next_seq)
-    .bind(cause_hash.map(<[u8]>::to_vec))
-    .execute(&mut **tx)
-    .await?;
+    // v1.0.0 #3527 — the head read, the sequence derivation, the identity
+    // re-sign and the INSERT are ONE indivisible allocation attempt, and they
+    // live in `chain_append` so no funnel can drive them differently. A race
+    // lost to a concurrent appender re-derives `sequence` from a fresh READ
+    // COMMITTED head read instead of failing the caller's whole write; a
+    // replayed `id` still fails PERMANENTLY on the primary key, which the
+    // `ON CONFLICT (sequence)` arbiter deliberately does not cover.
+    //
+    // Returns the sequence the WINNING attempt claimed and the signature it
+    // actually stored, so the watermark + witness anchors below commit to the
+    // row as it landed and can never carry a losing attempt's values.
+    let (next_seq, resigned) = chain_append::append_signed_event_row(tx, &row, timestamp).await?;
 
     // Compute the just-written head row's canonical hash (exactly what the
     // NEXT row's prev_hash would be) — shared by the #1850 watermark (item 7)
@@ -15437,7 +15363,9 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
         // off-table watermark / witness head hash matches what a verifier
         // recomputes for the next row's prev_hash (`canonical_chain_bytes`
         // commits the signature column). Mirrors the sqlite append discipline.
-        signature: resigned.clone(),
+        // #3527 — this is the signature the WINNING attempt actually stored
+        // (the retry funnel returns it), never a value from a lost attempt.
+        signature: resigned,
         attest_level: attest_level.to_string(),
         timestamp: timestamp.to_rfc3339(),
         prev_hash: Vec::new(),
@@ -15591,15 +15519,9 @@ async fn pg_read_revision_head_in_tx(
         String,
         Option<Vec<u8>>,
         i64,
-    )> = sqlx::query_as(
-        "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
-                signature, sequence \
-         FROM memory_revisions \
-         ORDER BY sequence DESC \
-         LIMIT 1",
-    )
-    .fetch_optional(&mut **tx)
-    .await?;
+    )> = sqlx::query_as(chain_append::SQL_MEMORY_REVISIONS_HEAD)
+        .fetch_optional(&mut **tx)
+        .await?;
     match head {
         None => Ok((0, crate::signed_events::hex_lower(&ZERO_HASH))),
         Some((
@@ -16297,98 +16219,15 @@ async fn pg_append_revision_leaf_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: PgRevisionLeafInsert<'_>,
 ) -> Result<(), sqlx::Error> {
-    use crate::revisions::{RevisionLeaf, canonical_revision_chain_bytes};
-    use crate::signed_events::ZERO_HASH;
-    use sha2::{Digest, Sha256};
-
-    let PgRevisionLeafInsert {
-        id,
-        memory_id,
-        kind,
-        prior_version,
-        namespace,
-        agent_id,
-        created_at,
-        signature,
-    } = row;
-
-    // Read the chain head.
-    let head: Option<(
-        String,
-        String,
-        String,
-        Option<i64>,
-        String,
-        Option<String>,
-        String,
-        Option<Vec<u8>>,
-        i64,
-    )> = sqlx::query_as(
-        "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
-                signature, sequence \
-         FROM memory_revisions \
-         ORDER BY sequence DESC \
-         LIMIT 1",
-    )
-    .fetch_optional(&mut **tx)
-    .await?;
-
-    let (next_seq, prev_hash) = match head {
-        None => (1_i64, ZERO_HASH.to_vec()),
-        Some((
-            h_id,
-            h_memory_id,
-            h_kind,
-            h_prior,
-            h_namespace,
-            h_agent,
-            h_created_at,
-            h_sig,
-            h_seq,
-        )) => {
-            // An unknown kind in the head row is a corrupted ledger; map it
-            // to a decode error rather than silently rehashing a bad row.
-            let h_kind = crate::revisions::RecordKind::from_str_opt(&h_kind)
-                .ok_or(sqlx::Error::Decode("memory_revisions: unknown kind".into()))?;
-            let leaf = RevisionLeaf {
-                id: h_id,
-                memory_id: h_memory_id,
-                kind: h_kind,
-                prior_version: h_prior,
-                namespace: h_namespace,
-                agent_id: h_agent,
-                created_at: h_created_at,
-                signature: h_sig,
-            };
-            let canon = canonical_revision_chain_bytes(&leaf, h_seq);
-            let mut hasher = Sha256::new();
-            hasher.update(&canon);
-            let mut digest = [0u8; 32];
-            digest.copy_from_slice(&hasher.finalize());
-            (h_seq + 1, digest.to_vec())
-        }
-    };
-
-    sqlx::query(
-        "INSERT INTO memory_revisions \
-            (id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
-             signature, prev_hash, sequence) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-    )
-    .bind(id)
-    .bind(memory_id)
-    .bind(kind.as_str())
-    .bind(prior_version)
-    .bind(namespace)
-    .bind(agent_id)
-    .bind(created_at)
-    .bind(signature.map(<[u8]>::to_vec))
-    .bind(&prev_hash)
-    .bind(next_seq)
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
+    // v1.0.0 #3527 — the `memory_revisions` chain allocates its `sequence`
+    // with the SAME read-then-insert shape as the `signed_events` chain and is
+    // protected by the SAME kind of UNIQUE index
+    // (`memory_revisions_sequence_idx`), so it carried the identical
+    // lost-update race. It therefore runs through the identical funnel: one
+    // attempt = one fresh head read + one arbiter-scoped INSERT, and a lost
+    // race re-derives rather than replays. A duplicate leaf `id` stays
+    // permanent (primary key, not the arbiter).
+    chain_append::append_revision_leaf_row(tx, row).await
 }
 
 /// #3290 — postgres twin of the sqlite [`crate::storage::sever_namespace_standards`]:
