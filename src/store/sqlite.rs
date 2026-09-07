@@ -1467,6 +1467,19 @@ impl MemoryStore for SqliteStore {
         db::revoke_agent_api_key(&conn, agent_id).map_err(box_err)
     }
 
+    /// #3529 — the sqlite guard delegates to the `crate::storage` SSOT, which
+    /// does the count and the DELETE inside one `BEGIN IMMEDIATE`. The guard
+    /// is dropped before this returns, so no blocking guard crosses an
+    /// unrelated `.await` (CONCURRENCY-20).
+    async fn revoke_agent_api_key_unless_last(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+    ) -> StoreResult<crate::storage::RevokeUnlessLastOutcome> {
+        let conn = self.state.lock().await;
+        db::revoke_agent_api_key_unless_last(&conn, agent_id).map_err(box_err)
+    }
+
     async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
         let conn = self.state.lock().await;
         db::list_agent_api_keys(&conn).map_err(box_err)

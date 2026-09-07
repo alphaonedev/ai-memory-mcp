@@ -817,3 +817,272 @@ async fn a_malformed_body_is_refused_without_echoing_it_3474() {
     );
     assert_eq!(fx.registry.len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// #3529 — the last-key rule is enforced ATOMICALLY, not by a pre-check.
+// ---------------------------------------------------------------------------
+
+/// Reads the whole forensic chain the process has written so far.
+///
+/// `shutdown` first, so the assertion reads flushed bytes rather than whatever
+/// happened to be on disk when the writer was still buffering.
+fn forensic_text(dir: &TempDir) -> String {
+    ai_memory::governance::audit::shutdown();
+    let mut text = String::new();
+    for entry in std::fs::read_dir(dir.path()).expect("read audit dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            text.push_str(&std::fs::read_to_string(&path).expect("read forensic file"));
+        }
+    }
+    text
+}
+
+/// The #3474 A1 defect, driven CONCURRENTLY through the real router.
+///
+/// Before #3529 each request read the enrolled set, saw the OTHER holder's key
+/// still there, concluded "I am not the last key", and then revoked in a
+/// separate step — so both applied and the registry ended EMPTY, which makes
+/// `enforce_for_request` inert in every mode (#1985) with no second approver
+/// ever having authorised it.
+///
+/// The assertion is deterministic under EVERY interleaving, which is what
+/// makes it a real proof rather than a timing bet: the count and the delete
+/// now happen in one transaction, so whichever request reaches the store
+/// second either finds itself holding the only remaining key (and is parked
+/// for approval by the pre-check) or is refused by the store's re-check (and
+/// is parked by the handler). One `200`, one `202`, exactly one key left —
+/// under every schedule.
+#[tokio::test]
+async fn two_concurrent_self_revokes_by_the_last_two_holders_leave_one_key_3529() {
+    const ADMIN_A: &str = "ai:key-admin-race-a";
+    const ADMIN_B: &str = "ai:key-admin-race-b";
+    let _g = serial().await;
+    let fx = fixture("lastkeyrace", &[ADMIN_A, ADMIN_B]);
+
+    // The last TWO key-holders: each holds exactly one key, and it is its own.
+    let (status, a_body, _) = mint(&fx.router, ADMIN_A, ADMIN_A).await;
+    assert_eq!(status, StatusCode::OK, "{a_body}");
+    let a_token = a_body["token"].as_str().expect("token").to_string();
+    let (status, b_body, _) = mint(&fx.router, ADMIN_B, ADMIN_B).await;
+    assert_eq!(status, StatusCode::OK, "{b_body}");
+    let b_token = b_body["token"].as_str().expect("token").to_string();
+    assert_eq!(fx.registry.len(), 2);
+
+    // Both self-revokes are in flight at once. Each one's pre-check can
+    // legitimately observe the other's key.
+    let (left, right) = tokio::join!(
+        call(&fx.router, revoke_req(ADMIN_A, ADMIN_A, &json!({}))),
+        call(&fx.router, revoke_req(ADMIN_B, ADMIN_B, &json!({}))),
+    );
+    let (a_status, _, a_out) = left;
+    let (b_status, _, b_out) = right;
+
+    let mut statuses = [a_status, b_status];
+    statuses.sort_by_key(StatusCode::as_u16);
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::ACCEPTED],
+        "exactly one self-revoke may apply and the other must be parked for a \
+         second principal: a={a_status} {a_out}, b={b_status} {b_out}"
+    );
+
+    // The load-bearing assertion: the registry is NOT empty.
+    assert_eq!(
+        fx.registry.len(),
+        1,
+        "two concurrent self-revokes by the last two holders must never empty \
+         the enrolled registry (#1985): a={a_out}, b={b_out}"
+    );
+    let a_live = token_authenticates(&fx.router, &a_token).await;
+    let b_live = token_authenticates(&fx.router, &b_token).await;
+    assert!(
+        a_live ^ b_live,
+        "exactly one of the two tokens must still authenticate \
+         (a_live={a_live}, b_live={b_live})"
+    );
+
+    // The parked one carries the honest reason AND the disclosure that
+    // approving it empties the registry.
+    let parked = if a_status == StatusCode::ACCEPTED {
+        &a_out
+    } else {
+        &b_out
+    };
+    assert_eq!(parked["reason"], "last_enrolled_key", "{parked}");
+    assert_eq!(parked["empties_registry"], true, "{parked}");
+}
+
+/// A queued approval whose target BECAME the last enrolled key is refused at
+/// APPLY time, audited, and changes nothing.
+///
+/// The approver said yes to "revoke that principal's key" while another
+/// key-holder still existed. By the time the approval is presented the other
+/// holder is gone, so applying it would empty the registry — a materially
+/// different act that nobody authorised. It is refused, the registry is
+/// untouched, and the refusal is on the signed chain.
+#[tokio::test]
+async fn an_approved_revoke_that_became_the_last_key_is_refused_at_apply_3529() {
+    const ADMIN: &str = "ai:key-admin-applylast";
+    const APPROVER: &str = "ai:key-approver-applylast";
+    let _g = serial().await;
+    let fx = fixture("applylast", &[ADMIN, APPROVER]);
+    let audit_dir = scratch("audit-applylast");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+
+    // Two holders: ALICE and the admin itself.
+    let (_, alice_body, _) = mint(&fx.router, ADMIN, ALICE).await;
+    let alice_token = alice_body["token"].as_str().expect("token").to_string();
+    let (_, admin_body, _) = mint(&fx.router, ADMIN, ADMIN).await;
+    let admin_token = admin_body["token"].as_str().expect("token").to_string();
+    assert_eq!(fx.registry.len(), 2);
+
+    // Park a revoke of ANOTHER principal's key. Two holders exist, so this
+    // does NOT empty the registry and the queued row says so.
+    let (status, _, queued) = call(&fx.router, revoke_req(ADMIN, ALICE, &json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["reason"], "another_principal");
+    assert_eq!(
+        queued["empties_registry"], false,
+        "another holder is still enrolled: {queued}"
+    );
+    let pending_id = queued["pending_id"]
+        .as_str()
+        .expect("pending id")
+        .to_string();
+
+    // The state the approval rested on now changes: the admin revokes its own
+    // key (immediate — ALICE still holds one), leaving ALICE as the LAST key.
+    let (status, _, body) = call(&fx.router, revoke_req(ADMIN, ADMIN, &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!token_authenticates(&fx.router, &admin_token).await);
+    assert_eq!(fx.registry.len(), 1);
+
+    // A DIFFERENT registered approver presents the approval. Refused.
+    let (status, _, refused) = call(
+        &fx.router,
+        revoke_req(
+            APPROVER,
+            ALICE,
+            &json!({ "approve_pending_id": pending_id }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an approval granted while another holder existed must not be the \
+         thing that empties the registry: {refused}"
+    );
+    assert_eq!(refused["error"], "revoke_would_empty_registry", "{refused}");
+
+    // Nothing was revoked.
+    assert_eq!(
+        fx.registry.len(),
+        1,
+        "the refused apply must change nothing"
+    );
+    assert!(
+        token_authenticates(&fx.router, &alice_token).await,
+        "the last enrolled key must still authenticate after a refused apply"
+    );
+
+    // …and the refusal is on the signed chain (non-vacuous: the queue row for
+    // the same action is there too, so the file is genuinely being written).
+    let audit_text = forensic_text(&audit_dir);
+    assert!(
+        audit_text.contains("queued_pending_approval"),
+        "the queue decision must be audited, else this assertion is vacuous"
+    );
+    assert!(
+        audit_text.contains("apply_refused_last_enrolled_key"),
+        "the refused apply must be audited: {audit_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #3530 — validate the path segment BEFORE the transport refusal is audited.
+// ---------------------------------------------------------------------------
+
+/// A malformed `{id}` over a NON-confidential transport is a `400` that writes
+/// NO audit row, while a well-formed one over the same transport still writes
+/// the transport refusal — so the ordering, not a broken audit sink, is what
+/// keeps the unvalidated segment off the signed chain.
+#[tokio::test]
+async fn a_malformed_agent_id_is_refused_before_any_audit_row_is_written_3530() {
+    const ADMIN: &str = "ai:key-admin-a2order";
+    let _g = serial().await;
+    let fx = fixture("a2order", &[ADMIN]);
+    let audit_dir = scratch("audit-a2order");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+
+    // Unbounded caller-controlled content: 600 bytes, far past the 128-byte
+    // agent-id ceiling. This is exactly the value that used to be JSON-encoded
+    // onto an append-only, signed chain before anything had validated it.
+    let malformed = "z".repeat(600);
+    mark_credential_transport_confidential(false);
+    let (status, _, body) = call(&fx.router, mint_req(ADMIN, &malformed, &json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a malformed agent_id must be refused on shape alone: {body}"
+    );
+    assert!(
+        !body.to_string().contains(&malformed),
+        "the refusal must not echo the raw segment back: {body}"
+    );
+
+    // Same transport posture, a WELL-FORMED id: the transport refusal and its
+    // audit row are unchanged.
+    let (status, _, body) = call(&fx.router, mint_req(ADMIN, ALICE, &json!({}))).await;
+    mark_credential_transport_confidential(true);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], TRANSPORT_REFUSAL);
+
+    let audit_text = forensic_text(&audit_dir);
+    // Non-vacuous: the well-formed refusal DID land, with its target.
+    assert!(
+        audit_text.contains("transport_not_confidential"),
+        "the transport refusal must still be audited, else this assertion is \
+         vacuous: {audit_text}"
+    );
+    assert!(
+        audit_text.contains(ALICE),
+        "the audited refusal must name the (validated) target agent"
+    );
+    // …and the never-validated segment reached no row at all.
+    assert!(
+        !audit_text.contains(&malformed),
+        "an unvalidated {{id}} must never reach the signed audit chain"
+    );
+}
+
+/// The transport refusal itself is UNCHANGED by the reordering: a well-formed
+/// id over a non-confidential transport is still `403`
+/// `credential_transport_not_confidential`, still binds nothing, and the same
+/// call still succeeds once the posture is confidential.
+#[tokio::test]
+async fn a_well_formed_id_over_a_non_confidential_transport_still_refuses_3530() {
+    const ADMIN: &str = "ai:key-admin-a2unchanged";
+    let _g = serial().await;
+    let fx = fixture("a2unchanged", &[ADMIN]);
+
+    mark_credential_transport_confidential(false);
+    let (status, _, body) = call(&fx.router, mint_req(ADMIN, ALICE, &json!({}))).await;
+    mark_credential_transport_confidential(true);
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], TRANSPORT_REFUSAL);
+    assert_eq!(
+        fx.registry.len(),
+        0,
+        "a transport-refused mint must not enrol anything"
+    );
+
+    let (status, body, _) = mint(&fx.router, ADMIN, ALICE).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refusal above must be the control, not a broken route: {body}"
+    );
+}
