@@ -34,9 +34,11 @@ import {
   WakeStateMachine,
   backoffForMs,
   decodeFrame,
+  decodeTopics,
   decodeWakeMeta,
   decodeWelcome,
   encodeFrame,
+  encodeTopics,
   helloTranscript,
   isHubDriven,
   lengthPrefixed,
@@ -360,16 +362,27 @@ function wakeFrame(row: string, seq: number): Buffer {
   });
 }
 
-function drive(frames: Buffer[]): { signals: WakeSignal[]; sent: number[] } {
-  const machine = new WakeStateMachine(loadedBundle());
+function drive(
+  frames: Buffer[],
+  topics: readonly string[] = [],
+): { signals: WakeSignal[]; sent: number[]; machine: WakeStateMachine; bodies: Buffer[] } {
+  const machine = new WakeStateMachine(loadedBundle(), topics);
   const signals: WakeSignal[] = [];
   const sent: number[] = [];
+  const bodies: Buffer[] = [];
   for (const body of frames) {
     const step = machine.onFrame(decodeFrame(body));
     signals.push(...step.signals);
-    for (const out of step.send) sent.push(decodeFrame(out.subarray(4)).kind);
+    for (const out of step.send) {
+      bodies.push(out.subarray(4));
+      sent.push(decodeFrame(out.subarray(4)).kind);
+    }
   }
-  return { signals, sent };
+  return { signals, sent, machine, bodies };
+}
+
+function ackFrame(kind: number, topics: readonly string[]): Buffer {
+  return encodeFrame({ kind, from: "hub", to: AGENT_ID, payload: encodeTopics(topics) });
 }
 
 describe("state machine", () => {
@@ -428,6 +441,76 @@ describe("state machine", () => {
     expect(signals.map((s) => s.reason)).toEqual(["welcome", "wake"]);
   });
 
+  // -------------------------------------------------------------------------
+  // #3532 — the subscribe acknowledgement
+  // -------------------------------------------------------------------------
+
+  it("round-trips a topic list and refuses a smuggled body (#3532)", () => {
+    expect(decodeTopics(encodeTopics(["#hive", "#swarm"]))).toEqual(["#hive", "#swarm"]);
+    expect(decodeTopics(encodeTopics([]))).toEqual([]);
+    expect(() => decodeTopics(Buffer.concat([encodeTopics(["#hive"]), Buffer.from("body")])))
+      .toThrow(/trailing/);
+    expect(() => encodeTopics(["no-hash"])).toThrow(/not a valid topic/);
+    expect(() => encodeTopics(Array.from({ length: 9 }, (_, i) => `#t${i}`))).toThrow(/at most/);
+  });
+
+  it("reports a subscription live only when the hub acknowledges it (#3532)", () => {
+    // The WRITE is not the guarantee: a peer's topic wake sent between the
+    // write and the hub's router mutation fans out to nobody, so liveness has
+    // to wait for the ack.
+    const { signals, sent, machine, bodies } = drive(
+      [challengeFrame(), welcomeFrame(), ackFrame(Kind.Subscribe, ["#hive"])],
+      ["#hive"],
+    );
+    expect(sent).toEqual([Kind.Hello, Kind.Subscribe]);
+    expect(decodeTopics(decodeFrame(bodies[1]!).payload)).toEqual(["#hive"]);
+    expect(signals.map((s) => s.reason)).toEqual(["welcome", "subscribed"]);
+    expect(signals[1]!.topics).toEqual(["#hive"]);
+    expect(machine.subscribedTopics).toEqual(["#hive"]);
+    // A liveness fact, not mail.
+    expect(isHubDriven("subscribed")).toBe(false);
+  });
+
+  it("sends no subscribe when no topic was asked for (#3532)", () => {
+    const { sent } = drive([challengeFrame(), welcomeFrame()]);
+    expect(sent).toEqual([Kind.Hello]);
+  });
+
+  it("ignores an unparseable acknowledgement rather than dropping the session (#3532)", () => {
+    // DEGRADE, never corrupt: the subscription stays UNACKNOWLEDGED, so a
+    // caller waiting on liveness keeps waiting instead of being told a lie.
+    const bad = encodeFrame({
+      kind: Kind.Subscribe,
+      from: "hub",
+      to: AGENT_ID,
+      payload: Buffer.from([1, 0x40]),
+    });
+    const { signals, machine } = drive(
+      [challengeFrame(), welcomeFrame(), bad, wakeFrame("row-z", 1)],
+      ["#hive"],
+    );
+    expect(signals.map((s) => s.reason)).toEqual(["welcome", "wake"]);
+    expect(machine.subscribedTopics).toEqual([]);
+  });
+
+  it("clears the live topics on an unsubscribe acknowledgement (#3532)", () => {
+    const { signals, machine } = drive(
+      [
+        challengeFrame(),
+        welcomeFrame(),
+        ackFrame(Kind.Subscribe, ["#hive"]),
+        ackFrame(Kind.Unsubscribe, ["#hive"]),
+      ],
+      ["#hive"],
+    );
+    expect(signals.map((s) => s.reason)).toEqual(["welcome", "subscribed", "subscribed"]);
+    expect(machine.subscribedTopics).toEqual([]);
+  });
+
+  it("refuses a bad topic at construction, not mid-session (#3532)", () => {
+    expect(() => new WakeStateMachine(loadedBundle(), ["hive"])).toThrow(/not a valid topic/);
+  });
+
   it("turns a refused handshake into a legible failure", () => {
     const payload = Buffer.concat([Buffer.alloc(2), Buffer.from("unauthorized")]);
     payload.writeUInt16BE(401, 0);
@@ -481,6 +564,7 @@ describe("bounds", () => {
     expect(isHubDriven("gap")).toBe(true);
     expect(isHubDriven("lagged")).toBe(true);
     expect(isHubDriven("backstop")).toBe(false);
+    expect(isHubDriven("subscribed")).toBe(false);
   });
 });
 

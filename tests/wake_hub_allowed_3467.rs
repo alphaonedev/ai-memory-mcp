@@ -18,9 +18,7 @@ mod wake_hub_harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ai_memory::wake_hub::frame::{
-    ErrorCode, Frame, Kind, WakeMeta, WelcomePayload, decode_error, encode_topics,
-};
+use ai_memory::wake_hub::frame::{ErrorCode, Frame, Kind, WakeMeta, WelcomePayload, decode_error};
 use ai_memory::wake_hub::identity::SameUidAuthorizer;
 use ai_memory::wake_hub::{HubConfig, limits};
 use bytes::Bytes;
@@ -249,15 +247,12 @@ async fn allowed_unsubscribe_stops_the_fanout_without_dropping_the_session() {
     sender.wake("#hive", "row-1").await;
     assert_eq!(recipient.expect_frame().await.kind, Kind::Wake);
 
-    let payload = encode_topics(&["#hive".to_string()]).expect("topics");
-    recipient
-        .send(Frame::new(Kind::Unsubscribe, "agent-b", "", payload))
-        .await;
-    // Round-trip a ping so the unsubscribe is known to have been processed.
-    recipient
-        .send(Frame::new(Kind::Ping, "agent-b", "", Bytes::new()))
-        .await;
-    assert_eq!(recipient.expect_frame().await.kind, Kind::Pong);
+    // #3532 — an APPLIED unsubscribe is acknowledged, and the hub drops the
+    // route BEFORE minting the ack. That retires the ping round-trip this test
+    // used to need: when the ack has been read, the removal has already taken
+    // effect, so the wake below is sent against a table that no longer routes
+    // `#hive` here.
+    recipient.unsubscribe_acked(&["#hive".to_string()]).await;
 
     sender.wake("#hive", "row-2").await;
     assert!(

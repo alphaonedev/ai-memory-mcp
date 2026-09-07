@@ -120,6 +120,8 @@ __all__ = [
     "WakeSignal",
     "Welcome",
     "backoff_for",
+    "decode_topics",
+    "encode_topics",
     "hello_transcript",
     "topics_hash",
 ]
@@ -142,6 +144,8 @@ _PUBKEY_BYTES = 32
 _SIGNATURE_BYTES = 64
 _WAKE_DIGEST_BYTES = 32
 _MAX_WAKE_META_BYTES = 256
+_MAX_TOPICS_PER_FRAME = 8
+_MAX_TOPIC_BYTES = 64
 _WELCOME_BYTES = 4 + 8 + 4 + 1 + 4 + 4
 _HELLO_TRANSCRIPT_DOMAIN = b"a2a/v1/hello"
 _A2A_HUB_SCOPE = "a2a-hub"
@@ -161,7 +165,18 @@ class WakeError(Exception):
 
 
 class Kind(IntEnum):
-    """Frame kinds the v1 protocol admits. There is no body kind."""
+    """Frame kinds the v1 protocol admits. There is no body kind.
+
+    Three kinds travel in BOTH directions: ``HELLO`` (the hub's challenge, then
+    the client's signed answer), ``PING``/``PONG``, and — since #3532 —
+    ``SUBSCRIBE`` / ``UNSUBSCRIBE``, whose hub-to-client form is the
+    acknowledgement that the router has APPLIED the change.
+
+    The ack reuses kinds 5/6 rather than taking a new wire number precisely
+    because :meth:`Frame.decode` raises on an unknown kind: a hub that emitted
+    a brand-new ``subscribed`` kind would have ended the session of every
+    client written before it, instead of being ignored by one.
+    """
 
     HELLO = 1
     WELCOME = 2
@@ -325,6 +340,55 @@ def topics_hash(topics: tuple[str, ...] = ()) -> bytes:
         h.update(bytes([min(len(raw), 255)]))
         h.update(raw)
     return h.digest()
+
+
+def encode_topics(topics: tuple[str, ...]) -> bytes:
+    """Encode a topic list as ``count(u8)`` then ``len(u8) || bytes`` per topic.
+
+    Mirrors ``wake_hub::frame::encode_topics``. Every bound is checked here so
+    a client cannot construct a frame the hub would refuse.
+    """
+    if len(topics) > _MAX_TOPICS_PER_FRAME:
+        raise WakeError(
+            f"at most {_MAX_TOPICS_PER_FRAME} topics per frame, got {len(topics)}"
+        )
+    out = bytearray([len(topics)])
+    for t in topics:
+        raw = t.encode("utf-8")
+        if not t.startswith("#") or len(raw) < 2 or len(raw) > _MAX_TOPIC_BYTES:
+            raise WakeError(f"{t!r} is not a valid topic")
+        if not t.isprintable():
+            raise WakeError("a topic may not carry a control character")
+        out.append(len(raw))
+        out += raw
+    return bytes(out)
+
+
+def decode_topics(buf: bytes) -> tuple[str, ...]:
+    """Decode a topic list written by :func:`encode_topics`.
+
+    Trailing bytes are REFUSED, so a body can never ride along behind an
+    otherwise valid topic list.
+    """
+    if not buf:
+        raise WakeError("topic list ended mid-field")
+    count = buf[0]
+    if count > _MAX_TOPICS_PER_FRAME:
+        raise WakeError(f"topic list declares {count} topics")
+    off = 1
+    out: list[str] = []
+    for _ in range(count):
+        if off >= len(buf):
+            raise WakeError("topic list ended mid-field")
+        length = buf[off]
+        off += 1
+        if len(buf) - off < length:
+            raise WakeError("topic list ended mid-field")
+        out.append(buf[off : off + length].decode("utf-8"))
+        off += length
+    if off != len(buf):
+        raise WakeError("topic list carried trailing bytes")
+    return tuple(out)
 
 
 def hello_transcript(
@@ -593,10 +657,16 @@ class WakeReason(str, Enum):
     WAKE = "wake"
     GAP = "gap"
     BACKSTOP = "backstop"
+    #: #3532 — the hub ACKNOWLEDGED a subscription change: it applied the
+    #: change to its router BEFORE minting this, so any topic wake a peer
+    #: addresses from now on is routed against a table containing this
+    #: session. It is a liveness fact, not a reason to read the inbox, so it
+    #: is deliberately NOT hub-driven for backstop accounting.
+    SUBSCRIBED = "subscribed"
 
     @property
     def is_hub_driven(self) -> bool:
-        return self is not WakeReason.BACKSTOP
+        return self not in (WakeReason.BACKSTOP, WakeReason.SUBSCRIBED)
 
 
 @dataclass(frozen=True)
@@ -607,6 +677,8 @@ class WakeSignal:
     meta: WakeMeta | None = None
     pending_count: int = 0
     missed: int = 0
+    #: Topics the hub acknowledged, on a :attr:`WakeReason.SUBSCRIBED` signal.
+    topics: tuple[str, ...] = ()
 
 
 @dataclass
@@ -711,6 +783,12 @@ class WakeListener:
 
     ``on_signal`` is called EXACTLY ONCE per event and is where you perform
     your catch-up inbox read. It is never called concurrently with itself.
+
+    One signal is NOT a read trigger: :attr:`WakeReason.SUBSCRIBED` (#3532)
+    reports that the hub has applied a subscription change, so a caller waiting
+    for a namespace subscription to go live waits for that signal rather than
+    for a timer. ``reason.is_hub_driven`` is ``False`` for it, which is the
+    flag to branch on if your callback reads unconditionally.
     """
 
     def __init__(
@@ -719,6 +797,7 @@ class WakeListener:
         bundle: DelegationBundle,
         on_signal: Callable[[WakeSignal], None],
         *,
+        topics: tuple[str, ...] = (),
         poll_interval: float = BACKSTOP_POLL_MAX,
         reconnect_base: float = _DEFAULT_RECONNECT_BASE,
         reconnect_jitter: float = _DEFAULT_RECONNECT_JITTER,
@@ -730,9 +809,20 @@ class WakeListener:
                 "The ceiling is REFUSED rather than clamped so nothing silently runs "
                 "slower than the wake plane's contract."
             )
+        # Validated at construction, so a bad topic is a configuration error
+        # rather than a refusal from the hub mid-session.
+        encode_topics(topics)
         self.socket_path = Path(socket_path)
         self.bundle = bundle
         self.on_signal = on_signal
+        #: Namespace topics (#3505) this listener asks for after the welcome.
+        #: EMPTY by default: a substrate wake is addressed directly to the
+        #: recipient, so own-inbox delivery needs no subscription at all.
+        self.topics = topics
+        #: #3532 — topics the hub has ACKNOWLEDGED for the live session.
+        #: Empty until the ack arrives, and reset on every reconnect: a
+        #: subscription belongs to a session, never to the listener.
+        self.subscribed: tuple[str, ...] = ()
         self.poll_interval = poll_interval
         self.reconnect_base = reconnect_base
         self.reconnect_jitter = reconnect_jitter
@@ -816,6 +906,23 @@ class WakeListener:
             )
         )
 
+        # #3532 — ask for the namespace topics only AFTER admission, and do
+        # not report the subscription live until the hub acknowledges it. The
+        # write is not the guarantee: a peer's topic wake sent between the
+        # write and the router mutation would fan out to nobody, which is
+        # exactly the race the ack exists to close.
+        self.subscribed = ()
+        if self.topics:
+            write_frame(
+                transport,
+                Frame(
+                    Kind.SUBSCRIBE,
+                    self.bundle.agent_id,
+                    "",
+                    encode_topics(self.topics),
+                ),
+            )
+
         tracker = seq if seq is not None else SeqTracker()
         transport.settimeout(self.poll_interval)
         while True:
@@ -840,6 +947,22 @@ class WakeListener:
                 )
             elif frame.kind is Kind.PING:
                 write_frame(transport, Frame(Kind.PONG, self.bundle.agent_id, frame.from_id, b""))
+            elif frame.kind in (Kind.SUBSCRIBE, Kind.UNSUBSCRIBE):
+                # #3532 — the hub applied a subscription change and is saying
+                # so. An ack that will not decode is IGNORED, never fatal: the
+                # subscription simply stays unacknowledged, so a caller waiting
+                # on liveness keeps waiting rather than being told a lie, and
+                # the durable inbox row is untouched either way.
+                try:
+                    acked = decode_topics(frame.payload)
+                except WakeError:
+                    continue
+                self.subscribed = (
+                    acked
+                    if frame.kind is Kind.SUBSCRIBE
+                    else tuple(t for t in self.subscribed if t not in acked)
+                )
+                self._emit(WakeSignal(WakeReason.SUBSCRIBED, topics=acked))
             elif frame.kind is Kind.ERROR:
                 raise WakeError(f"the hub refused this session: {_error_text(frame.payload)}")
             # Anything else is ignored rather than fatal: a future hub may send

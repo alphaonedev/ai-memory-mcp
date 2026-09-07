@@ -45,7 +45,7 @@ use ai_memory::wake_hub::delegation_verifier::{
     ALLOWLIST_FILE_VERSION, AllowlistCache, AllowlistEntry, AllowlistFile, ReloadingAllowlist,
     RootKeyResolver as _, ScopedDelegationVerifier,
 };
-use ai_memory::wake_hub::frame::{ErrorCode, Frame, Kind};
+use ai_memory::wake_hub::frame::{ErrorCode, Kind};
 use ai_memory::wake_hub::identity::SameUidAuthorizer;
 use ai_memory::wake_hub::limits::MAX_READABLE_PREFIXES;
 use bytes::Bytes;
@@ -471,27 +471,23 @@ async fn postgres_derivation_carries_the_same_proven_set_3505() {
 /// Subscribe and PROVE the hub has processed it before any peer addresses the
 /// topic.
 ///
-/// A `subscribe` the hub accepts answers with nothing, so the only way to know
-/// the router now holds the topic is a round-trip on the SAME connection: the
-/// hub handles one connection's frames in order, so the `pong` arriving means
-/// the `subscribe` before it was handled. Without this, a peer's topic wake
-/// sent right after can be routed first — fan-out to nobody, no error frame,
-/// so the subscriber waits forever. Linux's readiness ordering made that the
-/// DETERMINISTIC outcome (8/8 on the 157d4fda merge gate) while macOS hid it;
-/// `wake_hub_allowed_3467` sequences its unsubscribe the same way.
+/// Without this ordering a peer's topic wake sent right after a `subscribe`
+/// can be routed first — fan-out to nobody, no error frame, so the subscriber
+/// waits forever. Linux's readiness ordering made that the DETERMINISTIC
+/// outcome (8/8 on the 157d4fda merge gate) while macOS hid it.
+///
+/// The proof USED to be a ping round-trip on the same connection: the hub
+/// handles one connection's frames in order, so a `pong` arriving meant the
+/// `subscribe` before it was handled. Since v1.0.0 #3532 the hub ACKNOWLEDGES
+/// an applied subscribe in its own right — and it registers the topic BEFORE
+/// minting the ack — so the round-trip IS the ack and the ping is gone. Same
+/// guarantee, one frame instead of three, and it now proves the subscription
+/// directly rather than by proxy. `wake_hub_allowed_3467` sequences its
+/// unsubscribe the same way, on the `unsubscribe` ack.
 async fn subscribe_synced(client: &mut wake_hub_harness::Client, topic: &str) {
     client
-        .subscribe(std::slice::from_ref(&topic.to_string()))
+        .subscribe_acked(std::slice::from_ref(&topic.to_string()))
         .await;
-    let from = client.agent_id.clone();
-    client
-        .send(Frame::new(Kind::Ping, from, "", Bytes::new()))
-        .await;
-    assert_eq!(
-        client.expect_frame().await.kind,
-        Kind::Pong,
-        "the subscribe round-trip must answer with a pong"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -517,10 +513,11 @@ async fn allowed_a_proven_namespace_topic_delivers_a_wake_3505() {
     let mut bob = join(&hub, BOB, 23, 24).await;
 
     let topic = format!("#{SHARED}");
-    // The pong proves the subscription is live before BOB addresses it; the
-    // delivery below is then the ALLOWED half of the #3505 SEND gate: BOB's
-    // row proves the namespace, so his topic-addressed wake is admitted and
-    // fans out.
+    // v1.0.0 #3532 — the ack proves the subscription is live before BOB
+    // addresses it (it replaced the ping round-trip inside `subscribe_synced`,
+    // and unlike the pong it proves the subscription directly). The delivery
+    // below is then the ALLOWED half of the #3505 SEND gate: BOB's row proves
+    // the namespace, so his topic-addressed wake is admitted and fans out.
     subscribe_synced(&mut alice, &topic).await;
     bob.wake(&topic, "row-3505-a").await;
 
@@ -601,7 +598,9 @@ async fn denied_a_topic_send_outside_the_senders_scope_is_refused_3505() {
     let mut bob = join(&hub, BOB, 93, 94).await;
 
     let topic = format!("#{SHARED}");
-    alice.subscribe(std::slice::from_ref(&topic)).await;
+    // #3532 — order the connections on the ack, not on CAROL's refusal
+    // happening to round-trip first.
+    subscribe_synced(&mut alice, &topic).await;
 
     // CAROL addresses a namespace she cannot read.
     carol.wake(&topic, "row-3505-forged").await;
@@ -705,7 +704,10 @@ async fn denied_a_topic_send_from_an_empty_scope_peer_is_refused_3505() {
     let mut bob = join(&hub, BOB, 103, 104).await;
 
     let topic = format!("#{SHARED}");
-    alice.subscribe(std::slice::from_ref(&topic)).await;
+    // #3532 — the ack is consumed HERE, so the "reached no subscriber" bound
+    // below observes an empty stream rather than this session's own
+    // acknowledgement.
+    subscribe_synced(&mut alice, &topic).await;
 
     bob.wake(&topic, "row-3505-empty-scope").await;
     bob.expect_error(ErrorCode::Forbidden.as_u16()).await;

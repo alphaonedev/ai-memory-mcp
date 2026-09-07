@@ -46,7 +46,7 @@ use super::bundle::HubJoinBundle;
 use crate::wake_hub::codec::codec;
 use crate::wake_hub::frame::{
     CTX_DECODING_HUB_FRAME, CTX_HUB_CLOSED, CTX_UNPARSEABLE_REFUSAL, Frame, HelloPayload, Kind,
-    WakeMeta, WelcomePayload, decode_error,
+    WakeMeta, WelcomePayload, decode_error, decode_topics, encode_topics,
 };
 use crate::wake_hub::identity::{hello_transcript, topics_hash};
 use crate::wake_hub::limits::{DEFAULT_HANDSHAKE_TIMEOUT_MS, HELLO_NONCE_BYTES};
@@ -81,6 +81,19 @@ impl SessionConfig {
 pub enum SessionEvent {
     /// A wake hint addressed to this listener.
     Wake(Box<WakeMeta>),
+    /// v1.0.0 #3532 — the hub ACKNOWLEDGED a subscription change: it holds
+    /// (or, for an `unsubscribe`, has dropped) exactly these topics for this
+    /// session, and it applied that change BEFORE minting this frame. A
+    /// caller waiting for its subscription to go live waits for this, never
+    /// for a timer.
+    ///
+    /// It is an EVENT and not the return value of
+    /// [`Session::send_subscribe`] on purpose: a wake for a topic that was
+    /// already live can legitimately arrive between the request and its ack,
+    /// and a blocking `subscribe()` that read frames itself would have to
+    /// swallow or buffer that wake. Surfacing both through the one ordered
+    /// event stream means nothing is lost and nothing is reordered.
+    Subscribed(Vec<String>),
     /// A frame this version has no opinion about (liveness already answered).
     /// Surfaced rather than swallowed so the caller can keep its own idle
     /// accounting honest.
@@ -138,6 +151,17 @@ impl Session {
                 write_framed(&mut self.writer, pong).await?;
                 Ok(SessionEvent::Idle)
             }
+            // #3532 — the hub echoes an APPLIED subscription change back. An
+            // ack that does not decode is reported as `Idle`, never as a
+            // failure: the subscription itself is a routing hint, and dropping
+            // a live session over an unreadable acknowledgement would trade a
+            // durable-row-safe hint for an outage. It stays UNACKNOWLEDGED, so
+            // a caller waiting on liveness keeps waiting rather than being
+            // told a lie.
+            Kind::Subscribe | Kind::Unsubscribe => {
+                Ok(decode_topics(&frame.payload)
+                    .map_or(SessionEvent::Idle, SessionEvent::Subscribed))
+            }
             Kind::Error => {
                 let (code, reason) =
                     decode_error(&frame.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
@@ -148,6 +172,46 @@ impl Session {
             // over an unknown frame would trade wake latency for nothing.
             _ => Ok(SessionEvent::Idle),
         }
+    }
+
+    /// Ask the hub to add `topics` to this session's subscription set
+    /// (v1.0.0 #3532).
+    ///
+    /// This only WRITES. The subscription is not live when this returns — it
+    /// is live once [`Session::next_event`] yields
+    /// [`SessionEvent::Subscribed`] naming these topics, which the hub emits
+    /// only after its router already holds them. A caller that treats the
+    /// write as liveness reintroduces exactly the race #3532 closed: a peer's
+    /// topic wake in that window fans out to nobody.
+    ///
+    /// # Errors
+    ///
+    /// An invalid or over-count topic list, an encoding failure, or a write
+    /// failure. None of them can lose a durable row: the inbox is the truth
+    /// and the backstop poll still finds it.
+    pub async fn send_subscribe(&mut self, topics: &[String]) -> Result<()> {
+        self.send_subscription(Kind::Subscribe, topics).await
+    }
+
+    /// Ask the hub to drop `topics` from this session's subscription set.
+    ///
+    /// Acknowledged the same way as [`Session::send_subscribe`]: the removal
+    /// has taken effect once the matching [`SessionEvent::Subscribed`]
+    /// arrives, and not before.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::send_subscribe`].
+    pub async fn send_unsubscribe(&mut self, topics: &[String]) -> Result<()> {
+        self.send_subscription(Kind::Unsubscribe, topics).await
+    }
+
+    async fn send_subscription(&mut self, kind: Kind, topics: &[String]) -> Result<()> {
+        let payload = encode_topics(topics).context("encoding the topic list")?;
+        let body = Frame::new(kind, self.agent_id.clone(), "", payload)
+            .encode()
+            .with_context(|| format!("encoding a {kind} frame"))?;
+        write_framed(&mut self.writer, body).await
     }
 }
 

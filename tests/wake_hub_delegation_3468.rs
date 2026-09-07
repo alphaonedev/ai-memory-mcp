@@ -374,15 +374,9 @@ async fn subscription_cannot_expand_the_authenticated_namespace_read_scope() {
     client.delegation = mint(HUB, 3_600);
     client.hello(AGENT, &delegated_key(), &[]).await;
     assert_eq!(client.expect_frame().await.kind, Kind::Welcome);
-    client.subscribe(&[format!("#_inbox/{AGENT}")]).await;
-    client
-        .send(ai_memory::wake_hub::frame::Frame::new(
-            Kind::Ping,
-            AGENT,
-            "",
-            Bytes::new(),
-        ))
-        .await;
-    assert_eq!(client.expect_frame().await.kind, Kind::Pong);
+    // #3532 — the own-inbox subscribe the verifier DOES admit is now
+    // acknowledged in its own right, so acceptance is proved directly instead
+    // of inferred from a ping that round-trips after it.
+    client.subscribe_acked(&[format!("#_inbox/{AGENT}")]).await;
     hub.stop().await;
 }
