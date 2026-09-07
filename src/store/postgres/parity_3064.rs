@@ -16,8 +16,10 @@
 
 use chrono::{DateTime, Utc};
 
-use super::{PostgresStore, StoreError, StoreResult, to_store_err};
-use crate::confidence::calibrate::{CalibrationReport, ConsumeAccessDivergence, PerSourceBaseline};
+use super::{CallerContext, PostgresStore, StoreError, StoreResult, to_store_err};
+use crate::confidence::calibrate::{
+    CalibrationAudience, CalibrationReport, ConsumeAccessDivergence, PerSourceBaseline,
+};
 
 /// `tracing` target for this module's calibration logs — the SAME target the
 /// sqlite sweep uses, so an operator filters one name across both backends.
@@ -38,6 +40,52 @@ struct GroupRow {
     judged: i64,
     access_consumed: i64,
     access_unconsumed: i64,
+}
+
+/// v1.0.0 #3507 — the extra WHERE fragments + bind values a CALLER-SCOPED
+/// postgres sweep splices onto both passes.
+///
+/// The postgres twin of `crate::confidence::calibrate`'s `ScopedFragments`,
+/// and deliberately not a re-derivation of it: the predicate itself comes
+/// from the SAME generators (`crate::storage::visibility_clause` rendered
+/// with [`crate::visibility::SqlParamStyle::Postgres`],
+/// `crate::storage::compute_visibility_prefixes`,
+/// `crate::visibility::substrate_exclusion_sql`,
+/// `crate::models::lifecycle_visible_clause`). Only the parameter dialect
+/// differs, which is exactly what `SqlParamStyle` selects — a second,
+/// hand-written pg copy of the visibility clause is the #951 drift this
+/// project treats as a defect.
+struct ScopedFragmentsPg {
+    /// The caller principal bound at the visibility clause's caller slot.
+    caller: String,
+    /// The four namespace prefixes (private/team/unit/org) for the caller.
+    prefixes: crate::storage::VisibilityPrefixes,
+    /// `AND (...)` visibility predicate over the joined `memories m`.
+    visibility: String,
+    /// Fail-closed lifecycle allow-list + the #3348 substrate exclusion over
+    /// BOTH the reported observation namespace and the row's live namespace.
+    lifecycle_and_substrate: String,
+}
+
+impl ScopedFragmentsPg {
+    fn build(caller: &str, vis_start: usize, caller_ph: usize) -> Self {
+        Self {
+            caller: caller.to_string(),
+            prefixes: crate::storage::compute_visibility_prefixes(Some(caller)),
+            visibility: crate::storage::visibility_clause(
+                crate::visibility::SqlParamStyle::Postgres,
+                vis_start,
+                caller_ph,
+                "m",
+            ),
+            lifecycle_and_substrate: format!(
+                "{lifecycle}{sub_o}{sub_m}",
+                lifecycle = crate::models::lifecycle_visible_clause("m"),
+                sub_o = crate::visibility::substrate_exclusion_sql("o.namespace"),
+                sub_m = crate::visibility::substrate_exclusion_sql("m.namespace"),
+            ),
+        }
+    }
 }
 
 impl PostgresStore {
@@ -61,15 +109,28 @@ impl PostgresStore {
     /// and reproducing that contract explicitly is what keeps the two
     /// backends' numbers equal rather than merely similar.
     ///
+    /// # Caller gate (v1.0.0 #3507)
+    ///
+    /// `ctx` resolves through the SHARED
+    /// [`CallerContext::calibration_audience`] — the same helper the sqlite
+    /// adapter calls — so the two backends cannot disagree about who sees
+    /// what. An admin context keeps the GLOBAL sweep; every other context is
+    /// scoped through the shared visibility generators; an unusable
+    /// principal is REFUSED as `InvalidInput`.
+    ///
     /// # Errors
     ///
-    /// Propagates the bounded-window refusal from `checked_days_ago` and any
-    /// postgres error.
+    /// Propagates the bounded-window refusal from `checked_days_ago`, the
+    /// #3507 unresolvable-caller refusal, and any postgres error.
     pub(super) async fn calibrate_confidence_report_pg(
         &self,
+        ctx: &CallerContext,
         days: i64,
         now: DateTime<Utc>,
     ) -> StoreResult<CalibrationReport> {
+        let audience = ctx
+            .calibration_audience()
+            .map_err(|detail| StoreError::InvalidInput { detail })?;
         // #3384 — caller-controlled windows must never reach chrono's
         // panicking `Duration::days`. The SHARED validator is the SSOT for
         // both the bound and the message.
@@ -80,9 +141,15 @@ impl PostgresStore {
         })?;
         let since = since_dt.to_rfc3339();
 
-        self.backfill_recall_outcomes_pg().await?;
+        // v1.0.0 #3507 — the backfill is the ONE write in the sweep and it
+        // spans rows a scoped caller may not read, so it runs for the ADMIN
+        // sweep only; a caller-scoped calibration is strictly READ-ONLY on
+        // this backend exactly as on sqlite.
+        if audience.is_admin() {
+            self.backfill_recall_outcomes_pg().await?;
+        }
 
-        let groups = self.calibrate_pass1_pg(&since).await?;
+        let groups = self.calibrate_pass1_pg(&since, &audience).await?;
         let total_observations: u64 = groups
             .iter()
             .map(|g| u64::try_from(g.count).unwrap_or(0))
@@ -95,7 +162,7 @@ impl PostgresStore {
             }
             let count = u64::try_from(group.count).unwrap_or(0);
             let (median, buckets) = self
-                .calibrate_pass2_pg(&since, &group.namespace, &group.source, count)
+                .calibrate_pass2_pg(&since, &group.namespace, &group.source, count, &audience)
                 .await?;
 
             // v0.9.0 §11.5 (#1706) — consumption_utility = consumed / judged.
@@ -169,8 +236,22 @@ impl PostgresStore {
     /// orphan observation rows whose source memory was CASCADE-deleted still
     /// surface (as access 0), which is the audit-honest contract the sqlite
     /// module documents.
-    async fn calibrate_pass1_pg(&self, since: &str) -> StoreResult<Vec<GroupRow>> {
-        let rows: Vec<(String, String, i64, Option<f64>, i64, i64, i64, i64)> = sqlx::query_as(
+    ///
+    /// v1.0.0 #3507 — the SCOPED arm promotes that LEFT JOIN to an INNER
+    /// JOIN (an orphan row has no visibility to evaluate, so it fails
+    /// closed) and splices the shared visibility / lifecycle / substrate
+    /// fragments. Placeholder layout: `$1` = since, `$2..$5` = visibility
+    /// prefixes, `$6` = caller — the SAME layout the sqlite twin reserves,
+    /// so the two statements differ only in parameter dialect.
+    async fn calibrate_pass1_pg(
+        &self,
+        since: &str,
+        audience: &CalibrationAudience,
+    ) -> StoreResult<Vec<GroupRow>> {
+        let scoped = audience
+            .caller()
+            .map(|caller| ScopedFragmentsPg::build(caller, 2, 6));
+        let sql = format!(
             "SELECT o.namespace,
                     o.source,
                     COUNT(*)::BIGINT,
@@ -182,15 +263,32 @@ impl PostgresStore {
                     SUM(CASE WHEN o.recall_outcome = 'unconsumed'
                              THEN COALESCE(m.access_count, 0) ELSE 0 END)::BIGINT
              FROM confidence_shadow_observations o
-             LEFT JOIN memories m ON m.id = o.memory_id
+             {join} JOIN memories m ON m.id = o.memory_id
              WHERE o.observed_at >= $1
+               {vis}
+               {rest}
              GROUP BY o.namespace, o.source
              ORDER BY o.namespace, o.source",
-        )
-        .bind(since)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("calibrate pass 1 aggregate", e))?;
+            join = if scoped.is_some() { "" } else { "LEFT" },
+            vis = scoped.as_ref().map_or("", |s| s.visibility.as_str()),
+            rest = scoped
+                .as_ref()
+                .map_or("", |s| s.lifecycle_and_substrate.as_str()),
+        );
+        let mut query = sqlx::query_as(&sql).bind(since);
+        if let Some(scoped) = scoped.as_ref() {
+            let (p, t, u, o) = &scoped.prefixes;
+            query = query
+                .bind(p.clone())
+                .bind(t.clone())
+                .bind(u.clone())
+                .bind(o.clone())
+                .bind(scoped.caller.clone());
+        }
+        let rows: Vec<(String, String, i64, Option<f64>, i64, i64, i64, i64)> = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("calibrate pass 1 aggregate", e))?;
 
         Ok(rows
             .into_iter()
@@ -221,25 +319,61 @@ impl PostgresStore {
     /// the median needs only the value(s) at the central index, so the walk
     /// captures those scalars rather than sorting a second time — the values
     /// arrive `ORDER BY derived_confidence ASC` from the server.
+    ///
+    /// v1.0.0 #3507 — the scoped arm repeats pass 1's join + predicates so
+    /// the median and histogram are computed over EXACTLY the rows pass 1
+    /// counted. Placeholder layout: `$1` = since, `$2` = namespace,
+    /// `$3` = source, `$4..$7` = visibility prefixes, `$8` = caller.
     async fn calibrate_pass2_pg(
         &self,
         since: &str,
         namespace: &str,
         source: &str,
         count: u64,
+        audience: &CalibrationAudience,
     ) -> StoreResult<(f64, [u64; BUCKET_COUNT])> {
-        let values: Vec<(f64,)> = sqlx::query_as(
-            "SELECT derived_confidence
+        let scoped = audience
+            .caller()
+            .map(|caller| ScopedFragmentsPg::build(caller, 4, 8));
+        let sql = scoped.as_ref().map_or_else(
+            || {
+                "SELECT derived_confidence
              FROM confidence_shadow_observations
              WHERE observed_at >= $1 AND namespace = $2 AND source = $3
-             ORDER BY derived_confidence ASC",
-        )
-        .bind(since)
-        .bind(namespace)
-        .bind(source)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("calibrate pass 2 median scan", e))?;
+             ORDER BY derived_confidence ASC"
+                    .to_string()
+            },
+            |s| {
+                format!(
+                    "SELECT o.derived_confidence
+             FROM confidence_shadow_observations o
+             JOIN memories m ON m.id = o.memory_id
+             WHERE o.observed_at >= $1 AND o.namespace = $2 AND o.source = $3
+               {vis}
+               {rest}
+             ORDER BY o.derived_confidence ASC",
+                    vis = s.visibility,
+                    rest = s.lifecycle_and_substrate,
+                )
+            },
+        );
+        let mut query = sqlx::query_as(&sql)
+            .bind(since)
+            .bind(namespace)
+            .bind(source);
+        if let Some(scoped) = scoped.as_ref() {
+            let (p, t, u, o) = &scoped.prefixes;
+            query = query
+                .bind(p.clone())
+                .bind(t.clone())
+                .bind(u.clone())
+                .bind(o.clone())
+                .bind(scoped.caller.clone());
+        }
+        let values: Vec<(f64,)> = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("calibrate pass 2 median scan", e))?;
 
         let mut buckets = [0_u64; BUCKET_COUNT];
         let mid = usize::try_from(count / 2).unwrap_or(usize::MAX);
