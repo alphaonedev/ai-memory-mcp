@@ -259,3 +259,261 @@ async fn postgres_admin_api_key_seam_parity_3474() {
 fn postgres_url_helper_is_reachable_3474() {
     let _ = postgres_url();
 }
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3529 (#3474 advisory A1) — the last-key rule is enforced by the
+// STORE, atomically, on both backends.
+// ---------------------------------------------------------------------------
+
+/// Empty the enrolled-key registry so the registry-GLOBAL "would this be the
+/// last key" rule can be exercised at all.
+///
+/// The rule is deployment-wide by construction — an empty registry makes the
+/// identity gate inert in EVERY mode (#1985), which is why it is gated — so
+/// there is no per-agent scope to isolate on. This is safe here because the
+/// only database these tests ever reach is a throwaway sqlite file or the
+/// dedicated `AI_MEMORY_TEST_POSTGRES_URL` test tier, and the rows are
+/// ephemeral digests of test tokens that nothing can recover or needs to.
+async fn clear_all_enrolled(store: &Arc<dyn MemoryStore>) {
+    let ctx = CallerContext::for_agent("ai:k3529-cleaner".to_string());
+    let enrolled = store
+        .list_agent_api_keys()
+        .await
+        .expect("list_agent_api_keys");
+    let mut agents: Vec<String> = enrolled.into_iter().map(|(_, agent)| agent).collect();
+    agents.sort_unstable();
+    agents.dedup();
+    for agent in agents {
+        store
+            .revoke_agent_api_key(&ctx, &agent)
+            .await
+            .expect("clear enrolled key");
+    }
+    assert!(
+        store
+            .list_agent_api_keys()
+            .await
+            .expect("list after clear")
+            .is_empty(),
+        "the registry must be empty before the last-key rule can be exercised"
+    );
+}
+
+/// The #3474 A1 interleaving, PROVOKED rather than raced.
+///
+/// The handler's decision is a pure function of the enrolled snapshot
+/// (`revoke_requires_approval`), so the schedule where two concurrent
+/// self-revokes both slip through is exactly: compute BOTH decisions from the
+/// same snapshot — in which each holder can see the other's key — and then run
+/// both applies. That is what this does, with no sleeps and no timing bet.
+///
+/// Before #3529 both applies succeeded and the registry ended EMPTY. Now the
+/// store counts and deletes in one transaction, so the second one is refused
+/// with nothing removed.
+async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffix: &str) {
+    use ai_memory::handlers::agent_api_key::{
+        revoke_requires_approval, revoke_would_empty_registry,
+    };
+    use ai_memory::storage::RevokeUnlessLastOutcome;
+
+    clear_all_enrolled(store).await;
+
+    let a = format!("ai:k3529-holder-a-{suffix}");
+    let b = format!("ai:k3529-holder-b-{suffix}");
+    let c = format!("ai:k3529-holder-c-{suffix}");
+    let ctx_a = CallerContext::for_agent(a.clone());
+    let ctx_b = CallerContext::for_agent(b.clone());
+    let ctx_c = CallerContext::for_agent(c.clone());
+
+    let digest_a = api_key_sha256_hex(&format!("token-a-{suffix}"));
+    let digest_b = api_key_sha256_hex(&format!("token-b-{suffix}"));
+    store
+        .bind_agent_api_key(&ctx_a, &a, &digest_a)
+        .await
+        .expect("bind a");
+    store
+        .bind_agent_api_key(&ctx_b, &b, &digest_b)
+        .await
+        .expect("bind b");
+
+    // The ONE snapshot both in-flight requests observe. Each holder sees the
+    // other's key, so each pre-check says "apply immediately" — the exact
+    // state in which the pre-#3529 code emptied the registry.
+    let snapshot = store
+        .list_agent_api_keys()
+        .await
+        .expect("list_agent_api_keys");
+    assert_eq!(snapshot.len(), 2, "the last TWO key-holders: {snapshot:?}");
+    let count_of = |agent: &str| {
+        snapshot
+            .iter()
+            .filter(|(_, id)| id.as_str() == agent)
+            .count()
+    };
+    assert_eq!(
+        revoke_requires_approval(&a, &a, snapshot.len(), count_of(&a), false),
+        None,
+        "A's pre-check must legitimately conclude it is not the last key"
+    );
+    assert_eq!(
+        revoke_requires_approval(&b, &b, snapshot.len(), count_of(&b), false),
+        None,
+        "B's pre-check must legitimately conclude it is not the last key"
+    );
+    assert!(!revoke_would_empty_registry(snapshot.len(), count_of(&a)));
+
+    // Both applies now run. The FIRST wins…
+    match store
+        .revoke_agent_api_key_unless_last(&ctx_a, &a)
+        .await
+        .expect("A revoke")
+    {
+        RevokeUnlessLastOutcome::Revoked { bindings_removed } => {
+            assert_eq!(bindings_removed, 1, "A held exactly one key");
+        }
+        other @ RevokeUnlessLastOutcome::WouldEmptyRegistry => {
+            panic!("the first self-revoke must apply, got {other:?}")
+        }
+    }
+    // …and the SECOND is refused by the atomic re-check, even though its
+    // pre-check had already passed.
+    match store
+        .revoke_agent_api_key_unless_last(&ctx_b, &b)
+        .await
+        .expect("B revoke")
+    {
+        RevokeUnlessLastOutcome::WouldEmptyRegistry => {}
+        other @ RevokeUnlessLastOutcome::Revoked { .. } => {
+            panic!("the second self-revoke must be refused, got {other:?}")
+        }
+    }
+
+    // The load-bearing assertion: exactly ONE key survives, and it is B's.
+    let after = store
+        .list_agent_api_keys()
+        .await
+        .expect("list after the race");
+    assert_eq!(
+        after.len(),
+        1,
+        "the registry must never be emptied by two concurrent self-revokes: {after:?}"
+    );
+    assert_eq!(
+        store
+            .agent_id_for_api_key(&digest_b)
+            .await
+            .expect("resolve B"),
+        Some(b.clone()),
+        "the refused revoke must leave B's key live"
+    );
+    assert_eq!(
+        store
+            .agent_id_for_api_key(&digest_a)
+            .await
+            .expect("resolve A"),
+        None,
+        "the applied revoke must have removed A's key"
+    );
+
+    // ALLOWED — with another holder present the same call revokes, so the
+    // refusal above is the control and not a broken seam.
+    let digest_c = api_key_sha256_hex(&format!("token-c-{suffix}"));
+    store
+        .bind_agent_api_key(&ctx_c, &c, &digest_c)
+        .await
+        .expect("bind c");
+    match store
+        .revoke_agent_api_key_unless_last(&ctx_b, &b)
+        .await
+        .expect("B revoke with C enrolled")
+    {
+        RevokeUnlessLastOutcome::Revoked { bindings_removed } => {
+            assert_eq!(bindings_removed, 1);
+        }
+        other @ RevokeUnlessLastOutcome::WouldEmptyRegistry => {
+            panic!("a revoke that leaves C enrolled must apply, got {other:?}")
+        }
+    }
+
+    // An agent with NO keys is an idempotent no-op, NOT a refusal — the two
+    // zero-row cases must never be conflated, because answering "revoked" for
+    // a credential that is still live is a wrong answer.
+    match store
+        .revoke_agent_api_key_unless_last(&ctx_a, &a)
+        .await
+        .expect("A revoke with no keys")
+    {
+        RevokeUnlessLastOutcome::Revoked { bindings_removed } => {
+            assert_eq!(bindings_removed, 0, "no rows to remove");
+        }
+        other @ RevokeUnlessLastOutcome::WouldEmptyRegistry => {
+            panic!("a no-op revoke must not be a refusal, got {other:?}")
+        }
+    }
+
+    // C now holds every enrolled key: refused, and nothing is removed.
+    match store
+        .revoke_agent_api_key_unless_last(&ctx_c, &c)
+        .await
+        .expect("C revoke")
+    {
+        RevokeUnlessLastOutcome::WouldEmptyRegistry => {}
+        other @ RevokeUnlessLastOutcome::Revoked { .. } => {
+            panic!("the last holder's revoke must be refused, got {other:?}")
+        }
+    }
+    assert_eq!(
+        store
+            .agent_id_for_api_key(&digest_c)
+            .await
+            .expect("resolve C"),
+        Some(c.clone()),
+        "a refused revoke removes nothing"
+    );
+
+    // The UNGUARDED seam still exists and still empties the registry — that is
+    // what an approval which DISCLOSED `empties_registry` authorises, and
+    // keeping it separate is why the guarded one can refuse.
+    assert_eq!(
+        store
+            .revoke_agent_api_key(&ctx_c, &c)
+            .await
+            .expect("unguarded revoke"),
+        1
+    );
+    assert!(
+        store
+            .list_agent_api_keys()
+            .await
+            .expect("list after the approved emptying")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_revoke_unless_last_atomicity_3529() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("revoke-unless-last.db");
+    let _ = ai_memory::db::open(&db_path).expect("db::open (migrations)");
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    revoke_unless_last_atomicity_parity(&store, "lt").await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_revoke_unless_last_atomicity_3529() {
+    let Some(url) = postgres_url() else {
+        eprintln!(
+            "skip postgres_revoke_unless_last_atomicity_3529: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("PostgresStore::connect (the certified tier must be exercised, not skipped)");
+    let store: Arc<dyn MemoryStore> = Arc::new(store);
+    let suffix = format!("pg{}", uuid::Uuid::new_v4().simple());
+    revoke_unless_last_atomicity_parity(&store, &suffix).await;
+}

@@ -2318,6 +2318,42 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #3529 — revoke every key bound to `agent_id`, but ONLY if that
+    /// leaves at least one key enrolled somewhere on the deployment, with the
+    /// count and the delete inside ONE transaction.
+    ///
+    /// The two-step read-then-revoke this replaces on the admin HTTP surface
+    /// let two concurrent self-revokes by the last two key-holders each
+    /// observe the other's key, each decide it was not the last, and both
+    /// apply — emptying the registry (and so making the identity gate inert in
+    /// every mode, #1985) with no second approver. See
+    /// [`crate::storage::revoke_agent_api_key_unless_last`] for the sqlite
+    /// SSOT and the reasoning; the postgres twin takes a transaction-scoped
+    /// advisory lock so the same check-and-act is mutually exclusive there.
+    ///
+    /// [`crate::storage::RevokeUnlessLastOutcome::WouldEmptyRegistry`] means
+    /// NOTHING was removed and the caller must route the request through the
+    /// two-person approval gate; it is not an error, and it is deliberately
+    /// not reported as a zero-row success.
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors
+    /// [`MemoryStore::revoke_agent_api_key`]) so an adapter without key
+    /// provisioning fails loudly rather than silently answering "revoked" for
+    /// a binding that is still live.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces adapter/transport failures and the record-stop refusal.
+    async fn revoke_agent_api_key_unless_last(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+    ) -> StoreResult<crate::storage::RevokeUnlessLastOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REVOKE_AGENT_API_KEY_UNLESS_LAST".to_string(),
+        })
+    }
+
     /// #2044 — enumerate every enrolled per-agent api-key as
     /// `(token_sha256, agent_id)`. Seeds the in-memory principal-binding map
     /// ([`crate::handlers::ApiKeyState`]) so the hot-path middleware resolves

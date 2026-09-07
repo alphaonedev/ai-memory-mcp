@@ -14149,6 +14149,87 @@ pub fn revoke_agent_api_key(conn: &Connection, agent_id: &str) -> Result<usize> 
     Ok(n)
 }
 
+/// v1.0.0 [#3529] — the outcome of [`revoke_agent_api_key_unless_last`].
+///
+/// A typed answer rather than a `usize` row count, because "nothing was
+/// removed" has two meanings on this seam that an operator must never see
+/// conflated: the agent had no key (idempotent no-op) and the agent holds
+/// EVERY enrolled key (the revoke was refused). Reporting the second as a
+/// successful zero-row revoke would tell a caller a credential is dead while
+/// it still authenticates — a wrong answer, which is worse than a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeUnlessLastOutcome {
+    /// The bindings were removed inside the same transaction that counted
+    /// them. `bindings_removed` is the row count (0 when the agent had none).
+    Revoked {
+        /// Rows deleted from `agent_api_keys`.
+        bindings_removed: usize,
+    },
+    /// NOTHING was removed: the target holds every enrolled key, so applying
+    /// the revoke would leave the registry EMPTY. The caller must route the
+    /// request through the two-person approval gate instead.
+    WouldEmptyRegistry,
+}
+
+/// v1.0.0 [#3529] — revoke every key bound to `agent_id`, but ONLY if doing so
+/// leaves at least one key enrolled somewhere on the deployment.
+///
+/// # Why this exists as one call
+///
+/// [`crate::handlers::agent_api_key::revoke_agent_api_key`] used to read the
+/// enrolled set with [`list_agent_api_keys`], decide "this is not the last
+/// key", and then call [`revoke_agent_api_key`] as a SEPARATE step. Two
+/// concurrent self-revokes by the last two key-holders each observed the
+/// other's key still enrolled, each decided it was not the last, and both
+/// applied — leaving ZERO enrolled keys, which makes
+/// [`crate::handlers::identity_binding::enforce_for_request`] inert in EVERY
+/// mode ([#1985]) with no second approver ever having authorised it. A
+/// check-then-act pair cannot be made safe by ordering it more carefully; the
+/// count and the delete have to be ONE atomic decision, which is what this is.
+///
+/// `BEGIN IMMEDIATE` (rather than the default deferred transaction) takes the
+/// write lock before the count is read, so the read cannot be upgraded out
+/// from under us by a writer in another process — the CLI twin
+/// `ai-memory agents revoke-api-key` runs on the same file.
+///
+/// Refusing is the SAFE direction: the caller queues the revoke for a second
+/// principal, nothing durable is lost, and the operator's intent survives as a
+/// `pending_actions` row.
+///
+/// # Errors
+///
+/// Surfaces the record-stop gate refusal, and `BEGIN` / `SELECT` / `DELETE` /
+/// `COMMIT` failures.
+pub fn revoke_agent_api_key_unless_last(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<RevokeUnlessLastOutcome> {
+    // Wave-2 B7' — the postgres twin gates, so this one does too. A revoke is
+    // a write, and a record-stop means the substrate has stopped accepting
+    // writes; refusing here is the fail-closed side and the cross-backend
+    // parity the B7 structural scan asks for.
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let total: i64 = tx.query_row("SELECT COUNT(*) FROM agent_api_keys", [], |row| row.get(0))?;
+    let mine: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM agent_api_keys WHERE agent_id = ?1",
+        params![agent_id],
+        |row| row.get(0),
+    )?;
+    if mine > 0 && total == mine {
+        // Explicit, so the refusal is a decision in the code and not a
+        // side effect of dropping the guard.
+        tx.rollback()?;
+        return Ok(RevokeUnlessLastOutcome::WouldEmptyRegistry);
+    }
+    let bindings_removed = tx.execute(
+        "DELETE FROM agent_api_keys WHERE agent_id = ?1",
+        params![agent_id],
+    )?;
+    tx.commit()?;
+    Ok(RevokeUnlessLastOutcome::Revoked { bindings_removed })
+}
+
 /// #2044 — enumerate every enrolled per-agent api-key as
 /// `(token_sha256, agent_id)` for the boot-time in-memory seed.
 ///
