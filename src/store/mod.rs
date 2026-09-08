@@ -2291,19 +2291,34 @@ pub trait MemoryStore: Send + Sync {
     /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — bind a per-agent
     /// api-key to `agent_id` by its `sha256(token)` digest. The RAW token is
     /// NEVER passed here or stored (only its lowercase-hex sha256), so the DB
-    /// cannot leak the bearer secret. Re-binding the same digest updates the
-    /// mapping (idempotent enrollment). This is the server-held secret the
+    /// cannot leak the bearer secret. This is the server-held secret the
     /// HTTP `X-Agent-Id` principal binds against.
+    ///
+    /// v1.0.0 #3535 — re-binding the SAME `(agent, digest)` pair is an
+    /// idempotent success, but a digest already bound to a DIFFERENT agent is
+    /// REFUSED with
+    /// [`crate::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent`] and
+    /// NOTHING is written. The pre-#3535 upsert silently RE-POINTED such a
+    /// binding, so one live bearer credential changed which principal it
+    /// authenticates as with no signal and no second principal consulted —
+    /// see [`crate::storage::bind_agent_api_key`] for the sqlite SSOT and the
+    /// reasoning; the postgres twin serializes the same check-and-act with the
+    /// registry advisory lock it shares with
+    /// [`MemoryStore::revoke_agent_api_key_unless_last`].
     ///
     /// Default returns `UnsupportedCapability` (mirrors `bind_agent_pubkey`) so
     /// an adapter without key provisioning fails loudly rather than silently
     /// dropping a binding an operator believes is enrolled.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces adapter/transport failures and the record-stop refusal.
     async fn bind_agent_api_key(
         &self,
         _ctx: &CallerContext,
         _agent_id: &str,
         _token_sha256: &str,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<crate::storage::BindApiKeyOutcome> {
         Err(StoreError::UnsupportedCapability {
             capability: "BIND_AGENT_API_KEY".to_string(),
         })
@@ -7174,7 +7189,7 @@ mod tests {
                 assert_eq!(capability, "BIND_AGENT_API_KEY");
             }
             Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
-            Ok(()) => panic!("default bind_agent_api_key must error"),
+            Ok(outcome) => panic!("default bind_agent_api_key must error, got {outcome:?}"),
         }
 
         // resolve default → Ok(None): no per-agent keys enrolled.

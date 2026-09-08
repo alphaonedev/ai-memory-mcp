@@ -53,7 +53,14 @@ use super::{PostgresStore, StoreResult, to_store_err};
 /// Advisory-lock key serializing the enrolled-api-key registry's
 /// check-and-act. Namespaced so it cannot be confused with the per-title /
 /// per-namespace create-funnel locks in `postgres.rs`.
-const PG_AGENT_API_KEY_REGISTRY_LOCK_KEY: &str = "ai_memory:agent_api_keys:registry";
+///
+/// v1.0.0 #3535 — SHARED with `postgres::api_key_bind_3535`, deliberately.
+/// Both seams are a check-and-act over the same `agent_api_keys` registry
+/// (this one over its whole population, that one over one digest's incumbent
+/// owner), so one lock makes a bind and a last-key revoke mutually exclusive
+/// instead of leaving a second key that could disagree about what "the last
+/// key" was. Over-serializing an operator-rate action costs nothing.
+pub(super) const PG_AGENT_API_KEY_REGISTRY_LOCK_KEY: &str = "ai_memory:agent_api_keys:registry";
 
 impl PostgresStore {
     /// #3529 — the transactional check-and-act. Returns
@@ -79,9 +86,7 @@ impl PostgresStore {
         const CTX: &str = "revoke_agent_api_key_unless_last";
         self.gate_record_stop().await?;
         let mut tx = self.pool.begin().await.map_err(|e| to_store_err(CTX, e))?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(PG_AGENT_API_KEY_REGISTRY_LOCK_KEY)
-            .execute(&mut *tx)
+        super::pg_advisory_xact_lock_key(&mut tx, PG_AGENT_API_KEY_REGISTRY_LOCK_KEY)
             .await
             .map_err(|e| to_store_err(CTX, e))?;
         let (total, mine): (i64, i64) = sqlx::query_as(

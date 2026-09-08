@@ -208,6 +208,25 @@ pub mod msg {
         format!("cannot bind pubkey: agent '{agent_id}' is not registered (register it first)")
     }
 
+    /// v1.0.0 #3535 — the ONE refusal text for `ai-memory agents
+    /// bind-api-key` when the supplied token's digest is already enrolled to a
+    /// DIFFERENT agent, shared by the sqlite arm and the SAL (`--store-url`)
+    /// arm so the two writers cannot describe the same refusal differently.
+    ///
+    /// It names the agent the operator ASKED for and never the incumbent: the
+    /// digest is the primary key of `agent_api_keys`, so reporting who else
+    /// holds it would turn a paste error into a lookup of whose credential a
+    /// token is.
+    #[must_use]
+    pub fn api_key_digest_bound_to_another_agent(agent_id: impl std::fmt::Display) -> String {
+        format!(
+            "cannot bind api-key for agent '{agent_id}': that token is already enrolled to a \
+             different agent, and nothing was changed. Re-pointing a live bearer credential at \
+             another principal is never an enrolment — mint a fresh token for this agent, or \
+             revoke the existing binding first."
+        )
+    }
+
     /// Stable internal context for a proof or lineage refusal. Public HTTP
     /// surfaces replace this detail with [`BIND_PROOF_REFUSED`].
     #[must_use]

@@ -61,6 +61,10 @@ mod federation_3075;
 // #3529 — the transactional "revoke unless this is the last enrolled key"
 // seam. Own module for the same qual_10 budget reason as `parity_3064` above.
 mod api_key_revoke_3529;
+// #3535 — the transactional "bind unless this digest already belongs to
+// another agent" seam, sharing the #3529 registry advisory lock. Own module
+// for the same qual_10 budget reason as `parity_3064` above.
+mod api_key_bind_3535;
 mod pubkey_history;
 // #3527 — the single funnel that allocates a hash-chain `sequence` and
 // appends the row claiming it, for BOTH postgres chains. Own module for the
@@ -16714,8 +16718,27 @@ async fn pg_advisory_lock_title_namespace(
 async fn pg_advisory_lock_action_edges(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), sqlx::Error> {
+    pg_advisory_xact_lock_key(tx, PG_ACTION_EDGES_LOCK_KEY).await
+}
+
+/// v1.0.0 #3535 — the ONE single-key transaction-scoped advisory lock.
+///
+/// Three seams serialize a whole-relation check-and-act this way (action
+/// edges here, the #3529 last-key revoke and the #3535 bind conflict in
+/// `postgres/api_key_*`), and the statement was being written out at each of
+/// them. One helper, so the lock DISCIPLINE — `_xact_` scoped, released by
+/// COMMIT/ROLLBACK with no path to leak, single-key and therefore trivially
+/// deadlock-free (CONCURRENCY-04) — is stated once and cannot drift between
+/// callers.
+///
+/// # Errors
+/// Propagates the lock query error.
+pub(super) async fn pg_advisory_xact_lock_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(PG_ACTION_EDGES_LOCK_KEY)
+        .bind(key)
         .execute(&mut **tx)
         .await
         .map(|_| ())
@@ -26752,23 +26775,19 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         agent_id: &str,
         token_sha256: &str,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<crate::storage::BindApiKeyOutcome> {
         // Wave-2 B7' — sqlite twin `db::bind_agent_api_key` gates (ERRORS-09).
+        // The gate is taken here AND in the submodule that owns the INSERT:
+        // the B7' parity scan reads THIS file for the pg twin of the gated
+        // sqlite function, and the B7 structural scan reads the file holding
+        // the write SQL. One gate cannot satisfy both, and a record stop must
+        // refuse this write on either reading.
         self.gate_record_stop().await?;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO agent_api_keys (token_sha256, agent_id, bound_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (token_sha256)
-             DO UPDATE SET agent_id = EXCLUDED.agent_id, bound_at = EXCLUDED.bound_at",
-        )
-        .bind(token_sha256)
-        .bind(agent_id)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| to_store_err("bind_agent_api_key", e))?;
-        Ok(())
+        // #3535 — the whole check-and-act (read the incumbent owner of the
+        // digest, refuse a re-point, INSERT only when unbound) lives in the
+        // submodule; qual_10 budget, and the reasoning is one idea that
+        // belongs in one place.
+        self.bind_agent_api_key_pg(agent_id, token_sha256).await
     }
 
     async fn agent_id_for_api_key(&self, token_sha256: &str) -> StoreResult<Option<String>> {
