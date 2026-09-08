@@ -46,11 +46,11 @@ What it refuses to do
   which returns `0.0` for an empty sample; the conversion happens here, once,
   in `summarise`.
 * **It adds no unencrypted listener and offers no `--insecure`.** An `https`
-  base URL REQUIRES a pinned `--tls-ca`; a plaintext `http` base URL is
-  refused unless the operator names it explicitly with
-  `--allow-plaintext-loopback`, and the choice is recorded in the results so a
-  number produced over plaintext is never mistaken for one produced over the
-  shipped posture.
+  base URL REQUIRES a pinned `--tls-ca`, and a plaintext `http` base URL is
+  REFUSED with nothing on the command line that opens it. TLS is the only
+  posture this harness can measure, so a figure it produces cannot have come
+  from a weaker one -- there is no flag, and therefore no operator slip, that
+  could make a plaintext number look like a TLS number.
 * **It speaks the tree's own wire format.** The hub client is
   `sdk/python/ai_memory/wake.py`, loaded from this checkout -- not a private
   copy of the codec. A second implementation of a frame parser is a second
@@ -185,7 +185,7 @@ def _tls_context(ca_path: str) -> ssl.SSLContext:
 
 
 class Session:
-    """One keep-alive HTTP/1.1 connection to one daemon, TLS or plaintext.
+    """One keep-alive HTTP/1.1 connection to one daemon, over TLS.
 
     Deliberately NOT `benchlib.HttpSession`: that class refuses any scheme but
     `http` (its mesh runs on a private single-host bridge). Extending it in
@@ -199,6 +199,11 @@ class Session:
     for one socket.
     """
 
+    #: TEST-ONLY seam. `allow_plaintext` is NOT reachable from argv -- the
+    #: parser carries no flag that sets it (asserted in `--self-test`), so
+    #: every production session is TLS. It exists so the self-test can build
+    #: the plaintext object it needs to prove the refusal path is the only
+    #: path, without a live daemon and without a certificate.
     def __init__(self, base_url: str, agent_id: str | None = None,
                  api_key: str | None = None, tls_ca: str | None = None,
                  allow_plaintext: bool = False, timeout: float = 30.0):
@@ -215,10 +220,9 @@ class Session:
         elif u.scheme == "http":
             if not allow_plaintext:
                 raise HarnessError(
-                    "refusing a plaintext http base URL. Serve the bench daemon with "
-                    "--tls-cert/--tls-key and pass --tls-ca, or state the exception "
-                    "explicitly with --allow-plaintext-loopback (it is recorded in the "
-                    "results, so a plaintext number is never mistaken for a TLS one)"
+                    "refusing a plaintext http base URL, and this harness offers no "
+                    "way around it. Serve the bench daemon with --tls-cert/--tls-key "
+                    "and pass --tls-ca <pem>"
                 )
             self.tls = None
             default_port = 80
@@ -510,11 +514,10 @@ class SseArm:
     """
 
     def __init__(self, base_url: str, agents: list[str], tls_ca: str | None,
-                 allow_plaintext: bool, api_key: str | None):
+                 api_key: str | None):
         self.base_url = base_url
         self.agents = agents
         self.tls_ca = tls_ca
-        self.allow_plaintext = allow_plaintext
         self.api_key = api_key
         self.stop = threading.Event()
         self.threads: list[threading.Thread] = []
@@ -527,7 +530,7 @@ class SseArm:
 
     def _reader(self, agent: str) -> None:
         session = Session(self.base_url, agent_id=agent, api_key=self.api_key,
-                          tls_ca=self.tls_ca, allow_plaintext=self.allow_plaintext,
+                          tls_ca=self.tls_ca,
                           timeout=BACKSTOP_POLL_MAX + 30.0)
         with self._lock:
             self.sessions.append(session)
@@ -773,15 +776,22 @@ def portable_host_facts() -> dict:
     return facts
 
 
-def transport_meta(base_url: str, tls_ca: str | None, allow_plaintext: bool) -> dict:
+def transport_meta(base_url: str, tls_ca: str | None) -> dict:
+    """What transport produced these numbers.
+
+    There is deliberately no `plaintext_exception_taken` field. The CLI has no
+    flag that admits a plaintext base URL, so such a field could only ever be
+    `false` -- and a field that is structurally constant reads as evidence
+    while carrying none. The refusal itself is the guarantee; `scheme` and
+    `tls_ca_pinned` are what a reader needs to confirm it.
+    """
     scheme = urllib.parse.urlsplit(base_url).scheme
     return {
         "scheme": scheme,
         "tls": scheme == "https",
         "tls_ca_pinned": bool(tls_ca) and scheme == "https",
-        "plaintext_exception_taken": scheme == "http" and allow_plaintext,
-        "note": ("A figure produced over plaintext is NOT a figure produced under the "
-                 "shipped posture; this field is what tells the two apart."),
+        "note": ("This harness refuses a plaintext base URL and carries no flag that "
+                 "opens one, so every figure here was produced over pinned TLS."),
     }
 
 
@@ -809,7 +819,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     threading.stack_size(512 * 1024)
 
     producer = Session(a.base_url, agent_id=a.sender, api_key=a.api_key,
-                       tls_ca=a.tls_ca, allow_plaintext=a.allow_plaintext_loopback)
+                       tls_ca=a.tls_ca)
     warm_ms = producer.warmup()
     points = []
     committed_ledger: list[dict] = []
@@ -824,8 +834,7 @@ def cmd_run(a: argparse.Namespace) -> int:
                 hub_arm = HubArm(wake_mod, a.hub_socket, a.bundle_dir, agents, a.hub_id)
                 hub_arm.start(ready_timeout=a.ready_timeout)
             if "sse" in arms:
-                sse_arm = SseArm(a.base_url, agents, a.tls_ca,
-                                 a.allow_plaintext_loopback, a.api_key)
+                sse_arm = SseArm(a.base_url, agents, a.tls_ca, a.api_key)
                 sse_arm.start(ready_timeout=a.ready_timeout)
             # Both arms are attached BEFORE the first timed notify. A wake
             # minted for a recipient that had not yet subscribed is not a slow
@@ -888,8 +897,7 @@ def cmd_run(a: argparse.Namespace) -> int:
                               "committed), NOT the request"),
             "arms": arms,
             "hub_id": a.hub_id if "hub" in arms else None,
-            "transport": transport_meta(a.base_url, a.tls_ca,
-                                        a.allow_plaintext_loopback),
+            "transport": transport_meta(a.base_url, a.tls_ca),
             "fd_budget": fds,
             "warmup": {
                 "producer_first_request_ms": round(warm_ms, 3),
@@ -994,8 +1002,7 @@ def cmd_rate(a: argparse.Namespace) -> int:
         # owner from the header and refuses a mismatching query value.
         agent = a.sender if a.op == "notify" else agents[wid % len(agents)]
         session = Session(a.base_url, agent_id=agent, api_key=a.api_key,
-                          tls_ca=a.tls_ca,
-                          allow_plaintext=a.allow_plaintext_loopback)
+                          tls_ca=a.tls_ca)
         try:
             session.warmup()
         except HarnessError as exc:
@@ -1072,8 +1079,7 @@ def cmd_rate(a: argparse.Namespace) -> int:
             "host_substrate": a.host_substrate,
             "generated_at_utc": utc_stamp(),
             "measured_label": "MEASURED",
-            "transport": transport_meta(a.base_url, a.tls_ca,
-                                        a.allow_plaintext_loopback),
+            "transport": transport_meta(a.base_url, a.tls_ca),
             "host_facts": portable_host_facts(),
         },
         "point": {
@@ -1132,8 +1138,7 @@ def cmd_hold(a: argparse.Namespace) -> int:
                          agents, a.hub_id)
         hub_arm.start(ready_timeout=a.ready_timeout)
     if "sse" in arms:
-        sse_arm = SseArm(a.base_url, agents, a.tls_ca,
-                         a.allow_plaintext_loopback, a.api_key)
+        sse_arm = SseArm(a.base_url, agents, a.tls_ca, a.api_key)
         sse_arm.start(ready_timeout=a.ready_timeout)
 
     done = threading.Event()
@@ -1206,8 +1211,7 @@ def cmd_preflight(a: argparse.Namespace) -> int:
     was actually clean for THIS run.
     """
     agents = [a.agent_template.format(i=i) for i in range(a.agents)]
-    session = Session(a.base_url, api_key=a.api_key, tls_ca=a.tls_ca,
-                      allow_plaintext=a.allow_plaintext_loopback)
+    session = Session(a.base_url, api_key=a.api_key, tls_ca=a.tls_ca)
     dirty: list[tuple[str, int]] = []
     try:
         session.warmup()
@@ -1273,8 +1277,7 @@ def cmd_reconcile(a: argparse.Namespace) -> int:
     # ONE keep-alive connection, re-pointed per recipient: the identity is a
     # per-request header, and 256 handshakes plus 256 warm-ups would cost
     # minutes on this host for no extra evidence.
-    session = Session(a.base_url, api_key=a.api_key, tls_ca=a.tls_ca,
-                      allow_plaintext=a.allow_plaintext_loopback)
+    session = Session(a.base_url, api_key=a.api_key, tls_ca=a.tls_ca)
     try:
         session.warmup()
         for agent, expected in sorted(by_agent.items()):
@@ -1383,12 +1386,20 @@ def self_test() -> int:
         pass
     try:
         Session("http://127.0.0.1:9077")
-        check(False, "plaintext http must be refused without the explicit exception")
-    except HarnessError:
-        pass
-    session = Session("http://127.0.0.1:9077", allow_plaintext=True)
-    check(session.scheme == "http" and session.tls is None,
-          "the named plaintext exception must still produce a usable session")
+        check(False, "a plaintext http base URL must be refused")
+    except HarnessError as exc:
+        # The refusal must not advertise a way around itself. It once named
+        # `--allow-plaintext-loopback`; that flag is gone, and a message that
+        # still named it would send an operator hunting for an escape hatch
+        # the parser no longer has.
+        check("--tls-ca" in str(exc) and "allow-plaintext" not in str(exc),
+              "the plaintext refusal must name the TLS remedy and no escape hatch")
+    # The plaintext object is reachable ONLY from here: `allow_plaintext` is a
+    # test-only constructor seam with no argv path, which the dest census two
+    # checks below is what actually proves.
+    stub = Session("http://127.0.0.1:9077", allow_plaintext=True)
+    check(stub.scheme == "http" and stub.tls is None,
+          "the test-only seam must still build the object the refusal test needs")
     # The needles are ASSEMBLED rather than written out, so this assertion
     # cannot match itself and report the check as the violation.
     source = Path(__file__).read_text(encoding="utf-8")
@@ -1396,15 +1407,24 @@ def self_test() -> int:
                  "verify_mode = " + "ssl.CERT_" + "NONE"]
     check(not any(needle in source for needle in forbidden),
           "this harness must never grow a verification-skipping path")
-    check("insecure" not in {act.dest for act in build_parser()._actions},  # noqa: SLF001
-          "this harness must never grow a verification-skipping flag")
+    # The census walks EVERY subparser, not just the top level: an escape
+    # hatch added to one command would otherwise pass a top-level-only check.
+    dests = {act.dest for act in build_parser()._actions}  # noqa: SLF001
+    for action in build_parser()._actions:  # noqa: SLF001
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict):
+            for parser in choices.values():
+                dests |= {a.dest for a in getattr(parser, "_actions", [])}  # noqa: SLF001
+    banned = sorted(d for d in dests
+                    if any(word in d for word in ("insecure", "plaintext", "allow")))
+    check(not banned,
+          f"no verification-skipping or plaintext-admitting flag may exist: {banned}")
 
-    meta = transport_meta("http://127.0.0.1:9077", None, True)
-    check(meta["plaintext_exception_taken"] is True and meta["tls"] is False,
-          "a plaintext run must be labelled as one in the results")
-    meta = transport_meta("https://127.0.0.1:9443", "/tmp/ca.pem", False)
+    meta = transport_meta("https://127.0.0.1:9443", "/x/ca.pem")
     check(meta["tls"] is True and meta["tls_ca_pinned"] is True,
           "a TLS run must record that its CA was pinned")
+    check("plaintext_exception_taken" not in meta,
+          "a field that could only ever be false must not be reported as evidence")
 
     # 5. Argument parsing, end to end, for the exact phase-2 command line.
     parser = build_parser()
@@ -1445,7 +1465,7 @@ def self_test() -> int:
 
     # A session's identity is a per-request header, so one keep-alive
     # connection serves the whole read sweep.
-    probe = Session("http://127.0.0.1:9443", agent_id="ai:a", allow_plaintext=True)
+    probe = Session("http://127.0.0.1:9443", agent_id="ai:a", allow_plaintext=True)  # test-only seam
     probe.set_agent_id("ai:b")
     check(probe.headers()["x-agent-id"] == "ai:b",
           "set_agent_id must re-point the wire identity without reconnecting")
@@ -1493,8 +1513,6 @@ def _transport_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--base-url", required=True,
                      help="daemon base URL; https REQUIRES --tls-ca")
     sub.add_argument("--tls-ca", help="PEM the daemon's certificate is pinned to")
-    sub.add_argument("--allow-plaintext-loopback", action="store_true",
-                     help="explicit, recorded exception for a plaintext http daemon")
     sub.add_argument("--api-key", help="x-api-key, when the daemon requires one")
     sub.add_argument("--label", default="wake-latency-3473")
     sub.add_argument("--backend", default="postgres", choices=("postgres", "sqlite"))
