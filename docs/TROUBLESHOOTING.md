@@ -247,6 +247,13 @@ ai-memory curator --rollback-last 5
 Reversed entries are **tagged** `_reversed`, not deleted — the audit
 trail is preserved.
 
+The receipt is checked against the substrate (#3526). After each write the
+reversal re-reads the durable row and compares it to what it intended to
+restore. If the row does not carry that value, the command prints
+`rollback <id>: not applied (…)`, exits non-zero, and leaves the log entry
+**untagged** so it stays reversible once you resolve the cause — it never
+prints `applied` for a reversal that did not land.
+
 ## HTTP API
 
 ### "401 missing or invalid API key"

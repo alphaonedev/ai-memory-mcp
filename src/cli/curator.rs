@@ -1198,7 +1198,16 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
         };
         let entry: autonomy::RollbackEntry = serde_json::from_str(&mem.content)
             .context("rollback entry content is not a valid RollbackEntry JSON")?;
-        let applied = autonomy::reverse_rollback_entry(&conn, &entry)?;
+        // #3526 — a refused reversal prints a `not applied` receipt and exits
+        // non-zero; it NEVER prints `applied`, and the log row is left UNTAGGED
+        // so the entry stays reversible once the operator resolves the cause.
+        let applied = match autonomy::reverse_rollback_entry(&conn, &entry) {
+            Ok(applied) => applied,
+            Err(e) => {
+                writeln!(out.stdout, "rollback {id}: not applied ({e})")?;
+                return Err(e);
+            }
+        };
         let mut tags = mem.tags.clone();
         if !tags.iter().any(|t| t == "_reversed") {
             tags.push("_reversed".to_string());
@@ -1239,6 +1248,11 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
             None, // #1834 valid_at (no as-of)
         )?;
         let mut reversed = 0usize;
+        // #3526 — fail CLOSED on a refused reversal: name the entry that was
+        // not applied, still report the count that WAS reversed before it, then
+        // propagate (non-zero exit). The refused entry stays UNTAGGED, so it
+        // remains reversible once the operator resolves the cause.
+        let mut refusal: Option<anyhow::Error> = None;
         for mem in &log {
             if mem.tags.iter().any(|t| t == "_reversed") {
                 continue;
@@ -1246,7 +1260,14 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
             let Ok(entry) = serde_json::from_str::<autonomy::RollbackEntry>(&mem.content) else {
                 continue;
             };
-            let applied = autonomy::reverse_rollback_entry(&conn, &entry)?;
+            let applied = match autonomy::reverse_rollback_entry(&conn, &entry) {
+                Ok(applied) => applied,
+                Err(e) => {
+                    writeln!(out.stdout, "rollback {}: not applied ({e})", mem.id)?;
+                    refusal = Some(e);
+                    break;
+                }
+            };
             if applied {
                 reversed += 1;
                 let mut tags = mem.tags.clone();
@@ -1267,7 +1288,7 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
             }
         }
         writeln!(out.stdout, "reversed {reversed} rollback entries")?;
-        return Ok(());
+        return refusal.map_or(Ok(()), Err);
     }
 
     // QUAL-2 (med/low review batch) — typed error instead of `unreachable!()`.
@@ -1386,7 +1407,17 @@ async fn run_store_backed_rollback(
         };
         let entry: autonomy::RollbackEntry = serde_json::from_str(&mem.content)
             .context("rollback entry content is not a valid RollbackEntry JSON")?;
-        let applied = autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await?;
+        // #3526 — a refused reversal prints a `not applied` receipt and exits
+        // non-zero; it NEVER prints `applied`, and the log row is left UNTAGGED
+        // so the entry stays reversible once the operator resolves the cause.
+        let applied =
+            match autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await {
+                Ok(applied) => applied,
+                Err(e) => {
+                    writeln!(out.stdout, "rollback {id}: not applied ({e})")?;
+                    return Err(e);
+                }
+            };
         if !mem.tags.iter().any(|t| t == "_reversed") {
             let mut tagged = mem.clone();
             tagged.tags.push("_reversed".to_string());
@@ -1408,6 +1439,11 @@ async fn run_store_backed_rollback(
         };
         let log = store.list(&ctx, &filter).await?;
         let mut reversed = 0usize;
+        // #3526 — fail CLOSED on a refused reversal: name the entry that was
+        // not applied, still report the count that WAS reversed before it, then
+        // propagate (non-zero exit). The refused entry stays UNTAGGED, so it
+        // remains reversible once the operator resolves the cause.
+        let mut refusal: Option<anyhow::Error> = None;
         for mem in &log {
             if mem.tags.iter().any(|t| t == "_reversed") {
                 continue;
@@ -1416,7 +1452,14 @@ async fn run_store_backed_rollback(
                 continue;
             };
             let applied =
-                autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await?;
+                match autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        writeln!(out.stdout, "rollback {}: not applied ({e})", mem.id)?;
+                        refusal = Some(e);
+                        break;
+                    }
+                };
             if applied {
                 reversed += 1;
                 let mut tagged = mem.clone();
@@ -1425,7 +1468,7 @@ async fn run_store_backed_rollback(
             }
         }
         writeln!(out.stdout, "reversed {reversed} rollback entries")?;
-        return Ok(());
+        return refusal.map_or(Ok(()), Err);
     }
 
     anyhow::bail!("run_store_backed_rollback entered without --rollback or --rollback-last");
