@@ -328,6 +328,51 @@ pub fn check_validity(
     Ok(())
 }
 
+/// v1.0.0 [#3540](https://github.com/alphaonedev/ai-memory-mcp/issues/3540) —
+/// refuse a delegation minted BEFORE the key binding it rides on, judged at the
+/// precision the delegation's own stamp carries: WHOLE SECONDS.
+///
+/// # Why the comparison has to be second-granular
+///
+/// `not_before` is second-floored by every issuer in this build, and that is a
+/// property of the FORMAT (see the timestamp-precision section above), not a
+/// detail one issuer could change. The binding stamp it is compared against —
+/// the allowlist entry's `bound_at`, written by `agents bind-key` /
+/// `identity hub-cache` — carries sub-second precision. Comparing the two
+/// instants directly therefore refused every delegation minted in the SAME
+/// SECOND as its binding, by the sub-second remainder alone: the documented
+/// ceremony (generate → register → bind-key → delegate, back to back) mints
+/// exactly that, so the shipped ceremony produced a bundle the hub always
+/// refused (`delegation_invalid`).
+///
+/// Comparing at the delegation's own granularity is the narrowest fix that
+/// makes the two stamps commensurable. It does not widen the window it exists
+/// to enforce: a delegation minted in an EARLIER second than the binding is
+/// still refused, which is the property this check exists for — a bundle
+/// harvested under a superseded root must not ride a newer binding. Only the
+/// equal-second case (and a finer-grained peer stamp inside that second) moves
+/// from refused to admitted.
+///
+/// # Errors
+///
+/// [`HubDelegationError::OutsideValidity`] when `not_before_rfc3339` precedes
+/// `bound_at_rfc3339`, and — fail closed — when either stamp does not parse.
+pub fn check_binding_order(
+    not_before_rfc3339: &str,
+    bound_at_rfc3339: &str,
+) -> Result<(), HubDelegationError> {
+    let issued = parse_rfc3339(not_before_rfc3339)?;
+    let bound = parse_rfc3339(bound_at_rfc3339)?;
+    // `timestamp()` is whole non-leap seconds since the epoch, floored in both
+    // directions, so this is the same truncation `SecondsFormat::Secs` applies
+    // when the stamp is rendered — and it is integer arithmetic, so there is no
+    // lossy cast to reason about (rust-1.98 PERF-07).
+    if issued.timestamp() < bound.timestamp() {
+        return Err(HubDelegationError::OutsideValidity);
+    }
+    Ok(())
+}
+
 fn parse_rfc3339(value: &str) -> Result<chrono::DateTime<chrono::Utc>, HubDelegationError> {
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -602,6 +647,83 @@ mod tests {
         bad.not_after = "nonsense".into();
         assert_eq!(
             check_validity(&bad.as_delegation(), NOW),
+            Err(HubDelegationError::OutsideValidity)
+        );
+    }
+
+    /// v1.0.0 #3540, facet 1 — ALLOWED and DENIED at the comparison itself.
+    ///
+    /// The stamps are the ones the f2 acceptance run actually produced: a
+    /// second-floored `not_before` from `ai-memory identity delegate` against a
+    /// nanosecond-precision `bound_at` from `agents bind-key`.
+    #[test]
+    fn the_binding_order_is_judged_at_whole_second_precision_3540() {
+        const BOUND: &str = "2026-09-08T15:27:39.859989219+00:00";
+
+        // ALLOWED — the documented ceremony: bind and delegate inside one
+        // wall-clock second. Before #3540 the sub-second remainder alone
+        // refused this, so every agent hello in the #3473 run was denied.
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:39Z", BOUND),
+            Ok(()),
+            "a delegation minted in the same second as its binding must be admitted"
+        );
+        // ALLOWED — a peer's finer-grained stamp inside that same second, on
+        // either side of the binding instant.
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:39.000001Z", BOUND),
+            Ok(())
+        );
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:39.999999Z", BOUND),
+            Ok(())
+        );
+        // ALLOWED — a later second, which was never in doubt.
+        assert_eq!(check_binding_order("2026-09-08T15:27:40Z", BOUND), Ok(()));
+
+        // DENIED — the property the check exists for MUST survive: a
+        // delegation minted one second BEFORE the binding is still refused.
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:38Z", BOUND),
+            Err(HubDelegationError::OutsideValidity),
+            "a delegation minted before the binding must stay refused"
+        );
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:38.999999Z", BOUND),
+            Err(HubDelegationError::OutsideValidity),
+            "the boundary is the second, not the sub-second remainder"
+        );
+        // DENIED — an hour earlier, the harvested-under-a-superseded-root case.
+        assert_eq!(
+            check_binding_order("2026-09-08T14:27:39Z", BOUND),
+            Err(HubDelegationError::OutsideValidity)
+        );
+    }
+
+    /// Fail closed: an unparseable stamp on EITHER side is a refusal, never an
+    /// "assume ordered".
+    #[test]
+    fn an_unparseable_stamp_refuses_the_binding_order_3540() {
+        assert_eq!(
+            check_binding_order("not-a-timestamp", "2026-09-08T15:27:39Z"),
+            Err(HubDelegationError::OutsideValidity)
+        );
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:39Z", ""),
+            Err(HubDelegationError::OutsideValidity)
+        );
+    }
+
+    /// The comparison is on the INSTANT, not the rendered text: the same
+    /// instant written in another offset compares equal.
+    #[test]
+    fn the_binding_order_compares_instants_not_offsets_3540() {
+        assert_eq!(
+            check_binding_order("2026-09-08T17:27:39+02:00", "2026-09-08T15:27:39.5Z"),
+            Ok(())
+        );
+        assert_eq!(
+            check_binding_order("2026-09-08T17:27:38+02:00", "2026-09-08T15:27:39.5Z"),
             Err(HubDelegationError::OutsideValidity)
         );
     }

@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::identity::hub_delegation::{
-    DelegationWire, check_ttl, check_validity, verify_hub_delegation,
+    DelegationWire, check_binding_order, check_ttl, check_validity, verify_hub_delegation,
 };
 
 use super::identity::{
@@ -263,6 +263,17 @@ impl AllowlistCache {
         self
     }
 
+    /// Insert (or replace) an agent's full snapshot row — the binding stamp,
+    /// the revoked delegated keys and the proven read prefixes.
+    ///
+    /// The ONE place `entries` is populated, so the row a decision is made
+    /// against always came through the same door as the root key beside it
+    /// ([`Self::from_file_parts`] is its production caller).
+    pub(crate) fn insert_entry(&mut self, entry: AllowlistEntry) -> &mut Self {
+        self.entries.insert(entry.agent_id.clone(), entry);
+        self
+    }
+
     /// Number of agents in the cache.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -295,11 +306,14 @@ impl RootKeyResolver for AllowlistCache {
             return Ok(());
         };
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
-        let bound = chrono::DateTime::parse_from_rfc3339(&entry.bound_at)
-            .map_err(|_| DenyReason::DelegationInvalid)?;
-        let issued = chrono::DateTime::parse_from_rfc3339(issued)
-            .map_err(|_| DenyReason::DelegationInvalid)?;
-        if issued < bound || entry.revoked_keys.contains(&key) {
+        // v1.0.0 #3540 — the ordering check runs at the precision the
+        // delegation's stamp carries (whole seconds), through the ONE
+        // definition that owns that contract. Comparing the second-floored
+        // `not_before` against a sub-second `bound_at` directly refused every
+        // delegation minted in the same second as its binding, which is what
+        // the shipped ceremony produces.
+        check_binding_order(issued, &entry.bound_at).map_err(|_| DenyReason::DelegationInvalid)?;
+        if entry.revoked_keys.contains(&key) {
             return Err(DenyReason::DelegationInvalid);
         }
         Ok(())
@@ -858,6 +872,116 @@ mod tests {
         }
     }
 
+    // --- v1.0.0 #3540: the binding-order check, at the snapshot row --------
+
+    /// The sub-second `bound_at` an `agents bind-key` / `identity hub-cache`
+    /// row actually carries, and the second-floored `not_before` the shipped
+    /// `identity delegate` ceremony mints in that same second.
+    const BOUND_AT_SUBSECOND: &str = "2026-09-08T15:27:39.859989219+00:00";
+    const ISSUED_SAME_SECOND: &str = "2026-09-08T15:27:39Z";
+    const ISSUED_ONE_SECOND_EARLIER: &str = "2026-09-08T15:27:38Z";
+
+    /// A cache holding both the enrolled root AND the snapshot row, which is
+    /// what makes `check_delegate` reach its comparison at all — a cache with
+    /// no row for the agent short-circuits to `Ok`.
+    fn cache_with_entry(bound_at: &str, revoked: Vec<String>) -> AllowlistCache {
+        let mut cache = resolver(RootBindAuthority::PossessionProof);
+        cache.insert_entry(AllowlistEntry {
+            agent_id: AGENT.to_owned(),
+            pubkey_b64: crate::identity::keypair::encode_public_base64(&root_key().verifying_key()),
+            bind_authority: "possession_proof".to_owned(),
+            bound_at: bound_at.to_owned(),
+            revoked_keys: revoked,
+            readable_prefixes: Vec::new(),
+        });
+        cache
+    }
+
+    fn delegate_key_id_b64() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(delegate_key().verifying_key().to_bytes())
+    }
+
+    /// ALLOWED (#3540 facet 1): the documented ceremony mints the delegation in
+    /// the SAME wall-clock second as the key binding. The stamps are the two
+    /// the f2 acceptance run produced, and before this fix the sub-second
+    /// remainder alone refused every one of them.
+    #[test]
+    fn allowed_a_delegation_minted_in_the_binding_second_is_admitted_3540() {
+        let cache = cache_with_entry(BOUND_AT_SUBSECOND, Vec::new());
+        let key = delegate_key().verifying_key().to_bytes();
+        assert_eq!(
+            cache.check_delegate(AGENT, &key, ISSUED_SAME_SECOND),
+            Ok(()),
+            "generate -> register -> bind-key -> delegate back to back is the SHIPPED \
+             ceremony; the hub must admit what it tells operators to mint"
+        );
+        // And the whole chain agrees, not merely the leaf check.
+        assert!(
+            cache
+                .resolve_delegate(AGENT, &key, ISSUED_SAME_SECOND)
+                .is_ok()
+        );
+    }
+
+    /// DENIED (#3540 facet 1): the property the check exists for survives — a
+    /// delegation minted one second BEFORE the binding is still refused, so a
+    /// bundle harvested under a superseded root cannot ride a newer binding.
+    #[test]
+    fn denied_a_delegation_minted_before_the_binding_is_still_refused_3540() {
+        let cache = cache_with_entry(BOUND_AT_SUBSECOND, Vec::new());
+        let key = delegate_key().verifying_key().to_bytes();
+        assert_eq!(
+            cache.check_delegate(AGENT, &key, ISSUED_ONE_SECOND_EARLIER),
+            Err(DenyReason::DelegationInvalid),
+            "the fix must not widen the window past the second the delegation names"
+        );
+        // `EnrolledRoot` is deliberately not `PartialEq` (it wraps a key), so
+        // the whole-chain assertion compares the refusal itself.
+        assert_eq!(
+            cache
+                .resolve_delegate(AGENT, &key, ISSUED_ONE_SECOND_EARLIER)
+                .err(),
+            Some(DenyReason::DelegationInvalid)
+        );
+        // A malformed stamp on either side is a refusal, never an assumption.
+        assert_eq!(
+            cache.check_delegate(AGENT, &key, "not-a-timestamp"),
+            Err(DenyReason::DelegationInvalid)
+        );
+        assert_eq!(
+            cache_with_entry("not-a-timestamp", Vec::new()).check_delegate(
+                AGENT,
+                &key,
+                ISSUED_SAME_SECOND
+            ),
+            Err(DenyReason::DelegationInvalid)
+        );
+    }
+
+    /// DENIED (#3540 facet 1): revocation is untouched by the precision fix. A
+    /// revoked delegated key is refused even when the binding order is
+    /// impeccable — the two conditions stayed independent.
+    #[test]
+    fn denied_a_revoked_delegated_key_is_refused_regardless_of_the_binding_second_3540() {
+        let cache = cache_with_entry(BOUND_AT_SUBSECOND, vec![delegate_key_id_b64()]);
+        let key = delegate_key().verifying_key().to_bytes();
+        assert_eq!(
+            cache.check_delegate(AGENT, &key, ISSUED_SAME_SECOND),
+            Err(DenyReason::DelegationInvalid),
+            "revocation must not become reachable-only-through-the-ordering-check"
+        );
+        // A DIFFERENT delegated key under the same row is unaffected.
+        let other = SigningKey::from_bytes(&[123u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            cache.check_delegate(AGENT, &other, ISSUED_SAME_SECOND),
+            Ok(())
+        );
+    }
+
     // --- membership ------------------------------------------------------
 
     #[test]
@@ -1219,7 +1343,7 @@ impl AllowlistCache {
                 bail!("wake-hub: root was bound after the cache snapshot");
             }
             check_readable_prefixes(&entry)?;
-            cache.entries.insert(entry.agent_id.clone(), entry.clone());
+            cache.insert_entry(entry.clone());
             cache.insert(
                 &entry.agent_id,
                 EnrolledRoot {
