@@ -100,11 +100,17 @@ pub fn readable_prefixes_for(agent_id: &str) -> Vec<String> {
 /// The daemon's private key is never opened here, and no other agent's key
 /// material is consulted.
 ///
+/// # The binding stamp (v1.0.0 #3540)
+///
+/// `now` is the instant this snapshot is being derived at. It is the CEILING
+/// for the row's `bound_at`, not its value: the value is the daemon key's own
+/// bind instant, which is stable across republishes. See `producer_bound_at`.
+///
 /// # Errors
 ///
 /// Refuses when the host has no `daemon.pub` — an operator asking to publish a
 /// binding for a key that does not exist has made a mistake worth stopping on,
-/// not a row worth inventing.
+/// not a row worth inventing — and when `now` is not RFC3339.
 pub fn daemon_producer_entry(key_dir: &Path, now: &str) -> Result<AllowlistEntry> {
     let public = crate::identity::keypair::load_public(
         crate::identity::keypair::DAEMON_KEYPAIR_LABEL,
@@ -123,10 +129,10 @@ pub fn daemon_producer_entry(key_dir: &Path, now: &str) -> Result<AllowlistEntry
         agent_id: crate::identity::sentinels::WAKE_HUB_PRODUCER.to_owned(),
         pubkey_b64: crate::identity::keypair::encode_public_base64(&public),
         bind_authority: DAEMON_KEY_DIR_AUTHORITY.to_owned(),
-        // The instant the operator asserted the binding. The hub refuses a
-        // delegation ISSUED before this (`AllowlistCache::check_delegate`), so
-        // stamping it now — never backdating — keeps that ordering meaningful.
-        bound_at: now.to_owned(),
+        // v1.0.0 #3540 — the instant the BINDING was made, read from the key
+        // file itself, so it is identical on every republish. See
+        // [`producer_bound_at`].
+        bound_at: producer_bound_at(key_dir, now)?,
         revoked_keys: Vec::new(),
         // #3505 — the reserved producer's id carries no `/`, so it has no
         // team / unit / org ancestor and proves no namespace read scope. Its
@@ -137,6 +143,79 @@ pub fn daemon_producer_entry(key_dir: &Path, now: &str) -> Result<AllowlistEntry
         readable_prefixes: Vec::new(),
     })
 }
+
+/// v1.0.0 [#3540](https://github.com/alphaonedev/ai-memory-mcp/issues/3540) —
+/// the STABLE `bound_at` for the reserved producer row.
+///
+/// # The defect this fixes
+///
+/// The row used to carry the PUBLISH instant. The refresher republishes every
+/// 30 s, so every republish moved the producer's `bound_at` forward past the
+/// `not_before` of the delegation the daemon's live session was established
+/// under; the hub's once-per-second re-validation then refused that session
+/// (`session authority expired or revoked`) and the wake sink reconnected.
+/// Every wake minted in the reconnect gap was dropped — a permanent, periodic
+/// loss window in production, on the shipped refresher cadence.
+///
+/// `bound_at` is a property of the BINDING, not of the snapshot, so it is read
+/// from the binding's own durable record: the modification time of this host's
+/// `daemon.pub` ([`crate::identity::keypair::public_key_bound_at`]). Two
+/// successive publishes of an unchanged key therefore produce a byte-identical
+/// row — which also stops the `identity.hub_allow` event the audit spine used
+/// to record on every single refresh for a grant that never changed.
+///
+/// # Why it is clamped, and never merely trusted
+///
+/// The returned stamp is never later than `now`. A key file dated in the future
+/// (a clock that ran backwards, a restore with a bad mtime) would otherwise
+/// publish `bound_at > refreshed_at`, which
+/// `AllowlistCache::from_file_parts` refuses for the WHOLE snapshot — turning
+/// one odd timestamp into a fleet-wide hello refusal. Clamping DEGRADES to the
+/// old per-publish stamp for that host
+/// (the producer reconnects each refresh) instead of taking the hub down, and
+/// it can only ever move the stamp LATER, i.e. stricter. The same degrade is
+/// the answer when the platform cannot report a modification time at all.
+///
+/// # Errors
+/// Refuses a `now` that is not RFC3339 — a snapshot instant that cannot be
+/// parsed cannot bound anything.
+fn producer_bound_at(key_dir: &Path, now: &str) -> Result<String> {
+    let ceiling = chrono::DateTime::parse_from_rfc3339(now)
+        .with_context(|| format!("identity hub-cache: snapshot instant {now} is not RFC3339"))?
+        .with_timezone(&chrono::Utc);
+    let bound = match crate::identity::keypair::public_key_bound_at(
+        crate::identity::keypair::DAEMON_KEYPAIR_LABEL,
+        key_dir,
+    ) {
+        Ok(bound) => bound,
+        Err(error) => {
+            tracing::warn!(
+                target: PRODUCER_BINDING_TRACE_TARGET,
+                error = %error,
+                "identity hub-cache: cannot read the daemon key's bind instant; stamping the \
+                 producer row with the publish instant instead. The row stays correct, but the \
+                 daemon's hub session will be re-established on every refresh (#3540)."
+            );
+            return Ok(now.to_owned());
+        }
+    };
+    if bound > ceiling {
+        tracing::warn!(
+            target: PRODUCER_BINDING_TRACE_TARGET,
+            bind_instant = %bound.to_rfc3339(),
+            snapshot_instant = %now,
+            "identity hub-cache: this host's daemon key is dated AFTER the snapshot being \
+             published; clamping the producer row's bound_at to the publish instant so the \
+             snapshot stays loadable. Check the host clock and the key directory (#3540)."
+        );
+        return Ok(now.to_owned());
+    }
+    Ok(bound.to_rfc3339())
+}
+
+/// `tracing` target for the producer-binding stamp decisions, so an operator
+/// can filter for exactly these without a substring match on the message.
+const PRODUCER_BINDING_TRACE_TARGET: &str = "identity::hub_cache::producer_binding";
 
 /// Export selected principals from SQLite. Revoked/unproven principals are
 /// omitted, so a refresh removes their authority instead of keeping stale data.
@@ -296,7 +375,23 @@ mod tests {
             crate::identity::keypair::encode_public_base64(&expected)
         );
         assert_eq!(row.bind_authority, DAEMON_KEY_DIR_AUTHORITY);
-        assert_eq!(row.bound_at, now);
+        // #3540 — the stamp is the KEY's bind instant, not the publish
+        // instant, and it never runs past the snapshot it rides in.
+        assert_eq!(
+            row.bound_at,
+            crate::identity::keypair::public_key_bound_at(
+                crate::identity::keypair::DAEMON_KEYPAIR_LABEL,
+                dir.path()
+            )
+            .expect("the staged key has a bind instant")
+            .to_rfc3339()
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&row.bound_at).expect("RFC3339 bound_at")
+                <= chrono::DateTime::parse_from_rfc3339(&now).expect("RFC3339 now"),
+            "bound_at must never be later than the snapshot instant, or the hub refuses \
+             the whole file"
+        );
         assert!(row.revoked_keys.is_empty());
         // And the hub accepts that authority for this principal only.
         let authority = RootBindAuthority::from_column(&row.bind_authority);
@@ -333,6 +428,86 @@ mod tests {
         .expect("drop the private half");
         daemon_producer_entry(dir.path(), &chrono::Utc::now().to_rfc3339())
             .expect("the public half is all this needs");
+    }
+
+    /// ALLOWED (#3540 facet 2): two successive derivations of the producer row
+    /// — the 30 s refresher's shape — produce a BYTE-IDENTICAL row.
+    ///
+    /// Before #3540 `bound_at` was the publish instant, so it moved forward on
+    /// every republish and the hub's once-per-second re-validation refused the
+    /// daemon's established session against the NEW binding. Every wake minted
+    /// in the resulting reconnect gap was dropped.
+    #[test]
+    fn the_producer_bound_at_is_stable_across_successive_publishes_3540() {
+        let dir = key_dir_with_daemon_key();
+        let first_publish = chrono::Utc::now();
+        let second_publish = first_publish + chrono::Duration::seconds(30);
+
+        let first = daemon_producer_entry(dir.path(), &first_publish.to_rfc3339()).expect("first");
+        let second =
+            daemon_producer_entry(dir.path(), &second_publish.to_rfc3339()).expect("second");
+
+        assert_eq!(
+            first.bound_at, second.bound_at,
+            "bound_at is a property of the BINDING, not of the snapshot"
+        );
+        assert_eq!(
+            first, second,
+            "the whole row must be byte-identical, so a refresh that changed nothing \
+             emits no identity.hub_allow event either"
+        );
+        assert_ne!(
+            second.bound_at,
+            second_publish.to_rfc3339(),
+            "the publish instant is exactly what must NOT be stamped"
+        );
+
+        // And the audit spine agrees: republishing an unchanged grant records
+        // nothing, because there is nothing to record.
+        let snapshot = |row: &AllowlistEntry, at: chrono::DateTime<chrono::Utc>| AllowlistFile {
+            version: ALLOWLIST_FILE_VERSION,
+            refreshed_at: Some(at.to_rfc3339()),
+            agents: vec![row.clone()],
+        };
+        let previous = snapshot(&first, first_publish);
+        let next = snapshot(&second, second_publish);
+        assert!(
+            events(Some(&previous), &next).expect("events").is_empty(),
+            "an unchanged producer grant must not re-emit an allow event on every refresh"
+        );
+    }
+
+    /// DENIED-direction (#3540 facet 2): a key file dated AFTER the snapshot
+    /// being published is clamped to the publish instant rather than stamped
+    /// verbatim.
+    ///
+    /// `bound_at > refreshed_at` makes the hub refuse the WHOLE snapshot
+    /// (`AllowlistCache::from_file_parts`), which on the shipped 60 s expiry is
+    /// a fleet-wide hello refusal. Clamping degrades to the pre-#3540 behaviour
+    /// for that one host — the producer re-establishes on each refresh — and
+    /// can only ever move the stamp LATER, never earlier, so it never widens
+    /// what the binding-order check admits.
+    #[test]
+    fn a_future_dated_daemon_key_clamps_the_producer_bound_at_3540() {
+        let dir = key_dir_with_daemon_key();
+        // A snapshot instant an hour BEFORE the key file's mtime is the same
+        // arithmetic as a key file dated an hour into the future.
+        let publish = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let row = daemon_producer_entry(dir.path(), &publish).expect("row");
+        assert_eq!(
+            row.bound_at, publish,
+            "a future-dated key must not publish bound_at past refreshed_at"
+        );
+    }
+
+    /// DENIED (#3540 facet 2): an unparseable snapshot instant is a refusal.
+    /// A publish instant that cannot be parsed cannot bound anything, and a row
+    /// whose ceiling is unknown is not a row worth inventing.
+    #[test]
+    fn an_unparseable_snapshot_instant_refuses_the_producer_row_3540() {
+        let dir = key_dir_with_daemon_key();
+        let err = daemon_producer_entry(dir.path(), "not-a-timestamp").expect_err("must refuse");
+        assert!(format!("{err:#}").contains("RFC3339"), "{err:#}");
     }
 
     /// The producer row rides the SAME audit spine as a store-derived one: it

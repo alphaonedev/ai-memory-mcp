@@ -617,6 +617,51 @@ pub fn load_public(agent_id: &str, dir: &Path) -> Result<VerifyingKey> {
         .with_context(|| format!("decoding public key {}", pub_path.display()))
 }
 
+/// v1.0.0 [#3540](https://github.com/alphaonedev/ai-memory-mcp/issues/3540) —
+/// the instant `<agent_id>.pub` came into existence under `dir`: when THIS
+/// host's binding to that key was made.
+///
+/// # Why the file's own timestamp is the binding instant
+///
+/// A key bound from the host key directory has no v97 ledger row to read a
+/// `bound_at` from — that is exactly what makes it `daemon_key_dir` rather than
+/// a proven authority. The public-key FILE is therefore the only durable record
+/// of when the binding happened, and it is a genuine one: [`ensure_keypair`] is
+/// idempotent when both halves are present, so a daemon restart does not rewrite
+/// it and the instant only moves when the key genuinely does.
+///
+/// It is deliberately NOT "now": a stamp re-read from the clock on every
+/// snapshot publish is a property of the SNAPSHOT, not of the binding, and the
+/// hub's binding-order check then evicts every session established before the
+/// latest publish.
+///
+/// # Trust
+///
+/// This grants nothing. It runs the same `enforce_key_path_chain_secure` gate
+/// [`load_public`] runs, so a key directory another local uid can write is
+/// refused before the timestamp is believed; and an attacker who could set this
+/// mtime already holds the `.priv` beside it and needs no timestamp to forge
+/// anything.
+///
+/// # Errors
+/// Returns an error when the agent-id shape is invalid, the key path chain is
+/// not owner-secure, the public key file is absent, or the platform cannot
+/// report a modification time for it.
+pub fn public_key_bound_at(agent_id: &str, dir: &Path) -> Result<chrono::DateTime<chrono::Utc>> {
+    validate::validate_agent_id_shape(agent_id)?;
+    let pub_path = agent_pub_path(dir, agent_id);
+    enforce_key_path_chain_secure(dir, &pub_path)?;
+    let modified = fs::metadata(&pub_path)
+        .and_then(|meta| meta.modified())
+        .with_context(|| {
+            format!(
+                "reading the bind instant (modification time) of {}",
+                pub_path.display()
+            )
+        })?;
+    Ok(chrono::DateTime::<chrono::Utc>::from(modified))
+}
+
 /// Load `agent_id`'s keypair from `dir`.
 ///
 /// The public file must exist (errors otherwise). The private file is

@@ -413,6 +413,20 @@ There is deliberately no way to publish this row by naming the principal:
 key history and the store loop would silently omit it, publishing a snapshot
 that looked successful and granted nothing.
 
+The row's `bound_at` is the daemon key's own bind instant — read from
+`daemon.pub` on this host — not the instant the snapshot was published, so it is
+IDENTICAL on every refresh (#3540). That matters because the hub refuses a
+delegation issued BEFORE the binding it rides on: a `bound_at` that moved
+forward on every 30 s republish would refuse the daemon's own established
+session on the very next re-validation, and the forwarder would reconnect once
+per refresh, dropping every wake minted in the gap. Revocation is still the
+same single lever — drop the switch and the row disappears.
+
+The same ordering check compares the two stamps at the precision the delegation
+carries, WHOLE SECONDS: a bundle minted in the same second as the binding is
+admitted (the ceremony above mints exactly that), and one minted in an earlier
+second is still refused.
+
 ### What `daemon_key_dir` does and does not attest
 
 It says: the operator of this host, with read access to its 0700 key directory,

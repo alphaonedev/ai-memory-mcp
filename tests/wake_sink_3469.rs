@@ -496,6 +496,16 @@ fn load_daemon_key(key_dir: &std::path::Path) -> ed25519_dalek::VerifyingKey {
         .public
 }
 
+/// The daemon's ENROLLED signing key — the one root the producer session is
+/// issued under (#3469). Used by the #3540 regression to mint the producer
+/// delegation the way `wake_sink::producer_identity` mints it.
+fn load_daemon_signing_key(key_dir: &std::path::Path) -> SigningKey {
+    ai_memory::identity::keypair::load(ai_memory::identity::keypair::DAEMON_KEYPAIR_LABEL, key_dir)
+        .expect("load daemon keypair")
+        .private
+        .expect("the staged key dir holds the private half")
+}
+
 /// Mint an `a2a-hub/join/v1` delegation the way `ai-memory identity delegate`
 /// does, so a test client presents the real thing to the real verifier.
 fn mint_delegation(
@@ -803,4 +813,128 @@ async fn the_default_posture_starts_no_forwarder_3469() {
         .expect("an unconfigured sink is a valid posture, not a fault")
         .is_none()
     );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3540 — the producer session survives an allowlist republish
+// ---------------------------------------------------------------------------
+
+/// ALLOWED (#3540 facet 2), end to end over a REAL socket with the REAL
+/// reloading resolver: an ESTABLISHED producer session survives TWO successive
+/// allowlist republishes and still delivers.
+///
+/// Before #3540 the producer row's `bound_at` was the PUBLISH instant, so every
+/// republish moved it forward past the `not_before` of the delegation the live
+/// session was established under; the hub's once-per-second re-validation then
+/// refused that session (`session authority expired or revoked`) and the wake
+/// sink reconnected. On the shipped 30 s refresher that is a permanent,
+/// periodic wake-loss window — the f2 acceptance run measured the reconnect
+/// churn directly (established 15:31:13, revoked 15:31:42, established
+/// 15:31:44, revoked 15:32:12, ...).
+///
+/// The republishes here go through the REAL publication path
+/// (`daemon_producer_entry` -> `derive_with_extra` -> `publish`), so the row is
+/// derived exactly as `identity hub-cache --daemon-producer` derives it on each
+/// refresher tick, and the hub reads it through `ReloadingAllowlist` — the
+/// resolver production uses, which re-parses on the new inode immediately.
+#[tokio::test]
+async fn the_producer_session_survives_two_allowlist_republishes_3540() {
+    use ai_memory::wake_hub::delegation_verifier::{ReloadingAllowlist, ScopedDelegationVerifier};
+
+    let recipient = uid("jorge");
+    let key_dir = staged_key_dir(true);
+    let daemon_root = load_daemon_signing_key(key_dir.path());
+    let producer_session = SigningKey::from_bytes(&[71u8; 32]);
+    let recipient_root = SigningKey::from_bytes(&[72u8; 32]);
+    let recipient_delegate = SigningKey::from_bytes(&[73u8; 32]);
+
+    let allow_dir = tempfile::tempdir().expect("tempdir");
+    let allow = allow_dir.path().join("allow.json");
+    let rows = |dir: &std::path::Path| {
+        vec![
+            producer_row(dir),
+            recipient_row(&recipient, &recipient_root),
+        ]
+    };
+    publish_allowlist(&allow, &rows(key_dir.path()));
+
+    let harness = Harness::start(
+        |_| {},
+        Arc::new(ScopedDelegationVerifier::new(
+            ReloadingAllowlist::new(allow.clone()).expect("arm the reloading resolver"),
+        )),
+        Arc::new(ai_memory::wake_hub::identity::SameUidAuthorizer::for_current_process()),
+    );
+
+    // The recipient's own session, so the wake at the end has somewhere to land.
+    let mut listener = harness.connect().await;
+    listener.delegation = mint_delegation(
+        &recipient,
+        &harness.hub_id,
+        &recipient_root,
+        &recipient_delegate,
+    );
+    listener.hello(&recipient, &recipient_delegate, &[]).await;
+    assert_eq!(listener.expect_frame().await.kind, Kind::Welcome);
+
+    // The producer joins under the daemon's OWN enrolled root, exactly as the
+    // boot-wired forwarder does.
+    let mut producer = harness.connect().await;
+    producer.delegation = mint_delegation(
+        WAKE_HUB_PRODUCER,
+        &harness.hub_id,
+        &daemon_root,
+        &producer_session,
+    );
+    producer.hello(WAKE_HUB_PRODUCER, &producer_session, &[]).await;
+    let welcome = producer.expect_frame().await;
+    assert_eq!(
+        welcome.kind,
+        Kind::Welcome,
+        "the producer must be admitted; hub said {:?}",
+        ai_memory::wake_hub::frame::decode_error(&welcome.payload)
+    );
+
+    // Two refresher ticks, each a full re-derivation + audited republish, each
+    // followed by more than one revalidation period.
+    for _ in 0..2 {
+        publish_allowlist(&allow, &rows(key_dir.path()));
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+    }
+
+    // The session is still open: no close, no error frame.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), producer.read_frame())
+            .await
+            .is_err(),
+        "the producer session must survive a republish that changed nothing"
+    );
+
+    // And it still has authority: a wake minted now reaches the recipient.
+    producer.wake(&recipient, "row-3540").await;
+    let frame = listener.expect_frame().await;
+    assert_eq!(frame.kind, Kind::Wake);
+    assert_eq!(frame.to, recipient);
+    assert_eq!(frame.from, WAKE_HUB_PRODUCER);
+    assert_eq!(
+        WakeMeta::decode(&frame.payload).expect("meta").inbox_row_id,
+        "row-3540"
+    );
+
+    harness.stop().await;
+}
+
+/// The unit-level half of the same property, without a socket: the reserved
+/// producer row derived on two successive refresher ticks is BYTE-IDENTICAL,
+/// so the binding the hub re-validates against never moves.
+#[test]
+fn the_producer_row_is_identical_across_refresher_ticks_3540() {
+    let key_dir = staged_key_dir(true);
+    let first = producer_row(key_dir.path());
+    let second = producer_row(key_dir.path());
+    assert_eq!(
+        first, second,
+        "bound_at is a property of the daemon KEY BINDING, not of the snapshot"
+    );
+    assert_eq!(first.agent_id, WAKE_HUB_PRODUCER);
 }

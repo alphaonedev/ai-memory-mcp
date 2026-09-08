@@ -42,8 +42,24 @@ fn delegated_key() -> SigningKey {
     SigningKey::from_bytes(&[22u8; 32])
 }
 
+/// The binding stamp every pre-#3540 fixture used: comfortably older than
+/// anything the tests mint, so the binding-order check never bit.
+const OLD_BOUND_AT: &str = "2026-09-01T00:00:00Z";
+
 /// Write a 0600 allowlist naming one agent with the given bind authority.
 fn write_allowlist(dir: &Path, authority: &str, key: &SigningKey) -> PathBuf {
+    write_allowlist_bound_at(dir, authority, key, OLD_BOUND_AT)
+}
+
+/// [`write_allowlist`], with the entry's `bound_at` under the caller's control
+/// so v1.0.0 #3540 can exercise the binding-order check with the SUB-SECOND
+/// stamp a real `agents bind-key` / `identity hub-cache` row carries.
+fn write_allowlist_bound_at(
+    dir: &Path,
+    authority: &str,
+    key: &SigningKey,
+    bound_at: &str,
+) -> PathBuf {
     let path = dir.join("allow.json");
     let body = serde_json::json!({
         "version": ALLOWLIST_FILE_VERSION,
@@ -52,7 +68,7 @@ fn write_allowlist(dir: &Path, authority: &str, key: &SigningKey) -> PathBuf {
             "agent_id": AGENT,
             "pubkey_b64": URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
             "bind_authority": authority,
-            "bound_at": "2026-09-01T00:00:00Z",
+            "bound_at": bound_at,
         }],
     });
     let mut file = std::fs::OpenOptions::new()
@@ -71,7 +87,27 @@ fn write_allowlist(dir: &Path, authority: &str, key: &SigningKey) -> PathBuf {
 
 /// Mint a delegation the way `ai-memory identity delegate` does.
 fn mint(hub_id: &str, ttl_secs: i64) -> Bytes {
-    let now = chrono::Utc::now();
+    mint_at(hub_id, ttl_secs, chrono::Utc::now())
+}
+
+/// The whole-second instant `secs_ago` seconds back — the exact value a
+/// second-floored `not_before` denotes, so a #3540 test can construct a
+/// `bound_at` that provably lands in the SAME second (or a later one).
+fn floored_secs_ago(secs_ago: i64) -> chrono::DateTime<chrono::Utc> {
+    let base = chrono::Utc::now() - chrono::Duration::seconds(secs_ago);
+    let rendered = base.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    chrono::DateTime::parse_from_rfc3339(&rendered)
+        .expect("a second-floored stamp round-trips")
+        .with_timezone(&chrono::Utc)
+}
+
+/// [`mint`], from an instant the caller pins, so #3540 can place `not_before`
+/// in an exactly-known second relative to the binding it is judged against.
+///
+/// `not_before` stays WHOLE SECONDS — that is the format's own precision
+/// (v1.0.0 #3511), and it is exactly what makes the binding-order comparison
+/// second-granular.
+fn mint_at(hub_id: &str, ttl_secs: i64, now: chrono::DateTime<chrono::Utc>) -> Bytes {
     let mut wire = DelegationWire {
         principal: AGENT.to_owned(),
         scope: A2A_HUB_SCOPE.to_owned(),
@@ -88,9 +124,14 @@ fn mint(hub_id: &str, ttl_secs: i64) -> Bytes {
 
 /// A hub whose verifier is loaded from a real 0600 allowlist file.
 fn hub_with_allowlist(authority: &str) -> (Harness, tempfile::TempDir) {
+    hub_with_allowlist_bound_at(authority, OLD_BOUND_AT)
+}
+
+/// [`hub_with_allowlist`], with the entry's binding stamp under test control.
+fn hub_with_allowlist_bound_at(authority: &str, bound_at: &str) -> (Harness, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    let path = write_allowlist(dir.path(), authority, &enrolled_key());
+    let path = write_allowlist_bound_at(dir.path(), authority, &enrolled_key(), bound_at);
     let cache = AllowlistCache::load_from_file(&path).expect("load allowlist");
     assert_eq!(cache.len(), 1);
     let harness = Harness::start(
@@ -378,5 +419,59 @@ async fn subscription_cannot_expand_the_authenticated_namespace_read_scope() {
     // acknowledged in its own right, so acceptance is proved directly instead
     // of inferred from a ping that round-trips after it.
     client.subscribe_acked(&[format!("#_inbox/{AGENT}")]).await;
+    hub.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3540 — the binding-order check, over a REAL socket
+// ---------------------------------------------------------------------------
+
+/// ALLOWED: the SHIPPED ceremony — generate, register, bind-key, delegate, all
+/// back to back — mints the delegation in the SAME wall-clock second as the
+/// binding. The snapshot's `bound_at` carries sub-second precision; the
+/// delegation's `not_before` is second-floored by the format. Before #3540 the
+/// sub-second remainder alone refused every such hello (`delegation_invalid`),
+/// which is what the #3473 acceptance run measured: 135 denials for 16 agents.
+#[tokio::test]
+async fn allowed_a_delegation_minted_in_the_binding_second_is_admitted_3540() {
+    // Pin the second so the same-second case is exercised on EVERY run, not
+    // only when the wall clock happens to cooperate: the delegation names
+    // `issued`, and the binding lands half a second later INSIDE that second.
+    let issued = floored_secs_ago(2);
+    let bound_at = (issued + chrono::Duration::milliseconds(500)).to_rfc3339();
+    let (hub, _dir) = hub_with_allowlist_bound_at("possession_proof", &bound_at);
+    let mut client = hub.connect().await;
+    client.delegation = mint_at(HUB, 3_600, issued);
+    client
+        .hello(AGENT, &delegated_key(), &[format!("#_inbox/{AGENT}")])
+        .await;
+    let welcome = client.expect_frame().await;
+    assert_eq!(
+        welcome.kind,
+        Kind::Welcome,
+        "bind-then-delegate inside one second is the documented ceremony; hub said {:?}",
+        ai_memory::wake_hub::frame::decode_error(&welcome.payload)
+    );
+    assert_eq!(hub.metrics.snapshot(0).denied_hello, 0);
+    hub.stop().await;
+}
+
+/// DENIED, the twin: a delegation minted in an EARLIER second than the binding
+/// is STILL refused. This is the property the check exists for — a bundle
+/// harvested under a superseded root must not ride a newer binding — and the
+/// #3540 precision fix must not widen past the second the delegation names.
+#[tokio::test]
+async fn denied_a_delegation_minted_before_the_binding_is_still_refused_3540() {
+    let binding_second = floored_secs_ago(2);
+    let bound_at = (binding_second + chrono::Duration::milliseconds(500)).to_rfc3339();
+    let (hub, _dir) = hub_with_allowlist_bound_at("possession_proof", &bound_at);
+    let mut client = hub.connect().await;
+    // Five seconds BEFORE the binding: a different, strictly earlier second.
+    client.delegation = mint_at(HUB, 3_600, binding_second - chrono::Duration::seconds(5));
+    client
+        .hello(AGENT, &delegated_key(), &[format!("#_inbox/{AGENT}")])
+        .await;
+    client.expect_error(ErrorCode::Unauthorized.as_u16()).await;
+    assert!(hub.metrics.snapshot(0).denied_hello >= 1);
     hub.stop().await;
 }
