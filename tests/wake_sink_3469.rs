@@ -886,7 +886,9 @@ async fn the_producer_session_survives_two_allowlist_republishes_3540() {
         &daemon_root,
         &producer_session,
     );
-    producer.hello(WAKE_HUB_PRODUCER, &producer_session, &[]).await;
+    producer
+        .hello(WAKE_HUB_PRODUCER, &producer_session, &[])
+        .await;
     let welcome = producer.expect_frame().await;
     assert_eq!(
         welcome.kind,

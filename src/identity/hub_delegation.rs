@@ -670,8 +670,14 @@ mod tests {
         );
         // ALLOWED — a peer's finer-grained stamp inside that same second, on
         // either side of the binding instant.
-        assert_eq!(check_binding_order("2026-09-08T15:27:39.000001Z", BOUND), Ok(()));
-        assert_eq!(check_binding_order("2026-09-08T15:27:39.999999Z", BOUND), Ok(()));
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:39.000001Z", BOUND),
+            Ok(())
+        );
+        assert_eq!(
+            check_binding_order("2026-09-08T15:27:39.999999Z", BOUND),
+            Ok(())
+        );
         // ALLOWED — a later second, which was never in doubt.
         assert_eq!(check_binding_order("2026-09-08T15:27:40Z", BOUND), Ok(()));
 

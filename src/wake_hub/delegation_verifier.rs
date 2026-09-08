@@ -312,8 +312,7 @@ impl RootKeyResolver for AllowlistCache {
         // `not_before` against a sub-second `bound_at` directly refused every
         // delegation minted in the same second as its binding, which is what
         // the shipped ceremony produces.
-        check_binding_order(issued, &entry.bound_at)
-            .map_err(|_| DenyReason::DelegationInvalid)?;
+        check_binding_order(issued, &entry.bound_at).map_err(|_| DenyReason::DelegationInvalid)?;
         if entry.revoked_keys.contains(&key) {
             return Err(DenyReason::DelegationInvalid);
         }
@@ -919,7 +918,11 @@ mod tests {
              ceremony; the hub must admit what it tells operators to mint"
         );
         // And the whole chain agrees, not merely the leaf check.
-        assert!(cache.resolve_delegate(AGENT, &key, ISSUED_SAME_SECOND).is_ok());
+        assert!(
+            cache
+                .resolve_delegate(AGENT, &key, ISSUED_SAME_SECOND)
+                .is_ok()
+        );
     }
 
     /// DENIED (#3540 facet 1): the property the check exists for survives — a
@@ -970,8 +973,13 @@ mod tests {
             "revocation must not become reachable-only-through-the-ordering-check"
         );
         // A DIFFERENT delegated key under the same row is unaffected.
-        let other = SigningKey::from_bytes(&[123u8; 32]).verifying_key().to_bytes();
-        assert_eq!(cache.check_delegate(AGENT, &other, ISSUED_SAME_SECOND), Ok(()));
+        let other = SigningKey::from_bytes(&[123u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            cache.check_delegate(AGENT, &other, ISSUED_SAME_SECOND),
+            Ok(())
+        );
     }
 
     // --- membership ------------------------------------------------------
