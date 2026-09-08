@@ -422,6 +422,14 @@ session on the very next re-validation, and the forwarder would reconnect once
 per refresh, dropping every wake minted in the gap. Revocation is still the
 same single lever — drop the switch and the row disappears.
 
+Operationally that means the stamp is the daemon key FILE's timestamp: anything
+that rewrites `daemon.pub` — re-staging the key, a restore that does not
+preserve modification times, a `touch` — moves the binding forward, and the
+daemon's hub session is re-established ONCE on the next refresh (one reconnect,
+then stable again). Copy key directories with `cp -p` / `rsync -a` if you would
+rather not pay even that one reconnect. Nothing else about the grant changes,
+and the daemon re-joins on its own.
+
 The same ordering check compares the two stamps at the precision the delegation
 carries, WHOLE SECONDS: a bundle minted in the same second as the binding is
 admitted (the ceremony above mints exactly that), and one minted in an earlier
