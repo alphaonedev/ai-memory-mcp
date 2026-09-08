@@ -392,11 +392,29 @@ def load_sdk_wake(repo: Path):
             f"{path} is missing: this harness drives the hub with the tree's own "
             "client and will not substitute a private copy of the wire format"
         )
+    import sys
+
     spec = importlib.util.spec_from_file_location("ai_memory_wake_3473", path)
     if spec is None or spec.loader is None:
         raise HarnessError(f"could not load {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # REGISTER BEFORE EXEC -- the documented importlib recipe, and not
+    # optional here. `wake.py` decorates `@dataclass(frozen=True)` at import
+    # time, and CPython >= 3.12 `dataclasses._is_type` resolves
+    # `sys.modules.get(cls.__module__).__dict__` while decorating. With the
+    # module absent from `sys.modules` that lookup returns None and the whole
+    # load dies with `AttributeError: 'NoneType' object has no attribute
+    # '__dict__'` -- which surfaced as "the N hub sessions never attached",
+    # i.e. as a hub fault rather than as a harness fault (Master, #3473
+    # phase-2 f2 leg; reproduced verbatim on f1 under 3.14.5).
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        # A half-executed module left in `sys.modules` would be handed to the
+        # next caller as if it had loaded.
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
@@ -1480,6 +1498,23 @@ def self_test() -> int:
     check(TEARDOWN_DEADLINE_SECS == 30.0,
           "the teardown deadline is a RUN bound; a per-thread bound at 256 "
           "agents is a 21-minute hang between legs")
+
+    # 5b. The hub arm's loader must actually load the SHIPPED client.
+    #
+    # This check exists because its absence was a live defect: every other
+    # assertion passed while `load_sdk_wake` could not execute `wake.py` at
+    # all, so `--self-test: PASS` coexisted with a hub arm that could never
+    # attach a session. A loader is only proven by loading.
+    wake_mod = load_sdk_wake(REPO)
+    for symbol in ("WakeListener", "Frame", "Kind", "DelegationBundle"):
+        check(hasattr(wake_mod, symbol),
+              f"the shipped wake client must expose {symbol}")
+    check(sys.modules.get("ai_memory_wake_3473") is wake_mod,
+          "the wake module must be registered in sys.modules under its spec name")
+    # The frozen dataclasses are the exact construct that failed to decorate,
+    # so touch one rather than trusting the import alone.
+    check(getattr(wake_mod.Frame, "__dataclass_fields__", None) is not None,
+          "wake.Frame must have been decorated as a dataclass")
 
     # 6. The reconcile ceiling is the server's, not a local guess.
     check(SHED_CODE == 503,

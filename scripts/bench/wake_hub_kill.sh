@@ -101,7 +101,6 @@ if [ "$per_agent" -ge 500 ]; then
   wb_die "${NOTIFIES} notifies over ${AGENTS} agents is ${per_agent} rows each, at or past the inbox read ceiling of 500; lower --notifies"
 fi
 
-wb_schema_init
 wb_enroll_agents "$AGENTS"
 
 wb_start_daemon "$WB_SOCKET"
