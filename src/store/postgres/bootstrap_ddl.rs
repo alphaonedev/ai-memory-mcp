@@ -59,18 +59,38 @@ use sqlx::PgPool;
 
 use crate::store::StoreResult;
 
-/// Schema the bootstrap creates into. The adapter demotes `search_path` to
-/// this schema before the bootstrap runs (#3055), and the existing pgvector
-/// `atttypmod` probe already pins the same value, so a relation found here is
-/// the relation `CREATE ... IF NOT EXISTS` would have found.
-const BOOTSTRAP_SCHEMA: &str = "public";
+/// The SQL that names the schema an unqualified `CREATE TABLE` /
+/// `CREATE INDEX` in the bundled script would actually create into.
+///
+/// v1.0.0 #3520 push-gate regression fix. The first cut of this module bound
+/// the literal `public`, on the premise that "the adapter demotes
+/// `search_path` to this schema before the bootstrap runs (#3055)". **That
+/// premise was wrong, and the mistake was a data-isolation defect, not a
+/// tuning one.** `normalize_app_search_path` deliberately KEEPS a
+/// caller-supplied first schema, so a connection opened with
+/// `options=-c search_path=<fresh>,public` creates into `<fresh>` — while the
+/// probe asked about `public`. On any database whose `public` was already
+/// bootstrapped, EVERY relation statement was therefore filtered out as
+/// "already present" and the connect finished with NO tables in its own
+/// schema (`42P01` on first use). Any role or connection with a non-public
+/// first `search_path` on a host that also has a public bootstrap silently
+/// lost its schema isolation.
+///
+/// `current_schema()` is the exact answer to the question the filter must
+/// ask: PostgreSQL creates an unqualified relation in the first EXISTING
+/// schema on `search_path`, and `current_schema()` returns precisely that
+/// schema. Asking the catalog about any other namespace is asking a
+/// different question than the one `CREATE ... IF NOT EXISTS` will answer.
+const EFFECTIVE_SCHEMA_SQL: &str = "current_schema()";
 
 /// One top-level statement's classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StatementKind {
     /// `CREATE [UNIQUE] INDEX IF NOT EXISTS <name>` or
     /// `CREATE TABLE IF NOT EXISTS <name>` — skippable when `<name>` is a
-    /// relation in [`BOOTSTRAP_SCHEMA`].
+    /// relation in the connection's EFFECTIVE schema (see
+    /// [`EFFECTIVE_SCHEMA_SQL`]), i.e. the one an unqualified `CREATE` would
+    /// target on THIS connection.
     Relation(String),
     /// `CREATE EXTENSION IF NOT EXISTS <name>` — skippable when installed.
     Extension(String),
@@ -324,6 +344,11 @@ pub(crate) fn parse(sql: &str) -> Vec<Statement> {
 /// What the catalog says is already there.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct CatalogInventory {
+    /// The schema the probe actually asked about — the connection's effective
+    /// first `search_path` schema. Carried so the boot log names it and so a
+    /// regression test can assert WHICH namespace was consulted, rather than
+    /// only that the counts came out right.
+    pub(crate) schema: String,
     pub(crate) relations: HashSet<String>,
     pub(crate) extensions: HashSet<String>,
 }
@@ -345,13 +370,18 @@ pub(crate) async fn probe(
     extensions: &[String],
 ) -> StoreResult<CatalogInventory> {
     let mut inventory = CatalogInventory::default();
+    inventory.schema = effective_schema(pool).await?;
     if !relations.is_empty() {
+        // `current_schema()` is evaluated BY THE SERVER on THIS connection, so
+        // the namespace filter is always the one an unqualified `CREATE` on
+        // this same connection would target. Binding a schema NAME from the
+        // client — a constant, or even a value read earlier — reintroduces the
+        // regression the moment the two disagree.
         let found: Vec<(String,)> = sqlx::query_as(
             "SELECT c.relname FROM pg_class c \
                JOIN pg_namespace n ON n.oid = c.relnamespace \
-              WHERE n.nspname = $1 AND c.relname = ANY($2)",
+              WHERE n.nspname = current_schema() AND c.relname = ANY($1)",
         )
-        .bind(BOOTSTRAP_SCHEMA)
         .bind(relations)
         .fetch_all(pool)
         .await
@@ -368,6 +398,19 @@ pub(crate) async fn probe(
         inventory.extensions = found.into_iter().map(|(name,)| name).collect();
     }
     Ok(inventory)
+}
+
+/// The schema an unqualified `CREATE` would target on `pool`'s connection.
+///
+/// # Errors
+///
+/// Propagates a probe failure; the caller then runs the unfiltered script.
+pub(crate) async fn effective_schema(pool: &PgPool) -> StoreResult<String> {
+    let (schema,): (String,) = sqlx::query_as(&format!("SELECT {EFFECTIVE_SCHEMA_SQL}"))
+        .fetch_one(pool)
+        .await
+        .map_err(|e| super::to_store_err("bootstrap effective-schema probe", e))?;
+    Ok(schema)
 }
 
 /// The outcome of filtering the bundled script against the catalog.
@@ -440,6 +483,7 @@ mod tests {
 
     fn inv(relations: &[&str], extensions: &[&str]) -> CatalogInventory {
         CatalogInventory {
+            schema: "public".to_string(),
             relations: relations.iter().map(|s| (*s).to_string()).collect(),
             extensions: extensions.iter().map(|s| (*s).to_string()).collect(),
         }
@@ -621,5 +665,200 @@ mod tests {
             "the missing index {missing} was not re-emitted"
         );
         assert_eq!(filtered.skipped, relations.len(), "one relation + vector");
+    }
+
+    // ------------------------------------------------------------------
+    // v1.0.0 #3520 push-gate regression — SCHEMA-SCOPED BOOTSTRAP.
+    //
+    // Runs iff AI_MEMORY_TEST_POSTGRES_URL is set; otherwise self-skips. No
+    // shape guard: the test creates and drops its OWN uuid-suffixed schema
+    // and touches nothing else, so it is safe against any store (the same
+    // reasoning as `tx_retry`'s live cell, and the reason the 2026-09-07
+    // lane rule needs no name/port guard here).
+    // ------------------------------------------------------------------
+
+    /// The exact defect the first cut of this module shipped: a probe that
+    /// asks about the LITERAL `public` instead of the connection's effective
+    /// schema.
+    ///
+    /// Kept as an explicit oracle so the regression below asserts the DEFECT
+    /// and not merely the fix. A test that only checked "the tables exist"
+    /// would also pass on a build where the filter was disabled outright, and
+    /// would tell a reviewer nothing about WHY it now passes.
+    async fn relations_present_in_literal_public(
+        pool: &sqlx::PgPool,
+        relations: &[String],
+    ) -> Vec<String> {
+        let found: Vec<(String,)> = sqlx::query_as(
+            "SELECT c.relname FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND c.relname = ANY($1)",
+        )
+        .bind(relations)
+        .fetch_all(pool)
+        .await
+        .expect("legacy literal-public probe");
+        found.into_iter().map(|(n,)| n).collect()
+    }
+
+    /// A connect pinned at a FRESH schema must create the full relation set
+    /// in THAT schema, even when `public` is already fully bootstrapped.
+    ///
+    /// This is the push-gate regression: `public` bootstrapped first, then a
+    /// `options=-c search_path=<fresh>,public` connect. Pre-fix the probe
+    /// asked about `public`, saw everything, filtered every `CREATE TABLE` /
+    /// `CREATE INDEX` out, and left `<fresh>` EMPTY — `42P01` on first use,
+    /// i.e. a silent loss of schema isolation for any role whose search_path
+    /// does not start at `public`.
+    #[tokio::test]
+    async fn a_schema_scoped_connect_creates_its_own_relations_3520() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let raw = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip: cannot reach AI_MEMORY_TEST_POSTGRES_URL: {e}");
+                return;
+            }
+        };
+
+        // STEP 1 — `public` must be fully bootstrapped, because that is the
+        // precondition that turns the bug on. A fresh database HIDES it.
+        crate::store::postgres::PostgresStore::connect(&url)
+            .await
+            .expect("plain connect bootstraps public");
+
+        let schema = format!("bootstrap_3520_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&raw)
+            .await
+            .expect("create isolated schema");
+
+        // Keep `public` on the path so the pgvector type still resolves,
+        // exactly as tests/lineage_schema_masks_loss_3172.rs does; unqualified
+        // CREATE then lands in `{schema}` because it is FIRST.
+        let scoped_url = if url.contains('?') {
+            format!("{url}&options=-c%20search_path%3D{schema}%2Cpublic")
+        } else {
+            format!("{url}?options=-c%20search_path%3D{schema}%2Cpublic")
+        };
+        let scoped = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&scoped_url)
+            .await
+            .expect("scoped pool");
+
+        // The bundled script itself: `parse` only reads statement SHAPES, and the
+        // `vector({EMBEDDING_DIM})` placeholder never appears in a relation name.
+        let statements = parse(SCHEMA);
+        let (relations, extensions) = wanted(&statements);
+        assert!(
+            !relations.is_empty(),
+            "the bundled script defines relations"
+        );
+
+        // ASSERTION 1 — the probe consults the CONNECTION's schema, not a
+        // constant. This is the fix, stated directly.
+        let inventory = probe(&scoped, &relations, &extensions)
+            .await
+            .expect("probe on the scoped connection");
+        assert_eq!(
+            inventory.schema, schema,
+            "the probe must ask about the schema an unqualified CREATE targets"
+        );
+
+        // ASSERTION 2 — on the FRESH schema the probe finds nothing, so
+        // nothing is filtered and the whole script runs.
+        assert!(
+            inventory.relations.is_empty(),
+            "a fresh schema holds none of the script's relations, but the probe \
+             reported {} of them present",
+            inventory.relations.len()
+        );
+        let filtered = filter(&statements, &inventory);
+        // The ONLY admissible skip on a fresh schema is the `CREATE EXTENSION`
+        // half: `pg_extension.extname` is database-GLOBAL, so an extension
+        // installed for `public` is installed for `{schema}` too and
+        // re-issuing it would be the redundant work the filter exists to drop.
+        // Every RELATION statement must survive — that is the regression.
+        assert_eq!(
+            filtered.skipped,
+            inventory.extensions.len(),
+            "on a fresh schema only the already-installed extensions may be \
+             skipped, but {} statements were dropped ({} extensions present)",
+            filtered.skipped,
+            inventory.extensions.len()
+        );
+        // Structural, not textual: every RELATION-kind statement must still be
+        // in the batch. (Counting by text prefix would be wrong — a statement's
+        // text carries its leading comments.)
+        let relation_statements: Vec<&Statement> = statements
+            .iter()
+            .filter(|s| matches!(s.kind, StatementKind::Relation(_)))
+            .collect();
+        assert_eq!(
+            relation_statements.len(),
+            relations.len(),
+            "every relation the script names must have a statement"
+        );
+        for st in &relation_statements {
+            assert!(
+                filtered.sql.contains(st.text.as_str()),
+                "a relation statement was dropped for a fresh schema: {}",
+                &st.text[..st.text.len().min(80)]
+            );
+        }
+
+        // ASSERTION 3 — the DEFECT oracle: the pre-fix literal-`public` probe
+        // WOULD have reported these same relations present, and would
+        // therefore have skipped every one of them. Without this the test
+        // could not distinguish the fix from a disabled filter.
+        let legacy = relations_present_in_literal_public(&scoped, &relations).await;
+        assert_eq!(
+            legacy.len(),
+            relations.len(),
+            "precondition: public must be fully bootstrapped for this regression \
+             to be meaningful (found {} of {})",
+            legacy.len(),
+            relations.len()
+        );
+
+        // STEP 2 — the real connect through the adapter.
+        crate::store::postgres::PostgresStore::connect(&scoped_url)
+            .await
+            .expect("schema-scoped connect");
+
+        // ASSERTION 4 — the full relation set now exists IN `{schema}`.
+        // Counted against the catalog, keyed on the isolated namespace.
+        let present: Vec<(String,)> = sqlx::query_as(
+            "SELECT c.relname FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = $1 AND c.relname = ANY($2)",
+        )
+        .bind(&schema)
+        .bind(&relations)
+        .fetch_all(&raw)
+        .await
+        .expect("census of the isolated schema");
+        let present: std::collections::HashSet<String> =
+            present.into_iter().map(|(n,)| n).collect();
+        let missing: Vec<&String> = relations.iter().filter(|r| !present.contains(*r)).collect();
+        assert!(
+            missing.is_empty(),
+            "the schema-scoped connect left {} of {} relations missing from {schema}: {:?}",
+            missing.len(),
+            relations.len(),
+            &missing[..missing.len().min(10)]
+        );
+
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .execute(&raw)
+            .await;
     }
 }
