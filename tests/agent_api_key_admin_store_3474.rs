@@ -35,6 +35,7 @@ use ai_memory::handlers::agent_api_key::{
 };
 use ai_memory::handlers::identity_binding::api_key_sha256_hex;
 use ai_memory::models::AgentRegistration;
+use ai_memory::storage::BindApiKeyOutcome;
 use ai_memory::store::{ApproveOutcome, CallerContext, GovernedAction, MemoryStore};
 use serde_json::json;
 
@@ -83,10 +84,13 @@ async fn admin_api_key_seam_parity(store: &Arc<dyn MemoryStore>, suffix: &str) {
     // --- bind / resolve / revoke, digest-keyed ---------------------------
     let token = format!("minted-token-{suffix}");
     let digest = api_key_sha256_hex(&token);
-    store
-        .bind_agent_api_key(&ctx, &target, &digest)
-        .await
-        .expect("bind_agent_api_key");
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx, &target, &digest)
+            .await
+            .expect("bind_agent_api_key"),
+        BindApiKeyOutcome::Bound
+    );
     assert_eq!(
         store
             .agent_id_for_api_key(&digest)
@@ -327,14 +331,20 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
 
     let digest_a = api_key_sha256_hex(&format!("token-a-{suffix}"));
     let digest_b = api_key_sha256_hex(&format!("token-b-{suffix}"));
-    store
-        .bind_agent_api_key(&ctx_a, &a, &digest_a)
-        .await
-        .expect("bind a");
-    store
-        .bind_agent_api_key(&ctx_b, &b, &digest_b)
-        .await
-        .expect("bind b");
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_a, &a, &digest_a)
+            .await
+            .expect("bind a"),
+        BindApiKeyOutcome::Bound
+    );
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_b, &b, &digest_b)
+            .await
+            .expect("bind b"),
+        BindApiKeyOutcome::Bound
+    );
 
     // The ONE snapshot both in-flight requests observe. Each holder sees the
     // other's key, so each pre-check says "apply immediately" — the exact
@@ -418,10 +428,13 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
     // ALLOWED — with another holder present the same call revokes, so the
     // refusal above is the control and not a broken seam.
     let digest_c = api_key_sha256_hex(&format!("token-c-{suffix}"));
-    store
-        .bind_agent_api_key(&ctx_c, &c, &digest_c)
-        .await
-        .expect("bind c");
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_c, &c, &digest_c)
+            .await
+            .expect("bind c"),
+        BindApiKeyOutcome::Bound
+    );
     match store
         .revoke_agent_api_key_unless_last(&ctx_b, &b)
         .await
@@ -516,4 +529,137 @@ async fn postgres_revoke_unless_last_atomicity_3529() {
     let store: Arc<dyn MemoryStore> = Arc::new(store);
     let suffix = format!("pg{}", uuid::Uuid::new_v4().simple());
     revoke_unless_last_atomicity_parity(&store, &suffix).await;
+}
+
+/// v1.0.0 #3535 (#3474 advisory 3) — one digest, one agent, on BOTH backends.
+///
+/// `agent_api_keys` is keyed by `sha256(token)`, and both adapters used to
+/// bind with an upsert that overwrote the row's `agent_id`. Re-binding a token
+/// that already belonged to another principal therefore MOVED the binding:
+/// one live bearer credential stopped authenticating as A and started
+/// authenticating as B, with no signal to either and nothing on the signed
+/// chain recording that a binding had moved. The seam now refuses and writes
+/// nothing.
+///
+/// Pinned in both directions, and once per adapter from ONE body: a parity
+/// claim proved by two hand-written tests survives only until someone edits
+/// one of them.
+async fn bind_conflict_parity(store: &Arc<dyn MemoryStore>, suffix: &str) {
+    clear_all_enrolled(store).await;
+
+    let a = format!("ai:k3535-holder-a-{suffix}");
+    let b = format!("ai:k3535-holder-b-{suffix}");
+    let ctx_a = CallerContext::for_agent(a.clone());
+    let ctx_b = CallerContext::for_agent(b.clone());
+    let digest = api_key_sha256_hex(&format!("shared-token-{suffix}"));
+
+    // A enrols the digest.
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_a, &a, &digest)
+            .await
+            .expect("A bind"),
+        BindApiKeyOutcome::Bound
+    );
+
+    // Re-asserting the SAME pair is an idempotent success, not an error —
+    // a retried enrolment must not fail.
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_a, &a, &digest)
+            .await
+            .expect("A re-bind"),
+        BindApiKeyOutcome::AlreadyBoundToSameAgent
+    );
+
+    // B cannot take it, and NOTHING moves.
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_b, &b, &digest)
+            .await
+            .expect("B bind attempt"),
+        BindApiKeyOutcome::DigestBoundToAnotherAgent
+    );
+    assert_eq!(
+        store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve after the refused re-point"),
+        Some(a.clone()),
+        "a refused re-bind must leave the incumbent binding exactly as it was"
+    );
+    let listed = store
+        .list_agent_api_keys()
+        .await
+        .expect("list after the refusal");
+    assert_eq!(
+        listed.len(),
+        1,
+        "a refused re-bind must not add a row either: {listed:?}"
+    );
+
+    // ALLOWED — B enrols a digest of its own, so the refusal above is a
+    // conflict rule and not a broken seam.
+    let digest_b = api_key_sha256_hex(&format!("b-token-{suffix}"));
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_b, &b, &digest_b)
+            .await
+            .expect("B own bind"),
+        BindApiKeyOutcome::Bound
+    );
+
+    // …and once A's binding is revoked the digest is free again, so the
+    // refusal is about the INCUMBENT and never a permanent ban on the token.
+    assert_eq!(
+        store
+            .revoke_agent_api_key(&ctx_a, &a)
+            .await
+            .expect("revoke A"),
+        1
+    );
+    assert_eq!(
+        store
+            .bind_agent_api_key(&ctx_b, &b, &digest)
+            .await
+            .expect("B bind after A revoked"),
+        BindApiKeyOutcome::Bound
+    );
+    assert_eq!(
+        store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve after re-enrolment"),
+        Some(b.clone())
+    );
+
+    clear_all_enrolled(store).await;
+}
+
+#[tokio::test]
+async fn sqlite_bind_conflict_refusal_3535() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("bind-conflict.db");
+    let _ = ai_memory::db::open(&db_path).expect("db::open (migrations)");
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    bind_conflict_parity(&store, "lt").await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_bind_conflict_refusal_3535() {
+    let Some(url) = postgres_url() else {
+        eprintln!(
+            "skip postgres_bind_conflict_refusal_3535: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("PostgresStore::connect (the certified tier must be exercised, not skipped)");
+    let store: Arc<dyn MemoryStore> = Arc::new(store);
+    let suffix = format!("pg{}", uuid::Uuid::new_v4().simple());
+    bind_conflict_parity(&store, &suffix).await;
 }

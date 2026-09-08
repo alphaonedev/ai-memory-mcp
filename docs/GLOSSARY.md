@@ -59,6 +59,18 @@ when `AI_MEMORY_AUTONOMOUS_HOOKS=1`. Results persist into
 `metadata.auto_tags` and `metadata.confirmed_contradictions`. Off by
 default because they add ~1–5 s of Ollama latency.
 
+## Backstop poll
+
+The NORMATIVE inbox poll every wake-plane client keeps running: at most
+`wake_sink::BACKSTOP_POLL_MAX` (sixty seconds) between reads, hub or no
+hub. It is the guarantee; a wake frame is only a prompt to read early.
+Bounding it is what turns every "may drop a hint" in the wake plane —
+a full queue, a lagging bus subscriber, an absent hub process — into a
+bounded LATENCY cost instead of an unbounded correctness one. Sixty
+seconds is a ceiling, not a target: a client that sees a
+`seq_high_watermark` gap should read immediately. See
+[wake-hub.md](wake-hub.html).
+
 ## Backup / restore
 
 Hot-backup-safe snapshot via SQLite `VACUUM INTO` plus a sha256
@@ -253,6 +265,15 @@ removal in v0.8.x), `hook`, `api`, `cli`, `import`, `consolidation`,
 `system`, `chaos`, `notify`. Used by admins for filtering and by the
 curator to avoid recursive tagging of its own outputs.
 
+## Subscribe acknowledgement
+
+The wake hub's echo of an APPLIED `subscribe` / `unsubscribe` frame
+(#3532). A client that sent a subscribe knows the router mutation has
+landed only when the ack comes back, so a wake published in the window
+between the send and the apply cannot be silently missed. It carries no
+memory content, like every other frame on this plane. See
+[wake-hub.md](wake-hub.html).
+
 ## Sync-daemon
 
 Background peer-to-peer knowledge mesh (pre-v0.7 primitive, still
@@ -296,6 +317,44 @@ preserved.
 
 Lamport-style causal timestamp the sync-daemon exchanges to avoid
 double-applying updates. Stored in `sync_state` table.
+
+## Wake frame
+
+The unit the wake plane carries. Exactly
+`{inbox_row_id, namespace, sender, digest, seq_high_watermark}` — no
+body and no title, on the bus frame or on the wire. `digest` is the
+SHA-256 of the notification body, so a recipient can verify what it
+later reads back without the hub ever having seen it. The encoding is
+capped: fields shed in a fixed order (`sender`, then `namespace`, then
+`digest`) and `inbox_row_id` + `seq_high_watermark` never shed; a hint
+that will not fit even then is REFUSED rather than truncated, because a
+truncated row id points at the wrong row. See
+[wake-hub.md](wake-hub.html).
+
+## Wake hub
+
+`ai-memory wake-hub` — the same-host, content-free wake plane
+(`src/wake_hub/`, v1.0.0 EPIC #3466). A mode-`0600` Unix-domain-socket
+switch that pushes a bounded HINT ("you have inbox row X") to agents on
+this host in about a millisecond, with peer-credential checks, a scoped
+`a2a-hub/join/v1` delegation per session, per-recipient bounded queues
+and per-connection token buckets. It holds NO durable truth: the
+ai-memory inbox row is the record and the [backstop
+poll](#backstop-poll) is the guarantee, so losing the hub degrades wake
+LATENCY and nothing else. It is transport-only and explicitly OUTSIDE
+the enterprise-federation certification (§6 NOT COVERED). See
+[wake-hub.md](wake-hub.html).
+
+## Wake sink
+
+The bridge from the in-process `agent_notified` broadcast bus
+(`src/inbox_wake.rs`, #3465) to the wake hub (`src/wake_sink/`, #3469),
+in-process for a co-hosted hub or over the hub's own socket for a
+separate one. Fire-and-forget with bounded buffering throughout: the
+durable inbox row is already committed before a wake fires, so a slow,
+full or absent hub costs a hint and a counter — never a committed
+notify and never backpressure on the notify path. Every drop cause has
+its own counter. See [wake-hub.md](wake-hub.html).
 
 ## See also
 

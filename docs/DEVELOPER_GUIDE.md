@@ -42,6 +42,10 @@ forensic/          -- L2-5 forensic bundle export/verify
 federation/        -- Quorum sync, peer attestation, mTLS allowlist
 kg/                -- Knowledge-graph traversal (recursive-CTE + AGE Cypher)
 subscriptions.rs   -- HMAC-signed webhook dispatch (mandatory at v0.7.0 post R3-S1.HMAC; unsigned dispatch DISABLED), DLQ, replay
+inbox_wake.rs      -- v1.0.0 #3465 (EPIC #3466) the in-process `agent_notified` broadcast bus: one content-free frame per COMMITTED memory_notify; also feeds `GET /api/v1/inbox/stream`
+wake_hub/          -- v1.0.0 #3467 (EPIC #3466) `ai-memory wake-hub`: the same-host 0600 Unix-domain-socket wake switch (peer creds, scoped join delegation, bounded per-recipient queues, token buckets)
+wake_sink/         -- v1.0.0 #3469 (EPIC #3466) the bridge from the wake bus to the hub (in-process for a co-hosted hub, over the socket for a separate one); fire-and-forget, bounded, every drop cause counted
+wake_client/       -- v1.0.0 #3470 (EPIC #3466) the client half behind `ai-memory wake-listen` and `ai-memory inbox --wait`: one session, one catch-up read per hint, and the ALWAYS-armed bounded backstop poll
 signed_events.rs   -- Append-only audit chain with V-4 cross-row hash chain
 ```
 
@@ -274,6 +278,10 @@ Federation autonomy (split from the former `src/federation.rs` into `mod.rs` + `
 ### `src/subscriptions.rs`
 
 v0.6.0.0 webhook subscriptions. Subscribers register a URL + shared secret + event/namespace/agent filters; matching events POST an HMAC-SHA256-signed JSON payload (header `X-Ai-Memory-Signature: sha256=<hex>`) over a fire-and-forget thread. SSRF hardening: `http://` only to `127.0.0.0/8` or `localhost`; everywhere else requires `https://`; RFC1918 / RFC4193 / link-local hosts rejected unless `allow_private_networks=true`. Stored secret is SHA-256 of the plaintext (plaintext returned once at registration). Public API: `Subscription`, `NewSubscription`, `insert()`, `delete()`, `list()`, `dispatch_event()`, `validate_url()`.
+
+### `src/inbox_wake.rs`, `src/wake_hub/`, `src/wake_sink/`, `src/wake_client/`
+
+v1.0.0 wake plane (EPIC #3466) — a same-host, CONTENT-FREE push lane that turns `memory_notify` from "write a row and dispatch nothing" into "write a row and hint the recipient in about a millisecond". Four pieces: `inbox_wake` owns the in-process `agent_notified` broadcast bus (one frame per COMMITTED notify; it also backs `GET /api/v1/inbox/stream`); `wake_hub` is the `ai-memory wake-hub` switch, a mode-0600 Unix-domain socket with peer-credential checks, a scoped `a2a-hub/join/v1` delegation per session, a length-delimited frame codec, per-recipient bounded queues and per-connection token buckets; `wake_sink` bridges the bus to the hub, in-process for a co-hosted hub or over the hub's own socket for a separate one; `wake_client` is the client half behind `ai-memory wake-listen` and `ai-memory inbox --wait`. Contrast with `subscriptions.rs`: that lane POSTs a signed payload to a remote URL, this one carries no payload at all. A frame is exactly `{inbox_row_id, namespace, sender, digest, seq_high_watermark}` — no body, no title, on the bus frame or on the wire — so the hub never sees memory content. The durable inbox row is committed BEFORE any hint is minted and remains the record: every bound in the plane may drop a hint, and a NORMATIVE `<= 60 s` backstop inbox poll (`wake_sink::BACKSTOP_POLL_MAX`) is armed whether or not a hub exists, so a slow, full, absent or removed hub costs wake LATENCY and a counter and nothing else. The plane is transport-only and is explicitly outside the enterprise-federation certification (`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` §6); its removability is mechanised by the `wake_backstop_always_armed_3472` row in `scripts/check-cert-removal-proof.sh`. Full contract, operator ceremony and metrics: [`wake-hub.md`](wake-hub.md). Public API: `inbox_wake::subscribe()`, `inbox_wake::install_sink()`, `wake_sink::BACKSTOP_POLL_MAX`, `wake_sink::build_substrate_wake()`, `wake_hub::server`, `wake_client::WakeStream`.
 
 ### `src/migrate.rs`
 

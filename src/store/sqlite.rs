@@ -1443,12 +1443,17 @@ impl MemoryStore for SqliteStore {
     }
 
     // ----- #2044 (v1.0.0, #2032-A) — per-agent api-key principal binding ----
+    /// #3535 — delegates to the `crate::storage` SSOT, which reads the
+    /// incumbent owner of the digest and writes inside one `BEGIN IMMEDIATE`,
+    /// so a digest already bound to ANOTHER agent is refused rather than
+    /// silently re-pointed. The guard is dropped before this returns, so no
+    /// blocking guard crosses an unrelated `.await` (CONCURRENCY-20).
     async fn bind_agent_api_key(
         &self,
         _ctx: &CallerContext,
         agent_id: &str,
         token_sha256: &str,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<crate::storage::BindApiKeyOutcome> {
         let conn = self.state.lock().await;
         db::bind_agent_api_key(&conn, agent_id, token_sha256).map_err(box_err)
     }

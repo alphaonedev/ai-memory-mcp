@@ -1047,9 +1047,104 @@ pub fn persist_self_report(
     Ok(())
 }
 
+/// v1.0.0 #3526 — the ONE refusal both rollback twins raise when the DURABLE
+/// row does not carry what the reversal just claimed to write.
+///
+/// A `curator --rollback` receipt (`rollback <id>: applied`) is a claim about
+/// the SUBSTRATE, not about whether a write was issued without error. The two
+/// diverge whenever the write funnel MERGES rather than REPLACES: the
+/// create-funnel `(title, namespace)` upsert resolves `priority` with
+/// `MAX(memories.priority, excluded.priority)` (`GREATEST(...)` on postgres),
+/// so a reversal that must LOWER a priority — the entire point of reversing an
+/// earlier raise — landed as a silent no-op that still printed `applied`. On an
+/// AUDITED reversal path that is a claims-truth defect: the log says the
+/// adjustment was undone, the substrate says otherwise.
+///
+/// Every arm therefore reads the row back and funnels a divergence through
+/// here, which (a) emits an `Error`-outcome leaf on the existing audit path so
+/// the refusal is on the tamper-evident chain, and (b) returns an error the CLI
+/// renders as a `not applied` receipt with a non-zero exit. Fail closed: a
+/// reversal that did not land is NEVER reported as one that did.
+fn refuse_unapplied_rollback(memory_id: &str, namespace: &str, divergence: &str) -> anyhow::Error {
+    let detail = format!("rollback not applied: memory {memory_id} — {divergence} (#3526)");
+    crate::audit::emit(
+        crate::audit::EventBuilder::new(
+            crate::audit::AuditAction::Update,
+            // A substrate rollback has no authenticated principal (#3203): the
+            // leaf records the curator sentinel, never a borrowed identity.
+            crate::audit::actor(
+                crate::identity::sentinels::AI_CURATOR,
+                crate::audit::synthesis_sources::DEFAULT_FALLBACK,
+                None,
+            ),
+            crate::audit::target_memory(memory_id, namespace, None, None, None),
+        )
+        // OWNERSHIP-03 — borrow for the leaf (`&str: Into<String>`); the owned
+        // `detail` moves into the returned error, so nothing is cloned.
+        .error(detail.as_str()),
+    );
+    anyhow::anyhow!(detail)
+}
+
+/// v1.0.0 #3526 — the divergence text for a post-write row that the ORDINARY
+/// read lane cannot see (absent, or `quarantined` / `tombstoned`).
+///
+/// Both twins deliberately verify through the FILTERED read (`db::get` /
+/// `MemoryStore::get`) even though the conn twin could reach the unfiltered
+/// `db::get_any`: the SAL trait exposes no unfiltered read, and a reversal that
+/// applied on one backend and refused on the other is precisely the per-backend
+/// drift the store-backed twin (#1748) exists to prevent. When the row the
+/// operator would inspect is not readable, the reversal's effect is
+/// UNVERIFIABLE — so the honest receipt is `not applied`, never `applied` and
+/// never a `no-op` (which would itself claim, falsely, that nothing changed).
+const UNVERIFIABLE_AFTER_WRITE: &str = "the durable row could not be read back after the write (absent, or in a \
+     non-recall-visible lifecycle state), so the reversal is UNVERIFIABLE";
+
+/// v1.0.0 #3526 — the three `contradiction_*` marker keys a CONSERVE reversal
+/// promises to clear, asserted against the DURABLE row.
+///
+/// The store twin clears them with `get → remove → store.store`, and
+/// `store.store` is the create funnel whose `ON CONFLICT` arm re-overlays the
+/// STORED row's reserved metadata keys
+/// ([`crate::RESERVED_UPSERT_METADATA_KEYS`]) on top of the incoming object.
+/// None of the three markers is in that set today, so the clear lands — but the
+/// set has grown before (#2941), and the day a marker joins it the clear would
+/// silently become a no-op that still reports `applied`: the PriorityAdjust
+/// defect in a different column. This read-back turns that drift into a loud
+/// refusal instead of a false receipt.
+///
+/// # Errors
+/// [`refuse_unapplied_rollback`] when the durable row still carries a marker.
+fn assert_contradiction_markers_cleared(durable: &Memory) -> Result<()> {
+    let Some(map) = durable.metadata.as_object() else {
+        return Ok(());
+    };
+    for key in [
+        field_names::CONTRADICTION_CONSERVED,
+        field_names::CONTRADICTION_SOFT_LOSER,
+        field_names::CONTRADICTION_WINNER_ID,
+    ] {
+        if map.contains_key(key) {
+            return Err(refuse_unapplied_rollback(
+                &durable.id,
+                &durable.namespace,
+                &format!(
+                    "metadata still carries the marker key `{key}` that the CONSERVE reversal cleared"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reverse a single rollback-log entry. Returns `true` if a reverse
 /// action was applied, `false` if the entry was already superseded
 /// (idempotent rollback).
+///
+/// Receipt honesty (#3526): every arm READS THE DURABLE ROW BACK and compares
+/// it to what the reversal intended. A write the substrate did not take is
+/// REFUSED through [`refuse_unapplied_rollback`] (audited, non-zero exit,
+/// `not applied` receipt) rather than reported as `applied`.
 ///
 /// Collision safety (#300 item 2): before re-inserting a snapshot we
 /// check whether another memory now owns the same
@@ -1086,6 +1181,15 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
                 let mut m = m.clone();
                 crate::storage::stamp_substrate_why_trace(&mut m.metadata);
                 db::insert_restore_same_id(conn, &m)?;
+                // #3526 — read-back: this arm's claim is that the snapshot's
+                // row is LIVE again at its OWN id.
+                if db::get(conn, &m.id)?.is_none() {
+                    return Err(refuse_unapplied_rollback(
+                        &m.id,
+                        &m.namespace,
+                        UNVERIFIABLE_AFTER_WRITE,
+                    ));
+                }
             }
             Ok(existed)
         }
@@ -1094,6 +1198,15 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
             let mut snapshot = snapshot.clone();
             crate::storage::stamp_substrate_why_trace(&mut snapshot.metadata);
             db::insert_restore_same_id(conn, &snapshot)?;
+            // #3526 — read-back: the claim is that the snapshot's row is LIVE
+            // again at its OWN id.
+            if db::get(conn, &snapshot.id)?.is_none() {
+                return Err(refuse_unapplied_rollback(
+                    &snapshot.id,
+                    &snapshot.namespace,
+                    UNVERIFIABLE_AFTER_WRITE,
+                ));
+            }
             Ok(true)
         }
         RollbackEntry::PriorityAdjust {
@@ -1101,7 +1214,15 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
             before,
             after: _,
         } => {
-            let _ = db::update(
+            // #3526 — this twin already writes through the EXPLICIT `db::update`
+            // funnel (`priority=?6`, a REPLACE), which is why the MAX-merge
+            // no-op was store-only. What it did NOT do was tell the truth about
+            // the outcome: the `(found, content_changed)` tuple was discarded
+            // and the arm returned `true` unconditionally, so `curator
+            // --rollback` printed `applied` for a memory that no longer exists
+            // (the store twin already returned `false` there). Both halves are
+            // now asserted against the durable row.
+            let (found, _content_changed) = db::update(
                 conn,
                 memory_id,
                 None,
@@ -1114,6 +1235,29 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
                 None,
                 None,
             )?;
+            if !found {
+                // The target row is gone — nothing was reversed. `false` is the
+                // "already superseded" no-op this fn documents, and it matches
+                // the store twin's `NotFound` arm (parity).
+                return Ok(false);
+            }
+            let Some(durable) = db::get(conn, memory_id)? else {
+                return Err(refuse_unapplied_rollback(
+                    memory_id,
+                    "",
+                    UNVERIFIABLE_AFTER_WRITE,
+                ));
+            };
+            if durable.priority != *before {
+                return Err(refuse_unapplied_rollback(
+                    memory_id,
+                    &durable.namespace,
+                    &format!(
+                        "priority is {} on the durable row, not the reversed-to {before}",
+                        durable.priority
+                    ),
+                ));
+            }
             Ok(true)
         }
         // v0.9.0 G7 (#1824) — reverse a CONSERVE: remove the single
@@ -1129,6 +1273,16 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
             canonical_tgt,
         } => {
             db::reverse_conserve_contradiction(conn, loser_id, canonical_src, canonical_tgt)?;
+            // #3526 — read-back: this arm's claim is that the three marker keys
+            // are CLEARED. This twin clears them with a targeted metadata
+            // UPDATE (no upsert merge), so the assertion is cheap insurance
+            // here and parity with the store twin, where the same clear rides
+            // the MERGING `store.store` funnel. A loser row the read lane
+            // cannot see is left alone: `reverse_conserve_contradiction` is
+            // itself a no-op on a missing row, so there is nothing to verify.
+            if let Some(durable) = db::get(conn, loser_id)? {
+                assert_contradiction_markers_cleared(&durable)?;
+            }
             Ok(true)
         }
     }
@@ -1168,6 +1322,13 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
 ///   reversal never destroys the summary while the originals are still
 ///   missing. The summary's `[consolidated]` title never collides with an
 ///   original.
+/// * **Receipt honesty (#3526):** the `PriorityAdjust` arm writes through the
+///   EXPLICIT [`crate::store::MemoryStore::update`] funnel addressed by id, not
+///   the create-funnel upsert whose `ON CONFLICT` arm resolves
+///   `priority = MAX(memories.priority, excluded.priority)` — under which a
+///   reversal that must LOWER a priority was a silent no-op that still reported
+///   `applied`. EVERY arm then reads the durable row back and refuses through
+///   [`refuse_unapplied_rollback`] when the substrate did not take the write.
 #[cfg(feature = "sal")]
 pub async fn reverse_rollback_entry_store(
     store: &dyn crate::store::MemoryStore,
@@ -1192,7 +1353,7 @@ pub async fn reverse_rollback_entry_store(
         m: &Memory,
     ) -> Result<()> {
         match store.restore_or_conflict(ctx, m).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             Err(StoreError::Conflict { id: occupant }) => anyhow::bail!(
                 "rollback refused: (title={:?}, namespace={:?}) is now owned by memory \
                  {occupant}, not the snapshot {} — resolve the conflict (delete the \
@@ -1201,6 +1362,18 @@ pub async fn reverse_rollback_entry_store(
                 m.namespace,
                 m.id
             ),
+            Err(e) => return Err(e.into()),
+        }
+        // #3526 — read-back: this arm's claim is that the snapshot's row is
+        // LIVE again at its OWN id, so assert it against the substrate rather
+        // than infer it from a write that returned without error.
+        match store.get(ctx, &m.id).await {
+            Ok(_) => Ok(()),
+            Err(StoreError::NotFound { .. }) => Err(refuse_unapplied_rollback(
+                &m.id,
+                &m.namespace,
+                UNVERIFIABLE_AFTER_WRITE,
+            )),
             Err(e) => Err(e.into()),
         }
     }
@@ -1218,9 +1391,22 @@ pub async fn reverse_rollback_entry_store(
             }
             // Delete the consolidated summary; `NotFound` → already removed
             // (idempotent no-op), matching the rusqlite `existed` bool.
-            match store.delete(ctx, result_id).await {
-                Ok(()) => Ok(true),
-                Err(StoreError::NotFound { .. }) => Ok(false),
+            let existed = match store.delete(ctx, result_id).await {
+                Ok(()) => true,
+                Err(StoreError::NotFound { .. }) => false,
+                Err(e) => return Err(e.into()),
+            };
+            // #3526 — read-back: the other half of this arm's claim is that the
+            // consolidated summary is GONE. `existed` distinguishes "deleted
+            // now" from "already absent"; neither is allowed to report a
+            // reversal whose summary is still live.
+            match store.get(ctx, result_id).await {
+                Err(StoreError::NotFound { .. }) => Ok(existed),
+                Ok(live) => Err(refuse_unapplied_rollback(
+                    result_id,
+                    &live.namespace,
+                    "the consolidated summary is still live after the delete",
+                )),
                 Err(e) => Err(e.into()),
             }
         }
@@ -1233,16 +1419,52 @@ pub async fn reverse_rollback_entry_store(
             before,
             after: _,
         } => {
-            // Restore the prior priority. get → mutate → store (UPSERT on the
-            // existing (title, namespace): no new row, so no collision guard
-            // needed). `NotFound` → the row is gone (idempotent no-op).
+            // v1.0.0 #3526 — restore the prior priority through the EXPLICIT
+            // update funnel, addressed BY ID, never the create funnel.
+            //
+            // Pre-fix this arm did `get → mem.priority = before → store.store`.
+            // `store.store` is the CREATE funnel, and its
+            // `ON CONFLICT(title, namespace) DO UPDATE` arm resolves
+            // `priority = MAX(memories.priority, excluded.priority)`
+            // (`GREATEST(...)` on postgres). The row always exists here, so the
+            // merge always fired: a reversal that RAISES a priority worked, and
+            // a reversal that must LOWER one — undoing an earlier raise, the
+            // common case — was a silent no-op that still reported `applied`.
+            // `MemoryStore::update` writes `priority = COALESCE($n, priority)`
+            // (postgres) / `priority=?6` (sqlite): a REPLACE on both backends.
+            //
+            // The upsert's MAX-merge is load-bearing for the create funnel's
+            // other callers and is deliberately UNCHANGED (#3526 scope); it is
+            // the rollback that stopped using it.
+            let patch = crate::store::UpdatePatch {
+                priority: Some(*before),
+                ..Default::default()
+            };
+            match store.update(ctx, memory_id, patch).await {
+                Ok(()) => {}
+                // The row is gone → nothing to reverse (idempotent no-op),
+                // the same `false` the pre-fix arm returned.
+                Err(StoreError::NotFound { .. }) => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+            // #3526 — READ THE DURABLE ROW BACK. The receipt is a claim about
+            // the substrate, so it is asserted against the substrate and not
+            // against the fact that a write was issued without error.
             match store.get(ctx, memory_id).await {
-                Ok(mut mem) => {
-                    mem.priority = *before;
-                    store.store(ctx, &mem).await?;
-                    Ok(true)
-                }
-                Err(StoreError::NotFound { .. }) => Ok(false),
+                Ok(durable) if durable.priority == *before => Ok(true),
+                Ok(durable) => Err(refuse_unapplied_rollback(
+                    memory_id,
+                    &durable.namespace,
+                    &format!(
+                        "priority is {} on the durable row, not the reversed-to {before}",
+                        durable.priority
+                    ),
+                )),
+                Err(StoreError::NotFound { .. }) => Err(refuse_unapplied_rollback(
+                    memory_id,
+                    "",
+                    UNVERIFIABLE_AFTER_WRITE,
+                )),
                 Err(e) => Err(e.into()),
             }
         }
@@ -1286,8 +1508,30 @@ pub async fn reverse_rollback_entry_store(
                         map.remove(field_names::CONTRADICTION_SOFT_LOSER);
                         map.remove(field_names::CONTRADICTION_WINNER_ID);
                     }
+                    // #3526 — the marker clear deliberately stays on
+                    // `store.store`: it is the only surface that preserves
+                    // `updated_at` (the create funnel writes
+                    // `updated_at = excluded.updated_at`, and `mem` carries the
+                    // stored value), which this reversal documents as a
+                    // guarantee; `MemoryStore::update` would stamp `now`. Every
+                    // OTHER column `store.store` merges is a fixed point here
+                    // because `mem` was just READ from this store
+                    // (`MAX(x, x) = x`, `COALESCE(x, x) = x`), so the merge can
+                    // only affect the metadata object — which is exactly what
+                    // the read-back below checks.
                     store.store(ctx, &mem).await?;
-                    Ok(true)
+                    match store.get(ctx, loser_id).await {
+                        Ok(durable) => {
+                            assert_contradiction_markers_cleared(&durable)?;
+                            Ok(true)
+                        }
+                        Err(StoreError::NotFound { .. }) => Err(refuse_unapplied_rollback(
+                            loser_id,
+                            &mem.namespace,
+                            UNVERIFIABLE_AFTER_WRITE,
+                        )),
+                        Err(e) => Err(e.into()),
+                    }
                 }
                 Err(StoreError::NotFound { .. }) => Ok(false),
                 Err(e) => Err(e.into()),

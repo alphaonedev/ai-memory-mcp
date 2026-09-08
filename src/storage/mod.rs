@@ -14093,22 +14093,104 @@ pub fn admit_attested_write(
     Ok(inserted == 1)
 }
 
+/// v1.0.0 [#3535] — the outcome of [`bind_agent_api_key`].
+///
+/// A typed answer rather than `()`, because the three cases this seam can
+/// reach are not interchangeable and the pre-#3535 `INSERT OR REPLACE`
+/// collapsed all of them into "success":
+///
+/// * a NEW digest was enrolled,
+/// * the SAME `(agent, digest)` pair was re-asserted — an idempotent no-op
+///   that must stay a success, because a retried enrolment is not an error,
+/// * the digest is already bound to a DIFFERENT agent, which the old
+///   statement silently RE-POINTED. That is the [#3474] advisory: one
+///   credential quietly stops authenticating as principal A and starts
+///   authenticating as principal B, with no signal to either, no second
+///   principal consulted, and nothing on the audit chain saying a binding
+///   moved. Reporting it as a successful bind is a WRONG answer about who a
+///   live credential speaks for; the caller is told instead, and nothing
+///   changes.
+///
+/// [#3474]: https://github.com/alphaonedev/ai-memory-mcp/issues/3474
+/// [#3535]: https://github.com/alphaonedev/ai-memory-mcp/issues/3535
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a bind outcome that is discarded cannot distinguish an enrolment \
+              from a refused re-point"]
+pub enum BindApiKeyOutcome {
+    /// The digest was not enrolled and is now bound to `agent_id`.
+    Bound,
+    /// The digest was ALREADY bound to this same `agent_id`. Nothing was
+    /// written — in particular `bound_at` keeps its original value, so a
+    /// retried enrolment cannot move the recorded enrolment instant.
+    AlreadyBoundToSameAgent,
+    /// NOTHING was written: the digest is bound to a DIFFERENT agent. The
+    /// incumbent's id is deliberately NOT carried — the caller supplied a
+    /// token and must not learn, from a refusal, which other principal that
+    /// token authenticates as.
+    DigestBoundToAnotherAgent,
+}
+
 /// #2044 (v1.0.0, #2032-A) — bind a per-agent api-key to `agent_id` by its
-/// `sha256(token)` digest (schema v83 `agent_api_keys`). Idempotent
-/// `INSERT OR REPLACE` on the digest PK. The RAW token is never stored.
+/// `sha256(token)` digest (schema v83 `agent_api_keys`). The RAW token is
+/// never stored.
+///
+/// v1.0.0 [#3535] — CONFLICT-REFUSE, not `INSERT OR REPLACE`. The digest is
+/// the primary key, so re-binding a token that already belongs to another
+/// agent used to MOVE the binding: `INSERT OR REPLACE` deletes the incumbent
+/// row and inserts the new one, so one live bearer credential silently
+/// changed which principal it authenticates as. On the fleet-reachable admin
+/// route that is a principal-substitution primitive; on the CLI it is a way
+/// to lose an enrolment to a paste error. Re-binding the SAME `(agent,
+/// digest)` pair stays an idempotent success, because a retried enrolment is
+/// not an error — and it is a true no-op, so the original `bound_at` survives
+/// (the same reasoning `pubkey_history::bind_agent_pubkey` uses to keep a
+/// re-asserted key's original window).
+///
+/// The read of the incumbent and the write run inside ONE `BEGIN IMMEDIATE`
+/// transaction, so the check and the act cannot be separated by the CLI twin
+/// writing the same file — the [#3529] lesson applied to the other half of
+/// this table.
 ///
 /// # Errors
 ///
-/// Surfaces `INSERT` failures.
-pub fn bind_agent_api_key(conn: &Connection, agent_id: &str, token_sha256: &str) -> Result<()> {
+/// Surfaces the record-stop gate refusal, and `BEGIN` / `SELECT` / `INSERT` /
+/// `COMMIT` failures.
+///
+/// [#3529]: https://github.com/alphaonedev/ai-memory-mcp/issues/3529
+/// [#3535]: https://github.com/alphaonedev/ai-memory-mcp/issues/3535
+pub fn bind_agent_api_key(
+    conn: &Connection,
+    agent_id: &str,
+    token_sha256: &str,
+) -> Result<BindApiKeyOutcome> {
+    use rusqlite::OptionalExtension as _;
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT OR REPLACE INTO agent_api_keys (token_sha256, agent_id, bound_at)
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let incumbent: Option<String> = tx
+        .query_row(
+            "SELECT agent_id FROM agent_api_keys WHERE token_sha256 = ?1",
+            params![token_sha256],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(owner) = incumbent {
+        // Explicit rollback on both arms, so "nothing was written" is a
+        // decision in the code rather than a side effect of dropping a guard.
+        tx.rollback()?;
+        return Ok(if owner == agent_id {
+            BindApiKeyOutcome::AlreadyBoundToSameAgent
+        } else {
+            BindApiKeyOutcome::DigestBoundToAnotherAgent
+        });
+    }
+    tx.execute(
+        "INSERT INTO agent_api_keys (token_sha256, agent_id, bound_at)
          VALUES (?1, ?2, ?3)",
         params![token_sha256, agent_id, now],
     )?;
-    Ok(())
+    tx.commit()?;
+    Ok(BindApiKeyOutcome::Bound)
 }
 
 /// #2044 — resolve the `agent_id` bound to a per-agent api-key by its

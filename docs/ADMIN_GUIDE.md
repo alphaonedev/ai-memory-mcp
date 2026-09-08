@@ -1390,6 +1390,91 @@ strictly worse than performing one over a channel the operator already
 accepted, and a revoke returns no secret.
 `POST /api/v1/agents/{id}/api-key/revoke` therefore works in every topology.
 
+### Enrolling a per-agent api-key: dispositions that will surprise you ([#3535](https://github.com/alphaonedev/ai-memory-mcp/issues/3535))
+
+These properties of `POST /api/v1/agents/{id}/api-key` are deliberate, are easy
+to hit on a first enrolment, and each answers with a distinct status.
+
+**The target must already be a registered agent.** An id the `_agents`
+roster does not know is refused:
+
+```json
+{ "error": "agent_not_registered", "agent_id": "svc-indexr" }
+```
+
+with `404`, and nothing is bound. A key bound to an id nothing registered is a
+credential for a principal that does not exist: under the `enforce` identity
+posture the presented key would bind an `X-Agent-Id` to that id, while the
+governance `registered` level, the pending-action approver gate and
+`agents bind-key` all consult the roster and see no such agent. A typo'd id
+would otherwise mint a live bearer secret none of those controls can see. The
+fix is one extra call by the same admin:
+
+```bash
+curl -sS -X POST https://daemon/api/v1/agents \
+  -H "x-api-key: $KEY" -H "X-Agent-Id: $ADMIN" \
+  -H 'content-type: application/json' \
+  -d '{"agent_id":"svc-indexer","agent_type":"service"}'
+# then enrol its key
+curl -sS -X POST https://daemon/api/v1/agents/svc-indexer/api-key \
+  -H "x-api-key: $KEY" -H "X-Agent-Id: $ADMIN" -d '{}'
+```
+
+This includes minting a key for **yourself**: the rule is about the target, not
+the caller, so register the admin principal too. A deployment that uses the
+approval gate has to anyway — approving a parked revoke requires a *registered*
+approver — and `POST /api/v1/agents` with your own `agent_id` is a
+self-registration that needs no admin role.
+
+Two deliberate asymmetries. **`ai-memory agents bind-api-key` is NOT gated
+this way** — it is a shell on the host that owns the data tier, where the
+operator can already write the table directly, and it stays the bootstrap and
+recovery path. **Revoke is not gated this way either**: refusing a revocation
+is strictly worse than performing one, and revoking a key bound to an
+unregistered id is exactly the cleanup needed for a binding that predates this
+rule.
+
+**One digest, one agent.** Binding a token whose `sha256` is already
+enrolled to a *different* agent is refused with `409`:
+
+```json
+{ "error": "api_key_already_bound", "key_fingerprint": "9f2c4a1b7e05" }
+```
+
+and nothing changes. `agent_api_keys` is keyed by the token digest, so the
+previous behaviour was to overwrite the row's agent: one live bearer
+credential silently stopped authenticating as A and started authenticating as
+B, with no signal to either and nothing on the audit chain saying a binding
+had moved — and the enrolment it replaced was silently deleted. The refusal
+deliberately does **not** name the incumbent (you supplied the token; a
+refusal must not tell you whose credential it is). Re-binding the **same**
+`(agent, token)` pair is still an idempotent success, and is a true no-op — the
+recorded `bound_at` does not move, so a retried enrolment cannot rewrite when
+the key was enrolled. The same rules apply to `ai-memory agents bind-api-key`,
+which exits non-zero with the same disposition. To move a token deliberately:
+revoke the incumbent binding first, or (better) mint a fresh token for the new
+agent.
+
+**When a queued MINT is approved, the token goes to the APPROVER.** If the
+identity namespace (`_agents`) carries a governance policy whose `write` level
+is `approve`, a mint is parked and the requester receives a `202` with a
+`pending_id` and **no token** — none has been minted yet. A token cannot be
+produced at queue time and delivered later without persisting it in raw form,
+which this surface never does, so the mint happens at APPLY time: the approving
+principal's `{"approve_pending_id": "<id>"}` request is what mints, and the
+`200` it receives is the only place that token ever appears. Plan for the
+approver to hand the token to the agent, or to the requester out of band; do
+not go looking for it in the `202`. (A queued BIND has no such wrinkle — its
+payload already carries the digest of a token you hold.)
+
+**The mint rate limit is a FIXED window, so the real bound is 2N at a
+boundary.** Ten mints per sixty seconds per admitted caller means a caller
+straddling a window edge can issue up to **twenty** across two adjacent
+seconds. That is burst shaping, not a bypass of the cap: the fixed window is
+what keeps the limiter's table bounded and each decision auditable from one
+`(window_start, count)` pair, and a sliding window is deliberately not used.
+Size any alerting on mints-per-minute accordingly.
+
 ### Peer-mesh security (v0.6.0+) — MUST READ before deploying sync
 
 The peer-to-peer sync mesh introduces new trust assumptions. Disclosed gaps and required mitigations:

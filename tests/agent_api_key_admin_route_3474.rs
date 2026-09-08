@@ -27,6 +27,17 @@
 //! * revoking your OWN key is immediate;
 //! * a mint over a transport the daemon has not promised is confidential is
 //!   refused, and binds nothing.
+//!
+//! v1.0.0 #3535 adds the four #3474 advisories to the same discipline:
+//!
+//! * the TARGET must be a REGISTERED agent — both forms refuse an id the
+//!   `_agents` roster does not know, nothing is bound, and registering that
+//!   very id makes the identical call succeed;
+//! * a token whose digest is already enrolled to ANOTHER agent is a `409` that
+//!   changes nothing, while re-asserting the SAME (agent, digest) pair stays an
+//!   idempotent success;
+//! * a MINT parked by namespace policy returns NO token in its `202` — the
+//!   token is minted at APPLY time and lands in the APPROVER's response.
 
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
@@ -36,8 +47,9 @@ use std::sync::{Arc, Mutex};
 
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::agent_api_key::{
-    MIN_SUPPLIED_TOKEN_BYTES, MINT_RATE_LIMIT_PER_WINDOW, RATE_LIMITED, TOKEN_TOO_SHORT,
-    TRANSPORT_REFUSAL, approval_subject, mark_credential_transport_confidential,
+    MIN_SUPPLIED_TOKEN_BYTES, MINT_RATE_LIMIT_PER_WINDOW, RATE_LIMITED, TARGET_NOT_REGISTERED,
+    TOKEN_ALREADY_BOUND, TOKEN_TOO_SHORT, TRANSPORT_REFUSAL, approval_subject,
+    mark_credential_transport_confidential,
 };
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -98,6 +110,7 @@ struct Fixture {
     router: axum::Router,
     store: Arc<dyn MemoryStore>,
     registry: Arc<EnrolledAgentKeys>,
+    db_path: PathBuf,
     _dir: TempDir,
 }
 
@@ -114,9 +127,16 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
     {
         // Register every admin so the approver-eligibility gate (which
         // requires a REGISTERED approver on the HTTP surface) can admit one.
+        //
+        // v1.0.0 #3535 — ALICE, the canonical TARGET, is registered here for
+        // the OTHER half of the same rule: the mint/bind form now refuses a
+        // target that is not on the `_agents` roster, so a fixture that left
+        // the target unregistered would be testing the refusal, not the
+        // control under test. `register_target` adds any further target a
+        // single test needs.
         let conn = ai_memory::db::open(&db_path).expect("db::open");
-        for a in admins {
-            ai_memory::db::register_agent(&conn, a, "human", &[]).expect("register admin");
+        for a in admins.iter().copied().chain(std::iter::once(ALICE)) {
+            ai_memory::db::register_agent(&conn, a, "human", &[]).expect("register agent");
         }
     }
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -175,8 +195,19 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
         router: ai_memory::build_router(api_key_state, app_state),
         store,
         registry,
+        db_path,
         _dir: dir,
     }
+}
+
+/// v1.0.0 #3535 — put an extra agent on the `_agents` roster.
+///
+/// The mint/bind form refuses an unregistered target, so a test whose subject
+/// is some OTHER control has to register the target it mints for; a test whose
+/// subject IS the refusal deliberately does not.
+fn register_target(fx: &Fixture, agent_id: &str) {
+    let conn = ai_memory::db::open(&fx.db_path).expect("reopen for register");
+    ai_memory::db::register_agent(&conn, agent_id, "human", &[]).expect("register target");
 }
 
 async fn call(
@@ -474,6 +505,13 @@ async fn the_rate_limiter_admits_the_budget_and_refuses_the_next_mint_3474() {
     const ADMIN: &str = "ai:key-admin-ratelimit";
     let _g = serial().await;
     let fx = fixture("ratelimit", &[ADMIN]);
+
+    // #3535 — every burst target is on the roster, INCLUDING the N+1th, so
+    // the refusal below can only be the limiter and not the registration gate.
+    for i in 0..MINT_RATE_LIMIT_PER_WINDOW {
+        register_target(&fx, &format!("ai:key-burst-{i}"));
+    }
+    register_target(&fx, "ai:key-burst-over");
 
     for i in 0..MINT_RATE_LIMIT_PER_WINDOW {
         let target = format!("ai:key-burst-{i}");
@@ -1085,4 +1123,337 @@ async fn a_well_formed_id_over_a_non_confidential_transport_still_refuses_3530()
         StatusCode::OK,
         "the refusal above must be the control, not a broken route: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3535 (#3474 advisory 1) — the TARGET must be a registered agent.
+// ---------------------------------------------------------------------------
+
+/// DENIED — neither form of the enrolment route will create a credential for a
+/// principal the `_agents` roster does not know, and the SAME call succeeds the
+/// moment the target is registered, so the refusal is a gate and not a broken
+/// route.
+///
+/// The defect this pins: a typo'd `{id}` used to mint a LIVE bearer token for
+/// an agent that does not exist. `enforce` would then bind an `X-Agent-Id` to
+/// that id while `is_registered_agent` — the same predicate the governance
+/// `registered` level and every approver-eligibility gate consult — says there
+/// is no such agent, which is two identity subsystems disagreeing about who
+/// exists.
+#[tokio::test]
+async fn an_unregistered_target_is_refused_on_both_forms_and_binds_nothing_3535() {
+    const ADMIN: &str = "ai:key-admin-unregistered";
+    const GHOST: &str = "ai:key-ghost-typo";
+    let _g = serial().await;
+    let fx = fixture("unregistered", &[ADMIN]);
+
+    let supplied = "operator-supplied-token-3535-long-enough-to-be-a-credential";
+    for body in [json!({}), json!({ "token": supplied })] {
+        let (status, _, resp) = call(&fx.router, mint_req(ADMIN, GHOST, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unregistered target must be refused: {resp}"
+        );
+        assert_eq!(resp["error"], TARGET_NOT_REGISTERED, "{resp}");
+        assert!(
+            !resp.to_string().contains(supplied),
+            "the refusal must not echo the supplied token: {resp}"
+        );
+        assert!(
+            resp.get("token").is_none(),
+            "a refused mint must not return a token: {resp}"
+        );
+    }
+
+    // Nothing durable and nothing live: no binding for the ghost, and the
+    // operator-supplied token does not authenticate.
+    assert_eq!(fx.registry.len(), 0, "a refused mint must enrol nothing");
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&api_key_sha256_hex(supplied))
+            .await
+            .expect("resolve"),
+        None
+    );
+    assert!(!token_authenticates(&fx.router, supplied).await);
+
+    // ALLOWED — register the very same id and the very same call works, in one
+    // extra call by the SAME principal.
+    register_target(&fx, GHOST);
+    let (status, body, _) = mint(&fx.router, ADMIN, GHOST).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "registering the target must make the refused call succeed: {body}"
+    );
+    let token = body["token"].as_str().expect("minted token").to_string();
+    assert!(token_authenticates(&fx.router, &token).await);
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&api_key_sha256_hex(&token))
+            .await
+            .expect("resolve"),
+        Some(GHOST.to_string())
+    );
+}
+
+/// The refusal is NOT reachable without admin, so it adds no enumeration
+/// oracle: an unregistered target and a registered one are still the same
+/// generic `403` for a non-admin.
+#[tokio::test]
+async fn the_unregistered_target_refusal_is_behind_the_admin_gate_3535() {
+    const ADMIN: &str = "ai:key-admin-ghostoracle";
+    const GHOST: &str = "ai:key-ghost-oracle";
+    let _g = serial().await;
+    let fx = fixture("ghostoracle", &[ADMIN]);
+
+    for target in [ALICE, GHOST] {
+        let (status, _, body) = call(&fx.router, mint_req(MALLORY, target, &json!({}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{target}: {body}");
+        assert_eq!(
+            body,
+            json!({"error": "admin role required"}),
+            "{target} must not reveal whether the agent is registered"
+        );
+    }
+}
+
+/// REVOKE is deliberately NOT gated on registration: refusing a revocation is
+/// strictly worse than performing one, and revoking a key bound to an
+/// unregistered id is exactly the cleanup an operator needs for a binding that
+/// predates this rule.
+#[tokio::test]
+async fn revoke_is_not_gated_on_target_registration_3535() {
+    const ADMIN: &str = "ai:key-admin-revokeghost";
+    const GHOST: &str = "ai:key-ghost-legacy";
+    let _g = serial().await;
+    let fx = fixture("revokeghost", &[ADMIN]);
+
+    // A binding that predates the rule: enrolled directly at the store seam,
+    // the way `ai-memory agents bind-api-key` would have.
+    let legacy = "legacy-enrolled-token-3535-that-predates-the-registration-rule";
+    let digest = api_key_sha256_hex(legacy);
+    {
+        let conn = ai_memory::db::open(&fx.db_path).expect("reopen");
+        assert_eq!(
+            ai_memory::db::bind_agent_api_key(&conn, GHOST, &digest).expect("legacy bind"),
+            ai_memory::storage::BindApiKeyOutcome::Bound
+        );
+    }
+    // A second holder, so the revoke is not the last enrolled key.
+    let (status, body, _) = mint(&fx.router, ADMIN, ADMIN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = call(&fx.router, revoke_req(ADMIN, GHOST, &json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "revoking ANOTHER principal's key is parked, not refused for being unregistered: {body}"
+    );
+    assert_ne!(
+        body["error"], TARGET_NOT_REGISTERED,
+        "revoke must never refuse on registration: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3535 (#3474 advisory 3) — one digest, one agent.
+// ---------------------------------------------------------------------------
+
+/// DENIED — binding a token that is already enrolled to ANOTHER agent is a
+/// `409` that changes nothing; ALLOWED — re-binding the SAME pair is still an
+/// idempotent success.
+///
+/// The defect this pins: `agent_api_keys` is keyed by `sha256(token)`, so the
+/// pre-#3535 upsert overwrote the row's `agent_id` — one LIVE bearer
+/// credential silently stopped authenticating as ALICE and started
+/// authenticating as BOB, with no signal to either and nothing on the signed
+/// chain saying a binding had moved.
+#[tokio::test]
+async fn a_digest_bound_to_another_agent_is_refused_not_repointed_3535() {
+    const ADMIN: &str = "ai:key-admin-repoint";
+    const BOB: &str = "ai:key-bob-repoint";
+    let _g = serial().await;
+    let fx = fixture("repoint", &[ADMIN]);
+    register_target(&fx, BOB);
+
+    let token = "operator-supplied-token-3535-shared-between-two-agents-attempt";
+    let digest = api_key_sha256_hex(token);
+    let (status, _, body) = call(
+        &fx.router,
+        mint_req(ADMIN, ALICE, &json!({ "token": token })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string())
+    );
+
+    // The re-point attempt.
+    let (status, _, body) =
+        call(&fx.router, mint_req(ADMIN, BOB, &json!({ "token": token }))).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "re-pointing a bound digest must be refused: {body}"
+    );
+    assert_eq!(body["error"], TOKEN_ALREADY_BOUND, "{body}");
+    assert!(
+        !body.to_string().contains(token),
+        "the refusal must not echo the token: {body}"
+    );
+    assert!(
+        !body.to_string().contains(ALICE),
+        "the refusal must not name the incumbent principal: {body}"
+    );
+
+    // NOTHING changed: the durable row, the live registry and what the token
+    // actually authenticates as are all untouched.
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string()),
+        "a refused re-bind must leave the incumbent binding exactly as it was"
+    );
+    assert_eq!(fx.registry.len(), 1);
+    assert!(token_authenticates(&fx.router, token).await);
+
+    // ALLOWED — the SAME (agent, digest) pair is an idempotent success, so the
+    // refusal above is a conflict rule and not a ban on retrying an enrolment.
+    let (status, _, body) = call(
+        &fx.router,
+        mint_req(ADMIN, ALICE, &json!({ "token": token })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a re-assertion must succeed: {body}"
+    );
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&digest)
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string())
+    );
+    assert_eq!(fx.registry.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3535 (#3474 advisory 2) — a queued MINT's token goes to the APPROVER.
+// ---------------------------------------------------------------------------
+
+/// Put an `Approve` WRITE level on the identity namespace, so the mint form
+/// parks instead of acting.
+///
+/// The governance blob is flattened into `metadata.governance` exactly as the
+/// namespace-standard surface writes it, so this drives the SAME
+/// `resolve_governance_policy` the handler consults rather than a test-only
+/// shortcut.
+fn seed_identity_namespace_write_approve(fx: &Fixture, owner: &str) {
+    use ai_memory::handlers::agent_api_key::IDENTITY_NAMESPACE;
+    let conn = ai_memory::db::open(&fx.db_path).expect("reopen for governance seed");
+    let now = chrono::Utc::now().to_rfc3339();
+    let standard = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: format!("_standards-{IDENTITY_NAMESPACE}"),
+        title: format!("standard for {IDENTITY_NAMESPACE}"),
+        content: "#3535 identity-namespace write policy".to_string(),
+        source: "test".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: json!({ "agent_id": owner, "governance": { "write": "approve" } }),
+        ..ai_memory::models::Memory::default()
+    };
+    let std_id = ai_memory::db::insert(&conn, &standard).expect("insert standard");
+    ai_memory::db::set_namespace_standard(&conn, IDENTITY_NAMESPACE, &std_id, None)
+        .expect("set_namespace_standard");
+}
+
+/// A signed `{"approve_pending_id": …}` POST to the MINT route — the same K10
+/// envelope `revoke_req` builds, on the other verb.
+fn mint_approve_req(caller: &str, target: &str, pending_id: &str) -> Request<Body> {
+    let body = json!({ "approve_pending_id": pending_id });
+    let raw = serde_json::to_string(&body).expect("serialise");
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let subject = approval_subject(pending_id, caller);
+    let sig = common::sign_canonical_envelope(HMAC_SECRET, &ts, "POST", &subject, &raw);
+    Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{target}/api-key"))
+        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_AGENT_ID, caller)
+        .header(ai_memory::HEADER_AI_MEMORY_SIGNATURE, sig)
+        .header(ai_memory::HEADER_AI_MEMORY_TIMESTAMP, ts)
+        .header("content-type", "application/json")
+        .body(Body::from(raw))
+        .expect("build mint approve request")
+}
+
+/// The documented, deliberately surprising consequence of never persisting a
+/// raw token: when namespace policy parks a MINT, the requester's `202`
+/// carries NO token — there is none yet — and the token is minted at APPLY
+/// time, so it appears exactly once, in the APPROVER's `200`.
+///
+/// Pinned because it is the shape an operator would otherwise go looking for
+/// in the wrong response, and because "the requester never sees it" is a
+/// property of the flow, not an accident of this test.
+#[tokio::test]
+async fn a_queued_mint_returns_its_token_to_the_approver_not_the_requester_3535() {
+    const REQUESTER: &str = "ai:key-admin-queuedmint";
+    const APPROVER: &str = "ai:key-admin-queuedmint-2";
+    let _g = serial().await;
+    let fx = fixture("queuedmint", &[REQUESTER, APPROVER]);
+    seed_identity_namespace_write_approve(&fx, REQUESTER);
+
+    // The REQUESTER's mint is parked, and its 202 carries no secret.
+    let (status, queued, _) = mint(&fx.router, REQUESTER, ALICE).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "an Approve write level must park the mint: {queued}"
+    );
+    assert_eq!(queued["status"], "pending_approval", "{queued}");
+    assert!(
+        queued.get("token").is_none(),
+        "the requester's 202 must carry NO token — none has been minted yet: {queued}"
+    );
+    assert_eq!(fx.registry.len(), 0, "a queued mint enrols nothing");
+    let pending_id = queued["pending_id"]
+        .as_str()
+        .expect("pending_id")
+        .to_string();
+
+    // The APPROVER's call is what mints, and the token appears in ITS response.
+    let (status, _, applied) =
+        call(&fx.router, mint_approve_req(APPROVER, ALICE, &pending_id)).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    let token = applied["token"]
+        .as_str()
+        .expect("the approver's response carries the minted token")
+        .to_string();
+    assert_eq!(applied["agent_id"], ALICE, "{applied}");
+
+    // …and it is a real credential for the TARGET, not a placeholder.
+    assert!(
+        token_authenticates(&fx.router, &token).await,
+        "the token handed to the approver must authenticate"
+    );
+    assert_eq!(
+        fx.store
+            .agent_id_for_api_key(&api_key_sha256_hex(&token))
+            .await
+            .expect("resolve"),
+        Some(ALICE.to_string())
+    );
+    assert_eq!(fx.registry.len(), 1);
 }

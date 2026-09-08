@@ -55,6 +55,37 @@
 //! [`SUPPLIED_TOKEN_FLOOR_BYTES`] the floor it may never be lowered past, and
 //! the refusal echoes nothing of the candidate and audits no digest.
 //!
+//! **Registered targets only ([#3535]).** The mint/bind form REFUSES a target
+//! that is not on the `_agents` roster, with [`TARGET_NOT_REGISTERED`]. A key
+//! bound to an id nothing registered is a credential for a principal that does
+//! not exist: `enforce` would bind an `X-Agent-Id` to it while
+//! `is_registered_agent` — the SAME predicate the governance `registered`
+//! level and every approver-eligibility gate consult, and the one
+//! `bind_agent_pubkey` has always required — says there is no such agent. Two
+//! identity subsystems disagreeing about who exists is the defect; a typo'd
+//! `{id}` minting a live bearer secret is how it arrives. This is a NETWORK-
+//! surface rule, exactly like [`MIN_SUPPLIED_TOKEN_BYTES`]: `ai-memory agents
+//! bind-api-key` is a shell on the data tier, where the operator can already
+//! write the table directly, and it stays the deliberate bootstrap/recovery
+//! path. The refusal is reachable only after `require_admin` admits, and the
+//! caller it admits can read the whole roster with `GET /api/v1/agents`, so it
+//! is no oracle beyond what the gate already grants. It is actionable in one
+//! call by the same principal: `POST /api/v1/agents` registers the target,
+//! then this route enrols its key. REVOKE is deliberately NOT gated this way.
+//!
+//! **One digest, one agent ([#3535]).** The bind form REFUSES a token whose
+//! digest is already enrolled to a DIFFERENT agent, with
+//! [`TOKEN_ALREADY_BOUND`] and nothing changed. `agent_api_keys` is keyed by
+//! `sha256(token)`, and the pre-#3535 upsert overwrote the row's `agent_id`,
+//! so re-binding another principal's token silently MOVED the binding: one
+//! live credential stopped authenticating as A and started authenticating as
+//! B, with no signal to either and nothing on the chain saying so. Re-binding
+//! the SAME `(agent, digest)` pair stays an idempotent success — a retried
+//! enrolment is not an error — and is a true no-op, so the recorded
+//! enrolment instant survives. The refusal names no incumbent: the caller
+//! supplied a token, and a refusal must not tell them which other principal
+//! it speaks for.
+//!
 //! **No-log token transport.** The raw token is read from the request body as
 //! raw [`axum::body::Bytes`] and parsed HERE, so no extractor rejection can
 //! render any part of the body into an error string; a parse failure answers
@@ -83,7 +114,12 @@
 //! [`MINT_RATE_LIMIT_WINDOW_SECS`] per admitted caller, in a BOUNDED table
 //! ([`RATE_LIMIT_MAX_TRACKED_CALLERS`]) that refuses rather than admits when
 //! it is full of live windows — a limiter that fails OPEN under memory
-//! pressure is not a limiter.
+//! pressure is not a limiter. The window is FIXED, not sliding, so a caller
+//! straddling a boundary can issue up to 2N — twenty mints — across two
+//! adjacent seconds ([#3535]); that is a burst-shaping property, not a bypass
+//! of the cap, and the fixed window is what keeps the table bounded and each
+//! decision auditable from one `(window_start, count)` pair. A sliding window
+//! is deliberately NOT used.
 //!
 //! **Approval gate.** Revoking ANOTHER principal's key, or the LAST enrolled
 //! key on the deployment, queues a `pending_actions` row instead of acting;
@@ -97,6 +133,20 @@
 //! identity gate INERT in every mode (the [#1985] unsatisfiable-default rule),
 //! so "revoke one agent" and "disarm the fleet's identity binding" are the
 //! same keystroke unless someone else looks.
+//!
+//! **A queued MINT's token goes to the APPROVER, not the requester
+//! ([#3535]).** When the identity namespace's policy parks a mint, the 202
+//! carries a `pending_id` and NO token — there is none yet. A token cannot be
+//! produced at queue time and delivered later without persisting it in raw
+//! form, which is the one thing this surface never does, so the mint is
+//! DEFERRED to the apply step: the approver's own `{"approve_pending_id":
+//! …}` request is what mints, and the `200` it receives is the ONLY place
+//! that token ever appears. The requester must therefore obtain it from the
+//! approver out of band, or (the usual shape) the approver hands it to the
+//! agent directly. The queued BIND form has no such wrinkle — its payload
+//! already carries the digest of a token the operator holds. Documented on
+//! the route rows and in the admin guide so an operator does not go looking
+//! for a token in the 202.
 //!
 //! **Last-key atomicity ([#3529]).** The last-key rule is ENFORCED in the
 //! store, not by the pre-check that shapes the 202. [`revoke_requires_approval`]
@@ -138,6 +188,7 @@
 //! [#3474]: https://github.com/alphaonedev/ai-memory-mcp/issues/3474
 //! [#3529]: https://github.com/alphaonedev/ai-memory-mcp/issues/3529
 //! [#3530]: https://github.com/alphaonedev/ai-memory-mcp/issues/3530
+//! [#3535]: https://github.com/alphaonedev/ai-memory-mcp/issues/3535
 
 use axum::Json;
 use axum::body::Bytes;
@@ -227,6 +278,15 @@ pub const FIELD_EMPTIES_REGISTRY: &str = "empties_registry";
 /// Audit outcome token for a supplied token refused on strength.
 const OUTCOME_TOKEN_TOO_SHORT: &str = "supplied_token_too_short";
 
+/// Audit outcome: the mint/bind was refused because the target agent is not
+/// on the `_agents` roster ([#3535] advisory 1).
+const OUTCOME_TARGET_NOT_REGISTERED: &str = "target_agent_not_registered";
+
+/// Audit outcome: the supplied token's digest is already bound to a DIFFERENT
+/// agent, so the bind was refused and NOTHING was re-pointed ([#3535]
+/// advisory 3).
+const OUTCOME_TOKEN_ALREADY_BOUND: &str = "supplied_token_bound_to_another_agent";
+
 /// Audit outcome: the pre-check said "not the last key", the ATOMIC store
 /// re-check disagreed, and the revoke was parked instead of applied.
 const OUTCOME_REVOKE_REQUEUED_LAST_KEY: &str = "revoke_requeued_last_enrolled_key";
@@ -310,6 +370,17 @@ pub const RATE_LIMITED: &str = "rate_limited";
 /// Wire error for an APPROVED revoke refused at apply time because it would
 /// now empty the enrolled registry ([#3529]).
 pub const REVOKE_WOULD_EMPTY_REGISTRY: &str = "revoke_would_empty_registry";
+
+/// Wire error for a mint/bind whose TARGET is not a registered agent
+/// ([#3535] advisory 1). Fixed, and it names no state beyond the fact the
+/// caller asked about.
+pub const TARGET_NOT_REGISTERED: &str = "agent_not_registered";
+
+/// Wire error for a BIND whose supplied token is already enrolled to a
+/// DIFFERENT agent ([#3535] advisory 3). The refusal deliberately does NOT
+/// name the incumbent: the caller supplied a token, and a refusal must not
+/// tell them which OTHER principal that token authenticates as.
+pub const TOKEN_ALREADY_BOUND: &str = "api_key_already_bound";
 
 /// The once-only disclosure warning that rides the mint response, so the
 /// caller is told by the SERVER — not only by the docs — that the token is
@@ -686,13 +757,42 @@ async fn load_enrolled(app: &AppState) -> Result<Vec<(String, String)>, String> 
     db::list_agent_api_keys(&lock.0).map_err(|e| e.to_string())
 }
 
+/// Whether the TARGET is on the `_agents` roster ([#3535] advisory 1).
+///
+/// A membership probe with no caller context, matching the seam it calls:
+/// `is_registered_agent` is the SAME predicate the governance `Registered`
+/// level and every pending-action approver gate consult, and it reads a row
+/// that carries no per-row visibility scope — so there is nothing here for an
+/// elevated context to buy, and no `for_admin` site is added.
+///
+/// A read FAILURE is an error, never `false`: this predicate gates a
+/// credential mint, and a transient store fault must not be answerable as
+/// "the agent does not exist" — nor, by the same token, as "it does".
+async fn store_target_registered(app: &AppState, agent_id: &str) -> Result<bool, Response> {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return app
+            .store
+            .is_registered_agent(agent_id)
+            .await
+            .map_err(super::store_err_to_response);
+    }
+    let lock = app.db.lock().await;
+    db::is_registered_agent(&lock.0, agent_id)
+        .map_err(|e| crate::handlers::errors::handler_error_500(&e))
+}
+
 /// Bind `token_sha256` to `agent_id` durably.
+///
+/// v1.0.0 [#3535] — the outcome is TYPED, because the store no longer
+/// re-points a digest that belongs to another agent and the handler has to
+/// answer differently for each case (see [`crate::storage::BindApiKeyOutcome`]).
 async fn store_bind(
     app: &AppState,
     caller: &str,
     agent_id: &str,
     token_sha256: &str,
-) -> Result<(), Response> {
+) -> Result<crate::storage::BindApiKeyOutcome, Response> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(caller.to_string());
@@ -706,6 +806,45 @@ async fn store_bind(
     let lock = app.db.lock().await;
     db::bind_agent_api_key(&lock.0, agent_id, token_sha256)
         .map_err(|e| crate::handlers::errors::handler_error_500(&e))
+}
+
+/// The ONE answer to "this digest already belongs to someone else".
+///
+/// Shared by the direct bind and the post-approval apply so the audited
+/// outcome and the wire envelope cannot drift apart depending on which path
+/// hit the conflict. Nothing was written on either path.
+///
+/// The FINGERPRINT is audited, unlike the too-short refusal which audits no
+/// digest: a rejected too-short candidate is a guess that must not reach the
+/// signed chain, whereas a conflicting digest is by definition an ENROLLED
+/// key whose fingerprint is already on that chain from its own bind — so
+/// recording it correlates the refusal to the binding it protected and
+/// discloses nothing new.
+fn digest_already_bound_response(
+    caller: &str,
+    endpoint: &'static str,
+    agent_id: &str,
+    digest: &str,
+) -> Response {
+    audit(
+        caller,
+        "refuse",
+        endpoint,
+        agent_id,
+        OUTCOME_TOKEN_ALREADY_BOUND,
+        Some(digest),
+    );
+    no_store(
+        StatusCode::CONFLICT,
+        json!({
+            "error": TOKEN_ALREADY_BOUND,
+            (FIELD_KEY_FINGERPRINT): key_fingerprint(digest),
+            "message": "this token is already enrolled to a different agent. Nothing was \
+                        changed: re-pointing a live bearer credential at another principal \
+                        is never an enrolment. Mint a fresh token for this agent, or revoke \
+                        the existing binding first.",
+        }),
+    )
 }
 
 /// Revoke every key bound to `agent_id` durably; returns the row count.
@@ -1011,6 +1150,55 @@ pub async fn mint_agent_api_key(
             .into_response();
     }
 
+    // v1.0.0 #3535 (#3474 advisory 1) — the TARGET must be a REGISTERED agent.
+    //
+    // Placed HERE, ahead of the approve dispatch, so ONE check covers all
+    // three moments a credential could otherwise be created for a principal
+    // the roster does not know: the direct bind, the row this route QUEUES for
+    // an approver, and the APPLY of an approved row (which re-enters through
+    // this same handler and so is re-checked against the roster as it stands
+    // at apply time — the #3529 discipline, for the same reason: the state can
+    // move between the approval and its application).
+    //
+    // It sits AFTER the rate limiter deliberately. The refusal is an existence
+    // signal, and although it is reachable only by a caller `require_admin`
+    // has already admitted — who can read the whole roster with
+    // `GET /api/v1/agents` — bounding the probe at the same 10/60 s budget as
+    // the mint costs nothing and removes the question entirely.
+    //
+    // REVOKE is deliberately NOT gated this way: refusing a revocation is
+    // strictly worse than performing one, and revoking a key bound to an
+    // unregistered id is exactly the cleanup an operator needs after a typo
+    // enrolled one before this rule existed.
+    match store_target_registered(&app, &agent_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            audit(
+                &caller,
+                "refuse",
+                MINT_ENDPOINT,
+                &agent_id,
+                OUTCOME_TARGET_NOT_REGISTERED,
+                None,
+            );
+            return no_store(
+                StatusCode::NOT_FOUND,
+                json!({
+                    "error": TARGET_NOT_REGISTERED,
+                    "agent_id": agent_id,
+                    "message": "no such registered agent. A key bound to an id the roster does \
+                                not know is a credential for a principal that does not exist: \
+                                every other identity control — the governance `registered` \
+                                level, the approver-eligibility gate, `agents bind-key` — \
+                                consults that roster, and a typo'd id would mint a live \
+                                bearer secret none of them can see. Register the agent first \
+                                (POST /api/v1/agents), then enrol its key.",
+                }),
+            );
+        }
+        Err(resp) => return resp,
+    }
+
     if let Some(pending_id) = parsed.approve_pending_id.as_deref() {
         return apply_approved(&app, &headers, &body, &caller, &agent_id, pending_id, false).await;
     }
@@ -1091,16 +1279,28 @@ pub async fn mint_agent_api_key(
         };
     }
 
-    if let Err(resp) = store_bind(&app, &caller, &agent_id, &digest).await {
-        audit(
-            &caller,
-            "deny",
-            MINT_ENDPOINT,
-            &agent_id,
-            OUTCOME_STORE_ERROR,
-            Some(&digest),
-        );
-        return resp;
+    match store_bind(&app, &caller, &agent_id, &digest).await {
+        // v1.0.0 #3535 — a fresh bind and an idempotent re-assertion of the
+        // SAME (agent, digest) pair are one answer on the wire; the second is
+        // a retried enrolment, not an error.
+        Ok(
+            crate::storage::BindApiKeyOutcome::Bound
+            | crate::storage::BindApiKeyOutcome::AlreadyBoundToSameAgent,
+        ) => {}
+        Ok(crate::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent) => {
+            return digest_already_bound_response(&caller, MINT_ENDPOINT, &agent_id, &digest);
+        }
+        Err(resp) => {
+            audit(
+                &caller,
+                "deny",
+                MINT_ENDPOINT,
+                &agent_id,
+                OUTCOME_STORE_ERROR,
+                Some(&digest),
+            );
+            return resp;
+        }
     }
     refresh_registry(&app, Some((&digest, &agent_id)), None).await;
     audit(
@@ -1498,16 +1698,31 @@ async fn apply_approved(
             (Some(token), digest)
         }
     };
-    if let Err(resp) = store_bind(app, caller, agent_id, &digest).await {
-        audit(
-            caller,
-            "deny",
-            endpoint,
-            agent_id,
-            OUTCOME_STORE_ERROR,
-            Some(&digest),
-        );
-        return resp;
+    match store_bind(app, caller, agent_id, &digest).await {
+        Ok(
+            crate::storage::BindApiKeyOutcome::Bound
+            | crate::storage::BindApiKeyOutcome::AlreadyBoundToSameAgent,
+        ) => {}
+        // v1.0.0 #3535 — the queued BIND carried a digest captured at queue
+        // time; another agent may have enrolled it since. Refuse rather than
+        // re-point, exactly as the direct path does. The approval is spent —
+        // the same safe direction `apply_approved_revoke` takes on its own
+        // apply-time refusal: nothing durable is lost, the refusal is on the
+        // signed chain, and re-issuing queues a fresh approval.
+        Ok(crate::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent) => {
+            return digest_already_bound_response(caller, endpoint, agent_id, &digest);
+        }
+        Err(resp) => {
+            audit(
+                caller,
+                "deny",
+                endpoint,
+                agent_id,
+                OUTCOME_STORE_ERROR,
+                Some(&digest),
+            );
+            return resp;
+        }
     }
     refresh_registry(app, Some((&digest, agent_id)), None).await;
     audit(

@@ -63,10 +63,16 @@ authoritative for its topic; this page is just the map.
 - **[ARCHITECTURAL_LIMITS.md](ARCHITECTURAL_LIMITS.html)** — performance
   bounds and constraints under the current design.
 - **[wake-hub.md](wake-hub.html)** — the agent wake plane: the
-  `agent_notified` bus, the `ai-memory wake-hub` switch and the bus sink
-  between them. States the NORMATIVE backstop inbox poll, what a wake may
-  and may not carry, and why every bound there drops a hint rather than
-  producing a wrong one.
+  `agent_notified` bus, the `ai-memory wake-hub` switch, the bus sink
+  between them, and the `ai-memory wake-listen` / `inbox --wait` client.
+  States the NORMATIVE backstop inbox poll, what a wake may and may not
+  carry, which topics a session may subscribe to and how it knows the
+  subscription is live, the operator ceremony and the allowlist
+  refresher, and why every bound there drops a hint rather than
+  producing a wrong one. The plane is transport-only and content-free,
+  and is explicitly NOT COVERED by the
+  [enterprise-federation certification](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md)
+  (§6): losing the hub degrades wake latency, never a row.
 - **[RUNBOOK-ollama-kv-tuning.md](RUNBOOK-ollama-kv-tuning.html)** —
   `OLLAMA_KV_CACHE_TYPE=q4_0` for 2–4× LLM memory reduction. Zero
   ai-memory code change.

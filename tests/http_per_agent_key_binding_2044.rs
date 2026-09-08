@@ -47,7 +47,10 @@ fn db_bind_resolve_list_roundtrip_is_digest_keyed() {
 
     let token = "alice-secret-token";
     let hash = api_key_sha256_hex(token);
-    ai_memory::db::bind_agent_api_key(&conn, "alice", &hash).unwrap();
+    assert_eq!(
+        ai_memory::db::bind_agent_api_key(&conn, "alice", &hash).unwrap(),
+        ai_memory::storage::BindApiKeyOutcome::Bound
+    );
 
     // Resolve by the SAME digest → alice.
     assert_eq!(
@@ -63,17 +66,47 @@ fn db_bind_resolve_list_roundtrip_is_digest_keyed() {
     let all = ai_memory::db::list_agent_api_keys(&conn).unwrap();
     assert_eq!(all, vec![(hash.clone(), "alice".to_string())]);
 
-    // Re-binding the same digest rotates the mapping in place (idempotent).
-    ai_memory::db::bind_agent_api_key(&conn, "alice2", &hash).unwrap();
+    // v1.0.0 #3535 — re-binding the SAME digest to a DIFFERENT agent is now
+    // REFUSED, and nothing moves. This block used to assert the opposite
+    // ("rotates the mapping in place"), which is the #3474 advisory: the
+    // digest is the primary key, so the old `INSERT OR REPLACE` silently
+    // re-pointed a LIVE bearer credential from `alice` to `alice2` — one
+    // token quietly changing which principal it authenticates as, with no
+    // signal to either and nothing on the audit chain saying so.
+    assert_eq!(
+        ai_memory::db::bind_agent_api_key(&conn, "alice2", &hash).unwrap(),
+        ai_memory::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent
+    );
     assert_eq!(
         ai_memory::db::agent_id_for_api_key(&conn, &hash).unwrap(),
-        Some("alice2".to_string())
+        Some("alice".to_string()),
+        "a refused re-bind must leave the incumbent binding exactly as it was"
     );
     assert_eq!(ai_memory::db::list_agent_api_keys(&conn).unwrap().len(), 1);
 
-    // #2095 — revoke invalidates a leaked key (returns rows removed; idempotent).
+    // …while re-asserting the SAME (agent, digest) pair stays an idempotent
+    // success, because a retried enrolment is not an error.
+    assert_eq!(
+        ai_memory::db::bind_agent_api_key(&conn, "alice", &hash).unwrap(),
+        ai_memory::storage::BindApiKeyOutcome::AlreadyBoundToSameAgent
+    );
+    assert_eq!(
+        ai_memory::db::agent_id_for_api_key(&conn, &hash).unwrap(),
+        Some("alice".to_string())
+    );
+
+    // A never-enrolled agent revokes nothing — `alice2`'s refused re-bind wrote
+    // no row, so there is none to remove (#3535).
     assert_eq!(
         ai_memory::db::revoke_agent_api_key(&conn, "alice2").unwrap(),
+        0,
+        "a refused re-bind must not have created a row for the would-be owner"
+    );
+
+    // #2095 — revoke invalidates a leaked key (returns rows removed; idempotent).
+    // The owner is `alice`: the digest never moved.
+    assert_eq!(
+        ai_memory::db::revoke_agent_api_key(&conn, "alice").unwrap(),
         1
     );
     assert_eq!(
@@ -87,7 +120,7 @@ fn db_bind_resolve_list_roundtrip_is_digest_keyed() {
             .is_empty()
     );
     assert_eq!(
-        ai_memory::db::revoke_agent_api_key(&conn, "alice2").unwrap(),
+        ai_memory::db::revoke_agent_api_key(&conn, "alice").unwrap(),
         0,
         "revoking an already-revoked agent is a no-op"
     );

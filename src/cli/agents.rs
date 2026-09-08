@@ -114,7 +114,12 @@ pub enum AgentsAction {
     /// enrolled set on a bounded cadence, so this takes effect within that
     /// refresh window with NO restart (`AI_MEMORY_AGENT_KEY_REFRESH_SECS`,
     /// default 15s; `0` restores the pre-#3418 restart-required behaviour).
-    /// Re-binding the same token rotates the mapping in place.
+    ///
+    /// v1.0.0 #3535 — re-binding the same token to the SAME agent is an
+    /// idempotent no-op; re-binding it to a DIFFERENT agent is REFUSED and
+    /// nothing changes. It used to rotate the mapping in place, which meant a
+    /// paste error silently re-pointed a live bearer credential at another
+    /// principal — and silently deleted the enrolment it replaced.
     BindApiKey {
         /// Agent identifier the presenting caller is bound to.
         #[arg(long)]
@@ -520,7 +525,21 @@ pub fn run_agents(
                 anyhow::bail!("api-key token must not be empty");
             }
             let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
-            db::bind_agent_api_key(&conn, &agent_id, &token_sha256)?;
+            // v1.0.0 #3535 — CLI PARITY with the HTTP route: a digest already
+            // enrolled to a DIFFERENT agent is REFUSED, never re-pointed.
+            // Re-asserting the same pair stays an idempotent success. The
+            // refusal names no incumbent (the store outcome does not carry
+            // one), so a paste error cannot be turned into a lookup of whose
+            // key a token is.
+            if matches!(
+                db::bind_agent_api_key(&conn, &agent_id, &token_sha256)?,
+                crate::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent
+            ) {
+                anyhow::bail!(
+                    "{}",
+                    crate::errors::msg::api_key_digest_bound_to_another_agent(&agent_id)
+                );
+            }
             if json_out {
                 writeln!(
                     out.stdout,
@@ -961,9 +980,19 @@ pub async fn run_bind_api_key(
     }
     let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
     let ctx = crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
-    store
-        .bind_agent_api_key(&ctx, agent_id, &token_sha256)
-        .await?;
+    // v1.0.0 #3535 — the SAL twin of the sqlite arm above: conflict-refuse,
+    // never a silent re-point, on whichever backend `--store-url` selected.
+    if matches!(
+        store
+            .bind_agent_api_key(&ctx, agent_id, &token_sha256)
+            .await?,
+        crate::storage::BindApiKeyOutcome::DigestBoundToAnotherAgent
+    ) {
+        anyhow::bail!(
+            "{}",
+            crate::errors::msg::api_key_digest_bound_to_another_agent(agent_id)
+        );
+    }
     if json_out {
         println!(
             "{}",
@@ -2663,6 +2692,81 @@ mod tests {
         // json branch.
         rt.block_on(run_bind_api_key(&store, "bob", "bob-token", true))
             .expect("bind json ok");
+    }
+
+    /// v1.0.0 #3535 — CLI parity with the HTTP route on the SAL
+    /// (`--store-url`) path: a digest already enrolled to a DIFFERENT agent is
+    /// REFUSED and nothing moves, while re-asserting the SAME pair stays an
+    /// idempotent success. Before #3535 the second bind silently re-pointed a
+    /// live bearer credential from `alice` to `bob`.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn run_bind_api_key_refuses_a_digest_bound_to_another_agent_3535() {
+        let env = TestEnv::fresh();
+        let store = sal_store(&env.db_path);
+        let rt = rt();
+        let token = "shared-token-3535";
+        let hash = crate::handlers::identity_binding::api_key_sha256_hex(token);
+
+        rt.block_on(run_bind_api_key(&store, "alice", token, false))
+            .expect("first bind ok");
+        let err = rt
+            .block_on(run_bind_api_key(&store, "bob", token, false))
+            .expect_err("re-pointing a bound digest must refuse");
+        assert!(
+            err.to_string()
+                .contains("already enrolled to a different agent"),
+            "unexpected refusal text: {err}"
+        );
+        assert!(
+            !err.to_string().contains("alice"),
+            "the refusal must not name the incumbent: {err}"
+        );
+        assert_eq!(
+            rt.block_on(store.agent_id_for_api_key(&hash))
+                .expect("resolve"),
+            Some("alice".to_string()),
+            "a refused re-bind must leave the incumbent binding as it was"
+        );
+        // The same pair is still an idempotent success.
+        rt.block_on(run_bind_api_key(&store, "alice", token, false))
+            .expect("re-asserting the same pair must succeed");
+    }
+
+    /// The sqlite dispatch arm of the same verb — the path an operator takes
+    /// with a plain `--db`, which must refuse identically.
+    #[test]
+    fn bind_api_key_cli_sqlite_arm_refuses_a_repoint_3535() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let token = "shared-token-3535-sqlite-arm";
+        let bind = |agent: &str| AgentsArgs {
+            action: Some(AgentsAction::BindApiKey {
+                agent_id: agent.to_string(),
+                token: token.to_string(),
+                store_url: None,
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, bind("alice"), false, &mut out).expect("first bind ok");
+        }
+        let err = {
+            let mut out = env.output();
+            run_agents(&db, bind("bob"), false, &mut out).expect_err("re-point must refuse")
+        };
+        assert!(
+            err.to_string()
+                .contains("already enrolled to a different agent"),
+            "unexpected refusal text: {err}"
+        );
+        let conn = crate::db::open(&db).expect("open");
+        let hash = crate::handlers::identity_binding::api_key_sha256_hex(token);
+        assert_eq!(
+            crate::db::agent_id_for_api_key(&conn, &hash).expect("resolve"),
+            Some("alice".to_string()),
+            "a refused re-bind must leave the incumbent binding as it was"
+        );
     }
 
     #[cfg(feature = "sal")]
