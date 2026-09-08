@@ -170,10 +170,13 @@ conventions this directory already has (`benchlib.py`, `ops_producer.py`).
 The daemon is served over **TLS only**. `wake_bench_env.sh` mints a
 self-signed certificate for `127.0.0.1` into the run directory (never
 reusing operator key material) and the harness PINS it. There is no
-`--insecure`, no verification-skipping flag, and no unencrypted listener; a
-plaintext `http://` base URL is refused unless the operator states the
-exception with `--allow-plaintext-loopback`, which is then recorded in the
-results so a plaintext number is never mistaken for a TLS one.
+`--insecure`, no verification-skipping flag, and no unencrypted listener.
+An `https` base URL REQUIRES `--tls-ca`; a plaintext `http://` base URL is
+**refused outright, with no flag that opens it** — the earlier
+`--allow-plaintext-loopback` exception was removed at Master's phase-2
+review, so a plaintext figure cannot be produced at all rather than merely
+being labelled after the fact. `--self-test` walks every subparser and
+fails if any `insecure` / `plaintext` / `allow` option is ever added back.
 
 ## Identity ceremony — an honest deviation
 
