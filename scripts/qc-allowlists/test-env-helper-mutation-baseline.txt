@@ -40,6 +40,6 @@
 7 src/mcp/tools/store/tests.rs
 1 src/mcp/tools/subscribe.rs
 45 src/mcp/tools/update.rs
-12 src/storage/connection.rs
+10 src/storage/connection.rs
 1 src/storage/migrations.rs
-4 src/test_support.rs
+6 src/test_support.rs
