@@ -114,10 +114,10 @@ trap cleanup_all EXIT
 MAX_AGENTS=0
 for n in $AGENT_COUNTS; do [ "$n" -gt "$MAX_AGENTS" ] && MAX_AGENTS="$n"; done
 
-# Both of these run ONCE, before any timed leg. Minting 256 delegations or
-# bootstrapping a schema inside a measured window would report a setup cost as
-# a substrate latency.
-wb_schema_init
+# Runs ONCE, before any timed leg: minting 256 delegations inside a measured
+# window would report a setup cost as a substrate latency. The schema needs no
+# step of its own -- the daemon bootstraps it on connect and `wb_start_daemon`
+# waits for /api/v1/health, so it is done before anything is timed.
 wb_enroll_agents "$MAX_AGENTS"
 
 # run_rungs <leg> <agents>

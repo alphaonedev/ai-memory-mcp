@@ -209,17 +209,24 @@ PY
 }
 
 # --- schema ----------------------------------------------------------------
-# Idempotent bootstrap of the served store. Run ONCE, before any timed leg: a
-# daemon that bootstraps its schema inside a measured window reports the
-# bootstrap as latency.
-wb_schema_init() {
-  HOME="$WB_HOME" XDG_CONFIG_HOME="${WB_HOME}/.config" \
-  XDG_DATA_HOME="${WB_HOME}/.local/share" AI_MEMORY_NO_CONFIG=1 \
-  AI_MEMORY_KEY_DIR="$WB_KEYS" AI_MEMORY_STORE_URL_FILE="$WB_STORE_URL_FILE" \
-    "$WB_BINARY" schema-init --json >"${WB_RUN}/schema-init.json" 2>&1 \
-    || { tail -20 "${WB_RUN}/schema-init.json" >&2; wb_die "schema-init failed"; }
-  wb_log "schema-init: ok"
-}
+# There is deliberately NO `wb_schema_init` step, and this is the second
+# thing to check when porting the harness rather than a detail.
+#
+# It existed and it could never work: `ai-memory schema-init` takes the store
+# URL on `--store-url` and does NOT read `AI_MEMORY_STORE_URL_FILE`, while
+# this lane puts the URL on argv NEVER (#1927 -- argv is world-readable via
+# `ps auxww`). So the call printed usage and `wb_die`d, and every driver died
+# at exit 70 before a daemon existed (Master, #3473 phase-2 f2 leg).
+#
+# Dropping it costs nothing measurable. The daemon bootstraps its own schema
+# on connect (idempotent `CREATE ... IF NOT EXISTS` behind the #3520 catalog
+# probe), and `wb_start_daemon` does not return until `GET /api/v1/health`
+# answers -- so the bootstrap completes BEFORE any timed leg starts and
+# cannot land inside a percentile. That health gate, not a separate step, is
+# what keeps setup cost out of the numbers.
+#
+# Teaching `schema-init` to read the file env is a PRODUCT change and is out
+# of scope for this measurement lane; file it separately if wanted.
 
 # --- daemon ----------------------------------------------------------------
 # wb_start_daemon <sink-socket|"">
