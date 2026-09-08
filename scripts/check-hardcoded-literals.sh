@@ -48,6 +48,39 @@
 #     - inject a contrived NEW triplicated literal, verify HARD-BLOCK,
 #       clean up. Proves the gate is load-bearing (pm-v3.2).
 #
+# PORTABILITY / DETERMINISM CONTRACT (#3537). This gate is run on both a
+# Linux push gate (GNU coreutils + gawk + GNU grep) and a macOS gate host
+# (BSD coreutils + one-true-awk + ugrep/BSD grep). It MUST return the same
+# verdict on both, because a single frozen baseline is shared by both.
+#
+# The whole pipeline therefore runs under `LC_ALL=C`, and the length test
+# below is BYTE length. Why, precisely:
+#
+#   - GROUPING (the actual #3537 false FAIL): the literal key identity is
+#     decided by `sort | uniq -c`. BSD/macOS `uniq` compares lines with the
+#     LOCALE COLLATION, and in en_US.UTF-8 a run of U+2500 BOX DRAWINGS
+#     LIGHT HORIZONTAL collates as ignorable — so the 89-, 81- and 109-char
+#     box rules in src/bench.rs / src/bench_relevance.rs (three DISTINCT
+#     literals, one site each) folded into ONE group with count 3 and were
+#     reported as `+3 (baseline 0)`. GNU `uniq` compares bytes, so on Linux
+#     they stayed three count-1 entries, below DUP_THRESHOLD, and never
+#     entered the baseline. `LC_ALL=C` makes `uniq` byte-exact everywhere,
+#     which is the semantics the shipped baseline encodes.
+#
+#   - LENGTH (latent, same class): one-true-awk `length()` counts BYTES
+#     (243 for that 81-char rule) while gawk in a UTF-8 locale counts
+#     CHARACTERS (81), so MIN_LEN meant two different things per host.
+#     Under `LC_ALL=C` every awk (gawk, mawk, one-true-awk, BSD awk) makes
+#     `length()` byte length, so MIN_LEN has ONE meaning. Byte length is
+#     also the fail-closed choice: bytes >= chars, so the byte test admits
+#     a SUPERSET of the char test — the gate can only ever catch more, never
+#     fewer, duplicated magic strings. On the tree this baseline was frozen
+#     from, the two measures select an identical literal set, so pinning
+#     bytes does not reinterpret any existing baseline entry.
+#
+# `--self-test` re-proves both properties against every awk on the host.
+# Override the awk with AWK_BIN=/path/to/awk (the self-test uses this).
+#
 # Requires bash >= 4 (Grok W2-bash3): this gate uses an associative array
 # (`declare -A base_count`), absent from bash 3.2 (stock on macOS — Apple
 # has shipped no post-3.2 bash since the GPLv3 switch). Running under 3.2
@@ -60,6 +93,16 @@ if [[ -z "${BASH_VERSINFO:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
 fi
 
 set -euo pipefail
+
+# #3537 — pin the collation/character semantics for the ENTIRE pipeline
+# (grep, awk, sort, uniq and bash's own pattern matching). See the
+# PORTABILITY / DETERMINISM CONTRACT above. LC_ALL has the highest
+# precedence of the locale variables, so this one export is sufficient.
+export LC_ALL=C
+
+# The awk used for extraction. Overridable so --self-test can re-run the
+# extraction under every awk installed on the host and prove they agree.
+AWK="${AWK_BIN:-awk}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASELINE="${ROOT}/scripts/qc-allowlists/hardcoded-literals-baseline.txt"
@@ -94,7 +137,7 @@ find_test_boundary () {
     # in another file (e.g. mcp/mod.rs's `#[cfg(test)] pub(super) mod
     # parity_test_helpers;` made the gate skip 13.9k production lines).
     # Attr pattern also widened to catch `#[cfg(all(test, ...))]`.
-    line_cfg=$(awk '/^[[:space:]]*#\[cfg\((all\()?test[,)]/{attr=NR; next}
+    line_cfg=$("$AWK" '/^[[:space:]]*#\[cfg\((all\()?test[,)]/{attr=NR; next}
                     attr && /^[[:space:]]*(pub([(][^)]*[)])?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\{/{print attr; exit}
                     {attr=0}' "$f" 2>/dev/null)
     [[ -z "$line_mod" ]] && line_mod=999999999
@@ -114,7 +157,7 @@ emit_literals () {
     esac
     local boundary
     boundary=$(find_test_boundary "$f")
-    awk -v boundary="$boundary" -v minlen="$MIN_LEN" '
+    "$AWK" -v boundary="$boundary" -v minlen="$MIN_LEN" '
         NR >= boundary { exit }
         {
             line = $0
@@ -136,6 +179,8 @@ emit_literals () {
             while (match(rest, /"[^"]*"/)) {
                 lit = substr(rest, RSTART + 1, RLENGTH - 2)
                 rest = substr(rest, RSTART + RLENGTH)
+                # BYTE length: LC_ALL=C above makes length() byte length on
+                # gawk, mawk, one-true-awk and BSD awk alike (#3537).
                 if (length(lit) < minlen) continue
                 # ignore pure format-placeholder / whitespace-only noise
                 print lit
@@ -152,7 +197,7 @@ compute_current_counts () {
         emit_literals "$f"
     done < <(find "${ROOT}/src" "${ROOT}/tools" -type f -name '*.rs' -print0 2>/dev/null) \
     | sort | uniq -c \
-    | awk -v thr="$DUP_THRESHOLD" '$1 >= thr {
+    | "$AWK" -v thr="$DUP_THRESHOLD" '$1 >= thr {
         # reassemble the literal (may contain spaces) after the count field
         cnt = $1; $1 = ""; sub(/^[[:space:]]+/, "")
         printf "%d\t%s\n", cnt, $0
@@ -173,34 +218,152 @@ if [[ "${1:-}" == "--update-baseline" ]]; then
 fi
 
 # --- self-test ---------------------------------------------------------
+# Three planted probes, run once per awk installed on the host (#3537):
+#   A  gate-probe-magic-string-xyz x3   -> MUST be reported (gate is load-bearing)
+#   B  three U+2500 rules of DIFFERENT  -> MUST NOT be reported (three DISTINCT
+#      lengths, one site each              literals; folding them into one count-3
+#                                          group was the #3537 false FAIL)
+#   C  a 4-char / 12-byte multibyte     -> MUST be reported (pins BYTE length
+#      literal x3                          semantics for MIN_LEN)
+# Every awk must produce a BYTE-IDENTICAL violation set, or the gate is not
+# portable and the shared baseline cannot be trusted.
 if [[ "${1:-}" == "--self-test" ]]; then
-    echo "Hardcoded-literal gate: self-test (contrived NEW triplicated literal -> expect HARD-BLOCK -> cleanup)"
-    contrived="${ROOT}/src/.hardcoded_literal_gate_probe.rs"
-    if [[ -e "$contrived" ]]; then
-        echo "ERROR: self-test scratch already exists: $contrived" >&2
-        exit 2
-    fi
-    # A brand-new magic string on 3 production sites (absent from baseline).
-    cat > "$contrived" <<'EOF'
+    echo "Hardcoded-literal gate: self-test (planted probes A/B/C, once per awk on this host; #3537)"
+
+    probe_dup="${ROOT}/src/.hardcoded_literal_gate_probe.rs"
+    probe_mb="${ROOT}/src/.hardcoded_literal_gate_probe_mb.rs"
+    for probe in "$probe_dup" "$probe_mb"; do
+        if [[ -e "$probe" ]]; then
+            echo "ERROR: self-test scratch already exists: $probe" >&2
+            exit 2
+        fi
+    done
+    # Always remove the planted files, including on a kill: a leftover
+    # contrived .rs under src/ would break the build for everyone.
+    self_test_cleanup () { rm -f "$probe_dup" "$probe_mb"; }
+    trap self_test_cleanup EXIT INT TERM
+
+    # Probe A — a brand-new magic string on 3 production sites (absent from baseline).
+    cat > "$probe_dup" <<'EOF'
 // CONTRIVED VIOLATION for scripts/check-hardcoded-literals.sh --self-test.
 // Deleted by the self-test; if it persists, the run was killed — remove it.
 pub fn a() -> &'static str { "gate-probe-magic-string-xyz" }
 pub fn b() -> &'static str { "gate-probe-magic-string-xyz" }
 pub fn c() -> &'static str { "gate-probe-magic-string-xyz" }
 EOF
-    set +e
-    gate_output="$("$0" 2>&1)"
-    gate_exit=$?
-    set -e
-    rm -f "$contrived"
-    printf '%s\n' "$gate_output"
-    if (( gate_exit != 0 )) && printf '%s' "$gate_output" | grep -q 'gate-probe-magic-string-xyz'; then
+
+    # Probes B and C. Built from octal BYTE escapes so the planted bytes are
+    # exact regardless of the locale this script runs under.
+    mb_rule_char="$(printf '\342\224\200')"                              # U+2500
+    mb_short="$(printf '\343\202\254\343\202\254\343\202\254\343\202\254')" # 4 chars / 12 bytes
+    mb_rule () {
+        local n="$1" out="" i
+        for (( i = 0; i < n; i++ )); do out+="$mb_rule_char"; done
+        printf '%s' "$out"
+    }
+    {
+        echo "// CONTRIVED VIOLATION for scripts/check-hardcoded-literals.sh --self-test (#3537)."
+        echo "// Deleted by the self-test; if it persists, the run was killed — remove it."
+        echo "pub fn r1() -> &'static str { \"$(mb_rule 12)\" }"
+        echo "pub fn r2() -> &'static str { \"$(mb_rule 15)\" }"
+        echo "pub fn r3() -> &'static str { \"$(mb_rule 18)\" }"
+        echo "pub fn m1() -> &'static str { \"${mb_short}\" }"
+        echo "pub fn m2() -> &'static str { \"${mb_short}\" }"
+        echo "pub fn m3() -> &'static str { \"${mb_short}\" }"
+    } > "$probe_mb"
+
+    # Enumerate the awks present, de-duplicating by resolved path.
+    awk_bins=()
+    awk_labels=()
+    for cand in awk gawk mawk nawk /usr/bin/awk /usr/bin/gawk /usr/bin/mawk; do
+        cand_path="$(command -v "$cand" 2>/dev/null || true)"
+        if [[ -z "$cand_path" || ! -x "$cand_path" ]]; then
+            echo "  awk candidate '${cand}': ABSENT — skipped"
+            continue
+        fi
+        cand_path="$( (cd "$(dirname "$cand_path")" && pwd -P) || dirname "$cand_path" )/$(basename "$cand_path")"
+        already=0
+        for seen in ${awk_bins[@]+"${awk_bins[@]}"}; do
+            [[ "$seen" == "$cand_path" ]] && already=1
+        done
+        if (( already )); then
+            echo "  awk candidate '${cand}': same binary as one already listed (${cand_path}) — skipped"
+            continue
+        fi
+        awk_bins+=("$cand_path")
+        # `set -o pipefail` is on, so an awk that errors on --version would
+        # make this append non-zero and `set -e` would kill the self-test.
+        cand_ver="$("$cand_path" --version </dev/null 2>&1 | head -1 || true)"
+        awk_labels+=("${cand} -> ${cand_path} [${cand_ver:-version unknown}]")
+    done
+    if (( ${#awk_bins[@]} == 0 )); then
+        echo "Hardcoded-literal gate self-test: FAIL (no awk found on PATH)" >&2
+        exit 1
+    fi
+    echo "  awks under test (${#awk_bins[@]}):"
+    for label in "${awk_labels[@]}"; do echo "    - ${label}"; done
+
+    st_status=0
+    ref_violations=""
+    ref_awk=""
+    for awk_bin in "${awk_bins[@]}"; do
+        set +e
+        # Re-enter through the INTERPRETER WE ARE RUNNING UNDER, never the
+        # shebang: `#!/usr/bin/env bash` resolves to whatever bash is first on
+        # PATH, which on macOS with /usr/bin ahead of the homebrew prefix is
+        # stock bash 3.2 — the child would then die on the bash>=4 guard and
+        # the self-test would report a phantom failure (#3537).
+        gate_output="$(AWK_BIN="$awk_bin" "${BASH:-bash}" "$0" 2>&1)"
+        gate_exit=$?
+        set -e
+        violations="$(printf '%s\n' "$gate_output" | grep -E '^[[:space:]]*\+[0-9]+ \(baseline ' || true)"
+
         echo ""
-        echo "Hardcoded-literal gate self-test: PASS (caught the contrived violation; exit=${gate_exit})"
+        echo "  --- ${awk_bin} (exit=${gate_exit}) ---"
+        printf '%s\n' "${violations:-    (no violations reported)}"
+
+        # A: the contrived triplicated literal must be caught.
+        if (( gate_exit == 0 )) || ! printf '%s' "$violations" | grep -qF 'gate-probe-magic-string-xyz'; then
+            echo "  probe A (triplicated magic string): FAIL — not reported by ${awk_bin}" >&2
+            st_status=1
+        else
+            echo "  probe A (triplicated magic string): reported — OK"
+        fi
+        # B: three DISTINCT multibyte rules, one site each, must NOT be reported.
+        if printf '%s' "$violations" | grep -qF "$mb_rule_char"; then
+            echo "  probe B (#3537 distinct multibyte rules): FAIL — folded into a duplicate group by ${awk_bin}" >&2
+            st_status=1
+        else
+            echo "  probe B (#3537 distinct multibyte rules): not folded — OK"
+        fi
+        # C: the short-in-chars / long-in-bytes literal must be caught (BYTE MIN_LEN).
+        if ! printf '%s' "$violations" | grep -qF "$mb_short"; then
+            echo "  probe C (multibyte byte-length MIN_LEN): FAIL — not reported by ${awk_bin}" >&2
+            st_status=1
+        else
+            echo "  probe C (multibyte byte-length MIN_LEN): reported — OK"
+        fi
+        # Cross-awk agreement: identical violation sets, byte for byte.
+        if [[ -z "$ref_awk" ]]; then
+            ref_awk="$awk_bin"
+            ref_violations="$violations"
+        elif [[ "$violations" != "$ref_violations" ]]; then
+            echo "  cross-awk agreement: FAIL — ${awk_bin} disagrees with ${ref_awk}" >&2
+            st_status=1
+        else
+            echo "  cross-awk agreement with ${ref_awk}: identical — OK"
+        fi
+    done
+
+    self_test_cleanup
+    trap - EXIT INT TERM
+
+    echo ""
+    if (( st_status == 0 )); then
+        echo "Hardcoded-literal gate self-test: PASS (probes A/B/C correct and byte-identical across ${#awk_bins[@]} awk(s))"
         exit 0
     fi
-    echo "" >&2
-    echo "Hardcoded-literal gate self-test: FAIL (did not catch the contrived violation; exit=${gate_exit})" >&2
+    echo "Hardcoded-literal gate self-test: FAIL" >&2
     exit 1
 fi
 
