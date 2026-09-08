@@ -221,8 +221,9 @@ trap 'on_signal QUIT' QUIT
 trap 'on_signal PIPE' PIPE
 
 # control-name | shape | mutation-payload | target-file | lane-test-crate | lane-test-fn
-# shape ∈ {return, body} — see the header for the two grammars. The payload is the
-# always-allow disposition (return-statement, or whole-body expression).
+# shape ∈ {return, body, subst} — see the header for the three grammars. The payload
+# is the always-allow (or, for #3472, the control-deleted) disposition: a
+# return-statement, a whole-body expression, or an `<OLD>>>><NEW>` substitution.
 MAP=(
   "inbound_write_namespace_authorized|return|return true;|src/federation/receive_auth.rs|federation_write_ns_scope_2447|federated_write_outside_peer_scope_refused_2447"
   "inbound_by_id_namespace_authorized|return|return true;|src/federation/receive_auth.rs|federation_delete_ns_scope_2488|enrolled_unscoped_federated_deletion_refused_by_default_2488"
@@ -322,6 +323,34 @@ MAP=(
   # process-global registry (no I/O, no backend) — both backends' approve
   # funnels + the producer consult this ONE fn, so it is composite-covered.
   "consume_execution_exemption|return|return true;|src/approvals.rs|r40_approval_chokepoint|exemption_discriminates_unregistered_cid"
+  # #3472 (EPIC #3466) — the WAKE-PLANE REMOVABILITY row, and the only row here
+  # that runs in the OPPOSITE direction to the others. Every row above proves a
+  # control the certification COVERS is load-bearing. This one proves that a
+  # subsystem the certification explicitly does NOT cover — the same-host wake
+  # hub — is REMOVABLE, which is what makes the cert §6 NOT-COVERED entry
+  # ("transport-only, content-free, loss degrades LATENCY only") falsifiable
+  # instead of merely asserted.
+  #
+  # The load-bearing thing is the BACKSTOP, not the hub. `WakeStream::start`
+  # spawns `backstop_loop` UNCONDITIONALLY — before, and independently of, the
+  # `if let Some(hub)` arm — so the bounded `<=60 s` poll
+  # (`wake_sink::BACKSTOP_POLL_MAX`) is armed whether or not a hub exists. The
+  # control is that ONE unconditional spawn, not a guard fn, so it takes the
+  # `subst` shape: replacing the call with a no-op that still consumes the moved
+  # captures disarms the poll and leaves the rest of the client intact, which is
+  # precisely "the hub is the only delivery mechanism" — the world the cert
+  # entry says does not exist. The guard test drives `inbox --wait` on a host
+  # with NO hub and asserts the backstop fires inside its own bound, so the
+  # mutation reds it on the `expect("the backstop must fire inside its own
+  # bound")` and the honest tree greens it. Sqlite/UDS-local: no live Postgres.
+  #
+  # NOT a security control: nothing here gates authorization, and the wake plane
+  # carries no memory content (`wake_sink::wake_meta_for` — five fields, no body,
+  # no title). The mutation costs wake LATENCY in the working tree for the length
+  # of the run and can lose no durable row, because the inbox row is committed
+  # before any hint is minted. The #3119 trap/start-guard/end-assertion substrate
+  # covers it identically to every other row.
+  "wake_backstop_always_armed_3472|subst|backstop_loop(interval, tx, read_done, metrics).await;>>>let _ = (interval, tx, read_done, metrics); // CERT-REMOVAL-PROOF-MUTATION|src/wake_client/mod.rs|wake_client_3470|inbox_wait_returns_on_the_bounded_backstop_with_no_hub_3470"
 )
 
 # Apply MUTATION to function CTL in TARGET, per SHAPE.
@@ -453,7 +482,7 @@ list_map() {
 # --self-test — prove ALL THREE mutation grammars rewrite Rust source as intended,
 # WITHOUT compiling anything. Mirrors the plant-a-violation discipline the repo's
 # other gates carry; the cargo RED/GREEN acceptance run below exercises the shipped
-# MAP (all 14 shipped rows across the three shapes — return/body/subst), so this is
+# MAP (all 15 shipped rows across the three shapes — return/body/subst), so this is
 # the mechanical, compile-free proof that each grammar — including the PR-0 `body`
 # grammar and the 2x7 `subst` grammar — rewrites exactly what it claims to.
 self_test() {

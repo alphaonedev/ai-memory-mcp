@@ -8,7 +8,9 @@
 > (this page: the bus sink), [#3470](https://github.com/alphaonedev/ai-memory-mcp/issues/3470)
 > (this page: the client),
 > [#3504](https://github.com/alphaonedev/ai-memory-mcp/issues/3504) (this page:
-> snapshot reuse + the refresher).
+> snapshot reuse + the refresher),
+> [#3472](https://github.com/alphaonedev/ai-memory-mcp/issues/3472) (this page:
+> the certification stance and the removal proof).
 
 ## What the wake plane is for
 
@@ -322,6 +324,59 @@ Every drop cause has its own counter on `wake_sink::SinkMetricsSnapshot` —
 unaddressable recipient, unencodable frame, hub queue or egress overflow,
 offline-coalesced, offline-unknown, hand-off channel full, hub down, and bus
 lag. A hub that silently stopped waking anyone must not look like a quiet fleet.
+
+## Certification: transport-only, and provably removable
+
+The enterprise-federation certification
+(`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`) covers the
+federation trust boundary. **The wake plane is explicitly NOT covered by it**
+(§6), and that entry is a limit, not an omission. Three properties are what
+let the certification's claims stay true while this plane ships beside them:
+
+* **Transport-only.** The hub federates nothing. It is reachable only over a
+  mode-`0600` Unix-domain socket on ONE host, never between peers, and no
+  `/sync/push` verdict, no `receive_auth` control and no envelope or signature
+  gate the certification cites consults it. Nothing in the certified
+  federation path gets weaker, or stronger, because a hub is running.
+* **Content-free.** A wake frame is exactly
+  `{inbox_row_id, namespace, sender, digest, seq_high_watermark}` — no body
+  and no title, on the bus frame or on the wire. A hub process therefore
+  observes no memory content, and the plaintext-to-peer exposure the
+  certification already discloses is unchanged by it.
+* **Loss degrades LATENCY only.** The inbox row is committed before any hint
+  is minted and stays the durable truth; the `<= 60 s` backstop poll is armed
+  hub or no hub. A hub that is slow, full, absent — or deleted from the
+  deployment entirely — costs wake latency and a counter, never a committed
+  notify and never a row.
+
+What is therefore **not** covered: any wake-latency SLO, any delivery,
+ordering or at-least-once guarantee for a hint, any MEASURED hub scale
+envelope (the bounds here are architected, like the agent dimension of the
+certification's scale envelope), and any authority derived from a hint —
+what a woken recipient may read is decided by the ordinary inbox read it then
+performs, not by the wake.
+
+### The removal proof
+
+"Removable" is mechanised rather than asserted. `scripts/check-cert-removal-proof.sh`
+carries the row `wake_backstop_always_armed_3472`, the only row in that
+harness that runs in the opposite direction to the others: every other row
+proves a control the certification COVERS is load-bearing, this one proves the
+subsystem the certification does NOT cover is the removable half.
+
+The control it mutates is the unconditional spawn of the backstop loop in
+`wake_client::WakeStream::start` — the one that happens before, and
+independently of, the `if let Some(hub)` arm. Disarming it, and only it, is
+exactly the world where the hub is the sole delivery mechanism. The guard test
+is `tests/wake_client_3470.rs::inbox_wait_returns_on_the_bounded_backstop_with_no_hub_3470`,
+which drives `ai-memory inbox --wait` on a host with **no** hub and asserts the
+backstop fires inside its own bound. Broken it goes RED; restored it goes
+GREEN. That is the executable form of the sentence at the top of this page:
+the POLL is the guarantee, the wake is a prompt.
+
+Read the harness before running it: it rewrites tracked source in place for
+the length of a run (`#3118` / `#3119`), so `git add -A` after one is banned
+and `--force-restore` is the recovery path.
 
 ## Turning it on: the operator ceremony
 
