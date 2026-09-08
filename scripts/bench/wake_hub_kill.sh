@@ -105,6 +105,22 @@ wb_schema_init
 wb_enroll_agents "$AGENTS"
 
 wb_start_daemon "$WB_SOCKET"
+
+# R2 (Deputy review of the #3473 phase-1 READY) --- REFUSE a drill whose
+# row-loss gate could only ever answer INCONCLUSIVE.
+#
+# `reconcile` reads `GET /api/v1/inbox`, which the daemon caps at 500 rows
+# with NO cursor, and the A-B-A-B legs write thousands of rows to these SAME
+# recipient ids. On a reused database the reconciliation read is truncated,
+# so "every committed row is present" becomes unprovable rather than false.
+# Checked BEFORE the first notify: at this point every target inbox must be
+# empty, and if it is not, no amount of care later in the run recovers the
+# evidence.
+wb_python preflight --agents "$AGENTS" \
+  --base-url "$WB_BASE_URL" --tls-ca "$WB_TLS_CERT" \
+  --agent-template "$WB_AGENT_TEMPLATE_PY" \
+  || wb_die "hub-kill pre-flight refused: a target inbox already holds rows. Run this drill against a FRESH database (e.g. --db-name ai_memory_f1_3473_kill), or drop and recreate the one you named."
+
 wb_start_refresher "$AGENTS"
 wb_start_hub
 
@@ -123,7 +139,7 @@ wb_python run --arms hub --ready-file "$READY" \
   --base-url "$WB_BASE_URL" --tls-ca "$WB_TLS_CERT" \
   --hub-socket "$WB_SOCKET" --bundle-dir "$WB_BUNDLES" --hub-id "$WB_HUB_ID" \
   --sender "$WB_SENDER" --agents "$AGENTS" \
-  --agent-template "ai:wake-bench-{i:04d}" \
+  --agent-template "$WB_AGENT_TEMPLATE_PY" \
   --notifies "$NOTIFIES" --pace-ms "$PACE_MS" --settle-secs 5 \
   --label "hub-kill-3473" --host-substrate "${WB_HOST_LABEL:-f1}" \
   --committed-out "$COMMITTED" \

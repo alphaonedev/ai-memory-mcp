@@ -80,6 +80,9 @@ Subcommands
   run          the latency measurement (one or more agent counts)
   rate         write-path (`notify`) / read-path (`inbox`) throughput for one
                A-B-A-B leg (alias: `notify-rate`)
+  preflight    refuse the hub-kill drill unless every recipient inbox is
+               empty (the read path caps at 500 rows with no cursor, so a
+               reused database can only ever answer INCONCLUSIVE)
   reconcile    prove no inbox row was lost, from a committed-id ledger
   --self-test  contract checks that need no daemon (alias: --dry-run)
 
@@ -138,8 +141,27 @@ INBOX_PATH = "/api/v1/inbox"
 INBOX_STREAM_PATH = "/api/v1/inbox/stream"
 
 
+#: Overall wall-clock bound on tearing an arm down, NOT a per-thread bound.
+TEARDOWN_DEADLINE_SECS = 30.0
+
+
 class HarnessError(Exception):
     """A refusal. Every one of these is fail-closed: the run stops."""
+
+
+def _join_bounded(threads: list, deadline_secs: float, what: str) -> None:
+    """Join `threads` under ONE deadline shared across all of them."""
+    deadline = time.monotonic() + deadline_secs
+    for thread in threads:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
+    alive = sum(1 for t in threads if t.is_alive())
+    if alive:
+        print(f"[wake_latency] {alive}/{len(threads)} {what} threads outlived the "
+              f"{deadline_secs}s teardown deadline; they are daemon threads and "
+              f"hold no durable state, so the run continues", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +252,19 @@ class Session:
                 self._conn.close()
             finally:
                 self._conn = None
+
+    def set_agent_id(self, agent_id: str) -> None:
+        """Re-point this session's `X-Agent-Id` without reconnecting.
+
+        The daemon resolves the caller PER REQUEST from the header, so one
+        keep-alive connection can read N agents' inboxes in turn. That is
+        what makes the `preflight` and `reconcile` sweeps one handshake
+        instead of N — at 256 agents the difference is 256 TLS handshakes
+        and 256 discarded warm-ups, which on this host is minutes.
+
+        Only ever used on READ sweeps that are outside a timed window.
+        """
+        self.agent_id = agent_id
 
     def headers(self, extra: dict | None = None) -> dict:
         h = {"accept": "application/json"}
@@ -439,10 +474,17 @@ class HubArm:
                     f"{ready_timeout}s; last errors: {errors or ['none reported']}"
                 )
 
-    def stop_all(self) -> None:
+    def stop_all(self, deadline_secs: float = TEARDOWN_DEADLINE_SECS) -> None:
+        """Stop every listener under ONE overall deadline.
+
+        A per-thread `join(5s)` is a per-thread bound, not a run bound: at
+        256 agents a pathological teardown is 256 x 5 s = 21 minutes of a
+        driver script appearing to hang between legs. The listeners are
+        daemon threads and hold no durable state — the inbox row is the
+        record — so a residual is reported and abandoned, never waited on.
+        """
         self.stop.set()
-        for thread in self.threads:
-            thread.join(timeout=5.0)
+        _join_bounded(self.threads, deadline_secs, "hub listener")
 
     def metrics(self) -> dict:
         totals = {"sessions": 0, "reconnects": 0, "signals": 0}
@@ -571,12 +613,12 @@ class SseArm:
         if self.open_errors:
             raise HarnessError("SSE arm refused: " + "; ".join(self.open_errors[:5]))
 
-    def stop_all(self) -> None:
+    def stop_all(self, deadline_secs: float = TEARDOWN_DEADLINE_SECS) -> None:
+        """Close the streams, then join under ONE overall deadline (A4)."""
         self.stop.set()
         for session in self.sessions:
             session.close()
-        for thread in self.threads:
-            thread.join(timeout=5.0)
+        _join_bounded(self.threads, deadline_secs, "SSE reader")
 
     def metrics(self) -> dict:
         return {"events": dict(self.events)}
@@ -1145,6 +1187,55 @@ def read_inbox_ids(session: Session, agent: str, limit: int) -> tuple[set[str], 
     return ids, len(messages)
 
 
+def cmd_preflight(a: argparse.Namespace) -> int:
+    """REFUSE to start a hub-kill drill on a database that already has mail.
+
+    The row-loss gate reads each recipient's inbox through
+    `GET /api/v1/inbox`, which caps `limit` at 500 SERVER-SIDE and exposes no
+    cursor. So a recipient carrying rows from an EARLIER run — the
+    `wake_abab.sh` notify legs write thousands to these same ids, and the
+    README's own ordering runs them first against the same `--db-name` — will
+    hit that ceiling, and a truncated read cannot tell "lost" from "past the
+    page". The drill would then report INCONCLUSIVE by construction: never a
+    false PASS, but never a usable answer either, after paying for the whole
+    run.
+
+    Checking BEFORE the first notify converts that into a refusal that costs
+    seconds and names the remedy. It is the load-bearing half of the fix:
+    the README can be re-ordered, but only this check can prove the database
+    was actually clean for THIS run.
+    """
+    agents = [a.agent_template.format(i=i) for i in range(a.agents)]
+    session = Session(a.base_url, api_key=a.api_key, tls_ca=a.tls_ca,
+                      allow_plaintext=a.allow_plaintext_loopback)
+    dirty: list[tuple[str, int]] = []
+    try:
+        session.warmup()
+        for agent in agents:
+            session.set_agent_id(agent)
+            _, returned = read_inbox_ids(session, agent, 1)
+            if returned:
+                dirty.append((agent, returned))
+    finally:
+        session.close()
+
+    if dirty:
+        sample = ", ".join(f"{name}" for name, _ in dirty[:5])
+        more = f" (+{len(dirty) - 5} more)" if len(dirty) > 5 else ""
+        raise HarnessError(
+            f"{len(dirty)} of {len(agents)} recipient inboxes already carry rows "
+            f"— e.g. {sample}{more}. `GET /api/v1/inbox` caps at "
+            f"{INBOX_LIMIT_CAP} rows with no cursor, so the hub-kill row-loss "
+            "gate could only report INCONCLUSIVE against this database. Run the "
+            "drill against a FRESH database (its own --db-name, or DROP and "
+            "CREATE between steps); the A-B-A-B notify legs write to these same "
+            "recipient ids."
+        )
+    print(f"[wake_latency] preflight: {len(agents)} recipient inboxes are empty",
+          file=sys.stderr)
+    return 0
+
+
 def cmd_reconcile(a: argparse.Namespace) -> int:
     """Prove that every committed notify is still readable through the inbox.
 
@@ -1179,21 +1270,24 @@ def cmd_reconcile(a: argparse.Namespace) -> int:
     truncated: list[str] = []
     missing: dict[str, list[str]] = {}
     present_total = 0
-    for agent, expected in sorted(by_agent.items()):
-        session = Session(a.base_url, agent_id=agent, api_key=a.api_key,
-                          tls_ca=a.tls_ca,
-                          allow_plaintext=a.allow_plaintext_loopback)
-        try:
-            session.warmup()
+    # ONE keep-alive connection, re-pointed per recipient: the identity is a
+    # per-request header, and 256 handshakes plus 256 warm-ups would cost
+    # minutes on this host for no extra evidence.
+    session = Session(a.base_url, api_key=a.api_key, tls_ca=a.tls_ca,
+                      allow_plaintext=a.allow_plaintext_loopback)
+    try:
+        session.warmup()
+        for agent, expected in sorted(by_agent.items()):
+            session.set_agent_id(agent)
             ids, returned = read_inbox_ids(session, agent, limit)
-        finally:
-            session.close()
-        present_total += returned
-        if returned >= limit:
-            truncated.append(agent)
-        gone = sorted(expected - ids)
-        if gone:
-            missing[agent] = gone[:20]
+            present_total += returned
+            if returned >= limit:
+                truncated.append(agent)
+            gone = sorted(expected - ids)
+            if gone:
+                missing[agent] = gone[:20]
+    finally:
+        session.close()
 
     verdict = "PASS"
     code = 0
@@ -1342,6 +1436,31 @@ def self_test() -> int:
     check(args.op == "notify",
           "the legacy `notify-rate` spelling must still reach the notify op")
 
+    args = parser.parse_args([
+        "preflight", "--base-url", "https://127.0.0.1:9443",
+        "--tls-ca", "/x/ca.pem", "--agents", "128",
+    ])
+    check(args.cmd == "preflight" and args.agents == 128,
+          "the hub-kill pre-flight must parse an agent count")
+
+    # A session's identity is a per-request header, so one keep-alive
+    # connection serves the whole read sweep.
+    probe = Session("http://127.0.0.1:9443", agent_id="ai:a", allow_plaintext=True)
+    probe.set_agent_id("ai:b")
+    check(probe.headers()["x-agent-id"] == "ai:b",
+          "set_agent_id must re-point the wire identity without reconnecting")
+
+    # Teardown is bounded OVERALL, not per thread: 256 x 5 s is 21 minutes.
+    idle = [threading.Thread(target=lambda: None) for _ in range(3)]
+    for t in idle:
+        t.start()
+    started = time.monotonic()
+    _join_bounded(idle, 5.0, "self-test")
+    check(time.monotonic() - started < 5.0, "a bounded join must not spend its budget")
+    check(TEARDOWN_DEADLINE_SECS == 30.0,
+          "the teardown deadline is a RUN bound; a per-thread bound at 256 "
+          "agents is a 21-minute hang between legs")
+
     # 6. The reconcile ceiling is the server's, not a local guess.
     check(SHED_CODE == 503,
           "admission-control shedding must be counted apart from throughput, "
@@ -1450,6 +1569,13 @@ def build_parser() -> argparse.ArgumentParser:
     hold.add_argument("--max-secs", type=float, default=3600.0,
                       help="bounded: a held run can never outlive the drill")
 
+    pre = sub.add_parser(
+        "preflight",
+        help="refuse to start the hub-kill drill unless every recipient inbox is empty")
+    _transport_args(pre)
+    pre.add_argument("--agents", type=int, required=True)
+    pre.add_argument("--agent-template", default="ai:wake-bench-{i:04d}")
+
     rec = sub.add_parser("reconcile", help="prove no inbox row was lost")
     _transport_args(rec)
     rec.add_argument("--committed", required=True,
@@ -1473,6 +1599,8 @@ def main() -> int:
             return cmd_rate(a)
         if a.cmd == "hold":
             return cmd_hold(a)
+        if a.cmd == "preflight":
+            return cmd_preflight(a)
         if a.cmd == "reconcile":
             return cmd_reconcile(a)
     except HarnessError as exc:

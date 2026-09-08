@@ -58,7 +58,13 @@ WB_BINARY="${WB_BINARY:-}"
 WB_RUN="${WB_RUN:-}"
 WB_PORT="${WB_PORT:-19473}"
 WB_HUB_ID="${WB_HUB_ID:-ai-memory-wake-hub}"
-WB_AGENT_TEMPLATE="${WB_AGENT_TEMPLATE:-ai:wake-bench-%04d}"
+# ONE agent-id vocabulary in two dialects, because `printf` and Python
+# format strings cannot share a literal. They are ASSERTED equal at init
+# rather than trusted: a silent divergence would enrol one set of agents and
+# then measure a different set, and every wake would go missing for a reason
+# no counter could name.
+WB_AGENT_TEMPLATE_PRINTF="${WB_AGENT_TEMPLATE_PRINTF:-ai:wake-bench-%04d}"
+WB_AGENT_TEMPLATE_PY="${WB_AGENT_TEMPLATE_PY:-ai:wake-bench-{i:04d}}"
 WB_SENDER="${WB_SENDER:-ai:wake-bench-sender}"
 WB_DELEGATION_TTL="${WB_DELEGATION_TTL:-10800}"
 WB_MAX_CONNECTIONS="${WB_MAX_CONNECTIONS:-512}"
@@ -84,10 +90,22 @@ wb_die() { printf '[wake-bench] FATAL: %s\n' "$*" >&2; exit 70; }
 # --- disk floor ------------------------------------------------------------
 # The lane's binding floor. Stop BEFORE producing anything rather than fill a
 # host and take the node down mid-run.
+#
+# POSIX `df -Pk`, never `df -g`. `-g` is a BSD/macOS spelling that GNU
+# coreutils does not accept: on f2 (Linux) it makes `df` fail, `$4` come back
+# EMPTY, and the guard then compares an empty string — so the floor either
+# dies on every run or, worse, reads as satisfied. `-P` guarantees one line
+# per filesystem (no wrap on a long device name) and `-k` fixes the unit, so
+# the arithmetic is the same on both hosts. A non-numeric result REFUSES
+# rather than defaulting: a disk guard that cannot read the disk has not
+# cleared anything.
 wb_check_disk() {
   local free
-  free="$(df -g "${WB_RUN}" | awk 'NR==2 {print $4}')"
-  if [ "${free:-0}" -lt "${WB_DISK_FLOOR_GB:-100}" ]; then
+  free="$(df -Pk "${WB_RUN}" | awk 'NR==2 {print int($4/1048576)}')"
+  case "$free" in
+    ''|*[!0-9]*) wb_die "could not read free disk on ${WB_RUN} (df -Pk gave '${free}')" ;;
+  esac
+  if [ "$free" -lt "${WB_DISK_FLOOR_GB:-100}" ]; then
     wb_die "free disk on ${WB_RUN} is ${free} GB, below the ${WB_DISK_FLOOR_GB:-100} GB floor"
   fi
   wb_log "disk: ${free} GB free"
@@ -117,6 +135,7 @@ wb_init() {
   # The hub REFUSES to bind inside a directory another local user could write,
   # and `ai-memory wake-listen` (and this harness's hub arm) refuse to dial one.
   chmod 700 "$WB_SOCKDIR" "$WB_KEYS" "$WB_BUNDLES"
+  wb_assert_agent_template_agreement
   wb_check_disk
 }
 
@@ -125,14 +144,19 @@ wb_init() {
 # FIRST exec on f1. Spend it here, once, on `--version`, and PUBLISH the cost.
 # It is a host fact about f1 and it is never folded into a measured percentile.
 wb_prewarm_binary() {
-  local t0 t1 ms
+  local t0 t1 ms ver
+  # ONE exec, and it is the timed one. Calling `--version` again to fill the
+  # JSON would report the FIRST exec's cost beside the SECOND exec's output,
+  # and the second exec is warm by construction — the number and the string
+  # would then describe different events.
   t0="$(python3 -c 'import time; print(time.perf_counter())')"
-  "$WB_BINARY" --version >/dev/null 2>&1 || wb_die "the binary would not run"
+  ver="$("$WB_BINARY" --version 2>/dev/null | head -1)"
   t1="$(python3 -c 'import time; print(time.perf_counter())')"
+  [ -n "$ver" ] || wb_die "the binary would not run (${WB_BINARY} --version produced nothing)"
   ms="$(python3 -c "print(round((${t1}-${t0})*1000, 1))")"
   wb_log "binary first-exec warm-up: ${ms} ms (DISCARDED; f1 host effect, never a percentile)"
-  printf '{"binary_first_exec_ms": %s, "binary": "%s"}\n' \
-    "$ms" "$("$WB_BINARY" --version | head -1)" >"${WB_RUN}/results/host-effects.json"
+  python3 -c 'import json,sys; print(json.dumps({"binary_first_exec_ms": float(sys.argv[1]), "binary": sys.argv[2]}))' \
+    "$ms" "$ver" >"${WB_RUN}/results/host-effects.json"
 }
 
 # --- TLS -------------------------------------------------------------------
@@ -260,7 +284,21 @@ wb_stop_daemon() {
 }
 
 # --- agents ----------------------------------------------------------------
-wb_agent_id() { printf "$WB_AGENT_TEMPLATE" "$1"; }
+wb_agent_id() { printf "$WB_AGENT_TEMPLATE_PRINTF" "$1"; }
+
+# Render the same indices through both dialects and refuse on disagreement.
+# Index 0 catches a missing pad; 4095 catches a width that stops padding.
+wb_assert_agent_template_agreement() {
+  local i sh py
+  for i in 0 7 4095; do
+    sh="$(printf "$WB_AGENT_TEMPLATE_PRINTF" "$i")"
+    py="$(python3 -c 'import sys; print(sys.argv[1].format(i=int(sys.argv[2])))' \
+            "$WB_AGENT_TEMPLATE_PY" "$i")"
+    [ "$sh" = "$py" ] || wb_die \
+      "agent-id templates disagree at index ${i}: printf gave '${sh}', python gave '${py}'"
+  done
+  wb_log "agent-id template: $(wb_agent_id 0) .. $(wb_agent_id 4095) (both dialects agree)"
+}
 
 wb_cli() {
   HOME="$WB_HOME" XDG_CONFIG_HOME="${WB_HOME}/.config" \

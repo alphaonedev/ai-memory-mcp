@@ -135,13 +135,35 @@ conventions this directory already has (`benchlib.py`, `ops_producer.py`).
 
    ```sh
    psql "$(sed 's#/[^/?]*?#/postgres?#' ~/.ai-memory-ci-fed-url)" \
-     -c 'CREATE DATABASE ai_memory_f1_3473'   # f2 uses its own name
+     -c 'CREATE DATABASE ai_memory_f1_3473'        # f2 uses its own names
+   psql "$(sed 's#/[^/?]*?#/postgres?#' ~/.ai-memory-ci-fed-url)" \
+     -c 'CREATE DATABASE ai_memory_f1_3473_kill'
    ```
 
    The URL is then passed as a FILE (`--store-url-src`), swapped to that
    database name, written 0600 and handed to the daemon through
    `AI_MEMORY_STORE_URL_FILE` — never on argv, where `ps auxww` would show
    the password.
+
+   **The hub-kill drill needs a FRESH database of its own** — the second
+   name above, or the first one dropped and recreated between steps. The
+   row-loss gate reads `GET /api/v1/inbox`, which the daemon caps at 500
+   rows with no cursor, while the A-B-A-B legs write thousands of rows to
+   the SAME recipient ids. Sharing one database does not make the gate
+   fail; it makes it UNPROVABLE, which is worse, because a truncated read
+   cannot distinguish "no row was lost" from "the rows that were lost are
+   past the cap". `wake_hub_kill.sh` therefore runs
+   `wake_latency.py preflight` before its first notify and REFUSES (exit
+   70) unless every target inbox is empty.
+
+5. `openssl` with `req -addext` support — **OpenSSL >= 1.1.1** or
+   **LibreSSL >= 3.1**. `wb_mint_tls` uses `-addext
+   "subjectAltName=IP:127.0.0.1"` to put the SAN on the self-signed
+   certificate the harness pins; an older `openssl` rejects the flag and
+   the run stops there rather than falling back to a SAN-less certificate
+   the client would refuse anyway. macOS ships LibreSSL 3.3+ in
+   `/usr/bin/openssl`; on a host with an older one, put a newer
+   `openssl` first on `PATH`.
 
 ## Transport
 
@@ -200,9 +222,12 @@ scripts/bench/wake_abab.sh --binary target/release/ai-memory \
   --db-name ai_memory_f1_3473 --agent-counts "16 64 128 256"
 
 # 3. hub SIGKILL under load at 128 agents
+#    NOTE the SEPARATE database: the reconciliation read is capped at 500
+#    rows per inbox, so a database the A-B-A-B legs already wrote to can
+#    only answer INCONCLUSIVE. The pre-flight refuses that run outright.
 scripts/bench/wake_hub_kill.sh --binary target/release/ai-memory \
   --run-dir "$RUN" --store-url-src ~/.ai-memory-ci-fed-url \
-  --db-name ai_memory_f1_3473 --agents 128
+  --db-name ai_memory_f1_3473_kill --agents 128
 ```
 
 Step 1 needs a daemon + hub already up; the simplest order is to run step 2

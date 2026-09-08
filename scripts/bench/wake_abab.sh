@@ -127,7 +127,7 @@ run_rungs() {
     wb_python rate --op "$op" \
       --base-url "$WB_BASE_URL" --tls-ca "$WB_TLS_CERT" \
       --sender "$WB_SENDER" --agents "$agents" \
-      --agent-template "ai:wake-bench-{i:04d}" \
+      --agent-template "$WB_AGENT_TEMPLATE_PY" \
       --concurrency "$CONCURRENCY" --duration "$DURATION" \
       --leg "$leg" --label "abab-n${agents}" --host-substrate "${WB_HOST_LABEL:-f1}" \
       --out "${RESULTS}/n${agents}-${leg}-${op}.json" \
@@ -154,7 +154,7 @@ leg_b() {
   wb_python hold --agents "$agents" --arms hub \
     --base-url "$WB_BASE_URL" --tls-ca "$WB_TLS_CERT" \
     --hub-socket "$WB_SOCKET" --bundle-dir "$WB_BUNDLES" --hub-id "$WB_HUB_ID" \
-    --agent-template "ai:wake-bench-{i:04d}" --ready-file "$ready" \
+    --agent-template "$WB_AGENT_TEMPLATE_PY" --ready-file "$ready" \
     --max-secs 3600 --out "${RESULTS}/n${agents}-${leg}-hold.json" &
   HOLD_PID=$!
   local i=0
