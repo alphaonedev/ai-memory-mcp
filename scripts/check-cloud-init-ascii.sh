@@ -11,52 +11,81 @@
 # cloud-config is safest as pure ASCII; this gate keeps it that way.
 #
 # Scope: infra/do-hive/*.tpl (the templatefile() inputs). Exit 0 = clean,
-# 1 = a non-ASCII byte found (offender printed), 2 = usage/self-test failure.
+# 1 = a non-ASCII byte found (offender printed), 2 = scanner/usage/self-test failure.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_GLOB="${AI_MEMORY_CLOUDINIT_GLOB:-${HERE}/infra/do-hive/*.tpl}"
 
+mkdir -p "${HERE}/.local-runs"
+scratch="$(mktemp -d "${HERE}/.local-runs/cloud-init-ascii.XXXXXX")"
+trap '(cd "$HERE" && rm -rf ".local-runs/${scratch##*/}")' EXIT
+
 scan() {
-  local found=0 f
+  local found=0 f status
   for f in $1; do
     [ -f "$f" ] || continue
-    # grep -P byte class: any byte outside 0x00-0x7F. -n gives line numbers.
-    if LC_ALL=C grep -naP '[^\x00-\x7F]' "$f" >/tmp/_cia_$$  2>/dev/null; then
+    # Bash supplies literal range endpoints; C locale makes this a byte range.
+    # -a also scans NUL-containing files; -n retains offender line numbers.
+    if LC_ALL=C grep -na $'[\200-\377]' "$f" >"$scratch/matches"; then
       found=1
       echo "NON-ASCII in $f:" >&2
-      sed 's/^/  /' /tmp/_cia_$$ >&2
+      cat "$scratch/matches" >&2
+    else
+      status=$?
+      if [ "$status" -ne 1 ]; then
+        echo "FAIL: ASCII scanner exited $status for $f" >&2
+        return 2
+      fi
     fi
   done
-  rm -f /tmp/_cia_$$
-  return $found
+  return "$found"
 }
 
 if [ "${1:-}" = "--self-test" ]; then
-  tmp="$(mktemp -d)"
-  # em-dash (U+2014) in a comment — the exact #1880 shape.
-  printf '#cloud-config\n# Track E1 \xe2\x80\x94 bootstrap\n' > "$tmp/bad.tpl"
-  if scan "$tmp/bad.tpl" 2>/dev/null; then
-    echo "SELF-TEST FAIL: gate did not catch a non-ASCII cloud-init template" >&2
-    rm -rf "$tmp"; exit 2
-  fi
-  printf '#cloud-config\n# clean ascii only\n' > "$tmp/ok.tpl"
-  if ! scan "$tmp/ok.tpl" 2>/dev/null; then
-    echo "SELF-TEST FAIL: gate flagged a clean ASCII template" >&2
-    rm -rf "$tmp"; exit 2
-  fi
-  rm -rf "$tmp"
+  templates=("${HERE}"/infra/do-hive/*.tpl)
+  cp "${templates[0]}" "$scratch/copied.tpl"
+  printf '\200' >> "$scratch/copied.tpl"
+  printf '\200' > "$scratch/empty-with-byte.tpl"
+  printf '#cloud-config\n# en dash: \342\200\223\n' > "$scratch/utf8.tpl"
+  for fixture in copied empty-with-byte utf8; do
+    status=0
+    scan "$scratch/$fixture.tpl" >"$scratch/output" 2>&1 || status=$?
+    if [ "$status" -ne 1 ]; then
+      cat "$scratch/output" >&2
+      echo "SELF-TEST FAIL: $fixture expected detection (exit 1), got $status" >&2
+      exit 2
+    fi
+    echo "SELF-TEST PASS: $fixture non-ASCII detected (exit 1)"
+  done
+  printf '#cloud-config\n# clean ASCII\t\r\177\000\n' > "$scratch/ok.tpl"
+  : > "$scratch/empty.tpl"
+  for fixture in ok empty; do
+    if scan "$scratch/$fixture.tpl"; then
+      echo "SELF-TEST PASS: $fixture ASCII accepted (exit 0)"
+    else
+      echo "SELF-TEST FAIL: gate rejected $fixture ASCII template" >&2
+      exit 2
+    fi
+  done
   echo "check-cloud-init-ascii self-test OK"
   exit 0
 fi
 
-if scan "$TARGET_GLOB"; then
-  echo "check-cloud-init-ascii: OK (all cloud-init templates are pure ASCII)"
-  exit 0
-else
-  echo "" >&2
-  echo "FAIL (#1880): cloud-init templates must be pure ASCII — a non-ASCII byte" >&2
-  echo "makes cloud-init silently discard the config and boot a BARE droplet." >&2
-  echo "Replace em-dashes/smart-quotes/etc. with ASCII equivalents." >&2
-  exit 1
-fi
+status=0
+scan "$TARGET_GLOB" || status=$?
+case "$status" in
+  0)
+    echo "check-cloud-init-ascii: OK (all cloud-init templates are pure ASCII)"
+    ;;
+  1)
+    echo "" >&2
+    echo "FAIL (#1880): cloud-init templates must be pure ASCII — a non-ASCII byte" >&2
+    echo "makes cloud-init silently discard the config and boot a BARE droplet." >&2
+    echo "Replace em-dashes/smart-quotes/etc. with ASCII equivalents." >&2
+    ;;
+  *)
+    echo "FAIL: cloud-init ASCII scan could not complete" >&2
+    ;;
+esac
+exit "$status"
