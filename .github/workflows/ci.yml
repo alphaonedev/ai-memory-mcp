@@ -696,7 +696,26 @@ jobs:
             runner: '["ubuntu-latest"]'
             node: ubuntu-latest
             tier: sqlite
-            timeout: 55
+            # 2026-09-08 (#3538): 55 KILLED this leg twice, both times mid
+            # `Build release`, both times as a nameless `cancelled` that reads
+            # exactly like a product red: 70c20c8d (job 100354894089, 3319s,
+            # 09-02) and 25ebe4a7 attempt 1 (job 101978130955, 3316s, 09-08;
+            # the re-run passed in 3083s). This is the ONE leg that also
+            # carries the 2x2-invariant extras (cargo-audit + the release
+            # profile smoke), and on a FULL-impact diff its measured wall time
+            # grew 2897s (d41050df, 09-02) -> 3271s (3017ea05, 09-07 — the
+            # LONGEST run that completed) = 54.5 min against a 55 min cap, i.e.
+            # 29s of margin. 75 min is ~1.38x that measured max AND clears
+            # 3865s (64.4 min), the sum of every step's individually observed
+            # maximum (free-disk 187s + impact-aware tests 2441s + a COLD
+            # `cargo install cargo-audit` 413s + release smoke 787s +
+            # setup/post ~37s) — a combination no single run has hit yet but
+            # any run may. The #1492 watchdog below stays the inner bound and
+            # the hang detector (worst case ~55 min: 970s compile + 2100s
+            # watchdog + 224s setup), so a genuine hang still fails with a
+            # NAMED ::error:: ~20 min before this outer cap. Re-derive when a
+            # measured full run comes within 20 % of this value.
+            timeout: 75
             # `once` marks the ONE leg that carries the 2x2-invariant extras
             # (cargo-audit, the release-profile smoke build) so they do not
             # multiply across four legs. It is an explicit flag rather than a
@@ -1085,9 +1104,24 @@ jobs:
           TAIL=""
           # #1492 hung-test watchdog cap (seconds), TIER- and NODE-AWARE
           # (#3461 made it node-aware; see the sqlite branch below). The
-          # `sqlite` legs run the default suite in PARALLEL and finish fast, so
-          # 1500s is ample hang-detection headroom on the hosted ubuntu runner
-          # — but NOT on the shared macos-fed node, which gets 2400s below.
+          # `sqlite` legs run the default suite in PARALLEL, but "finishes
+          # fast" stopped being true for the FULL-impact run: on the hosted
+          # ubuntu leg the WATCHDOGGED window (test runtime only — the compile
+          # is prebuilt outside it, see #1989 below) measured 1254s (70c20c8d,
+          # 09-02) -> 1341s (d4c5e243) -> 1360s (5ebf6906) -> 1381s (3017ea05,
+          # 09-07) -> 1366s (25ebe4a7), i.e. 92 % of the old 1500s cap with a
+          # 119s margin, so the next batch of suites would have made the
+          # watchdog fire on a HEALTHY suite — the #2657 misdirection #3461
+          # already had to fix once on macos-fed. 2100s is ~1.52x the 1381s
+          # measured max (#3538) and absorbs ~29 days at the measured +25s/day;
+          # the shared macos-fed node still overrides UP to 2400s below.
+          # Raised as the shared DEFAULT rather than behind a
+          # `CI_NODE = ubuntu-latest` comparison ON PURPOSE: this leg has
+          # already been renamed once (linux-fed,sqlite -> ubuntu-latest,sqlite)
+          # and a node-name comparison silently stops matching on a rename —
+          # the exact drift the `once:` flag above exists to avoid. Every
+          # non-macos sqlite node therefore gets the larger hang budget by
+          # default, which delays hang DETECTION and never weakens it.
           # The `enterprise-fed` legs run
           # the sal-postgres suite SINGLE-THREADED (`-- --test-threads=1`, to
           # serialise the shared-database DDL) — the exact discipline the
@@ -1109,7 +1143,7 @@ jobs:
           # variance headroom rather than a knife-edge margin. The cap must
           # stay a hang-detector, so the job-level `timeout-minutes` is the
           # outer bound (see that key on this job).
-          WATCHDOG_SECS=1500
+          WATCHDOG_SECS=2100
           if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
             FEAT="--features sal-postgres"
             TAIL="-- --test-threads=1"
@@ -1145,9 +1179,11 @@ jobs:
             # invariant gates pin. Raising one integer keeps the hang-detection
             # intent intact with nothing new to maintain.
             #
-            # The linux tiers are UNCHANGED: ubuntu-latest,sqlite keeps 1500s
-            # (a hosted runner that finishes well inside it) and
-            # linux-fed,enterprise-fed keeps its 3300s above.
+            # This override is still the LARGER of the two: #3538 measured
+            # the hosted ubuntu leg at 92 % of the old 1500s default and raised
+            # that default to 2100s, so macos-fed keeps its own 2400s here. The
+            # enterprise-fed tier is untouched by both and keeps the 4800s
+            # #3525 set above.
             if [ "${CI_NODE:-}" = "macos-fed" ]; then
               WATCHDOG_SECS=2400
             fi
