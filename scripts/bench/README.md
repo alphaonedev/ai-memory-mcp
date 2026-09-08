@@ -236,9 +236,23 @@ scripts/bench/wake_hub_kill.sh --binary target/release/ai-memory \
 Step 1 needs a daemon + hub already up; the simplest order is to run step 2
 or 3 first (each brings the whole lifecycle up and tears it down), or to
 source `wake_bench_env.sh` in a shell and call `wb_init` / `wb_mint_tls` /
-`wb_write_store_url` / `wb_schema_init` / `wb_enroll_agents` /
+`wb_write_store_url` / `wb_enroll_agents` /
 `wb_start_daemon "$WB_SOCKET"` / `wb_start_refresher` / `wb_start_hub` by
 hand.
+
+**There is no schema-init step, on purpose.** An earlier revision called
+`ai-memory schema-init` before the first leg; it could never work, because
+that subcommand takes the store URL on `--store-url` and does not read
+`AI_MEMORY_STORE_URL_FILE`, while this lane never puts the URL on argv
+(#1927 — argv is world-readable via `ps auxww`). Every driver therefore died
+at exit 70 before a daemon existed (Master, #3473 phase-2 f2 leg). Removing
+it costs nothing measurable: the daemon bootstraps its own schema on connect
+(idempotent `CREATE … IF NOT EXISTS` behind the #3520 catalog probe), and
+`wb_start_daemon` does not return until `GET /api/v1/health` answers — so the
+bootstrap is finished before anything is timed, and the health gate, not a
+separate step, is what keeps setup cost out of the percentiles. Teaching
+`schema-init` to honour the file env is a product change and is out of scope
+for this lane.
 
 Contract checks, no daemon needed:
 
