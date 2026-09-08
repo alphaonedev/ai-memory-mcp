@@ -2918,6 +2918,15 @@ impl PostgresStore {
                         } else {
                             tracing::debug!(
                                 target: TRACE_TARGET,
+                                // The namespace the probe actually consulted:
+                                // this connection's effective first
+                                // search_path schema, NOT a constant. A
+                                // schema-scoped connect must show its OWN
+                                // schema here — if it ever shows `public`
+                                // while the caller pinned another schema, the
+                                // filter is answering the wrong question and
+                                // the connect is about to lose its isolation.
+                                schema = %inventory.schema,
                                 skipped = filtered.skipped,
                                 total = filtered.total,
                                 "#3520: bootstrap DDL trimmed against the catalog; skipped statements take no relation-level lock"
