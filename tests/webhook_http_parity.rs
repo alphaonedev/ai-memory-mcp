@@ -290,8 +290,17 @@ fn seed_memory(db_path: &Path, title: &str, namespace: &str) -> String {
     conn.execute(
         "INSERT INTO memories (id, title, content, tier, namespace, tags, priority, \
          confidence, source, metadata, created_at, updated_at, access_count) \
-         VALUES (?1, ?2, ?3, 'mid', ?4, '[]', 5, 1.0, 'cli', '{}', ?5, ?5, 0)",
-        rusqlite::params![id, title, "test content", namespace, now],
+         VALUES (?1, ?2, ?3, 'mid', ?4, '[]', 5, 1.0, 'cli', ?6, ?5, ?5, 0)",
+        // These anonymous webhook fixtures need readable, unowned sources
+        // for the current link and consolidation read gates (#3498/#3380).
+        rusqlite::params![
+            id,
+            title,
+            "test content",
+            namespace,
+            now,
+            json!({"scope": "collective"}).to_string()
+        ],
     )
     .expect("insert memory");
     id

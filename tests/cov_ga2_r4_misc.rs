@@ -553,24 +553,24 @@ async fn sqlite_consolidate_no_summary_deterministic_fallback() {
 }
 
 #[tokio::test]
-async fn sqlite_consolidate_unknown_source_id_is_400() {
+async fn sqlite_consolidate_unknown_source_id_is_404() {
     let (r, _t) = sqlite_router();
     let ns = uniq_ns();
     // No summary forces the source-pair fetch; a non-existent id in the
-    // SQLite arm surfaces Ok(None) → 400 (lines 208-214).
+    // SQLite arm surfaces Ok(None) → 404 (lines 208-214).
     let ghost = format!("ghost-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let (status, _b) = post_json(
         &r,
         "/api/v1/consolidate",
         json!({
-            "ids": [ghost],
+            "ids": [ghost, "missing-second-3380"],
             "title": "ghost consolidate",
             "namespace": ns,
             "agent_id": CALLER,
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

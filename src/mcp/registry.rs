@@ -1607,6 +1607,9 @@ mod d1_6_987_tests {
         // #3382: restore preserves original_expires_at; it never cleared expiry.
         "memory_archive_restore",
         "memory_calibrate_confidence",
+        // 2026-09-09 (#3380): tombstoned sources retain derived_from links;
+        // the former metadata-only provenance claim was false.
+        "memory_consolidate",
         "memory_delete",
         "memory_entity_register",
         "memory_export_reflection",

@@ -10086,7 +10086,8 @@ async fn http_consolidate_two_into_one_happy_path() {
             updated_at: now.clone(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({"agent_id": "alice"}),
+            // #3380: the successful consolidator must own each source.
+            metadata: serde_json::json!({"agent_id": "consolidator"}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -10144,6 +10145,7 @@ async fn http_consolidate_two_into_one_happy_path() {
 
 #[tokio::test]
 async fn http_consolidate_fans_out_to_peer_1552() {
+    crate::governance::wire_check::ensure_installed_for_test();
     // #1552 — the consolidate write path must broadcast the merged memory +
     // source deletions to the federation quorum (shared `consolidate_fanout`
     // helper, exercised here through the sqlite branch). With W=2 and one
@@ -10172,7 +10174,8 @@ async fn http_consolidate_fans_out_to_peer_1552() {
             updated_at: now.clone(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({"agent_id": "alice"}),
+            // #3380: the successful consolidator must own each source.
+            metadata: serde_json::json!({"agent_id": "consolidator"}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -10223,6 +10226,7 @@ async fn http_consolidate_fans_out_to_peer_1552() {
 
 #[tokio::test]
 async fn http_consolidate_under_replicated_returns_created_id_2856() {
+    crate::governance::wire_check::ensure_installed_for_test();
     // #2856 (federation data-integrity, 5-agent vote `4d3ea1c5`, Option A) —
     // a consolidation is a substrate-derived write the origin daemon cannot
     // sign as the tenant consolidator, so a strict-write-sig peer refuses it
@@ -10528,10 +10532,9 @@ async fn http_consolidate_max_id_count_cap_exceeded_400() {
 }
 
 #[tokio::test]
-async fn http_consolidate_missing_source_500() {
-    // Two well-formed UUIDs but the rows don't exist — db::consolidate
-    // bails inside the transaction, surface as 500. This covers the
-    // post-validation error arm of the handler.
+async fn http_consolidate_missing_source_404() {
+    // #3380: missing sources are refused with the same 404 envelope as
+    // hidden sources, before summary generation or the write transaction.
     let state = test_state();
     let id_a = Uuid::new_v4().to_string();
     let id_b = Uuid::new_v4().to_string();
@@ -10555,7 +10558,7 @@ async fn http_consolidate_missing_source_500() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ---- detect_contradictions (GET /api/v1/contradictions) ----------------
@@ -15440,7 +15443,8 @@ async fn http_consolidate_accepts_use_llm_without_summary_l7() {
             updated_at: now.clone(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({"agent_id": "alice"}),
+            // #3380: the successful consolidator must own each source.
+            metadata: serde_json::json!({"agent_id": "ai:alice"}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -15551,7 +15555,8 @@ async fn http_consolidate_response_carries_summary_on_every_key_s51_reads() {
             updated_at: now.clone(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({"agent_id": "alice"}),
+            // #3380: the successful consolidator must own each source.
+            metadata: serde_json::json!({"agent_id": "ai:alice"}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
