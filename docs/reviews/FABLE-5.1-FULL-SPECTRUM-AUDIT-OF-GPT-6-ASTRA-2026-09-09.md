@@ -1,7 +1,7 @@
 # Fable 5.1 Full-Spectrum Audit of the GPT-6 Astra Assessment — ai-memory v1.0.0
 
 **Author:** Claude Fable 5.1 (Conductor / gatekeeper / sole merger of `release/v1.0.0`)
-**Date:** 2026-09-09 (revision 4, after all three 3×3 waves, §9)
+**Date:** 2026-09-09 (revision 4.1: rulings recorded in §8)
 **Audited documents:** `GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md` (reviewed SHA `87f86a0a`)
 and `GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md`, both in this directory.
 **Tree audited:** `495404d79de186ff6e0bd0ec43996829c91ec200` (the merge-gated chain
@@ -354,28 +354,22 @@ appendix. Defensible certificate dates: **best case 19–23 Oct** if the soak ho
 hard-reset VM are provisioned this week; **expected 26 Oct – 6 Nov**. Without the two
 hosts there is no certificate date at all, only a tag.
 
-**Two decisions only the operator can make:**
+**The two decisions — RULED by the operator on 2026-09-09 (first delegated to the
+Conductor, then restated as the operator's own):**
 
-1. **GA means certified, or GA means tagged?** Either hold the v1.0.0 tag until G1–G8
-   are green (the tag date becomes the certificate date, late October at best), or tag
-   v1.0.0 on the tag-track path labelled "pilot — VENDOR SELF-CERTIFIED pending
-   certification" in the release note, README banner and `/capabilities`, with the
-   certificate as a separate October artifact against that immutable SHA. The
-   certificate is evidence about a frozen binary, so holding the tag couples a code
-   freeze to two hosts nobody has scheduled; the tag-track items already remove every
-   known would-ship defect. Wave 3 recommends the second with the mandatory "pilot"
-   wording; the Conductor's own preference is the first because the operator's stated
-   goal is the bet-the-farm standard. If the operator will not say "pilot" in public,
-   only the first is honest.
-2. **May the V-series be deferred?** PLAN-0 (2026-09-05) rolled every former v1.1
-   candidate into GA and #3247 cites a 2026-08-22 no-deferral directive. V1–V10 are
-   labelled `deferred-v1.x` here because they are comparative benchmarks, roadmap
-   experiments or new capabilities whose absence the standard already states in its
-   NOT CERTIFIED rows; deferring them changes no claim the certificate makes. The ruling
-   should be a dated operator comment on #3308 naming each id, with two conditions:
-   #2437 stays `ga-blocker`/`cert-blocker`, and the mission-summary regression case
-   (A32) rides N31 if the operator wants the published NHI verdict to move before the
-   certificate.
+1. **GA means certified.** The `v1.0.0` tag is cut only when gates G1–G8 pass on the
+   exact binary and the certificate is issued against that SHA. Interim builds on the
+   tag track ship as SemVer pre-release tags `v1.0.0-rc.N`, labelled "release candidate
+   — not certified"; no rc may be called GA and no public statement may imply
+   certification before the certificate exists. The binary freeze applies only to the
+   final rc that enters the soak.
+2. **V1–V10 stay deferred to v1.1**, superseding PLAN-0's roll-in for those ids; #2437
+   stays a GA and cert blocker as the harness-integrity prerequisite; the mission-summary
+   regression case (A32) rides #3564.
+
+**Standing rule from the operator: time is not an issue; the objective is to get
+ai-memory 100 % correct.** Every date above is a planning estimate and never a reason to
+skip, narrow or waive a gate, or to move an item to a later track.
 
 Three provisioning items cannot be closed by code or agent hours: a soak host for the
 24 h and 72 h runs (f1 and f2 are the gate fleet), a VM whose host can be hard-reset for

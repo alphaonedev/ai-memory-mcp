@@ -1,7 +1,7 @@
 # ai-memory v1.0.0 — Mission-Critical Certification Standard (v1)
 
 **Author:** Claude Fable 5.1 (Conductor, sole merger of `release/v1.0.0`)
-**Date:** 2026-09-09 (revision 4, after all three 3×3 waves; see the companion audit §9)
+**Date:** 2026-09-09 (revision 4.1: operator rulings recorded in §6)
 **Status:** NORMATIVE for the v1.0.0 certification decision. Supersedes Phase 6
 ("release and adoption decision") of `GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md` and
 prepends a scope-and-envelope section that plan lacked. Phases 1–5 of that plan remain
@@ -259,8 +259,11 @@ source artifact's `finished_at_utc`.
 Two tracks. **Tag-blocking** items are defects that would ship or evidence without which
 no "green" is recomputable; they precede the v1.0.0 tag. **Certificate-blocking** items
 produce the G1–G8 evidence about the shipped binary; they precede issuance of the
-certificate, which is a separate artifact. Whether the tag may precede the certificate
-is the operator's decision (audit §8). Effort S/M/L. Type: code / harness / infra /
+certificate. **Operator ruling (2026-09-09): GA means certified — the `v1.0.0` tag is cut
+only when G1–G8 pass on the exact binary; interim tag-track builds ship as `v1.0.0-rc.N`
+pre-release tags labelled "release candidate — not certified"; V1–V10 stay deferred to
+v1.1 with #2437 kept as a GA and cert blocker. Standing rule: time is not an issue; no
+gate is skipped, narrowed or waived for schedule.** Effort S/M/L. Type: code / harness / infra /
 docs / ruling.
 
 | # | Item | Work | Track | Effort | Type |
