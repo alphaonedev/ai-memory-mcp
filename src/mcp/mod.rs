@@ -891,6 +891,10 @@ pub mod tools {
         pub use super::super::skill_register::{SkillRegisterRequest, handle_skill_register};
     }
 
+    // #3381/#3523: isolated auto-tag envelope tests use the same cfg-gated entry pattern.
+    #[cfg(any(test, feature = "test-support"))]
+    pub use super::auto_tag::handle_auto_tag_for_tests;
+
     // v1.0.0 #3523 — re-export the TEST-ONLY entry to the caller-scoped
     // contradiction handler so the five `*_3387` cases can run in their OWN
     // PROCESS (`tests/detect_contradiction_3387.rs`) per the #3475 pattern,
@@ -2618,7 +2622,15 @@ fn dispatch_memory_expand_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 }
 
 fn dispatch_memory_auto_tag(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_auto_tag(ctx.conn, ctx.llm, ctx.arguments)
+    let caller =
+        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
+    handle_auto_tag(
+        ctx.conn,
+        ctx.llm,
+        ctx.arguments,
+        caller.as_deref(),
+        ctx.mcp_client,
+    )
 }
 
 fn dispatch_memory_detect_contradiction(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

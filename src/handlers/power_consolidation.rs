@@ -809,12 +809,36 @@ pub async fn auto_tag_handler(
             .into_response();
     }
 
+    // v1.0.0 #3381 (#2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller is resolved from `X-Agent-Id` for the `scope=private` source
+    // read below. Pre-fix `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`
+    // with per-agent keys enrolled 403'd `POST /api/v1/consolidate` but left
+    // `POST /api/v1/auto_tag` open, so a shared-transport-key caller forging
+    // `X-Agent-Id: <victim>` still read the victim's private content back
+    // through the model. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "auto_tag",
+    ) {
+        return resp;
+    }
+
     // QC P1 fix (2026-05-20): use header-resolved caller principal
     // for the source-memory fetch so the SAL #910 visibility filter
     // applies. Helper takes `&str` so non-sal builds compile.
     let auto_tag_caller_principal =
-        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
-            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+        match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
+            Ok(caller) => caller,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": crate::errors::msg::invalid("agent_id", error)})),
+                )
+                    .into_response();
+            }
+        };
 
     // Resolve (title, content). S51 sends `memory_id`; we fetch the
     // memory from the active backend. Ad-hoc callers may instead
@@ -988,17 +1012,19 @@ async fn fetch_memory_for_handler(
     id: &str,
     caller_principal: &str,
 ) -> Result<Memory, Response> {
-    #[cfg(not(feature = "sal"))]
-    let _ = caller_principal;
+    // HTTP only returns tags; it never writes them. Both backend reads must
+    // satisfy #3348 before content reaches the model. MCP additionally checks
+    // ownership and routes its write through the governed update funnel.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 fix (2026-05-20): use header-resolved caller so the
-        // SAL #910 scope=private visibility filter applies — caller
-        // can only fetch memories they own (or scope=shared/public).
         let caller = crate::store::CallerContext::for_agent(caller_principal.to_string());
         return match app.store.get(&caller, id).await {
-            Ok(mem) => Ok(mem),
-            Err(crate::store::StoreError::NotFound { .. }) => Err((
+            Ok(mem)
+                if crate::visibility::is_readable_on_query(&mem, Some(caller_principal), None) =>
+            {
+                Ok(mem)
+            }
+            Ok(_) | Err(crate::store::StoreError::NotFound { .. }) => Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
             )
@@ -1007,15 +1033,18 @@ async fn fetch_memory_for_handler(
         };
     }
 
-    // ARCH-2 keeper: same constraint as `fetch_consolidate_source_pairs`
-    // — `app.store` and `app.db` are pinned to disjoint files in the
-    // test harness, so routing this sqlite read through `app.store.get`
-    // breaks tests. ARCH-2-followup must converge the harness before
-    // the sqlite path can route through SAL.
+    // The SQLite handler harness can keep app.db and app.store in different
+    // files; retain app.db as the authoritative SQLite connection.
     let lock = app.db.lock().await;
-    match db::get(&lock.0, id) {
-        Ok(Some(mem)) => Ok(mem),
-        Ok(None) => Err((
+    let fetched = db::get(&lock.0, id);
+    drop(lock);
+    match fetched {
+        Ok(Some(mem))
+            if crate::visibility::is_readable_on_query(&mem, Some(caller_principal), None) =>
+        {
+            Ok(mem)
+        }
+        Ok(_) => Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
         )

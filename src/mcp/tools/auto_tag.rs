@@ -16,19 +16,36 @@
 use crate::llm::OllamaClient;
 use crate::{db, validate};
 use serde_json::{Value, json};
+
+/// Generate and persist tags through the caller-scoped, governed update funnel.
+/// The read and ownership checks run before content reaches the external model.
+/// An absent caller retains the ordinary single-operator read posture; substrate
+/// rows remain excluded because this tool does not accept a namespace selector.
 pub(super) fn handle_auto_tag(
     conn: &rusqlite::Connection,
     llm: Option<&OllamaClient>,
     params: &Value,
+    caller: Option<&str>,
+    mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let llm = llm.ok_or("auto-tagging requires smart or autonomous tier (Ollama LLM)")?;
     let id = params["id"]
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
+    // #3348 read visibility precedes #1786 ownership: mutation permission
+    // alone does not grant permission to send a row to the model.
     let mem = db::get(conn, id)
         .map_err(|e| e.to_string())?
         .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
+    if !crate::visibility::is_readable_on_query(&mem, caller, None) {
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
+    }
+    if let Some(c) = caller
+        && !crate::visibility::caller_owns_for_mutation(&mem, c, false)
+    {
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
+    }
     // COVERAGE: LLM response variability. The call below produces a
     // Vec<String> derived from the model's response; envelope is
     // tested at ≥95% via wiremock-driven success / error / shape
@@ -44,20 +61,30 @@ pub(super) fn handle_auto_tag(
             all_tags.push(t.clone());
         }
     }
-    db::update(
-        conn,
-        id,
-        None,
-        None,
-        None,
-        None,
-        Some(&all_tags),
-        None,
-        None,
-        None,
-        None,
-    )
-    .map_err(|e| e.to_string())?;
+    // #3381 — the WRITE goes through the governed update funnel. Embedder /
+    // vector-index are deliberately `None`: a tags-only patch changes neither
+    // title nor content, so there is nothing to re-embed and passing them
+    // would be the only behavioural difference from the pre-fix raw write.
+    let mut update_params = json!({ "id": &mem.id, (crate::mcp::param_names::TAGS): &all_tags });
+    if let Some(caller) = caller {
+        update_params[crate::mcp::param_names::AGENT_ID] = json!(caller);
+    }
+    let updated = crate::mcp::update::handle_update(conn, &update_params, None, None, mcp_client)?;
+    // The governed funnel may answer `pending` (namespace requires approval)
+    // or `ask` (a permission rule) INSTEAD of writing. Surface that envelope
+    // verbatim rather than reporting tags that were never persisted — a
+    // success-shaped body on an unperformed write is itself a defect.
+    if matches!(
+        updated.get("status").and_then(Value::as_str),
+        Some("pending" | "ask")
+    ) {
+        let mut out = updated;
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("new_tags".into(), json!(&tags));
+            obj.insert("all_tags".into(), json!(&all_tags));
+        }
+        return Ok(out);
+    }
     Ok(json!({"id": id, "new_tags": tags, "all_tags": all_tags}))
 }
 
@@ -120,286 +147,19 @@ mod d1_5_986_tests {
     }
 }
 
-// =====================================================================
-// L0.7-5 Tier D — envelope unit tests
-//
-// Drives the production `OllamaClient` against an in-process wiremock
-// server. The blocking client is run via `tokio::task::spawn_blocking`
-// so the async test runtime stays free for the mock server. The
-// `/api/tags` health probe (which `new_with_url` performs before
-// returning) is mounted ahead of any other route on every server.
-// =====================================================================
-#[cfg(test)]
-mod tests {
-    use super::handle_auto_tag;
-    use crate::llm::OllamaClient;
-    use crate::storage as db;
-    use serde_json::json;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Build a fresh in-memory SQLite DB (via a tempfile, since
-    /// `:memory:` doesn't survive across the WAL pragma touch).
-    fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let conn = db::open(tmp.path()).expect("db::open");
-        (conn, tmp)
-    }
-
-    /// Insert a baseline memory and return its id.
-    fn seed_memory(conn: &rusqlite::Connection, tags: Vec<String>) -> String {
-        let now = chrono::Utc::now().to_rfc3339();
-        let mem = crate::models::Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: uuid::Uuid::new_v4().to_string(),
-            tier: crate::models::Tier::Mid,
-            namespace: "tier-d".to_string(),
-            title: "subject".to_string(),
-            content: "body of memory".to_string(),
-            tags,
-            priority: 5,
-            confidence: 1.0,
-            source: "test".to_string(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now,
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: json!({"agent_id": "ai:test"}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
-        };
-        db::insert(conn, &mem).expect("insert")
-    }
-
-    async fn mount_tags_ok(server: &MockServer) {
-        Mock::given(method("GET"))
-            .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
-            .mount(server)
-            .await;
-    }
-
-    /// Envelope (1/N): client absent → tier-gating error message.
-    #[test]
-    fn rejects_when_llm_absent() {
-        let (conn, _tmp) = fresh_db();
-        let err = handle_auto_tag(&conn, None, &json!({"id": "anything"})).unwrap_err();
-        assert!(
-            err.contains("smart") || err.contains("autonomous") || err.contains("Ollama"),
-            "expected tier-gating error, got: {err}"
-        );
-    }
-
-    /// Envelope (2/N): missing `id` → typed error.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rejects_when_id_missing() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        let uri = server.uri();
-        let err = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_auto_tag(&conn, Some(&client), &json!({}))
-                .err()
-                .unwrap_or_default()
-        })
-        .await
-        .unwrap();
-        assert!(err.contains("id"), "expected id-required, got: {err}");
-    }
-
-    /// Envelope (3/N): `id` field present but contains invalid chars →
-    /// validate::validate_id rejects.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rejects_when_id_fails_validation() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        let uri = server.uri();
-        let err = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            // shell-metachar should be rejected by validate_id
-            handle_auto_tag(&conn, Some(&client), &json!({"id": "bad; rm -rf /"}))
-                .err()
-                .unwrap_or_default()
-        })
-        .await
-        .unwrap();
-        assert!(
-            !err.is_empty(),
-            "expected validation error on bad id, got empty string"
-        );
-    }
-
-    /// Envelope (4/N): `id` is valid but missing from DB → not-found.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rejects_when_memory_not_found() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        let uri = server.uri();
-        let err = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_auto_tag(
-                &conn,
-                Some(&client),
-                &json!({"id": "00000000-0000-0000-0000-000000000000"}),
-            )
-            .err()
-            .unwrap_or_default()
-        })
-        .await
-        .unwrap();
-        assert!(err.contains("not found"), "expected not-found, got: {err}");
-    }
-
-    /// Envelope (5/N): happy path — auto_tag returns 3 tags; the
-    /// envelope must:
-    ///   - call /api/generate (L15 — auto_tag uses /api/generate),
-    ///   - lowercase + dedupe with existing tags,
-    ///   - persist the union onto the memory row,
-    ///   - shape `{id, new_tags, all_tags}` for the caller.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn success_unions_tags_and_persists() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "alpha\nbeta\ngamma"},
-            })))
-            .mount(&server)
-            .await;
-
-        let uri = server.uri();
-        let (id, value) = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            // Existing tag "alpha" already lives on the memory; the
-            // envelope must NOT duplicate it in `all_tags`.
-            let id = seed_memory(&conn, vec!["alpha".to_string()]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            let out = handle_auto_tag(&conn, Some(&client), &json!({"id": id.clone()}))
-                .expect("handler should succeed");
-            // Verify DB state — `tags` column carries the union now.
-            let mem = db::get(&conn, &id).unwrap().unwrap();
-            (id, json!({"out": out, "stored_tags": mem.tags}))
-        })
-        .await
-        .unwrap();
-
-        let out = &value["out"];
-        assert_eq!(out["id"], json!(id));
-        let new_tags = out["new_tags"].as_array().unwrap();
-        assert_eq!(new_tags.len(), 3);
-        let all_tags = out["all_tags"].as_array().unwrap();
-        // alpha already existed; beta + gamma are new — union is 3.
-        assert_eq!(all_tags.len(), 3);
-        // Stored row reflects the union.
-        let stored = value["stored_tags"].as_array().unwrap();
-        assert_eq!(stored.len(), 3);
-    }
-
-    /// Envelope (6/N): LLM returns no tags (blank-only output) — the
-    /// envelope still completes; `new_tags` is empty and `all_tags`
-    /// is unchanged from the prior state.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn success_with_empty_response_yields_no_new_tags() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "   \n  \n"},
-            })))
-            .mount(&server)
-            .await;
-
-        let uri = server.uri();
-        let out = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id = seed_memory(&conn, vec!["existing".to_string()]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_auto_tag(&conn, Some(&client), &json!({"id": id})).expect("ok")
-        })
-        .await
-        .unwrap();
-        let new_tags = out["new_tags"].as_array().unwrap();
-        assert!(new_tags.is_empty());
-        let all_tags = out["all_tags"].as_array().unwrap();
-        assert_eq!(all_tags.len(), 1);
-        assert_eq!(all_tags[0], "existing");
-    }
-
-    /// Envelope (7/N): LLM 500 → error surfaces through `?`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn surfaces_llm_500_error() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("oh no"))
-            .mount(&server)
-            .await;
-
-        let uri = server.uri();
-        let err = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id = seed_memory(&conn, vec![]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_auto_tag(&conn, Some(&client), &json!({"id": id}))
-                .err()
-                .unwrap_or_default()
-        })
-        .await
-        .unwrap();
-        assert!(
-            err.contains("500") || err.contains("Generate failed"),
-            "expected upstream error, got: {err}"
-        );
-    }
-
-    /// Envelope (8/N): malformed JSON from LLM → parse error.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn surfaces_llm_malformed_json_error() {
-        let server = MockServer::start().await;
-        mount_tags_ok(&server).await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("not valid")
-                    .insert_header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON),
-            )
-            .mount(&server)
-            .await;
-
-        let uri = server.uri();
-        let err = tokio::task::spawn_blocking(move || {
-            let (conn, _tmp) = fresh_db();
-            let id = seed_memory(&conn, vec![]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_auto_tag(&conn, Some(&client), &json!({"id": id}))
-                .err()
-                .unwrap_or_default()
-        })
-        .await
-        .unwrap();
-        assert!(
-            err.to_lowercase().contains("parse") || err.to_lowercase().contains("json"),
-            "expected parse-error, got: {err}"
-        );
-    }
+/// Test entry point for the isolated auto-tag envelope suite (#3381/#3523).
+/// Forwards to the production handler without changing caller or control flow.
+/// Absent from builds without `test` or `test-support`.
+///
+/// # Errors
+/// Returns the production handler's validation, visibility, governance or model error.
+#[cfg(any(test, feature = "test-support"))]
+pub fn handle_auto_tag_for_tests(
+    conn: &rusqlite::Connection,
+    llm: Option<&OllamaClient>,
+    params: &Value,
+    caller: Option<&str>,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    handle_auto_tag(conn, llm, params, caller, mcp_client)
 }

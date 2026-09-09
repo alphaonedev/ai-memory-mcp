@@ -198,7 +198,16 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // legacy-typed surface. Measured 126 on the pre-rebase base (125 + 1); the
 // same +1 lands on the tip's 128 (#3357 + #3523 arrived in between).
 // Measured 129. Never lower.
-const QUAL_6_CEILING: usize = 129;
+// 2026-09-09 (#3381 own-binary envelope suite) — raised 128 -> 129 for
+// TEST-ONLY `handle_auto_tag_for_tests` in `src/mcp/tools/auto_tag.rs`.
+// Like the #3523 wrapper above, it forwards the existing MCP envelope
+// verbatim so the 13 caller/egress/governance cases run in their own binary.
+// It is absent without `test` or `test-support`; no production error
+// contract changes. Exact measured addition: +1, per the Master's
+// 2026-09-07 QUAL-6/QUAL-7 lockstep ruling; no spare headroom.
+// 2026-09-09 chain 3 (Conductor lockstep): #3423 (+1) and #3381 (+1) both land on the
+// tip's 128, so the merged tree measures 130. Set on the merged tree, never lower.
+const QUAL_6_CEILING: usize = 130;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
