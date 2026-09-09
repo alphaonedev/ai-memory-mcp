@@ -105,10 +105,11 @@ pub fn run(
     let results: Vec<crate::models::Memory> = results
         .into_iter()
         .filter(|m| {
-            crate::visibility::is_readable_on_query(
+            crate::visibility::is_readable_on_query_with_scope(
                 m,
                 vis_caller.as_deref(),
                 args.namespace.as_deref(),
+                args.as_agent.as_deref(),
             )
         })
         .collect();

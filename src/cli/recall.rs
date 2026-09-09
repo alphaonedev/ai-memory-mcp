@@ -605,10 +605,11 @@ pub(crate) fn run_with_embedder(
     let results: Vec<(crate::models::Memory, f64)> = results
         .into_iter()
         .filter(|(m, _)| {
-            crate::visibility::is_readable_on_query(
+            crate::visibility::is_readable_on_query_with_scope(
                 m,
                 vis_caller.as_deref(),
                 args.namespace.as_deref(),
+                args.as_agent.as_deref(),
             )
         })
         .collect();

@@ -1618,6 +1618,8 @@ mod d1_6_987_tests {
         "memory_promote",
         "memory_quota_status",
         "memory_recall",
+        "memory_search",
+        "memory_session_start",
         "memory_signal_inbox",
         "memory_skill_delete",
         "memory_skill_get",

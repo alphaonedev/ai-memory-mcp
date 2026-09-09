@@ -489,15 +489,10 @@ async fn recall_response(
             crate::models::RECALL_MODE_KEYWORD
         };
 
-        // `as_agent` is the explicit query-param override (admin /
-        // act-on-behalf semantics). When set, it overrides the
-        // header-derived principal. Otherwise use `caller_principal`
-        // (resolved from X-Agent-Id by the entry handler), falling
-        // back to "daemon" only when neither is present (legacy
-        // pre-#910 behavior, harmless on non-scope=private memories).
+        // #3499: the header-resolved caller is the store/ledger identity.
+        // A requested scope position only narrows the admitted rows below.
         let ctx_caller = crate::store::CallerContext::for_agent(
-            as_agent
-                .or(caller_principal)
+            caller_principal
                 .unwrap_or(crate::identity::sentinels::DAEMON_PRINCIPAL)
                 .to_string(),
         );
@@ -568,10 +563,11 @@ async fn recall_response(
                 let scored_pairs: Vec<_> = scored_pairs
                     .into_iter()
                     .filter(|(m, _)| {
-                        crate::visibility::is_readable_on_query(
+                        crate::visibility::is_readable_on_query_with_scope(
                             m,
-                            as_agent.or(caller_principal),
+                            caller_principal,
                             namespace,
+                            as_agent,
                         )
                     })
                     .collect();
@@ -720,7 +716,7 @@ async fn recall_response(
                         .record_recall_observation(
                             &recall_id,
                             &candidates,
-                            as_agent.or(caller_principal),
+                            caller_principal,
                             namespace,
                         )
                         .await
@@ -1002,7 +998,12 @@ async fn recall_response(
         let rows: Vec<_> = rows
             .into_iter()
             .filter(|(m, _)| {
-                crate::visibility::is_readable_on_query(m, as_agent.or(caller_principal), namespace)
+                crate::visibility::is_readable_on_query_with_scope(
+                    m,
+                    caller_principal,
+                    namespace,
+                    as_agent,
+                )
             })
             .collect();
         (rows, outcome, telemetry)
@@ -1021,9 +1022,8 @@ async fn recall_response(
         let recall_id_w = recall_id.clone();
         // Owned ledger identity, re-derived from the still-in-scope
         // borrowed params (the phase-1 copies were moved into the pool
-        // closure). Mirrors the pre-split `as_agent.or(caller_principal)`
-        // + `namespace` stamping.
-        let agent_for_ledger = as_agent.or(caller_principal).map(str::to_string);
+        // closure). The scope position never becomes the ledger actor.
+        let agent_for_ledger = caller_principal.map(str::to_string);
         let ns_for_ledger = namespace.map(str::to_string);
         if let Err(e) = super::db_op(app.db.clone(), move |guard| {
             // #1710 — record the recalled set into the ledger on the

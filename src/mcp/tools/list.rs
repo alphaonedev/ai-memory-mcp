@@ -55,7 +55,7 @@ impl McpTool for ListTool {
     fn docs() -> &'static str {
         "Browse memories. Filters: namespace, tier, agent_id, valid_at. Limit caps at 200. \
          #3171: the default response format is `toon_compact`, NOT json — pass \
-         format=\"json\" for a JSON envelope."
+         format=\"json\" for a JSON envelope. as_agent is unsupported; visibility uses the enforced caller."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ListRequest>()

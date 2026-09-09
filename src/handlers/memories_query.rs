@@ -447,10 +447,11 @@ pub async fn search_memories(
                 let r: Vec<Memory> = r
                     .into_iter()
                     .filter(|m| {
-                        is_readable_on_query(
+                        crate::visibility::is_readable_on_query_with_scope(
                             m,
                             Some(&resolved_caller),
                             requested_namespace.as_deref(),
+                            p.as_agent.as_deref(),
                         )
                     })
                     .collect();
@@ -545,10 +546,11 @@ pub async fn search_memories(
                     let r: Vec<Memory> = r
                         .into_iter()
                         .filter(|m| {
-                            is_readable_on_query(
+                            crate::visibility::is_readable_on_query_with_scope(
                                 m,
                                 Some(&resolved_caller),
                                 requested_namespace.as_deref(),
+                                p.as_agent.as_deref(),
                             )
                         })
                         .collect();
@@ -598,7 +600,12 @@ pub async fn search_memories(
             let r: Vec<Memory> = r
                 .into_iter()
                 .filter(|m| {
-                    is_readable_on_query(m, Some(&resolved_caller), requested_namespace.as_deref())
+                    crate::visibility::is_readable_on_query_with_scope(
+                        m,
+                        Some(&resolved_caller),
+                        requested_namespace.as_deref(),
+                        p.as_agent.as_deref(),
+                    )
                 })
                 .collect();
             crate::handlers::wire_format::search_response(

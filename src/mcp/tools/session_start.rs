@@ -211,7 +211,7 @@ impl McpTool for SessionStartTool {
         "Auto-recall recent memories on session start."
     }
     fn docs() -> &'static str {
-        "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary."
+        "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary. as_agent is unsupported; visibility uses the enforced caller."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SessionStartRequest>()

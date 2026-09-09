@@ -1245,6 +1245,12 @@ pub async fn kg_find_paths(
 /// defaults to 1 and is bounded by `KG_QUERY_MAX_SUPPORTED_DEPTH`.
 #[derive(Debug, Deserialize)]
 pub struct KgQueryBody {
+    /// Exact target namespace filter; substrate rows require explicit opt-in.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Optional scope position that narrows the enforced caller's visibility.
+    #[serde(default)]
+    pub as_agent: Option<String>,
     /// Canonical name. Aliased by `from` (S82's wire shape).
     #[serde(default)]
     pub source_id: Option<String>,
@@ -1292,6 +1298,8 @@ async fn kg_query_filter_visible(
     app: &AppState,
     caller: &str,
     target_ids: Vec<String>,
+    namespace: Option<&str>,
+    as_agent: Option<&str>,
 ) -> std::collections::HashSet<String> {
     // v0.7.0 F-E3 fix (issue #1436): route through the canonical
     // `crate::visibility::is_visible_to_caller` helper instead of
@@ -1305,7 +1313,14 @@ async fn kg_query_filter_visible(
     let ctx = crate::store::CallerContext::for_agent(caller);
     for id in target_ids {
         if let Ok(mem) = app.store.get(&ctx, &id).await {
-            if crate::visibility::is_visible_to_caller(&mem, caller) {
+            if namespace.is_none_or(|ns| mem.namespace == ns)
+                && crate::visibility::is_readable_on_query_with_scope(
+                    &mem,
+                    Some(caller),
+                    namespace,
+                    as_agent,
+                )
+            {
                 visible.insert(id);
             }
         }
@@ -1413,6 +1428,33 @@ pub async fn kg_query(
         }
     };
 
+    for (field, value) in [
+        ("namespace", body.namespace.as_deref()),
+        ("as_agent", body.as_agent.as_deref()),
+    ] {
+        if let Some(value) = value
+            && let Err(e) = validate::validate_namespace(value)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid(field, e)})),
+            )
+                .into_response();
+        }
+    }
+
+    // #3499: match HTTP recall/search's header-bound scope selector.
+    if body
+        .as_agent
+        .as_deref()
+        .is_some_and(|scope| scope != caller)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "agent_id_query_header_mismatch: as_agent disagrees with authenticated caller"})),
+        ).into_response();
+    }
+
     // S82's wire shape sends `from` instead of `source_id`; resolve
     // the canonical id from either field with `source_id` taking
     // precedence when both are supplied.
@@ -1488,7 +1530,14 @@ pub async fn kg_query(
                 // target was returned verbatim regardless of the
                 // target's owner / scope.
                 let target_ids: Vec<String> = nodes.iter().map(|n| n.target_id.clone()).collect();
-                let visible = kg_query_filter_visible(&app, &caller, target_ids).await;
+                let visible = kg_query_filter_visible(
+                    &app,
+                    &caller,
+                    target_ids,
+                    body.namespace.as_deref(),
+                    body.as_agent.as_deref(),
+                )
+                .await;
                 let nodes: Vec<_> = nodes
                     .into_iter()
                     .filter(|n| visible.contains(&n.target_id))
@@ -1574,7 +1623,17 @@ pub async fn kg_query(
                 std::collections::HashSet::with_capacity(nodes.len());
             for n in nodes {
                 if let Ok(Some(mem)) = db::get(&lock.0, &n.target_id) {
-                    if crate::visibility::is_visible_to_caller(&mem, &caller) {
+                    if body
+                        .namespace
+                        .as_deref()
+                        .is_none_or(|ns| mem.namespace == ns)
+                        && crate::visibility::is_readable_on_query_with_scope(
+                            &mem,
+                            Some(&caller),
+                            body.namespace.as_deref(),
+                            body.as_agent.as_deref(),
+                        )
+                    {
                         visible.insert(n.target_id.clone());
                     }
                 }
