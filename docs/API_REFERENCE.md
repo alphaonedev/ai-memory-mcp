@@ -1558,6 +1558,19 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/admin/quarantine/{id}/release` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — release one quarantined memory back to `lifecycle_state=open` (`handlers::release_quarantined`), the operator half of the [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) route-OUT contract that shipped with no caller. **Admin-gated**; the audit actor is the principal `require_admin` RETURNS — an id it admits only when it is on the admin allowlist AND the deployment has request authentication configured (#1570), and, under the `enforce` identity-binding posture, only when it is key-attested to a per-agent api key (#2044). The handler never reads `X-Agent-Id` itself. Appends a `memory.dequarantined` signed audit row in the SAME transaction as the state change on both backends. Idempotent: an id that is not currently quarantined answers `200 {"released": false}` and writes nothing (deliberately not `404` — that would leak the existence of rows this surface does not return). |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (**104** advertised entries at `--profile full`; **7** family tools at `core`, **8** on the wire with always-on `memory_capabilities`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
+`memory_export_reflection` (#3551) resolves the HTTP caller from the bound request
+headers on SQLite and PostgreSQL, then admits the reflection and every linked
+source before returning content or lineage. Hidden and missing members refuse
+alike with `reflection not found: <requested reflection id>`. An admin read
+exemption requires both explicit enrollment and the existing trusted/identity-bound
+admin predicate. The same rule covers SQLite `POST /api/v1/skill/{id}/promote`,
+which retains its admin-only admission and records the resolved actor in
+`metadata.promoted_by`. Promotion no longer creates deleted-source stubs: missing
+or hidden sources refuse before bundle/resource registration or promotion audit.
+PostgreSQL promotion remains 501 (#3183); its allowed path is not applicable until
+#2804. Unscoped substrate namespaces remain excluded.
+
+
 HTTP `POST /api/v1/capture_turn` uses the HTTP-direct attestation posture (#3406): unsigned requests are refused with `403 ATTESTATION_FAILED` by default; `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` or `false` explicitly permits them and emits an audit admission event. A presented host signature must verify against the L4 host-key allowlist **and** the resolved caller's bound public key, on both SQLite and PostgreSQL; the opt-out never relaxes these checks. The legacy envelope signs only `host_session_id`, `host_turn_index`, `role`, and `content` (NUL-separated), so it remains `signed_by_peer`, never `agent_attested`: identity, namespace, and timestamp are not signed fields. Durable `(session, turn)` deduplication makes repeats idempotent (`200`, the original memory ID, no new write); the 600-second `SignableWrite` replay ledger does not apply. MCP capture behavior is unchanged. A fully bound capture envelope is tracked separately in #3575.
 
 #### Skills export root (#3357)

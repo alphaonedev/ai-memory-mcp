@@ -109,19 +109,53 @@ pub fn handle_skill_promote_from_reflection(
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
 ) -> Result<Value, String> {
+    let read_caller =
+        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
+    let caller = crate::identity::resolve_governance_subject(
+        params["agent_id"].as_str(),
+        None,
+        "promote skills",
+    )
+    .map_err(|error| error.to_string())?;
+    handle_skill_promote_for_caller(
+        conn,
+        params,
+        active_keypair,
+        &caller,
+        read_caller.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Shared SQLite promotion body. HTTP preserves its authenticated actor separately
+/// from the enrolled-admin read exemption; MCP preserves its unset-identity posture.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn handle_skill_promote_for_caller(
+    conn: &Connection,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+    caller: &str,
+    read_caller: Option<&str>,
+) -> anyhow::Result<Value> {
     // ─── 1. Argument parsing ────────────────────────────────────────────
     let reflection_id = params[field_names::REFLECTION_ID]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_promote_from_reflection requires 'reflection_id'")?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("memory_skill_promote_from_reflection requires 'reflection_id'")
+        })?;
     let skill_name = params[param_names::SKILL_NAME]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_promote_from_reflection requires 'skill_name'")?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("memory_skill_promote_from_reflection requires 'skill_name'")
+        })?;
     let skill_description = params[field_names::SKILL_DESCRIPTION]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_promote_from_reflection requires 'skill_description'")?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("memory_skill_promote_from_reflection requires 'skill_description'")
+        })?;
     // v0.9.0 §11.5 B7-SKILL (#1865) — widened from `!v.is_null() &&
     // v.is_object()` to `!v.is_null()` so a non-object value reaches
     // `validate_parameters_schema` below and is REJECTED (fail-closed)
@@ -132,7 +166,7 @@ pub fn handle_skill_promote_from_reflection(
 
     // Validate skill name against agentskills.io §3.1 BEFORE any DB work
     // so the caller sees the parse error at the boundary.
-    crate::parsing::skill_md::validate_skill_name(skill_name)?;
+    crate::parsing::skill_md::validate_skill_name(skill_name).map_err(anyhow::Error::msg)?;
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — FAIL CLOSED on a malformed
     // parameters_schema here too, same structural gate `skill_register`
@@ -140,36 +174,13 @@ pub fn handle_skill_promote_from_reflection(
     // the register-time contract by going through the reflection-promote
     // path instead.
     if let Some(schema) = parameters_schema {
-        validate_parameters_schema(schema)
-            .map_err(|e| format!("parameters_schema rejected at promote (fail-closed): {e}"))?;
+        validate_parameters_schema(schema).map_err(|e| {
+            anyhow::anyhow!("parameters_schema rejected at promote (fail-closed): {e}")
+        })?;
     }
 
-    // #913 (security-medium / SOC2, 2026-05-19) — admin/state-change
-    // audit. Skill promotion mints a new signed capability bundle from
-    // a reflection; emit the forensic-chain row BEFORE the storage write
-    // so the audit trail captures the caller + source reflection_id
-    // regardless of downstream outcome.
-    // #3363 — BIND the audited actor to the enforced caller: the promote mints
-    // a signed capability bundle, so the forensic row must name the principal
-    // that actually asked for it, not a wire-asserted one.
-    let caller = crate::identity::resolve_governance_subject(
-        params["agent_id"].as_str(),
-        None,
-        "promote skills",
-    )
-    .map_err(|e| e.to_string())?;
-    crate::governance::audit::record_decision(
-        &caller,
-        "allow",
-        "skill_promote_from_reflection",
-        "",
-        serde_json::json!({
-            (field_names::REFLECTION_ID): reflection_id,
-            (field_names::SKILL_NAME): skill_name,
-        }),
-    );
     if skill_description.len() > 1024 {
-        return Err(format!(
+        return Err(anyhow::anyhow!(
             "skill 'description' must be ≤ 1024 characters \
              (agentskills.io spec §3.2): got {} characters",
             skill_description.len()
@@ -177,12 +188,15 @@ pub fn handle_skill_promote_from_reflection(
     }
 
     // ─── 2. Fetch + validate the source reflection ─────────────────────
-    let reflection = crate::db::get(conn, reflection_id)
-        .map_err(|e| format!("loading reflection '{reflection_id}': {e}"))?
-        .ok_or_else(|| format!("reflection not found: {reflection_id}"))?;
+    let reflection = super::export_reflection::read_reflection_member(
+        conn,
+        reflection_id,
+        reflection_id,
+        read_caller,
+    )?;
 
     if reflection.memory_kind != MemoryKind::Reflection {
-        return Err(format!(
+        return Err(anyhow::anyhow!(
             "memory '{reflection_id}' is memory_kind='{}', expected 'reflection' \
              (memory_skill_promote_from_reflection is reflection-only)",
             reflection.memory_kind
@@ -199,11 +213,13 @@ pub fn handle_skill_promote_from_reflection(
     #[allow(clippy::cast_sign_loss)]
     let actual_depth_u32: u32 = reflection.reflection_depth.max(0) as u32;
     if actual_depth_u32 < min_depth {
-        return Err(format!(
+        return Err(anyhow::anyhow!(
             "reflection '{reflection_id}' has reflection_depth={} but \
              namespace '{}' requires skill_promotion_min_depth={} — \
              a depth-0 reflection carries no synthesised insight to promote",
-            reflection.reflection_depth, reflection.namespace, min_depth,
+            reflection.reflection_depth,
+            reflection.namespace,
+            min_depth,
         ));
     }
 
@@ -214,7 +230,7 @@ pub fn handle_skill_promote_from_reflection(
     // of these edges, so the order matches the original source_ids
     // input order at the wire level.
     let links = crate::db::get_links(conn, reflection_id)
-        .map_err(|e| format!("loading reflects_on edges: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("loading reflects_on edges: {e}"))?;
     let mut source_ids: Vec<String> = links
         .into_iter()
         .filter(|l| l.source_id == reflection_id && l.relation == MemoryLinkRelation::ReflectsOn)
@@ -225,36 +241,40 @@ pub fn handle_skill_promote_from_reflection(
     // `query_map` order isn't a documented guarantee, so we sort by id.
     source_ids.sort();
 
-    // Materialise each source memory into a reference resource.
-    let mut resources: Vec<(String, String, Vec<u8>)> = Vec::with_capacity(source_ids.len());
-    for (i, src_id) in source_ids.iter().enumerate() {
-        let src = crate::db::get(conn, src_id)
-            .map_err(|e| format!("loading source memory '{src_id}': {e}"))?;
-        // Build the reference body. If the source memory is gone (GC'd
-        // between reflect and promote), fall back to an id-only stub so
-        // the promotion still lands — provenance edge is preserved by id.
-        let body = match src {
-            Some(m) => format!(
-                "# Source memory: {title}\n\n\
-                 - memory id: `{id}`\n\
-                 - namespace: `{ns}`\n\
-                 - reflection_depth: {depth}\n\
-                 - created_at: {created}\n\n\
-                 ## Content\n\n{content}\n",
-                title = m.title,
-                id = m.id,
-                ns = m.namespace,
-                depth = m.reflection_depth,
-                created = m.created_at,
-                content = m.content,
-            ),
-            None => format!(
-                "# Source memory: (deleted)\n\n\
-                 - memory id: `{src_id}`\n\
-                 - note: source memory was deleted between reflection and promotion; \
-                 only the id provenance edge is preserved.\n",
-            ),
-        };
+    // Admit EVERY source before rendering any resource or auditing/signing/registering.
+    let sources = source_ids
+        .iter()
+        .map(|id| {
+            super::export_reflection::read_reflection_member(conn, id, reflection_id, read_caller)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    crate::governance::audit::record_decision(
+        caller,
+        "allow",
+        "skill_promote_from_reflection",
+        "",
+        serde_json::json!({
+            (field_names::REFLECTION_ID): reflection_id,
+            (field_names::SKILL_NAME): skill_name,
+        }),
+    );
+    let mut resources: Vec<(String, String, Vec<u8>)> = Vec::with_capacity(sources.len());
+    for (i, m) in sources.iter().enumerate() {
+        let body = format!(
+            "# Source memory: {title}\n\n\
+             - memory id: `{id}`\n\
+             - namespace: `{ns}`\n\
+             - reflection_depth: {depth}\n\
+             - created_at: {created}\n\n\
+             ## Content\n\n{content}\n",
+            title = m.title,
+            id = m.id,
+            ns = m.namespace,
+            depth = m.reflection_depth,
+            created = m.created_at,
+            content = m.content,
+        );
         let res_path = format!("references/source_{i}.md");
         resources.push((res_path, "reference".to_string(), body.into_bytes()));
     }
@@ -284,7 +304,7 @@ pub fn handle_skill_promote_from_reflection(
 
     if let Some(schema) = parameters_schema {
         let pretty = serde_json::to_string_pretty(schema)
-            .map_err(|e| format!("parameters_schema serialize: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("parameters_schema serialize: {e}"))?;
         body.push_str("\n## Parameters\n\n```json\n");
         body.push_str(&pretty);
         body.push_str("\n```\n");
@@ -294,6 +314,7 @@ pub fn handle_skill_promote_from_reflection(
     let mut metadata = json!({
         "derived_from_reflection_id": reflection_id,
         "original_reflection_depth": reflection.reflection_depth,
+        "promoted_by": caller,
     });
     // v0.9.0 §11.5 B7-SKILL (#1865) — mirror `parameters_schema` into the
     // same `skills.metadata` column `skill_register` uses, so a promoted
@@ -341,7 +362,8 @@ pub fn handle_skill_promote_from_reflection(
         res_digests,
         &resources,
         active_keypair,
-    )?;
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
 
@@ -424,7 +446,7 @@ impl McpTool for SkillPromoteFromReflectionTool {
         "Promote a Reflection into a reusable Agent Skill."
     }
     fn docs() -> &'static str {
-        "L2-6 (#671): reflection (depth>=namespace.governance.skill_promotion_min_depth, default 1) -> SKILL.md. Each reflects_on source -> references/source_{i}.md. Frontmatter preserves derived_from_reflection_id + original_reflection_depth. Promote->export->register => identical SHA-256. Refuses depth-0."
+        "L2-6 (#671): reflection (depth>=namespace.governance.skill_promotion_min_depth, default 1) -> SKILL.md. Each reflects_on source -> references/source_{i}.md. Frontmatter preserves derived_from_reflection_id + original_reflection_depth. Promote->export->register => identical SHA-256. Refuses depth-0. #3551: admits the reflection and every source before rendering, auditing or registration; hidden/missing sources refuse alike, with no deleted-source stubs. metadata.promoted_by records the resolved actor. HTTP promotion remains SQLite-only (PostgreSQL 501, #2804)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SkillPromoteFromReflectionRequest>()
@@ -469,6 +491,16 @@ mod d1_5_986_tests {
 
 #[cfg(test)]
 mod tests {
+    // Caller resolution is covered through isolated MCP subprocesses (#3551).
+    // These depth/schema unit tests use an explicit actor and read context.
+    fn handle_skill_promote_from_reflection(
+        conn: &Connection,
+        params: &Value,
+        keypair: Option<&AgentKeypair>,
+    ) -> anyhow::Result<Value> {
+        super::handle_skill_promote_for_caller(conn, params, keypair, "ai:test", None)
+    }
+
     use super::*;
     use crate::db;
     use crate::models::{Memory, MemoryKind, Tier};
@@ -544,7 +576,9 @@ mod tests {
             "skill_name": "test-skill",
             "skill_description": "Test skill from observation (should fail).",
         });
-        let err = handle_skill_promote_from_reflection(&conn, &params, None).unwrap_err();
+        let err = handle_skill_promote_from_reflection(&conn, &params, None)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("memory_kind='observation'"),
             "must surface kind mismatch: {err}",
@@ -559,7 +593,9 @@ mod tests {
             "skill_name": "x",
             "skill_description": "desc",
         });
-        let err = handle_skill_promote_from_reflection(&conn, &params, None).unwrap_err();
+        let err = handle_skill_promote_from_reflection(&conn, &params, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not found"), "expected not found: {err}");
     }
 
@@ -573,19 +609,24 @@ mod tests {
             "skill_name": "BadName",
             "skill_description": "desc",
         });
-        let err = handle_skill_promote_from_reflection(&conn, &params, None).unwrap_err();
+        let err = handle_skill_promote_from_reflection(&conn, &params, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("spec §3.1"), "must cite spec: {err}");
     }
 
     #[test]
     fn rejects_missing_required_params() {
         let (conn, _dir) = open_db();
-        let err = handle_skill_promote_from_reflection(&conn, &sjson!({}), None).unwrap_err();
+        let err = handle_skill_promote_from_reflection(&conn, &sjson!({}), None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("reflection_id"), "{err}");
 
         let err =
             handle_skill_promote_from_reflection(&conn, &sjson!({"reflection_id": "x"}), None)
-                .unwrap_err();
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("skill_name"), "{err}");
 
         let err = handle_skill_promote_from_reflection(
@@ -593,7 +634,8 @@ mod tests {
             &sjson!({"reflection_id": "x", "skill_name": "n"}),
             None,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("skill_description"), "{err}");
     }
 
@@ -613,7 +655,9 @@ mod tests {
             "skill_description": "desc",
             "parameters_schema": "not-an-object",
         });
-        let err = handle_skill_promote_from_reflection(&conn, &params, None).unwrap_err();
+        let err = handle_skill_promote_from_reflection(&conn, &params, None)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("fail-closed") && err.contains("must be a JSON object"),
             "{err}"

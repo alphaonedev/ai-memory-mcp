@@ -41,7 +41,7 @@ use crate::models::MemoryKind;
 /// Errors:
 /// * `memory_id is required` — caller omitted the parameter.
 /// * `memory_id cannot be empty`.
-/// * `memory not found: <id>` — substrate doesn't know this id.
+/// * `reflection not found: <id>` — reflection or any source is missing/hidden.
 /// * `memory is not a reflection: <id>` — caller passed an observation.
 /// * `unsupported export format '<x>'` — `format` was neither
 ///   `md` nor `json`.
@@ -49,11 +49,23 @@ pub fn handle_export_reflection(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
+    let caller =
+        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
+    handle_export_reflection_for_caller(conn, params, caller.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+/// HTTP passes its already resolved caller; `None` retains the local read posture.
+pub(crate) fn handle_export_reflection_for_caller(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> anyhow::Result<Value> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?;
+        .ok_or_else(|| anyhow::anyhow!(crate::errors::msg::MEMORY_ID_REQUIRED))?;
     if memory_id.is_empty() {
-        return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
+        return Err(anyhow::anyhow!(crate::errors::msg::MEMORY_ID_EMPTY));
     }
     // #3171 — an unknown STRING already fails closed (`parse_format_for_mcp`),
     // but a present-but-non-string `format` (`5`, `true`, `{}`) silently
@@ -61,21 +73,22 @@ pub fn handle_export_reflection(
     // still takes the documented `md` default.
     let format_str = match params.get(param_names::FORMAT) {
         None | Some(Value::Null) => "md",
-        Some(v) => v
-            .as_str()
-            .ok_or_else(|| "format must be a string ('md', 'markdown' or 'json')".to_string())?,
+        Some(v) => v.as_str().ok_or_else(|| {
+            anyhow::anyhow!("format must be a string ('md', 'markdown' or 'json')")
+        })?,
     };
-    let format = parse_format_for_mcp(format_str)?;
+    let format = parse_format_for_mcp(format_str).map_err(anyhow::Error::msg)?;
 
-    let mem = db::get(conn, memory_id)
-        .map_err(|e| format!("memory_export_reflection substrate error: {e}"))?
-        .ok_or_else(|| crate::errors::msg::memory_not_found(memory_id))?;
+    let mem = read_reflection_member(conn, memory_id, memory_id, caller)?;
     if !matches!(mem.memory_kind, MemoryKind::Reflection) {
-        return Err(format!("memory is not a reflection: {memory_id}"));
+        return Err(anyhow::anyhow!("memory is not a reflection: {memory_id}"));
     }
 
     let edges = collect_outbound_reflects_on(conn, memory_id)
-        .map_err(|e| format!("reading reflects_on links: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("reading reflects_on links: {e}"))?;
+    for edge in &edges {
+        read_reflection_member(conn, &edge.target_id, memory_id, caller)?;
+    }
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let content = export_reflections::render_payload(&mem, &edges, attest_level, format);
     let suggested = suggested_filename(&mem.namespace, &mem.id, format);
@@ -83,6 +96,19 @@ pub fn handle_export_reflection(
         "content": content,
         "suggested_filename": suggested,
     }))
+}
+
+/// Admit a reflection or source without disclosing which member was hidden/missing.
+pub(super) fn read_reflection_member(
+    conn: &rusqlite::Connection,
+    member_id: &str,
+    reflection_id: &str,
+    caller: Option<&str>,
+) -> anyhow::Result<crate::models::Memory> {
+    db::get(conn, member_id)
+        .map_err(|error| anyhow::anyhow!("reading reflection substrate: {error}"))?
+        .filter(|memory| crate::visibility::is_readable_on_query(memory, caller, None))
+        .ok_or_else(|| anyhow::anyhow!("reflection not found: {reflection_id}"))
 }
 
 /// Local copy of the format parser — kept here so the MCP error
@@ -162,7 +188,7 @@ impl McpTool for ExportReflectionTool {
         "Render a single reflection memory as markdown or JSON (no filesystem write)."
     }
     fn docs() -> &'static str {
-        "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O. #3171: `format` accepts `md` (or the alias `markdown`) and `json`, case-insensitively; any other value is REFUSED."
+        "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O. #3171: `format` accepts `md` (or the alias `markdown`) and `json`, case-insensitively; any other value is REFUSED. #3551: the reflection and every linked source must be readable by the resolved caller; hidden or missing members return reflection not found keyed only to the requested reflection. A malformed configured MCP identity is refused."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ExportReflectionRequest>()
@@ -197,6 +223,15 @@ mod d1_5_986_tests {
 
 #[cfg(test)]
 mod tests {
+    // Caller resolution is covered through isolated MCP subprocesses (#3551).
+    // These format/argument unit tests use an explicit local read context.
+    fn handle_export_reflection(
+        conn: &rusqlite::Connection,
+        params: &Value,
+    ) -> anyhow::Result<Value> {
+        super::handle_export_reflection_for_caller(conn, params, None)
+    }
+
     use super::*;
     use crate::models::{Memory, Tier};
     use chrono::Utc;
@@ -248,14 +283,18 @@ mod tests {
     #[test]
     fn missing_memory_id_errors() {
         let (conn, _g) = fresh_db();
-        let err = handle_export_reflection(&conn, &json!({})).unwrap_err();
+        let err = handle_export_reflection(&conn, &json!({}))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("memory_id"));
     }
 
     #[test]
     fn empty_memory_id_errors() {
         let (conn, _g) = fresh_db();
-        let err = handle_export_reflection(&conn, &json!({"memory_id": ""})).unwrap_err();
+        let err = handle_export_reflection(&conn, &json!({"memory_id": ""}))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty"));
     }
 
@@ -266,7 +305,8 @@ mod tests {
             &conn,
             &json!({"memory_id": "11111111-2222-3333-4444-555555555555"}),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("not found"));
     }
 
@@ -277,7 +317,9 @@ mod tests {
         obs.memory_kind = MemoryKind::Observation;
         obs.reflection_depth = 0;
         let id = db::insert(&conn, &obs).unwrap();
-        let err = handle_export_reflection(&conn, &json!({"memory_id": id})).unwrap_err();
+        let err = handle_export_reflection(&conn, &json!({"memory_id": id}))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a reflection"));
     }
 
@@ -287,7 +329,8 @@ mod tests {
         let rfl = make_reflection("ns", 1, "ai:test");
         let id = db::insert(&conn, &rfl).unwrap();
         let err = handle_export_reflection(&conn, &json!({"memory_id": id, "format": "yaml"}))
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unsupported export format"));
     }
 
