@@ -391,6 +391,7 @@ mod tests {
 
     #[test]
     fn direct_cycle_detected() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // Existing: B→A. Proposed: A→B. Would close A→B→A.
         let conn = open_db();
         insert_memory(&conn, "a");
@@ -410,6 +411,7 @@ mod tests {
 
     #[test]
     fn indirect_cycle_detected() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // Existing: A→B, B→C. Proposed: C→A. Would close C→A→B→C.
         let conn = open_db();
         insert_memory(&conn, "a");
@@ -431,6 +433,7 @@ mod tests {
 
     #[test]
     fn non_cycle_succeeds() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // Existing: A→B. Proposed: C→B. C is unrelated to A — no cycle.
         let conn = open_db();
         insert_memory(&conn, "a");
@@ -449,6 +452,7 @@ mod tests {
 
     #[test]
     fn legal_deep_chain_within_safety_headroom_resolves() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // Chain: E→D→C→B→A (4 hops). Proposed: C→D is NOT a cycle (C already
         // reflects_on B, and D is upstream of C). We pick a NON-cyclic deep
         // probe to prove a legitimate chain whose longest path is within the
@@ -485,6 +489,7 @@ mod tests {
     // unexplored returns `would_cycle = true`.
     #[test]
     fn depth_bound_fails_closed_on_truncation() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // Chain: G→F→E→D→C→B→A (6 hops). Proposed: A→G closes a 7-node cycle.
         let conn = open_db();
         for id in ["a", "b", "c", "d", "e", "f", "g"] {
@@ -548,6 +553,7 @@ mod tests {
 
     #[test]
     fn max_depth_zero_falls_back_to_default_bound() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // Line 77: `max_depth == 0` triggers the `DEFAULT_MAX_DEPTH`
         // fallback. We assert the function still detects a real cycle
         // when the caller passes the sentinel `0` (i.e. "use default").

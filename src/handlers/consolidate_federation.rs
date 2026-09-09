@@ -498,10 +498,6 @@ mod tests {
 
     // ---- finalize+disposition helper coverage (both backend twins) ----
 
-    use std::sync::Mutex;
-    /// Serializes the tombstone/lineage process-global flag flips.
-    static FLAG_LOCK: Mutex<()> = Mutex::new(());
-
     fn seed_mem(id: &str, ns: &str, title: &str, author: &str) -> Memory {
         Memory {
             id: id.to_string(),
@@ -520,11 +516,9 @@ mod tests {
     /// retained tombstoned sources + navigable edges (no `deletions`).
     #[test]
     fn sqlite_finalize_and_disposition_tombstone_disposition() {
-        let _g = FLAG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::config::set_lineage_dag(true);
-        crate::config::set_consolidate_tombstone_sources(true);
+        let g = crate::test_support::LineageDagIsolation::new();
+        g.set_lineage_dag(true);
+        g.set_consolidate_tombstone_sources(true);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
@@ -543,9 +537,6 @@ mod tests {
             Some("a caller summary"),
         )
         .expect("finalize");
-
-        crate::config::set_lineage_dag(false);
-        crate::config::set_consolidate_tombstone_sources(false);
 
         assert!(
             disp.deletions.is_empty(),
@@ -584,11 +575,9 @@ mod tests {
     /// source ids and no tombstoned rows / edges are shipped.
     #[test]
     fn sqlite_finalize_and_disposition_legacy_delete_disposition() {
-        let _g = FLAG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::config::set_lineage_dag(false);
-        crate::config::set_consolidate_tombstone_sources(false);
+        let g = crate::test_support::LineageDagIsolation::new();
+        g.set_lineage_dag(false);
+        g.set_consolidate_tombstone_sources(false);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
@@ -623,11 +612,9 @@ mod tests {
     #[tokio::test]
     async fn store_finalize_and_disposition_matches_sqlite_twin() {
         use crate::store::{CallerContext, MemoryStore};
-        let _g = FLAG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::config::set_lineage_dag(true);
-        crate::config::set_consolidate_tombstone_sources(true);
+        let g = crate::test_support::LineageDagIsolation::new();
+        g.set_lineage_dag(true);
+        g.set_consolidate_tombstone_sources(true);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let store = crate::store::sqlite::SqliteStore::open(dir.path().join("s.db")).expect("open");
@@ -658,9 +645,6 @@ mod tests {
         .await
         .expect("finalize");
 
-        crate::config::set_lineage_dag(false);
-        crate::config::set_consolidate_tombstone_sources(false);
-
         assert!(disp.deletions.is_empty());
         assert_eq!(disp.tombstoned_sources.len(), 2);
         assert_eq!(disp.derived_edges.len(), 2);
@@ -677,11 +661,9 @@ mod tests {
     /// #3238 — missing tombstone source must fail closed, not silently omit.
     #[test]
     fn sqlite_finalize_missing_tombstone_fails_closed_3238() {
-        let _g = FLAG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::config::set_lineage_dag(true);
-        crate::config::set_consolidate_tombstone_sources(true);
+        let g = crate::test_support::LineageDagIsolation::new();
+        g.set_lineage_dag(true);
+        g.set_consolidate_tombstone_sources(true);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
@@ -696,19 +678,15 @@ mod tests {
             None,
         )
         .expect_err("missing tombstone must fail closed");
-        crate::config::set_lineage_dag(false);
-        crate::config::set_consolidate_tombstone_sources(false);
         assert!(err.contains("CONSOLIDATE_TOMBSTONE_MISSING"), "got {err}");
     }
 
     /// #3238 — persist against a missing origin row must fail closed.
     #[test]
     fn sqlite_finalize_missing_origin_fails_closed_3238() {
-        let _g = FLAG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::config::set_lineage_dag(false);
-        crate::config::set_consolidate_tombstone_sources(false);
+        let g = crate::test_support::LineageDagIsolation::new();
+        g.set_lineage_dag(false);
+        g.set_consolidate_tombstone_sources(false);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let conn = crate::db::open(&dir.path().join("t.db")).expect("open");

@@ -1013,15 +1013,23 @@ mod tests {
     // edge then attempts B → A which closes the cycle.
     #[test]
     fn reflects_on_cycle_refused() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
         let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
-        let a = make_reflection("ref-a", "cycle-ns");
-        let b = make_reflection("ref-b", "cycle-ns");
-        let a_id = db::insert(&conn, &a).unwrap();
+        // #3577 — pin created_at so a --reflects_on--> b is strictly
+        // newer→older (Pass 0 admits it even if LINEAGE_DAG leaked ON).
+        let mut b = make_reflection("ref-b", "cycle-ns");
+        let mut a = make_reflection("ref-a", "cycle-ns");
+        b.created_at = crate::test_support::LINEAGE_FIXTURE_OLDER_AT.to_string();
+        b.updated_at = b.created_at.clone();
+        a.created_at = crate::test_support::LINEAGE_FIXTURE_NEWER_AT.to_string();
+        a.updated_at = a.created_at.clone();
         let b_id = db::insert(&conn, &b).unwrap();
-        // Existing edge: a reflects_on b
-        db::create_link(&conn, &a_id, &b_id, REFLECTS_ON).unwrap();
+        let a_id = db::insert(&conn, &a).unwrap();
+        // Existing edge: a (newer) reflects_on b (older)
+        db::create_link(&conn, &a_id, &b_id, REFLECTS_ON)
+            .expect("pre-seed newer→older reflects_on must be admitted");
         let db_path = db_path();
         // Attempting b reflects_on a closes the cycle.
         let err = handle_link(

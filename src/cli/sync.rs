@@ -1181,6 +1181,7 @@ mod tests {
 
     #[test]
     fn pr9i_merge_propagates_links_both_directions() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let mut env = TestEnv::fresh();
         let local = env.db_path.clone();
         let remote_env = TestEnv::fresh();

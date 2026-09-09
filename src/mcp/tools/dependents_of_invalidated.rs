@@ -246,6 +246,7 @@ mod tests {
 
     #[test]
     fn returns_only_inbound_reflects_on_edges() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let conn = fresh_conn();
         let r1 = make_mem("R1", "ns-a", MemoryKind::Reflection);
         let m1 = make_mem("M1", "ns-a", MemoryKind::Observation);

@@ -28791,6 +28791,7 @@ mod tests {
             PermissionsMode, lock_permissions_mode_for_test,
             override_active_permissions_mode_for_test,
         };
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         // The active permissions mode is process-wide; hold the
         // serialisation guard so parallel lib tests cannot flip the
         // mode out from under us. See `pin_governance_enforce_for_test`
@@ -28975,14 +28976,17 @@ mod tests {
             PermissionsMode, lock_permissions_mode_for_test,
             override_active_permissions_mode_for_test,
         };
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let _gate = lock_permissions_mode_for_test();
         override_active_permissions_mode_for_test(PermissionsMode::Off);
 
         let conn = test_db();
-        let a = make_memory("inbound-cycle-a", "ns", Tier::Long, 5);
+        // #3577 — insert the pre-seed TARGET first so a --reflects_on--> b
+        // is newer→older (admitted under both LINEAGE_DAG values).
         let b = make_memory("inbound-cycle-b", "ns", Tier::Long, 5);
-        insert(&conn, &a).unwrap();
+        let a = make_memory("inbound-cycle-a", "ns", Tier::Long, 5);
         insert(&conn, &b).unwrap();
+        insert(&conn, &a).unwrap();
         create_link(&conn, &a.id, &b.id, "reflects_on").unwrap();
 
         let cycle_link = MemoryLink {
@@ -33561,6 +33565,7 @@ mod tests {
     fn lifecycle_lineage_deliberately_keeps_tombstoned_ancestor() {
         // The intentional EXCEPTION: the lineage-DAG walk conserves provenance,
         // so a Tombstoned ancestor MUST still be reachable (contrast kg_query).
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let conn = test_db();
         let parent = insert(
             &conn,

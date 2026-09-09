@@ -299,12 +299,14 @@
 #       only), and a DELEGATE-WRAPPER compliant fixture (issue #2163
 #       over-widen guard -- a test acquiring its guard via a local
 #       delegate wrapper that transitively cites the token, which arm (c)
-#       must NOT false-positive), and an ARM-(d) fixture (issue #3475 -- a
+#       must NOT false-positive), an ARM-(d) fixture (issue #3475 -- a
 #       wholly-new `src/**` file that INSTALLS a value into the
 #       process-global AI_MEMORY_AGENT_ID, invisible to arms (a)-(c)
-#       because it never touches $HOME); verifies the gate catches all six
-#       violators and spares BOTH compliant fixtures, then cleans up.
-#       Exit 0 on PASS.
+#       because it never touches $HOME), an ARM-(e) fixture (issue #3523
+#       -- helper-routed EnvGuard write), and an ARM-(f) fixture (issue
+#       #3577 -- qualified config::set_lineage_dag( outside the funnel);
+#       verifies the gate catches all eight violators and spares the
+#       compliant fixtures, then cleans up. Exit 0 on PASS.
 
 set -euo pipefail
 
@@ -528,7 +530,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
     probe_arm_f="${ROOT}/src/.check_passphrase_window_probe_3539.rs"
     probe_arm_f_compliant="${ROOT}/src/.check_passphrase_window_compliant_probe_3539.rs"
 
-    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant"; do
+
+    # Arm (g) (#3577) probe. NOT dot-prefixed (arms (d)-(g) skip those).
+    # A qualified config::set_lineage_dag( call in a new src/** file is
+    # the seeder-leak shape; a method call on LineageDagIsolation is NOT.
+    probe_arm_g="${ROOT}/src/check_test_env_arm_g_probe_3577.rs"
+
+    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run -- remove manually)" >&2
@@ -862,20 +870,34 @@ async fn contrived_guarded_plain_sqlite_boot() {
 }
 EOF
 
+    # Case 13 (arm (g), issue #3577): a WHOLLY-NEW src/** file that seeds
+    # LINEAGE_DAG via the qualified config setter, not the isolation
+    # funnel. Invisible to arms (a)-(f). Arm (g) must flag it.
+    cat > "$probe_arm_g" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-env-lock.sh --self-test.
+// Seeds the process-global LINEAGE_DAG atomic via the qualified setter
+// with no LineageDagIsolation restore-on-drop — the issue #3577 class.
+#[test]
+fn contrived_lineage_dag_seed_without_funnel() {
+    crate::config::set_lineage_dag(true);
+    crate::config::set_consolidate_tombstone_sources(true);
+}
+EOF
+
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant"
+    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g"
     printf '%s\n' "$gate_output"
 
-    # PASS requires: non-zero exit, ALL SIX violators reported (no-lock,
+    # PASS requires: non-zero exit, ALL EIGHT violators reported (no-lock,
     # hand-rolled-lock, comment-only-mention #2153a, the module-local-lock-
-    # adjacency #2153b shape, the naked-mutation #2163 shape, and the arm-(d)
-    # AI_MEMORY_AGENT_ID install #3475), and BOTH compliant fixtures (the
-    # plain compliant one AND the config.rs delegate-wrapper one) NOT
-    # reported.
+    # adjacency #2153b shape, the naked-mutation #2163 shape, the arm-(d)
+    # AI_MEMORY_AGENT_ID install #3475, the arm-(e) helper-routed bypass
+    # #3523, and the arm-(f) LINEAGE_DAG setter #3577), and the compliant
+    # fixtures (plain, delegate-wrapper, arm-(e) exempt) NOT reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
     printf '%s' "$gate_output" | grep -q '\.check_home_lock_violation_probe\.rs' || ok=0
@@ -887,6 +909,7 @@ EOF
     printf '%s' "$gate_output" | grep -q 'check_test_env_arm_e_probe_3523\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_naked_passphrase_seed\|\.check_passphrase_window_probe_3539\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_naked_plain_sqlite_boot\|bootstrap_serve' || ok=0
+    printf '%s' "$gate_output" | grep -q 'check_test_env_arm_g_probe_3577\.rs' || ok=0
     if printf '%s' "$gate_output" | grep -q '\.check_home_lock_compliant_probe\.rs'; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: the compliant fixture was flagged)" >&2
@@ -919,7 +942,7 @@ EOF
     fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-env-lock gate self-test: PASS (caught all nine contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, the #3523 arm (e) helper-routed bypass, and BOTH #3539 arm (f) shapes (naked passphrase seed, naked plain-sqlite boot) -- and spared all four compliant fixtures; exit=${gate_exit})"
+        echo "Test-env-lock gate self-test: PASS (caught all ten contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, the #3523 arm (e) helper-routed bypass, BOTH #3539 arm (f) shapes (naked passphrase seed, naked plain-sqlite boot), and the #3577 arm (g) LINEAGE_DAG setter -- and spared all four compliant fixtures; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
@@ -1454,7 +1477,73 @@ else
     echo "Test-env-lock gate arm (f): PASS (every src/** test that seeds or reads the passphrase channel holds the shared window)"
 fi
 
-if (( home_fail != 0 || arm_d_fail != 0 || arm_e_fail != 0 || arm_f_fail != 0 )); then
+# ---------------------------------------------------------------------
+# ARM (g) -- issue #3577: process-global LINEAGE_DAG / CONSOLIDATE_TOMBSTONE_SOURCES
+# seeders must go through `test_support::LineageDagIsolation`.
+#
+# `set_lineage_dag` / `set_consolidate_tombstone_sources` mutate process-wide
+# AtomicBools. A seeder that flips them true without a restore-on-drop guard
+# leaks the flag into every concurrent lib test that writes a lineage
+# relation (Pass 0 of `validate_link_pre_create` then refuses older→newer
+# `reflects_on` edges). The funnel is `LineageDagIsolation` (lock + snapshot
+# + restore on drop). Readers hold `no_lineage_dag_guard()`.
+#
+# This arm greps src/**/*.rs for a QUALIFIED call
+# (`config::set_lineage_dag(` / `config::set_consolidate_tombstone_sources(`)
+# so a method call on the guard (`g.set_lineage_dag(true)`) is NOT a hit.
+# Allowlisted: the funnel (`src/test_support.rs`) and the production boot
+# seed (`src/daemon_runtime.rs`, already `#[cfg(not(test))]`).
+# `tests/**` is out of scope (own process). Dot-prefixed basenames skipped
+# (same as arms (d)/(e)/(f); they are never compiled into the lib test binary).
+# ---------------------------------------------------------------------
+
+LINEAGE_SETTER_PATTERN='config::set_lineage_dag\(|config::set_consolidate_tombstone_sources\('
+LINEAGE_FUNNEL_ALLOW=(
+    "src/test_support.rs"
+    "src/daemon_runtime.rs"
+)
+
+arm_g_fail=0
+arm_g_report=""
+while IFS= read -r -d '' f; do
+    base="${f##*/}"
+    case "$base" in .*) continue ;; esac
+    rel="${f#"${ROOT}/"}"
+    allowed=0
+    for a in "${LINEAGE_FUNNEL_ALLOW[@]}"; do
+        [[ "$rel" == "$a" ]] && allowed=1 && break
+    done
+    (( allowed == 1 )) && continue
+    stripped="$(strip_line_comments "$f")"
+    if grep -nE "$LINEAGE_SETTER_PATTERN" <<< "$stripped" >/dev/null 2>&1; then
+        hits="$(grep -nE "$LINEAGE_SETTER_PATTERN" <<< "$stripped" || true)"
+        arm_g_report+="  ${rel}"$'\n'
+        while IFS= read -r h; do
+            [[ -z "$h" ]] && continue
+            arm_g_report+="    ${h}"$'\n'
+        done <<< "$hits"
+    fi
+done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null)
+
+if [[ -n "${arm_g_report//[[:space:]]/}" ]]; then
+    {
+        echo "LINEAGE_DAG setter outside the #3577 funnel (issue #3577):"
+        printf '%s' "$arm_g_report"
+        echo ""
+        echo "set_lineage_dag / set_consolidate_tombstone_sources mutate process-wide"
+        echo "atomics. Seeders hold crate::test_support::LineageDagIsolation and call"
+        echo "its methods (restore on drop). Readers hold no_lineage_dag_guard()."
+        echo "A qualified config::set_lineage_dag( call in src/** outside"
+        echo "src/test_support.rs (funnel) and src/daemon_runtime.rs (production"
+        echo "boot seed) is a leak of the #3539 class."
+    } >&2
+    echo "Test-env-lock gate arm (g): FAIL" >&2
+    arm_g_fail=1
+else
+    echo "Test-env-lock gate arm (g): PASS (no src/** file calls config::set_lineage_dag / set_consolidate_tombstone_sources outside the #3577 funnel)"
+fi
+
+if (( home_fail != 0 || arm_d_fail != 0 || arm_e_fail != 0 || arm_f_fail != 0 || arm_g_fail != 0 )); then
     echo "" >&2
     echo "Test-env-lock gate: FAIL" >&2
     exit 1

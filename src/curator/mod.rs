@@ -2691,6 +2691,7 @@ mod tests {
     ///     `attest_level = "self_signed"`.
     #[test]
     fn run_once_persona_sweep_generates_signed_persona_for_new_entity() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
@@ -2824,6 +2825,7 @@ mod tests {
     /// dry-run accounting block without invoking the LLM generator.
     #[test]
     fn run_once_persona_sweep_dry_run_counts_without_writing() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
@@ -2909,6 +2911,7 @@ mod tests {
     /// disabled the sweep could not pass this test.
     #[test]
     fn persona_sweep_honours_exclude_namespaces() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -2949,6 +2952,7 @@ mod tests {
     /// namespaces.
     #[test]
     fn persona_sweep_honours_include_namespaces() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
         let tmp = tempfile::NamedTempFile::new().unwrap();

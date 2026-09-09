@@ -127,6 +127,7 @@ mod tests {
 
     #[test]
     fn lineage_cli_walks_a_reflects_on_edge_human_render() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let a = seed_memory(&db, "ns", "lin-src", "source");

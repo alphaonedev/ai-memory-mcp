@@ -38839,6 +38839,7 @@ mod tests {
     /// are unaffected.
     #[tokio::test]
     async fn live_link_reflects_on_cycle_refused_1568() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let Some(url) = postgres_url() else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
@@ -38847,10 +38848,12 @@ mod tests {
         let ctx = CallerContext::for_agent("ai:sal-test");
         let unique = uuid::Uuid::new_v4();
         let ns = format!("h1res-link-{unique}");
-        let a = sample_memory(&format!("cyc-a-{unique}"), &ns, "cyc-a", "body a");
+        // #3577 — store the pre-seed TARGET first so a --reflects_on--> b
+        // is newer→older (admitted under both LINEAGE_DAG values).
         let b = sample_memory(&format!("cyc-b-{unique}"), &ns, "cyc-b", "body b");
-        let a_id = store.store(&ctx, &a).await.expect("store a");
+        let a = sample_memory(&format!("cyc-a-{unique}"), &ns, "cyc-a", "body a");
         let b_id = store.store(&ctx, &b).await.expect("store b");
+        let a_id = store.store(&ctx, &a).await.expect("store a");
 
         let mk = |src: &str, dst: &str| crate::models::MemoryLink {
             source_id: src.to_string(),

@@ -158,6 +158,7 @@ mod tests {
     /// terminal (previously hardcoded non-transitive; only HTTP + MCP had it).
     #[test]
     fn dependents_of_invalidated_cli_transitive_surfaces_downstream_suspects_3037() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let target = seed_memory(&db, "ns", "invalidated-reflection", "content");
