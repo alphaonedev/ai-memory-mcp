@@ -15,14 +15,19 @@ packages; also usable standalone on any systemd distro.
 | `ai-memory-wake-hub.service` | Content-free wake plane (`User=ai-memory-hub`) | `simple` |
 | `ai-memory-wake-hub-refresh.service` | Derive+install the hub allowlist snapshot | `oneshot` |
 | `ai-memory-wake-hub-refresh.timer` | 30 s refresh of that snapshot | `timer` |
+| `ai-memory.sysusers.conf` | Creates `ai-memory` + `ai-memory-hub` via systemd-sysusers | `sysusers` |
 
 ## Install — manual
 
 ```sh
-# 1. System user + state dir. The Debian (.deb) postinst and Fedora COPR
-#    %post scriptlet do this automatically.
-sudo useradd --system --home /var/lib/ai-memory --shell /usr/sbin/nologin ai-memory
-sudo useradd --system --home /run/ai-memory-hub --shell /usr/sbin/nologin ai-memory-hub
+# 1. System users + state dir. Distro packages install
+#    packaging/systemd/ai-memory.sysusers.conf as
+#    /usr/lib/sysusers.d/ai-memory.conf; systemd-sysusers creates both
+#    users on first boot (the AUR PKGBUILD ships this). Manual:
+sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
+# Fallback if systemd-sysusers is unavailable:
+# sudo useradd --system --home /var/lib/ai-memory --shell /usr/sbin/nologin ai-memory
+# sudo useradd --system --home /run/ai-memory-hub --shell /usr/sbin/nologin ai-memory-hub
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory/backups
 

@@ -60,4 +60,13 @@ package() {
     install -Dm644 packaging/systemd/ai-memory.service \
       "$pkgdir/usr/lib/systemd/system/ai-memory.service"
   fi
+
+  # systemd-sysusers fragment — creates ai-memory + ai-memory-hub on
+  # first boot (pacman systemd-sysusers hook). Without the hub user the
+  # shipped ai-memory-wake-hub.service cannot start on a fresh host
+  # (#3578 item 3b).
+  if [ -f packaging/systemd/ai-memory.sysusers.conf ]; then
+    install -Dm644 packaging/systemd/ai-memory.sysusers.conf \
+      "$pkgdir/usr/lib/sysusers.d/ai-memory.conf"
+  fi
 }
