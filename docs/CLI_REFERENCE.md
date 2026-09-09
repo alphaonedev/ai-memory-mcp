@@ -72,7 +72,7 @@ never downgrades.
 | `--expires-at` | RFC3339 | — | Overrides tier default. |
 | `--ttl-secs` | int | — | Overrides tier default. |
 | `--scope` | enum | `private` | Task 1.5 visibility. `private`/`team`/`unit`/`org`/`collective`. |
-| `--kind` | enum | `observation` | v0.7.0 F2.3 (#1427) Form-6 memory kind: `observation`, `reflection`, `persona`, `concept`, `entity`, `claim`, `relation`, `event`, `conversation`, `decision`. |
+| `--kind` | enum | `observation` | 16 `MemoryKind` slugs (`src/models/memory.rs::MemoryKind::all()`; [`docs/memory-kind-vocab.md`](memory-kind-vocab.html)): `observation`, `reflection`, `persona`, `concept`, `entity`, `claim`, `relation`, `event`, `conversation`, `decision`, `goal`, `plan`, `step` (#1709), `told`, `instruction`, `intervention` (#1945). Unknown values 400. |
 | `--citations` | JSON | — | Form-4 provenance: JSON array of `{uri, accessed_at, hash?, span?}`. |
 | `--source-uri` | string | — | Form-4 source pointer; `uri:` / `doc:` / `file:` schemes. |
 | `--source-span` | JSON | — | Form-4 byte-range pin: `{start, end}`. |

@@ -212,9 +212,13 @@ Emitting surfaces, verified in the daemon:
 The federation-receive 429 additionally carries `x-quota-reset-at` (UTC
 midnight) and `x-quota-limit` headers.
 
-**`POST /api/v1/memories/bulk` does NOT return 429.** A quota-rejected row
-in a bulk batch is folded into the response `errors[]` array and the batch
-still answers 200 — see the bulk section below.
+**`POST /api/v1/memories/bulk` does not 429 per row.** A quota-rejected
+row is folded into `errors[]`. The HTTP status follows the live #2588
+contract in the bulk section below: `200` only when every submitted row
+landed as its own distinct row; `207 Multi-Status` on a partial
+application; `429` (dominant cause) when **nothing** persisted and quota
+was the worst rejection. A wholly quota-rejected batch is therefore
+`429`, not `200`.
 
 Read paths (`GET /recall`, `/search`, `/memories`, …) are not quota-charged
 and never return 429.
@@ -557,6 +561,7 @@ or expect `"storage_backend": "sqlite"` — that key is absent on sqlite.
   "priority": 7,
   "confidence": 0.9,
   "source": "api",
+  "kind": "observation",
   "ttl_secs": 604800,
   "expires_at": "2026-05-08T10:30:00Z",
   "metadata": {"custom": "data"},
@@ -572,12 +577,18 @@ or expect `"storage_backend": "sqlite"` — that key is absent on sqlite.
 HTTP ↔ MCP parameter coverage table at the bottom of this document.
 
 An optional `kind` field is also accepted. Omitting it keeps the
-`observation` default; a supplied value MUST be one of the canonical
-variants (`observation`, `reflection`, `persona`, `concept`, `entity`,
-`claim`, `relation`, `event`, `conversation`, `decision`) or the request
-is rejected with **400** (#1467 — this endpoint previously coerced an
-unknown `kind` to `observation`; it now rejects to match the CLI and MCP
-surfaces). See `docs/memory-kind-vocab.md`.
+`observation` default; a supplied value MUST be one of the **16**
+canonical `MemoryKind` slugs (`src/models/memory.rs::MemoryKind::all()`;
+see [`docs/memory-kind-vocab.md`](memory-kind-vocab.html)):
+
+`observation`, `reflection`, `persona`, `concept`, `entity`, `claim`,
+`relation`, `event`, `conversation`, `decision`, `goal`, `plan`, `step`
+(v0.8.0 Pillar-2 typed-cognition, #1709), `told`, `instruction`,
+`intervention` (v1.0.0 epistemic typing, #1945).
+
+Anything else is rejected with **400** (#1467 — this endpoint previously
+coerced an unknown `kind` to `observation`; it now rejects to match the
+CLI and MCP surfaces).
 
 #### Agent attestation (`signature` + `created_at`) — #626 Layer-3
 
@@ -652,6 +663,32 @@ UUID or unique prefix. Returns memory + its links.
 }
 ```
 
+### `GET /api/v1/memories/{id}/lineage`
+
+Walk the derivation lineage-DAG from `id` over the provenance subset
+P = {`derived_from`, `reflects_on`, `derives_from`} (`handlers::get_lineage`,
+#1859). Three-surface parity with `memory_lineage` and `ai-memory lineage`.
+Requires `AI_MEMORY_LINEAGE_DAG` (compiled default on).
+
+Query params: `direction` (`ancestors` default, or `descendants`),
+`max_depth` (default = `LINEAGE_MAX_DEPTH` = 5).
+
+```json
+{
+  "id": "…",
+  "direction": "ancestors",
+  "nodes": [
+    { "id": "…", "cid": "b3:…", "relation": "derived_from", "depth": 1 }
+  ],
+  "count": 1
+}
+```
+
+Tombstoned ancestors are included (a consolidated-away source is still
+an ancestor). A root the caller cannot see is **404** (postgres) /
+**403** (sqlite owner-mismatch) — not an existence oracle on postgres
+(`NotFound` folds hidden + missing). An unknown `direction` is **400**.
+
 ### `PUT /api/v1/memories/{id}` — update
 
 All fields optional. Tier never downgrades.
@@ -716,34 +753,20 @@ nothing is never `200`.
 Postgres-backed daemons additionally carry `"pending": [ … ]` — the rows
 a governance standard routed to approval instead of writing.
 
-> ⚠️ **A 200 from this endpoint does NOT mean any row was created.**
+> **Callers MUST inspect `created` / `errors` / `pending` as well as the
+> status.** [#2588](https://github.com/alphaonedev/ai-memory-mcp/issues/2588)
+> **shipped** (`src/handlers/bulk.rs`): the status is the batch-level
+> signal (`200` / `207` / `202` / dominant-cause `4xx`/`5xx`), and
+> per-row failures still accumulate into `errors[]` rather than aborting
+> the rest of the batch. A retry policy keyed only on `response.ok`
+> will treat a `207` partial fill as delivered. Key success on
+> `status === 200 && created === body.length && errors.length === 0`,
+> and surface `errors[]` to the operator.
 >
-> Once the batch passes the size/auth/attestation preconditions, the
-> terminal response is a bare JSON body with **no status code override**
-> (`src/handlers/memories_query.rs`), so it is always **HTTP 200** —
-> whatever the per-row outcome was. Per-row failures do not fail the
-> request: validation errors, governance refusals, **per-agent quota
-> rejections**, and store errors are all accumulated into `errors[]` and
-> the corresponding rows are skipped.
->
-> A batch in which *every* row was rejected by the per-agent daily write
-> quota answers **`200` with `{"created": 0, "errors": [ …one entry per
-> row… ]}`**. Nothing was written.
->
-> **Callers MUST inspect `created` and `errors` — the status code is not
-> a success signal for this endpoint.** A retry policy keyed on
-> `response.ok` will treat a wholly-rejected batch as delivered and drop
-> the data. Key it on `created === body.length && errors.length === 0`
-> instead, and surface `errors[]` to the operator.
->
-> Note this endpoint does **not** return 429 even though the single-write
-> `POST /api/v1/memories` does; the quota rejection is a per-row entry in
-> `errors[]` here.
->
-> Returning `207 Multi-Status` (or 400 on total rejection) is tracked as
-> [#2588](https://github.com/alphaonedev/ai-memory-mcp/issues/2588). Until
-> that lands, the contract above is what the daemon does — write your
-> client against it.
+> A wholly quota-rejected batch is **`429`** with `created: 0` and one
+> `errors[]` entry per row — not `200`. Mixed quota + success is
+> **`207`**. The single-write `POST /api/v1/memories` still 429s the
+> whole request on quota; bulk folds quota into the ledger.
 
 ## Recall + search
 
@@ -910,11 +933,46 @@ fields are `created_at` / `valid_from` / `valid_until`).
 
 Withholding the signature is a design decision, not an omission: this is
 a read-only graph view, and the verification surface is owned by
-**`memory_verify`** — over HTTP, `POST /api/v1/links/verify`. That
-endpoint returns `{verified, attest_level, signature_present,
-observed_by, source_id, target_id, relation, findings}`. Build link
-attestation checks against it; `GET /api/v1/links/{id}` will never carry
-the bytes to verify against.
+**`memory_verify`** — over HTTP, `POST /api/v1/links/verify` (next
+section). `GET /api/v1/links/{id}` will never carry the bytes to verify
+against.
+
+### `DELETE /api/v1/links`
+
+Same JSON body shape as POST (`source_id`/`from`, `target_id`/`to`,
+`relation`/`rel_type`). Unknown fields → **400**
+`{"error":"unknown_field","fields":[…]}`. `relation` must be one of the
+nine closed-taxonomy values (the shared `validate_link_triple` check);
+the delete itself matches on the `(source_id, target_id)` pair **only**
+and removes every relation between that pair (`MemoryStore::delete_link`).
+
+```json
+{ "source_id": "abc", "target_id": "def", "relation": "related_to" }
+```
+
+Response: `{"deleted": true}` when at least one row was removed,
+`{"deleted": false}` when the pair had no edge (including a missing
+source — not 404, so this is not an existence oracle). **403** when the
+caller owns neither endpoint. Never a count — `deleted` is a **bool**.
+
+### `POST /api/v1/links/verify`
+
+Ed25519 link verification. Identify the row by `(source_id, target_id)`
+or by `link_id` (at least one of `source_id` / `link_id` is required).
+
+```json
+{
+  "source_id": "abc",
+  "target_id": "def",
+  "verification_nonce": "uuid-v4"
+}
+```
+
+Response: `{verified, attest_level, signature_present, observed_by,
+source_id, target_id, relation, findings}`. Missing identifier → **400**.
+When `[verify] require_nonce = true`, a missing `verification_nonce` is
+**400**; otherwise a deprecation WARN is logged and verify proceeds. A
+replayed `(canonical_link_id, nonce)` tuple is **409**.
 
 ## Knowledge Graph + taxonomy (v0.6.3)
 
@@ -986,6 +1044,11 @@ Register an entity-as-typed-memory. Idempotent on
   "metadata": {}
 }
 ```
+
+There is **no `entity_type` field**. The stored memory's kind is always
+`entity` (`metadata.kind` is overwritten). Extra JSON keys are ignored
+by serde (this body is not `deny_unknown_fields`); they are not
+validated. Blank aliases are skipped; duplicates collapse.
 
 Response: `{"entity_id":"ent-...","canonical_name":"PostgreSQL","namespace":"my-app","aliases":["pg","postgres","PostgreSQL"],"created":true}`.
 
@@ -1101,6 +1164,35 @@ Response:
 
 Ordering: `depth ASC, COALESCE(valid_from, link_created_at) ASC,
 link_created_at ASC`.
+
+### `POST /api/v1/kg/find_paths`
+
+Enumerate paths between two memories. Cypher on AGE / recursive-CTE on
+SQLite. `POST /api/v1/find_paths` is a registered alias of this route
+(#934 — legacy callers). Body fields `from_id` / `to_id` are accepted as
+aliases of `source_id` / `target_id`.
+
+```json
+{ "source_id": "abc", "target_id": "def", "max_depth": 4, "max_results": 10 }
+```
+
+`max_depth` defaults to **4** (`FIND_PATHS_DEFAULT_DEPTH`); `max_results`
+defaults to **10**. Response:
+
+```json
+{
+  "paths": [["abc", "mid", "def"]],
+  "count": 1,
+  "source_id": "abc",
+  "target_id": "def"
+}
+```
+
+Each inner array is the chain of memory ids from source to target,
+inclusive. Paths that walk through a `scope=private` memory the caller
+cannot see are dropped (#910). Over-budget walks return **400**
+`TRAVERSAL_BUDGET_EXCEEDED` (or **422** when the adapter rejects
+`max_depth`). Invalid ids → **400**.
 
 ## Namespaces
 
@@ -1450,7 +1542,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; Cypher on AGE / recursive-CTE on SQLite. |
 | `POST` | `/api/v1/find_paths` | Alias for `/api/v1/kg/find_paths` (#934 — legacy callers). |
 | `POST` | `/api/v1/links/verify` | Ed25519 link verification surface — wire shape: `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
-| `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": N}`. |
+| `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": true}` (bool — at least one row removed) or `{"deleted": false}`. |
 | `GET`  | `/api/v1/contradictions` | Detect contradiction candidates (similar titles in a namespace). |
 | `POST` | `/api/v1/memory_load_family` | HTTP parity for the always-on `memory_load_family` MCP loader. |
 | `POST` | `/api/v1/capture_turn` | #1416 — L4 layered-capture HTTP mirror of MCP `memory_capture_turn` (idempotent per-turn write via `MemoryStore::capture_turn_idempotent`). |
