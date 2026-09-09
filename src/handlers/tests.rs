@@ -78,6 +78,9 @@ fn install_security_bypass_for_legacy_tests() {
 
 fn test_state() -> Db {
     install_security_bypass_for_legacy_tests();
+    // #3498 battery: isolated handler slices must install the network gate
+    // before fanout, just as the federation test fixtures do (#3515).
+    crate::governance::wire_check::ensure_installed_for_test();
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)))
@@ -5258,7 +5261,7 @@ async fn http_kg_timeline_returns_empty_for_unlinked_source() {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({"scope": "collective"}),
+            metadata: serde_json::json!({}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,

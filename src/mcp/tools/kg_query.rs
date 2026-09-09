@@ -190,12 +190,15 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
 
     // #3498: apply the query predicate even without a caller. Every hop is
     // checked because the serialized path exposes intermediate IDs too.
-    let namespace = params["namespace"].as_str();
     let nodes: Vec<_> = nodes
         .into_iter()
         .filter(|n| {
             n.path.split("->").all(|id| match db::get(conn, id) {
-                Ok(Some(mem)) => crate::visibility::is_readable_on_query(&mem, caller, namespace),
+                Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                    &mem,
+                    caller,
+                    (id == source_id).then_some(mem.namespace.as_str()),
+                ),
                 _ => false,
             })
         })

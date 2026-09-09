@@ -32651,7 +32651,7 @@ impl MemoryStore for PostgresStore {
                     // #3498/#2633: reuse the canonical query predicate with
                     // the fields it reads, rather than maintaining a parallel
                     // SQL/metadata visibility rule. Even privileged traversals
-                    // require an explicit namespace to surface substrate rows.
+                    // withhold reached substrate rows; endpoints are explicit anchors.
                     let v = match row {
                         Some(r) => {
                             let node_id: String =
@@ -32662,15 +32662,17 @@ impl MemoryStore for PostgresStore {
                             let meta: serde_json::Value = r
                                 .try_get("metadata")
                                 .map_err(|e| to_store_err("read metadata", e))?;
+                            let mem = Memory {
+                                id: node_id,
+                                namespace: node_ns,
+                                metadata: meta,
+                                ..Memory::default()
+                            };
                             crate::visibility::is_readable_on_query(
-                                &Memory {
-                                    id: node_id,
-                                    namespace: node_ns,
-                                    metadata: meta,
-                                    ..Memory::default()
-                                },
+                                &mem,
                                 caller,
-                                None,
+                                (node == source_id || node == target_id)
+                                    .then_some(mem.namespace.as_str()),
                             )
                         }
                         // Fail-closed: missing node ⇒ drop the path.

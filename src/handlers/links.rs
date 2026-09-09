@@ -448,8 +448,8 @@ pub async fn create_link(
         return resp;
     }
 
-    // #3498: the non-mutating target admission rule matches MCP link.
-    // A named row ID does not opt a request into a substrate namespace.
+    // #3498 amendment: HTTP checks target visibility only for substrate rows.
+    // Ordinary targets retain the #939/#941 source-ownership write authority.
     if relation != crate::models::MemoryLinkRelation::Supersedes.as_str() {
         let caller = match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
             Ok(caller) => caller,
@@ -459,7 +459,9 @@ pub async fn create_link(
         };
         #[cfg(feature = "sal")]
         let target = if matches!(app.storage_backend, StorageBackend::Postgres) {
-            let ctx = crate::store::CallerContext::for_agent(&caller);
+            // #939/#941: inspect all targets before substrate admission below.
+            // Confine the visibility bypass to this read, never the link write.
+            let ctx = crate::store::CallerContext::for_admin(&caller);
             match app.store.get(&ctx, &target_id).await {
                 Ok(mem) => Some(mem),
                 Err(error) => return store_err_to_response(error),
@@ -479,10 +481,14 @@ pub async fn create_link(
                 Err(error) => return crate::handlers::errors::handler_error_500(&error),
             }
         };
-        if target
-            .as_ref()
-            .is_some_and(|mem| !crate::visibility::is_readable_on_query(mem, Some(&caller), None))
-        {
+        if target.as_ref().is_some_and(|mem| {
+            crate::visibility::is_substrate_namespace(&mem.namespace)
+                && !crate::visibility::is_readable_on_query(
+                    mem,
+                    Some(&caller),
+                    Some(&mem.namespace),
+                )
+        }) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": "caller cannot see the link target"})),
@@ -1219,7 +1225,7 @@ pub async fn get_links(
                                 crate::visibility::is_readable_on_query(
                                     &m,
                                     (!caller_is_admin).then_some(caller.as_str()),
-                                    None,
+                                    (m.id == id).then_some(m.namespace.as_str()),
                                 )
                             })
                             .unwrap_or(false);
@@ -1231,7 +1237,7 @@ pub async fn get_links(
                                 crate::visibility::is_readable_on_query(
                                     &m,
                                     (!caller_is_admin).then_some(caller.as_str()),
-                                    None,
+                                    (m.id == id).then_some(m.namespace.as_str()),
                                 )
                             })
                             .unwrap_or(false);
@@ -1278,7 +1284,7 @@ pub async fn get_links(
                                     crate::visibility::is_readable_on_query(
                                         m,
                                         (!caller_is_admin).then_some(caller.as_str()),
-                                        None,
+                                        (m.id == id).then_some(m.namespace.as_str()),
                                     )
                                 });
                             let tgt_ok = db::get(&lock.0, &link.target_id)
@@ -1289,7 +1295,7 @@ pub async fn get_links(
                                     crate::visibility::is_readable_on_query(
                                         m,
                                         (!caller_is_admin).then_some(caller.as_str()),
-                                        None,
+                                        (m.id == id).then_some(m.namespace.as_str()),
                                     )
                                 });
                             src_ok && tgt_ok
@@ -1406,7 +1412,7 @@ pub async fn get_lineage(
                     if !crate::visibility::is_readable_on_query(
                         &mem,
                         (!caller_is_admin).then_some(caller.as_str()),
-                        None,
+                        Some(&mem.namespace),
                     ) {
                         return (
                             StatusCode::FORBIDDEN,
@@ -1478,7 +1484,7 @@ pub async fn get_lineage(
                 if !crate::visibility::is_readable_on_query(
                     &mem,
                     (!caller_is_admin).then_some(caller.as_str()),
-                    None,
+                    Some(&mem.namespace),
                 ) =>
             {
                 drop(lock);

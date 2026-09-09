@@ -3389,9 +3389,12 @@ impl MemoryStore for SqliteStore {
             for node in &path {
                 let entry = visible_cache.entry(node.clone()).or_insert_with(|| {
                     match db::get(&conn, node) {
-                        Ok(Some(mem)) => {
-                            crate::visibility::is_readable_on_query(&mem, caller, None)
-                        }
+                        Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                            &mem,
+                            caller,
+                            (node == source_id || node == target_id)
+                                .then_some(mem.namespace.as_str()),
+                        ),
                         // Fail-closed: missing node ⇒ drop the path.
                         Ok(None) | Err(_) => false,
                     }

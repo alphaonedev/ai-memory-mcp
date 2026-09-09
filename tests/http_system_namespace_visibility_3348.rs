@@ -615,9 +615,9 @@ async fn graph_http_matrix_3498(f: &Fixture) {
     );
     for (target, count) in [
         (&f.neighbor, 1),
-        (&f.own_inbox, 0),
+        (&f.own_inbox, 1),
         (&f.other_inbox, 0),
-        (&f.registry, 0),
+        (&f.registry, 2),
     ] {
         let paths = post_graph(
             &f.router,
@@ -657,9 +657,16 @@ async fn graph_http_matrix_3498(f: &Fixture) {
     }
     for anchor in [&f.own_inbox, &f.other_inbox, &f.registry] {
         let links = get(&f.router, &format!("/api/v1/links/{anchor}")).await;
-        assert!(
-            links["links"].as_array().unwrap().is_empty(),
-            "substrate anchor links withheld: {links}"
+        assert_eq!(
+            links["links"].as_array().unwrap().len(),
+            if anchor == &f.other_inbox {
+                0
+            } else if anchor == &f.registry {
+                2
+            } else {
+                1
+            },
+            "explicit anchor links: {links}"
         );
         for uri in [
             format!("/api/v1/kg/timeline?source_id={anchor}"),
@@ -677,30 +684,40 @@ async fn graph_http_matrix_3498(f: &Fixture) {
                 )
                 .await
                 .unwrap();
-            assert!(
-                matches!(
+            if anchor == &f.other_inbox {
+                assert!(
+                    matches!(
+                        response.status(),
+                        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+                    ),
+                    "foreign anchor refused: {uri}"
+                );
+            } else if anchor == &f.registry && uri.contains("timeline") {
+                assert_eq!(
                     response.status(),
-                    StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-                ),
-                "substrate anchor refused: {uri}"
-            );
+                    StatusCode::FORBIDDEN,
+                    "timeline owner gate: {uri}"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::OK, "readable anchor: {uri}");
+            }
         }
     }
-    for target in [&f.neighbor, &f.own_inbox, &f.registry] {
+    for target in [&f.neighbor, &f.own_inbox, &f.registry, &f.other_inbox] {
         let (status, body) = post_graph_response(
             &f.router,
             "/api/v1/links",
             json!({"source_id": f.ordinary, "target_id": target, "relation": "related_to"}),
         )
         .await;
-        if target == &f.neighbor {
-            assert!(status.is_success(), "ordinary link admitted: {body}");
-        } else {
+        if target == &f.other_inbox {
             assert_eq!(
                 status,
                 StatusCode::FORBIDDEN,
                 "substrate link refused: {body}"
             );
+        } else {
+            assert!(status.is_success(), "ordinary link admitted: {body}");
         }
     }
 }

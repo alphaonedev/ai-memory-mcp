@@ -296,7 +296,11 @@ pub(super) fn handle_link(
                 if !crate::visibility::caller_owns_for_mutation(&tgt, &caller, false) {
                     return Err(TARGET_NOT_OWNED_FOR_MUTATION.into());
                 }
-            } else if !crate::visibility::is_readable_on_query(&tgt, Some(&caller), None) {
+            } else if !crate::visibility::is_readable_on_query(
+                &tgt,
+                Some(&caller),
+                Some(&tgt.namespace),
+            ) {
                 return Err(TARGET_NOT_VISIBLE.into());
             }
         }
@@ -499,10 +503,10 @@ pub(super) fn handle_get_links(
     // the anchor row and, in the multi-tenant posture, return the same empty
     // shape an unknown id yields when the caller cannot see the anchor — so it
     // cannot confirm a private row's existence or enumerate its neighbors.
-    // #3498: substrate anchors and endpoints are withheld in both postures.
+    // #3498: the anchor is explicit; other endpoints are ambient reads.
     let resolved = db::resolve_id(conn, id).map_err(|e| e.to_string())?;
     if let Some(mem) = resolved.as_ref() {
-        if !crate::visibility::is_readable_on_query(mem, caller, None) {
+        if !crate::visibility::is_readable_on_query(mem, caller, Some(&mem.namespace)) {
             return Ok(json!({"links": [], "count": 0}));
         }
     }
@@ -511,7 +515,7 @@ pub(super) fn handle_get_links(
     links.retain(|link| {
         [&link.source_id, &link.target_id].into_iter().all(|id| {
             matches!(db::get_any(conn, id), Ok(Some(mem))
-            if crate::visibility::is_readable_on_query(&mem, caller, None))
+            if crate::visibility::is_readable_on_query(&mem, caller, (id == anchor).then_some(mem.namespace.as_str())))
         })
     });
     Ok(json!({"links": links, "count": links.len()}))
@@ -820,7 +824,7 @@ mod tests {
                 let denied = handle_get_links(&conn, &json!({"id": a}), caller).unwrap();
                 assert_eq!(denied["count"], 0, "substrate neighbor withheld");
                 let denied = handle_get_links(&conn, &json!({"id": b}), caller).unwrap();
-                assert_eq!(denied["count"], 0, "substrate anchor withheld");
+                assert_eq!(denied["count"], 1, "explicit readable anchor admitted");
             }
         }
     }

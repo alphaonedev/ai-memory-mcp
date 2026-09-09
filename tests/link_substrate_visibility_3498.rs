@@ -37,7 +37,7 @@ fn link_target_substrate_gate_3498() {
             content: "link gate".to_string(),
             created_at: now.clone(),
             updated_at: now,
-            metadata: json!({"agent_id": owner, "scope": "collective", "target_agent_id": owner}),
+            metadata: json!({"agent_id": owner, "scope": "private", "target_agent_id": owner}),
             ..Memory::default()
         };
         ai_memory::db::insert(&conn, &memory).unwrap()
@@ -45,6 +45,8 @@ fn link_target_substrate_gate_3498() {
     let root = seed("ordinary", "ai:me");
     for namespace in [
         "ordinary",
+        "ordinary-foreign",
+        "legacy-unowned",
         "_inbox/ai:me",
         "_messages/ai:me",
         "_inbox/ai:other",
@@ -52,23 +54,43 @@ fn link_target_substrate_gate_3498() {
         "_agent_sessions",
         "_standards",
     ] {
-        let target = seed(namespace, "ai:me");
+        let target = seed(
+            namespace,
+            if matches!(namespace, "_inbox/ai:other" | "ordinary-foreign") {
+                "ai:other"
+            } else {
+                "ai:me"
+            },
+        );
+        if namespace == "legacy-unowned" {
+            conn.execute(
+                "UPDATE memories SET metadata = '{}' WHERE id = ?1",
+                [&target],
+            )
+            .unwrap();
+        }
         let result = ai_memory::mcp::dispatch_handle_link_for_test(
             &conn,
             &path,
             &json!({"source_id": root, "target_id": target, "relation": "related_to", "agent_id": "ai:me"}),
             None,
         );
-        if namespace == "ordinary" {
-            assert!(result.is_ok(), "ordinary target allowed: {result:?}");
-        } else {
+        if matches!(
+            namespace,
+            "_inbox/ai:other" | "ordinary-foreign" | "legacy-unowned"
+        ) {
             assert!(
                 result.unwrap_err().contains("cannot see the link target"),
-                "substrate target refused"
+                "MCP preserves target visibility for {namespace}"
             );
             assert!(
                 ai_memory::db::get_links(&conn, &target).unwrap().is_empty(),
                 "refusal must not write an edge"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "explicit readable target allowed: {result:?}"
             );
         }
     }
@@ -125,6 +147,15 @@ fn named_kg_namespace_preserves_owner_gate_3498() {
             };
             db::insert(&conn, &mail).unwrap();
             db::create_link(&conn, &root.id, &mail.id, "related_to").unwrap();
+            db::create_link(&conn, &mail.id, &root.id, "derived_from").unwrap();
+            let anchored =
+                ai_memory::mcp::handle_kg_query(&conn, &json!({"source_id": mail.id})).unwrap();
+            assert_eq!(
+                anchored["count"].as_u64().unwrap() > 0,
+                recipient == "ai:me",
+                "explicit inbox source: {anchored}"
+            );
+
             for mut params in [
                 json!({"source_id": root.id}),
                 json!({"by_source_uri": "doc:mail-3498"}),
@@ -136,7 +167,11 @@ fn named_kg_namespace_preserves_owner_gate_3498() {
                     .unwrap()
                     .iter()
                     .any(|m| m["target_id"] == mail.id);
-                assert_eq!(found, recipient == "ai:me", "named inbox gate: {out}");
+                assert_eq!(
+                    found,
+                    params.get("by_source_uri").is_some() && recipient == "ai:me",
+                    "anchor vs reached inbox gate: {out}"
+                );
             }
         }
     }
