@@ -1522,7 +1522,7 @@
       "name": "memory_routine_list"
     },
     {
-      "description": "Scan",
+      "description": "Calibrate confidence baselines",
       "inputSchema": {
         "properties": {
           "days": {

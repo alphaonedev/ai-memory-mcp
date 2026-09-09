@@ -188,8 +188,9 @@ pub(super) fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value,
 ///    so the governed content still exists and the hold is not defeated;
 ///    refusing there would strand expired rows in every deployment that has any
 ///    delete-governed namespace, which is a reliability cost with no integrity
-///    benefit. (The archive path's link-cascade loss is #3161 — the memory TEXT
-///    survives, which is the durable truth; the edges are derived.)
+///    benefit. (#3161 closed the archive-path link-cascade loss: an archiving
+///    sweep snapshots `memory_links` into `archived_memory_links` and restore
+///    re-inserts them. A HARD `archive=false` sweep is still irreversible.)
 /// 3. **Forensic capture.** An `allow` decision chained BEFORE the write, so
 ///    the trail records intent regardless of the storage outcome (#913).
 ///
@@ -345,8 +346,8 @@ pub(super) fn handle_gc(
         // `archive_on_gc` setting: with it OFF the sweep is a permanent
         // hard-delete + crypto-erase, and the pre-fix response gave the
         // caller NO way to tell a recoverable move from an unrecoverable
-        // erase. (The archive path's own link-cascade loss is #3161, not
-        // fixed here — see the tool docs.)
+        // erase. (#3161 snapshots edges on the archiving path; see the
+        // tool docs.)
         return Ok(json!({"collected": count, "dry_run": true, "archived": archive}));
     }
     let count = db::gc(conn, archive).map_err(|e| e.to_string())?;
@@ -465,7 +466,9 @@ impl McpTool for ArchiveRestoreTool {
         "Restore an archived memory back to the active store."
     }
     fn docs() -> &'static str {
-        "Restore archived row; expires_at cleared."
+        "Restore archived row; expires_at cleared. Re-inserts snapshotted \
+         memory_links whose both endpoints still exist (#1771/#3161). A HARD \
+         (archive=false) gc/forget cannot be restored."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ArchiveRestoreRequest>()
@@ -506,9 +509,13 @@ impl McpTool for GcTool {
          this is a PERMANENT hard-delete + crypto-erase with no recoverable copy. #3171: the \
          response carries `archived` so a caller can tell a recoverable move from an \
          unrecoverable erase — do not infer it from the tool name. The sweep is \
-         SUBSTRATE-WIDE and ungated (every namespace, every owner) and also prunes the \
-         recall_observations ledger and expired signals. Per #3161 the gc archive path does \
-         not archive link edges, so edges of archived rows are lost. dry_run previews."
+         SUBSTRATE-WIDE (every namespace, every owner). A real sweep is GATED (#3204): K9 \
+         permission rules, delete-governance refuse on a destructive (non-archiving) sweep \
+         when any reapable namespace is non-Any, and a forensic allow row before the write. \
+         dry_run is a count-only preview and stays ungated. Also prunes the \
+         recall_observations ledger and expired signals. Per #3161 an ARCHIVING sweep \
+         snapshots link edges into archived_memory_links; memory_archive_restore re-inserts \
+         them. A HARD (archive=false) sweep is irreversible by design."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<GcRequest>()
@@ -588,6 +595,22 @@ mod d1_5_986_tests {
         assert_eq!(ArchiveRestoreTool::family(), "archive");
     }
 
+    /// #3397 — restore docs must disclose that #3161/#1771 re-inserts
+    /// snapshotted edges. The pre-fix one-liner ("Restore archived row;
+    /// expires_at cleared.") contradicted the gc docs and the restore path.
+    #[test]
+    fn archive_restore_docs_disclose_link_restore_3397() {
+        let docs = ArchiveRestoreTool::docs();
+        assert!(
+            docs.contains("memory_links"),
+            "restore docs must name the restored edge table, got: {docs}"
+        );
+        assert!(
+            docs.contains("#3161") || docs.contains("#1771"),
+            "restore docs must cite the snapshot/restore contract, got: {docs}"
+        );
+    }
+
     #[test]
     fn archive_stats_parity_986() {
         let derived = derived_props_for::<ArchiveStatsRequest>();
@@ -621,6 +644,34 @@ mod d1_6_987_tests {
     fn gc_tool_metadata_987() {
         assert_eq!(GcTool::name(), "memory_gc");
         assert_eq!(GcTool::family(), "lifecycle");
+    }
+
+    /// #3397 — GcTool docs claimed the sweep was ungated (#3204 gated it)
+    /// and that archive-path edges were lost (#3161 snapshots them). Pin
+    /// both the denied (stale) phrasing and the allowed (current) contract.
+    #[test]
+    fn gc_docs_match_gated_snapshot_contract_3397() {
+        let docs = GcTool::docs();
+        assert!(
+            !docs.contains("SUBSTRATE-WIDE and ungated"),
+            "stale ungated-sweep claim must not survive, got: {docs}"
+        );
+        assert!(
+            !docs.contains("does not archive link edges"),
+            "stale #3161 loss claim must not survive, got: {docs}"
+        );
+        assert!(
+            docs.contains("#3204") && docs.contains("GATED"),
+            "docs must disclose the #3204 real-sweep gates, got: {docs}"
+        );
+        assert!(
+            docs.contains("archived_memory_links"),
+            "docs must disclose the #3161 edge snapshot, got: {docs}"
+        );
+        assert!(
+            docs.contains("dry_run") && docs.contains("ungated"),
+            "docs must still say dry_run stays ungated, got: {docs}"
+        );
     }
 }
 

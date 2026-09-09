@@ -103,10 +103,16 @@ impl McpTool for CalibrateConfidenceTool {
         crate::mcp::registry::tool_names::MEMORY_CALIBRATE_CONFIDENCE
     }
     fn description() -> &'static str {
-        "Scan confidence_shadow_observations and emit per-source baselines (Form 5)."
+        // First sentence MUST be ≤32 bytes (purpose): `wire_compact_descriptions`
+        // (`compact_description`, MAX=32) is what `tools/list` ships. The
+        // IGNORED caveat is the second sentence so it is honest without
+        // replacing the tool's purpose on the wire (#3397 review). Full
+        // disclosure lives in `docs()`; wire-level survival of a trailing
+        // caveat is #3378.
+        "Calibrate confidence baselines. output_format is ignored. Scan confidence_shadow_observations; emit per-source baselines (Form 5)."
     }
     fn docs() -> &'static str {
-        "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier."
+        "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier. output_format is IGNORED (#3171/#3397) — the response is always the JSON envelope; the field stays declared so existing clients are not refused. The field description is stripped from tools/list and compact_description MAX=32 keeps only the purpose sentence, so this docs() sentence is the load-bearing IGNORED disclosure."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<CalibrateConfidenceRequest>()
@@ -139,6 +145,44 @@ mod d1_5_986_tests {
             "memory_calibrate_confidence"
         );
         assert_eq!(CalibrateConfidenceTool::family(), "power");
+    }
+
+    /// #3397 — purpose first on the wire; IGNORED disclosure in `docs()`.
+    /// compact_description MAX=32 keeps only the first sentence, so that
+    /// sentence must be the tool purpose (≤32 bytes including the `.`).
+    /// The inert-field caveat is the second sentence of `description()`
+    /// and the load-bearing copy lives in `docs()`. Denied path: a
+    /// description that still looks like a working format selector.
+    #[test]
+    fn calibrate_purpose_first_ignored_in_docs_3397() {
+        let desc = CalibrateConfidenceTool::description();
+        let docs = CalibrateConfidenceTool::docs();
+        let (first, rest) = desc
+            .split_once('.')
+            .expect("description has a first sentence");
+        assert!(
+            first.len() < 32,
+            "purpose sentence must be ≤32 bytes so compact_description keeps it, got len={} {first:?}",
+            first.len() + 1
+        );
+        assert!(
+            first.to_ascii_lowercase().contains("calibrate")
+                && first.to_ascii_lowercase().contains("confidence"),
+            "first sentence must be the tool purpose, got: {desc}"
+        );
+        assert!(
+            rest.to_ascii_lowercase()
+                .contains("output_format is ignored."),
+            "second sentence must disclose the inert field, got: {desc}"
+        );
+        assert!(
+            docs.contains("IGNORED") || docs.to_ascii_lowercase().contains("ignored"),
+            "verbose docs must also disclose the inert field, got: {docs}"
+        );
+        assert!(
+            !desc.contains("json envelope or ASCII table"),
+            "must not advertise output_format as a working selector, got: {desc}"
+        );
     }
 }
 

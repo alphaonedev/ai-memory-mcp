@@ -1604,6 +1604,8 @@ mod d1_6_987_tests {
     /// fails the build rather than silently unpinning a tool.
     const DOCS_CORRECTIONS: &[&str] = &[
         "memory_archive_purge",
+        "memory_archive_restore",
+        "memory_calibrate_confidence",
         "memory_delete",
         "memory_entity_register",
         "memory_export_reflection",
@@ -1632,6 +1634,12 @@ mod d1_6_987_tests {
     /// written — not merely incomplete — earns an entry, and the replacement
     /// must stay within a few characters of the original.
     const DESCRIPTION_CORRECTIONS: &[&str] = &[
+        // output_format is advertised on the wire but read by no handler;
+        // the field description is stripped from tools/list (#3397). The
+        // short description was corrected so the FIRST sentence is the
+        // purpose (compact_description MAX=32 keeps that) and the second
+        // sentence discloses IGNORED; full disclosure lives in docs().
+        "memory_calibrate_confidence",
         // "archives first" is unconditional as written; archiving is
         // conditional on `archive_on_gc`, and with it off the sweep is a
         // permanent hard-delete + crypto-erase.
@@ -1899,5 +1907,43 @@ mod d1_6_987_tests {
                  the D1.6 allowed-diffs do NOT permit required-set changes"
             );
         }
+    }
+
+    /// #3397 — `output_format` is inert and its field description is
+    /// stripped from `tools/list`. compact_description MAX=32 keeps only
+    /// the first sentence of `description()`, so that sentence must be
+    /// the tool PURPOSE (≤32 bytes). The IGNORED disclosure lives in
+    /// `docs()` (verbose drilldown); wire-level survival of a trailing
+    /// caveat is #3378. Denied path: a compacted description that is
+    /// not the purpose, or docs() that omit the inert-field caveat.
+    #[test]
+    fn calibrate_tools_list_description_keeps_ignored_after_compact_3397() {
+        let defs = super::tool_definitions_for_profile(&crate::profile::Profile::full());
+        let tools = defs["tools"]
+            .as_array()
+            .expect("tools/list emits a tools array");
+        let cal = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("memory_calibrate_confidence"))
+            .expect("memory_calibrate_confidence is in the full profile");
+        let desc = cal
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("tools/list description present");
+        let desc_lc = desc.to_ascii_lowercase();
+        assert!(
+            desc_lc.contains("calibrate") && desc_lc.contains("confidence"),
+            "compacted tools/list description must carry the tool purpose, got: {desc:?}"
+        );
+        assert!(
+            desc.len() <= 32,
+            "tools/list description is compacted to ≤32 bytes, got len={} {desc:?}",
+            desc.len()
+        );
+        let docs = crate::mcp::calibrate_confidence::CalibrateConfidenceTool::docs();
+        assert!(
+            docs.contains("IGNORED") || docs.to_ascii_lowercase().contains("ignored"),
+            "docs() must keep the IGNORED disclosure, got: {docs}"
+        );
     }
 }
