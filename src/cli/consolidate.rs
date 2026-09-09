@@ -56,6 +56,7 @@ pub fn run(
         .collect();
     // #1590 — explicit --namespace > configured [storage].default_namespace
     // > git remote > cwd basename > "global" (see `cli::helpers`).
+    let requested_namespace = args.namespace.clone();
     let namespace = crate::cli::helpers::resolve_namespace(args.namespace);
     validate::validate_consolidate(&ids, &args.title, &args.summary, &namespace)?;
     // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
@@ -63,6 +64,28 @@ pub fn run(
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let consolidator_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    let caller = cli_agent_id
+        .map(str::to_owned)
+        .or_else(identity::resolve_read_visibility_caller);
+    // #3380: validate every source before any derivative write or tombstone.
+    for id in &ids {
+        let mem = db::get(&conn, id)?
+            .ok_or_else(|| anyhow::anyhow!(crate::errors::msg::memory_not_found(id)))?;
+        if !crate::visibility::is_readable_on_query(
+            &mem,
+            caller.as_deref(),
+            requested_namespace.as_deref(),
+        ) {
+            anyhow::bail!(crate::errors::msg::memory_not_found(id));
+        }
+        if caller
+            .as_deref()
+            .is_some_and(|c| !crate::visibility::caller_owns_for_mutation(&mem, c, false))
+        {
+            anyhow::bail!(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY);
+        }
+    }
+
     // #2121 — the CLI is a CALLER-origin authoring surface for the covenant
     // clause-1 gate (same posture as CLI `store` / `import`, whose writes are
     // insert-gated): never substrate-authored. Under
@@ -126,6 +149,10 @@ pub fn run_auto(
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let consolidator_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    let caller = cli_agent_id
+        .map(str::to_owned)
+        .or_else(identity::resolve_read_visibility_caller);
+
     let tier_filter = if args.short_only {
         Some(Tier::Short)
     } else {
@@ -157,6 +184,21 @@ pub fn run_auto(
             None,
             None, // #1834 valid_at (no as-of)
         )?;
+        // #3380: this discovery surface omits inaccessible and foreign-owned
+        // rows before grouping, including dry-run titles. Never infer an
+        // explicit substrate opt-in from an enumerated namespace.
+        let memories: Vec<_> = memories
+            .into_iter()
+            .filter(|mem| {
+                crate::visibility::is_readable_on_query(
+                    mem,
+                    caller.as_deref(),
+                    args.namespace.as_deref(),
+                ) && caller
+                    .as_deref()
+                    .is_none_or(|c| crate::visibility::caller_owns_for_mutation(mem, c, false))
+            })
+            .collect();
         if memories.len() < args.min_count {
             continue;
         }

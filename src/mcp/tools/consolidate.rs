@@ -22,43 +22,29 @@ use std::path::Path;
 /// back as `summary_preview` AND had her row tombstoned — on a row
 /// `memory_get` refuses him.
 ///
-/// The gate is the single CANONICAL mutation predicate
-/// [`crate::visibility::caller_owns_for_mutation`] (#1786) — the same one
-/// `memory_update` and `memory_delete` gate on, with `allow_inbox = false`
-/// mirroring `memory_update` / `PUT /memories/{id}`.
-///
-/// Consumability, NOT readability, is the right question here, and it is
-/// strictly the stronger one for this surface: a row owned by another agent is
-/// refused even when it is READABLE (a `collective`-scope or inbox row), which
-/// closes the summary leak; and the predicate keeps the #1786 legacy carve-out
-/// so an UNOWNED row — a pre-NHI corpus, or any row written before the caller
-/// stamp existed — stays consolidatable exactly as it stays updatable and
-/// deletable. An earlier draft of this fix ALSO required
-/// `is_visible_to_caller`, which looked safer but was strictly wrong: the
-/// conjunction refused unowned rows that both canonical predicates
-/// deliberately admit, silently stranding legacy corpora.
-///
-/// The refusal renders as the not-found message, identical to an absent id, so
-/// the surface is not a cross-tenant presence oracle (#1553 mask).
-///
-/// `caller == None` is the single-operator trust-all posture and is unchanged.
+/// Every source must pass the request-scoped read predicate before the
+/// mutation predicate (`allow_inbox = false`). Hidden and absent sources use
+/// the same not-found error. Readable foreign-owned sources are also refused.
+/// A missing caller retains the ordinary single-operator ownership posture;
+/// substrate reads still require an explicit namespace.
 fn resolve_consolidate_sources(
     conn: &rusqlite::Connection,
     ids: &[String],
     caller: Option<&str>,
+    requested_namespace: Option<&str>,
 ) -> Result<Vec<crate::models::Memory>, String> {
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         let row = db::get(conn, id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| crate::errors::msg::memory_not_found(id))?;
-        // The gate is CONSUMABILITY, and its refusal is rendered as the
-        // not-found message so the surface is not a presence oracle: a caller
-        // learns nothing about a row it may not consume.
+        if !crate::visibility::is_readable_on_query(&row, caller, requested_namespace) {
+            return Err(crate::errors::msg::memory_not_found(id));
+        }
         if let Some(c) = caller
             && !crate::visibility::caller_owns_for_mutation(&row, c, false)
         {
-            return Err(crate::errors::msg::memory_not_found(id));
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
         out.push(row);
     }
@@ -104,7 +90,7 @@ pub(super) fn handle_consolidate(
     // #3380 — CALLER-OWNS-SOURCE gate, before any model call and before any
     // write. Resolved once and reused for the LLM pairs below, so the rows the
     // gate admitted are exactly the rows the model sees.
-    let sources = resolve_consolidate_sources(conn, &ids, caller)?;
+    let sources = resolve_consolidate_sources(conn, &ids, caller, params["namespace"].as_str())?;
 
     // Auto-generate summary via LLM if not provided
     let summary: String = if let Some(s) = params["summary"].as_str() {
@@ -366,7 +352,7 @@ impl McpTool for ConsolidateTool {
         // are RETAINED, so `db::consolidate` writes navigable
         // `derived_from` edges from the merged row to each source and they
         // survive. Say which disposition each contract belongs to.
-        "Merge 2-100 sources into one long-tier memory; deletes sources; provenance in \
+        "Merge 2-100 sources into one long-tier memory; consumes sources; provenance in \
          metadata.derived_from + metadata.consolidated_from_agents (plus derived_from link rows \
          only when sources are tombstoned, not deleted). LLM auto-generates summary if omitted \
          (smart/autonomous tier)."
@@ -828,6 +814,99 @@ mod tests {
         db::insert(conn, &mem).expect("insert")
     }
 
+    #[test]
+    fn consolidate_read_and_owner_matrix_3380() {
+        let (conn, tmp) = fresh_db();
+        let own = seed_owned(&conn, "cn-3380-matrix", "owner", "ai:bob");
+        for (namespace, metadata, requested, expected) in [
+            (
+                "cn-3380-matrix",
+                json!({"agent_id": "ai:alice", "scope": "collective"}),
+                Some("cn-3380-matrix"),
+                "owner",
+            ),
+            (
+                "cn-3380-matrix",
+                json!({}),
+                Some("cn-3380-matrix"),
+                "hidden",
+            ),
+            (
+                "_agents",
+                json!({"agent_id": "ai:bob", "scope": "private"}),
+                None,
+                "hidden",
+            ),
+            (
+                "_agents",
+                json!({"agent_id": "ai:bob", "scope": "private"}),
+                Some("cn-3380-matrix"),
+                "hidden",
+            ),
+            (
+                "_messages/ai:bob",
+                json!({"agent_id": "ai:alice", "target_agent_id": "ai:bob", "scope": "private"}),
+                Some("_messages/ai:bob"),
+                "owner",
+            ),
+        ] {
+            let id = seed_owned(&conn, namespace, "matrix source", "ai:bob");
+            conn.execute(
+                "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+                rusqlite::params![metadata.to_string(), id],
+            )
+            .expect("fixture metadata");
+            for supplied in [false, true] {
+                let mut params = json!({"ids": [own, id], "title": "matrix consolidation"});
+                if let Some(ns) = requested {
+                    params["namespace"] = json!(ns);
+                }
+                if supplied {
+                    params["summary"] =
+                        json!("A summary long enough for consolidation validation.");
+                }
+                let before: Vec<(String, String)> = conn
+                    .prepare("SELECT id, lifecycle_state FROM memories ORDER BY id")
+                    .expect("snapshot")
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .expect("rows")
+                    .collect::<Result<_, _>>()
+                    .expect("snapshot rows");
+                let error = handle_consolidate(
+                    &conn,
+                    tmp.path(),
+                    &params,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("ai:bob"),
+                )
+                .expect_err("must refuse before summary or writes");
+                assert_eq!(
+                    error,
+                    if expected == "owner" {
+                        crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into()
+                    } else {
+                        crate::errors::msg::memory_not_found(&id)
+                    }
+                );
+                let after: Vec<(String, String)> = conn
+                    .prepare("SELECT id, lifecycle_state FROM memories ORDER BY id")
+                    .expect("snapshot")
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .expect("rows")
+                    .collect::<Result<_, _>>()
+                    .expect("snapshot rows");
+                assert_eq!(before, after, "no output or source disposition on refusal");
+            }
+        }
+        let a = seed_owned(&conn, "_agents", "explicit substrate a", "ai:bob");
+        let b = seed_owned(&conn, "_agents", "explicit substrate b", "ai:bob");
+        let response = handle_consolidate(&conn, tmp.path(), &json!({"ids": [a, b], "title": "explicit substrate", "namespace": "_agents", "summary": "An explicit substrate namespace permits owned sources."}), None, None, None, None, Some("ai:bob")).expect("explicit substrate owner");
+        assert_eq!(response["consolidated"], 2);
+    }
+
     /// v1.0.0 #3380 (DENIED direction) — a caller cannot consolidate a source
     /// they cannot read. Pre-fix `ai:bob` naming `ai:alice`'s `scope=private`
     /// id got her content back as the summary AND had her row tombstoned,
@@ -899,17 +978,7 @@ mod tests {
         assert_eq!(call(&absent), crate::errors::msg::memory_not_found(&absent));
     }
 
-    /// v1.0.0 #3380 (ALLOWED direction) — an UNOWNED legacy row stays
-    /// consolidatable. The #1786 mutation predicate deliberately admits rows
-    /// with no `metadata.agent_id` (pre-NHI corpora, and every row written by
-    /// the single-operator default), exactly as `memory_update` and
-    /// `memory_delete` admit them.
-    ///
-    /// This pins the correction to an earlier draft of this fix, which ALSO
-    /// required `is_visible_to_caller`: that conjunction looked safer but
-    /// refused unowned rows both canonical predicates admit, which would have
-    /// silently stranded legacy corpora on every surface — the HTTP webhook
-    /// parity suite seeds exactly such rows (`metadata = '{}'`).
+    /// Readable unowned legacy rows retain the mutation carve-out.
     #[test]
     fn consolidate_allows_unowned_legacy_source_3380() {
         let (conn, tmp) = fresh_db();
@@ -955,7 +1024,7 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({}),
+            metadata: json!({"scope": "collective"}),
             reflection_depth: 0,
             memory_kind: MemoryKind::Observation,
             entity_id: None,

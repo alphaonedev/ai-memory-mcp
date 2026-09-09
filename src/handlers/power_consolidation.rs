@@ -155,30 +155,38 @@ async fn resolve_consolidate_summary(
 /// neither branch applied an OWNERSHIP gate, so a non-owner consumed a
 /// victim's rows and read their content back through the summary.
 ///
-/// The gate is the single canonical mutation predicate
-/// [`crate::visibility::caller_owns_for_mutation`] (#1786), `allow_inbox =
-/// false`, mirroring `PUT /memories/{id}`. Consumability is the right question
-/// and the stronger one: a row owned by another agent is refused even when it
-/// is READABLE (collective scope, an inbox row), which is what closes the
-/// summary leak — while the #1786 legacy carve-out keeps an UNOWNED row
-/// consolidatable, exactly as it stays updatable and deletable. Requiring
-/// `is_visible_to_caller` as well would refuse unowned rows that both
-/// canonical predicates deliberately admit, stranding pre-NHI corpora.
-///
-/// A missing source and a source the caller may not consume BOTH surface as
-/// the same 400 naming the id, so neither backend is a cross-tenant presence
-/// oracle.
+/// Apply request-scoped readability before mutation ownership on both backends.
+/// Hidden and absent sources share a 404 not-found envelope, as on HTTP reads;
+/// readable foreign-owned rows return 403, matching the HTTP mutation contract.
 async fn gate_consolidate_sources(
     app: &AppState,
     ids: &[String],
     caller_principal: &str,
+    requested_namespace: Option<&str>,
 ) -> Result<Vec<Memory>, Response> {
     let not_found = |id: &str| -> Response {
         (
-            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
             Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
         )
             .into_response()
+    };
+    let check = |mem: &Memory| -> Result<(), Response> {
+        if !crate::visibility::is_readable_on_query(
+            mem,
+            Some(caller_principal),
+            requested_namespace,
+        ) {
+            return Err(not_found(&mem.id));
+        }
+        if !crate::visibility::caller_owns_for_mutation(mem, caller_principal, false) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY})),
+            )
+                .into_response());
+        }
+        Ok(())
     };
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
@@ -196,13 +204,7 @@ async fn gate_consolidate_sources(
         for id in ids {
             match app.store.get(&caller, id).await {
                 Ok(mem) => {
-                    // #3380 — the SAL `get` filter answers "may I READ it";
-                    // consuming it requires the canonical mutation predicate.
-                    // Rendered as the same 400 an absent id produces so the
-                    // surface is not a presence oracle.
-                    if !crate::visibility::caller_owns_for_mutation(&mem, caller_principal, false) {
-                        return Err(not_found(id));
-                    }
+                    check(&mem)?;
                     out.push(mem);
                 }
                 Err(crate::store::StoreError::NotFound { .. }) => return Err(not_found(id)),
@@ -228,17 +230,9 @@ async fn gate_consolidate_sources(
         match db::get(&lock.0, id) {
             // #3380 — caller-scoped read on the sqlite branch (the postgres
             // branch above rides the SAL #910 filter). A row that exists but
-            // is not visible masks to the SAME 400 an absent id produces.
+            // is not visible masks to the SAME 404 an absent id produces.
             Ok(Some(mem)) => {
-                if !crate::visibility::caller_owns_for_mutation(&mem, caller_principal, false) {
-                    tracing::warn!(
-                        target: "ai_memory::visibility",
-                        "consolidate source 400-masked: caller {caller_principal} may not \
-                         consume it (id={})",
-                        mem.id
-                    );
-                    return Err(not_found(id));
-                }
+                check(&mem)?;
                 out.push(mem);
             }
             Ok(None) => return Err(not_found(id)),
@@ -435,11 +429,17 @@ pub async fn consolidate_memories(
     // the victim's rows having performed no source read at all. Resolved once
     // here and reused for the model pairs below, so the rows the gate admitted
     // are exactly the rows the model sees and the merge consumes.
-    let consolidate_sources =
-        match gate_consolidate_sources(&app, &body.ids, &consolidate_caller_principal).await {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let consolidate_sources = match gate_consolidate_sources(
+        &app,
+        &body.ids,
+        &consolidate_caller_principal,
+        Some(&body.namespace),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let summary = match body.summary.clone() {
         Some(s) if !s.is_empty() => s,
         _ => {
