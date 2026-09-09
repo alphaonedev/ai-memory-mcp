@@ -6568,6 +6568,18 @@ pub fn lineage_dag_enabled() -> bool {
     LINEAGE_DAG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Test-only snapshot of BOTH lineage atomics, including the raw tombstone
+/// sub-flag (not AND-gated by the master). Used by
+/// [`crate::test_support::LineageDagIsolation`] to restore on drop (#3577).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn lineage_flags_snapshot() -> (bool, bool) {
+    (
+        LINEAGE_DAG.load(std::sync::atomic::Ordering::Relaxed),
+        CONSOLIDATE_TOMBSTONE_SOURCES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Seed the process-wide consolidate-tombstone-sources sub-flag (#1859).
 /// Called once at boot from
 /// [`ResolvedStorage::consolidate_tombstone_sources`].

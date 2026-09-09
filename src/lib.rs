@@ -867,9 +867,9 @@ pub mod mcp;
 pub mod metrics;
 pub mod mine;
 pub mod models;
-/// Crate-internal, test-only environment-isolation helpers (process-wide env
-/// lock + snapshot/restore `EnvGuard`) shared by every unit-test module that
-/// mutates process-global env vars — one guard, one lock (#3301, #2905 class).
+/// Crate-internal, test-only isolation helpers: process-wide env lock +
+/// snapshot/restore `EnvGuard` (#3301, #2905 class) and `LineageDagIsolation`
+/// for the process-global `LINEAGE_DAG` atomic (#3577).
 #[cfg(test)]
 mod test_support;
 // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator. Batman

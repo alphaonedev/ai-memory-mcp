@@ -373,6 +373,7 @@ mod tests {
 
     #[test]
     fn list_dependents_returns_inbound_reflects_on_only() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let conn = fresh_conn();
         // R1 (reflection) is the target of two reflects_on edges and one
         // related_to edge. Only the reflects_on rows should surface.
@@ -398,6 +399,7 @@ mod tests {
 
     #[test]
     fn propagate_writes_one_notification_per_dependent() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let conn = fresh_conn();
         let r1 = make_mem("R1", "ns-a", MemoryKind::Reflection);
         let r2 = make_mem("R2", "ns-a", MemoryKind::Reflection);
@@ -437,6 +439,7 @@ mod tests {
 
     #[test]
     fn propagate_records_signed_events_row_per_notification() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let conn = fresh_conn();
         let r1 = make_mem("R1", "ns-a", MemoryKind::Reflection);
         let r2 = make_mem("R2", "ns-a", MemoryKind::Reflection);
@@ -481,6 +484,7 @@ mod tests {
 
     #[test]
     fn metadata_carries_all_four_required_fields() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let conn = fresh_conn();
         let r1 = make_mem("R1", "ns-a", MemoryKind::Reflection);
         let r2 = make_mem("R2", "ns-a", MemoryKind::Reflection);

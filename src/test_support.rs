@@ -124,9 +124,138 @@ impl Drop for EnvGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #3577 — process-global LINEAGE_DAG / CONSOLIDATE_TOMBSTONE_SOURCES funnel
+// ---------------------------------------------------------------------------
+
+/// Process-wide lock serialising every test that reads or writes the
+/// lineage-DAG atomics (`LINEAGE_DAG`, `CONSOLIDATE_TOMBSTONE_SOURCES`).
+///
+/// Distinct from [`env_lock`]: these are `AtomicBool`s, not environment
+/// variables. Folding into the env mutex would deadlock any test that
+/// already holds `env_lock` (std `Mutex` is not reentrant —
+/// rust-1.98 CONCURRENCY-04) once #3539 also takes that lock on
+/// daemon-boot tests. A poisoned lock is recovered rather than
+/// propagated (CONCURRENCY-18): a panic in one seeder must not wedge
+/// the readers, and [`LineageDagIsolation`]'s `Drop` already restored
+/// the atomics on the way out.
+fn lineage_dag_mutex() -> &'static Mutex<()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    &LOCK
+}
+
+fn lineage_dag_lock() -> MutexGuard<'static, ()> {
+    lineage_dag_mutex()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Snapshot+restore guard for the process-global lineage-DAG flags.
+///
+/// Hold this for the whole seeder body; [`set_lineage_dag`] /
+/// [`set_consolidate_tombstone_sources`] are reachable from `cfg(test)`
+/// code only through the methods on this guard (ERRORS-09, enforced by
+/// `scripts/check-test-env-lock.sh` arm (f)). `Drop` restores the
+/// pre-guard values even on panic (OWNERSHIP-24; Drop is infallible —
+/// OWNERSHIP-25).
+#[must_use]
+pub(crate) struct LineageDagIsolation {
+    _lock: MutexGuard<'static, ()>,
+    prev_dag: bool,
+    prev_tombstone: bool,
+}
+
+impl LineageDagIsolation {
+    /// Acquire the funnel and snapshot the current flags. Does not
+    /// change them — seeders call [`set_lineage_dag`] /
+    /// [`set_consolidate_tombstone_sources`] next; readers use
+    /// [`no_lineage_dag_guard`] which asserts OFF.
+    pub(crate) fn new() -> Self {
+        let lock = lineage_dag_lock();
+        let (prev_dag, prev_tombstone) = crate::config::lineage_flags_snapshot();
+        Self {
+            _lock: lock,
+            prev_dag,
+            prev_tombstone,
+        }
+    }
+
+    /// Seed the master flag. The caller must hold this guard; the
+    /// script gate forbids a bare `config::set_lineage_dag(` outside this
+    /// module and `daemon_runtime.rs` (the production boot seed).
+    pub(crate) fn set_lineage_dag(&self, enabled: bool) {
+        let _held = &self._lock;
+        crate::config::set_lineage_dag(enabled);
+    }
+
+    /// Seed the tombstone sub-flag. Same funnel as [`Self::set_lineage_dag`].
+    pub(crate) fn set_consolidate_tombstone_sources(&self, enabled: bool) {
+        let _held = &self._lock;
+        crate::config::set_consolidate_tombstone_sources(enabled);
+    }
+
+    /// Write the snapshotted flags back. [`Drop`] calls this
+    /// (OWNERSHIP-24); tests call it while still holding the funnel so
+    /// the assertion cannot race a sibling seeder after lock release
+    /// (CONCURRENCY-03). Infallible (OWNERSHIP-25).
+    fn restore_flags(&self) {
+        let _held = &self._lock;
+        crate::config::set_lineage_dag(self.prev_dag);
+        crate::config::set_consolidate_tombstone_sources(self.prev_tombstone);
+    }
+}
+
+/// Pinned RFC3339 stamps for cycle-test fixtures so Pass 0
+/// (`lineage_edge_is_forward`) sees a strict newer→older pre-seed even
+/// when two inserts would otherwise share one `Utc::now()` tick.
+pub(crate) const LINEAGE_FIXTURE_OLDER_AT: &str = "2026-01-01T00:00:00+00:00";
+/// Newer sibling of [`LINEAGE_FIXTURE_OLDER_AT`].
+pub(crate) const LINEAGE_FIXTURE_NEWER_AT: &str = "2026-03-01T00:00:00+00:00";
+
+/// Seeder funnel that simulates the production boot seed (`lineage_dag`
+/// compiled default ON, tombstone sub-flag tracking it). Lib-test
+/// `bootstrap_serve` skips the real seed (`#[cfg(not(test))]`); daemon-boot
+/// tests must opt in through this helper so a leaked ON restores on drop.
+#[must_use]
+pub(crate) fn simulate_production_lineage_seed() -> LineageDagIsolation {
+    let g = LineageDagIsolation::new();
+    g.set_lineage_dag(true);
+    g.set_consolidate_tombstone_sources(true);
+    g
+}
+
+impl Drop for LineageDagIsolation {
+    fn drop(&mut self) {
+        self.restore_flags();
+    }
+}
+
+/// Reader-side funnel: hold the lock and assert `LINEAGE_DAG` is OFF.
+///
+/// Every lib test that writes a lineage relation (`reflects_on` /
+/// `derived_from` / `derives_from`) must hold this for the whole body
+/// so a concurrent seeder cannot flip the flag mid-write. If a seeder
+/// leaked `true` (the pre-#3577 `FLAG_LOCK`-only restore), this
+/// asserts loudly instead of failing later inside `create_link` as a
+/// flake.
+#[must_use]
+pub(crate) fn no_lineage_dag_guard() -> LineageDagIsolation {
+    let g = LineageDagIsolation::new();
+    assert!(
+        !crate::config::lineage_dag_enabled(),
+        "#3577: LINEAGE_DAG must be OFF for this reader; a seeder leaked \
+         the process-global flag (seeders hold LineageDagIsolation and \
+         restore on drop)"
+    );
+    g
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EnvGuard, env_lock, env_mutex};
+    use super::{
+        EnvGuard, LineageDagIsolation, env_lock, env_mutex, lineage_dag_mutex,
+        no_lineage_dag_guard, simulate_production_lineage_seed,
+    };
 
     /// #3523 — the OBSERVED singleton pin: `test_support::env_lock()` and
     /// `config::test_env_lock()` are ONE mutex, not two.
@@ -185,6 +314,81 @@ mod tests {
         assert!(
             std::env::var_os(KEY).is_none(),
             "#3523: `EnvGuard` must restore the ABSENT pre-guard state on drop"
+        );
+    }
+
+    /// #3577 — `LineageDagIsolation` restores BOTH flags on drop,
+    /// including the "was false" case a seeder must not leak.
+    ///
+    /// Snapshot, mutate, and restore MUST all run while this guard
+    /// holds the funnel. A process-global read before `new()` or after
+    /// `Drop` races sibling seeders: the 20:43Z battery saw
+    /// `before=(true,true)` from
+    /// `sqlite_finalize_and_disposition_tombstone_disposition` and
+    /// `after=(false,false)` from this guard's captured prev. std
+    /// `Mutex` is not reentrant (CONCURRENCY-04), so we cannot take
+    /// the lock and then construct a second `LineageDagIsolation`.
+    /// `restore_flags` is what `Drop` calls; asserting under the same
+    /// hold proves the write-back without a lock-release window.
+    #[test]
+    fn lineage_dag_isolation_restores_pre_guard_state_3577() {
+        let g = LineageDagIsolation::new();
+        let before = (g.prev_dag, g.prev_tombstone);
+        g.set_lineage_dag(!before.0);
+        g.set_consolidate_tombstone_sources(!before.1);
+        assert_eq!(
+            crate::config::lineage_flags_snapshot(),
+            (!before.0, !before.1)
+        );
+        g.restore_flags();
+        assert_eq!(
+            crate::config::lineage_flags_snapshot(),
+            before,
+            "#3577: LineageDagIsolation must restore both flags on drop"
+        );
+    }
+
+    /// #3577 — the OBSERVED singleton: holding the isolation guard, a
+    /// probe thread must fail to acquire the same mutex.
+    #[test]
+    fn lineage_dag_isolation_serialises_probe_thread_3577() {
+        let _held = LineageDagIsolation::new();
+        let probe_acquired = std::thread::spawn(|| lineage_dag_mutex().try_lock().is_ok())
+            .join()
+            .expect("probe thread must not panic");
+        assert!(
+            !probe_acquired,
+            "#3577: a probe thread acquired the lineage-DAG mutex while \
+             LineageDagIsolation was held"
+        );
+    }
+
+    /// #3577 — the reader funnel succeeds when the flag is OFF (the
+    /// unseeded atomic default). The loud assert-on-true path is the
+    /// same `assert!` the seeder-leak message names; exercising it
+    /// here would require leaking `true` without holding the lock,
+    /// which is the defect this funnel exists to close.
+    #[test]
+    fn no_lineage_dag_guard_holds_when_off_3577() {
+        let _g = no_lineage_dag_guard();
+        assert!(!crate::config::lineage_dag_enabled());
+    }
+
+    /// #3577 — production-boot simulation restores BOTH flags on drop
+    /// even when it flipped them ON for the seeder body. Same lock-hold
+    /// as [`lineage_dag_isolation_restores_pre_guard_state_3577`]: no
+    /// unlocked before/after snapshot.
+    #[test]
+    fn simulate_production_lineage_seed_restores_pre_guard_state_3577() {
+        let g = simulate_production_lineage_seed();
+        let before = (g.prev_dag, g.prev_tombstone);
+        assert!(crate::config::lineage_dag_enabled());
+        assert!(crate::config::consolidate_tombstone_sources_enabled());
+        g.restore_flags();
+        assert_eq!(
+            crate::config::lineage_flags_snapshot(),
+            before,
+            "#3577: simulate_production_lineage_seed must restore both flags on drop"
         );
     }
 }

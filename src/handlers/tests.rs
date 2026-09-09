@@ -1940,12 +1940,14 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
     override_active_permissions_mode_for_test(PermissionsMode::Off);
 
     let state = test_state();
-    let now = Utc::now().to_rfc3339();
     // Seed two memories on the receiver and a pre-existing
     // a --reflects_on--> b chain so a fresh b --reflects_on--> a
-    // would close the cycle.
+    // would close the cycle. #3577 — pin created_at (newer→older pre-seed)
+    // and take the lineage std mutex only after the tokio DB lock
+    // (CONCURRENCY-20).
     let (a_id, b_id) = {
         let lock = state.lock().await;
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let a = Memory {
             cid: None,
             valid_from: None,
@@ -1960,8 +1962,8 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
             confidence: 1.0,
             source: "api".into(),
             access_count: 0,
-            created_at: now.clone(),
-            updated_at: now.clone(),
+            created_at: crate::test_support::LINEAGE_FIXTURE_NEWER_AT.into(),
+            updated_at: crate::test_support::LINEAGE_FIXTURE_NEWER_AT.into(),
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({}),
@@ -1993,8 +1995,8 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
             confidence: 1.0,
             source: "api".into(),
             access_count: 0,
-            created_at: now.clone(),
-            updated_at: now.clone(),
+            created_at: crate::test_support::LINEAGE_FIXTURE_OLDER_AT.into(),
+            updated_at: crate::test_support::LINEAGE_FIXTURE_OLDER_AT.into(),
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({}),
@@ -2019,6 +2021,8 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
         .with_state(test_app_state(state.clone()));
+    // Link-row stamp only (Pass 0 compares memory `created_at`, pinned above).
+    let now = chrono::Utc::now().to_rfc3339();
     let body = serde_json::json!({
         "sender_agent_id": "peer-alice",
         "sender_clock": {"entries": {}},
@@ -5857,11 +5861,12 @@ async fn seed_lineage_pair() -> (Db, String, String) {
     };
     let (a, r) = {
         let lock = state.lock().await;
+        let _lineage = crate::test_support::no_lineage_dag_guard();
         let a = db::insert(
             &lock.0,
             &mk(
                 "lineage-a",
-                "2026-01-01T00:00:00+00:00",
+                crate::test_support::LINEAGE_FIXTURE_OLDER_AT,
                 serde_json::json!({}),
             ),
         )
@@ -5870,7 +5875,7 @@ async fn seed_lineage_pair() -> (Db, String, String) {
             &lock.0,
             &mk(
                 "lineage-r",
-                "2026-03-01T00:00:00+00:00",
+                crate::test_support::LINEAGE_FIXTURE_NEWER_AT,
                 serde_json::json!({}),
             ),
         )
@@ -6097,8 +6102,7 @@ async fn http_lineage_tombstoned_root_conserved_for_owner_refused_for_stranger_3
     //   * the OWNER keeps access to their own tombstoned root's conserved
     //     lineage (200), the #3270 stated intent.
     let state = test_state();
-    let now = "2026-03-01T00:00:00+00:00";
-    let mk = |title: &str, meta: serde_json::Value| Memory {
+    let mk = |title: &str, at: &str, meta: serde_json::Value| Memory {
         cid: None,
         valid_from: None,
         valid_until: None,
@@ -6112,8 +6116,8 @@ async fn http_lineage_tombstoned_root_conserved_for_owner_refused_for_stranger_3
         confidence: 1.0,
         source: "test".into(),
         access_count: 0,
-        created_at: now.into(),
-        updated_at: now.into(),
+        created_at: at.into(),
+        updated_at: at.into(),
         last_accessed_at: None,
         expires_at: None,
         metadata: meta,
@@ -6133,8 +6137,25 @@ async fn http_lineage_tombstoned_root_conserved_for_owner_refused_for_stranger_3
     let owner_meta = serde_json::json!({"agent_id": "ai:owner", "scope": "private"});
     let (root, ancestor) = {
         let lock = state.lock().await;
-        let a = db::insert(&lock.0, &mk("tomb-ancestor", owner_meta.clone())).unwrap();
-        let r = db::insert(&lock.0, &mk("tomb-root", owner_meta.clone())).unwrap();
+        let _lineage = crate::test_support::no_lineage_dag_guard();
+        let a = db::insert(
+            &lock.0,
+            &mk(
+                "tomb-ancestor",
+                crate::test_support::LINEAGE_FIXTURE_OLDER_AT,
+                owner_meta.clone(),
+            ),
+        )
+        .unwrap();
+        let r = db::insert(
+            &lock.0,
+            &mk(
+                "tomb-root",
+                crate::test_support::LINEAGE_FIXTURE_NEWER_AT,
+                owner_meta.clone(),
+            ),
+        )
+        .unwrap();
         db::create_link(&lock.0, &r, &a, "reflects_on").unwrap();
         // Logically delete the root: `db::get` now hides it, `db::get_any`
         // does not — exactly the #3235 condition that made the gate skippable.
@@ -12815,14 +12836,62 @@ async fn http_create_link_refuses_cycle() {
     override_active_permissions_mode_for_test(PermissionsMode::Off);
 
     let state = test_state();
-    let a = insert_test_memory(&state, "a3-http-cycle", "a").await;
-    let b = insert_test_memory(&state, "a3-http-cycle", "b").await;
-    // Pre-seed a --reflects_on--> b so b --reflects_on--> a would
-    // close the cycle.
-    {
+    // #3577 — pin created_at so the pre-seed is strictly newer→older
+    // (Pass 0 admits it whether LINEAGE_DAG is on or off). CONCURRENCY-20:
+    // take the tokio DB lock first, then the lineage std mutex, and do
+    // not .await while the std guard is live.
+    // The HTTP write is then b --reflects_on--> a: Pass 0 refuses when
+    // the flag is on (older→newer); Pass 1 refuses when it is off
+    // (cycle). Both envelopes are `LINK_CYCLE_ERR_PREFIX`.
+    let (a, b) = {
         let lock = state.lock().await;
-        db::create_link(&lock.0, &a, &b, "reflects_on").unwrap();
-    }
+        let _lineage = crate::test_support::no_lineage_dag_guard();
+        let mk = |title: &str, at: &str| Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "a3-http-cycle".into(),
+            title: title.into(),
+            content: format!("content for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: at.into(),
+            updated_at: at.into(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({"scope": "collective"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let b = db::insert(
+            &lock.0,
+            &mk("b", crate::test_support::LINEAGE_FIXTURE_OLDER_AT),
+        )
+        .unwrap();
+        let a = db::insert(
+            &lock.0,
+            &mk("a", crate::test_support::LINEAGE_FIXTURE_NEWER_AT),
+        )
+        .unwrap();
+        db::create_link(&lock.0, &a, &b, "reflects_on")
+            .expect("pre-seed newer→older reflects_on must be admitted");
+        (a, b)
+    };
     let app = Router::new()
         .route("/api/v1/links", axum_post(create_link))
         .with_state(test_app_state(state));
