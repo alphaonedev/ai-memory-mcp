@@ -451,6 +451,20 @@ fn reset_db_passphrase_for_tests() {
 /// seeding test cannot poison later store-open tests in the same
 /// process. Production has no equivalent: [`OnceLock`] is
 /// never-clearable. Drop is infallible (OWNERSHIP-25).
+///
+/// # #3539 — reset is not exclusion
+///
+/// Clearing on enter and on drop bounds the seed to one test body but
+/// excludes NO ONE: [`refuse_at_rest_requested_without_sqlcipher`] runs on
+/// EVERY sqlite open and reads this same process-global slot, so any
+/// concurrently-running lib test that opened a plain sqlite store inside a
+/// live seed window took the sqlcipher refusal (`macos-fed,sqlite`,
+/// 2026-09-08 — the #3517/#3523 defect class with the passphrase slot as the
+/// process-global). [`Self::enter`] therefore now REQUIRES a borrow of
+/// [`crate::test_support::PassphraseEnvIsolation`], the crate-wide passphrase
+/// window: seeding the slot without holding the shared env mutex is no longer
+/// expressible (ERRORS-09), and the readers enter the same window through
+/// [`crate::test_support::no_passphrase_guard`].
 #[cfg(test)]
 #[must_use = "dropping this guard resets the test passphrase slot"]
 pub(crate) struct DbPassphraseGuard {
@@ -459,7 +473,14 @@ pub(crate) struct DbPassphraseGuard {
 
 #[cfg(test)]
 impl DbPassphraseGuard {
-    pub(crate) fn enter() -> Self {
+    /// Clear the slot and hold it cleared until drop.
+    ///
+    /// `_iso` is unused at runtime: it is a compile-time WITNESS that the
+    /// caller holds the crate-wide passphrase window, so no seeder can race a
+    /// plain-sqlite open (#3539). Take the isolation ONCE per test body and
+    /// pass it by reference — [`crate::test_support::env_lock`] is a
+    /// `std::sync::Mutex` and is not re-entrant.
+    pub(crate) fn enter(_iso: &crate::test_support::PassphraseEnvIsolation) -> Self {
         reset_db_passphrase_for_tests();
         Self { _private: () }
     }
@@ -1638,11 +1659,11 @@ mod tests {
     #[cfg(not(feature = "sqlcipher"))]
     #[test]
     fn db_passphrase_test_reset_does_not_poison_later_open_b11() {
-        let _lock = crate::test_support::env_lock();
-        let env_g = crate::test_support::EnvGuard::capture(ENV_DB_PASSPHRASE);
-        env_g.unset();
+        // #3539 — ONE window for the whole body: the env var stays cleared
+        // and no other test can open sqlite while the seed below is live.
+        let iso = crate::test_support::PassphraseEnvIsolation::enter();
         {
-            let _pass = DbPassphraseGuard::enter();
+            let _pass = DbPassphraseGuard::enter(&iso);
             set_db_passphrase("b11-poison-probe".into()).expect("first seed");
             assert!(
                 passphrase_requested(),
