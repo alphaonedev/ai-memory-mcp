@@ -1469,6 +1469,15 @@ two coordination paths are exposed over HTTP; the rest of the
 coordination toolset (action CRUD, leases, checkpoints, routines) is
 MCP-only.
 
+`memory_routine_run` admits only the routine owner when a caller identity is
+enforced (#3506). An owner mismatch refuses before run, audit, action, edge or
+quota writes; an ownerless legacy row refuses with `ROUTINE_OWNER_UNKNOWN`.
+Both SAL backends enforce the authenticated `CallerContext.agent_id`, without
+an `as_agent` or admin visibility exemption. MCP/local execution without an
+enforced caller retains the single-operator identity ladder. Run metadata
+`agent_id`, action attribution, audit actor and storage charges use the resolved
+caller. Delegated routine execution is deferred to #3576.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/v1/actions/{id}/transition` | Coordination action-state transition (`handlers::transition_action`) — local CAS write + W-of-N federation fanout. MCP: `memory_action_transition`. |

@@ -6,6 +6,37 @@
 use crate::models::{Action, ActionState, EdgeType, Routine};
 use serde_json::{Value, json};
 
+/// An ownerless legacy routine cannot be admitted for an enforced caller.
+pub const ROUTINE_OWNER_UNKNOWN: &str = "ROUTINE_OWNER_UNKNOWN";
+
+/// Resolve owner-only run admission before any run, audit, DAG or quota write.
+/// SAL supplies its authenticated `agent_id`; `as_agent` and admin visibility
+/// bypasses do not grant execution. An absent caller retains the MCP/local
+/// single-operator identity ladder (#3506, ERRORS-09).
+///
+/// # Errors
+/// Refuses unknown owners under an enforced caller, invalid identities and
+/// caller/owner mismatches using the existing governance-subject contract.
+pub(crate) fn authorize_run(owner: &str, caller: Option<&str>) -> anyhow::Result<String> {
+    let enforced = crate::identity::resolve_mcp_read_visibility_caller()?;
+    if owner.is_empty() && (enforced.is_some() || caller.is_some()) {
+        anyhow::bail!(ROUTINE_OWNER_UNKNOWN);
+    }
+    let actor = crate::identity::resolve_governance_subject(Some(owner), None, "run routine")?;
+    if let Some(caller) = caller {
+        crate::validate::validate_agent_id(caller)?;
+        let caller =
+            crate::identity::resolve_governance_subject(Some(caller), None, "run routine")?;
+        if caller != actor {
+            anyhow::bail!(
+                "agent_id mismatch: caller '{caller}' may only run routine as itself \
+                 (requested '{actor}')"
+            );
+        }
+    }
+    Ok(actor)
+}
+
 pub(crate) struct Materialization {
     pub actions: Vec<Action>,
     pub edges: Vec<(String, String, EdgeType)>,
@@ -121,7 +152,9 @@ pub(crate) fn plan(
     routine: &Routine,
     arguments: &Value,
     now: i64,
+    caller: Option<&str>,
 ) -> Result<Materialization, String> {
+    let actor = authorize_run(&routine.created_by, caller).map_err(|e| e.to_string())?;
     if routine.state != crate::models::RoutineState::Frozen {
         return Err(crate::routines::ROUTINE_NOT_FROZEN.to_string());
     }
@@ -202,7 +235,7 @@ pub(crate) fn plan(
                 title,
                 payload,
                 priority,
-                agent_id: Some(routine.created_by.clone()),
+                agent_id: Some(actor.clone()),
                 claimed_by: None,
                 vector_clock: json!({}),
                 metadata: spec_obj
@@ -275,7 +308,17 @@ pub fn materialize_template(
     arguments: &Value,
     now: i64,
 ) -> Result<Vec<String>, String> {
-    let plan = plan(routine, arguments, now)?;
+    materialize_template_for_caller(conn, routine, arguments, now, None)
+}
+
+pub(crate) fn materialize_template_for_caller(
+    conn: &rusqlite::Connection,
+    routine: &Routine,
+    arguments: &Value,
+    now: i64,
+    caller: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let plan = plan(routine, arguments, now, caller)?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut ids = Vec::with_capacity(plan.actions.len());
     for action in plan.actions {

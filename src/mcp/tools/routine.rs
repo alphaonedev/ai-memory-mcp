@@ -206,6 +206,9 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         return Err(crate::routines::ROUTINE_NOT_FROZEN.to_string());
     }
 
+    let actor = crate::routines::materialization::authorize_run(&routine.created_by, None)
+        .map_err(|e| e.to_string())?;
+
     // (2) Insert the run row in the Running state before materialising.
     let now = chrono::Utc::now().timestamp();
     let run = RoutineRun {
@@ -218,19 +221,18 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         started_at: now,
         finished_at: None,
         error: None,
-        metadata: json!({}),
+        metadata: json!({"agent_id": actor}),
     };
     let run_id = crate::routines::run_insert(conn, &run).map_err(|e| e.to_string())?;
 
     // #1722 — coordination observability: best-effort audit row for the run,
-    // attributed to the routine's owning agent (`created_by`, "" when
-    // unspecified) since the run materialises actions under that principal.
+    // attributed to the admitted caller, also used for actions and quota.
     // Identity = routine id / run id / "run". Emitted once the run row is
     // recorded (it persists in both the failed and completed paths below).
     crate::coordination_audit::emit(
         conn,
         crate::coordination_audit::ROUTINE_RUN,
-        &routine.created_by,
+        &actor,
         &[routine_id, &run_id, "run"],
     );
 

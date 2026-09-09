@@ -29896,12 +29896,12 @@ impl MemoryStore for PostgresStore {
 
     async fn routine_materialize(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         routine_id: &str,
         arguments: &serde_json::Value,
     ) -> StoreResult<Vec<String>> {
         self.gate_record_stop().await?;
-        self.materialize_routine(routine_id, arguments).await
+        self.materialize_routine(ctx, routine_id, arguments).await
     }
 
     async fn routine_run_create(

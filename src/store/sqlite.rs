@@ -2653,7 +2653,7 @@ impl MemoryStore for SqliteStore {
 
     async fn routine_materialize(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         routine_id: &str,
         arguments: &serde_json::Value,
     ) -> StoreResult<Vec<String>> {
@@ -2665,11 +2665,12 @@ impl MemoryStore for SqliteStore {
         if routine.state != crate::models::RoutineState::Frozen {
             return Err(box_err(crate::routines::ROUTINE_NOT_FROZEN));
         }
-        crate::routines::materialization::materialize_template(
+        crate::routines::materialization::materialize_template_for_caller(
             &conn,
             &routine,
             arguments,
             chrono::Utc::now().timestamp(),
+            Some(&ctx.agent_id),
         )
         .map_err(box_err)
     }
