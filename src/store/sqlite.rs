@@ -3381,10 +3381,7 @@ impl MemoryStore for SqliteStore {
         // path-length). Fail-closed: a node that cannot be resolved
         // (deleted mid-traversal, or in a namespace this caller can
         // never read) drops every path that touches it.
-        if ctx.bypass_visibility {
-            return Ok(paths);
-        }
-        let caller = ctx.effective_principal();
+        let caller = (!ctx.bypass_visibility).then(|| ctx.effective_principal());
         let mut visible_cache: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let mut filtered: Vec<Vec<String>> = Vec::with_capacity(paths.len());
@@ -3392,7 +3389,9 @@ impl MemoryStore for SqliteStore {
             for node in &path {
                 let entry = visible_cache.entry(node.clone()).or_insert_with(|| {
                     match db::get(&conn, node) {
-                        Ok(Some(mem)) => is_visible_to_caller(&mem, caller),
+                        Ok(Some(mem)) => {
+                            crate::visibility::is_readable_on_query(&mem, caller, None)
+                        }
                         // Fail-closed: missing node ⇒ drop the path.
                         Ok(None) | Err(_) => false,
                     }

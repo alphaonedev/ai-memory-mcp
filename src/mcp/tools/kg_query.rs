@@ -81,6 +81,8 @@ impl McpTool for KgQueryTool {
 // duplicating business logic. Wire envelope is byte-equal across MCP /
 // HTTP / CLI.
 pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let caller = crate::identity::resolve_read_visibility_caller();
+    let caller = caller.as_deref();
     // v0.7.0 Provenance Gap 6 (#889) — reciprocal "subgraph rooted at
     // every memory sharing source_uri" entrypoint. When
     // `by_source_uri` is supplied, every memory carrying that URI is
@@ -112,10 +114,9 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
         // DISTINCT from the `as_agent` namespace) and thread it to the
         // owner-keyed `visibility_clause` private arm. `None` = fail-
         // closed (no private rows reach an unidentified caller).
-        let caller = crate::identity::resolve_read_visibility_caller();
-        let roots =
-            db::list_by_source_uri(conn, uri, namespace, limit, as_agent, caller.as_deref())
-                .map_err(|e| e.to_string())?;
+        let mut roots = db::list_by_source_uri(conn, uri, namespace, limit, as_agent, caller)
+            .map_err(|e| e.to_string())?;
+        roots.retain(|m| crate::visibility::is_readable_on_query(m, caller, namespace));
         let memories_json: Vec<Value> = roots
             .iter()
             .map(|m| {
@@ -187,27 +188,18 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
     )
     .map_err(|e| e.to_string())?;
 
-    // #1935 (CWE-863) — visibility filter, mirroring the HTTP twin at
-    // `src/handlers/kg.rs`. `db::kg_query` returns each reachable node's
-    // title + namespace with NO per-caller gate; because links can be forged
-    // to targets the caller cannot see (#1929), an attacker-rooted walk could
-    // otherwise disclose the titles/namespaces/graph-structure of linked
-    // PRIVATE memories. Keyed on the ENFORCED-read caller (env-only) so it
-    // fires ONLY when `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); the
-    // single-operator trust-all default returns the full topology
-    // byte-unchanged. Nodes the caller cannot see (or that can't be fetched)
-    // are DROPPED — fail closed.
-    let nodes: Vec<_> = if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
-        nodes
-            .into_iter()
-            .filter(|n| match db::get(conn, &n.target_id) {
-                Ok(Some(mem)) => crate::visibility::is_visible_to_caller(&mem, &caller),
+    // #3498: apply the query predicate even without a caller. Every hop is
+    // checked because the serialized path exposes intermediate IDs too.
+    let namespace = params["namespace"].as_str();
+    let nodes: Vec<_> = nodes
+        .into_iter()
+        .filter(|n| {
+            n.path.split("->").all(|id| match db::get(conn, id) {
+                Ok(Some(mem)) => crate::visibility::is_readable_on_query(&mem, caller, namespace),
                 _ => false,
             })
-            .collect()
-    } else {
-        nodes
-    };
+        })
+        .collect();
 
     let memories_json: Vec<Value> = nodes
         .iter()

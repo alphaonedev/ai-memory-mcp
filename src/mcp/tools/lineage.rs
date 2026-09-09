@@ -82,24 +82,12 @@ pub fn handle_lineage(
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
 
-    // #1800 discipline — when a visibility caller is resolved, gate on the
-    // ROOT memory's ownership: if the root row exists and is not visible to
-    // the caller, refuse rather than leak its provenance neighborhood. A
-    // `None` caller (single-tenant trust-all) or a missing root proceeds
-    // unchanged (mirrors `handle_find_paths`).
-    //
-    // v1.0.0 #3270 — the gate is TOTAL over `Result<Option<Memory>>`, read
-    // through the UNFILTERED `db::get_any`. #3235 made the recall-visible
-    // `db::get` return `Ok(None)` for hidden (tombstoned / quarantined)
-    // rows; the old `if let Ok(Some(mem))` chain then short-circuited on that
-    // `None` and SKIPPED the gate for exactly the hidden rows, so a non-owner
-    // walked their conserved ancestry. Reading unfiltered means a hidden row
-    // is still owner-checked (non-owner refused; the owner keeps access to
-    // their own tombstoned root's lineage). A lookup error fails closed
-    // (ERRORS-19) rather than folding into ALLOW.
-    if let Some(caller) = caller {
+    // #3498: an ID anchor does not opt into substrate reads, even in the
+    // single-tenant posture. Use the unfiltered row so hidden lifecycle states
+    // cannot skip the source check (#3270); lookup failures fail closed.
+    {
         match db::get_any(conn, id) {
-            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, caller) => {
+            Ok(Some(mem)) if !crate::visibility::is_readable_on_query(&mem, caller, None) => {
                 return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
             }
             // Visible row (incl. the owner's own hidden root) or a genuinely
@@ -134,6 +122,14 @@ pub fn handle_lineage(
     // kg_query/find_paths convention) so callers can tell "you asked for
     // too much" from a real fault.
     .map_err(|e| e.to_string())?;
+
+    let nodes: Vec<_> = nodes
+        .into_iter()
+        .filter(|node| {
+            matches!(db::get_any(conn, &node.id), Ok(Some(mem))
+            if crate::visibility::is_readable_on_query(&mem, caller, None))
+        })
+        .collect();
 
     // v1.0.0 R20 (#1958) — surface the root's read-time min-propagated trust
     // tier: min(own attest_level, all recorded ancestors' attest_levels) over

@@ -357,9 +357,8 @@ pub fn handle_load_family(
     // the postgres `load_family_handler` escalation: filter, and when the
     // visible set is short of `k`, re-ask at the historical `LIST_MAX_LIMIT`
     // window and re-filter so both backends return the same rows up to `k`.
-    // `caller == None` is the single-tenant trust-all posture where the SQL
-    // `LIMIT k` is already exact. `count` tracks the filtered set so the wire
-    // count stays honest.
+    // #3498: substrate filtering also applies without a caller, so escalation
+    // must run in both postures. The count tracks the filtered set.
     let run = |limit: usize| -> Result<Vec<Memory>, String> {
         let mut stmt = conn
             .prepare(&sql)
@@ -373,17 +372,14 @@ pub fn handle_load_family(
         let memories: Vec<Memory> = rows
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| format!("collect memory_load_family rows failed: {e}"))?;
-        Ok(match caller {
-            Some(c) => memories
-                .into_iter()
-                .filter(|m| crate::visibility::is_visible_to_caller(m, c))
-                .collect(),
-            None => memories,
-        })
+        Ok(memories
+            .into_iter()
+            .filter(|m| crate::visibility::is_readable_on_query(m, caller, namespace))
+            .collect())
     };
 
     let mut memories = run(k)?;
-    if caller.is_some() && memories.len() < k {
+    if memories.len() < k {
         memories = run(crate::db::LIST_MAX_LIMIT)?;
         memories.truncate(k);
     }

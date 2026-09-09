@@ -32631,10 +32631,7 @@ impl MemoryStore for PostgresStore {
         // it.
         let paths =
             PostgresStore::find_paths(self, source_id, target_id, max_depth, max_results).await?;
-        if ctx.bypass_visibility {
-            return Ok(paths);
-        }
-        let caller = ctx.effective_principal();
+        let caller = (!ctx.bypass_visibility).then(|| ctx.effective_principal());
         let mut visible_cache: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let mut filtered: Vec<Vec<String>> = Vec::with_capacity(paths.len());
@@ -32651,28 +32648,10 @@ impl MemoryStore for PostgresStore {
                             .fetch_optional(&self.pool)
                             .await
                             .map_err(|e| to_store_err("find_paths visibility fetch", e))?;
-                    // #2633 — this arm USED to re-implement the visibility
-                    // predicate inline (`if scope != "private" { true } else
-                    // { owner == caller }`) with a comment asserting parity
-                    // with `crate::visibility::is_visible_to_caller`. It had
-                    // drifted TWICE and the comment concealed both:
-                    //
-                    //   * it never received the #1921 subtree restriction, so
-                    //     `team` / `unit` / `org` rows stayed WORLD-READABLE on
-                    //     this postgres kg path long after every other read
-                    //     path was narrowed; and
-                    //   * it carried the #2633 "unknown scope ⇒ widest posture"
-                    //     widening, so a TYPO'd `metadata.scope` published a
-                    //     node here exactly as it did in the canonical
-                    //     predicate.
-                    //
-                    // The stated reason for the copy — "we only have the
-                    // metadata blob, not a full Memory struct" — is answered by
-                    // selecting the two extra scalar columns the predicate
-                    // actually needs and calling `is_visible_by_fields`. Per
-                    // the #951 rule this module opens with, drift between
-                    // copies of this predicate is a real defect; a copy that
-                    // only LOOKS canonical is the worst kind.
+                    // #3498/#2633: reuse the canonical query predicate with
+                    // the fields it reads, rather than maintaining a parallel
+                    // SQL/metadata visibility rule. Even privileged traversals
+                    // require an explicit namespace to surface substrate rows.
                     let v = match row {
                         Some(r) => {
                             let node_id: String =
@@ -32683,8 +32662,15 @@ impl MemoryStore for PostgresStore {
                             let meta: serde_json::Value = r
                                 .try_get("metadata")
                                 .map_err(|e| to_store_err("read metadata", e))?;
-                            crate::visibility::is_visible_by_fields(
-                                &node_id, &node_ns, &meta, caller,
+                            crate::visibility::is_readable_on_query(
+                                &Memory {
+                                    id: node_id,
+                                    namespace: node_ns,
+                                    metadata: meta,
+                                    ..Memory::default()
+                                },
+                                caller,
+                                None,
                             )
                         }
                         // Fail-closed: missing node ⇒ drop the path.

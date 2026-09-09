@@ -296,7 +296,7 @@ pub(super) fn handle_link(
                 if !crate::visibility::caller_owns_for_mutation(&tgt, &caller, false) {
                     return Err(TARGET_NOT_OWNED_FOR_MUTATION.into());
                 }
-            } else if !crate::visibility::is_visible_to_caller(&tgt, &caller) {
+            } else if !crate::visibility::is_readable_on_query(&tgt, Some(&caller), None) {
                 return Err(TARGET_NOT_VISIBLE.into());
             }
         }
@@ -499,15 +499,21 @@ pub(super) fn handle_get_links(
     // the anchor row and, in the multi-tenant posture, return the same empty
     // shape an unknown id yields when the caller cannot see the anchor — so it
     // cannot confirm a private row's existence or enumerate its neighbors.
-    // `caller == None` is the single-tenant trust-all posture (unchanged).
+    // #3498: substrate anchors and endpoints are withheld in both postures.
     let resolved = db::resolve_id(conn, id).map_err(|e| e.to_string())?;
-    if let (Some(c), Some(mem)) = (caller, resolved.as_ref()) {
-        if !crate::visibility::is_visible_to_caller(mem, c) {
+    if let Some(mem) = resolved.as_ref() {
+        if !crate::visibility::is_readable_on_query(mem, caller, None) {
             return Ok(json!({"links": [], "count": 0}));
         }
     }
     let anchor = resolved.as_ref().map_or(id, |m| m.id.as_str());
-    let links = db::get_links(conn, anchor).map_err(|e| e.to_string())?;
+    let mut links = db::get_links(conn, anchor).map_err(|e| e.to_string())?;
+    links.retain(|link| {
+        [&link.source_id, &link.target_id].into_iter().all(|id| {
+            matches!(db::get_any(conn, id), Ok(Some(mem))
+            if crate::visibility::is_readable_on_query(&mem, caller, None))
+        })
+    });
     Ok(json!({"links": links, "count": links.len()}))
 }
 
@@ -789,6 +795,36 @@ mod tests {
         assert_eq!(links.len(), 1);
     }
 
+    #[test]
+    fn get_links_substrate_anchor_and_neighbor_3498() {
+        let conn = fresh_conn();
+        let (a, b) = insert_two(&conn);
+        db::create_link(&conn, &a, &b, "related_to").unwrap();
+        for caller in [None, Some("ai:alice")] {
+            let allowed = handle_get_links(&conn, &json!({"id": a}), caller).unwrap();
+            assert_eq!(allowed["count"], 1, "ordinary link remains readable");
+        }
+        for namespace in [
+            "_inbox/alice",
+            "_messages/alice",
+            "_agents",
+            "_agent_sessions",
+            "_standards",
+        ] {
+            conn.execute(
+                "UPDATE memories SET namespace = ?1 WHERE id = ?2",
+                [namespace, &b],
+            )
+            .unwrap();
+            for caller in [None, Some("ai:alice")] {
+                let denied = handle_get_links(&conn, &json!({"id": a}), caller).unwrap();
+                assert_eq!(denied["count"], 0, "substrate neighbor withheld");
+                let denied = handle_get_links(&conn, &json!({"id": b}), caller).unwrap();
+                assert_eq!(denied["count"], 0, "substrate anchor withheld");
+            }
+        }
+    }
+
     // handle_get_links — missing id
     #[test]
     fn handle_get_links_missing_id_errors() {
@@ -814,10 +850,10 @@ mod tests {
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         db::create_link(&conn, &a, &b, "related_to").unwrap();
-        // Mark the anchor row `a` scope=private owned by alice.
+        // Both endpoints belong to alice; #3498 also filters the neighbor.
         conn.execute(
-            "UPDATE memories SET metadata = json_object('agent_id','alice','scope','private') WHERE id = ?1",
-            [&a],
+            "UPDATE memories SET metadata = json_object('agent_id','alice','scope','private') WHERE id IN (?1, ?2)",
+            [&a, &b],
         )
         .unwrap();
         // Bob sees the empty shape; alice (owner) and None (trust-all) see the edge.
