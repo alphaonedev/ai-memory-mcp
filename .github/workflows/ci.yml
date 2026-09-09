@@ -1075,6 +1075,42 @@ jobs:
             echo "RUSTFLAGS=-C debuginfo=0"
           } >> "$GITHUB_ENV"
 
+      # #3539 HYGIENE — NOT the fix. The `Check (macos-fed,sqlite)` failure
+      # this addresses came from a process-global INSIDE the lib test binary
+      # (the cfg(test) passphrase slot), and the read-only survey of the f1
+      # self-hosted runners found NO passphrase anywhere in their environment,
+      # service plists, `.env` files, shell files or operator config. The fix
+      # is the crate-wide passphrase window in `src/`. This step exists so a
+      # future operator env on ANY self-hosted runner can never reach a job:
+      # `refuse_at_rest_requested_without_sqlcipher()` refuses EVERY sqlite
+      # open while `AI_MEMORY_DB_PASSPHRASE` is non-empty on a non-sqlcipher
+      # build, and a self-hosted runner inherits its service environment
+      # (a GitHub-hosted runner starts clean, so this is self-hosted only).
+      #
+      # EMPTY, not unset: a step cannot unset an inherited variable for its
+      # SIBLINGS, but a `$GITHUB_ENV` assignment overrides the inherited value
+      # for every subsequent step, and `passphrase_requested()` treats an EMPTY
+      # value as "no passphrase requested" — the same fail-closed reading the
+      # boot gate uses.
+      #
+      # NAMED, not `AI_MEMORY_*`-blanket: the enterprise-fed step above exports
+      # `AI_MEMORY_TEST_POSTGRES_URL` through this same `$GITHUB_ENV`, so a
+      # blanket scrub would blank the ephemeral database URL the fed leg was
+      # just pointed at and silently send it back to the shared database.
+      # `AI_MEMORY_NO_CONFIG` is likewise kept deliberately: the f1 runners set
+      # it on purpose so jobs never read operator config.
+      - name: Scrub inherited passphrase env (self-hosted only, issue 3539 hygiene)
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
+        run: |
+          set -euo pipefail
+          for name in AI_MEMORY_DB_PASSPHRASE AI_MEMORY_DB_PASSPHRASE_FILE; do
+            if [ -n "${!name-}" ]; then
+              echo "::warning::[#3539] $name was present in this self-hosted runner's environment; neutralising it for this job (value never printed)"
+            fi
+            printf '%s=\n' "$name" >> "$GITHUB_ENV"
+          done
+          echo "::notice::[#3539] passphrase env scrubbed for this job (AI_MEMORY_NO_CONFIG kept)"
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
         env:

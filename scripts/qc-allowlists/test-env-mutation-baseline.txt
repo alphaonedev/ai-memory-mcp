@@ -32,7 +32,7 @@
 0 9 src/confidence/shadow.rs
 0 141 src/config.rs
 1 2 src/coordination_guard.rs
-0 67 src/daemon_runtime.rs
+0 65 src/daemon_runtime.rs
 0 5 src/egress.rs
 0 9 src/embeddings.rs
 0 47 src/enterprise_federation_posture.rs

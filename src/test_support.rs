@@ -124,6 +124,96 @@ impl Drop for EnvGuard {
     }
 }
 
+/// #3539 — the ONE window in which a lib test may touch the SQLCipher
+/// passphrase channel (the [`crate::storage::ENV_DB_PASSPHRASE`] variable
+/// AND the `cfg(test)` process-private passphrase slot behind
+/// [`crate::storage::connection::db_passphrase`]).
+///
+/// # Why this type exists
+///
+/// `storage::connection::refuse_at_rest_requested_without_sqlcipher()` runs
+/// on EVERY sqlite open and refuses when `passphrase_requested()` is true —
+/// which consults BOTH the environment variable AND the process-private
+/// slot. Under `cfg(test)` that slot is a process-global
+/// `RwLock<Option<String>>`, so a test that seeds it makes EVERY concurrent
+/// sqlite open in the SAME lib test binary refuse. The pre-#3539
+/// `DbPassphraseGuard` only RESET the slot on enter and on drop: it excluded
+/// nothing, so `daemon_runtime::tests::test_bootstrap_serve_*` (which took no
+/// lock at all) could open sqlite inside a seeding test's live window and hit
+/// the sqlcipher refusal — the #3517/#3523 defect class with the passphrase
+/// slot as the process-global (CI `macos-fed,sqlite`, 2026-09-08).
+///
+/// A lock only works when the READERS take it too, so this is the single
+/// funnel for both sides:
+///
+/// * seeders hold it because [`crate::storage::connection::DbPassphraseGuard`]
+///   cannot be constructed without a borrow of one (illegal states
+///   unrepresentable, ERRORS-09 — not merely a convention a new test can
+///   forget); and
+/// * readers hold it via [`no_passphrase_guard`], which additionally ASSERTS
+///   the slot is empty, so a regression fails loudly instead of flaking.
+///
+/// Entering clears the environment variable as well as excluding the slot
+/// seeders, so a passphrase inherited from the HOST environment cannot reach
+/// a plain-sqlite boot either (fail closed; the self-hosted CI legs also blank
+/// `AI_MEMORY_DB_PASSPHRASE` / `AI_MEMORY_DB_PASSPHRASE_FILE` before the test
+/// step as defence in depth — hygiene, not the fix).
+///
+/// # Drop order
+///
+/// Field order IS drop order (OWNERSHIP-24): `_env` restores the variable to
+/// its pre-guard value FIRST, and only then does `_lock` release the mutex —
+/// so no other test can ever observe the cleared value. `Drop` is infallible
+/// (OWNERSHIP-25).
+///
+/// Not re-entrant: [`env_lock`] is a `std::sync::Mutex`, so a nested
+/// `enter()` on one thread self-deadlocks. Take ONE per test body and pass it
+/// by reference (`&`) to any inner scope that needs it.
+#[must_use = "dropping this guard reopens the passphrase window"]
+pub(crate) struct PassphraseEnvIsolation {
+    _env: EnvGuard,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl PassphraseEnvIsolation {
+    /// Acquire the crate-wide env mutex and clear
+    /// [`crate::storage::ENV_DB_PASSPHRASE`] for the guard's lifetime.
+    pub(crate) fn enter() -> Self {
+        let lock = env_lock();
+        let env = EnvGuard::capture(crate::storage::ENV_DB_PASSPHRASE);
+        env.unset();
+        Self {
+            _env: env,
+            _lock: lock,
+        }
+    }
+}
+
+/// #3539 — reader-side entry to the passphrase window for any lib test that
+/// opens a plain (non-sqlcipher) sqlite store or boots a daemon.
+///
+/// Holds [`PassphraseEnvIsolation`] for the caller's whole body and asserts
+/// the process-private passphrase slot is empty. The assertion is sound
+/// rather than flaky precisely because the seeders hold the same mutex and
+/// clear the slot before releasing it, so once this returns the slot cannot
+/// change under the caller.
+///
+/// # Panics
+///
+/// If the passphrase slot is non-empty while this lock is held — that would
+/// mean a seeder mutated it outside the window, i.e. the #3539 funnel was
+/// bypassed.
+pub(crate) fn no_passphrase_guard() -> PassphraseEnvIsolation {
+    let iso = PassphraseEnvIsolation::enter();
+    assert!(
+        crate::storage::connection::db_passphrase().is_none(),
+        "#3539: the process-private passphrase slot must be empty inside the \
+         passphrase window — a seeder mutated it without holding \
+         PassphraseEnvIsolation"
+    );
+    iso
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EnvGuard, env_lock, env_mutex};
