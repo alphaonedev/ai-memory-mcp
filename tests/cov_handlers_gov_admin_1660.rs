@@ -310,6 +310,8 @@ async fn approve_pending_invalid_id_format_returns_400() {
 
 #[tokio::test]
 async fn capture_turn_fake_pg_sal_path_creates_then_dedups() {
+    // #3406: this unsigned routing fixture explicitly opts out of attestation.
+    let _attestation = common::EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0".into());
     // storage_backend=Postgres with an SqliteStore handle drives the
     // `#[cfg(feature="sal")]` SAL `capture_turn_idempotent` arm.
     let (router, _f, _db) = build_router(StorageBackend::Postgres);

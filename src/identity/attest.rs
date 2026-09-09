@@ -22,7 +22,7 @@
 //! The STORE-path default for `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is
 //! *surface-scoped*. With the env unset, an unsigned write is REJECTED only
 //! on the HTTP direct-write surface ([`WriteSurface::HttpDirect`] —
-//! `POST /api/v1/memories` + `/memories/bulk`); on the MCP and CLI surfaces
+//! `POST /api/v1/memories` + `/memories/bulk` + `/capture_turn`); on the MCP and CLI surfaces
 //! ([`WriteSurface::Mcp`] / [`WriteSurface::Cli`]) an unsigned write is the
 //! permissive operator-as-actor path (#1621/#1675) and lands unstamped (a
 //! bare `claimed`-level write). The compiled default is resolved by
@@ -158,7 +158,8 @@ pub fn now_attestable_rfc3339() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteSurface {
     /// HTTP direct-write handlers: `POST /api/v1/memories` and
-    /// `POST /api/v1/memories/bulk`. Attestation is REQUIRED by default
+    /// `POST /api/v1/memories/bulk` and `/api/v1/capture_turn`.
+    /// Attestation is REQUIRED by default
     /// (fail-closed) — an unauthenticated network client is not the
     /// operator, so an unsigned direct write is rejected unless the operator
     /// opts out with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`.
