@@ -11,18 +11,29 @@ Wants=ai-memory.service
 
 [Service]
 Type=simple
-User=ai-memory
-Group=ai-memory
+# #3578 — DISTINCT user from the daemon (`User=ai-memory`). The hub process
+# must not be able to open the store or the key directory even if a bug
+# asked it to: the kernel path is InaccessiblePaths=/var/lib/ai-memory
+# (and ProtectHome), not a convention in src/wake_hub/mod.rs.
+User=ai-memory-hub
+Group=ai-memory-hub
 # Socket path + allowlist are per-deployment. Set via drop-in or env file:
 #   /etc/ai-memory/wake-hub.env
-#     SOCKET=/run/ai-memory/wake-hub.sock
-#     ALLOWLIST=/run/ai-memory/hub-allow.json
+#     SOCKET=/run/ai-memory-hub/wake-hub.sock
+#     ALLOWLIST=/run/ai-memory-hub/hub-allow.json
 #
-# WITHOUT --allowlist the hub admits NOBODY (fail-closed by design). Publish
-# the derived public snapshot with:
-#   ai-memory identity hub-cache --include-agent <id> --out /run/ai-memory/hub-allow.json
+# WITHOUT --allowlist the hub admits NOBODY (fail-closed by design). The
+# #3504 refresher derives the snapshot as User=ai-memory (it MUST open
+# the store) then install(1)s it 0600 owned by ai-memory-hub into this
+# runtime directory, because AllowlistFile::load_from_file requires the
+# file be owned by THIS uid at exact mode 0600.
 EnvironmentFile=-/etc/ai-memory/wake-hub.env
 Environment=RUST_LOG=ai_memory=info
+Environment=SOCKET=/run/ai-memory-hub/wake-hub.sock
+Environment=ALLOWLIST=/run/ai-memory-hub/hub-allow.json
+# No --tcp in the shipped ExecStart. The kernel RestrictAddressFamilies
+# below is AF_UNIX only; a TCP listener is an operator drop-in that must
+# add BOTH the flag AND AF_INET/AF_INET6, never one without the other.
 ExecStart=/bin/sh -c '/usr/bin/ai-memory wake-hub --socket "$SOCKET" --allowlist "$ALLOWLIST" $EXTRA_ARGS'
 
 # ExecStartPost proves the hub is actually REACHABLE, not merely running.
@@ -63,6 +74,10 @@ ProtectClock=yes
 ProtectProc=invisible
 # AF_UNIX ONLY. The wake plane is same-host by construction — it never opens a
 # network socket — so the kernel enforces that here as well as the code.
+# TCP is not shipped; an operator who adds --tcp MUST also drop in
+# RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6. The packaging test
+# (tests/wake_hub_process_isolation_3578.rs) refuses a shipped unit that
+# names AF_INET or --tcp.
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -75,23 +90,25 @@ SystemCallFilter=~@mount @swap @reboot @obsolete
 CapabilityBoundingSet=
 AmbientCapabilities=
 ReadOnlyPaths=-/etc/ai-memory
+# #3578 — the durable store lives here. The hub uid must not be able to
+# open it, even if a future code path asked. Exact token the packaging
+# test greps for.
+InaccessiblePaths=/var/lib/ai-memory
 # The socket's parent directory. The hub creates the leaf 0700 (owner-only)
 # with mkdir(2) itself and forces the socket to 0600, verifying both.
-RuntimeDirectory=ai-memory
+# DISTINCT from the daemon's /run/ai-memory (if any) so a compromised hub
+# cannot rewrite the daemon runtime.
+RuntimeDirectory=ai-memory-hub
 RuntimeDirectoryMode=0700
-# CHOSEN: keep the allowlist in /run and PRESERVE the directory across stops.
-# Without this, systemd removes /run/ai-memory when the unit stops, deleting
-# the very allowlist snapshot the comments above tell the operator to publish
-# at /run/ai-memory/hub-allow.json -- and a hub that starts with no allowlist
-# admits NOBODY. So the ONE allowlist path for this unit is
-#   /run/ai-memory/hub-allow.json
-# and that is the path #3504's refresher timer must write.
-# Honest bound: /run is a tmpfs, so `preserve` survives a stop/restart but NOT
-# a reboot. Publishing the snapshot after boot is exactly what the refresher
-# covers; until it exists, re-run `ai-memory identity hub-cache ... --out
-# /run/ai-memory/hub-allow.json` after a reboot.
+# CHOSEN: keep the allowlist in /run/ai-memory-hub and PRESERVE the directory
+# across stops. Without this, systemd removes the runtime directory when the
+# unit stops, deleting the snapshot the refresher install(1)s at
+# /run/ai-memory-hub/hub-allow.json -- and a hub that starts with no
+# allowlist admits NOBODY. Honest bound: /run is a tmpfs, so `preserve`
+# survives a stop/restart but NOT a reboot. The refresher's OnBootSec=15s
+# is what republishes after boot.
 RuntimeDirectoryPreserve=yes
-ReadWritePaths=/run/ai-memory
+ReadWritePaths=/run/ai-memory-hub
 
 # MUST match wake_hub::limits::DESIRED_NOFILE. The hub raises its own soft
 # limit toward this value at start-up and sizes its connection ceiling from

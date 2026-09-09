@@ -689,7 +689,10 @@ missed tick costs nothing, writing to the SAME path the hub reads:
 # Linux (the $ALLOWLIST that ai-memory-wake-hub.service passes to --allowlist)
 ai-memory identity hub-cache \
     --include-agent <each agent that may listen> \
-    --out /run/ai-memory/hub-allow.json
+    --out /var/lib/ai-memory/hub-allow.json
+# The shipped refresher then install(1)s that file 0600 owned by
+# ai-memory-hub into /run/ai-memory-hub/hub-allow.json — the hub uid
+# must own the snapshot at exact mode 0600.
 
 # macOS (the path dev.alphaone.ai-memory.wake-hub.plist reads)
 ai-memory identity hub-cache \
@@ -697,14 +700,16 @@ ai-memory identity hub-cache \
     --out ~/.ai-memory/hub-allow.json
 ```
 
-**Write it where the hub reads it.** `/run/ai-memory/hub-allow.json` on Linux
-and `~/.ai-memory/hub-allow.json` on macOS are the paths the #3471 hub units
+**Write it where the hub reads it.** `/run/ai-memory-hub/hub-allow.json` on
+Linux and `~/.ai-memory/hub-allow.json` on macOS are the paths the hub units
 name; a refresher pointed anywhere else leaves a hub reading a file nobody
 writes, which looks like a working install right up to the moment every hello
-is refused. On Linux the runtime directory is created `0700` by the hub unit
-(`RuntimeDirectory=ai-memory`, `RuntimeDirectoryPreserve=yes`) and both units
-run as the same `User=`, so the refresher writes into it without creating or
-chmod-ing anything.
+is refused. On Linux the hub runtime directory is created `0700` by the hub
+unit (`RuntimeDirectory=ai-memory-hub`, `User=ai-memory-hub`,
+`RuntimeDirectoryPreserve=yes`). The refresher is a DISTINCT user
+(`User=ai-memory`) because it opens the store; it cannot write the 0700 hub
+directory, so `ExecStartPost=+/usr/bin/install -o ai-memory-hub …` is the
+hand-off that satisfies the hub's owner-only 0600 allowlist gate (#3578).
 
 **Grant the database's DIRECTORY, not the database file.** The systemd
 refresher runs under `ProtectSystem=strict`, so every path it writes has to be
@@ -915,21 +920,37 @@ soft limit toward that value where the hard limit allows, sizes its connection
 ceiling from what it actually got (WARNing when that is below the target), and
 REFUSES to bind at all when the budget cannot cover `MIN_CONNECTION_CEILING`
 connections plus `FD_HEADROOM` descriptors — a smaller hub is honest, a hub
-that lies about its capacity is not. The systemd unit additionally restricts
-the address family to `AF_UNIX`: the wake plane is same-host by construction,
-so the kernel enforces that as well as the code. Its `ExecStartPost` runs
-`--health`, so a unit that reports "started" has actually been reached — a
-claim that holds **only because that probe retries**. `Type=simple` lets
-systemd run `ExecStartPost` as soon as it has forked the main process, before
-the hub has bound, and the hub sends no `sd_notify`; the unit therefore retries
-the probe for about five seconds across the bind race and fails the unit only
-if the hub is still unreachable after that. A single-shot probe would fail
-every start and, with `Restart=on-failure`, convert a healthy host into a
-restart loop. The unit also sets `RuntimeDirectoryPreserve=yes`, so the
-allowlist snapshot it tells you to publish at `/run/ai-memory/hub-allow.json`
-survives a stop or restart instead of being deleted with the runtime directory
-— which would leave the restarted hub admitting nobody. `/run` is a tmpfs, so
-that path still does not survive a **reboot**; republish it after boot.
+that lies about its capacity is not.
+
+**Process isolation (#3578).** The systemd unit runs as `User=ai-memory-hub`
+(not the daemon's `ai-memory`), jails `/var/lib/ai-memory` with
+`InaccessiblePaths=`, and restricts the address family to `AF_UNIX`: the wake
+plane is same-host by construction, so the kernel enforces that as well as the
+code. A TCP listener is **not shipped**; an operator drop-in that added one
+would have to add both a listen flag and `AF_INET`, and
+`tests/wake_hub_process_isolation_3578.rs` refuses a unit that names either
+today. The launchd template names `UserName`/`GroupName` `ai-memory-hub`,
+which launchd honours only for a LaunchDaemon under `/Library/LaunchDaemons`;
+the `~/Library/LaunchAgents` copy is a dev convenience that does not satisfy
+the contract. Create the system user before enabling the unit:
+
+```sh
+sudo useradd --system --home /run/ai-memory-hub --shell /usr/sbin/nologin ai-memory-hub
+```
+
+Its `ExecStartPost` runs `--health`, so a unit that reports "started" has
+actually been reached — a claim that holds **only because that probe retries**.
+`Type=simple` lets systemd run `ExecStartPost` as soon as it has forked the
+main process, before the hub has bound, and the hub sends no `sd_notify`; the
+unit therefore retries the probe for about five seconds across the bind race
+and fails the unit only if the hub is still unreachable after that. A
+single-shot probe would fail every start and, with `Restart=on-failure`,
+convert a healthy host into a restart loop. The unit also sets
+`RuntimeDirectoryPreserve=yes`, so the allowlist snapshot the refresher
+install(1)s at `/run/ai-memory-hub/hub-allow.json` survives a stop or restart
+instead of being deleted with the runtime directory — which would leave the
+restarted hub admitting nobody. `/run` is a tmpfs, so that path still does not
+survive a **reboot**; republish it after boot.
 
 ### `ai-memory doctor`
 

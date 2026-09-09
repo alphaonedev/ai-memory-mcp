@@ -135,6 +135,22 @@ access to the backup directory; a malicious or mistaken administrator; a poisone
 stale memory acted on by a downstream agent. Adversaries outside this list (hypervisor,
 hardware, supply chain below the SBOM) are out of scope and stated as such.
 
+#### Wake-hub / rust-a2a sidecar (#3578)
+
+The hub holds no authority over ai-memory data by design (`src/wake_hub/mod.rs`:
+the process never opens the store). Admission is a public snapshot derived by a
+separate unit (`ai-memory identity hub-cache`); identity is a scoped
+`a2a-hub/join/v1` delegation; frames are ≤256-byte content-free wake hints;
+topics are proven read scopes (#3505). The four residual exposures, with the
+control for each:
+
+| # | Exposure | Control | Honest residual |
+|---|---|---|---|
+| WH-1 | Exfiltration after an authorized read | Recall-observation ledger + per-agent key binding (#2044) + quotas. Attributable, bounded. | **Not preventable** by any substrate once a principal was authorized to read. Detectable, not stoppable. |
+| WH-2 | Oversight gap on ephemeral coordination | Content-free frames (`MAX_WAKE_META_BYTES` = 256; no `content`/`title`); hub holds no durable truth; inbox row + ≤60 s backstop poll is the record. | Coordination *existence* (that a wake was sent) is visible in hub metrics and the inbox; the *body* never rides the hub. |
+| WH-3 | Laundered injection through an agent that trusts A2A input | SDK-edge screen (item 6 of this issue, Codex); `resolve_governance_subject` / header resolver refuse a hub delegation (`A2A_HUB_SCOPE`) as write authority (item 1). | An agent that treats a wake hint as a command is an agent bug. The substrate cannot police a peer's trust of its own input; it can refuse to let the hint become a write principal. |
+| WH-4 | Hub-process compromise | Distinct `User=ai-memory-hub` (#3578 item 3); `InaccessiblePaths=/var/lib/ai-memory`; `RestrictAddressFamilies=AF_UNIX`; snapshot is public keys only, 0600 owned by the hub uid. Tests: `tests/wake_hub_process_isolation_3578.rs`. | A compromised hub can drop or delay hints (availability of the *wake*, never of the inbox row). It cannot mint identities, cannot open the store, cannot emit a body. |
+
 ## 1. Evidence schema (normative)
 
 One JSON-lines record per case per run.

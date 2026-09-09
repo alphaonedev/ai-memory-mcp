@@ -11,7 +11,7 @@ Documentation=https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/wake-h
 # nobody until this unit has run once. That is what OnBootSec=15s in the
 # companion timer is for: the first refresh after boot is what lets the hub
 # admit anyone at all.
-After=ai-memory.service
+After=ai-memory.service ai-memory-wake-hub.service
 
 [Service]
 Type=oneshot
@@ -29,10 +29,18 @@ Group=ai-memory
 # own --include-agent; omitting one on the next refresh REVOKES it, which is
 # the intended revocation mechanism. Add --daemon-producer only if this host's
 # daemon pushes wakes (see docs/wake-hub.md).
+# Derive as User=ai-memory (this unit OPENS the store). The hub process
+# is User=ai-memory-hub and AllowlistFile::load_from_file requires the
+# snapshot be owned by THAT uid at exact mode 0600, so ExecStartPost
+# install(1)s the file into the hub runtime directory as root (`+`
+# prefix ignores User= and the sandbox — CAP_CHOWN is otherwise
+# unavailable to ai-memory).
 ExecStart=/usr/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db \
     identity hub-cache \
     --include-agent REPLACE_AGENT_ID \
-    --out /run/ai-memory/hub-allow.json
+    --out /var/lib/ai-memory/hub-allow.json
+ExecStartPost=+/usr/bin/install -o ai-memory-hub -g ai-memory-hub -m 0600 \
+    /var/lib/ai-memory/hub-allow.json /run/ai-memory-hub/hub-allow.json
 
 # --- hardening ---
 NoNewPrivileges=yes
@@ -56,15 +64,9 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@mount @swap @reboot @obsolete
 CapabilityBoundingSet=
 AmbientCapabilities=
-# The snapshot is the ONLY thing this unit writes, and it writes it where the
-# HUB reads it: /run/ai-memory/hub-allow.json is the $ALLOWLIST that
-# ai-memory-wake-hub.service passes to --allowlist (#3471). That unit creates
-# the runtime directory 0700 (RuntimeDirectory=ai-memory,
-# RuntimeDirectoryMode=0700, RuntimeDirectoryPreserve=yes) and both units run
-# as the same User=, so this one writes into it without creating or chmod-ing
-# anything. The file names every agent permitted to join, so the hub refuses to
-# read it unless it is an owner-only 0600 regular file.
-ReadWritePaths=/run/ai-memory
+# Staging snapshot (public keys only) lives next to the store. The hub
+# runtime directory is 0700 ai-memory-hub, so this unit cannot write it
+# directly; ExecStartPost=+install is the hand-off (#3578).
 # The DIRECTORY, not the database file, exactly as ai-memory.service grants it
 # ("Only touch AI_MEMORY_DB's parent"). SQLite runs the store in WAL mode, and
 # WAL mode creates and locks `ai-memory.db-wal` and `ai-memory.db-shm` BESIDE

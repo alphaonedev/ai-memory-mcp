@@ -30,13 +30,29 @@
        and the hub REFUSES an over-long path rather than letting bind(2)
        silently truncate it.
 
-  Install:
+  PROCESS ISOLATION (#3578):
+    UserName/GroupName = ai-memory-hub. launchd honours UserName ONLY for
+    LaunchDaemons. Production install is /Library/LaunchDaemons/ as that
+    user, with socket + allowlist paths that user can write (not $HOME).
+    ~/Library/LaunchAgents/ is a DEV convenience that runs as the logged-in
+    user and does NOT satisfy the process-isolation contract.
+
+  Install (dev convenience — isolation contract NOT in force):
     cp scripts/templates/dev.alphaone.ai-memory.wake-hub.plist \
        ~/Library/LaunchAgents/
     sed -i.bak 's|/Users/YOU|'"$HOME"'|g' \
        ~/Library/LaunchAgents/dev.alphaone.ai-memory.wake-hub.plist
     launchctl bootstrap "gui/$(id -u)" \
        ~/Library/LaunchAgents/dev.alphaone.ai-memory.wake-hub.plist
+
+  Install (production — isolation contract IN force):
+    sudo dscl . -create /Users/ai-memory-hub
+    sudo cp scripts/templates/dev.alphaone.ai-memory.wake-hub.plist \
+       /Library/LaunchDaemons/
+    # rewrite ProgramArguments paths off $HOME onto a directory owned by
+    # ai-memory-hub, then:
+    sudo launchctl bootstrap system \
+       /Library/LaunchDaemons/dev.alphaone.ai-memory.wake-hub.plist
 
   Operations:
     launchctl print "gui/$(id -u)/dev.alphaone.ai-memory.wake-hub" | grep state
@@ -58,6 +74,13 @@
 <dict>
     <key>Label</key>
     <string>dev.alphaone.ai-memory.wake-hub</string>
+
+    <!-- #3578 — DISTINCT from the daemon / operator uid. Honoured only
+         when this plist is loaded as a LaunchDaemon. -->
+    <key>UserName</key>
+    <string>ai-memory-hub</string>
+    <key>GroupName</key>
+    <string>ai-memory-hub</string>
 
     <key>ProgramArguments</key>
     <array>

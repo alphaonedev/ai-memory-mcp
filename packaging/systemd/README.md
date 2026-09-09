@@ -12,6 +12,9 @@ packages; also usable standalone on any systemd distro.
 | `ai-memory-sync.service` | Peer-mesh sync daemon (optional) | `simple` |
 | `ai-memory-backup.service` | One-shot snapshot via `VACUUM INTO` | `oneshot` |
 | `ai-memory-backup.timer` | Hourly backup trigger | `timer` |
+| `ai-memory-wake-hub.service` | Content-free wake plane (`User=ai-memory-hub`) | `simple` |
+| `ai-memory-wake-hub-refresh.service` | Derive+install the hub allowlist snapshot | `oneshot` |
+| `ai-memory-wake-hub-refresh.timer` | 30 s refresh of that snapshot | `timer` |
 
 ## Install — manual
 
@@ -19,6 +22,7 @@ packages; also usable standalone on any systemd distro.
 # 1. System user + state dir. The Debian (.deb) postinst and Fedora COPR
 #    %post scriptlet do this automatically.
 sudo useradd --system --home /var/lib/ai-memory --shell /usr/sbin/nologin ai-memory
+sudo useradd --system --home /run/ai-memory-hub --shell /usr/sbin/nologin ai-memory-hub
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory/backups
 
