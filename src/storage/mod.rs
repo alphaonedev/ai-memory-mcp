@@ -15999,51 +15999,111 @@ const SQL_SIZE_GC_NEXT_VICTIM: &str = "SELECT id, \
 // Archive operations
 // ---------------------------------------------------------------------------
 
+const ARCHIVED_TOTAL_KEY: &str = "archived_total";
+
+/// v1.0.0 #3382 — the column projection shared by every `archived_memories`
+/// listing shape. Single-sourced so the caller-scoped and unscoped variants
+/// cannot drift in what they return (the #1637 v49-column carry lives here).
+const SQL_ARCHIVE_LIST_PROJECTION: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
+     source, access_count, created_at, updated_at, last_accessed_at, \
+     expires_at, archived_at, archive_reason, metadata, \
+     reflection_depth, memory_kind, entity_id, persona_version, \
+     citations, source_uri, source_span, confidence_source, \
+     confidence_signals, confidence_decayed_at, version, \
+     atomised_into, atom_of, mentioned_entity_id \
+     FROM archived_memories";
+
+/// #3382 archive ownership SQL prefilter; the final read decision also
+/// applies canonical query visibility before pagination or aggregation.
+fn archive_owner_scope_clause(idx: usize) -> String {
+    format!(
+        "(json_extract(metadata, '$.agent_id') = ?{idx} OR \
+          json_extract(metadata, '$.target_agent_id') = ?{idx} OR \
+          json_extract(metadata, '$.agent_id') IS NULL OR \
+          json_extract(metadata, '$.agent_id') = '')"
+    )
+}
+
 pub fn list_archived(
     conn: &Connection,
     namespace: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    let ns_predicate = if namespace.is_some_and(|ns| ns.starts_with(crate::INBOX_NAMESPACE_PREFIX))
-    {
-        "namespace IN (SELECT ?1 UNION SELECT legacy_prefix || substr(?1, length(canonical_prefix) + 1) FROM inbox_namespace_aliases)"
+    list_archived_impl(conn, namespace, None, limit, offset, false)
+}
+
+/// #3382 caller-scoped listing: query visibility and archive ownership apply
+/// before pagination. `None` retains ordinary single-operator visibility but
+/// still excludes substrate rows unless a namespace is explicitly requested.
+///
+/// # Errors
+/// Propagates any rusqlite prepare / query failure.
+pub fn list_archived_scoped(
+    conn: &Connection,
+    namespace: Option<&str>,
+    caller: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<serde_json::Value>> {
+    list_archived_impl(conn, namespace, caller, limit, offset, true)
+}
+
+fn list_archived_impl(
+    conn: &Connection,
+    namespace: Option<&str>,
+    caller: Option<&str>,
+    limit: usize,
+    offset: usize,
+    scoped: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let mut wheres: Vec<String> = Vec::new();
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(ns) = namespace {
+        params_vec.push(Box::new(ns.to_string()));
+        wheres.push(if ns.starts_with(crate::INBOX_NAMESPACE_PREFIX) {
+            "namespace IN (SELECT ?1 UNION SELECT legacy_prefix || substr(?1, length(canonical_prefix) + 1) FROM inbox_namespace_aliases)".to_string()
+        } else {
+            "namespace = ?1".to_string()
+        });
+    }
+    if let Some(c) = caller {
+        params_vec.push(Box::new(c.to_string()));
+        wheres.push(archive_owner_scope_clause(params_vec.len()));
+    }
+    let mut where_sql = if wheres.is_empty() {
+        String::new()
     } else {
-        "namespace = ?1"
+        format!("WHERE {} ", wheres.join(" AND "))
     };
-    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match namespace {
-        Some(ns) => (
-            format!(
-                "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
-             source, access_count, created_at, updated_at, last_accessed_at, \
-             expires_at, archived_at, archive_reason, metadata, \
-             reflection_depth, memory_kind, entity_id, persona_version, \
-             citations, source_uri, source_span, confidence_source, \
-             confidence_signals, confidence_decayed_at, version, \
-             atomised_into, atom_of, mentioned_entity_id \
-             FROM archived_memories WHERE {ns_predicate} \
-             ORDER BY archived_at DESC LIMIT ?2 OFFSET ?3"
-            ),
-            vec![Box::new(ns.to_string()), Box::new(limit), Box::new(offset)],
-        ),
-        None => (
-            "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
-             source, access_count, created_at, updated_at, last_accessed_at, \
-             expires_at, archived_at, archive_reason, metadata, \
-             reflection_depth, memory_kind, entity_id, persona_version, \
-             citations, source_uri, source_span, confidence_source, \
-             confidence_signals, confidence_decayed_at, version, \
-             atomised_into, atom_of, mentioned_entity_id \
-             FROM archived_memories \
-             ORDER BY archived_at DESC LIMIT ?1 OFFSET ?2"
-                .to_string(),
-            vec![Box::new(limit), Box::new(offset)],
-        ),
-    };
+    if scoped && !crate::visibility::substrate_namespace_requested(namespace) {
+        if where_sql.is_empty() {
+            where_sql.push_str("WHERE 1=1 ");
+        }
+        where_sql.push_str(&crate::visibility::SQL_AND_NOT_SUBSTRATE);
+        where_sql.push(' ');
+    }
+    params_vec.push(Box::new(if scoped {
+        -1_i64
+    } else {
+        i64::try_from(limit)?
+    }));
+    let limit_idx = params_vec.len();
+    params_vec.push(Box::new(if scoped { 0 } else { offset }));
+    let offset_idx = params_vec.len();
+    let sql = format!(
+        "{SQL_ARCHIVE_LIST_PROJECTION} {where_sql}\
+         ORDER BY archived_at DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    );
     let params_refs: Vec<&dyn rusqlite::types::ToSql> =
         params_vec.iter().map(std::convert::AsRef::as_ref).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        // #3382: filter before pagination, including the single-operator
+        // substrate restriction. Decode once from this row; no per-row SQL.
+        if scoped && !archive_row_readable(row, caller, namespace)? {
+            return Ok(None);
+        }
         // v0.7.0 issue #861 — `metadata` is stored as a JSON TEXT blob
         // in the column. Falling back to `{}` only covers a NULL/empty
         // read; the surrounding column projection then re-encodes it
@@ -16072,7 +16132,7 @@ pub fn list_archived(
         let tags_str = row.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string());
         let tags: serde_json::Value =
             serde_json::from_str(&tags_str).unwrap_or_else(|_| serde_json::json!([]));
-        Ok(serde_json::json!({
+        Ok(Some(serde_json::json!({
             "id": row.get::<_, String>(0)?,
             "tier": row.get::<_, String>(1)?,
             "namespace": row.get::<_, String>(2)?,
@@ -16116,10 +16176,24 @@ pub fn list_archived(
             (field_names::ATOMISED_INTO): row.get::<_, Option<i64>>(28)?,
             (field_names::ATOM_OF): row.get::<_, Option<String>>(29)?,
             (field_names::MENTIONED_ENTITY_ID): row.get::<_, Option<String>>(30)?,
-        }))
+        })))
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    // Keep memory bounded to the requested visible page; hidden rows consume
+    // neither offset nor limit. Unscoped operator callers retain SQL paging.
+    let mut page = Vec::new();
+    let mut remaining_offset = if scoped { offset } else { 0 };
+    for row in rows {
+        let Some(value) = row? else { continue };
+        if remaining_offset > 0 {
+            remaining_offset -= 1;
+        } else if page.len() < limit {
+            page.push(value);
+        }
+        if page.len() == limit {
+            break;
+        }
+    }
+    Ok(page)
 }
 
 /// Restore an archived memory ROW back into the live `memories` table.
@@ -16435,19 +16509,14 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // inbox-target row whose recipient is the caller, or be a
         // legacy unowned row — see archive_memory_for_caller for the
         // matching SQL + #940 carve-out rationale).
+        // #3382: share the archive ownership prefilter. Read surfaces also
+        // require query visibility; restoration keeps its recovery contract.
+        let owned_sql = format!(
+            "SELECT COUNT(*) > 0 FROM archived_memories WHERE id = ?1 AND {}",
+            archive_owner_scope_clause(2)
+        );
         let owned: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM archived_memories \
-                 WHERE id = ?1 \
-                   AND ( \
-                     json_extract(metadata, '$.agent_id') = ?2 OR \
-                     json_extract(metadata, '$.target_agent_id') = ?2 OR \
-                     json_extract(metadata, '$.agent_id') IS NULL OR \
-                     json_extract(metadata, '$.agent_id') = '' \
-                   )",
-                params![id, caller],
-                |r| r.get(0),
-            )
+            .query_row(&owned_sql, params![id, caller], |r| r.get(0))
             .unwrap_or(false);
         if !owned {
             // #2064 — reconstruct-on-read (owner-scoped twin). Only when the
@@ -16511,6 +16580,9 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // caller context); ownership gating already happened on the
         // SELECT above.
         let candidate = load_archived_as_memory(conn, id)?;
+        if !crate::visibility::caller_owns_for_mutation(&candidate, caller, true) {
+            return Ok(false);
+        }
         consult_governance_pre_write(&candidate)?;
         // v1.0.0 #2418 (L-EXPIRY-CANON) — ?6: the archive's
         // `original_expires_at` in the canonical fixed-UTC rendering. Bound as
@@ -16968,9 +17040,81 @@ pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(serde_json::json!({
-        "archived_total": total,
+        (ARCHIVED_TOTAL_KEY): total,
         (field_names::BY_NAMESPACE): by_ns,
     }))
+}
+
+/// #3382: decode only the fields used by canonical visibility and ownership.
+/// In particular, aggregate scans never load archived content or embeddings.
+fn archive_row_readable(
+    row: &rusqlite::Row<'_>,
+    caller: Option<&str>,
+    namespace: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let metadata_index = row.as_ref().column_index("metadata")?;
+    let metadata: Option<String> = row.get(metadata_index)?;
+    let memory = Memory {
+        id: row.get("id")?,
+        namespace: row.get("namespace")?,
+        metadata: serde_json::from_str(metadata.as_deref().unwrap_or("{}")).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                metadata_index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        ..Memory::default()
+    };
+    Ok(
+        crate::visibility::is_readable_on_query(&memory, caller, namespace)
+            && caller.is_none_or(|c| crate::visibility::caller_owns_for_mutation(&memory, c, true)),
+    )
+}
+
+/// Caller-visible archive totals. The aggregate excludes substrate namespaces
+/// because this tool has no namespace selector. Unscoped admin SAL/HTTP callers
+/// continue to use `archive_stats`.
+///
+/// # Errors
+/// Propagates query and row decoding failures.
+pub fn archive_stats_scoped(conn: &Connection, caller: Option<&str>) -> Result<serde_json::Value> {
+    let mut sql = format!(
+        "SELECT id, namespace, metadata FROM archived_memories WHERE 1=1 {}",
+        *crate::visibility::SQL_AND_NOT_SUBSTRATE,
+    );
+    if caller.is_some() {
+        sql.push_str(" AND ");
+        sql.push_str(&archive_owner_scope_clause(1));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(caller), |row| {
+        Ok((
+            row.get::<_, String>("namespace")?,
+            archive_row_readable(row, caller, None)?,
+        ))
+    })?;
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut total = 0_usize;
+    for row in rows {
+        let (namespace, readable) = row?;
+        if readable {
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("archive count overflow"))?;
+            let count = counts.entry(namespace).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("archive count overflow"))?;
+        }
+    }
+    let mut by_namespace: Vec<_> = counts.into_iter().collect();
+    by_namespace.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let by_namespace: Vec<_> = by_namespace
+        .into_iter()
+        .map(|(namespace, count)| serde_json::json!({"namespace": namespace, "count": count}))
+        .collect();
+    Ok(serde_json::json!({(ARCHIVED_TOTAL_KEY): total, (field_names::BY_NAMESPACE): by_namespace}))
 }
 
 pub fn export_all(conn: &Connection) -> Result<Vec<Memory>> {
