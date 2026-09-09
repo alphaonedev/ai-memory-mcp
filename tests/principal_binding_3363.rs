@@ -171,7 +171,7 @@ fn skill_row_count(conn: &Connection, id: &str) -> i64 {
 }
 
 /// Seed a depth-1 reflection so `memory_skill_promote_from_reflection` has a
-/// promotable source on the allowed path.
+/// promotable source owned by the enforced caller (#3551).
 fn seed_reflection(conn: &Connection, ns: &str) -> String {
     let now = chrono::Utc::now().to_rfc3339();
     let mem = Memory {
@@ -183,6 +183,8 @@ fn seed_reflection(conn: &Connection, ns: &str) -> String {
         priority: 5,
         confidence: 1.0,
         source: "test-3363".to_string(),
+        agent_id: Some(CALLER.to_string()),
+        scope: "private".to_string(),
         created_at: now.clone(),
         updated_at: now,
         memory_kind: MemoryKind::Reflection,
