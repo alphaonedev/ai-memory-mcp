@@ -211,6 +211,7 @@ mod pg {
     #[tokio::test]
     async fn postgres_routine_controls_and_atomic_quota() {
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: live PostgreSQL requires AI_MEMORY_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect(&url).await.expect("postgres");

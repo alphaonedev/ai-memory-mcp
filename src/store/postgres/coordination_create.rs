@@ -186,6 +186,7 @@ impl PostgresStore {
 
     pub(super) async fn materialize_routine(
         &self,
+        ctx: &super::CallerContext,
         routine_id: &str,
         arguments: &serde_json::Value,
     ) -> StoreResult<Vec<String>> {
@@ -209,8 +210,9 @@ impl PostgresStore {
             });
         }
         let now = Utc::now().timestamp();
-        let plan = crate::routines::materialization::plan(&routine, arguments, now)
-            .map_err(|detail| StoreError::IntegrityFailed { detail })?;
+        let plan =
+            crate::routines::materialization::plan(&routine, arguments, now, Some(&ctx.agent_id))
+                .map_err(|detail| StoreError::IntegrityFailed { detail })?;
         super::pg_advisory_lock_action_edges(&mut tx)
             .await
             .map_err(|e| to_store_err("routine edges lock", e))?;
