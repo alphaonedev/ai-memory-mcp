@@ -1264,7 +1264,17 @@ pub(crate) async fn load_family_rows_via_store(
     };
     let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
     let narrow = |rows: Vec<Memory>| -> Vec<Memory> {
-        let mut kept: Vec<Memory> = rows.into_iter().filter(|m| family_eq.matches(m)).collect();
+        let mut kept: Vec<Memory> = rows
+            .into_iter()
+            .filter(|m| {
+                family_eq.matches(m)
+                    && crate::visibility::is_readable_on_query(
+                        m,
+                        Some(ctx.effective_principal()),
+                        namespace,
+                    )
+            })
+            .collect();
         // priority DESC, updated_at DESC, id ASC (mirrors handle_load_family
         // + the #2602/#2615 `store::list` tiebreak). `sort_by` is stable, so
         // this in-process sort inherits determinism only IMPLICITLY from the

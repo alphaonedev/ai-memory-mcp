@@ -5258,7 +5258,7 @@ async fn http_kg_timeline_returns_empty_for_unlinked_source() {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({"scope": "collective"}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
