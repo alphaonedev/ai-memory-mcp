@@ -189,7 +189,12 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // the shared `cargo test --lib` binary, and it is
 // `#[cfg(any(test, feature = "test-support"))]` — absent from a release
 // build entirely. Net acknowledged: +1.
-const QUAL_6_CEILING: usize = 128;
+// 2026-09-09 (#3386 kg-query visibility) — raised 128 -> 130 for the two
+// traversal helpers extracted from handle_kg_query: kg_query_by_source_uri
+// and kg_query_from_source. Both retain that MCP handler's existing
+// Result<Value, String> boundary; the split makes the shared input filters
+// explicit above both traversal paths. Preserve the earlier lane counts.
+const QUAL_6_CEILING: usize = 130;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
