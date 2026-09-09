@@ -496,7 +496,19 @@ check on demand.
 
 Structured database stats (counts by tier/namespace, links, size,
 last GC). **Admin-gated** (#946 cluster). SQLite and PostgreSQL both emit
-`by_tier` and `by_namespace` as the documented lists below.
+`by_tier` and `by_namespace` as the documented lists below. The **count
+field names are not identical** across backends (#3416):
+
+- **SQLite** (default) serializes `models::Stats` directly. The raw
+  physical row count is `total`. There is **no** `storage_backend`
+  field and **no** `total_memories` alias on this envelope.
+- **PostgreSQL** (`postgres_stats_envelope`) aliases that count as
+  `total_memories` and adds `storage_backend: "postgres"`. It does
+  **not** emit `dim_violations` / `index_evictions_total` (those stay
+  on the sqlite `Stats` serialization).
+
+MCP `memory_stats` is the sqlite shape (`total`). Prefer `live` over
+either count when reconciling against boot's LIVE inventory (#2334).
 
 Query:
 
@@ -504,12 +516,17 @@ Query:
   omits `by_namespace`. Unknown values are **400**.
 - `by_namespace_limit` — top-N namespaces by count (default **20**, max
   **100**). Remainder folds into `others: {count, namespace_count}`. Memory
-  totals (`total` / `total_memories`, `live`, `expired_pending_gc`) are
-  unchanged.
+  totals (`total` on sqlite / `total_memories` on postgres, plus `live`,
+  `expired_pending_gc`, `substrate`) are unchanged.
+
+SQLite example (the default daemon):
 
 ```json
 {
-  "total_memories": 150,
+  "total": 150,
+  "live": 145,
+  "expired_pending_gc": 5,
+  "substrate": 0,
   "by_tier": [{"tier":"short","count":20},{"tier":"mid","count":100},{"tier":"long","count":30}],
   "by_namespace": [{"namespace":"global","count":90}],
   "by_namespace_total": 1,
@@ -517,11 +534,14 @@ Query:
   "expiring_soon": 5,
   "links_count": 23,
   "db_size_bytes": 524288,
-  "live": 145,
-  "expired_pending_gc": 5,
-  "storage_backend": "sqlite"
+  "dim_violations": 0,
+  "index_evictions_total": 0
 }
 ```
+
+A postgres daemon answers the same lists with `"total_memories": 150`
+and `"storage_backend": "postgres"` instead of `"total"`. Do not send
+or expect `"storage_backend": "sqlite"` — that key is absent on sqlite.
 
 ## Memory CRUD
 
@@ -1088,6 +1108,27 @@ pre-page matching cardinality.
 }
 ```
 
+### `POST /api/v1/namespaces` — set namespace standard (collection form)
+
+S34 collection write. The namespace is taken from the **JSON body**
+(`namespace`, or nested `standard.namespace` — S34 nests the payload).
+Query-string `?namespace=` is **not read on POST** (#3416): a body that
+omits `namespace` is **400** even when the URL carries `?namespace=…`.
+Use this collection form **or** the path form below; they share
+`set_namespace_standard_inner`.
+
+Body: `{ "namespace": "<ns>", "id": "<optional-memory-id>", "parent": "<optional-parent-namespace>", "governance": { … } }`.
+`governance` accepts `write` / `promote` / `delete` (each `any` |
+`registered` | `owner` | `approve`), `approver` (ApproverType), and
+`inherit` (boolean, default `true`). Equivalent MCP tool:
+`memory_namespace_set_standard` (`src/mcp/tools/namespace.rs`).
+
+### `DELETE /api/v1/namespaces` — clear namespace standard (collection form)
+
+S35 collection clear. Unlike POST, DELETE **does** take
+`?namespace=<ns>` (required; omitting it is **400**). Path-form twin
+below.
+
 ### `GET /api/v1/namespaces/{ns}/standard` — get namespace standard
 
 Query: `inherit` (boolean, default `false`). When `true`, returns the
@@ -1405,7 +1446,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. **`/api/v1/memory_calibrate_confidence` is a caller-scoped aggregate ([#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507)):** the report's `baselines` NAME namespaces, so the sweep is computed only over rows the caller can read, using the store's own visibility predicates (subtree scopes, owner-keyed `scope=private`, substrate exclusion) on BOTH backends. `X-Agent-Id` is REQUIRED — an absent header answers `403`, never the pre-#3507 corpus-wide sweep, because the shared resolver would otherwise synthesize a per-request `anonymous:req-…` that owns no rows. An admin caller (the existing `is_admin_caller_trusted` gate) keeps the global aggregate; every other caller is scoped, and for a scoped caller the sweep is strictly read-only (the `recall_outcome` backfill is admin-only, so `consumption_utility` may report `null`). |
 | `GET`  | `/api/v1/admin/quarantine` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — list the memories currently held in federation quarantine (`handlers::list_quarantined`). **Admin-gated.** Identifying metadata ONLY (id, namespace, title, source, kind, timestamps) — never `content`: a quarantined row is untrusted input by construction and its content may be an at-rest seal sentinel. `?namespace=` narrows, `?limit=` pages (clamped to 1000). |
 | `POST` | `/api/v1/admin/quarantine/{id}/release` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — release one quarantined memory back to `lifecycle_state=open` (`handlers::release_quarantined`), the operator half of the [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) route-OUT contract that shipped with no caller. **Admin-gated**; the audit actor is the principal `require_admin` RETURNS — an id it admits only when it is on the admin allowlist AND the deployment has request authentication configured (#1570), and, under the `enforce` identity-binding posture, only when it is key-attested to a per-agent api key (#2044). The handler never reads `X-Agent-Id` itself. Appends a `memory.dequarantined` signed audit row in the SAME transaction as the state change on both backends. Idempotent: an id that is not currently quarantined answers `200 {"released": false}` and writes nothing (deliberately not `404` — that would leak the existence of rows this surface does not return). |
-| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (104 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
+| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (**104** advertised entries at `--profile full`; **7** family tools at `core`, **8** on the wire with always-on `memory_capabilities`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
 #### Skills export root (#3357)
 
@@ -1439,8 +1480,8 @@ daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 84` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 98`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 86` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 100`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).
@@ -1448,12 +1489,13 @@ daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 > Re-derive the path count yourself against the route-path SSOT:
 >
 > ```bash
-> grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l   # 80
+> grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l
 > ```
 >
-> That is 79 `/api/v1/*` paths plus the bare `/metrics`. Do not count
-> `.route(` occurrences in `src/lib.rs` to get the registration total —
-> the router also registers test-only routes under `#[cfg(test)]`, so a
+> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (86): the
+> `/api/v1/*` paths plus the bare `/metrics`. Do not count `.route(`
+> occurrences in `src/lib.rs` to get the registration total — the
+> router also registers test-only routes under `#[cfg(test)]`, so a
 > raw grep overcounts; the pinned const is the answer.
 >
 > **Postgres caveat.** Not every registered route is served on the
@@ -1476,7 +1518,7 @@ MCP-only.
 
 ### v0.9.0 + v1.0.0 net-new endpoints
 
-The four paths below complete the 80-unique-path inventory. Each is
+The paths below complete the unique-path inventory. Each is
 registered in `src/lib.rs` against the corresponding
 `src/handlers/routes.rs` const, so the path string here is the SSOT
 value, not a transcription.
@@ -1507,13 +1549,13 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
 | `memory_agent_register` / `memory_agent_list` | `POST /api/v1/agents`, `GET /api/v1/agents` | `meta` family. Register an NHI agent (`agent_type`, `capabilities`) in `_agents` (refreshes `last_seen_at`, preserves `registered_at`) and list every registered agent (ordered by `registered_at`). `agent_id` is CLAIMED, not attested — pair with attestation (#626 Layer-3) for a security boundary. |
 
-For the canonical full inventory — **103 entries advertised at `--profile full`** (102 callable tools plus the always-on `memory_capabilities` bootstrap), matching the `GET /api/v1/tools/list` row above:
+For the canonical full inventory — **104 advertised entries at `--profile full`** (103 callable "memory tools" plus the always-on `memory_capabilities` bootstrap, which is also listed in `Family::Meta` so `Profile::full().expected_tool_count()` **is** 104), matching the `GET /api/v1/tools/list` row above:
 
 ```bash
-grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l   # 103
+grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l
 ```
 
-The `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth, and `Profile::full().expected_tool_count()` in `src/profile.rs` is the SSOT the registry is pinned against (`const_count_matches_full_profile`). `memory_capabilities` is counted inside the `full` families, which is why `full` is 103 and not 104.
+The `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth, and `Profile::full().expected_tool_count()` in `src/profile.rs` is the SSOT the registry is pinned against (`profile_full_matches_registry_all` / `tool_names::ALL.len()`). See issue #862 for the 104-vs-103 disambiguation.
 
 Default `--profile core` selects **7** family tools (`Profile::core().expected_tool_count()`), and `tools/list` then appends the always-on `memory_capabilities` (`profile::ALWAYS_ON_TOOLS`), so a `core` daemon advertises **8 entries on the wire**. Both numbers are correct and mean different things; cite the one you need.
 

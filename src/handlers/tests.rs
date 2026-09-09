@@ -11292,6 +11292,38 @@ async fn http_set_namespace_standard_qs_missing_namespace_returns_400() {
 }
 
 #[tokio::test]
+async fn http_set_namespace_standard_qs_query_string_is_not_read_3416() {
+    // #3416 — POST /api/v1/namespaces takes namespace from the JSON
+    // body only. A query-string `?namespace=` does not rescue a body
+    // that omits it (S34 is body-shaped; DELETE is the QS verb).
+    let state = test_state();
+    let app = Router::new()
+        .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+        .with_state(test_app_state(state));
+    let body = json!({"governance": {"approver": "human"}});
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/namespaces?namespace=from-qs")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("namespace"),
+        "query-string namespace must not be treated as the subject, got {v:?}"
+    );
+}
+
+#[tokio::test]
 async fn http_set_namespace_standard_qs_invalid_governance_returns_400() {
     // Pre-seed a real memory we can target by id, so we get past the
     // placeholder branch and into `validate_governance_policy`.

@@ -1291,9 +1291,11 @@ pub fn build_router_with_timeout(
         )
         // HTTP parity for MCP-only tools. The `/api/v1/namespaces` surface
         // serves three verbs: GET lists namespaces OR (when ?namespace=…)
-        // fetches the namespace standard, POST sets a standard, DELETE
-        // clears one. S34/S35 use the query-string form; the path form
-        // (`/api/v1/namespaces/{ns}/standard`) is kept for MCP-tool parity.
+        // fetches the namespace standard; POST sets a standard (namespace
+        // in the JSON body — query-string `?namespace=` is NOT read on
+        // POST, #3416); DELETE clears one (`?namespace=` required). The
+        // path form (`/api/v1/namespaces/{ns}/standard`) is kept for
+        // MCP-tool parity.
         .route(
             handlers::routes::NAMESPACES,
             get(handlers::get_namespace_standard_qs),
