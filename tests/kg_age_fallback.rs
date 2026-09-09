@@ -166,6 +166,27 @@ async fn insert_fixture_links(url: &str, ids: &[String]) {
     }
 }
 
+/// Bind AGE's binary wire type, as the production Cypher helpers do (#2511).
+/// AGE requires a bare, agtype-typed parameter rather than a cast from text.
+struct Agtype(String);
+
+impl sqlx::Type<sqlx::Postgres> for Agtype {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_name("ag_catalog.agtype")
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Postgres> for Agtype {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        buf.push(1); // AGE binary format version, followed by JSON text.
+        buf.extend_from_slice(self.0.as_bytes());
+        Ok(sqlx::encode::IsNull::No)
+    }
+}
+
 /// Project the same edges into the AGE `memory_graph` so the cypher
 /// branch has data to traverse. Same shape as
 /// `tests/age_cte_equivalence.rs::project_fixture_into_age`.
@@ -186,11 +207,12 @@ async fn project_fixture_into_age(
 
     for id in ids {
         let cypher = "MERGE (n {id: $id}) RETURN n";
-        let sql = format!(
-            "SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1::agtype) AS (n agtype)"
-        );
+        let sql = format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (n agtype)");
         let params = serde_json::json!({ "id": id }).to_string();
-        sqlx::query(&sql).bind(params).fetch_all(&mut *tx).await?;
+        sqlx::query(&sql)
+            .bind(Agtype(params))
+            .fetch_all(&mut *tx)
+            .await?;
     }
 
     let base = chrono::Utc::now() - chrono::Duration::seconds(1000);
@@ -202,9 +224,7 @@ async fn project_fixture_into_age(
              SET r.valid_from = $vf, r.observed_by = 'ai:fold-a2a1-3-fallback', \
                  r.created_at = $vf \
              RETURN r";
-        let sql = format!(
-            "SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1::agtype) AS (r agtype)"
-        );
+        let sql = format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (r agtype)");
         let params = serde_json::json!({
             "src": ids[*src],
             "dst": ids[*dst],
@@ -212,7 +232,10 @@ async fn project_fixture_into_age(
             "vf": valid_from,
         })
         .to_string();
-        sqlx::query(&sql).bind(params).fetch_all(&mut *tx).await?;
+        sqlx::query(&sql)
+            .bind(Agtype(params))
+            .fetch_all(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;

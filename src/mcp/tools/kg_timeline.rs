@@ -64,12 +64,14 @@ pub fn handle_kg_timeline(
         .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
 
-    // #3498: an ID anchor does not opt into substrate reads, even in the
-    // single-tenant posture. Use the unfiltered row so hidden lifecycle states
+    // #3498: naming an anchor explicitly requests its namespace.
+    // Use the unfiltered row so hidden lifecycle states
     // cannot skip the source check (#3270); lookup failures fail closed.
     {
         match db::get_any(conn, source_id) {
-            Ok(Some(mem)) if !crate::visibility::is_readable_on_query(&mem, caller, None) => {
+            Ok(Some(mem))
+                if !crate::visibility::is_readable_on_query(&mem, caller, Some(&mem.namespace)) =>
+            {
                 return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
             }
             Ok(_) => {}

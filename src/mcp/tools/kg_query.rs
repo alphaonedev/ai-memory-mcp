@@ -369,7 +369,20 @@ fn kg_query_from_source(
         .into_iter()
         .filter(|n| {
             let hops_readable = n.path.split("->").all(|id| match db::get(conn, id) {
-                Ok(Some(mem)) => crate::visibility::is_readable_on_query(&mem, caller, namespace),
+                Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                    &mem,
+                    caller,
+                    // #3498 follow-up (rule 1): the anchor the caller NAMED is
+                    // an explicit request for its own namespace; every other
+                    // hop uses the request's `namespace` (the explicit opt-in
+                    // `memory_recall --namespace` also honours, #3348) or the
+                    // ambient rule when none was given.
+                    if id == source_id {
+                        Some(mem.namespace.as_str())
+                    } else {
+                        namespace
+                    },
+                ),
                 _ => false,
             });
             hops_readable

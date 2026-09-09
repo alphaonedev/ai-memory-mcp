@@ -78,3 +78,13 @@ src/cli/stop.rs:AI_OPERATOR
 # ctx keys the covenant clause-1 substrate why_trace stamp, matching the
 # direct-sqlite path's substrate_authored=true.
 src/recover/mod.rs:opts.agent_id
+# #3498 follow-up — read-only anchor admission probes. The binding #944/#941
+# decision requires inspecting the row before applying the handler's gate:
+# timeline hides inaccessible substrate anchors but returns 403 for ordinary
+# non-owners; HTTP link admits ordinary targets under source ownership
+# (#939, amended rule 3). SAL get otherwise folds these into NotFound.
+# Each context is scoped to this one lookup, never
+# passed to traversal or mutation, and the returned row is checked before use.
+# Candidate exceptions for Fable's code/security review on #3498.
+src/handlers/kg.rs:caller
+src/handlers/links.rs:caller
