@@ -522,11 +522,15 @@ mod tests {
         let mut src = make_mem("inbox source", "_messages/ai:bob", "ai:alice");
         src.metadata["target_agent_id"] = json!("ai:bob");
         let id = db::insert(&conn, &src).expect("seed inbox");
-        let mut params = json!({"source_memory_id": id, "target_agent_id": "ai:carol"});
+        // Named `request`, not `params`: the #3171 schema-subset guard
+        // (`tests/mcp_handler_params_subset_of_schema.rs`) reads every
+        // `params["key"]` in this file, test modules included, and `namespace`
+        // is deliberately NOT a declared share parameter.
+        let mut request = json!({"source_memory_id": id, "target_agent_id": "ai:carol"});
         for namespace in [None, Some("_messages/ai:bob")] {
-            params["namespace"] = json!(namespace);
+            request["namespace"] = json!(namespace);
             for caller in [None, Some("ai:alice"), Some("ai:bob"), Some("ai:mallory")] {
-                let error = handle_share(&conn, &params, caller)
+                let error = handle_share(&conn, &request, caller)
                     .expect_err("share cannot opt into substrate namespaces");
                 assert_eq!(error, format!("source memory {id} not found"));
             }
