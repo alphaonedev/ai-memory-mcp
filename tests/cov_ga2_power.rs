@@ -532,17 +532,17 @@ async fn consolidate_invalid_ids_is_400() {
 }
 
 #[tokio::test]
-async fn consolidate_missing_source_id_is_400() {
+async fn consolidate_missing_source_id_is_404() {
     let (r, _t) = sqlite_router();
     // No summary → resolve_consolidate_summary fetches source pairs;
-    // a missing id short-circuits to 400 naming the offending id.
+    // a missing id short-circuits to 404 naming the offending id.
     let (status, body) = post_json(
         &r,
         "/api/v1/consolidate",
         json!({"ids": ["ghost-id-1", "ghost-id-2"], "title": "merge"}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
         body["error"]
             .as_str()

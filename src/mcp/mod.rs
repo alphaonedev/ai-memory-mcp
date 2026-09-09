@@ -8065,10 +8065,24 @@ mod tests {
     fn handle_consolidate_error_missing_summary_keyword_tier() {
         // Keyword tier has no LLM, so `summary` is required.
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let req = make_tools_call(
-            "memory_consolidate",
-            json!({"ids": ["a", "b"], "title": "t"}),
-        );
+        // Source admission precedes summary resolution (#3380).
+        let ids: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|title| {
+                db::insert(
+                    &conn,
+                    &Memory {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        title: title.into(),
+                        content: "source observation".into(),
+                        metadata: json!({"scope": "collective"}),
+                        ..Memory::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let req = make_tools_call("memory_consolidate", json!({"ids": ids, "title": "t"}));
         let resp = invoke_handle_request(&conn, &req);
         let result = resp.result.unwrap();
         assert_eq!(result["isError"], true);

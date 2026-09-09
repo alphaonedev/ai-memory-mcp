@@ -390,9 +390,9 @@ async fn consolidate_llm_auto_summary_when_summary_omitted() {
 }
 
 #[tokio::test]
-async fn consolidate_unknown_source_id_returns_400() {
+async fn consolidate_unknown_source_id_returns_404() {
     // LLM wired, summary omitted → resolve_consolidate_summary fetches
-    // source pairs and a missing id short-circuits to 400.
+    // source pairs and a missing id short-circuits to 404.
     let server = start_chat_mock("ignored").await;
     let (router, _f, _db) = build_llm_router(Some(&server.uri()));
     let id1 = seed_memory(&router, "cov-cons2", "Real one", "consol2").await;
@@ -407,7 +407,7 @@ async fn consolidate_unknown_source_id_returns_400() {
         "consol2",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
 }
 
 #[tokio::test]

@@ -1604,6 +1604,9 @@ mod d1_6_987_tests {
     /// fails the build rather than silently unpinning a tool.
     const DOCS_CORRECTIONS: &[&str] = &[
         "memory_archive_purge",
+        // 2026-09-09 (#3380): tombstoned sources retain derived_from links;
+        // the former metadata-only provenance claim was false.
+        "memory_consolidate",
         "memory_delete",
         "memory_entity_register",
         "memory_export_reflection",

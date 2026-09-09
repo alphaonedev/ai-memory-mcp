@@ -710,11 +710,11 @@ pg_test!(
     }
 );
 
-pg_test!(pg_consolidate_unknown_source_id_is_400, url, {
+pg_test!(pg_consolidate_unknown_source_id_is_404, url, {
     let r = pg_router(&url).await;
     let ns = uniq_ns();
     // No summary forces the source-pair fetch; a non-existent id in the
-    // postgres arm surfaces as a 400 (NotFound → memory_not_found).
+    // postgres arm surfaces as a 404 (NotFound → memory_not_found).
     let ghost = format!("ghost-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ghost2 = format!("ghost-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let (status, _b) = post_json(
@@ -728,7 +728,7 @@ pg_test!(pg_consolidate_unknown_source_id_is_400, url, {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 });
 
 // ---------------------------------------------------------------------------

@@ -1662,7 +1662,7 @@ impl RequestValidator {
         namespace: &str,
     ) -> Result<(), ValidationError> {
         validate_consolidate_request(ids, title, namespace)
-            .map_err(|e| ValidationError::from_anyhow("consolidate", e))
+            .map_err(|e| ValidationError::from_anyhow(crate::audit::OP_CONSOLIDATE, e))
     }
 
     /// Memory-consolidation request validation. Mirrors
@@ -1678,7 +1678,7 @@ impl RequestValidator {
         namespace: &str,
     ) -> Result<(), ValidationError> {
         validate_consolidate(ids, title, summary, namespace)
-            .map_err(|e| ValidationError::from_anyhow("consolidate", e))
+            .map_err(|e| ValidationError::from_anyhow(crate::audit::OP_CONSOLIDATE, e))
     }
 
     /// Single-field id validation, surfaced through the facade for
