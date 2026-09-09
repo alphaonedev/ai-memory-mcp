@@ -176,3 +176,57 @@ fn refresher_stays_the_store_opener_and_installs_as_the_hub_uid_3578() {
         "refresher must land the snapshot where the hub unit reads it"
     );
 }
+
+/// systemd-sysusers `u` records (the NAME field). Comments and non-`u`
+/// rows are skipped. `ai-memory` and `ai-memory-hub` are distinct names
+/// (whitespace-split), so a prefix match cannot collapse them.
+fn sysusers_user_names(conf: &str) -> Vec<&str> {
+    trimmed_lines(conf)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("u"), Some(name)) => Some(name),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn sysusers_violations(conf: &str) -> Vec<&'static str> {
+    let names = sysusers_user_names(conf);
+    let mut v = Vec::new();
+    if !names.iter().any(|n| *n == "ai-memory") {
+        v.push("missing u ai-memory");
+    }
+    if !names.iter().any(|n| *n == "ai-memory-hub") {
+        v.push("missing u ai-memory-hub");
+    }
+    v
+}
+
+#[test]
+fn sysusers_file_names_both_users_3578() {
+    let conf = read("packaging/systemd/ai-memory.sysusers.conf");
+    let violations = sysusers_violations(&conf);
+    assert!(
+        violations.is_empty(),
+        "sysusers fragment must name both users so the shipped units can start on a fresh host: {violations:?}"
+    );
+}
+
+#[test]
+fn a_sysusers_file_missing_the_hub_user_is_refused_3578() {
+    // DENIED pin: a fragment that only creates the daemon user leaves
+    // User=ai-memory-hub unknown and the hub unit cannot start.
+    let only_daemon = "u ai-memory - \"ai-memory daemon\" /var/lib/ai-memory\n";
+    let v = sysusers_violations(only_daemon);
+    assert!(
+        v.iter().any(|s| s.contains("ai-memory-hub")),
+        "denied pin must catch a missing hub user, got {v:?}"
+    );
+    assert!(
+        !v.iter().any(|s| *s == "missing u ai-memory"),
+        "denied pin must still accept the daemon user, got {v:?}"
+    );
+}
