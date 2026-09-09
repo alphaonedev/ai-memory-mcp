@@ -375,9 +375,17 @@ pub async fn skill_promote_route(
     // mints a new skill row carrying the promoting agent's signing
     // surface. Cross-tenant promote = laundering an executable
     // capability through someone else's reflection.
-    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_promote") {
-        return resp;
-    }
+    let caller = match super::admin_role::require_admin(&app, &headers, "skill_promote") {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let is_admin = crate::identity::is_admin_agent_in(&caller, &app.admin_agent_ids)
+        && super::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
+    let read_caller = if is_admin {
+        None
+    } else {
+        Some(caller.as_str())
+    };
     let mut params = json!({
         (field_names::REFLECTION_ID): id,
         (field_names::SKILL_NAME): body.name,
@@ -388,9 +396,10 @@ pub async fn skill_promote_route(
     }
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
-    match crate::mcp::handle_skill_promote_from_reflection(&lock.0, &params, kp) {
+    match crate::mcp::handle_skill_promote_for_caller(&lock.0, &params, kp, &caller, read_caller) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
+            let e = e.to_string();
             if e.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {

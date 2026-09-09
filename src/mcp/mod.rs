@@ -756,6 +756,7 @@ pub use skill_export::{
 };
 pub use skill_get::handle_skill_get;
 pub use skill_list::handle_skill_list;
+pub(crate) use skill_promote::handle_skill_promote_for_caller;
 pub use skill_promote::handle_skill_promote_from_reflection;
 pub use skill_register::handle_skill_register;
 pub use skill_resource::handle_skill_resource;
@@ -770,6 +771,7 @@ pub use skill_retire::{handle_skill_delete, handle_skill_retire};
 pub use calibrate_confidence::handle_calibrate_confidence;
 pub use dependents_of_invalidated::handle_dependents_of_invalidated;
 pub use export_reflection::handle_export_reflection;
+pub(crate) use export_reflection::handle_export_reflection_for_caller;
 pub use pending::handle_subscription_dlq_list;
 pub use reflect::{handle_reflect, handle_reflect_caller};
 // Consumed only by the postgres SAL HTTP branch in `route_1111`, which is

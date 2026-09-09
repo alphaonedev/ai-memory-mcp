@@ -698,26 +698,42 @@ async fn dependents_http_via_store(app: &AppState, params: &Value) -> axum::resp
 
 /// `POST /api/v1/memory_export_reflection` — export a reflection
 /// memory + its full reflects_on lineage as a structured JSON bundle.
-/// Read-only; no caller-ownership gate (the lineage walk uses
-/// substrate visibility filters).
+/// The reflection and every linked source must be readable before rendering.
 pub async fn handle_export_reflection_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // #3064 batch C — postgres SAL dispatch. `get` (admin-bypass, matching
-    // sqlite `db::get` with no caller gate) + `list_outbound_reflects_on`
-    // + the same CLI renderer the MCP handler uses.
+    if let Some(response) = super::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "export_reflection",
+    ) {
+        return response;
+    }
+    let caller =
+        match super::parity::resolve_caller_agent_id(body["agent_id"].as_str(), &headers, None) {
+            Ok(caller) => caller,
+            Err(error) => return err_response(error),
+        };
+    let is_admin = crate::identity::is_admin_agent_in(&caller, &app.admin_agent_ids)
+        && super::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
+    let read_caller = if is_admin {
+        None
+    } else {
+        Some(caller.as_str())
+    };
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return export_reflection_http_via_store(&app, &body).await;
+        return export_reflection_http_via_store(&app, &body, &caller, is_admin).await;
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_export_reflection(&lock.0, &body);
+    let result = crate::mcp::handle_export_reflection_for_caller(&lock.0, &body, read_caller);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => err_response(e),
+        Err(e) => err_response(e.to_string()),
     }
 }
 
@@ -726,6 +742,8 @@ pub async fn handle_export_reflection_http(
 async fn export_reflection_http_via_store(
     app: &AppState,
     params: &Value,
+    caller: &str,
+    is_admin: bool,
 ) -> axum::response::Response {
     use crate::cli::commands::export_reflections::{self, ExportFormat, ReflectsOnEdge};
     use crate::mcp::param_names;
@@ -758,16 +776,19 @@ async fn export_reflection_http_via_store(
             return err_response(crate::errors::msg::unsupported_export_format(other));
         }
     };
-    // sqlite `db::get` is unfiltered; SAL `get` with `for_admin` is the
-    // bypass_visibility twin so private reflections still export (parity).
-    let ctx = CallerContext::for_admin("http:export-reflection");
+    let ctx = CallerContext::for_admin_checked(caller, is_admin);
+    let read_caller = if is_admin { None } else { Some(caller) };
+    let refusal = || err_response(format!("reflection not found: {memory_id}"));
     let mem = match app.store.get(&ctx, &memory_id).await {
         Ok(m) => m,
         Err(StoreError::NotFound { .. }) => {
-            return err_response(crate::errors::msg::memory_not_found(&memory_id));
+            return refusal();
         }
         Err(e) => return super::store_err_to_response(e),
     };
+    if !crate::visibility::is_readable_on_query(&mem, read_caller, None) {
+        return refusal();
+    }
     if !matches!(mem.memory_kind, MemoryKind::Reflection) {
         return err_response(format!("memory is not a reflection: {memory_id}"));
     }
@@ -782,6 +803,13 @@ async fn export_reflection_http_via_store(
             .collect::<Vec<_>>(),
         Err(e) => return super::store_err_to_response(e),
     };
+    for edge in &edges {
+        match app.store.get(&ctx, &edge.target_id).await {
+            Ok(source) if crate::visibility::is_readable_on_query(&source, read_caller, None) => {}
+            Ok(_) | Err(StoreError::NotFound { .. }) => return refusal(),
+            Err(error) => return super::store_err_to_response(error),
+        }
+    }
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let content = export_reflections::render_payload(&mem, &edges, attest_level, format);
     let ns_clean = mem.namespace.trim_matches('/');

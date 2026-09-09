@@ -1629,6 +1629,8 @@ mod d1_6_987_tests {
         "memory_signal_inbox",
         "memory_skill_delete",
         "memory_skill_get",
+        // #3551: source admission replaces missing-source stubs before promotion.
+        "memory_skill_promote_from_reflection",
         "memory_stats",
     ];
 

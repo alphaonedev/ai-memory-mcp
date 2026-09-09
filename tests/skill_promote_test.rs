@@ -573,3 +573,6 @@ fn skills_ref_validates_promoted_skill_if_installed() {
         }
     }
 }
+
+#[path = "skill_promote_visibility_3551/mod.rs"]
+mod visibility_3551;

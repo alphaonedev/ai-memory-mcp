@@ -492,6 +492,13 @@ promote) and refuses depths below
 produces the IDENTICAL SHA-256 digest as the in-DB row — the lineage
 is preserved cryptographically across promotion and re-registration.
 
+The reflection and every linked source must be readable by the resolved caller
+before promotion renders, audits, signs or registers the bundle (#3551).
+Hidden and missing members both refuse with `reflection not found: <requested id>`;
+deleted-source stubs are no longer produced. `metadata.promoted_by` records the
+resolved actor. HTTP promotion remains admin-only and SQLite-only; PostgreSQL
+returns 501, and its promotion allowed path is not applicable until #2804.
+
 Full surface is documented in [`docs/agent-skills.md`](agent-skills.html);
 this section pins the substrate-side contract for the reflection ↔
 skill bridge.
@@ -538,7 +545,14 @@ The companion MCP tool `memory_export_reflection` returns the
 rendered content + a suggested filename without touching the
 filesystem — the agent harness owns disk I/O so the substrate
 stays under the operator's capability gate. Symmetric with
-`memory_skill_export` (L1-5).
+`memory_skill_export` (L1-5). MCP and HTTP export admit the reflection and every
+linked source before rendering; a hidden or missing member returns the same
+`reflection not found: <requested id>` refusal. HTTP uses its header-bound caller
+on both backends. Export and HTTP promotion permit an admin read exemption only
+when the caller passes both the explicit admin allowlist and the existing trusted,
+identity-bound admin check. Substrate namespaces remain excluded from these
+unscoped reads. MCP with no configured identity retains local single-operator
+visibility; a configured but malformed identity fails closed.
 
 Per-namespace auto-export: setting
 `governance.auto_export_reflections_to_filesystem: true` on a
