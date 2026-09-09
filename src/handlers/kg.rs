@@ -636,7 +636,12 @@ pub async fn kg_timeline(
         if matches!(app.storage_backend, StorageBackend::Postgres) {
             let ctx = crate::store::CallerContext::for_agent(caller.clone());
             match app.store.get(&ctx, &p.source_id).await {
-                Ok(mem) => Some(extract_owner_target(&mem)),
+                Ok(mem) => crate::visibility::is_readable_on_query(
+                    &mem,
+                    (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
+                    None,
+                )
+                .then(|| extract_owner_target(&mem)),
                 Err(e) => {
                     let msg = format!("{e:?}");
                     if msg.contains("NotFound") || msg.contains("not found") {
@@ -654,7 +659,12 @@ pub async fn kg_timeline(
         } else {
             let lock = app.db.lock().await;
             match db::get(&lock.0, &p.source_id) {
-                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
+                Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                    &mem,
+                    (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
+                    None,
+                )
+                .then(|| extract_owner_target(&mem)),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::error!("kg_timeline: source lookup failed: {e}");
@@ -670,7 +680,12 @@ pub async fn kg_timeline(
         {
             let lock = app.db.lock().await;
             match db::get(&lock.0, &p.source_id) {
-                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
+                Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                    &mem,
+                    (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
+                    None,
+                )
+                .then(|| extract_owner_target(&mem)),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::error!("kg_timeline: source lookup failed: {e}");
@@ -738,14 +753,18 @@ pub async fn kg_timeline(
                 // source-owner gate above does not cover the target
                 // title/namespace these events disclose; drop any event whose
                 // target memory is not visible to the caller (see the MCP
-                // twin in mcp/tools/kg_timeline.rs). Daemon/admin is exempt
-                // (matches the source-gate exemption above).
-                let events = if caller != sentinels::DAEMON_PRINCIPAL {
+                // twin in mcp/tools/kg_timeline.rs). #3498: the substrate
+                // gate also applies to daemon reads.
+                let events = {
                     let raw_ctx = crate::store::CallerContext::for_admin(caller.clone());
                     let mut kept = Vec::with_capacity(events.len());
                     for e in events {
                         let visible = match app.store.get(&raw_ctx, &e.target_id).await {
-                            Ok(m) => crate::visibility::is_visible_to_caller(&m, &caller),
+                            Ok(m) => crate::visibility::is_readable_on_query(
+                                &m,
+                                (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
+                                None,
+                            ),
                             Err(_) => false,
                         };
                         if visible {
@@ -753,8 +772,6 @@ pub async fn kg_timeline(
                         }
                     }
                     kept
-                } else {
-                    events
                 };
                 let events_json: Vec<serde_json::Value> = events
                     .iter()
@@ -788,12 +805,15 @@ pub async fn kg_timeline(
             // the postgres branch above). `db::get` is the raw storage read,
             // so the visibility check is explicit here; a missing target row
             // has no metadata to leak and is retained.
-            if caller != sentinels::DAEMON_PRINCIPAL {
-                events.retain(|e| {
-                    db::get(&lock.0, &e.target_id)
-                        .ok()
-                        .flatten()
-                        .is_none_or(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+            {
+                events.retain(|e| match db::get_any(&lock.0, &e.target_id) {
+                    Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                        &mem,
+                        (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
+                        None,
+                    ),
+                    Ok(None) => true,
+                    Err(_) => false,
                 });
             }
             let events_json: Vec<serde_json::Value> = events
@@ -1275,23 +1295,14 @@ pub struct KgQueryBody {
     pub rel_types: Option<Vec<String>>,
 }
 
-/// #910 (security-medium, 2026-05-19) — apply the scope=private
-/// visibility filter on `POST /api/v1/kg/query` traversal results.
-/// Pre-#910 the handler returned every reachable target node from
-/// the recursive-CTE / AGE Cypher walk; a target whose
-/// `metadata.scope == "private"` was visible to any caller who could
-/// pass `kg_query` validation, including callers other than the
-/// target's `metadata.agent_id` owner. The fix mirrors the post-
-/// filter applied in `memories_query::list_memories` — a row is
-/// visible iff `metadata.scope != "private"` OR
-/// `metadata.agent_id == caller`. Rows we cannot fetch (deleted
-/// since the traversal, in another namespace the caller cannot
-/// read, etc.) fail-closed (excluded).
+/// #3498/#910: admit only readable graph-path IDs. This HTTP request has no
+/// namespace parameter, so substrate rows are always withheld. Failed lookups
+/// drop the path. Callers deduplicate IDs before fetching full memory rows.
 #[cfg(feature = "sal-postgres")]
 async fn kg_query_filter_visible(
     app: &AppState,
     caller: &str,
-    target_ids: Vec<String>,
+    target_ids: std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
     // v0.7.0 F-E3 fix (issue #1436): route through the canonical
     // `crate::visibility::is_visible_to_caller` helper instead of
@@ -1305,7 +1316,7 @@ async fn kg_query_filter_visible(
     let ctx = crate::store::CallerContext::for_agent(caller);
     for id in target_ids {
         if let Ok(mem) = app.store.get(&ctx, &id).await {
-            if crate::visibility::is_visible_to_caller(&mem, caller) {
+            if crate::visibility::is_readable_on_query(&mem, Some(caller), None) {
                 visible.insert(id);
             }
         }
@@ -1487,11 +1498,14 @@ pub async fn kg_query(
                 // `kg_query_filter_visible`). Pre-#910 every reachable
                 // target was returned verbatim regardless of the
                 // target's owner / scope.
-                let target_ids: Vec<String> = nodes.iter().map(|n| n.target_id.clone()).collect();
+                let target_ids: std::collections::HashSet<String> = nodes
+                    .iter()
+                    .flat_map(|n| n.path.split("->").map(str::to_string))
+                    .collect();
                 let visible = kg_query_filter_visible(&app, &caller, target_ids).await;
                 let nodes: Vec<_> = nodes
                     .into_iter()
-                    .filter(|n| visible.contains(&n.target_id))
+                    .filter(|n| n.path.split("->").all(|id| visible.contains(id)))
                     .collect();
 
                 // S82's wire shape — when `to` is supplied, project a
@@ -1572,10 +1586,10 @@ pub async fn kg_query(
             // #951 closed at the SAL layer.
             let mut visible: std::collections::HashSet<String> =
                 std::collections::HashSet::with_capacity(nodes.len());
-            for n in nodes {
-                if let Ok(Some(mem)) = db::get(&lock.0, &n.target_id) {
-                    if crate::visibility::is_visible_to_caller(&mem, &caller) {
-                        visible.insert(n.target_id.clone());
+            for id in nodes.iter().flat_map(|n| n.path.split("->")) {
+                if let Ok(Some(mem)) = db::get(&lock.0, id) {
+                    if crate::visibility::is_readable_on_query(&mem, Some(&caller), None) {
+                        visible.insert(id.to_string());
                     }
                 }
             }
@@ -1589,7 +1603,7 @@ pub async fn kg_query(
             let visible = nodes_opt.unwrap_or_default();
             let nodes: Vec<_> = nodes
                 .into_iter()
-                .filter(|n| visible.contains(&n.target_id))
+                .filter(|n| n.path.split("->").all(|id| visible.contains(id)))
                 .collect();
             // #3424 — the SAME shared projection the postgres branch uses.
             let memories_json = kg_query_memories_json(&nodes);

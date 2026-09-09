@@ -448,6 +448,49 @@ pub async fn create_link(
         return resp;
     }
 
+    // #3498: the non-mutating target admission rule matches MCP link.
+    // A named row ID does not opt a request into a substrate namespace.
+    if relation != crate::models::MemoryLinkRelation::Supersedes.as_str() {
+        let caller = match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
+            Ok(caller) => caller,
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+            }
+        };
+        #[cfg(feature = "sal")]
+        let target = if matches!(app.storage_backend, StorageBackend::Postgres) {
+            let ctx = crate::store::CallerContext::for_agent(&caller);
+            match app.store.get(&ctx, &target_id).await {
+                Ok(mem) => Some(mem),
+                Err(error) => return store_err_to_response(error),
+            }
+        } else {
+            let lock = app.db.lock().await;
+            match db::get_any(&lock.0, &target_id) {
+                Ok(mem) => mem,
+                Err(error) => return crate::handlers::errors::handler_error_500(&error),
+            }
+        };
+        #[cfg(not(feature = "sal"))]
+        let target = {
+            let lock = app.db.lock().await;
+            match db::get_any(&lock.0, &target_id) {
+                Ok(mem) => mem,
+                Err(error) => return crate::handlers::errors::handler_error_500(&error),
+            }
+        };
+        if target
+            .as_ref()
+            .is_some_and(|mem| !crate::visibility::is_readable_on_query(mem, Some(&caller), None))
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "caller cannot see the link target"})),
+            )
+                .into_response();
+        }
+    }
+
     // v0.7.0 Wave-3 — Postgres-backed daemons take the SAL trait
     // dispatch path. The trait's `link_signed` returns the resolved
     // `attest_level` so the wire response carries the same byte shape
@@ -1135,7 +1178,7 @@ pub async fn get_links(
     // an attacker who knew / guessed a victim's memory id could
     // enumerate that memory's outgoing link topology regardless of
     // whether either endpoint memory was scope=private owned by a
-    // different agent. Admin callers bypass the filter.
+    // different agent. Admin callers still apply the substrate gate.
     let caller = {
         let header_agent_id = headers
             .get(crate::HEADER_AGENT_ID)
@@ -1145,7 +1188,6 @@ pub async fn get_links(
     };
     let caller_is_admin =
         crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
-
     // v0.7.0 Wave-3 + FX-C2 (ARCH-2 followup) — Postgres-backed daemons
     // ride the SAL `get_links_for_anchor` trait method. Pre-FX-C2 this
     // branch walked the full `list_links(None)` set and narrowed
@@ -1157,10 +1199,11 @@ pub async fn get_links(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return match app.store.get_links_for_anchor(&id).await {
             Ok(edges) => {
-                let visible = if caller_is_admin {
-                    edges
-                } else {
-                    let ctx = crate::store::CallerContext::for_agent(&caller);
+                let visible: Vec<_> = {
+                    let ctx = crate::store::CallerContext::for_admin_checked(
+                        caller.clone(),
+                        caller_is_admin,
+                    );
                     let mut keep: Vec<_> = Vec::with_capacity(edges.len());
                     for link in edges {
                         // The SAL `get` already applies its own #910
@@ -1172,13 +1215,25 @@ pub async fn get_links(
                             .store
                             .get(&ctx, &link.source_id)
                             .await
-                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+                            .map(|m| {
+                                crate::visibility::is_readable_on_query(
+                                    &m,
+                                    (!caller_is_admin).then_some(caller.as_str()),
+                                    None,
+                                )
+                            })
                             .unwrap_or(false);
                         let tgt_ok = app
                             .store
                             .get(&ctx, &link.target_id)
                             .await
-                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+                            .map(|m| {
+                                crate::visibility::is_readable_on_query(
+                                    &m,
+                                    (!caller_is_admin).then_some(caller.as_str()),
+                                    None,
+                                )
+                            })
                             .unwrap_or(false);
                         if src_ok && tgt_ok {
                             keep.push(link);
@@ -1208,41 +1263,8 @@ pub async fn get_links(
     drop(lock);
     match links_for_anchor {
         Ok(links) => {
-            let visible = if caller_is_admin {
-                links
-            } else {
-                // ARCH-2 (post-#961 SAL boundary cleanup): route the
-                // per-endpoint visibility post-filter through the SAL
-                // `MemoryStore::get` trait method so the sqlite
-                // visibility check mirrors the postgres branch above
-                // (#910 scope=private folding into NotFound is honored
-                // verbatim in both backends). Under `--no-default-
-                // features` (no `sal`) the legacy `db::get`-based filter
-                // remains as the only available path.
-                #[cfg(feature = "sal")]
-                {
-                    let ctx = crate::store::CallerContext::for_agent(&caller);
-                    let mut keep: Vec<_> = Vec::with_capacity(links.len());
-                    for link in links {
-                        let src_ok = app
-                            .store
-                            .get(&ctx, &link.source_id)
-                            .await
-                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
-                            .unwrap_or(false);
-                        let tgt_ok = app
-                            .store
-                            .get(&ctx, &link.target_id)
-                            .await
-                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
-                            .unwrap_or(false);
-                        if src_ok && tgt_ok {
-                            keep.push(link);
-                        }
-                    }
-                    keep
-                }
-                #[cfg(not(feature = "sal"))]
+            let visible: Vec<_> = {
+                // Read endpoints from the same SQLite connection as the edges.
                 {
                     let lock = app.db.lock().await;
                     links
@@ -1253,14 +1275,22 @@ pub async fn get_links(
                                 .flatten()
                                 .as_ref()
                                 .is_some_and(|m| {
-                                    crate::visibility::is_visible_to_caller(m, &caller)
+                                    crate::visibility::is_readable_on_query(
+                                        m,
+                                        (!caller_is_admin).then_some(caller.as_str()),
+                                        None,
+                                    )
                                 });
                             let tgt_ok = db::get(&lock.0, &link.target_id)
                                 .ok()
                                 .flatten()
                                 .as_ref()
                                 .is_some_and(|m| {
-                                    crate::visibility::is_visible_to_caller(m, &caller)
+                                    crate::visibility::is_readable_on_query(
+                                        m,
+                                        (!caller_is_admin).then_some(caller.as_str()),
+                                        None,
+                                    )
                                 });
                             src_ok && tgt_ok
                         })
@@ -1358,8 +1388,9 @@ pub async fn get_lineage(
 
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        if !caller_is_admin {
-            let ctx = crate::store::CallerContext::for_agent(&caller);
+        {
+            let ctx =
+                crate::store::CallerContext::for_admin_checked(caller.clone(), caller_is_admin);
             // v1.0.0 #3270 — TOTAL over the `get` Result. `PostgresStore::get`
             // folds a non-recall-visible (tombstoned / quarantined) row AND a
             // scope-denied row AND a genuinely-absent row all into
@@ -1372,7 +1403,11 @@ pub async fn get_lineage(
             // backend error surfaces as itself, never as ALLOW (ERRORS-19).
             match app.store.get(&ctx, &id).await {
                 Ok(mem) => {
-                    if !crate::visibility::is_visible_to_caller(&mem, &caller) {
+                    if !crate::visibility::is_readable_on_query(
+                        &mem,
+                        (!caller_is_admin).then_some(caller.as_str()),
+                        None,
+                    ) {
                         return (
                             StatusCode::FORBIDDEN,
                             Json(json!({
@@ -1401,13 +1436,30 @@ pub async fn get_lineage(
             app.store.lineage_ancestors(&id, max_depth).await
         };
         return match walk {
-            Ok(nodes) => Json(json!({
-                "id": id,
-                "direction": direction,
-                "nodes": nodes,
-                "count": nodes.len(),
-            }))
-            .into_response(),
+            Ok(nodes) => {
+                let ctx =
+                    crate::store::CallerContext::for_admin_checked(caller.clone(), caller_is_admin);
+                let mut kept = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    if let Ok(mem) = app.store.get(&ctx, &node.id).await {
+                        if crate::visibility::is_readable_on_query(
+                            &mem,
+                            (!caller_is_admin).then_some(caller.as_str()),
+                            None,
+                        ) {
+                            kept.push(node);
+                        }
+                    }
+                }
+                let nodes = kept;
+                Json(json!({
+                    "id": id,
+                    "direction": direction,
+                    "nodes": nodes,
+                    "count": nodes.len(),
+                }))
+                .into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -1420,9 +1472,15 @@ pub async fn get_lineage(
     // owner-checked (non-owner → 403; the owner keeps access to their own
     // tombstoned root's conserved lineage). A genuinely-absent root still
     // proceeds to the empty walk (unchanged); a lookup error fails closed.
-    if !caller_is_admin {
+    {
         match db::get_any(&lock.0, &id) {
-            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, &caller) => {
+            Ok(Some(mem))
+                if !crate::visibility::is_readable_on_query(
+                    &mem,
+                    (!caller_is_admin).then_some(caller.as_str()),
+                    None,
+                ) =>
+            {
                 drop(lock);
                 return (
                     StatusCode::FORBIDDEN,
@@ -1447,6 +1505,15 @@ pub async fn get_lineage(
     } else {
         db::lineage_ancestors(&lock.0, &id, max_depth)
     };
+    let walk = walk.map(|nodes| {
+        nodes
+            .into_iter()
+            .filter(|node| {
+                matches!(db::get_any(&lock.0, &node.id), Ok(Some(mem))
+            if crate::visibility::is_readable_on_query(&mem, (!caller_is_admin).then_some(caller.as_str()), None))
+            })
+            .collect::<Vec<_>>()
+    });
     drop(lock);
     match walk {
         Ok(nodes) => Json(json!({

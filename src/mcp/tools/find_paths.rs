@@ -81,21 +81,12 @@ pub fn handle_find_paths(
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
     validate::validate_id(target_id).map_err(|e| e.to_string())?;
 
-    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate onto the
-    // MCP surface. When a visibility caller is resolved (operator opted
-    // in via AI_MEMORY_AGENT_ID), gate on the SOURCE memory's ownership:
-    // if the source row exists and is not visible to the caller, refuse
-    // rather than leak its id-chain neighborhood. A `None` caller
-    // (single-tenant trust-all) or a missing source row proceeds
-    // unchanged. Gates on source_id only, matching the HTTP twin.
-    //
-    // v1.0.0 #3270 — TOTAL over `Result<Option<Memory>>` via the UNFILTERED
-    // `db::get_any`, so a hidden (tombstoned / quarantined per #3235) source
-    // is still owner-checked instead of its `Ok(None)` short-circuiting the
-    // gate and letting a non-owner walk it. A lookup error fails closed.
-    if let Some(caller) = caller {
+    // #3498: an ID anchor does not opt into substrate reads, even in the
+    // single-tenant posture. Use the unfiltered row so hidden lifecycle states
+    // cannot skip the source check (#3270); lookup failures fail closed.
+    {
         match db::get_any(conn, source_id) {
-            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, caller) => {
+            Ok(Some(mem)) if !crate::visibility::is_readable_on_query(&mem, caller, None) => {
                 return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
             }
             Ok(_) => {}
@@ -138,6 +129,16 @@ pub fn handle_find_paths(
         // distinguish "you asked for too much" from a real fault.
         e.to_string()
     })?;
+
+    let paths: Vec<_> = paths
+        .into_iter()
+        .filter(|path| {
+            path.iter().all(|id| {
+                matches!(db::get_any(conn, id), Ok(Some(mem))
+            if crate::visibility::is_readable_on_query(&mem, caller, None))
+            })
+        })
+        .collect();
 
     Ok(json!({
         "source_id": source_id,

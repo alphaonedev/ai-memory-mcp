@@ -64,23 +64,12 @@ pub fn handle_kg_timeline(
         .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
 
-    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate onto the
-    // MCP surface. When a visibility caller is resolved (operator opted
-    // in via AI_MEMORY_AGENT_ID), gate on the SOURCE memory's ownership:
-    // if the source row exists and is not visible to the caller, refuse
-    // rather than leak its outbound link-event timeline (target title /
-    // namespace / relation / valid_from). A `None` caller (single-tenant
-    // trust-all) or a missing source row proceeds unchanged. Gates on
-    // source_id only, matching the HTTP twin.
-    //
-    // v1.0.0 #3270 — TOTAL over `Result<Option<Memory>>` via the UNFILTERED
-    // `db::get_any`, so a hidden (tombstoned / quarantined per #3235) source
-    // is still owner-checked instead of its `Ok(None)` short-circuiting the
-    // gate and letting a non-owner read its outbound timeline. A lookup
-    // error fails closed.
-    if let Some(caller) = caller {
+    // #3498: an ID anchor does not opt into substrate reads, even in the
+    // single-tenant posture. Use the unfiltered row so hidden lifecycle states
+    // cannot skip the source check (#3270); lookup failures fail closed.
+    {
         match db::get_any(conn, source_id) {
-            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, caller) => {
+            Ok(Some(mem)) if !crate::visibility::is_readable_on_query(&mem, caller, None) => {
                 return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
             }
             Ok(_) => {}
@@ -111,26 +100,12 @@ pub fn handle_kg_timeline(
     let mut events =
         db::kg_timeline(conn, source_id, since, until, limit).map_err(|e| e.to_string())?;
 
-    // #1804 (SECURITY) — per-TARGET visibility filter. The source-owner gate
-    // above guards WHO can query a timeline, but the events disclose each
-    // linked TARGET's title + namespace; without this a caller could leak a
-    // victim's `scope=private` memory metadata by rooting a link at it and
-    // reading the timeline. Drop any event whose target memory is not visible
-    // to the caller (mirrors `get_links` / postgres `find_paths` per-row
-    // filtering). `None` caller = single-tenant trust-all (unchanged); a
-    // missing target row has no metadata to leak so it is retained.
-    //
-    // v1.0.0 #3270 (same #3235 root cause as the source gate above) — read
-    // through the UNFILTERED `db::get_any` and make the retain TOTAL. The
-    // pre-fix `db::get(..).ok().flatten().is_none_or(..)` folded a HIDDEN
-    // (tombstoned / quarantined) target into `None` → `is_none_or` RETAINED
-    // it → the timeline disclosed a hidden target's title/namespace
-    // cross-principal. Unfiltered, a hidden target is owner-checked (dropped
-    // for a non-owner, kept for its owner); a genuinely-missing target has no
-    // metadata to leak and is kept; a lookup error fails closed (drop).
-    if let Some(caller) = caller {
+    // #3498/#3270: apply the same rule to every returned target, including
+    // hidden lifecycle states. A lookup error drops the event; a genuinely
+    // absent target retains the historical dangling-edge behavior.
+    {
         events.retain(|e| match db::get_any(conn, &e.target_id) {
-            Ok(Some(m)) => crate::visibility::is_visible_to_caller(&m, caller),
+            Ok(Some(m)) => crate::visibility::is_readable_on_query(&m, caller, None),
             Ok(None) => true,
             Err(_) => false,
         });
