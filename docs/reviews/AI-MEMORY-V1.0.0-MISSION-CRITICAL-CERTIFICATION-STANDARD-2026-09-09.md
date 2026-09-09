@@ -1,7 +1,7 @@
 # ai-memory v1.0.0 — Mission-Critical Certification Standard (v1)
 
 **Author:** Claude Fable 5.1 (Conductor, sole merger of `release/v1.0.0`)
-**Date:** 2026-09-09 (revision 4.1: operator rulings recorded in §6)
+**Date:** 2026-09-09 (revision 4.2: freeze line recorded in §6 and §7)
 **Status:** NORMATIVE for the v1.0.0 certification decision. Supersedes Phase 6
 ("release and adoption decision") of `GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md` and
 prepends a scope-and-envelope section that plan lacked. Phases 1–5 of that plan remain
@@ -259,12 +259,12 @@ source artifact's `finished_at_utc`.
 Two tracks. **Tag-blocking** items are defects that would ship or evidence without which
 no "green" is recomputable; they precede the v1.0.0 tag. **Certificate-blocking** items
 produce the G1–G8 evidence about the shipped binary; they precede issuance of the
-certificate. **Operator ruling (2026-09-09): GA means certified — the `v1.0.0` tag is cut
-only when G1–G8 pass on the exact binary; interim tag-track builds ship as `v1.0.0-rc.N`
-pre-release tags labelled "release candidate — not certified"; V1–V10 stay deferred to
-v1.1 with #2437 kept as a GA and cert blocker. Standing rule: time is not an issue; no
-gate is skipped, narrowed or waived for schedule.** Effort S/M/L. Type: code / harness / infra /
-docs / ruling.
+certificate. **Operator decision (2026-09-09 17:05Z, final): v1.0.0 GA ships at the
+freeze line — the tag track — and describes itself as production-supported inside the
+published envelope, NOT CERTIFIED for mission-critical use; v1.1.0 is the certification
+release that produces G1–G8 and issues the certificate. `v1.0.0-rc.N` pre-release tags
+ship as the freeze list clears. Track column: `tag` = inside the v1.0.0 freeze
+(`ga-freeze`), `cert` = v1.1.0.**
 
 | # | Item | Work | Track | Effort | Type |
 |---|---|---|---|---|---|
@@ -322,13 +322,18 @@ requires every tag-track code item, so those three cannot precede the tag.
 
 ## 7. Adoption statement a buyer may rely on
 
-A Fortune 500, federal, state or municipal adopter may rely on a v1.0.0 certificate only
-when: G1–G8 are green for the artifact they deploy; the envelope in §0.1 contains their
+A Fortune 500, federal, state or municipal adopter may rely on a certificate only when:
+G1–G8 are green for the artifact they deploy; the envelope in §0.1 contains their
 backend, transport model, host range, topology, posture and external processors; their
 declared SLO/RPO/RTO in §0.2 are inside the measured values on hardware not weaker than
 theirs; the certificate is not expired; and the certificate is not labelled VENDOR
-SELF-CERTIFIED unless their procurement rules allow it. A tagged release without an
-issued certificate is a pilot, and the vendor must say so.
+SELF-CERTIFIED unless their procurement rules allow it.
+
+**v1.0.0 GA without a certificate** is production-supported inside its published
+envelope for business processes whose owner accepts the published NOT-CERTIFIED list and
+the absence of G1–G8 evidence; it is not certified for mission-critical use, and the
+vendor says so in the release note, the README and `/capabilities`. The certificate is
+the v1.1.0 deliverable.
 
 ## 8. Procurement appendix (what a public-sector reviewer will ask for)
 

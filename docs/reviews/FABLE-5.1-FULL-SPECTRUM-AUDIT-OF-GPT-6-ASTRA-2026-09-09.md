@@ -1,7 +1,7 @@
 # Fable 5.1 Full-Spectrum Audit of the GPT-6 Astra Assessment — ai-memory v1.0.0
 
 **Author:** Claude Fable 5.1 (Conductor / gatekeeper / sole merger of `release/v1.0.0`)
-**Date:** 2026-09-09 (revision 4.1: rulings recorded in §8)
+**Date:** 2026-09-09 (revision 4.2: freeze line recorded in §8)
 **Audited documents:** `GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md` (reviewed SHA `87f86a0a`)
 and `GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md`, both in this directory.
 **Tree audited:** `495404d79de186ff6e0bd0ec43996829c91ec200` (the merge-gated chain
@@ -354,22 +354,25 @@ appendix. Defensible certificate dates: **best case 19–23 Oct** if the soak ho
 hard-reset VM are provisioned this week; **expected 26 Oct – 6 Nov**. Without the two
 hosts there is no certificate date at all, only a tag.
 
-**The two decisions — RULED by the operator on 2026-09-09 (first delegated to the
-Conductor, then restated as the operator's own):**
+**Decisions, final (operator, 2026-09-09 17:05Z — "set a FREEZE point line in the sand,
+everything else moves to v1.1.0"; this supersedes the earlier GA = certified ruling):**
 
-1. **GA means certified.** The `v1.0.0` tag is cut only when gates G1–G8 pass on the
-   exact binary and the certificate is issued against that SHA. Interim builds on the
-   tag track ship as SemVer pre-release tags `v1.0.0-rc.N`, labelled "release candidate
-   — not certified"; no rc may be called GA and no public statement may imply
-   certification before the certificate exists. The binary freeze applies only to the
-   final rc that enters the soak.
-2. **V1–V10 stay deferred to v1.1**, superseding PLAN-0's roll-in for those ids; #2437
-   stays a GA and cert blocker as the harness-integrity prerequisite; the mission-summary
-   regression case (A32) rides #3564.
+1. **v1.0.0 GA freeze line.** GA carries every fix for a defect that would ship
+   (authority on every transport, data integrity, false-success shapes), every item that
+   makes published evidence truthful, the hardened release workflow, and the honest
+   envelope (declaration, NOT-CERTIFIED list, certificate status). 81 open issues are
+   inside the line (`ga-freeze`); 60 moved to `v1.1.0`. Release candidates `v1.0.0-rc.N`
+   ship as the list clears; code freeze at the final rc. GA describes itself as
+   production-supported inside the published envelope and **not certified for
+   mission-critical use** under the standard.
+2. **v1.1.0 is the certification release.** Everything that produces G1–G8 evidence
+   (CONFIG-2 and E3 harnesses, continuity clocks, fault matrix, soak, backup battery,
+   adapter conformance, the G3 subset, the on-call rehearsal, the certificate re-issue)
+   plus performance, UX, hygiene and the V-series lands there; #2437 stays a GA and cert
+   blocker; the mission-summary regression case rides #3564.
 
-**Standing rule from the operator: time is not an issue; the objective is to get
-ai-memory 100 % correct.** Every date above is a planning estimate and never a reason to
-skip, narrow or waive a gate, or to move an item to a later track.
+**Standing rule from the operator: get it correct.** Dates are planning estimates and
+never a reason to skip, narrow or waive a gate inside the freeze.
 
 Three provisioning items cannot be closed by code or agent hours: a soak host for the
 24 h and 72 h runs (f1 and f2 are the gate fleet), a VM whose host can be hard-reset for
