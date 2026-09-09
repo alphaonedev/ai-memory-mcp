@@ -10975,6 +10975,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_keyword_tier_no_embedder() {
+        // #3539 — `bootstrap_serve` opens sqlite, and
+        // `storage::connection::refuse_at_rest_requested_without_sqlcipher`
+        // refuses EVERY open while a passphrase is requested — which reads the
+        // `cfg(test)` process-global passphrase slot as well as
+        // `AI_MEMORY_DB_PASSPHRASE`. Without this window a slot-seeding test
+        // running concurrently in the SAME lib test binary turned this boot
+        // into the sqlcipher refusal (`macos-fed,sqlite`, 2026-09-08). The
+        // seeders hold the same mutex, so entering it makes the overlap
+        // impossible rather than unlikely.
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // These are the unconditional Tokio handles owned by a sqlite
         // keyword-tier `ServeBootstrap`. Keep the inventory named so a new
         // worker cannot be accepted by changing an unexplained integer.
@@ -11173,6 +11183,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_with_api_key_logs_enabled() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         let env = TestEnv::fresh();
         let mut cfg = AppConfig::default();
         cfg.tier = Some("keyword".to_string());
@@ -11187,6 +11200,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_disabled_when_quorum_zero() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         let env = TestEnv::fresh();
         let mut cfg = AppConfig::default();
         cfg.tier = Some("keyword".to_string());
@@ -11211,6 +11227,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_enabled_attaches_config() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // quorum_writes=1 + one peer → FederationConfig::build returns
         // Some, so app_state.federation is wired in. Catchup loop is
         // disabled (catchup_interval_secs=0) — the spawn-catchup branch
@@ -11232,6 +11251,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_enabled_with_catchup_loop() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // catchup_interval_secs > 0 → spawn_catchup_loop is invoked.
         // We can't directly observe the catchup loop's internal handle
         // (federation::spawn_catchup_loop returns a JoinHandle owned
@@ -11254,6 +11276,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_invalid_peer_errors() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // FederationConfig::build returns Err on duplicate peer URLs
         // (#341). The bootstrap_serve `.context("federation config")`
         // wrap turns it into a daemon-startup error.
@@ -12133,11 +12158,16 @@ mod tests {
         // state (`storage::set_db_passphrase`) and MUST NOT re-publish into
         // `AI_MEMORY_DB_PASSPHRASE` (the #2905 env-leak class; children
         // spawned afterwards would inherit it).
-        let _enc = crate::test_support::env_lock();
+        // #3539 — the crate-wide passphrase window. It takes
+        // `test_support::env_lock()` AND clears `AI_MEMORY_DB_PASSPHRASE` for
+        // the whole body, so the two hand-rolled `remove_var` calls this test
+        // used to make are gone and no concurrently-running lib test can open
+        // a plain sqlite store while the seed below is live. LOCK ORDER
+        // (CONCURRENCY-04): the env mutex FIRST, the caller-identity lock
+        // second — the order every other site here uses.
+        let iso = crate::test_support::PassphraseEnvIsolation::enter();
         let _g = env_var_lock();
-        let _pass = crate::storage::connection::DbPassphraseGuard::enter();
-        // SAFETY: serialized via env_var_lock.
-        unsafe { std::env::remove_var(crate::storage::ENV_DB_PASSPHRASE) };
+        let _pass = crate::storage::connection::DbPassphraseGuard::enter(&iso);
         let env = TestEnv::fresh();
         let pass_path = env.db_path.with_file_name("pass");
         std::fs::write(&pass_path, "test-passphrase\n").unwrap();
@@ -12172,8 +12202,8 @@ mod tests {
         );
         // First-writer-wins: a second seed is refused, not swapped.
         assert!(crate::storage::set_db_passphrase("other".into()).is_err());
-        // SAFETY: serialized via env_var_lock.
-        unsafe { std::env::remove_var(crate::storage::ENV_DB_PASSPHRASE) };
+        // No manual `remove_var` teardown: `iso` restores the variable to its
+        // pre-test value on drop, even on an unwinding panic (#3539).
     }
 
     #[test]
@@ -12471,6 +12501,9 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_bootstrap_serve_mtls_enforced_true_with_all_three_tls_args() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // Covers `let mtls_enforced = ... && ... && ...` with the all-Some
         // case (true branch). Paired with `api_key = Some(...)` so the
         // outer `if api_key_state.key.is_some()` also fires and the
@@ -12504,6 +12537,9 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_bootstrap_serve_mtls_enforced_false_when_allowlist_absent() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // Covers the AND short-circuit: cert+key set, allowlist None →
         // `mtls_enforced = false`. This is the TLS-but-no-mTLS
         // half-configured case (the `tracing::warn!("TLS enabled but
@@ -12531,6 +12567,9 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_bootstrap_serve_mtls_enforced_false_when_only_allowlist_set() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // Covers the AND short-circuit: cert/key None, allowlist Some →
         // false. (clap's `requires = "tls_cert"` would block this combo
         // at the CLI surface, but we're constructing `ServeArgs`
@@ -12555,6 +12594,9 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_bootstrap_serve_mtls_enforced_with_federation_threads_api_key() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // Joint exercise of the two fold-A2A1.4 surfaces in one
         // bootstrap: federation outbound carries the configured
         // `[api] api_key` (line ~2155, `app_config.api_key.clone()` into
@@ -12823,6 +12865,9 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_bootstrap_serve_sec2_fail_closed_when_pubkey_missing_and_rules_enabled() {
+        // #3539 — plain-sqlite boot: hold the passphrase window (see
+        // `test_bootstrap_serve_keyword_tier_no_embedder`).
+        let _no_pass = crate::test_support::no_passphrase_guard();
         // v0.7.0 SEC-2 (Cluster D) — when `[governance]
         // require_operator_pubkey = true` AND `governance_rules` has
         // any `enabled = 1` row AND no operator pubkey is resolved,

@@ -208,9 +208,76 @@
 # rise. Seeded at the #3523 commit, which is why it is green on a tree that
 # already carries 26 helper-routed files.
 #
+# ARM (f) -- issue #3539 (2026-09-08). The SQLCipher passphrase channel.
+#
+# Arms (a)-(e) police the process ENVIRONMENT. Arm (f) polices a second
+# process-global that behaves exactly like one but is invisible to them:
+# the `cfg(test)` passphrase slot
+# (`storage::connection::DB_PASSPHRASE`, a
+# `static RwLock<Option<String>>` under `cfg(test)`, a never-clearable
+# `OnceLock` in production).
+#
+# WHAT #3539 WAS. `refuse_at_rest_requested_without_sqlcipher()` runs on
+# EVERY sqlite open and refuses when `passphrase_requested()` is true --
+# and that consults BOTH `AI_MEMORY_DB_PASSPHRASE` AND the slot. Two lib
+# tests seed the slot (`storage::connection::tests::
+# db_passphrase_test_reset_does_not_poison_later_open_b11` and
+# `daemon_runtime::tests::
+# test_apply_startup_env_with_db_passphrase_file_does_not_export_env`).
+# The old `DbPassphraseGuard` only RESET the slot on enter and on drop --
+# a bound, not an exclusion -- so `daemon_runtime::tests::
+# test_bootstrap_serve_keyword_tier_no_embedder`, which took NO lock and
+# opens sqlite through `bootstrap_serve`, could land inside a live seed
+# window and take the sqlcipher refusal (`Check (macos-fed,sqlite)`,
+# 2026-09-08). Same shape as #3517/#3523: a process-global written under
+# a lock that the READERS do not take.
+#
+# THE FIX THIS ARM PINS. One funnel, `test_support::PassphraseEnvIsolation`
+# -- it takes the crate-canonical env mutex AND clears
+# `AI_MEMORY_DB_PASSPHRASE` for its lifetime. Seeders cannot bypass it in
+# Rust at all (`DbPassphraseGuard::enter` takes `&PassphraseEnvIsolation`,
+# so the illegal state is unrepresentable); readers enter it through
+# `test_support::no_passphrase_guard()`, which also asserts the slot is
+# empty. This arm is the grep-level twin for the shapes a type signature
+# cannot reach.
+#
+# WHAT IT FLAGS -- in `src/**` only (that is the ONE lib test binary whose
+# threads share the slot; every `tests/*.rs` is its own process, so gating
+# it would invert the control, exactly as for arms (d)/(e)). For each
+# brace-balanced `#[test]`-attributed fn body, reusing arm (c)'s fn-scoped
+# detector verbatim:
+#
+#   * SEED half -- a call to `set_db_passphrase(`, a
+#     `set_var`/`remove_var` of `ENV_DB_PASSPHRASE` /
+#     `"AI_MEMORY_DB_PASSPHRASE"`, or an `EnvGuard::capture(` of that
+#     variable, with no guard token in the same fn body.
+#   * READER half -- a call to `bootstrap_serve(` (the plain-sqlite daemon
+#     boot; the #3539 victim cohort) with no guard token in the same fn
+#     body. On the #3539 tip ALL ELEVEN of those call sites were naked,
+#     which is what made the failure a scheduling coin-flip.
+#
+# GUARD TOKENS: `PassphraseEnvIsolation`, `no_passphrase_guard`, and
+# `env_lock` -- the last one because the crate-canonical mutex is spelled
+# `test_support::env_lock()` / `config::test_env_lock()` (both contain the
+# substring) and holding IT is what provides the exclusion. The
+# caller-identity lock `env_var_lock()` deliberately does NOT match: it is
+# a different mutex. `DbPassphraseGuard` alone is deliberately NOT a token
+# either -- it is the thing being funnelled, not the funnel.
+#
+# BOUNDS (documented, not overclaimed). Line-based and fn-scoped, so it
+# shares every lexical bound of arm (c) (one level of delegate
+# indirection is NOT chased here -- the token list is literal). It pins
+# the two seed sites and the `bootstrap_serve` reader cohort; a lib test
+# that opens a plain sqlite store by some OTHER route and takes no window
+# is still theoretically exposed to a seeder, and closing that would mean
+# either sweeping every sqlite-opening test onto the mutex or making the
+# slot thread-local -- the latter would silently stop the S1 fail-closed
+# gate from firing on a worker thread, which is a worse trade than the
+# residual. Widen the READER pattern here if a new victim cohort appears.
+#
 # Usage:
 #   scripts/check-test-env-lock.sh
-#     - exit 0 on clean, exit 1 on any violation (arms (a)-(e))
+#     - exit 0 on clean, exit 1 on any violation (arms (a)-(f))
 #   scripts/check-test-env-lock.sh --update-baseline
 #     - rewrite BOTH census baselines (arm (d) #3475, arm (e) #3523). Any
 #       number it RAISES is a deliberate widening of the control and must be
@@ -455,8 +522,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # be SPARED, so the exemption is proven deliberate rather than accidental.
     probe_arm_e="${ROOT}/src/check_test_env_arm_e_probe_3523.rs"
     probe_arm_e_exempt="${ROOT}/src/check_test_env_arm_e_exempt_probe_3523.rs"
+    # Arm (f) (#3539) probes. Dot-prefixed like the arms (a)-(c) fixtures:
+    # arm (f) scans dot-prefixed files (they are the only shape a scratch
+    # fixture can take without also tripping arms (d)/(e), which skip them).
+    probe_arm_f="${ROOT}/src/.check_passphrase_window_probe_3539.rs"
+    probe_arm_f_compliant="${ROOT}/src/.check_passphrase_window_compliant_probe_3539.rs"
 
-    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt"; do
+    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run -- remove manually)" >&2
@@ -749,12 +821,53 @@ fn contrived_exempt_isolation_fixture() {
 }
 EOF
 
+    # Case 11 (arm (f), issue #3539): a `#[test]` fn that SEEDS the passphrase
+    # channel and a second one that BOOTS a plain sqlite daemon, both with no
+    # passphrase window of any kind -- the exact #3539 shape. Invisible to arms
+    # (a)-(e): it never touches $HOME, spells no bare set_var/remove_var that
+    # arm (d) counts for a dot-prefixed file, and routes nothing through the
+    # arm (e) helpers.
+    cat > "$probe_arm_f" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-env-lock.sh --self-test.
+// Seeds the process-global SQLCipher passphrase slot, and separately boots a
+// plain sqlite daemon, with NO crate-wide passphrase window held -- the issue
+// #3539 defect class. Both must be caught by arm (f).
+#[test]
+fn contrived_naked_passphrase_seed() {
+    let _ = crate::storage::set_db_passphrase("contrived-3539".to_string());
+}
+#[tokio::test]
+async fn contrived_naked_plain_sqlite_boot() {
+    let _ = bootstrap_serve(&path, &args, &cfg).await;
+}
+EOF
+
+    # Case 12 (arm (f) NEAR MISS): the SAME two shapes, correctly funnelled
+    # through the crate-wide window. Must be SPARED, so the arm is proven not
+    # to be a blanket ban on touching the passphrase channel at all.
+    cat > "$probe_arm_f_compliant" <<'EOF'
+// CONTRIVED COMPLIANT FIXTURE for scripts/check-test-env-lock.sh --self-test.
+// Both shapes are funnelled through the ONE crate-wide passphrase window;
+// arm (f) must NOT flag either.
+#[test]
+fn contrived_guarded_passphrase_seed() {
+    let iso = crate::test_support::PassphraseEnvIsolation::enter();
+    let _pass = crate::storage::connection::DbPassphraseGuard::enter(&iso);
+    let _ = crate::storage::set_db_passphrase("contrived-3539".to_string());
+}
+#[tokio::test]
+async fn contrived_guarded_plain_sqlite_boot() {
+    let _no_pass = crate::test_support::no_passphrase_guard();
+    let _ = bootstrap_serve(&path, &args, &cfg).await;
+}
+EOF
+
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt"
+    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant"
     printf '%s\n' "$gate_output"
 
     # PASS requires: non-zero exit, ALL SIX violators reported (no-lock,
@@ -772,6 +885,8 @@ EOF
     printf '%s' "$gate_output" | grep -q 'contrived_naked_second_test\|\.check_home_lock_naked_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'check_test_env_arm_d_probe_3475\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'check_test_env_arm_e_probe_3523\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'contrived_naked_passphrase_seed\|\.check_passphrase_window_probe_3539\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'contrived_naked_plain_sqlite_boot\|bootstrap_serve' || ok=0
     if printf '%s' "$gate_output" | grep -q '\.check_home_lock_compliant_probe\.rs'; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: the compliant fixture was flagged)" >&2
@@ -797,9 +912,14 @@ EOF
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (e) flagged the documented-exempt isolation fixture -- a gate that fires on test_key_dir::install() will be switched off)" >&2
         exit 1
     fi
+    if printf '%s' "$gate_output" | grep -q '\.check_passphrase_window_compliant_probe_3539\.rs\|contrived_guarded_'; then
+        echo "" >&2
+        echo "Test-env-lock gate self-test: FAIL (over-widened: arm (f) flagged the correctly-funnelled passphrase fixture)" >&2
+        exit 1
+    fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-env-lock gate self-test: PASS (caught all seven contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, and the #3523 arm (e) helper-routed bypass -- and spared all three compliant fixtures; exit=${gate_exit})"
+        echo "Test-env-lock gate self-test: PASS (caught all nine contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, the #3523 arm (e) helper-routed bypass, and BOTH #3539 arm (f) shapes (naked passphrase seed, naked plain-sqlite boot) -- and spared all four compliant fixtures; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
@@ -1255,7 +1375,86 @@ else
     echo "Test-env-lock gate arm (e): PASS (no src/** file gained helper-routed env mutation over the #3523 baseline)"
 fi
 
-if (( home_fail != 0 || arm_d_fail != 0 || arm_e_fail != 0 )); then
+# ---------------------------------------------------------------------
+# ARM (f) -- issue #3539. SQLCipher passphrase-channel serialization.
+# See the arm (f) header block for the full rationale, token list and bounds.
+# ---------------------------------------------------------------------
+
+# SEED half: anything that writes the passphrase channel (the process-private
+# slot or the environment variable) from inside a lib test.
+PASSPHRASE_SEED_PATTERN='set_db_passphrase\(|(set_var|remove_var)\([^)]*(ENV_DB_PASSPHRASE|"AI_MEMORY_DB_PASSPHRASE")|EnvGuard::capture\([^)]*(ENV_DB_PASSPHRASE|"AI_MEMORY_DB_PASSPHRASE")'
+
+# READER half: the plain-sqlite daemon boot -- the #3539 victim cohort. Every
+# one of these opens sqlite and therefore runs the at-rest boot gate.
+PASSPHRASE_READER_PATTERN='bootstrap_serve\('
+
+# COMMA-joined (the #3523 SEPARATOR note on `naked_home_mutations`).
+# `env_lock` also matches `test_env_lock` by substring, which is intended:
+# they are ONE mutex (#3523). `env_var_lock` does NOT match -- different lock.
+PASSPHRASE_GUARD_TOKENS='PassphraseEnvIsolation,no_passphrase_guard,env_lock'
+
+arm_f_report=""
+arm_f_detector_fail=0
+while IFS= read -r -d '' f; do
+    rel="${f#"${ROOT}/"}"
+    # Comment-stripped so a `// ... bootstrap_serve(...)` prose mention or a
+    # doc-comment reference to `set_db_passphrase(` is not a violation. `sed`
+    # emits one output line per input line, so `grep -n` line numbers stay
+    # aligned with the real file (which is what the fn-scoped detector keys on).
+    f_stripped="$(strip_line_comments "$f")"
+    f_hits="$(grep -nE "${PASSPHRASE_SEED_PATTERN}|${PASSPHRASE_READER_PATTERN}" <<< "$f_stripped" || true)"
+    [[ -z "${f_hits//[[:space:]]/}" ]] && continue
+    f_csv="$(printf '%s\n' "$f_hits" | cut -d: -f1 | paste -sd, -)"
+    # Reuses arm (c)'s fn-scoped, `#[test]`-attributed detector verbatim: it is
+    # generic over the flagged line numbers and the guard-token list, so the
+    # mutation forms stay defined in exactly one place (here).
+    f_rc=0
+    f_flagged="$(naked_home_mutations "$f" "$PASSPHRASE_GUARD_TOKENS" "$f_csv")" || f_rc=$?
+    if (( f_rc != 0 )); then
+        echo "Test-env-lock gate arm (f): the fn-scoped detector FAILED on ${rel} (exit ${f_rc}) -- refusing to report a clean arm (f)" >&2
+        arm_f_detector_fail=1
+    fi
+    while IFS= read -r f_line; do
+        [[ -z "$f_line" ]] && continue
+        arm_f_report+="  ${rel}:${f_line}"$'\n'
+    done <<< "$f_flagged"
+done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null)
+
+if [[ -n "${arm_f_report//[[:space:]]/}" || "$arm_f_detector_fail" -ne 0 ]]; then
+    {
+        echo "Unserialized SQLCipher passphrase-channel access in the LIB TEST BINARY (issue #3539):"
+        printf '%s' "$arm_f_report"
+        echo ""
+        echo "storage::connection::refuse_at_rest_requested_without_sqlcipher()"
+        echo "runs on EVERY sqlite open and refuses while a passphrase is"
+        echo "requested -- reading BOTH AI_MEMORY_DB_PASSPHRASE and the"
+        echo "cfg(test) process-global passphrase SLOT. src/**/*.rs compiles"
+        echo "into ONE test binary whose tests run in PARALLEL THREADS, so a"
+        echo "test that seeds the slot makes every concurrent plain-sqlite"
+        echo "open in the process refuse (#3539). Resetting the slot on drop"
+        echo "bounds the window; it does not exclude the readers."
+        echo ""
+        echo "Enter the ONE crate-wide passphrase window instead:"
+        echo ""
+        echo "  // seeding a passphrase:"
+        echo "  let iso = crate::test_support::PassphraseEnvIsolation::enter();"
+        echo "  let _pass = crate::storage::connection::DbPassphraseGuard::enter(&iso);"
+        echo ""
+        echo "  // opening a plain sqlite store / booting a daemon:"
+        echo "  let _no_pass = crate::test_support::no_passphrase_guard();"
+        echo ""
+        echo "Take it ONCE per test body (std::sync::Mutex is not re-entrant)"
+        echo "and BEFORE env_var_lock() where both are needed (CONCURRENCY-04)."
+        echo ""
+    } >&2
+    echo "Test-env-lock gate arm (f): FAIL" >&2
+    arm_f_fail=1
+else
+    arm_f_fail=0
+    echo "Test-env-lock gate arm (f): PASS (every src/** test that seeds or reads the passphrase channel holds the shared window)"
+fi
+
+if (( home_fail != 0 || arm_d_fail != 0 || arm_e_fail != 0 || arm_f_fail != 0 )); then
     echo "" >&2
     echo "Test-env-lock gate: FAIL" >&2
     exit 1
