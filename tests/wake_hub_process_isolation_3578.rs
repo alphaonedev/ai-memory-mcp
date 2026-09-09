@@ -8,8 +8,8 @@
 //! The hub process must run as a DISTINCT user (`ai-memory-hub`), must not
 //! be able to open the durable store (`InaccessiblePaths=/var/lib/ai-memory`),
 //! and must not open a network socket (`RestrictAddressFamilies=AF_UNIX`,
-//! no `--tcp` in the shipped ExecStart). TCP is an operator drop-in that
-//! has to add BOTH the flag AND AF_INET — the shipped unit has neither.
+//! no `--tcp` in the shipped `ExecStart`). TCP is an operator drop-in that
+//! has to add BOTH the flag AND `AF_INET` — the shipped unit has neither.
 
 use std::path::Path;
 
@@ -196,10 +196,10 @@ fn sysusers_user_names(conf: &str) -> Vec<&str> {
 fn sysusers_violations(conf: &str) -> Vec<&'static str> {
     let names = sysusers_user_names(conf);
     let mut v = Vec::new();
-    if !names.iter().any(|n| *n == "ai-memory") {
+    if !names.contains(&"ai-memory") {
         v.push("missing u ai-memory");
     }
-    if !names.iter().any(|n| *n == "ai-memory-hub") {
+    if !names.contains(&"ai-memory-hub") {
         v.push("missing u ai-memory-hub");
     }
     v
@@ -226,7 +226,7 @@ fn a_sysusers_file_missing_the_hub_user_is_refused_3578() {
         "denied pin must catch a missing hub user, got {v:?}"
     );
     assert!(
-        !v.iter().any(|s| *s == "missing u ai-memory"),
+        !v.contains(&"missing u ai-memory"),
         "denied pin must still accept the daemon user, got {v:?}"
     );
 }
