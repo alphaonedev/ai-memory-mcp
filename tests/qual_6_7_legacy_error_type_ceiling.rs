@@ -189,7 +189,14 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // the shared `cargo test --lib` binary, and it is
 // `#[cfg(any(test, feature = "test-support"))]` — absent from a release
 // build entirely. Net acknowledged: +1.
-const QUAL_6_CEILING: usize = 128;
+// 2026-09-09 (#3381 own-binary envelope suite) — raised 128 -> 129 for
+// TEST-ONLY `handle_auto_tag_for_tests` in `src/mcp/tools/auto_tag.rs`.
+// Like the #3523 wrapper above, it forwards the existing MCP envelope
+// verbatim so the 13 caller/egress/governance cases run in their own binary.
+// It is absent without `test` or `test-support`; no production error
+// contract changes. Exact measured addition: +1, per the Master's
+// 2026-09-07 QUAL-6/QUAL-7 lockstep ruling; no spare headroom.
+const QUAL_6_CEILING: usize = 129;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
