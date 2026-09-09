@@ -52,9 +52,33 @@ pub struct ShareBody {
 /// ```
 pub async fn share_memory(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<ShareBody>,
 ) -> impl IntoResponse {
+    // v1.0.0 #3379 — per-agent-key identity gate BEFORE the caller is resolved
+    // from `X-Agent-Id` for the caller-owns-source check below. Without it a
+    // shared-transport-key caller could forge `X-Agent-Id: <victim>` and share
+    // the victim's `scope=private` rows out to itself. Mirrors the #2044 gate
+    // on `get_memory` / `load_family`; inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "share_memory",
+    ) {
+        return resp;
+    }
+    // #3379 — resolve the caller the same way every other gated HTTP read does
+    // (`handlers::memories::get_memory`): header id, else a per-request
+    // `anonymous:req-…` principal which owns nothing. The substrate primitive
+    // then refuses any source this caller cannot read, with the identical
+    // not-found body an absent id produces.
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let share_caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+
     let mut params: Value = json!({
         (field_names::SOURCE_MEMORY_ID): body.source_memory_id,
         (field_names::TARGET_AGENT_ID): body.target_agent_id,
@@ -69,16 +93,21 @@ pub async fn share_memory(
     // dispatch, release. The MCP path uses the same handler so wire
     // shape parity is guaranteed.
     let lock = app.db.lock().await;
-    let result = crate::mcp::share::handle_share(&lock.0, &params);
+    let result = crate::mcp::share::handle_share(&lock.0, &params, Some(&share_caller));
     drop(lock);
 
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            // Surface validation / not-found / governance refusal as
-            // 400. The substrate primitive returns a String error;
-            // map it to a structured envelope so HTTP callers can
-            // parse the failure shape uniformly.
+            // #3426: mask unreadable sources exactly like absent rows;
+            // readable foreign rows receive the canonical ownership refusal.
+            if e == format!("source memory {} not found", body.source_memory_id) {
+                return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+                    .into_response();
+            }
+            if e == crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
+            }
             tracing::warn!("share_memory failed: {e}");
             (
                 StatusCode::BAD_REQUEST,

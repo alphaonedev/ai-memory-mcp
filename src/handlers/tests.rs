@@ -16967,3 +16967,86 @@ async fn issue_1579_b4_search_format_negotiation() {
         crate::toon::invalid_format_msg("xml")
     );
 }
+
+// #3379 — direct HTTP handler tests run even without SAL features.
+#[tokio::test]
+async fn http_share_masks_hidden_and_missing_sources_3379() {
+    let app = test_app_state(test_state());
+    let source = Memory {
+        id: Uuid::new_v4().to_string(),
+        namespace: "notes".to_string(),
+        title: "private share source".to_string(),
+        content: "private content".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        metadata: json!({"agent_id": "ai:alice", "scope": "private"}),
+        ..Memory::default()
+    };
+    db::insert(&app.db.lock().await.0, &source).expect("seed source");
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(crate::HEADER_AGENT_ID, "ai:bob".parse().expect("header"));
+    for id in [&source.id, &Uuid::new_v4().to_string()] {
+        let response = super::share::share_memory(
+            axum::extract::State(app.clone()),
+            headers.clone(),
+            Json(super::share::ShareBody {
+                source_memory_id: id.clone(),
+                target_agent_id: "ai:carol".to_string(),
+                why_trace: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("JSON"),
+            json!({"error": "not found"})
+        );
+    }
+    let count: i64 = app
+        .db
+        .lock()
+        .await
+        .0
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(count, 1, "refused shares cannot write");
+}
+
+#[tokio::test]
+async fn http_share_owner_allowed_collective_reader_refused_3379() {
+    let app = test_app_state(test_state());
+    let source = Memory {
+        id: Uuid::new_v4().to_string(),
+        namespace: "notes".to_string(),
+        title: "collective share source".to_string(),
+        content: "shared content".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        metadata: json!({"agent_id": "ai:alice", "scope": "collective"}),
+        ..Memory::default()
+    };
+    db::insert(&app.db.lock().await.0, &source).expect("seed source");
+    for (caller, status) in [
+        ("ai:bob", StatusCode::FORBIDDEN),
+        ("ai:alice", StatusCode::OK),
+    ] {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(crate::HEADER_AGENT_ID, caller.parse().expect("header"));
+        let response = super::share::share_memory(
+            axum::extract::State(app.clone()),
+            headers,
+            Json(super::share::ShareBody {
+                source_memory_id: source.id.clone(),
+                target_agent_id: "ai:carol".to_string(),
+                why_trace: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), status, "caller {caller}");
+    }
+}
