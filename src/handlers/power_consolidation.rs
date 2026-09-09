@@ -829,8 +829,16 @@ pub async fn auto_tag_handler(
     // for the source-memory fetch so the SAL #910 visibility filter
     // applies. Helper takes `&str` so non-sal builds compile.
     let auto_tag_caller_principal =
-        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
-            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+        match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
+            Ok(caller) => caller,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": crate::errors::msg::invalid("agent_id", error)})),
+                )
+                    .into_response();
+            }
+        };
 
     // Resolve (title, content). S51 sends `memory_id`; we fetch the
     // memory from the active backend. Ad-hoc callers may instead
@@ -1004,15 +1012,19 @@ async fn fetch_memory_for_handler(
     id: &str,
     caller_principal: &str,
 ) -> Result<Memory, Response> {
+    // HTTP only returns tags; it never writes them. Both backend reads must
+    // satisfy #3348 before content reaches the model. MCP additionally checks
+    // ownership and routes its write through the governed update funnel.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 fix (2026-05-20): use header-resolved caller so the
-        // SAL #910 scope=private visibility filter applies — caller
-        // can only fetch memories they own (or scope=shared/public).
         let caller = crate::store::CallerContext::for_agent(caller_principal.to_string());
         return match app.store.get(&caller, id).await {
-            Ok(mem) => Ok(mem),
-            Err(crate::store::StoreError::NotFound { .. }) => Err((
+            Ok(mem)
+                if crate::visibility::is_readable_on_query(&mem, Some(caller_principal), None) =>
+            {
+                Ok(mem)
+            }
+            Ok(_) | Err(crate::store::StoreError::NotFound { .. }) => Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
             )
@@ -1021,47 +1033,18 @@ async fn fetch_memory_for_handler(
         };
     }
 
-    // ARCH-2 keeper: same constraint as `fetch_consolidate_source_pairs`
-    // — `app.store` and `app.db` are pinned to disjoint files in the
-    // test harness, so routing this sqlite read through `app.store.get`
-    // breaks tests. ARCH-2-followup must converge the harness before
-    // the sqlite path can route through SAL.
+    // The SQLite handler harness can keep app.db and app.store in different
+    // files; retain app.db as the authoritative SQLite connection.
     let lock = app.db.lock().await;
     let fetched = db::get(&lock.0, id);
     drop(lock);
     match fetched {
-        // v1.0.0 #3381 (CWE-863) — apply the caller-scoped visibility gate on
-        // the SQLITE branch. The postgres branch above has routed through the
-        // SAL `#910` filter since the 2026-05-20 QC pass, but the sqlite
-        // branch called the unfiltered `db::get` and DISCARDED the resolved
-        // caller entirely — so `POST /api/v1/auto_tag` shipped another
-        // agent's `scope=private` title + content to the external model and
-        // returned tags derived from it, on a row `GET /memories/{id}` masks
-        // as 404 for the same caller. The predicate is the single canonical
-        // [`crate::visibility::is_visible_to_caller`] (#951), and the mask is
-        // the SAME 404 an absent id produces so the surface is not a presence
-        // oracle (#927 / #1553 convention).
-        //
-        // Deliberately the READ predicate, not the sibling MCP tool's
-        // consumability one: this HTTP route only RETURNS the tags, it never
-        // persists them, so "may this caller read the row" is the whole
-        // question and the answer must match `GET /memories/{id}` (#927). The
-        // MCP `memory_auto_tag` gates on `caller_owns_for_mutation` because it
-        // also WRITES the tags back through the governed update funnel.
-        Ok(Some(mem)) if crate::visibility::is_visible_to_caller(&mem, caller_principal) => Ok(mem),
-        Ok(Some(mem)) => {
-            tracing::warn!(
-                target: "ai_memory::visibility",
-                "auto_tag/source fetch 404-masked: not visible to caller {caller_principal} (id={})",
-                mem.id
-            );
-            Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
-            )
-                .into_response())
+        Ok(Some(mem))
+            if crate::visibility::is_readable_on_query(&mem, Some(caller_principal), None) =>
+        {
+            Ok(mem)
         }
-        Ok(None) => Err((
+        Ok(_) => Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
         )

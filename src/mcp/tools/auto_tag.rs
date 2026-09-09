@@ -17,31 +17,10 @@ use crate::llm::OllamaClient;
 use crate::{db, validate};
 use serde_json::{Value, json};
 
-/// MCP `memory_auto_tag` — LLM-generate tags for a memory and persist the
-/// union onto the row.
-///
-/// v1.0.0 #3381 (CWE-863, unauthenticated cross-tenant WRITE) — pre-fix this
-/// handler took NO caller: it read the row through the unfiltered `db::get`,
-/// shipped the victim's title + content to the external model, and wrote the
-/// resulting tags back through the RAW `db::update` primitive. That bypassed
-/// every control `memory_update` enforces — the #1786 owner gate, the K9
-/// permission rules, and the namespace governance funnel — so in a
-/// `governance.write = "approve"` namespace `memory_update` queued a pending
-/// action while `memory_auto_tag` committed immediately, and any agent could
-/// bump the version of a `scope=private` row it is told "not found" about.
-///
-/// The control is now TWO canonical funnels, not a local check:
-///   * the READ is gated by the canonical mutation predicate
-///     [`crate::visibility::caller_owns_for_mutation`] (#1786) BEFORE any LLM
-///     call, so another agent's row is never sent to the model — refused with
-///     the not-found message an absent id produces, so there is no oracle; and
-///   * the WRITE is delegated to [`crate::mcp::update::handle_update`], the
-///     governed update path, so auto-tagging inherits the owner gate, the
-///     permission rules, the governance decision (including a `pending`
-///     approval envelope), and the audit trail by CONSTRUCTION rather than by
-///     a copy of them that can drift.
-///
-/// `caller == None` is the single-operator trust-all posture and is unchanged.
+/// Generate and persist tags through the caller-scoped, governed update funnel.
+/// The read and ownership checks run before content reaches the external model.
+/// An absent caller retains the ordinary single-operator read posture; substrate
+/// rows remain excluded because this tool does not accept a namespace selector.
 pub(super) fn handle_auto_tag(
     conn: &rusqlite::Connection,
     llm: Option<&OllamaClient>,
@@ -54,27 +33,14 @@ pub(super) fn handle_auto_tag(
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    // #3381 — the gate is the single canonical mutation predicate
-    // `visibility::caller_owns_for_mutation` (#1786), applied BEFORE the paid,
-    // content-shipping LLM round-trip rather than after it. `handle_update`
-    // re-applies the same predicate structurally below, so this is the cheap
-    // early arm, not a second copy of the rule.
-    //
-    // Consumability, not readability, is the right question for a tool that
-    // both reads a row's content and writes to it: a row owned by ANOTHER
-    // agent is refused even when it is readable (collective scope, an inbox
-    // row), which is what closes the content leak to the external model —
-    // while the #1786 legacy carve-out keeps an UNOWNED row taggable, exactly
-    // as it stays updatable and deletable. Gating the read on
-    // `is_visible_to_caller` as well would refuse unowned rows that this
-    // tool's own write funnel admits, an internal contradiction that would
-    // strand pre-NHI corpora (the same defect corrected in the sibling #3380).
-    //
-    // The refusal renders as the not-found message, identical to an absent id,
-    // so the tool cannot be used as a cross-tenant presence oracle (#1553).
+    // #3348 read visibility precedes #1786 ownership: mutation permission
+    // alone does not grant permission to send a row to the model.
     let mem = db::get(conn, id)
         .map_err(|e| e.to_string())?
         .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
+    if !crate::visibility::is_readable_on_query(&mem, caller, None) {
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
+    }
     if let Some(c) = caller
         && !crate::visibility::caller_owns_for_mutation(&mem, c, false)
     {
@@ -99,13 +65,11 @@ pub(super) fn handle_auto_tag(
     // vector-index are deliberately `None`: a tags-only patch changes neither
     // title nor content, so there is nothing to re-embed and passing them
     // would be the only behavioural difference from the pre-fix raw write.
-    let updated = crate::mcp::update::handle_update(
-        conn,
-        &json!({ "id": &mem.id, (crate::mcp::param_names::TAGS): &all_tags }),
-        None,
-        None,
-        mcp_client,
-    )?;
+    let mut update_params = json!({ "id": &mem.id, (crate::mcp::param_names::TAGS): &all_tags });
+    if let Some(caller) = caller {
+        update_params[crate::mcp::param_names::AGENT_ID] = json!(caller);
+    }
+    let updated = crate::mcp::update::handle_update(conn, &update_params, None, None, mcp_client)?;
     // The governed funnel may answer `pending` (namespace requires approval)
     // or `ask` (a permission rule) INSTEAD of writing. Surface that envelope
     // verbatim rather than reporting tags that were never persisted — a
@@ -189,8 +153,8 @@ mod d1_5_986_tests {
 // Drives the production `OllamaClient` against an in-process wiremock
 // server. The blocking client is run via `tokio::task::spawn_blocking`
 // so the async test runtime stays free for the mock server. The
-// `/api/tags` health probe (which `new_with_url` performs before
-// returning) is mounted ahead of any other route on every server.
+// probe-free test constructor avoids the load-sensitive health-check bridge;
+// model requests still exercise the production client.
 // =====================================================================
 #[cfg(test)]
 mod tests {
@@ -204,7 +168,8 @@ mod tests {
     /// Build a fresh in-memory SQLite DB (via a tempfile, since
     /// `:memory:` doesn't survive across the WAL pragma touch).
     fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::create_dir_all(".local-runs").expect("scratch directory");
+        let tmp = tempfile::NamedTempFile::new_in(".local-runs").expect("tempfile");
         let conn = db::open(tmp.path()).expect("db::open");
         (conn, tmp)
     }
@@ -273,8 +238,9 @@ mod tests {
         mount_tags_ok(&server).await;
         let uri = server.uri();
         let err = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             handle_auto_tag(&conn, Some(&client), &json!({}), None, None)
                 .err()
                 .unwrap_or_default()
@@ -292,8 +258,9 @@ mod tests {
         mount_tags_ok(&server).await;
         let uri = server.uri();
         let err = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             // shell-metachar should be rejected by validate_id
             handle_auto_tag(
                 &conn,
@@ -320,8 +287,9 @@ mod tests {
         mount_tags_ok(&server).await;
         let uri = server.uri();
         let err = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             handle_auto_tag(
                 &conn,
                 Some(&client),
@@ -437,6 +405,42 @@ mod tests {
         db::set_namespace_standard(conn, ns, &sid, None).expect("set standard");
     }
 
+    /// Readable foreign rows still cannot be mutated; owned substrate rows
+    /// are withheld even when the caller is absent. Neither refusal may egress.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_tag_refuses_collective_foreign_and_substrate_rows_3381() {
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
+            let (conn, _tmp) = fresh_db();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
+            for (namespace, caller) in [
+                ("alice/notes", Some("ai:bob")),
+                ("_agents", Some("ai:alice")),
+                ("_agents", None),
+            ] {
+                let id = seed_memory_owned(&conn, namespace, "ai:alice", vec!["keep".into()]);
+                db::set_row_metadata(
+                    &conn,
+                    &id,
+                    r#"{"agent_id":"ai:alice","scope":"collective"}"#,
+                )
+                .unwrap();
+                let before = db::get(&conn, &id).unwrap().unwrap();
+                let err = handle_auto_tag(&conn, Some(&client), &json!({"id": id}), caller, None)
+                    .expect_err("must refuse before calling the model");
+                assert_eq!(err, crate::errors::msg::MEMORY_NOT_FOUND);
+                let after = db::get(&conn, &id).unwrap().unwrap();
+                assert_eq!(after.tags, before.tags);
+                assert_eq!(after.version, before.version);
+            }
+        })
+        .await
+        .unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     /// v1.0.0 #3381 (DENIED direction) — a non-owner is refused BEFORE the LLM
     /// call and writes nothing. Pre-fix `ai:bob` calling `memory_auto_tag` on
     /// `ai:alice`'s `scope=private` row shipped her title + content to the
@@ -451,9 +455,10 @@ mod tests {
         mount_tags_ok(&server).await;
         let uri = server.uri();
         let (err, tags_after, version_after) = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
             let id = seed_memory_owned(&conn, "alice/notes", "ai:alice", vec!["keep".into()]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             let err = handle_auto_tag(
                 &conn,
                 Some(&client),
@@ -473,15 +478,10 @@ mod tests {
         assert_eq!(version_after, 1, "a refused auto_tag must not bump version");
     }
 
-    /// v1.0.0 #3381 (ALLOWED direction) — an UNOWNED legacy row stays
-    /// taggable. The #1786 predicate deliberately admits rows with no
-    /// `metadata.agent_id`, and this tool's own write funnel
-    /// (`mcp::update::handle_update`) admits them, so gating the read more
-    /// strictly than the write would be an internal contradiction that
-    /// stranded pre-NHI corpora. Sibling of
-    /// `consolidate_allows_unowned_legacy_source_3380`.
+    /// An unowned private row is unreadable to an identified caller even
+    /// though the legacy mutation predicate would allow changing it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn auto_tag_allows_unowned_legacy_row_3381() {
+    async fn auto_tag_refuses_unreadable_unowned_row_3381() {
         let server = MockServer::start().await;
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
@@ -492,25 +492,27 @@ mod tests {
             .mount(&server)
             .await;
         let uri = server.uri();
-        let stored = tokio::task::spawn_blocking(move || {
+        let (err, stored) = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
             // metadata = {} : no agent_id, the legacy/unowned shape.
             let id = seed_memory(&conn, vec![]);
             crate::db::set_row_metadata(&conn, &id, "{}").expect("clear owner");
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_auto_tag(
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
+            let err = handle_auto_tag(
                 &conn,
                 Some(&client),
                 &json!({"id": id.clone()}),
                 Some("ai:bob"),
                 None,
             )
-            .expect("an unowned legacy row must stay taggable");
-            db::get(&conn, &id).unwrap().unwrap().tags
+            .expect_err("unowned private row must remain unreadable");
+            (err, db::get(&conn, &id).unwrap().unwrap().tags)
         })
         .await
         .unwrap();
-        assert!(stored.contains(&"alpha".to_string()), "got {stored:?}");
+        assert_eq!(err, crate::errors::msg::MEMORY_NOT_FOUND);
+        assert!(stored.is_empty());
     }
 
     /// #3381 (ALLOWED direction) — the OWNER still auto-tags, and the union
@@ -528,9 +530,10 @@ mod tests {
             .await;
         let uri = server.uri();
         let (out, stored) = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::set("ai:alice");
             let (conn, _tmp) = fresh_db();
             let id = seed_memory_owned(&conn, "alice/notes", "ai:alice", vec!["keep".into()]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             let out = handle_auto_tag(
                 &conn,
                 Some(&client),
@@ -570,15 +573,18 @@ mod tests {
             .await;
         let uri = server.uri();
         let (out, stored) = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::set("ai:alice");
             let _pm = crate::config::lock_permissions_mode_for_test();
             crate::config::override_active_permissions_mode_for_test(
                 crate::config::PermissionsMode::Enforce,
             );
             let (conn, _tmp) = fresh_db();
             let ns = "gov-approve-autotag";
-            install_write_approve_policy(&conn, ns, "ai:alice");
+            // #3292: the standard owner auto-allows; a distinct policy owner
+            // makes Alice's otherwise-authorized tag update require approval.
+            install_write_approve_policy(&conn, ns, "ai:governor");
             let id = seed_memory_owned(&conn, ns, "ai:alice", vec!["keep".into()]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             let out = handle_auto_tag(
                 &conn,
                 Some(&client),
@@ -587,6 +593,14 @@ mod tests {
                 None,
             )
             .expect("pending returns Ok");
+            let pending =
+                db::get_pending_action(&conn, out["pending_id"].as_str().expect("pending id"))
+                    .unwrap()
+                    .expect("persisted pending action");
+            assert_eq!(
+                pending.requested_by, "ai:alice",
+                "#3171: preserve the caller"
+            );
             let mem = db::get(&conn, &id).unwrap().unwrap();
             crate::config::clear_permissions_mode_override_for_test();
             (out, mem.tags)
@@ -622,11 +636,12 @@ mod tests {
 
         let uri = server.uri();
         let (id, value) = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
             // Existing tag "alpha" already lives on the memory; the
             // envelope must NOT duplicate it in `all_tags`.
             let id = seed_memory(&conn, vec!["alpha".to_string()]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             let out = handle_auto_tag(&conn, Some(&client), &json!({"id": id.clone()}), None, None)
                 .expect("handler should succeed");
             // Verify DB state — `tags` column carries the union now.
@@ -665,9 +680,10 @@ mod tests {
 
         let uri = server.uri();
         let out = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
             let id = seed_memory(&conn, vec!["existing".to_string()]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             handle_auto_tag(&conn, Some(&client), &json!({"id": id}), None, None).expect("ok")
         })
         .await
@@ -692,9 +708,10 @@ mod tests {
 
         let uri = server.uri();
         let err = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
             let id = seed_memory(&conn, vec![]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             handle_auto_tag(&conn, Some(&client), &json!({"id": id}), None, None)
                 .err()
                 .unwrap_or_default()
@@ -724,9 +741,10 @@ mod tests {
 
         let uri = server.uri();
         let err = tokio::task::spawn_blocking(move || {
+            let _identity = crate::identity::test_agent_id::AgentIdOverride::unset();
             let (conn, _tmp) = fresh_db();
             let id = seed_memory(&conn, vec![]);
-            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
             handle_auto_tag(&conn, Some(&client), &json!({"id": id}), None, None)
                 .err()
                 .unwrap_or_default()
