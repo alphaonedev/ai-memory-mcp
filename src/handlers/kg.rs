@@ -1454,10 +1454,20 @@ pub async fn kg_query(
         }
     };
 
-    for (field, value) in [
-        ("namespace", body.namespace.as_deref()),
-        ("as_agent", body.as_agent.as_deref()),
-    ] {
+    // Astra cross-file review (2026-09-09): normalise ONCE at ingress exactly
+    // as the MCP twin does (`str::trim`, empty ⇒ absent), so a padded value
+    // validates AND filters/compares on the same string on both twins.
+    let namespace = body
+        .namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let as_agent = body
+        .as_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    for (field, value) in [("namespace", namespace), ("as_agent", as_agent)] {
         if let Some(value) = value
             && let Err(e) = validate::validate_namespace(value)
         {
@@ -1470,11 +1480,7 @@ pub async fn kg_query(
     }
 
     // #3499: match HTTP recall/search's header-bound scope selector.
-    if body
-        .as_agent
-        .as_deref()
-        .is_some_and(|scope| scope != caller)
-    {
+    if as_agent.is_some_and(|scope| scope != caller) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "agent_id_query_header_mismatch: as_agent disagrees with authenticated caller"})),
@@ -1560,22 +1566,13 @@ pub async fn kg_query(
                     .flat_map(|n| n.path.split("->").map(str::to_string))
                     .collect();
                 let visible = kg_query_filter_visible(
-                    &app,
-                    &caller,
-                    target_ids,
-                    &source_id,
-                    body.namespace.as_deref(),
-                    body.as_agent.as_deref(),
+                    &app, &caller, target_ids, &source_id, namespace, as_agent,
                 )
                 .await;
                 // #3499: exact target-namespace filter on the result rows.
                 let nodes: Vec<_> = nodes
                     .into_iter()
-                    .filter(|n| {
-                        body.namespace
-                            .as_deref()
-                            .is_none_or(|ns| n.target_namespace == ns)
-                    })
+                    .filter(|n| namespace.is_none_or(|ns| n.target_namespace == ns))
                     .collect();
                 let nodes: Vec<_> = nodes
                     .into_iter()
@@ -1668,9 +1665,9 @@ pub async fn kg_query(
                         if id == source_id {
                             Some(mem.namespace.as_str())
                         } else {
-                            body.namespace.as_deref()
+                            namespace
                         },
-                        body.as_agent.as_deref(),
+                        as_agent,
                     ) {
                         visible.insert(id.to_string());
                     }
@@ -1688,11 +1685,7 @@ pub async fn kg_query(
                 .into_iter()
                 .filter(|n| n.path.split("->").all(|id| visible.contains(id)))
                 // #3499: exact target-namespace filter on the result rows.
-                .filter(|n| {
-                    body.namespace
-                        .as_deref()
-                        .is_none_or(|ns| n.target_namespace == ns)
-                })
+                .filter(|n| namespace.is_none_or(|ns| n.target_namespace == ns))
                 .collect();
             // #3424 — the SAME shared projection the postgres branch uses.
             let memories_json = kg_query_memories_json(&nodes);

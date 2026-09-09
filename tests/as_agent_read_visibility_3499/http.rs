@@ -211,6 +211,15 @@ async fn assert_reads(router: &axum::Router, f: &Fixture) {
     }
     for (caller, source, namespace, scope, expected) in [
         (ALICE, "public", Some(NS), Some(ALICE), vec!["alice"]),
+        // Padded values normalise at ingress exactly as the MCP twin does
+        // (Astra cross-file review, 2026-09-09): same node set as above.
+        (
+            ALICE,
+            "public",
+            Some(" scope3499 "),
+            Some(" ai:alice "),
+            vec!["alice"],
+        ),
         (ALICE, "public", Some("absent3499"), Some(ALICE), vec![]),
         (ALICE, "public", None, None, vec!["alice"]),
         (
