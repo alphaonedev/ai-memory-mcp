@@ -111,7 +111,7 @@ Store a new memory. Deduplicates by title+namespace -- if a memory with the same
 | `priority` | integer (1-10) | No | `5` | Priority ranking |
 | `confidence` | number (0.0-1.0) | No | `1.0` | Certainty level |
 | `source` | string | No | `"nhi"` (v0.7.x vendor-neutral default, #1175) | Origin — one of `VALID_SOURCES`: `"user"`, `"nhi"`, `"claude"` (deprecated), `"hook"`, `"api"`, `"cli"`, `"import"`, `"consolidation"`, `"system"`, `"chaos"`, `"notify"` |
-| `kind` | string | No | `"observation"` | Memory kind. Omit for the `observation` default; a supplied value MUST be one of the canonical variants (`observation`, `reflection`, `persona`, `concept`, `entity`, `claim`, `relation`, `event`, `conversation`, `decision`) or the write is rejected (#1467). See `docs/memory-kind-vocab.md`. |
+| `kind` | string | No | `"observation"` | Memory kind. Omit for the `observation` default; a supplied value MUST be one of the 16 `MemoryKind` slugs (`observation`, `reflection`, `persona`, `concept`, `entity`, `claim`, `relation`, `event`, `conversation`, `decision`, `goal`, `plan`, `step`, `told`, `instruction`, `intervention`) or the write is rejected (#1467). See `docs/memory-kind-vocab.md`. |
 
 **Example request:**
 
