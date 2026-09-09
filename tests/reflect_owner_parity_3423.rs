@@ -49,7 +49,6 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -92,7 +91,7 @@ fn build_router() -> (axum::Router, NamedTempFile, PathBuf) {
     )));
     let store: Arc<dyn MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
-    let enrolled = Arc::new(HashMap::new());
+    let enrolled = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
 
     let app_state = AppState {
         db,

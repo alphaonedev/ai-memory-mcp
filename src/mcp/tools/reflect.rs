@@ -880,31 +880,12 @@ mod tests {
         assert!(err.contains("agent_id"), "got: {err}");
     }
 
-    #[test]
-    fn reflect_owner_without_an_authenticated_caller_keeps_the_3171_binding() {
-        // The `None` path — every MCP / CLI caller — must be byte-identical to
-        // pre-#3423: the #3171 wire binding still refuses a self-asserted id
-        // that disagrees with the enforced caller, and honours a matching one.
-        let _envg = crate::identity::agent_id_env_test_lock();
-        // SAFETY: process-global env mutation serialised on the crate-wide test
-        // lock held above; every mutator takes the same lock.
-        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:realcaller") };
-
-        let err = resolve_reflect_owner(Some("ai:forged"), None, None)
-            .expect_err("a forged wire principal must still refuse");
-        assert!(err.contains("agent_id mismatch"), "got: {err}");
-        assert_eq!(
-            resolve_reflect_owner(Some("ai:realcaller"), None, None).expect("self"),
-            "ai:realcaller"
-        );
-        assert_eq!(
-            resolve_reflect_owner(None, None, None).expect("ambient"),
-            "ai:realcaller"
-        );
-
-        // SAFETY: same serialisation as the set above.
-        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-    }
+    // The `None`-caller half of the owner rule (the #3171 env binding: a forged
+    // wire id is refused, a matching one and the ambient default resolve to the
+    // enforced caller) installs `AI_MEMORY_AGENT_ID`, which the #3475 arm of
+    // `scripts/check-test-env-lock.sh` forbids inside the lib test binary (the
+    // READERS on sibling threads do not take the lock). It lives in its own
+    // process instead: `tests/reflect_owner_env_binding_3423.rs`.
 
     #[test]
     fn parse_reflect_input_threads_the_authenticated_caller_3423() {
