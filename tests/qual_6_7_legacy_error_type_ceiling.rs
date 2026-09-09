@@ -207,7 +207,13 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // 2026-09-07 QUAL-6/QUAL-7 lockstep ruling; no spare headroom.
 // 2026-09-09 chain 3 (Conductor lockstep): #3423 (+1) and #3381 (+1) both land on the
 // tip's 128, so the merged tree measures 130. Set on the merged tree, never lower.
-const QUAL_6_CEILING: usize = 130;
+// 2026-09-09 (#3386 kg-query visibility) — raised 128 -> 130 for the two
+// traversal helpers extracted from handle_kg_query: kg_query_by_source_uri
+// and kg_query_from_source. Both retain that MCP handler's existing
+// Result<Value, String> boundary; the split makes the shared input filters
+// explicit above both traversal paths. Preserve the earlier lane counts.
+// 2026-09-09 chain 3 (Conductor lockstep, updated): + #3386 (+2) => merged tree measures 132.
+const QUAL_6_CEILING: usize = 132;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
