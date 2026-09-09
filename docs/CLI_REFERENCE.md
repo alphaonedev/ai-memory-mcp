@@ -1676,7 +1676,7 @@ successful.
 The published JSON reports how much topic authority the snapshot grants:
 
 ```json
-{"allowlist":"/run/ai-memory/hub-allow.json","agents":3,"refreshed_at":"…",
+{"allowlist":"/run/ai-memory-hub/hub-allow.json","agents":3,"refreshed_at":"…",
  "max_age_secs":60,"readable_prefixes":7,"max_readable_prefixes_per_agent":3}
 ```
 
@@ -1719,9 +1719,11 @@ optional, and it is not a thing to do by hand. Ship it as a job:
 (every 30 s, jittered, no catch-up) on Linux, or
 `scripts/templates/dev.alphaone.ai-memory.wake-hub-refresh.plist` on macOS
 ([#3504](https://github.com/alphaonedev/ai-memory-mcp/issues/3504)). Both run
-exactly this command, and both write to the path the #3471 hub units READ —
-`/run/ai-memory/hub-allow.json` on Linux (the `$ALLOWLIST` that
-`ai-memory-wake-hub.service` passes to `--allowlist`) and
+exactly this command, and both write to the path the hub units READ —
+`/run/ai-memory-hub/hub-allow.json` on Linux (the `$ALLOWLIST` that
+`ai-memory-wake-hub.service` passes to `--allowlist`; the refresher
+derives as `User=ai-memory` then `install(1)`s the file 0600 owned by
+`ai-memory-hub`) and
 `~/.ai-memory/hub-allow.json` on macOS. Pointing the refresher anywhere else
 leaves a hub reading a file nobody writes. Because `/run` is a tmpfs the
 snapshot does not survive a reboot, so the first post-boot refresh

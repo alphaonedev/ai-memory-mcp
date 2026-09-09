@@ -66,6 +66,19 @@ v1.0.0 flips the federation-receive and federation-transport lanes to fail-close
 - **The curator daemon reads across all tenants** (`bypass_visibility`, admin-class) to perform background maintenance (reflect/consolidate/decay). Treat curator credentials as root-equivalent; it is C8-allowlist-gated in CI but is a privileged in-process actor.
 - **Namespace governance is allow-on-silence (#1569)**: a namespace with no configured standard defaults to `write/promote: Any`. `enforce` permissions mode does nothing until you install rules / namespace standards. Configure explicit standards for production / multi-tenant namespaces.
 
+## Wake-hub / rust-a2a sidecar threat model (#3578)
+
+The wake hub is a same-host, content-free hint plane. It is **not** an authority over ai-memory data: the hub process never opens the store, never sees a memory body, and never becomes a write principal. Can an agent use the sidecar to bypass ai-memory's controls? Four exposures, with the control for each:
+
+| Exposure | Control | Residual |
+|----------|---------|----------|
+| Exfiltration after an authorized read | Recall-observation ledger + per-agent API-key binding + quotas | Detectable, **not preventable** once the principal was authorized to read |
+| Oversight gap on ephemeral coordination | Frames are `{inbox_row_id, namespace, sender, digest, seq}` ≤ 256 B; no `content`/`title`; inbox row + ≤60 s backstop is the record | Coordination *existence* is observable; the body never rides the hub |
+| Laundered injection through an agent that trusts A2A input | A hub delegation (`a2a-hub/join/v1`) is refused as a caller identity or write authority; SDK-edge screen on A2A payloads (v1.1.0 BabelTele, item 6) | An agent that treats a wake as a command is that agent's bug |
+| Hub-process compromise | Distinct `User=ai-memory-hub` / launchd `UserName`; `InaccessiblePaths=/var/lib/ai-memory`; `RestrictAddressFamilies=AF_UNIX` (TCP only behind an operator `--tcp` drop-in that is **not** shipped). Pins: `tests/wake_hub_process_isolation_3578.rs` | Compromised hub can drop/delay hints. It cannot mint identities or reach the store |
+
+Packaging: `packaging/systemd/ai-memory-wake-hub.service` and `scripts/templates/dev.alphaone.ai-memory.wake-hub.plist`. The refresher (`ai-memory-wake-hub-refresh.service`) is the unit that opens the store; it runs as `User=ai-memory` and `install(1)`s the 0600 snapshot as the hub uid. Red-team acceptance cases live on [#3473](https://github.com/alphaonedev/ai-memory-mcp/issues/3473). The certification-standard rows are `docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md` §0.6.
+
 ## Reporting a vulnerability
 
 **Do NOT open a public GitHub issue for a vulnerability report.** Report privately via one of:

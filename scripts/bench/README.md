@@ -73,6 +73,27 @@ scripts/bench/host-facts.sh --check
 
 # The wake-plane acceptance run (#3473, EPIC #3466)
 
+## Red-team acceptance cases (#3578 item 5)
+
+These are the GA-blocker cases the operator directed onto this issue. Each
+has a denied pin already in tree (or, for hub-process DB access, a
+permissions pin that makes the attempt impossible). The latency/A-B-A-B/kill
+producers above do **not** replace them.
+
+| Case | Denied pin | Allowed pin |
+|---|---|---|
+| Forged delegation | `src/wake_hub/delegation_verifier.rs::denied_a_delegation_for_a_different_key_cannot_be_replayed`; `tests/wake_hub_denied_3467.rs::denied_a_forged_from_is_refused_and_routed_nowhere` | A hello whose scoped `a2a-hub/join/v1` verifies under the agent's enrolled key is admitted (`tests/wake_hub_authority_3468.rs`) |
+| Replayed join | `src/wake_hub/mod.rs` challenge uniqueness (`assert_ne!(a, b, "a reused challenge would make hello replayable")`); `src/wake_hub/identity.rs` domain-separated hello transcript | A fresh challenge + matching signature joins |
+| Subscribe outside proven scope | `tests/wake_hub_topic_scopes_3505.rs` (own-inbox only until #3505 topics; out-of-scope subscribe is refused) | In-scope topic subscribe ACKs |
+| Oversized frame | `src/wake_hub/frame.rs::decode_refuses_an_oversize_frame_before_parsing_it`; `src/wake_hub/codec.rs::an_oversize_length_prefix_is_refused_before_the_body_is_buffered`; `MAX_WAKE_META_BYTES = 256` | A wake whose metadata is ≤ 256 B is routed |
+| Hub process attempting DB/key access | **Impossible by permissions**: `User=ai-memory-hub` + `InaccessiblePaths=/var/lib/ai-memory` + `ProtectHome=yes`. Pin: `tests/wake_hub_process_isolation_3578.rs` (denied fixture is a unit that shares `User=ai-memory` or can `ReadWritePaths` the store) | The refresher (`User=ai-memory`) is the unit that opens the store and `install(1)`s the snapshot |
+| Hub compromise simulation | A hostile hub still cannot mint identities (no enrolled private key in its uid; snapshot is public keys only) and cannot reach the store (same jail). It can drop or delay hints — availability of the *wake*, never of the inbox row (`wake_hub_kill.sh` already proves kill-under-load loses no inbox rows) | Inbox row + ≤60 s backstop poll remain the record |
+
+The first four are code gates. The last two are the packaging contract #3578
+item 3 added; they are not producible as a latency sample and must not be
+folded into `wake_latency.py`.
+
+
 `#3473` is the acceptance leg of the wake-plane EPIC. Three questions, three
 producers, one shared lifecycle:
 
