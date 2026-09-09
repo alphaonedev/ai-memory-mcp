@@ -807,6 +807,18 @@ When a `confidence_tier` filter is requested, the response envelope adds a `meta
 
 These fields are uniform across MCP `memory_recall`, HTTP recall, and `memory_session_start`.
 
+`as_agent` is a scope position that only narrows reads on CLI recall/search,
+MCP `memory_recall`/`memory_search`, and HTTP recall/search/KG query (#3499).
+Caller/substrate admission runs first; team/unit/org scope then uses `as_agent`,
+while private/inbox ownership always uses the enforced caller. `as_agent` never
+selects the governance or recall-ledger identity. With no enforced caller,
+supplying `as_agent` withholds private/inbox rows, including the named agent's
+own inbox. Omitting both preserves the documented single-operator posture.
+HTTP rejects an `as_agent` that differs from the header-resolved caller.
+MCP `memory_list` and `memory_session_start` do not support `as_agent`; their
+schemas and enforced-caller visibility remain unchanged.
+
+
 ### `GET /api/v1/search`
 
 Read-only FTS5 keyword search. Same filter params as list, plus `q`
@@ -1041,6 +1053,12 @@ Response: `{"found":true,"valid_until":"...","previous_valid_until":null}`.
 
 Recursive-CTE traversal of the temporal knowledge graph rooted at a
 source memory.
+
+Optional `namespace` selects target rows by exact namespace after traversal;
+substrate targets require an explicitly requested substrate namespace.
+Optional `as_agent` applies the same caller-then-scope narrowing rule described
+above, on SQLite and native PostgreSQL/AGE. Neither parameter changes reachability.
+
 
 ```json
 {

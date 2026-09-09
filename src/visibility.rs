@@ -904,6 +904,22 @@ mod substrate_visibility_3348_tests {
     }
 }
 
+/// Apply caller and substrate admission before an optional scope-position filter.
+///
+/// #3499: `as_agent` only narrows a read. It never becomes the ownership,
+/// governance, or ledger identity. With no caller, an explicit scope position
+/// withholds private/inbox rows; omitting it preserves single-operator reads.
+#[must_use]
+pub fn is_readable_on_query_with_scope(
+    mem: &Memory,
+    caller: Option<&str>,
+    requested_namespace: Option<&str>,
+    as_agent: Option<&str>,
+) -> bool {
+    is_readable_on_query(mem, caller, requested_namespace)
+        && as_agent.is_none_or(|scope| is_visible_to_scope_agent(mem, scope, caller))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

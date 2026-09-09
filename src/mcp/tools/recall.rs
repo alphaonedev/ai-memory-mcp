@@ -42,7 +42,7 @@ impl McpTool for RecallTool {
         "Recall memories relevant to a context (ranked)."
     }
     fn docs() -> &'static str {
-        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller). #3171: `limit` is CAPPED AT 50 by the recall engine — a larger value is silently clamped, so reaching past 50 needs a narrower query, not a bigger limit."
+        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller). #3171: `limit` is CAPPED AT 50 by the recall engine — a larger value is silently clamped, so reaching past 50 needs a narrower query, not a bigger limit. as_agent is a scope position that only narrows; it never selects ownership, governance, or ledger identity. With as_agent and no enforced caller, private/inbox rows are withheld."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<RecallRequest>()
@@ -1050,7 +1050,12 @@ pub fn handle_recall_dto(
         results
             .into_iter()
             .filter(|(m, _)| {
-                crate::visibility::is_readable_on_query(m, caller, requested_namespace)
+                crate::visibility::is_readable_on_query_with_scope(
+                    m,
+                    caller,
+                    requested_namespace,
+                    req.as_agent.as_deref(),
+                )
             })
             .collect()
     };

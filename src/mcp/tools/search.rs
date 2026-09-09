@@ -62,7 +62,7 @@ impl McpTool for SearchTool {
         "Search memories by exact keyword match (AND semantics)."
     }
     fn docs() -> &'static str {
-        "Exact keyword AND search. Deterministic; no fuzzy/semantic. Filters: namespace, tier, agent_id, as_agent (Task 1.5 scope). WT-1-E: atomised sources hidden by default."
+        "Exact keyword AND search. Deterministic; no fuzzy/semantic. Filters: namespace, tier, agent_id, as_agent (scope position that only narrows; never an ownership identity). Private/inbox rows require an enforced caller when as_agent is supplied. WT-1-E: atomised sources hidden by default."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SearchRequest>()
@@ -80,7 +80,7 @@ impl McpTool for SearchTool {
 /// identity via [`crate::identity::resolve_read_visibility_caller`]) we
 /// additionally drop rows the caller does not own per
 /// [`crate::visibility::is_visible_to_caller`]. `None` keeps the
-/// single-tenant trust-all behavior.
+/// single-tenant trust-all behavior only when `as_agent` is also absent.
 pub(super) fn handle_search(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -154,7 +154,7 @@ pub(super) fn handle_search(
                 caller,
             )
             .map_err(|e| e.to_string())?;
-            let results = filter_visible(results, caller, namespace);
+            let results = filter_visible(results, caller, namespace, as_agent);
             return Ok(json!({"results": results, "count": results.len()}));
         }
         return Err(crate::errors::msg::QUERY_REQUIRED.into());
@@ -177,7 +177,7 @@ pub(super) fn handle_search(
         caller,
     )
     .map_err(|e| e.to_string())?;
-    let results = filter_visible(results, caller, namespace);
+    let results = filter_visible(results, caller, namespace, as_agent);
     Ok(json!({"results": results, "count": results.len()}))
 }
 
@@ -193,10 +193,18 @@ fn filter_visible(
     results: Vec<crate::models::Memory>,
     caller: Option<&str>,
     requested_namespace: Option<&str>,
+    as_agent: Option<&str>,
 ) -> Vec<crate::models::Memory> {
     results
         .into_iter()
-        .filter(|m| crate::visibility::is_readable_on_query(m, caller, requested_namespace))
+        .filter(|m| {
+            crate::visibility::is_readable_on_query_with_scope(
+                m,
+                caller,
+                requested_namespace,
+                as_agent,
+            )
+        })
         .collect()
 }
 
