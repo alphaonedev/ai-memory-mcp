@@ -30,11 +30,16 @@ use super::store_err_to_response;
 use super::{AppState, JsonOrBadRequest};
 use crate::mcp::{MemoryCaptureTurnRequest, prepare_capture_turn};
 
+mod attestation;
+
 /// Build the success envelope shared by every backend path. A dedup hit
 /// is a no-op idempotent replay → `200 OK`; a fresh capture wrote rows
 /// → `201 Created`. `attest_level` (`self_signed` / `signed_by_peer`)
 /// is surfaced only on a fresh write, matching the MCP tool response.
-fn capture_turn_ok(result: &crate::models::CaptureTurnResult, attest_level: &str) -> Response {
+fn capture_turn_ok(
+    result: &crate::models::CaptureTurnResult,
+    attest_level: crate::models::AttestLevel,
+) -> Response {
     if result.dedup_hit {
         (
             StatusCode::OK,
@@ -52,7 +57,7 @@ fn capture_turn_ok(result: &crate::models::CaptureTurnResult, attest_level: &str
                 "memory_id": result.memory_id,
                 "dedup_hit": false,
                 "layer": "L4",
-                (field_names::ATTEST_LEVEL): attest_level,
+                (field_names::ATTEST_LEVEL): attest_level.as_str(),
             })),
         )
             .into_response()
@@ -90,13 +95,29 @@ pub async fn capture_turn(
     // verification #1414) + Memory/SignedEvent construction happens here,
     // shared verbatim with the MCP tool. String errors are caller-facing
     // input problems → 400.
-    let write = match prepare_capture_turn(&req, &agent_id) {
+    let mut write = match prepare_capture_turn(&req, &agent_id) {
         Ok(w) => w,
         Err(msg) => {
+            if req.host_signature_b64.is_some() || req.host_pubkey_b64.is_some() {
+                return attestation::refusal(StatusCode::FORBIDDEN, &msg);
+            }
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
         }
     };
-    let attest_level = write.signed_event.attest_level.clone();
+    // #3406 — the host envelope has already verified. HTTP additionally
+    // requires the direct-write posture and the caller's bound key. Legacy
+    // session/turn dedup remains its replay control (not the timed ledger).
+    let attest_level = match attestation::admit(&app, &req, &write, &agent_id).await {
+        Ok(level) => level,
+        Err(response) => return response,
+    };
+    write.signed_event.attest_level = attest_level.as_str().to_string();
+    if let Some(metadata) = write.memory.metadata.as_object_mut() {
+        metadata.insert(
+            field_names::ATTEST_LEVEL.into(),
+            json!(attest_level.as_str()),
+        );
+    }
 
     // #3225 — MCP `handle_capture_turn` runs K9 `Permissions::evaluate` +
     // K3 `enforce_governance` before the idempotent write. HTTP used to
@@ -126,7 +147,7 @@ pub async fn capture_turn(
         // adapter, so this serves both backends through the trait method.
         let ctx = crate::store::CallerContext::for_agent(agent_id).with_capability(capability);
         match app.store.capture_turn_idempotent(&ctx, &write).await {
-            Ok(result) => capture_turn_ok(&result, &attest_level),
+            Ok(result) => capture_turn_ok(&result, attest_level),
             Err(e) => store_err_to_response(e),
         }
     };
@@ -144,7 +165,7 @@ pub async fn capture_turn(
         // the SAL branch above, whose `for_agent` ctx has
         // `bypass_visibility = false`).
         match crate::storage::capture_turn_idempotent(&lock.0, &write, false) {
-            Ok(result) => capture_turn_ok(&result, &attest_level),
+            Ok(result) => capture_turn_ok(&result, attest_level),
             Err(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": msg })),

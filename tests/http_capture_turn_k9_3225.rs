@@ -26,6 +26,8 @@ use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
+mod common;
+
 fn postgres_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .ok()
@@ -102,6 +104,8 @@ async fn build_pg_router(url: &str) -> axum::Router {
 #[tokio::test]
 #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL"]
 async fn http_capture_turn_respects_namespace_deny() {
+    // #3406: exercise the namespace gate, not the strict unsigned refusal.
+    let _attestation = common::EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0".into());
     let Some(url) = postgres_url() else {
         panic!("AI_MEMORY_TEST_POSTGRES_URL unset — cannot run live-pg #3225 pin");
     };
@@ -139,6 +143,12 @@ async fn http_capture_turn_respects_namespace_deny() {
         .expect("body");
     let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
     clear_active_permission_rules_for_test();
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("no HTTP capture into secrets")),
+        "{payload}"
+    );
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
