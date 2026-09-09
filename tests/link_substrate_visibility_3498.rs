@@ -167,10 +167,16 @@ fn named_kg_namespace_preserves_owner_gate_3498() {
                     .unwrap()
                     .iter()
                     .any(|m| m["target_id"] == mail.id);
+                // Chain-3 reconciliation (Conductor, #3498 review 20:45Z): a
+                // request `namespace` is the explicit opt-in for substrate
+                // rows in THAT namespace on BOTH traversal paths (#3386 keeps
+                // the two paths in lockstep; #3348 gives `--namespace` the
+                // same meaning on recall), still gated by caller visibility:
+                // own mail is returned, another agent's mail is withheld.
                 assert_eq!(
                     found,
-                    params.get("by_source_uri").is_some() && recipient == "ai:me",
-                    "anchor vs reached inbox gate: {out}"
+                    recipient == "ai:me",
+                    "named-namespace inbox gate on both paths: {out}"
                 );
             }
         }
