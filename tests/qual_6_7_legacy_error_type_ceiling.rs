@@ -189,7 +189,16 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // the shared `cargo test --lib` binary, and it is
 // `#[cfg(any(test, feature = "test-support"))]` — absent from a release
 // build entirely. Net acknowledged: +1.
-const QUAL_6_CEILING: usize = 128;
+// 2026-09-02 (#3423 reflect owner parity, rebased onto 02580a51 2026-09-08) —
+// raised 128 -> 129 for `handle_reflect_caller` (`src/mcp/tools/reflect.rs`),
+// the authenticated-caller entry point the HTTP reflect route uses so SQLite
+// and PostgreSQL attribute a reflection to the same principal. It carries
+// `handle_reflect`'s existing `Result<Value, String>` MCP envelope verbatim —
+// the shipped `handle_recall` / `handle_recall_caller` split, not a new
+// legacy-typed surface. Measured 126 on the pre-rebase base (125 + 1); the
+// same +1 lands on the tip's 128 (#3357 + #3523 arrived in between).
+// Measured 129. Never lower.
+const QUAL_6_CEILING: usize = 129;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
