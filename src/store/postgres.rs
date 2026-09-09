@@ -38839,6 +38839,10 @@ mod tests {
     /// are unaffected.
     #[tokio::test]
     async fn live_link_reflects_on_cycle_refused_1568() {
+        // CONCURRENCY-20 exception: the test-only lineage std mutex is held
+        // across `store.store().await`. Safe because no other task on either
+        // runtime contends this lock; insert order is already flag-independent
+        // (b then a) so the hold only serialises against seeders.
         let _lineage = crate::test_support::no_lineage_dag_guard();
         let Some(url) = postgres_url() else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");

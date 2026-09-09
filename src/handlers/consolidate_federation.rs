@@ -612,6 +612,10 @@ mod tests {
     #[tokio::test]
     async fn store_finalize_and_disposition_matches_sqlite_twin() {
         use crate::store::{CallerContext, MemoryStore};
+        // CONCURRENCY-20 exception: the test-only lineage std mutex is held
+        // across `.await` (store + finalize). Safe because no other task on
+        // either runtime contends this lock — it serialises lib-test seeders
+        // in this process only.
         let g = crate::test_support::LineageDagIsolation::new();
         g.set_lineage_dag(true);
         g.set_consolidate_tombstone_sources(true);
