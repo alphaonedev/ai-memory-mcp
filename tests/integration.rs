@@ -3962,7 +3962,7 @@ fn test_consolidate_stamps_curator_derived_provenance_1633() {
                 "--db",
                 db_path.to_str().unwrap(),
                 "--agent-id",
-                "alice",
+                "curator",
                 "--json",
                 "store",
                 "-T",
@@ -4037,12 +4037,62 @@ fn test_consolidate_attributes_to_consolidator() {
         ids.push(j["id"].as_str().unwrap().to_string());
     }
 
-    let out = cmd(binary)
+    // #3380: a named non-owner cannot consume these private sources.
+    // Snapshot every row so refusal proves no source mutation or derivative.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let snapshot = || {
+        let mut stmt = conn
+            .prepare("SELECT id, content, metadata, lifecycle_state FROM memories ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    let before = snapshot();
+    assert_eq!(before.len(), ids.len(), "all source rows must be present");
+    let denied = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
             "--agent-id",
             "consolidator-dana",
+            "consolidate",
+            "--title",
+            "denied-merged",
+            "--summary",
+            "A+B+C",
+            "--namespace",
+            "cg",
+            &ids.join(","),
+        ])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "non-owner must be refused");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("memory not found"),
+        "hidden sources must share the missing-source error: {denied:?}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "refusal must not tombstone sources or insert a derivative"
+    );
+
+    // Single-operator mode admits multi-author consolidation; no named caller
+    // or inherited agent identity may turn this into a foreign-owner request.
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
             "consolidate",
             "--title",
             "merged",
@@ -4061,6 +4111,7 @@ fn test_consolidate_attributes_to_consolidator() {
     );
 
     let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -4072,14 +4123,21 @@ fn test_consolidate_attributes_to_consolidator() {
         .output()
         .unwrap();
     let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(resp["memories"][0]["title"], "merged");
     let meta = &resp["memories"][0]["metadata"];
 
-    assert_eq!(
-        meta["agent_id"], "consolidator-dana",
-        "consolidator's agent_id must be authoritative"
+    let consolidator = meta["agent_id"].as_str().unwrap();
+    assert!(
+        !consolidator.is_empty() && !["alice", "bob", "charlie"].contains(&consolidator),
+        "the ambient consolidator must be authoritative, not a source author: {meta}"
     );
     let sources = meta["consolidated_from_agents"].as_array().unwrap();
     let source_strs: Vec<&str> = sources.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        source_strs.len(),
+        3,
+        "preserve exactly the three source authors"
+    );
     assert!(source_strs.contains(&"alice"));
     assert!(source_strs.contains(&"bob"));
     assert!(source_strs.contains(&"charlie"));
