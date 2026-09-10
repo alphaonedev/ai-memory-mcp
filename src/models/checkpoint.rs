@@ -159,20 +159,22 @@ impl ConditionType {
         Self::EpochAdvance,
     ];
 
-    /// Completeness pin (#3378 unit 3): a new variant not listed in
-    /// [`Self::ALL`] fails to compile because this match is exhaustive.
-    const fn all_exhaustive(self) {
+    /// Index of this variant in [`Self::ALL`] (declaration order, 0..N).
+    /// Completeness pin (#3378 unit 3): exhaustive so a new variant fails
+    /// to compile, and the const block below asserts `ALL.len() == N` and
+    /// `ALL[i].variant_index() == i` so ALL cannot silently omit it.
+    const fn variant_index(self) -> usize {
         match self {
-            Self::Approval
-            | Self::ExternalSignal
-            | Self::ConditionPredicate
-            | Self::Deadline
-            | Self::AuditHeadWitness
-            | Self::GovernanceVerdict
-            | Self::GovernanceEnforcement
-            | Self::EpochAdvance
-            | Self::PeerHeadEntanglement
-            | Self::ReAnchor => {}
+            Self::Approval => 0,
+            Self::ExternalSignal => 1,
+            Self::ConditionPredicate => 2,
+            Self::Deadline => 3,
+            Self::AuditHeadWitness => 4,
+            Self::GovernanceVerdict => 5,
+            Self::GovernanceEnforcement => 6,
+            Self::EpochAdvance => 7,
+            Self::PeerHeadEntanglement => 8,
+            Self::ReAnchor => 9,
         }
     }
 
@@ -248,11 +250,16 @@ impl CheckpointState {
     /// caller-supplied resolutions.
     pub const RESOLUTION: [Self; 2] = [Self::Resolved, Self::Rejected];
 
-    /// Completeness pin (#3378 unit 3): a new variant not listed in
-    /// [`Self::ALL`] fails to compile because this match is exhaustive.
-    const fn all_exhaustive(self) {
+    /// Index of this variant in [`Self::ALL`] (declaration order, 0..N).
+    /// Completeness pin (#3378 unit 3): exhaustive so a new variant fails
+    /// to compile, and the const block below asserts `ALL.len() == N` and
+    /// `ALL[i].variant_index() == i` so ALL cannot silently omit it.
+    const fn variant_index(self) -> usize {
         match self {
-            Self::Pending | Self::Resolved | Self::Rejected | Self::Expired => {}
+            Self::Pending => 0,
+            Self::Resolved => 1,
+            Self::Rejected => 2,
+            Self::Expired => 3,
         }
     }
 
@@ -266,9 +273,28 @@ impl CheckpointState {
     }
 }
 
-const _: fn(ConditionType) = ConditionType::all_exhaustive;
+const _: () = {
+    const N: usize = 10;
+    assert!(ConditionType::ALL.len() == N);
+    let mut i = 0;
+    while i < N {
+        assert!(ConditionType::ALL[i].variant_index() == i);
+        i += 1;
+    }
+};
+
 const _: fn(ConditionType) -> bool = ConditionType::caller_mintable_exhaustive;
-const _: fn(CheckpointState) = CheckpointState::all_exhaustive;
+
+const _: () = {
+    const N: usize = 4;
+    assert!(CheckpointState::ALL.len() == N);
+    let mut i = 0;
+    while i < N {
+        assert!(CheckpointState::ALL[i].variant_index() == i);
+        i += 1;
+    }
+};
+
 const _: fn(CheckpointState) -> bool = CheckpointState::resolution_exhaustive;
 
 /// A conditional coordination gate — one row in the Pillar-1 `checkpoints`
@@ -306,10 +332,11 @@ mod tests {
 
     #[test]
     fn condition_type_roundtrips_str() {
-        for c in ConditionType::ALL {
+        assert_eq!(ConditionType::ALL.len(), 10);
+        for (i, c) in ConditionType::ALL.into_iter().enumerate() {
+            assert_eq!(c.variant_index(), i);
             assert_eq!(ConditionType::from_str(c.as_str()), Some(c));
         }
-        assert_eq!(ConditionType::ALL.len(), 10);
     }
 
     #[test]
@@ -351,10 +378,11 @@ mod tests {
 
     #[test]
     fn checkpoint_state_roundtrips_str() {
-        for s in CheckpointState::ALL {
+        assert_eq!(CheckpointState::ALL.len(), 4);
+        for (i, s) in CheckpointState::ALL.into_iter().enumerate() {
+            assert_eq!(s.variant_index(), i);
             assert_eq!(CheckpointState::from_str(s.as_str()), Some(s));
         }
-        assert_eq!(CheckpointState::ALL.len(), 4);
         assert_eq!(
             CheckpointState::RESOLUTION,
             [CheckpointState::Resolved, CheckpointState::Rejected]

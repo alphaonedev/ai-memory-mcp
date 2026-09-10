@@ -74,16 +74,18 @@ impl ActionState {
         Self::Abandoned,
     ];
 
-    /// Completeness pin (#3378 unit 3): a new variant not listed in
-    /// [`Self::ALL`] fails to compile because this match is exhaustive.
-    const fn all_exhaustive(self) {
+    /// Index of this variant in [`Self::ALL`] (declaration order, 0..N).
+    /// Completeness pin (#3378 unit 3): exhaustive so a new variant fails
+    /// to compile, and the const block below asserts `ALL.len() == N` and
+    /// `ALL[i].variant_index() == i` so ALL cannot silently omit it.
+    const fn variant_index(self) -> usize {
         match self {
-            Self::Pending
-            | Self::Claimed
-            | Self::InProgress
-            | Self::Done
-            | Self::Failed
-            | Self::Abandoned => {}
+            Self::Pending => 0,
+            Self::Claimed => 1,
+            Self::InProgress => 2,
+            Self::Done => 3,
+            Self::Failed => 4,
+            Self::Abandoned => 5,
         }
     }
 
@@ -189,17 +191,40 @@ impl EdgeType {
         Self::Sibling,
     ];
 
-    /// Completeness pin (#3378 unit 3): a new variant not listed in
-    /// [`Self::ALL`] fails to compile because this match is exhaustive.
-    const fn all_exhaustive(self) {
+    /// Index of this variant in [`Self::ALL`] (declaration order, 0..N).
+    /// Completeness pin (#3378 unit 3): exhaustive so a new variant fails
+    /// to compile, and the const block below asserts `ALL.len() == N` and
+    /// `ALL[i].variant_index() == i` so ALL cannot silently omit it.
+    const fn variant_index(self) -> usize {
         match self {
-            Self::Requires | Self::Unlocks | Self::Blocks | Self::GatedBy | Self::Sibling => {}
+            Self::Requires => 0,
+            Self::Unlocks => 1,
+            Self::Blocks => 2,
+            Self::GatedBy => 3,
+            Self::Sibling => 4,
         }
     }
 }
 
-const _: fn(ActionState) = ActionState::all_exhaustive;
-const _: fn(EdgeType) = EdgeType::all_exhaustive;
+const _: () = {
+    const N: usize = 6;
+    assert!(ActionState::ALL.len() == N);
+    let mut i = 0;
+    while i < N {
+        assert!(ActionState::ALL[i].variant_index() == i);
+        i += 1;
+    }
+};
+
+const _: () = {
+    const N: usize = 5;
+    assert!(EdgeType::ALL.len() == N);
+    let mut i = 0;
+    while i < N {
+        assert!(EdgeType::ALL[i].variant_index() == i);
+        i += 1;
+    }
+};
 
 /// A typed edge in the action dependency DAG. Mirrors the v59
 /// `action_edges` table.
@@ -229,11 +254,12 @@ mod tests {
 
     #[test]
     fn action_state_roundtrips_str() {
-        for s in ActionState::ALL {
+        assert_eq!(ActionState::ALL.len(), 6);
+        for (i, s) in ActionState::ALL.into_iter().enumerate() {
+            assert_eq!(s.variant_index(), i);
             assert_eq!(ActionState::from_str(s.as_str()), Some(s));
         }
         assert_eq!(ActionState::from_str("bogus"), None);
-        assert_eq!(ActionState::ALL.len(), 6);
     }
 
     #[test]
@@ -257,11 +283,12 @@ mod tests {
 
     #[test]
     fn edge_type_roundtrips_str() {
-        for e in EdgeType::ALL {
+        assert_eq!(EdgeType::ALL.len(), 5);
+        for (i, e) in EdgeType::ALL.into_iter().enumerate() {
+            assert_eq!(e.variant_index(), i);
             assert_eq!(EdgeType::from_str(e.as_str()), Some(e));
         }
         assert_eq!(EdgeType::from_str("gated_by"), Some(EdgeType::GatedBy));
         assert_eq!(EdgeType::from_str("bogus"), None);
-        assert_eq!(EdgeType::ALL.len(), 5);
     }
 }

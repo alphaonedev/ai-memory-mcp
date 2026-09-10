@@ -892,7 +892,7 @@
       "name": "memory_replay"
     },
     {
-      "description": "Full per-tool docs: verbose=true",
+      "description": "Discover runtime capabilities; full per-tool docs: verbose=true",
       "inputSchema": {
         "properties": {
           "accept": {

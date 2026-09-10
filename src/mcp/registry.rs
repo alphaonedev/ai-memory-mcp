@@ -1250,12 +1250,16 @@ const COMPACT_DANGLING_LAST_TOKENS: &[&str] = &[
 ];
 
 /// Compact `tools/list` label for the always-on bootstrap (#3378 unit 3
-/// ruling). One pointer on the wire, zero per-tool suffix cost. Fits
-/// [`COMPACT_DESCRIPTION_MAX`] exactly (32 bytes). Full prose / schema
-/// lives on `memory_capabilities { verbose=true }`.
-const CAPABILITIES_COMPACT: &str = "Full per-tool docs: verbose=true";
+/// ruling). One pointer on the wire, zero per-tool suffix cost. This
+/// label **bypasses** [`compact_description`] (it contains `;`, which
+/// would otherwise cut the gist at the first sentence), so the length
+/// pin is [`COMPACT_DESCRIPTION_EXTEND_MAX`] rather than
+/// [`COMPACT_DESCRIPTION_MAX`]. Full prose / schema lives on
+/// `memory_capabilities { verbose=true }`.
+const CAPABILITIES_COMPACT: &str =
+    "Discover runtime capabilities; full per-tool docs: verbose=true";
 
-const _: () = assert!(CAPABILITIES_COMPACT.len() <= COMPACT_DESCRIPTION_MAX);
+const _: () = assert!(CAPABILITIES_COMPACT.len() <= COMPACT_DESCRIPTION_EXTEND_MAX);
 
 /// Compact a `tools/list` description. The capabilities bootstrap uses
 /// [`CAPABILITIES_COMPACT`] so the pointer sits once on the always-on
@@ -1496,9 +1500,14 @@ mod compact_description_3378_tests {
 
     #[test]
     fn capabilities_compact_is_the_verbose_pointer_3378() {
-        // Exact Master 01:08Z string; length is pinned by the const assert
-        // next to CAPABILITIES_COMPACT (32/80 rule).
-        assert_eq!(CAPABILITIES_COMPACT, "Full per-tool docs: verbose=true");
+        // Exact Master 01:50Z string; length is pinned by the const assert
+        // next to CAPABILITIES_COMPACT (<= EXTEND_MAX; bypasses compact_description).
+        assert_eq!(
+            CAPABILITIES_COMPACT,
+            "Discover runtime capabilities; full per-tool docs: verbose=true"
+        );
+        assert_eq!(CAPABILITIES_COMPACT.len(), 63);
+        assert!(CAPABILITIES_COMPACT.len() <= COMPACT_DESCRIPTION_EXTEND_MAX);
     }
 
     #[test]

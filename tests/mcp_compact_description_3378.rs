@@ -185,12 +185,14 @@ fn ordinary_tools_do_not_carry_uniform_capabilities_suffix_3378() {
 fn memory_capabilities_compact_is_the_verbose_pointer_3378() {
     let got = compacted_description("memory_capabilities");
     assert_eq!(
-        got, "Full per-tool docs: verbose=true",
+        got, "Discover runtime capabilities; full per-tool docs: verbose=true",
         "memory_capabilities compact must be the one-time verbose pointer"
     );
+    assert_eq!(got.len(), 63, "specified label length, got {got:?}");
     assert!(
-        got.len() <= 32,
-        "capabilities compact must fit the 32-byte gist, got len={} {got:?}",
+        got.len() <= 80,
+        "capabilities compact bypasses compact_description so the ceiling \
+         is COMPACT_DESCRIPTION_EXTEND_MAX, got len={} {got:?}",
         got.len()
     );
 }

@@ -52,16 +52,27 @@ impl RoutineState {
     /// [`Self::from_str`] / [`Self::as_str`].
     pub const ALL: [Self; 2] = [Self::Draft, Self::Frozen];
 
-    /// Completeness pin (#3378 unit 3): a new variant not listed in
-    /// [`Self::ALL`] fails to compile because this match is exhaustive.
-    const fn all_exhaustive(self) {
+    /// Index of this variant in [`Self::ALL`] (declaration order, 0..N).
+    /// Completeness pin (#3378 unit 3): exhaustive so a new variant fails
+    /// to compile, and the const block below asserts `ALL.len() == N` and
+    /// `ALL[i].variant_index() == i` so ALL cannot silently omit it.
+    const fn variant_index(self) -> usize {
         match self {
-            Self::Draft | Self::Frozen => {}
+            Self::Draft => 0,
+            Self::Frozen => 1,
         }
     }
 }
 
-const _: fn(RoutineState) = RoutineState::all_exhaustive;
+const _: () = {
+    const N: usize = 2;
+    assert!(RoutineState::ALL.len() == N);
+    let mut i = 0;
+    while i < N {
+        assert!(RoutineState::ALL[i].variant_index() == i);
+        i += 1;
+    }
+};
 
 /// Lifecycle state of a [`RoutineRun`] (the `routine_runs.state` column).
 ///
@@ -159,10 +170,11 @@ mod tests {
 
     #[test]
     fn routine_state_roundtrips_str() {
-        for s in RoutineState::ALL {
+        assert_eq!(RoutineState::ALL.len(), 2);
+        for (i, s) in RoutineState::ALL.into_iter().enumerate() {
+            assert_eq!(s.variant_index(), i);
             assert_eq!(RoutineState::from_str(s.as_str()), Some(s));
         }
-        assert_eq!(RoutineState::ALL.len(), 2);
     }
 
     #[test]
