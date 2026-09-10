@@ -23,7 +23,7 @@ supplements `--help` with examples and context.
 |------|------|---------|-------------|
 | `--db <PATH>` | path | `ai-memory.db` | SQLite database path. Honours `AI_MEMORY_DB` env var. |
 | `--json` | bool | `false` | Emit machine-parseable JSON on stdout. |
-| `--agent-id <ID>` | string | synthesized NHI default | Stamps `metadata.agent_id`. Honours `AI_MEMORY_AGENT_ID` env var. |
+| `--agent-id <ID>` | string | synthesized NHI default | Stamps `metadata.agent_id` on writes. Also the notify sender, subscribe `created_by`, and inbox owner (#3433). Honours `AI_MEMORY_AGENT_ID` env var. |
 | `--db-passphrase-file <PATH>` | path | — | v0.6.0.0+. Root-readable file holding the SQLCipher passphrase. Only meaningful on `--features sqlcipher` builds. Seeds process-private state; does **not** export `AI_MEMORY_DB_PASSPHRASE` (#3213). |
 
 ## Environment variables
@@ -1337,9 +1337,9 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 | `check-duplicate` | `memory_check_duplicate` | Pre-write near-duplicate check (cosine over stored embeddings; requires semantic tier+). |
 | `replay` | `memory_replay` | Reconstruct the transcript chain that produced a memory. |
 | `reflect` | `memory_reflect` | Synthesize a reflection over source memories (CLI dispatcher runs unsigned / no LLM dedup — use MCP/HTTP for those). |
-| `subscribe` / `unsubscribe` / `list-subscriptions` | `memory_subscribe` / `memory_unsubscribe` / `memory_list_subscriptions` | Webhook subscription CRUD. |
+| `subscribe` / `unsubscribe` / `list-subscriptions` | `memory_subscribe` / `memory_unsubscribe` / `memory_list_subscriptions` | Webhook subscription CRUD. `created_by` / the #870/#872 owner gate is the global `--agent-id` ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
 | `subscription-replay` / `subscription-dlq-list` | `memory_subscription_replay` / `memory_subscription_dlq_list` | Webhook DLQ replay + inspection. |
-| `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. |
+| `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. Sender/owner is the global `--agent-id`; a subcommand `inbox --agent-id` that disagrees is refused ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
 | `ingest-multistep` | `memory_ingest_multistep` | Form 3 multi-step ingest (CLI passes no LLM handler; tier-locked advisory on every tier). |
 | `entity-register` / `entity-get-by-alias` | `memory_entity_register` / `memory_entity_get_by_alias` | Entity registry. CLI errors name `--canonical-name`, not MCP `title` ([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)). |
 | `dependents-of-invalidated` | `memory_dependents_of_invalidated` | Memories citing invalidated KG edges. |
@@ -1855,9 +1855,13 @@ the caller.
 ### `inbox --wait` — block until there is mail (v1.0.0, #3470 / EPIC #3466)
 
 ```bash
-ai-memory inbox --wait --agent-id ai:alice
-ai-memory inbox --wait --timeout 300 --agent-id ai:alice --json
+ai-memory --agent-id ai:alice inbox --wait
+ai-memory --agent-id ai:alice inbox --wait --timeout 300 --json
 ```
+
+The owner is the resolved caller (global `--agent-id` / `AI_MEMORY_AGENT_ID` /
+host fallback). A subcommand `--agent-id` is a match-only refinement: it
+cannot select another agent's inbox ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)).
 
 Blocks on the wake plane — the hub when `[wake_hub].socket` names one,
 otherwise the bounded backstop poll — and then performs and prints the inbox

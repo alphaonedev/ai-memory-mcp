@@ -2914,7 +2914,7 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::subscribe::cmd_subscribe(&db_path, &a, &mut out)
+            cli::commands::subscribe::cmd_subscribe(&db_path, &a, cli_agent_id.as_deref(), &mut out)
         }
         Command::Unsubscribe(a) => {
             let stdout = std::io::stdout();
@@ -2922,7 +2922,12 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::unsubscribe::cmd_unsubscribe(&db_path, &a, &mut out)
+            cli::commands::unsubscribe::cmd_unsubscribe(
+                &db_path,
+                &a,
+                cli_agent_id.as_deref(),
+                &mut out,
+            )
         }
         Command::ListSubscriptions(a) => {
             let stdout = std::io::stdout();
@@ -2930,7 +2935,12 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::list_subscriptions::cmd_list_subscriptions(&db_path, &a, &mut out)
+            cli::commands::list_subscriptions::cmd_list_subscriptions(
+                &db_path,
+                &a,
+                cli_agent_id.as_deref(),
+                &mut out,
+            )
         }
         Command::SubscriptionReplay(a) => {
             let stdout = std::io::stdout();
@@ -2954,7 +2964,13 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::notify::cmd_notify(&db_path, &a, app_config, &mut out)
+            cli::commands::notify::cmd_notify(
+                &db_path,
+                &a,
+                app_config,
+                cli_agent_id.as_deref(),
+                &mut out,
+            )
         }
         Command::Inbox(a) => {
             // v1.0.0 #3470 — `--wait` blocks on the wake plane (the hub when

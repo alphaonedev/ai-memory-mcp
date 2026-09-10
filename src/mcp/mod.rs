@@ -731,6 +731,10 @@ pub(crate) use session_start::handle_session_start;
 #[cfg(feature = "sal")]
 pub(crate) use session_start::SESSION_START_MODE;
 pub use subscribe::handle_unsubscribe;
+pub(crate) use subscribe::{
+    handle_list_subscriptions_as_caller, handle_subscribe_as_created_by,
+    handle_unsubscribe_as_caller,
+};
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — CLI parity exports for the
 // subscribe family + entity family + kg admin family + multistep
 // ingest + reflect/dependents/origin/quota observers. Promoted from

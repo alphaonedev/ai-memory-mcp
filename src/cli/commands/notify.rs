@@ -59,6 +59,11 @@ pub struct NotifyArgs {
 
 /// `ai-memory notify` dispatch entry.
 ///
+/// `cli_agent_id` is the global `--agent-id` flag (clap also folds
+/// `AI_MEMORY_AGENT_ID` into that slot). The sender stamped on the
+/// inbox row is that resolved caller — never the host fallback while
+/// an explicit identity is set (#3433).
+///
 /// # Errors
 ///
 /// - The DB at `db_path` cannot be opened.
@@ -68,10 +73,13 @@ pub fn cmd_notify(
     db_path: &std::path::Path,
     args: &NotifyArgs,
     app_config: &AppConfig,
+    cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
     let resolved_ttl = app_config.effective_ttl();
+    let sender = crate::identity::resolve_agent_id(cli_agent_id, None)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::notify(e)))?;
 
     let mut params = json!({
         (field_names::TARGET_AGENT_ID): args.target_agent_id,
@@ -90,8 +98,9 @@ pub fn cmd_notify(
         params[db::META_KEY_WHY_TRACE] = json!(wt);
     }
 
-    let envelope = crate::mcp::handle_notify(&conn, db_path, &params, &resolved_ttl, None)
-        .map_err(|e| anyhow::anyhow!("notify: {e}"))?;
+    let envelope =
+        crate::mcp::handle_notify_as_sender(&conn, db_path, &params, &resolved_ttl, &sender)
+            .map_err(|e| anyhow::anyhow!(crate::errors::msg::notify(e.message())))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -124,7 +133,7 @@ mod tests {
             json: true,
         };
         let mut out = env.output();
-        let err = cmd_notify(&db, &args, &cfg, &mut out).expect_err("must fail");
+        let err = cmd_notify(&db, &args, &cfg, None, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("notify"), "got: {err}");
     }
 
@@ -144,10 +153,59 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_notify(&db, &args, &cfg, &mut out).expect("notify ok");
+            cmd_notify(&db, &args, &cfg, None, &mut out).expect("notify ok");
         }
         let stdout = env.stdout_str();
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert_eq!(envelope["to"].as_str(), Some("ai:bob"));
+    }
+
+    /// ALLOWED (#3433): global `--agent-id` is the sender, not `host:<hostname>`.
+    #[test]
+    fn notify_cli_global_agent_id_stamps_sender_3433() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = AppConfig::default();
+        let args = NotifyArgs {
+            target_agent_id: "ai:bob".into(),
+            title: "subject".into(),
+            payload: "body".into(),
+            priority: None,
+            tier: None,
+            why_trace: None,
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_notify(&db, &args, &cfg, Some("ai:alice"), &mut out).expect("notify ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["from"].as_str(), Some("ai:alice"));
+        assert_eq!(envelope["to"].as_str(), Some("ai:bob"));
+    }
+
+    /// DENIED (#3433): an invalid global `--agent-id` is refused before write.
+    #[test]
+    fn notify_cli_invalid_global_agent_id_refused_3433() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = AppConfig::default();
+        let args = NotifyArgs {
+            target_agent_id: "ai:bob".into(),
+            title: "subject".into(),
+            payload: "body".into(),
+            priority: None,
+            tier: None,
+            why_trace: None,
+            json: true,
+        };
+        let mut out = env.output();
+        let err = cmd_notify(&db, &args, &cfg, Some("bad agent with spaces"), &mut out)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("notify"), "got: {err}");
+        assert!(
+            env.stdout_str().trim().is_empty(),
+            "must not write an envelope on refusal"
+        );
     }
 }
