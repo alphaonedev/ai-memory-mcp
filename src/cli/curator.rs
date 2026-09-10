@@ -213,32 +213,90 @@ fn print_curator_report(r: &curator::CuratorReport, out: &mut CliOutput<'_>) -> 
     Ok(())
 }
 
+/// #3585 test-only handshake: published after unix SIGTERM + SIGINT
+/// handlers are installed in [`await_shutdown_signal`], so a self-signal
+/// kicker never races the default disposition (which would SIGTERM the
+/// whole `--lib` binary under load).
+#[cfg(all(test, unix))]
+mod shutdown_handlers_ready {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    static READY: AtomicBool = AtomicBool::new(false);
+
+    pub fn reset() {
+        READY.store(false, Ordering::Release);
+    }
+
+    pub fn mark() {
+        READY.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_ready() -> bool {
+        READY.load(Ordering::Acquire)
+    }
+
+    /// Poll until [`mark`] has run, or `timeout`. CONCURRENCY-08: the
+    /// `Acquire` load pairs with `mark`'s `Release` store.
+    #[must_use]
+    pub async fn wait(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if is_ready() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        is_ready()
+    }
+}
+
 /// Resolve when the process receives SIGINT (ctrl_c, cross-platform)
 /// or — on unix — SIGTERM, so `systemctl stop` / `docker stop` / `kill`
 /// (whose default signal is SIGTERM) trigger the same clean
 /// between-cycles shutdown the `curator --daemon` doc promises
 /// (issue #2119). Mirrors the `cli::watch` daemon arm exactly: when the
 /// SIGTERM handler cannot install, its arm parks on `pending()` so the
-/// `select!` still resolves on ctrl_c alone. On non-unix targets only
+/// `select!` still resolves on interrupt alone. On non-unix targets only
 /// SIGINT is available.
 async fn await_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).ok();
+        // Install SIGINT the same way (not via `ctrl_c()`, which only
+        // registers on first poll of the select branch) so both
+        // handlers exist before the test-only ready flag is published.
+        let mut interrupt = signal(SignalKind::interrupt()).ok();
+        // Publish ready only when both handlers actually installed —
+        // otherwise a #3585 kicker must refuse to signal (default
+        // disposition would kill the process).
+        #[cfg(test)]
+        if term.is_some() && interrupt.is_some() {
+            shutdown_handlers_ready::mark();
+        }
         let term_fut = async {
             match term.as_mut() {
                 Some(t) => {
                     t.recv().await;
                 }
                 // No SIGTERM handler could be installed — park forever
-                // so `select!` resolves on ctrl_c alone.
+                // so `select!` resolves on interrupt alone.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let int_fut = async {
+            match interrupt.as_mut() {
+                Some(t) => {
+                    t.recv().await;
+                }
                 None => std::future::pending::<()>().await,
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
             () = term_fut => {}
+            () = int_fut => {}
         }
     }
     #[cfg(not(unix))]
@@ -2074,66 +2132,81 @@ mod tests {
         // No assertion on the value; the test exercises lines 55-56.
     }
 
+    /// #3585 — wait until `await_shutdown_signal` has installed
+    /// handlers, then self-signal. Returns whether the kicker fired.
+    /// False means handlers never became ready: the caller MUST panic
+    /// rather than SIGTERM a not-ready process (the whole `--lib` binary
+    /// would die under the default disposition).
+    #[cfg(unix)]
+    async fn kick_after_shutdown_handlers_ready(sig: i32) -> bool {
+        if !super::shutdown_handlers_ready::wait(std::time::Duration::from_secs(10)).await {
+            return false;
+        }
+        // SAFETY: kill(getpid, sig) is well-defined on POSIX.
+        unsafe {
+            libc::kill(libc::getpid(), sig);
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_handlers_ready_starts_false_and_mark_is_visible() {
+        super::shutdown_handlers_ready::reset();
+        assert!(
+            !super::shutdown_handlers_ready::is_ready(),
+            "handshake must start unset so a kicker cannot fire early"
+        );
+        super::shutdown_handlers_ready::mark();
+        assert!(super::shutdown_handlers_ready::is_ready());
+        super::shutdown_handlers_ready::reset();
+    }
+
     // Unix-only — the test self-fires `libc::kill(getpid, SIGINT)` to
-    // exercise the ctrl_c shutdown path. The libc crate's `getpid` /
-    // `kill` / `SIGINT` symbols are not available on Windows, where
-    // signal handling uses a different surface entirely. The daemon
-    // shutdown path itself is cross-platform (tokio::signal::ctrl_c
-    // works on Windows); only the self-fire test mechanism is
-    // POSIX-bound.
+    // exercise the interrupt shutdown path. Isolated in a subprocess
+    // (#3585, `key_dir_isolation_3355` pattern) so a lost race can only
+    // fail that child, never the whole `--lib` binary. The daemon
+    // shutdown path itself is cross-platform (`tokio::signal::ctrl_c`
+    // on Windows); only the self-fire test mechanism is POSIX-bound.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn curator_daemon_mode_short_loop_returns_on_shutdown() {
-        // Drives lines 128-150 — daemon mode entry. We fire SIGINT to
-        // ourselves after a short delay so the ctrl_c spawn notifies
-        // shutdown, the AtomicBool flag flips, and `run_daemon`'s loop
-        // exits at its next check. The blocking task joins and the
-        // outer `await` returns.
-        //
-        // We do NOT install our own signal handler — tokio's signal
-        // registry consumes the single SIGINT before any default
-        // handler trips. This test runs under multi_thread so the
-        // ctrl_c watcher can fire on a separate worker.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::curator::tests::curator_daemon_mode_short_loop_returns_on_shutdown",
+        ) {
+            return;
+        }
+        super::shutdown_handlers_ready::reset();
         use std::path::PathBuf;
         let env = TestEnv::fresh();
         let db: PathBuf = env.db_path.clone();
         let cfg = config::AppConfig::default();
         let mut args = default_args();
         args.daemon = true;
-        // Tiny interval so the daemon body wakes quickly to check the
-        // shutdown flag.
         args.interval_secs = 60; // clamped; the shutdown check is on each loop
         args.dry_run = true;
 
-        // Fire SIGINT to ourselves after a brief delay.
-        let kicker = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            // SAFETY: kill(getpid, SIGINT) is well-defined on POSIX.
-            unsafe {
-                let pid = libc::getpid();
-                libc::kill(pid, libc::SIGINT);
-            }
-        });
+        let kicker = tokio::spawn(kick_after_shutdown_handlers_ready(libc::SIGINT));
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
-        // The daemon should return Ok(()) after shutdown is signaled.
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             run(&db, &args, &cfg, &mut out),
         )
         .await;
-        let _ = kicker.await;
-        // The daemon CAN take more than 15s on a loaded box if its
-        // sleep is long; the timeout is a soft cap. Either an Ok join
-        // or a timeout means the daemon mode code ran.
+        let fired = kicker.await.expect("kicker join");
+        assert!(
+            fired,
+            "kicker must not fire before shutdown handlers are ready"
+        );
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => panic!("daemon mode errored: {e}"),
             Err(_) => {
-                // Timed out — that's fine for line-coverage purposes:
-                // the daemon-mode code path has already executed.
+                // Timed out after a ready-gated signal — the path ran;
+                // a slow cycle is not a lost race.
                 eprintln!("daemon-mode test timed out; coverage already captured");
             }
         }
@@ -2141,17 +2214,19 @@ mod tests {
 
     // #2119 regression twin of the SIGINT test above — proves the
     // curator `--daemon` arm returns cleanly on SIGTERM (the default
-    // `systemctl stop` / `kill` signal), not just SIGINT. Before the
-    // fix no `SignalKind::terminate()` handler was installed, so a
-    // self-fired SIGTERM would hard-kill the test process instead of
-    // triggering the documented between-cycles clean shutdown. The
-    // daemon's spawned watcher installs the SIGTERM handler at startup
-    // (well before the 200ms self-fire), so tokio consumes the signal
-    // and the loop exits at its next shutdown check. Unix-only: the
-    // self-fire uses `libc::kill(getpid, SIGTERM)`.
+    // `systemctl stop` / `kill` signal), not just SIGINT. #3585: the
+    // kicker waits on the handler-installed handshake instead of a
+    // fixed 200 ms sleep, and the body runs in a subprocess so a lost
+    // race cannot SIGTERM the whole `--lib` binary.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn curator_daemon_mode_returns_on_sigterm() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::curator::tests::curator_daemon_mode_returns_on_sigterm",
+        ) {
+            return;
+        }
+        super::shutdown_handlers_ready::reset();
         use std::path::PathBuf;
         let env = TestEnv::fresh();
         let db: PathBuf = env.db_path.clone();
@@ -2161,16 +2236,7 @@ mod tests {
         args.interval_secs = 60; // clamped; shutdown checked each loop
         args.dry_run = true;
 
-        // Fire SIGTERM to ourselves after a brief delay — long enough
-        // for the daemon's watcher task to install the SIGTERM handler.
-        let kicker = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            // SAFETY: kill(getpid, SIGTERM) is well-defined on POSIX.
-            unsafe {
-                let pid = libc::getpid();
-                libc::kill(pid, libc::SIGTERM);
-            }
-        });
+        let kicker = tokio::spawn(kick_after_shutdown_handlers_ready(libc::SIGTERM));
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -2180,14 +2246,15 @@ mod tests {
             run(&db, &args, &cfg, &mut out),
         )
         .await;
-        let _ = kicker.await;
+        let fired = kicker.await.expect("kicker join");
+        assert!(
+            fired,
+            "kicker must not fire before shutdown handlers are ready"
+        );
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => panic!("daemon mode errored on SIGTERM: {e}"),
             Err(_) => {
-                // Timed out — acceptable; the SIGTERM path already ran
-                // without hard-killing the process (the pre-fix failure
-                // mode would have aborted the whole test binary).
                 eprintln!("sigterm daemon test timed out; path already exercised");
             }
         }
@@ -2733,11 +2800,17 @@ mod tests {
     #[cfg(all(feature = "sal", unix))]
     #[tokio::test(flavor = "multi_thread")]
     async fn store_url_sqlite_daemon_loop_returns_on_shutdown() {
-        // Covers the SAL daemon-loop arm of run_store_backed_sweep. The
-        // ctrl_c watcher is spawned AFTER build_curator_store, so the
-        // SIGINT kick waits 3s — long enough for the watcher to register
-        // even under llvm-cov instrumentation (the 200ms legacy delay
-        // races the slower instrumented store build).
+        // Covers the SAL daemon-loop arm of run_store_backed_sweep.
+        // #3585: the watcher is spawned AFTER build_curator_store, so a
+        // fixed sleep races llvm-cov; wait on the handler handshake
+        // instead, in a subprocess so a lost race cannot SIGINT the
+        // whole `--lib` binary.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::curator::tests::store_url_sqlite_daemon_loop_returns_on_shutdown",
+        ) {
+            return;
+        }
+        super::shutdown_handlers_ready::reset();
         use std::path::PathBuf;
         let env = TestEnv::fresh();
         let db: PathBuf = env.db_path.clone();
@@ -2748,13 +2821,7 @@ mod tests {
         args.daemon = true;
         args.interval_secs = 60;
         args.dry_run = true;
-        let kicker = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
-            // SAFETY: kill(getpid, SIGINT) is well-defined on POSIX.
-            unsafe {
-                libc::kill(libc::getpid(), libc::SIGINT);
-            }
-        });
+        let kicker = tokio::spawn(kick_after_shutdown_handlers_ready(libc::SIGINT));
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
@@ -2763,7 +2830,11 @@ mod tests {
             run(&db, &args, &cfg, &mut out),
         )
         .await;
-        let _ = kicker.await;
+        let fired = kicker.await.expect("kicker join");
+        assert!(
+            fired,
+            "kicker must not fire before shutdown handlers are ready"
+        );
         assert!(res.is_ok(), "SAL daemon did not return within timeout");
         assert!(res.unwrap().is_ok());
     }
