@@ -931,6 +931,29 @@ with the resolved caller. Ordinary principal names such as `ai:alice` and
 matrix is pinned by `tests/wake_hub_identity_domain_3578.rs`. This wire
 reservation does not change the internal-bootstrap shape-only validator.
 
+**Credential and write-authority pins (#3578, #3579).**
+`tests/wake_hub_write_authority_3578.rs` first admits the exact delegation
+through the production hub hello verifier using a backend-derived possession
+binding. That delegation's wire envelope, root signature, and delegated public
+key cannot replace an enrolled HTTP API key. A hub-domain signature or a memory
+write signed by its delegated key cannot replace the enrolled root's memory-write
+signature. Denied requests leave the complete memory-row snapshot unchanged;
+allowed controls persist the independently resolved caller. Forged wake
+principal/sender/from and namespace fields do not select notification authority
+or its destination namespace. PostgreSQL tests require a live database and
+also check that the SQLite shadow receives no write.
+
+HTTP tests use the real router in per-agent API-key Enforce mode. MCP tests
+use the existing production-handler test entry and its host caller context;
+MCP has no API-key login. The PostgreSQL MCP path forwards over a real loopback
+HTTP listener requiring an enrolled-root write signature. That listener has
+no API-key gate because the existing forwarder sends only `X-Agent-Id`; the
+separate HTTP credential cases cover that gate. These pins do not claim stdio
+framing, a sandbox, or authentication of arbitrary operator code.
+`tests/http_notify_caller_binding_3579.rs` additionally pins the exact HTTP
+sender in both ambient-identity postures on SQLite and live PostgreSQL, and
+preserves MCP's host identity ladder and validation order.
+
 **Binary hint codec pins (#3578).** `tests/qual_wake_meta_codec_3578.rs`,
 `sdk/python/tests/test_wake_meta_3578.py`, and
 `sdk/typescript/__tests__/wake_meta_3578.test.ts` consume the same
