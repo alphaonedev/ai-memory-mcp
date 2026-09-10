@@ -122,7 +122,13 @@ jobs:
       # property KEYS + type shapes), not prose (the trim already strips
       # per-property descriptions). 7760 = 7684 + 76 margin; matches
       # tests/budget_tokens.rs::FULL_PROFILE_TOKEN_CEILING (lockstep).
-      - name: full-profile <= 7760 tokens (v0.7 C5 hard ceiling, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204 + #3171 + #3266/#3322)
+      # 2026-09-10 — raised 7760 -> 8110 (lockstep with tests/budget_tokens.rs::
+      # FULL_PROFILE_TOKEN_CEILING, Conductor ruling on the 869b4d49 campaign):
+      # #3378 units 1-3 compacted tool descriptions and moved enum lists into
+      # the description text; measured 8029 on 869b4d49; 8110 = 8029 + 81 margin.
+      # The 46be65a9 lockstep commit raised only the Rust constant; this is the
+      # workflow half (both steps below), found by the 6082af8a campaign.
+      - name: full-profile <= 8110 tokens (v0.7 C5 hard ceiling, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204 + #3171 + #3266/#3322 + #3378)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
@@ -134,11 +140,11 @@ jobs:
       # JSON shape (renamed field, dropped key) trips the gate too. We
       # parse the documented `trimmed_full_profile_total_tokens` field
       # — the bare `tools/list` wire payload after C2/C3/C4 trims —
-      # and fail with a pointer to the C2-C4 audit if it exceeds 7760.
+      # and fail with a pointer to the C2-C4 audit if it exceeds 8110.
       # The verbose sibling `full_profile_total_tokens` is only reachable
       # via the opt-in `memory_capabilities { verbose: true, … }` path
       # and is not gated here (see tests/budget_tokens.rs rationale).
-      - name: doctor --tokens --json reports trimmed total <= 7760 (v0.7 C5 post-D1.6 + #1709 + #2037 + #2059 + #2204 + #3171 + #3266/#3322)
+      - name: doctor --tokens --json reports trimmed total <= 8110 (v0.7 C5 post-D1.6 + #1709 + #2037 + #2059 + #2204 + #3171 + #3266/#3322 + #3378)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
@@ -147,9 +153,9 @@ jobs:
           PAYLOAD="$(./target/release/ai-memory doctor --tokens --json)"
           TOTAL="$(printf '%s' "$PAYLOAD" \
             | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["trimmed_full_profile_total_tokens"])')"
-          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 7760, post-D1.6 + #1067 + #1709 + #2037 skill tools + #2059 covenant params + #2204 claim-bitemporal params + #3171 schema-vs-handler + #3266/#3322 swarm_rewind)"
-          if [ "$TOTAL" -gt 7760 ]; then
-            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 7760, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204 + #3171 + #3266/#3322)."
+          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 8110, post-D1.6 + #1067 + #1709 + #2037 skill tools + #2059 covenant params + #2204 claim-bitemporal params + #3171 schema-vs-handler + #3266/#3322 swarm_rewind)"
+          if [ "$TOTAL" -gt 8110 ]; then
+            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 8110, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204 + #3171 + #3266/#3322)."
             echo "::error::C2 (split docs field), C3 (collapse schema boilerplate) and C4 (hide rare optional params) drove the wire form from ~7.4K to ~3.5K tokens at v0.6.4; D1.6 schemars metadata + #1067 LLM provider docs took it back to ~5.5K; v0.8.0 #1709 grew the surface 74→100 tools (structural) to ~6.2K; #2204 added 3 optional claim-bitemporal wire params (structural) to ~6.69K; #3171 declared previously-hidden MCP params (structural) to ~7.57K; #3266/#3322 swarm_rewind (MVG) added the memory_swarm_rewind tool (structural) to ~7.68K. The 7760-token ceiling is the operator-accepted floor (raised from 7650 per the #3266/#3322 growth), matching tests/budget_tokens.rs (lockstep)."
             echo "::error::Inspect 'cargo run --release -- doctor --tokens --raw-table' to find the offending tool (the per-tool 'tokens' column already reflects the trim). See docs/v0.7/schema-compaction-audit.md."
             exit 1
