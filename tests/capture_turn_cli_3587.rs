@@ -201,6 +201,68 @@ fn capture_turn_cli_stop_payload_auto_index_dedups_3587() {
     );
 }
 
+/// #3587 U4 acceptance (hook mode, guard 2) — two DIFFERENT turns in the
+/// same session get distinct in-transaction indices (0 then 1), so the
+/// auto-index derivation is itself load-bearing: a broken derivation that
+/// pinned every turn to one index would still pass the re-delivery dedup
+/// test above (different content ⇒ different `sha256`), so this pins the
+/// actual `MAX+1` ladder and the distinct memory ids.
+#[test]
+fn capture_turn_cli_stop_payload_auto_index_advances_3587() {
+    let (_dir, db) = scratch("stop-advance");
+    let session = "sess-advance-3587";
+    let turns = [
+        "first finished assistant turn",
+        "second finished assistant turn",
+    ];
+
+    let mut ids = Vec::new();
+    for text in turns {
+        let stop = json!({
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "last_assistant_message": text,
+        })
+        .to_string();
+        let out = run_cli(&db, &["capture-turn", "--json"], &stop);
+        assert!(
+            out.status.success(),
+            "distinct Stop payload must capture; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let env: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+        assert_eq!(
+            env["dedup_hit"],
+            Value::Bool(false),
+            "distinct turns must not dedup; got {env}"
+        );
+        ids.push(env["memory_id"].as_str().expect("memory_id").to_string());
+    }
+    assert_ne!(
+        ids[0], ids[1],
+        "distinct turns must produce distinct memories"
+    );
+
+    // The derived indices must be the contiguous MAX+1 ladder 0, 1.
+    let conn = ai_memory::db::open(&db).expect("open capture db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT host_turn_index FROM transcript_line_dedup \
+             WHERE host_session_id = ?1 ORDER BY host_turn_index",
+        )
+        .expect("prepare index probe");
+    let indices: Vec<i64> = stmt
+        .query_map([session], |row| row.get(0))
+        .expect("query indices")
+        .collect::<std::result::Result<_, _>>()
+        .expect("collect indices");
+    assert_eq!(
+        indices,
+        vec![0, 1],
+        "auto index must advance MAX+1 per session"
+    );
+}
+
 /// #3587 U4 — a `Stop` payload whose `last_assistant_message` is null is an
 /// explicit no-op (exit 0, no memory), never a refusal.
 #[test]
