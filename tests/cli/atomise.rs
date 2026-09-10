@@ -447,7 +447,11 @@ fn test_cli_atomise_source_too_small_returns_informational() {
     assert!(stdout.is_empty());
     assert!(stderr.contains(&short_id), "stderr must echo memory id");
     assert!(
-        stderr.contains("max_atom_tokens"),
-        "stderr must hint at the token budget: {stderr}"
+        stderr.contains("--max-atom-tokens"),
+        "stderr must name the CLI flag, not the MCP param: {stderr}"
+    );
+    assert!(
+        !stderr.contains("max_atom_tokens"),
+        "MCP param leaked: {stderr}"
     );
 }

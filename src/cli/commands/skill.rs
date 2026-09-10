@@ -315,8 +315,46 @@ pub fn run(
     }
 }
 
+/// #3414 — CLI-boundary mapping of MCP tool/param names onto clap flags.
+/// `retire`/`delete` share selector grammar (`--id` OR `--name`+`--namespace`);
+/// `get`/`resource`/… require `--id`. Distinct via the `verb` prefix the
+/// caller prints (`ai-memory skill retire:` vs `ai-memory skill delete:`).
+const SKILL_SELECTOR_REQUIRED: &str = "requires --id or both --namespace and --name";
+const SKILL_ID_FLAG_REQUIRED: &str = "requires --id";
+
+fn map_skill_mcp_err(verb: &str, e: &str) -> String {
+    if matches!(verb, "retire" | "delete")
+        && (e.contains("requires either") || e.contains("requires skill_id"))
+    {
+        return SKILL_SELECTOR_REQUIRED.to_string();
+    }
+    if e.contains("requires 'skill_id'") || e.contains("requires skill_id") {
+        return SKILL_ID_FLAG_REQUIRED.to_string();
+    }
+    let stripped = match verb {
+        "retire" => e.strip_prefix("memory_skill_retire "),
+        "delete" => e.strip_prefix("memory_skill_delete "),
+        "resource" => e.strip_prefix("memory_skill_resource "),
+        "get" => e.strip_prefix("memory_skill_get "),
+        "export" => e.strip_prefix("memory_skill_export "),
+        "list" => e.strip_prefix("memory_skill_list "),
+        "register" => e.strip_prefix("memory_skill_register "),
+        "promote" => e.strip_prefix("memory_skill_promote_from_reflection "),
+        "compose" => e.strip_prefix("memory_skill_compositional_context "),
+        _ => None,
+    };
+    stripped
+        .unwrap_or(e)
+        .replace("'skill_id'", "--id")
+        .replace("skill_id", "--id")
+}
+
 fn handler_err_exit(out: &mut CliOutput<'_>, verb: &str, e: &str) -> Result<i32> {
-    writeln!(out.stderr, "ai-memory skill {verb}: {e}")?;
+    writeln!(
+        out.stderr,
+        "ai-memory skill {verb}: {}",
+        map_skill_mcp_err(verb, e)
+    )?;
     Ok(2)
 }
 
@@ -1110,5 +1148,97 @@ mod tests {
         drop(out);
         let text = String::from_utf8(stdout).unwrap();
         assert!(text.contains("cli-manifest-file"));
+    }
+
+    #[test]
+    fn map_skill_mcp_err_retire_selector_uses_cli_flags_3414() {
+        let mapped = map_skill_mcp_err(
+            "retire",
+            "memory_skill_retire requires either 'skill_id' or both 'namespace' and 'name'",
+        );
+        assert_eq!(mapped, SKILL_SELECTOR_REQUIRED);
+        assert!(!mapped.contains("memory_skill_retire"));
+        assert!(!mapped.contains("skill_id"));
+    }
+
+    #[test]
+    fn map_skill_mcp_err_delete_selector_uses_cli_flags_3414() {
+        let mapped = map_skill_mcp_err(
+            "delete",
+            "memory_skill_delete requires either 'skill_id' or both 'namespace' and 'name'",
+        );
+        assert_eq!(mapped, SKILL_SELECTOR_REQUIRED);
+        assert!(!mapped.contains("memory_skill_delete"));
+    }
+
+    #[test]
+    fn map_skill_mcp_err_resource_requires_id_flag_3414() {
+        let mapped = map_skill_mcp_err("resource", "memory_skill_resource requires 'skill_id'");
+        assert_eq!(mapped, SKILL_ID_FLAG_REQUIRED);
+        assert!(!mapped.contains("skill_id"));
+    }
+
+    #[test]
+    fn cli_skill_retire_missing_selector_maps_cli_flags_3414() {
+        let (_dir, db_path) = fresh_db();
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let args = SkillArgs {
+            action: SkillAction::Retire(RetireArgs {
+                id: None,
+                name: None,
+                namespace: None,
+                unretire: false,
+                reason: None,
+                json: false,
+            }),
+        };
+        let code = run(&db_path, &args, None, &mut out).unwrap();
+        assert_eq!(code, 2);
+        drop(out);
+        let err = String::from_utf8(stderr).unwrap();
+        assert!(err.contains("ai-memory skill retire:"), "got: {err}");
+        assert!(err.contains(SKILL_SELECTOR_REQUIRED), "got: {err}");
+        assert!(
+            !err.contains("memory_skill_retire"),
+            "MCP tool leaked: {err}"
+        );
+        assert!(!err.contains("skill_id"), "MCP param leaked: {err}");
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn cli_skill_retire_by_id_allowed_3414() {
+        let (_dir, db_path) = fresh_db();
+        let conn = db::open(&db_path).unwrap();
+        let reg = crate::mcp::handle_skill_register(
+            &conn,
+            &json!({"inline_skill": minimal_skill_md("cli-retire")}),
+            None,
+        )
+        .unwrap();
+        let id = reg["id"].as_str().unwrap().to_string();
+        drop(conn);
+
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let args = SkillArgs {
+            action: SkillAction::Retire(RetireArgs {
+                id: Some(id),
+                name: None,
+                namespace: None,
+                unretire: false,
+                reason: None,
+                json: false,
+            }),
+        };
+        let code = run(&db_path, &args, None, &mut out).unwrap();
+        assert_eq!(code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+        drop(out);
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(text.contains("retired"), "got: {text}");
+        assert!(text.contains("cli-retire"), "got: {text}");
     }
 }

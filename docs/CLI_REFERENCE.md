@@ -466,6 +466,14 @@ ai-memory archive purge --confirm-global          # every namespace
 ai-memory archive stats
 ```
 
+**`archive restore` missing id**
+([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)).
+A missing id refuses with `not found in archive: <id>` and a non-zero
+exit on every output mode (`bail!`, not `process::exit`). Pre-fix JSON
+wrote `{"restored": false}` and exited 0; text wrote stderr then
+`process::exit(1)` which skipped destructors and could not be asserted
+in-process.
+
 **`archive purge` safety rail**
 ([#3013](https://github.com/alphaonedev/ai-memory-mcp/issues/3013)). `purge`
 is the most destructive verb in the CLI — it destroys the LAST copy of an
@@ -1065,6 +1073,10 @@ for the WT-1/QW/Form additions).
 
 Decomposes a long memory into 2-10 atomic propositions. Backs the
 `memory_atomise` MCP tool. See [`docs/atomisation.md`](atomisation.html).
+CLI errors name clap flags (`--max-atom-tokens`, `--force`), not MCP
+param names
+([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)).
+A source already under the token budget is informational exit 1.
 
 ### `calibrate confidence` — Form 5 sweep (#758)
 
@@ -1329,7 +1341,7 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 | `subscription-replay` / `subscription-dlq-list` | `memory_subscription_replay` / `memory_subscription_dlq_list` | Webhook DLQ replay + inspection. |
 | `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. |
 | `ingest-multistep` | `memory_ingest_multistep` | Form 3 multi-step ingest (CLI passes no LLM handler; tier-locked advisory on every tier). |
-| `entity-register` / `entity-get-by-alias` | `memory_entity_register` / `memory_entity_get_by_alias` | Entity registry. |
+| `entity-register` / `entity-get-by-alias` | `memory_entity_register` / `memory_entity_get_by_alias` | Entity registry. CLI errors name `--canonical-name`, not MCP `title` ([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)). |
 | `dependents-of-invalidated` | `memory_dependents_of_invalidated` | Memories citing invalidated KG edges. |
 | `reflection-origin` | `memory_reflection_origin` | Walk a reflection back to its origin chain. |
 | `quota-status` | `memory_quota_status` | K8 per-agent quota row. |
@@ -1355,7 +1367,7 @@ recovery goes through `memory_recall` / `memory_session_start` instead.
 |---|---|
 | `deref <ref_id>` | QW-3 — dereference a previously-offloaded blob; refuses tampered rows (SHA-256 mismatch). Pairs with `offload`. |
 | `share` | #1095 — copy a memory into `_shared/<from>→<to>/` (same primitive as `memory_share` / `POST /api/v1/share`). |
-| `skill <register\|list\|get\|resource\|export\|promote\|compose>` | Cluster E API-2 (#767) — CLI parity for the 7 `memory_skill_*` MCP tools. `export` is **jailed** (#3357): the destination folder must resolve inside the export root — `AI_MEMORY_SKILLS_EXPORT_ROOT` when set, otherwise a `skills-export` directory beside the resolved store (the parent directory of the `--db` path, created `0700` on first export). A `..` component, an absolute path outside the root, or a symlink leading out of it is REFUSED before anything is written; if neither root resolves to an existing directory the export is refused rather than falling back to an unconfined write. Same control as the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail (#1923). The process working directory is deliberately not the fallback. |
+| `skill <register\|list\|get\|resource\|export\|promote\|compose\|retire\|delete>` | Cluster E API-2 (#767) — CLI parity for the `memory_skill_*` MCP tools. `export` is **jailed** (#3357): the destination folder must resolve inside the export root — `AI_MEMORY_SKILLS_EXPORT_ROOT` when set, otherwise a `skills-export` directory beside the resolved store (the parent directory of the `--db` path, created `0700` on first export). A `..` component, an absolute path outside the root, or a symlink leading out of it is REFUSED before anything is written; if neither root resolves to an existing directory the export is refused rather than falling back to an unconfined write. Same control as the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail (#1923). The process working directory is deliberately not the fallback. Substrate errors are mapped onto clap flags (`--id`, `--name`, `--namespace`) at the CLI boundary so `skill retire` never prints `memory_skill_retire requires skill_id` ([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)). |
 | `namespace <set-standard\|get-standard\|clear-standard\|batman-policy>` | #800 — operator CRUD for the per-namespace standard policy pointer. |
 | `verify-reflection-chain <memory_id>` | L1-3 — walk `reflects_on` edges to depth 0, verify each Ed25519 signature, emit a chain-integrity report. Distinct from `verify-signed-events-chain` and `audit verify`. |
 

@@ -7,7 +7,7 @@ use crate::cli::CliOutput;
 use crate::cli::helpers::id_short;
 use crate::models::field_names;
 use crate::{db, validate};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 use std::path::Path;
 
@@ -76,6 +76,16 @@ pub fn global_scope_purge_error_message() -> &'static str {
      --namespace=<ns>, or preview with --dry-run, for safety"
 }
 
+/// #3414 — not-found prose for `archive restore <id>`. Distinct from
+/// `errors::msg::not_found` / `memory_not_found` so the raise site is
+/// greppable. Returned via `bail!` (not `process::exit`) so the
+/// dispatcher maps it to exit 1 after WAL checkpoint, and tests can
+/// assert the message in-process.
+#[must_use]
+pub fn archive_restore_not_found_message(id: &str) -> String {
+    format!("not found in archive: {id}")
+}
+
 /// `archive` handler.
 pub fn run(
     db_path: &Path,
@@ -119,17 +129,22 @@ pub fn run(
         ArchiveAction::Restore { id } => {
             validate::validate_id(&id)?;
             let restored = db::restore_archived(&conn, &id)?;
+            if !restored {
+                // #3414 — missing id is exit 1 on every output mode, like
+                // every other CLI verb. Pre-fix JSON wrote
+                // `{"restored":false}` and returned Ok (exit 0); text
+                // called `process::exit(1)` which skipped destructors and
+                // could not be asserted in-process.
+                bail!("{}", archive_restore_not_found_message(&id));
+            }
             if json_out {
                 writeln!(
                     out.stdout,
                     "{}",
-                    serde_json::json!({"restored": restored, "id": id})
+                    serde_json::json!({"restored": true, "id": id})
                 )?;
-            } else if restored {
-                writeln!(out.stdout, "restored: {}", id_short(&id))?;
             } else {
-                writeln!(out.stderr, "not found in archive: {id}")?;
-                std::process::exit(1);
+                writeln!(out.stdout, "restored: {}", id_short(&id))?;
             }
         }
         ArchiveAction::Purge {
@@ -299,13 +314,9 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_restore_nonexistent_exits_via_stderr() {
-        // process::exit would terminate the test; we instead use a valid-looking
-        // ID and expect the stderr write, but since exit(1) happens we test the
-        // success branch via direct DB seeding.
+    fn test_archive_restore_text_allowed() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        // Seed a memory and archive it via direct DB call.
         let id = seed_memory(&db, "ns", "t", "c");
         let conn = db::open(&db).unwrap();
         let _ = db::archive_memory(&conn, &id, None);
@@ -318,6 +329,59 @@ mod tests {
             run(&db, args, false, &mut out).unwrap();
         }
         assert!(env.stdout_str().contains("restored:"));
+    }
+
+    #[test]
+    fn archive_restore_missing_id_refused_3414() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let missing = uuid::Uuid::new_v4().to_string();
+        let args = ArchiveArgs {
+            action: ArchiveAction::Restore {
+                id: missing.clone(),
+            },
+        };
+        let err = {
+            let mut out = env.output();
+            run(&db, args, false, &mut out).expect_err("missing id must refuse")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&archive_restore_not_found_message(&missing)),
+            "got: {msg}"
+        );
+        assert!(
+            env.stdout_str().is_empty(),
+            "no success envelope: {}",
+            env.stdout_str()
+        );
+    }
+
+    #[test]
+    fn archive_restore_missing_id_json_refused_3414() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let missing = uuid::Uuid::new_v4().to_string();
+        let args = ArchiveArgs {
+            action: ArchiveAction::Restore {
+                id: missing.clone(),
+            },
+        };
+        let err = {
+            let mut out = env.output();
+            run(&db, args, true, &mut out)
+                .expect_err("JSON missing id must refuse, not restored:false")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&archive_restore_not_found_message(&missing)),
+            "got: {msg}"
+        );
+        let stdout = env.stdout_str();
+        assert!(
+            !stdout.contains("\"restored\""),
+            "pre-#3414 JSON wrote restored:false and exited 0; got: {stdout}"
+        );
     }
 
     #[test]
