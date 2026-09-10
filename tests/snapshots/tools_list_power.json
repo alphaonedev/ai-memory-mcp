@@ -142,7 +142,7 @@
       "name": "memory_store"
     },
     {
-      "description": "Recall memories relevant to a",
+      "description": "Recall memories relevant to a context (ranked)",
       "inputSchema": {
         "definitions": {
           "KindsFilter": {
@@ -409,7 +409,7 @@
       "name": "memory_list"
     },
     {
-      "description": "Load top-k recent +",
+      "description": "Load top-k recent + high-priority memories from a Family",
       "inputSchema": {
         "properties": {
           "family": {
@@ -676,7 +676,7 @@
       "name": "memory_reflection_origin"
     },
     {
-      "description": "List dependents flagged by the",
+      "description": "List dependents flagged by the L2-3 invalidation walker",
       "inputSchema": {
         "properties": {
           "memory_id": {
@@ -902,7 +902,7 @@
       "name": "memory_action_create"
     },
     {
-      "description": "Fetch a coordination action by",
+      "description": "Fetch a coordination action by id (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -917,7 +917,7 @@
       "name": "memory_action_get"
     },
     {
-      "description": "State-guarded transition of a",
+      "description": "State-guarded transition of a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "claimed_by": {
@@ -942,7 +942,7 @@
       "name": "memory_action_transition"
     },
     {
-      "description": "List coordination actions by",
+      "description": "List coordination actions by namespace/state (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -970,7 +970,7 @@
       "name": "memory_action_list"
     },
     {
-      "description": "Add a typed DAG edge between",
+      "description": "Add a typed DAG edge between two coordination actions (#1709)",
       "inputSchema": {
         "properties": {
           "edge_type": {
@@ -993,7 +993,7 @@
       "name": "memory_action_add_edge"
     },
     {
-      "description": "List DAG edges for a",
+      "description": "List DAG edges for a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1103,7 +1103,7 @@
       "name": "memory_lease_renew"
     },
     {
-      "description": "Release an owned lease on a",
+      "description": "Release an owned lease on a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1122,7 +1122,7 @@
       "name": "memory_lease_release"
     },
     {
-      "description": "Read the lease on a",
+      "description": "Read the lease on a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1208,7 +1208,7 @@
       "name": "memory_signal_read"
     },
     {
-      "description": "List UNACKED signals for a",
+      "description": "List UNACKED signals for a namespace/recipient — direct + broadcast (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1356,7 +1356,7 @@
       "name": "memory_checkpoint_resolve"
     },
     {
-      "description": "Query checkpoints by",
+      "description": "Query checkpoints by namespace/condition_type/state, newest-first (#1709)",
       "inputSchema": {
         "properties": {
           "condition_type": {
@@ -1390,7 +1390,7 @@
       "name": "memory_checkpoint_query"
     },
     {
-      "description": "Fetch a checkpoint by id and",
+      "description": "Fetch a checkpoint by id and verify its attested resolution (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1405,7 +1405,7 @@
       "name": "memory_checkpoint_verify"
     },
     {
-      "description": "Create a draft routine — a",
+      "description": "Create a draft routine — a parameterised action+edge template (#1709)",
       "inputSchema": {
         "properties": {
           "created_by": {
@@ -1472,7 +1472,7 @@
       "name": "memory_routine_run"
     },
     {
-      "description": "Fetch a routine run by id, with",
+      "description": "Fetch a routine run by id, with its state and created action ids (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1494,7 +1494,7 @@
       "name": "memory_routine_status"
     },
     {
-      "description": "List a namespace's routines by",
+      "description": "List a namespace's routines by state, newest-first (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1577,7 +1577,7 @@
       "name": "memory_capabilities"
     },
     {
-      "description": "LLM-expand a search query into",
+      "description": "LLM-expand a search query into related terms (smart/autonomous tier)",
       "inputSchema": {
         "properties": {
           "query": {
@@ -1695,7 +1695,7 @@
       "name": "memory_subscription_dlq_list"
     },
     {
-      "description": "Report per-agent +",
+      "description": "Report per-agent + per-namespace quota usage (read-only)",
       "inputSchema": {
         "properties": {
           "agent_id": {

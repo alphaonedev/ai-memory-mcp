@@ -142,7 +142,7 @@
       "name": "memory_store"
     },
     {
-      "description": "Recall memories relevant to a",
+      "description": "Recall memories relevant to a context (ranked)",
       "inputSchema": {
         "definitions": {
           "KindsFilter": {
@@ -409,7 +409,7 @@
       "name": "memory_list"
     },
     {
-      "description": "Load top-k recent +",
+      "description": "Load top-k recent + high-priority memories from a Family",
       "inputSchema": {
         "properties": {
           "family": {
@@ -465,7 +465,7 @@
       "name": "memory_smart_load"
     },
     {
-      "description": "Return a hierarchical tree of",
+      "description": "Return a hierarchical tree of namespaces with memory counts",
       "inputSchema": {
         "properties": {
           "depth": {
@@ -550,7 +550,7 @@
       "name": "memory_entity_get_by_alias"
     },
     {
-      "description": "Ordered fact timeline for an",
+      "description": "Ordered fact timeline for an entity (outbound KG links by valid_from)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -584,7 +584,7 @@
       "name": "memory_kg_timeline"
     },
     {
-      "description": "Mark a KG link as superseded by",
+      "description": "Mark a KG link as superseded by setting its valid_until column",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -620,7 +620,7 @@
       "name": "memory_kg_invalidate"
     },
     {
-      "description": "Outbound KG traversal from a",
+      "description": "Outbound KG traversal from a source memory (<=5 hops)",
       "inputSchema": {
         "properties": {
           "allowed_agents": {
