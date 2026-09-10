@@ -922,6 +922,15 @@ REFUSES to bind at all when the budget cannot cover `MIN_CONNECTION_CEILING`
 connections plus `FD_HEADROOM` descriptors — a smaller hub is honest, a hub
 that lies about its capacity is not.
 
+**Wire identity domain (#3578).** `a2a-hub` and every `a2a-hub/...` scoped
+form are reserved by `validate::RESERVED_AGENT_IDS` and its scoped-form
+check. HTTP header/body claims and MCP explicit caller claims are refused
+through the shared identity validator, even when the claimed value agrees
+with the resolved caller. Ordinary principal names such as `ai:alice` and
+`a2a-hub-agent` retain their existing grammar. The allowed/refused resolver
+matrix is pinned by `tests/wake_hub_identity_domain_3578.rs`. This wire
+reservation does not change the internal-bootstrap shape-only validator.
+
 **Process isolation (#3578).** The systemd unit runs as `User=ai-memory-hub`
 (not the daemon's `ai-memory`), jails `/var/lib/ai-memory` with
 `InaccessiblePaths=`, and restricts the address family to `AF_UNIX`: the wake
