@@ -731,7 +731,7 @@
       "name": "memory_get"
     },
     {
-      "description": "Discover runtime capabilities",
+      "description": "Discover runtime capabilities; full per-tool docs: verbose=true",
       "inputSchema": {
         "properties": {
           "accept": {

@@ -1200,7 +1200,9 @@ fn build_tool_definitions_for_profile(profile: &crate::profile::Profile) -> Valu
 ///    bytes, whichever is shorter). A cut that would end on a dangling
 ///    preposition or `+` is extended up to
 ///    [`COMPACT_DESCRIPTION_EXTEND_MAX`] so the verb-noun gist
-///    survives (#3378). The verbose drilldown
+///    survives (#3378). The always-on `memory_capabilities` compact
+///    is the one-time pointer at the verbose drilldown
+///    ([`CAPABILITIES_COMPACT`]; #3378 unit 3). The verbose call
 ///    (`memory_capabilities { verbose=true }`) still carries the
 ///    full short-form description; the wire form stays inside the
 ///    budget gate at 11000 cl100k tokens (post-D1.6 schemars expansion, was 3500 in pre-D1.6 hand-coded macro).
@@ -1217,11 +1219,16 @@ fn wire_compact_descriptions(defs: &mut Value) {
         let Some(obj) = tool.as_object_mut() else {
             continue;
         };
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let Some(desc) = obj.get("description").and_then(Value::as_str) else {
             continue;
         };
-        let compact = compact_description(desc);
-        if compact.len() != desc.len() {
+        let compact = compact_tools_list_description(&name, desc);
+        if compact != desc {
             obj.insert("description".to_string(), Value::String(compact));
         }
     }
@@ -1241,6 +1248,29 @@ const COMPACT_DANGLING_LAST_TOKENS: &[&str] = &[
     "+", "-", "/", "to", "for", "of", "with", "from", "a", "an", "the", "and", "or", "per", "by",
     "in", "on", "at", "as", "into", "onto", "between", "over", "under", "via",
 ];
+
+/// Compact `tools/list` label for the always-on bootstrap (#3378 unit 3
+/// ruling). One pointer on the wire, zero per-tool suffix cost. This
+/// label **bypasses** [`compact_description`] (it contains `;`, which
+/// would otherwise cut the gist at the first sentence), so the length
+/// pin is [`COMPACT_DESCRIPTION_EXTEND_MAX`] rather than
+/// [`COMPACT_DESCRIPTION_MAX`]. Full prose / schema lives on
+/// `memory_capabilities { verbose=true }`.
+const CAPABILITIES_COMPACT: &str =
+    "Discover runtime capabilities; full per-tool docs: verbose=true";
+
+const _: () = assert!(CAPABILITIES_COMPACT.len() <= COMPACT_DESCRIPTION_EXTEND_MAX);
+
+/// Compact a `tools/list` description. The capabilities bootstrap uses
+/// [`CAPABILITIES_COMPACT`] so the pointer sits once on the always-on
+/// tool; every other tool is a 32/80 gist with no uniform suffix.
+fn compact_tools_list_description(name: &str, desc: &str) -> String {
+    if name == tool_names::MEMORY_CAPABILITIES {
+        CAPABILITIES_COMPACT.to_string()
+    } else {
+        compact_description(desc)
+    }
+}
 
 /// Truncate a tool's short-form description to the first sentence
 /// (or a word-boundary cut at [`COMPACT_DESCRIPTION_MAX`]), preserving
@@ -1379,8 +1409,8 @@ fn drop_trailing_dangling(s: &str) -> String {
 #[cfg(test)]
 mod compact_description_3378_tests {
     use super::{
-        COMPACT_DESCRIPTION_EXTEND_MAX, COMPACT_DESCRIPTION_MAX, compact_description,
-        compact_ends_dangling,
+        CAPABILITIES_COMPACT, COMPACT_DESCRIPTION_EXTEND_MAX, COMPACT_DESCRIPTION_MAX,
+        compact_description, compact_ends_dangling, compact_tools_list_description, tool_names,
     };
 
     #[test]
@@ -1465,6 +1495,40 @@ mod compact_description_3378_tests {
         assert!(
             got.contains("query"),
             "gist must include the object: {got:?}"
+        );
+    }
+
+    #[test]
+    fn capabilities_compact_is_the_verbose_pointer_3378() {
+        // Exact Master 01:50Z string; length is pinned by the const assert
+        // next to CAPABILITIES_COMPACT (<= EXTEND_MAX; bypasses compact_description).
+        assert_eq!(
+            CAPABILITIES_COMPACT,
+            "Discover runtime capabilities; full per-tool docs: verbose=true"
+        );
+        assert_eq!(CAPABILITIES_COMPACT.len(), 63);
+        assert!(CAPABILITIES_COMPACT.len() <= COMPACT_DESCRIPTION_EXTEND_MAX);
+    }
+
+    #[test]
+    fn capabilities_compact_overrides_description_gist_3378() {
+        let got = compact_tools_list_description(
+            tool_names::MEMORY_CAPABILITIES,
+            "Discover runtime capabilities; family=<name> drills in.",
+        );
+        assert_eq!(got, CAPABILITIES_COMPACT);
+    }
+
+    #[test]
+    fn ordinary_tool_compact_has_no_uniform_suffix_3378() {
+        let got = compact_tools_list_description(
+            "memory_calibrate_confidence",
+            "Calibrate confidence baselines. output_format is ignored.",
+        );
+        assert_eq!(got, "Calibrate confidence baselines");
+        assert!(
+            !got.contains(tool_names::MEMORY_CAPABILITIES),
+            "ordinary tools must not carry a uniform capabilities suffix, got {got:?}"
         );
     }
 }
@@ -2133,9 +2197,8 @@ mod d1_6_987_tests {
     /// stripped from `tools/list`. compact_description MAX=32 keeps only
     /// the first sentence of `description()`, so that sentence must be
     /// the tool PURPOSE (≤32 bytes). The IGNORED disclosure lives in
-    /// `docs()` (verbose drilldown); wire-level survival of a trailing
-    /// caveat is #3378. Denied path: a compacted description that is
-    /// not the purpose, or docs() that omit the inert-field caveat.
+    /// `docs()` (verbose drilldown). Denied path: a compacted gist that
+    /// is not the purpose, or docs() that omit the inert-field caveat.
     #[test]
     fn calibrate_tools_list_description_keeps_ignored_after_compact_3397() {
         let defs = super::tool_definitions_for_profile(&crate::profile::Profile::full());

@@ -1613,7 +1613,7 @@
       "name": "memory_calibrate_confidence"
     },
     {
-      "description": "Discover runtime capabilities",
+      "description": "Discover runtime capabilities; full per-tool docs: verbose=true",
       "inputSchema": {
         "properties": {
           "accept": {

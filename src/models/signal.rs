@@ -67,7 +67,31 @@ impl SignalType {
         Self::Response,
         Self::Broadcast,
     ];
+
+    /// Index of this variant in [`Self::ALL`] (declaration order, 0..N).
+    /// Completeness pin (#3378 unit 3): exhaustive so a new variant fails
+    /// to compile, and the const block below asserts `ALL.len() == N` and
+    /// `ALL[i].variant_index() == i` so ALL cannot silently omit it.
+    const fn variant_index(self) -> usize {
+        match self {
+            Self::Authorize => 0,
+            Self::Notify => 1,
+            Self::Request => 2,
+            Self::Response => 3,
+            Self::Broadcast => 4,
+        }
+    }
 }
+
+const _: () = {
+    const N: usize = 5;
+    assert!(SignalType::ALL.len() == N);
+    let mut i = 0;
+    while i < N {
+        assert!(SignalType::ALL[i].variant_index() == i);
+        i += 1;
+    }
+};
 
 /// A typed, signed inter-agent signal — one row in the Pillar-1 `signals`
 /// table. Mirrors the v60 `signals` table 1:1.
@@ -110,10 +134,11 @@ mod tests {
 
     #[test]
     fn signal_type_roundtrips_str() {
-        for s in SignalType::ALL {
+        assert_eq!(SignalType::ALL.len(), 5);
+        for (i, s) in SignalType::ALL.into_iter().enumerate() {
+            assert_eq!(s.variant_index(), i);
             assert_eq!(SignalType::from_str(s.as_str()), Some(s));
         }
-        assert_eq!(SignalType::ALL.len(), 5);
     }
 
     #[test]

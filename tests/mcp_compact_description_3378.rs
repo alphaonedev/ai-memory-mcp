@@ -151,3 +151,48 @@ fn no_compacted_full_profile_description_ends_on_comma_or_colon_3378() {
         offenders.join("\n")
     );
 }
+
+#[test]
+fn ordinary_tools_do_not_carry_uniform_capabilities_suffix_3378() {
+    let defs = tool_definitions_for_profile(&Profile::full());
+    let tools = defs["tools"].as_array().expect("tools array");
+    let mut offenders: Vec<String> = Vec::new();
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>");
+        if name == "memory_capabilities" {
+            continue;
+        }
+        let desc = tool
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        if desc.contains("See memory_capabilities") {
+            offenders.push(format!("{name}: {desc:?}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "ordinary tools/list descriptions must not carry a uniform \
+         capabilities suffix (#3378 unit 3 ruling):\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn memory_capabilities_compact_is_the_verbose_pointer_3378() {
+    let got = compacted_description("memory_capabilities");
+    assert_eq!(
+        got, "Discover runtime capabilities; full per-tool docs: verbose=true",
+        "memory_capabilities compact must be the one-time verbose pointer"
+    );
+    assert_eq!(got.len(), 63, "specified label length, got {got:?}");
+    assert!(
+        got.len() <= 80,
+        "capabilities compact bypasses compact_description so the ceiling \
+         is COMPACT_DESCRIPTION_EXTEND_MAX, got len={} {got:?}",
+        got.len()
+    );
+}
