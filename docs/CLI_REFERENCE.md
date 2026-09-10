@@ -1387,34 +1387,66 @@ recovery goes through `memory_recall` / `memory_session_start` instead.
 | `undo-edit <id> [--dry-run]` | #1727 — **CLI-ONLY** (no MCP tool / HTTP route, by deliberate security design) NON-DESTRUCTIVE undo of an in-place edit. Re-applies the `archive_reason='in_place_edit'` (#1725) snapshot to the live row via the in-place update path — NO raw DELETE, so `ON DELETE CASCADE` children survive. Routes through the backend-blind `MemoryStore::undo_in_place_edit` trait so SQLite + Postgres behave identically. |
 | `verify-audit-trail [--since <RFC3339>] [--json]` | §22 Policy-Engine PE-8 (#697 / EPIC #1709) — verify the append-only `signed_events` V-4 cross-row hash chain end-to-end and surface any gaps for operator review. `--since` scopes by timestamp (chain still verified across the boundary). Exit 0 if intact + no gaps, 1 on any break/gap. Distinct from `verify-signed-events-chain` (V-4 closeout #698) and `audit verify` (JSONL audit log). |
 
-### `watch` — L3 substrate poll-based filesystem-watcher capture daemon (#1978)
+### `watch` — L3 substrate poll-based filesystem-watcher capture daemon (#1978, #3587 U2)
 
-Opt-in continuous capture backstop: the `notify` crate is forbidden
-under the sole-authority no-external-injection rule, so this ticks a
-**std-only poll loop** (`std::fs::metadata` mtime/size diffing) over
-every known host transcript directory (`claude-code`, `codex`,
-`gemini`) instead of subscribing to OS filesystem notifications. On a
-detected change it feeds the exact same shared L2 parser pipeline
+Opt-in continuous capture backstop. Default build ticks a **std-only
+poll loop** (`std::fs::metadata` mtime/size) over every known host
+transcript directory (`claude-code`, `codex`, `gemini`). The OPT-IN
+`fs-notify` cargo feature (OFF by default; operator-authorized
+notify-rs) layers an event-driven watch **alongside** that poll loop
+and degrades to polling when a directory is unwatchable. On a
+detected transcript change it feeds the shared L2 parser pipeline
 (`recover_from_transcript`) `recover-previous-session` uses — same
 `transcript_line_dedup` idempotency, same per-host graceful
 degradation. Never runs unless explicitly invoked.
+
+`#3587` U2 adds a second source at the watcher layer, **not** a new
+`HostKind` (that enum stays the four-arm transcript wire):
+`--host file:<path>` (repeatable). Line-file capture, path safety,
+per-file dedup, and `observed_actor` are documented in
+[`docs/anti-drift.md`](anti-drift.html).
 
 ```bash
 ai-memory watch --once                       # single poll tick, human report
 ai-memory watch --once --json                # single poll tick, JSON report
 ai-memory watch --daemon --interval-secs 10  # continuous poll loop until SIGINT
 ai-memory watch --daemon --host claude-code --host codex
+ai-memory watch --daemon --host file:/path/to/DEPUTY-OUTBOX.md
+ai-memory watch --once --host file:./MASTER-INBOX.md --dry-run
 ```
 
 | Flag | Notes |
 |---|---|
 | `--once` / `--daemon` | Mutually exclusive; exactly one required. |
 | `--interval-secs <N>` | Poll interval (default 5s), clamped `[1, 3600]`. |
-| `--host <HOST>` | Repeatable; restricts polling to `claude-code`/`codex`/`gemini`. Default: all three, tracked independently (not the `Auto` most-recent-wins union). |
+| `--host <HOST>` | Repeatable. Transcript hosts: `claude-code` / `codex` / `gemini`. Line-file sources: `file:<path>` (absolute or cwd-relative; empty `file:` is refused). Default with the flag omitted: all three transcript hosts, tracked independently (not the `Auto` most-recent-wins union). CLI `--host auto` is refused; the JSON `WatchConfig` wire still round-trips `auto` for the transcript arm. Mix transcript and `file:` flags in one invocation. |
 | `--namespace <NS>` | Namespace override for captured memories. |
-| `--limit <N>` | Max lines atomised per host, per tick (default 100). |
-| `--dry-run` | Parse + report only, no writes. |
-| `--json` | Emit the `WatchReport` wire shape instead of a human summary. |
+| `--limit <N>` | Max lines atomised per source, per tick (default 100). |
+| `--dry-run` | Parse + report only, no writes, no retry-state arming. |
+| `--json` | Emit the `WatchReport` wire shape instead of a human summary. Line-file outcomes serialize `host` as `file:<abs path>`. |
+
+**Line-file semantics (`file:<path>`, #3587 U2).** `agent_id` is
+always this process's resolved `--agent-id` / `AI_MEMORY_AGENT_ID`; a
+parsed actor prefix lands in `metadata.observed_actor` (untrusted).
+Dedup reuses `transcript_line_dedup` with `host_kind=file` and
+`sha256(abs_path ‖ 0x00 ‖ line)` in both sha slots (the same line in
+two files is two memories); `metadata.line_sha256` is `sha256(line)`.
+Title is `<basename>:<line sha8>`. Tags come from the closed
+`SWARM_LINE_TAGS` set (`READY` / `STATUS` / `BLOCKER` / `ACK` /
+`NOTE` / `MASTER`, matched case-sensitively) plus `swarm-line` and
+`host:file`. Path safety: regular file, no symlink components, same
+uid as the watch process, bounded line (64 KiB) and file (1 GiB);
+FIFO / directory / non-regular / foreign-uid / symlink are refused.
+A missing file is not an error (the daemon may start before the
+outbox exists). Quiet ticks do not open the database. Trailing
+fragment without a newline is never consumed; whitespace-only lines
+are skipped; an oversized line is refused and the next line still
+ingests. Default (non-`sal`) build `refuse_pg_store`s; `--features
+sal` writes line-file and transcript rows through
+`recover_turn_idempotent` so a postgres hive works. Under
+`--features fs-notify`, each line-file source watches its **parent
+directory** and falls back to polling only when that directory is
+unwatchable.
 
 ## v0.9.0 + v1.0.0 net-new CLI subcommands
 

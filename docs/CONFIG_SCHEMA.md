@@ -951,6 +951,28 @@ Everything else — including `ai-memory boot` — fails closed. Serving an agen
 its first-turn context out of the wrong database is a WRONG ANSWER, which the
 data-integrity directive ranks with corruption, not with degraded function.
 
+## Quality-gate module-size ceilings (not runtime config)
+
+[#3587](https://github.com/alphaonedev/ai-memory-mcp/issues/3587) U5a
+bumped three QUAL-10 **test** ceilings so later swarm anti-drift units
+can land without fighting
+`tests/qual_10_module_size_ceiling.rs`. That commit added **no**
+`config.toml` keys, no `[qual]` / `[autonomy]` / extra `[curator]`
+fields, and no env knobs. Do not look for these numbers in this schema
+file's TOML examples — they are lockstep rows in the QUAL-10 table:
+
+| Module | Ceiling after U5a |
+|---|---|
+| `src/storage/mod.rs` | 35_200 |
+| `src/config.rs` | 15_500 |
+| `src/cli/install.rs` | 3_900 |
+
+QUAL-6 stays 132. Full dated rationale:
+[`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.html) §2.7.
+Line-file watch capture (U2) is documented in
+[`anti-drift.md`](anti-drift.html); it is a CLI `--host file:<path>`
+source, not a config section.
+
 ## Related
 
 - [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) —

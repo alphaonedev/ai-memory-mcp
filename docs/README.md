@@ -62,6 +62,9 @@ authoritative for its topic; this page is just the map.
   SQLCipher at rest, attested identity, SSRF hardening.
 - **[ARCHITECTURAL_LIMITS.md](ARCHITECTURAL_LIMITS.html)** — performance
   bounds and constraints under the current design.
+- **[anti-drift.md](anti-drift.html)** — swarm line-file capture
+  (`ai-memory watch --host file:<path>`): path safety, per-file dedup,
+  untrusted `observed_actor`, `SWARM_LINE_TAGS`. [#3587](https://github.com/alphaonedev/ai-memory-mcp/issues/3587) U2.
 - **[wake-hub.md](wake-hub.html)** — the agent wake plane: the
   `agent_notified` bus, the `ai-memory wake-hub` switch, the bus sink
   between them, and the `ai-memory wake-listen` / `inbox --wait` client.
