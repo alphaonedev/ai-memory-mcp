@@ -86,6 +86,19 @@ The recent context loaded for you appears below. Reference it when relevant to t
 /// `MessageFile` strategy stages the boot-context system message.
 const WRAP_STAGING_SUBDIR: &str = "wrap";
 
+/// #3586 — operator-facing prefix for the one-line notice `wrap` writes
+/// to its OWN stderr when the inner `boot --quiet` refuses the DB.
+/// Post-#3411 `boot` is silent on stdout AND stderr under `--quiet`
+/// (a hook must not inject a warn header into the agent's context), so
+/// wrap recovers the reason itself and reports it to the operator. The
+/// reason sits between this prefix and [`WRAP_BOOT_REFUSED_SUFFIX`];
+/// the agent's system message is unaffected (preamble-only).
+const WRAP_BOOT_REFUSED_PREFIX: &str = "ai-memory wrap: memory boot refused (";
+
+/// #3586 — operator-facing suffix closing the refusal notice (see
+/// [`WRAP_BOOT_REFUSED_PREFIX`]).
+const WRAP_BOOT_REFUSED_SUFFIX: &str = "); running agent without boot context";
+
 /// #1575 — resolve (and secure) the staging directory for the
 /// `MessageFile` boot-context file: `~/.ai-memory/wrap/`, mode 0700.
 ///
@@ -198,9 +211,10 @@ fn resolve_strategy(args: &WrapArgs) -> WrapStrategy {
 ///
 /// On any boot failure, this function returns an empty `String` rather
 /// than propagating — the agent should still run even if memory load
-/// fails. The user-facing diagnostic header is already on stdout in
-/// that case (`# ai-memory boot: warn — db unavailable …`) so the
-/// caller still sees what happened.
+/// fails. Since #3411 `boot --quiet` emits no header on stdout for a
+/// refusal, so an empty body is indistinguishable here from a healthy
+/// but empty store; the `run` caller recovers the reason with
+/// [`probe_boot_refusal`] and reports it on wrap's own stderr (#3586).
 fn run_boot_capture(
     db_path: &Path,
     limit: usize,
@@ -228,6 +242,29 @@ fn run_boot_capture(
         return String::new();
     }
     String::from_utf8(stdout).unwrap_or_default()
+}
+
+/// #3586 — recover the refusal reason `boot --quiet` swallowed.
+///
+/// Post-#3411 the inner `boot` call refuses a missing / schema-behind /
+/// schema-ahead DB with EMPTY stdout and stderr under `--quiet`, so the
+/// reason is not present in [`run_boot_capture`]'s buffers. Probing
+/// [`crate::db::open_existing_read_only`] reproduces the SAME typed
+/// refusal without creating or migrating anything (ERRORS-01), so
+/// `wrap` can surface it on its own stderr without changing `boot`'s
+/// own contract.
+///
+/// Returns `None` when boot is disabled by operator choice — `boot`
+/// then returns empty by design, which is NOT a refusal — and when the
+/// DB opens cleanly (a healthy but empty store).
+fn probe_boot_refusal(db_path: &Path, app_config: &crate::config::AppConfig) -> Option<String> {
+    if !app_config.effective_boot().effective_enabled() {
+        return None;
+    }
+    match crate::db::open_existing_read_only(db_path) {
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
+    }
 }
 
 /// Assemble the `<preamble>\n\n<boot_output>` system message. Trims
@@ -385,7 +422,7 @@ pub fn run(
     db_path: &Path,
     args: &WrapArgs,
     app_config: &crate::config::AppConfig,
-    _out: &mut CliOutput<'_>,
+    out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let strategy = resolve_strategy(args);
 
@@ -396,6 +433,22 @@ pub fn run(
         WRAP_PREAMBLE.to_string()
     } else {
         let boot_output = run_boot_capture(db_path, args.limit, args.budget_tokens, app_config);
+        // #3586 — `boot --quiet` (#3411) is deliberately silent on an
+        // unreachable DB so a hook cannot inject a warn header into the
+        // agent's context; that silence must NOT extend to the OPERATOR.
+        // Recover the refusal reason and emit exactly ONE line on wrap's
+        // OWN stderr. The agent's system message stays preamble-only
+        // (`build_system_message` below).
+        if boot_output.trim_end().is_empty()
+            && let Some(reason) = probe_boot_refusal(db_path, app_config)
+        {
+            // Keep it to a single line even if a typed refusal is multiline.
+            let reason = reason.replace('\n', " ");
+            writeln!(
+                out.stderr,
+                "{WRAP_BOOT_REFUSED_PREFIX}{reason}{WRAP_BOOT_REFUSED_SUFFIX}"
+            )?;
+        }
         build_system_message(&boot_output)
     };
 
@@ -420,7 +473,7 @@ pub fn os_str_to_string_lossy(s: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_utils::{TestEnv, seed_memory};
+    use crate::cli::test_utils::{TestEnv, materialize_empty_schema, seed_memory};
 
     fn default_args(agent: &str) -> WrapArgs {
         WrapArgs {
@@ -876,6 +929,117 @@ mod tests {
             &argv[2..],
             ["--model", "gpt-x"],
             "trailing args must follow the message-file pair: {argv:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #3586 — `boot --quiet` (#3411) is silent on a refusal so a hook
+    // cannot inject a warn header into the agent's context; wrap must
+    // still tell the OPERATOR, on its OWN stderr, that the refusal
+    // happened. The agent's system message stays preamble-only.
+    // ------------------------------------------------------------------
+
+    /// The end-to-end contract: an unreachable DB makes `run` emit one
+    /// operator line on wrap's stderr while the wrapped agent still
+    /// starts (exit 0 propagated) and no boot header leaks anywhere.
+    #[test]
+    #[cfg(unix)]
+    fn wrap_unreachable_db_emits_operator_stderr_line_3586() {
+        let mut env = TestEnv::fresh();
+        let db_path = env.db_path.clone();
+        let mut out = env.output();
+        let code = run(
+            &db_path,
+            &default_args("true"),
+            &crate::config::AppConfig::default(),
+            &mut out,
+        )
+        .expect("wrap must run the agent even when boot refuses");
+        drop(out);
+        assert_eq!(code, 0, "the wrapped agent's exit code must propagate");
+        let stderr = env.stderr_str();
+        assert!(
+            stderr.contains(WRAP_BOOT_REFUSED_PREFIX),
+            "operator stderr must carry the refusal prefix: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(WRAP_BOOT_REFUSED_SUFFIX),
+            "operator stderr must carry the refusal suffix: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("database does not exist"),
+            "operator stderr must name the refusal reason: {stderr:?}"
+        );
+        // The agent's context stays clean: no boot warn header is routed
+        // through wrap's stdout (the pre-#3411 behavior).
+        assert!(
+            !env.stdout_str().contains("# ai-memory boot:"),
+            "boot's warn header must not leak into the agent's context"
+        );
+    }
+
+    /// The agent-facing half of the contract: the refusal leaves the
+    /// assembled system message exactly the preamble.
+    #[test]
+    fn wrap_unreachable_db_system_message_is_preamble_only_3586() {
+        let env = TestEnv::fresh();
+        let bad = env.db_path.parent().unwrap().join("nope/3586/db.sqlite");
+        let captured = run_boot_capture(
+            &bad,
+            10,
+            DEFAULT_WRAP_BUDGET_TOKENS,
+            &crate::config::AppConfig::default(),
+        );
+        assert!(
+            captured.is_empty(),
+            "`boot --quiet` must stay silent on the refusal (#3411): {captured}"
+        );
+        assert_eq!(
+            build_system_message(&captured),
+            WRAP_PREAMBLE,
+            "a refused boot must leave exactly the preamble for the agent"
+        );
+    }
+
+    #[test]
+    fn probe_boot_refusal_returns_reason_for_missing_db_3586() {
+        let env = TestEnv::fresh();
+        let bad = env.db_path.parent().unwrap().join("missing/3586.sqlite");
+        let reason = probe_boot_refusal(&bad, &crate::config::AppConfig::default())
+            .expect("a missing DB must yield a refusal reason");
+        assert!(
+            reason.contains("database does not exist"),
+            "the recovered reason must name the refusal: {reason}"
+        );
+    }
+
+    #[test]
+    fn probe_boot_refusal_returns_none_for_healthy_db_3586() {
+        let env = TestEnv::fresh();
+        materialize_empty_schema(&env.db_path);
+        assert!(
+            probe_boot_refusal(&env.db_path, &crate::config::AppConfig::default()).is_none(),
+            "a readable schema-current DB is not a refusal"
+        );
+    }
+
+    /// An operator-disabled boot produces an empty capture BY CHOICE,
+    /// not a refusal — the probe must stay silent (no false operator
+    /// line for the privacy escape hatch).
+    #[test]
+    fn probe_boot_refusal_returns_none_when_boot_disabled_3586() {
+        let env = TestEnv::fresh();
+        let bad = env.db_path.parent().unwrap().join("disabled/3586.sqlite");
+        let cfg = crate::config::AppConfig {
+            boot: Some(crate::config::BootConfig {
+                enabled: Some(false),
+                redact_titles: None,
+            }),
+            ..crate::config::AppConfig::default()
+        };
+        assert!(
+            probe_boot_refusal(&bad, &cfg).is_none(),
+            "a disabled boot is not a refusal"
         );
     }
 }
