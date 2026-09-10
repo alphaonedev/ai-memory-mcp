@@ -122,12 +122,26 @@ fn boot_dispatch_no_header_suppresses_prefix() {
 fn boot_dispatch_quiet_exits_zero_on_missing_db() {
     // --quiet is the load-bearing flag for the SessionStart hook
     // contract: a missing DB must NOT block the agent's first turn.
+    // #3411: that also means empty stdout AND empty stderr.
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("definitely-does-not-exist.db");
-    ai_memory(&db)
+    let out = ai_memory(&db)
         .args(["boot", "--namespace", "audit-test", "--quiet"])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        out.stdout.is_empty(),
+        "--quiet missing-db must yield empty stdout, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "--quiet missing-db must yield empty stderr, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!db.exists(), "boot --quiet must not create a missing --db");
 }
 
 #[test]
