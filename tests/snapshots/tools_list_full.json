@@ -142,7 +142,7 @@
       "name": "memory_store"
     },
     {
-      "description": "Recall memories relevant to a",
+      "description": "Recall memories relevant to a context (ranked)",
       "inputSchema": {
         "definitions": {
           "KindsFilter": {
@@ -449,7 +449,7 @@
       "name": "memory_list"
     },
     {
-      "description": "Load top-k recent +",
+      "description": "Load top-k recent + high-priority memories from a Family",
       "inputSchema": {
         "properties": {
           "family": {
@@ -505,7 +505,7 @@
       "name": "memory_smart_load"
     },
     {
-      "description": "Return a hierarchical tree of",
+      "description": "Return a hierarchical tree of namespaces with memory counts",
       "inputSchema": {
         "properties": {
           "depth": {
@@ -622,7 +622,7 @@
       "name": "memory_entity_get_by_alias"
     },
     {
-      "description": "Ordered fact timeline for an",
+      "description": "Ordered fact timeline for an entity (outbound KG links by valid_from)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -656,7 +656,7 @@
       "name": "memory_kg_timeline"
     },
     {
-      "description": "Mark a KG link as superseded by",
+      "description": "Mark a KG link as superseded by setting its valid_until column",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -692,7 +692,7 @@
       "name": "memory_kg_invalidate"
     },
     {
-      "description": "Outbound KG traversal from a",
+      "description": "Outbound KG traversal from a source memory (<=5 hops)",
       "inputSchema": {
         "properties": {
           "allowed_agents": {
@@ -896,7 +896,7 @@
       "name": "memory_promote"
     },
     {
-      "description": "Bulk delete memories matching a",
+      "description": "Bulk delete memories matching a pattern,",
       "inputSchema": {
         "properties": {
           "capability": {
@@ -1373,7 +1373,7 @@
       "name": "memory_reflection_origin"
     },
     {
-      "description": "List dependents flagged by the",
+      "description": "List dependents flagged by the L2-3 invalidation walker",
       "inputSchema": {
         "properties": {
           "memory_id": {
@@ -1599,7 +1599,7 @@
       "name": "memory_action_create"
     },
     {
-      "description": "Fetch a coordination action by",
+      "description": "Fetch a coordination action by id (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1614,7 +1614,7 @@
       "name": "memory_action_get"
     },
     {
-      "description": "State-guarded transition of a",
+      "description": "State-guarded transition of a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "claimed_by": {
@@ -1639,7 +1639,7 @@
       "name": "memory_action_transition"
     },
     {
-      "description": "List coordination actions by",
+      "description": "List coordination actions by namespace/state (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1667,7 +1667,7 @@
       "name": "memory_action_list"
     },
     {
-      "description": "Add a typed DAG edge between",
+      "description": "Add a typed DAG edge between two coordination actions (#1709)",
       "inputSchema": {
         "properties": {
           "edge_type": {
@@ -1690,7 +1690,7 @@
       "name": "memory_action_add_edge"
     },
     {
-      "description": "List DAG edges for a",
+      "description": "List DAG edges for a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1800,7 +1800,7 @@
       "name": "memory_lease_renew"
     },
     {
-      "description": "Release an owned lease on a",
+      "description": "Release an owned lease on a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1819,7 +1819,7 @@
       "name": "memory_lease_release"
     },
     {
-      "description": "Read the lease on a",
+      "description": "Read the lease on a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1905,7 +1905,7 @@
       "name": "memory_signal_read"
     },
     {
-      "description": "List UNACKED signals for a",
+      "description": "List UNACKED signals for a namespace/recipient — direct + broadcast (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -2053,7 +2053,7 @@
       "name": "memory_checkpoint_resolve"
     },
     {
-      "description": "Query checkpoints by",
+      "description": "Query checkpoints by namespace/condition_type/state, newest-first (#1709)",
       "inputSchema": {
         "properties": {
           "condition_type": {
@@ -2087,7 +2087,7 @@
       "name": "memory_checkpoint_query"
     },
     {
-      "description": "Fetch a checkpoint by id and",
+      "description": "Fetch a checkpoint by id and verify its attested resolution (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -2102,7 +2102,7 @@
       "name": "memory_checkpoint_verify"
     },
     {
-      "description": "Create a draft routine — a",
+      "description": "Create a draft routine — a parameterised action+edge template (#1709)",
       "inputSchema": {
         "properties": {
           "created_by": {
@@ -2169,7 +2169,7 @@
       "name": "memory_routine_run"
     },
     {
-      "description": "Fetch a routine run by id, with",
+      "description": "Fetch a routine run by id, with its state and created action ids (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -2191,7 +2191,7 @@
       "name": "memory_routine_status"
     },
     {
-      "description": "List a namespace's routines by",
+      "description": "List a namespace's routines by state, newest-first (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -2368,7 +2368,7 @@
       "name": "memory_capture_turn"
     },
     {
-      "description": "LLM-expand a search query into",
+      "description": "LLM-expand a search query into related terms (smart/autonomous tier)",
       "inputSchema": {
         "properties": {
           "query": {
@@ -2499,7 +2499,7 @@
       "name": "memory_archive_stats"
     },
     {
-      "description": "Trigger garbage collection on",
+      "description": "Trigger garbage collection on expired memories (archives first WHEN ENABLED)",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -2514,7 +2514,7 @@
       "name": "memory_gc"
     },
     {
-      "description": "Auto-recall recent memories on",
+      "description": "Auto-recall recent memories on session start",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -2549,7 +2549,7 @@
       "name": "memory_session_start"
     },
     {
-      "description": "Set a memory as the",
+      "description": "Set a memory as the standard/policy for a namespace",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -2603,7 +2603,7 @@
       "name": "memory_namespace_get_standard"
     },
     {
-      "description": "Clear the standard/policy for a",
+      "description": "Clear the standard/policy for a namespace",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -2727,7 +2727,7 @@
       "name": "memory_pending_reject"
     },
     {
-      "description": "Register an agent in the",
+      "description": "Register an agent in the reserved _agents namespace",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -2950,7 +2950,7 @@
       "name": "memory_subscription_dlq_list"
     },
     {
-      "description": "Report per-agent +",
+      "description": "Report per-agent + per-namespace quota usage (read-only)",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -3192,7 +3192,7 @@
       "name": "memory_skill_export"
     },
     {
-      "description": "Promote a Reflection into a",
+      "description": "Promote a Reflection into a reusable Agent Skill",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -3303,7 +3303,7 @@
       "name": "memory_skill_delete"
     },
     {
-      "description": "Skill body +",
+      "description": "Skill body + composes_with_reflections (bounded by max_reflection_depth)",
       "inputSchema": {
         "properties": {
           "budget_tokens": {

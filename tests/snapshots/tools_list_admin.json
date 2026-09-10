@@ -142,7 +142,7 @@
       "name": "memory_store"
     },
     {
-      "description": "Recall memories relevant to a",
+      "description": "Recall memories relevant to a context (ranked)",
       "inputSchema": {
         "definitions": {
           "KindsFilter": {
@@ -409,7 +409,7 @@
       "name": "memory_list"
     },
     {
-      "description": "Load top-k recent +",
+      "description": "Load top-k recent + high-priority memories from a Family",
       "inputSchema": {
         "properties": {
           "family": {
@@ -533,7 +533,7 @@
       "name": "memory_promote"
     },
     {
-      "description": "Bulk delete memories matching a",
+      "description": "Bulk delete memories matching a pattern,",
       "inputSchema": {
         "properties": {
           "capability": {
@@ -858,7 +858,7 @@
       "name": "memory_capture_turn"
     },
     {
-      "description": "Trigger garbage collection on",
+      "description": "Trigger garbage collection on expired memories (archives first WHEN ENABLED)",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -873,7 +873,7 @@
       "name": "memory_gc"
     },
     {
-      "description": "Set a memory as the",
+      "description": "Set a memory as the standard/policy for a namespace",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -927,7 +927,7 @@
       "name": "memory_namespace_get_standard"
     },
     {
-      "description": "Clear the standard/policy for a",
+      "description": "Clear the standard/policy for a namespace",
       "inputSchema": {
         "properties": {
           "agent_id": {

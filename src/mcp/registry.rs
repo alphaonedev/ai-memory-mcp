@@ -1196,11 +1196,14 @@ fn build_tool_definitions_for_profile(profile: &crate::profile::Profile) -> Valu
 /// applied, in order:
 ///
 /// 1. **Truncate** the top-level tool `description` to the first
-///    sentence (anything before `.` / `;` / first 28 characters,
-///    whichever is shorter). The verbose drilldown
+///    sentence (anything before `.` / `;` / [`COMPACT_DESCRIPTION_MAX`]
+///    bytes, whichever is shorter). A cut that would end on a dangling
+///    preposition or `+` is extended up to
+///    [`COMPACT_DESCRIPTION_EXTEND_MAX`] so the verb-noun gist
+///    survives (#3378). The verbose drilldown
 ///    (`memory_capabilities { verbose=true }`) still carries the
-///    full short-form description; the wire form is now even
-///    shorter so the budget gate at 11000 cl100k tokens (post-D1.6 schemars expansion, was 3500 in pre-D1.6 hand-coded macro) holds.
+///    full short-form description; the wire form stays inside the
+///    budget gate at 11000 cl100k tokens (post-D1.6 schemars expansion, was 3500 in pre-D1.6 hand-coded macro).
 /// 2. **Strip** numeric / boolean schema defaults that match the
 ///    JSON-Schema validation no-op (e.g. `"default": 0` on an
 ///    `integer` with `minimum: 0`). Currently no-op; left as a
@@ -1224,38 +1227,219 @@ fn wire_compact_descriptions(defs: &mut Value) {
     }
 }
 
+/// Preferred `tools/list` description budget in bytes (#859).
+const COMPACT_DESCRIPTION_MAX: usize = 32;
+/// Extend budget for a dangling 32-byte cut (#3378). When the preferred
+/// cut would end on a preposition or `+`, the first sentence is kept
+/// if it fits; otherwise the cut walks forward a word at a time.
+const COMPACT_DESCRIPTION_EXTEND_MAX: usize = 80;
+
+/// Last tokens that mean the compact cut landed mid-phrase.
+/// `#3378` named `'Report per-agent +'` / `'Skill body +'`; the rest
+/// are the same class (`"Recall memories relevant to a"`).
+const COMPACT_DANGLING_LAST_TOKENS: &[&str] = &[
+    "+", "-", "/", "to", "for", "of", "with", "from", "a", "an", "the", "and", "or", "per", "by",
+    "in", "on", "at", "as", "into", "onto", "between", "over", "under", "via",
+];
+
 /// Truncate a tool's short-form description to the first sentence
-/// (or the first 32 characters at a word boundary), preserving at
-/// least the verb-noun gist so display surfaces have a label.
+/// (or a word-boundary cut at [`COMPACT_DESCRIPTION_MAX`]), preserving
+/// the verb-noun gist so display surfaces have a label.
 ///
 /// Strategy:
-/// 1. If the full description is ≤ 32 chars, keep it verbatim (cheap
-///    enough to ship intact).
-/// 2. If there's a sentence terminator (`.` / `;`) at or before the
-///    32-char mark, cut just before it — that's the cleanest break.
-/// 3. Otherwise cut at the last whitespace before 32 chars so we
-///    never split a word in half. If no whitespace exists in the
-///    first 32 chars, fall back to a char-boundary-safe truncation.
+/// 1. If the full description is ≤ [`COMPACT_DESCRIPTION_MAX`] bytes,
+///    keep it verbatim.
+/// 2. If a sentence terminator (`.` / `;`) sits at or before that
+///    mark, cut just before it.
+/// 3. Otherwise cut at the last whitespace before the mark so a word
+///    is never split. The prefix is always a char-boundary-safe slice
+///    (OWNERSHIP-15): a UTF-8 em-dash on the 32-byte edge must not
+///    panic.
+/// 4. If that preferred cut ends on a dangling last token (`+`,
+///    preposition, article, conjunction — #3378), take the first
+///    sentence when it fits in [`COMPACT_DESCRIPTION_EXTEND_MAX`],
+///    else walk forward a word at a time up to that extend cap
+///    (budget-by-tool: only the dangling tools spend the extra bytes).
 fn compact_description(s: &str) -> String {
-    const MAX: usize = 32;
-    if s.len() <= MAX {
+    if s.len() <= COMPACT_DESCRIPTION_MAX {
         return s.to_string();
     }
-    // Sentence-terminator path — preserves natural prose boundary.
-    let slice = &s[..MAX.min(s.len())];
+    let preferred = cut_at_sentence_or_word(s, COMPACT_DESCRIPTION_MAX);
+    if !compact_ends_dangling(&preferred) {
+        return preferred;
+    }
+    if let Some(sentence) = first_sentence_if_within(s, COMPACT_DESCRIPTION_EXTEND_MAX)
+        && !compact_ends_dangling(&sentence)
+    {
+        return sentence;
+    }
+    let mut cut = preferred.len();
+    let mut compact = preferred;
+    while compact_ends_dangling(&compact) {
+        let Some(next) = next_word_end(s, cut) else {
+            break;
+        };
+        if next > COMPACT_DESCRIPTION_EXTEND_MAX {
+            break;
+        }
+        cut = next;
+        compact = s[..cut].to_string();
+        if let Some(idx) = compact.find(['.', ';']) {
+            compact = compact[..idx].to_string();
+            break;
+        }
+    }
+    if compact_ends_dangling(&compact) {
+        drop_trailing_dangling(&compact)
+    } else {
+        compact
+    }
+}
+
+/// Byte prefix of `s` ending on a UTF-8 char boundary (OWNERSHIP-15).
+fn byte_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn cut_at_sentence_or_word(s: &str, max_bytes: usize) -> String {
+    let slice = byte_prefix(s, max_bytes);
     if let Some(idx) = slice.find(['.', ';']) {
         return s[..idx].to_string();
     }
-    // Word-boundary path — never split a word.
     if let Some(idx) = slice.rfind(char::is_whitespace) {
         return s[..idx].to_string();
     }
-    // No whitespace in budget — char-boundary-safe truncation.
-    let mut end = MAX.min(s.len());
-    while !s.is_char_boundary(end) && end > 0 {
-        end -= 1;
+    slice.to_string()
+}
+
+fn first_sentence_if_within(s: &str, max_bytes: usize) -> Option<String> {
+    let slice = byte_prefix(s, max_bytes);
+    slice.find(['.', ';']).map(|idx| s[..idx].to_string())
+}
+
+fn next_word_end(s: &str, cut: usize) -> Option<usize> {
+    let rest = s.get(cut..)?;
+    let trimmed = rest.trim_start();
+    if trimmed.is_empty() {
+        return None;
     }
-    s[..end].to_string()
+    let skip = rest.len() - trimmed.len();
+    let word_len = trimmed
+        .find(|c: char| c.is_whitespace() || c == '—' || c == '.' || c == ';')
+        .unwrap_or(trimmed.len());
+    if word_len == 0 {
+        return None;
+    }
+    Some(cut + skip + word_len)
+}
+
+fn compact_last_token(s: &str) -> &str {
+    let s = s.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '.' | ';' | ',' | ':' | ')' | '(' | '—' | '-')
+    });
+    s.rsplit(|c: char| c.is_whitespace() || c == '—')
+        .next()
+        .unwrap_or("")
+}
+
+fn compact_ends_dangling(s: &str) -> bool {
+    let tok = compact_last_token(s);
+    COMPACT_DANGLING_LAST_TOKENS
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(tok))
+}
+
+fn drop_trailing_dangling(s: &str) -> String {
+    let tok = compact_last_token(s);
+    if tok.is_empty() {
+        return s.trim().to_string();
+    }
+    let Some(idx) = s.rmatch_indices(tok).next() else {
+        return s.trim().to_string();
+    };
+    s[..idx.0].trim_end().to_string()
+}
+
+#[cfg(test)]
+mod compact_description_3378_tests {
+    use super::{
+        COMPACT_DESCRIPTION_EXTEND_MAX, COMPACT_DESCRIPTION_MAX, compact_description,
+        compact_ends_dangling,
+    };
+
+    #[test]
+    fn quota_status_gist_survives_plus_cut_3378() {
+        let src = "Report per-agent + per-namespace quota usage (read-only).";
+        let got = compact_description(src);
+        assert!(
+            !got.ends_with('+') && !got.ends_with(" +"),
+            "denied: compacted quota description ended on '+': {got:?}"
+        );
+        assert!(
+            got.contains("per-namespace"),
+            "allowed: gist must keep per-namespace, got {got:?}"
+        );
+        assert!(
+            got.len() <= COMPACT_DESCRIPTION_EXTEND_MAX,
+            "extend cap is the budget-by-tool ceiling, got {} bytes",
+            got.len()
+        );
+    }
+
+    #[test]
+    fn skill_body_gist_survives_plus_cut_3378() {
+        let src = "Skill body + composes_with_reflections (bounded by max_reflection_depth).";
+        let got = compact_description(src);
+        assert!(
+            !got.ends_with('+') && !got.ends_with(" +"),
+            "denied: compacted skill description ended on '+': {got:?}"
+        );
+        assert!(
+            got.contains("composes_with_reflections"),
+            "allowed: gist must keep composes_with_reflections, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn preferred_max_still_keeps_a_clean_first_sentence_3378() {
+        let src = "Calibrate confidence baselines. output_format is ignored.";
+        let got = compact_description(src);
+        // First-sentence cut drops the terminator (existing #859 shape).
+        assert_eq!(got, "Calibrate confidence baselines");
+        assert!(got.len() <= COMPACT_DESCRIPTION_MAX);
+    }
+
+    #[test]
+    fn multibyte_emdash_on_the_max_edge_does_not_panic_3378() {
+        // 31 ASCII bytes + U+2014 EM DASH (3 bytes) straddles byte 32.
+        let mut src = "a".repeat(31);
+        src.push('—');
+        src.push_str(" scheduled coordination recipe.");
+        let got = compact_description(&src);
+        assert!(!got.is_empty());
+        assert!(
+            src.get(..got.len()).is_some(),
+            "cut must be a char boundary"
+        );
+    }
+
+    #[test]
+    fn dangling_preposition_cut_is_extended_3378() {
+        let src = "Recall memories relevant to a query string.";
+        let got = compact_description(src);
+        assert!(
+            !compact_ends_dangling(&got),
+            "extended cut must not stay dangling: {got:?}"
+        );
+        assert!(
+            got.contains("query"),
+            "gist must include the object: {got:?}"
+        );
+    }
 }
 
 /// Round-4 — process-level escape hatch from the C4 trim used by
@@ -1643,7 +1827,8 @@ mod d1_6_987_tests {
         // output_format is advertised on the wire but read by no handler;
         // the field description is stripped from tools/list (#3397). The
         // short description was corrected so the FIRST sentence is the
-        // purpose (compact_description MAX=32 keeps that) and the second
+        // purpose (`compact_description` preferred MAX=32 keeps a clean
+        // first sentence; #3378 only extends a dangling cut) and the second
         // sentence discloses IGNORED; full disclosure lives in docs().
         "memory_calibrate_confidence",
         // "archives first" is unconditional as written; archiving is
