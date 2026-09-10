@@ -180,6 +180,25 @@ fn capture_turn_cli_stop_payload_auto_index_dedups_3587() {
         second_env["memory_id"], first_env["memory_id"],
         "dedup hit returns the original memory id"
     );
+
+    // The hook contract (`--quiet`) is silent on success: a Stop hook's
+    // stdout is host-visible, so a per-turn status line would be noise.
+    let quiet = run_cli(&db, &["capture-turn", "--quiet"], &stop);
+    assert!(
+        quiet.status.success(),
+        "quiet capture must exit 0; stderr={}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert!(
+        quiet.stdout.is_empty(),
+        "quiet success must not write stdout; got {}",
+        String::from_utf8_lossy(&quiet.stdout)
+    );
+    assert!(
+        quiet.stderr.is_empty(),
+        "quiet success must not write stderr; got {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
 }
 
 /// #3587 U4 — a `Stop` payload whose `last_assistant_message` is null is an
