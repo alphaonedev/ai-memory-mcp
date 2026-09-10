@@ -114,7 +114,7 @@ replacement contract), auto-promote mid→long at 5 accesses.
 | `--namespace`/`-n` | string | — | |
 | `--limit` | int | `10` | Capped at 50. |
 | `--tags` | comma-list | — | |
-| `--since`/`--until` | RFC3339 | — | |
+| `--since`/`--until` | RFC3339 | — | Malformed values refuse (exit 1); same #3366 parse-or-refuse as `valid_at`. |
 | `--tier`/`-T` | enum | config | `keyword`/`semantic`/`smart`/`autonomous`. |
 | `--as-agent` | string | — | Task 1.5 scope-aware recall. |
 | `--budget-tokens` | int | — | Task 1.11 context-budget. |
@@ -151,7 +151,7 @@ Read-only FTS5 keyword search. Does not mutate the database.
 | `--namespace`/`-n` | string | — | |
 | `--tier`/`-t` | enum | — | |
 | `--limit` | int | `20` | (The MCP `memory_search` tool caps at 200; the CLI passes the limit through.) |
-| `--since`/`--until` | RFC3339 | — | |
+| `--since`/`--until` | RFC3339 | — | Malformed values refuse (exit 1); same #3366 parse-or-refuse as `valid_at`. |
 | `--tags` | comma-list | — | |
 | `--agent-id` | string | — | Exact `metadata.agent_id` match. |
 | `--as-agent` | string | — | Scope-aware filter. |
@@ -180,7 +180,10 @@ don't pass.
 to `search`.** `list` accepts `--namespace`/`-n`, `--tier`/`-t`,
 `--since`, `--until`, `--tags`, `--agent-id`, plus `--limit` (default
 `20`), `--offset` (default `0`) and `--valid-at` (#1834 bitemporal
-as-of). It does **not** accept `--as-agent` or `--include-archived` —
+as-of). Malformed `--since`/`--until`/`--valid-at` refuse with exit 1
+([#3413](https://github.com/alphaonedev/ai-memory-mcp/issues/3413);
+`--valid-at` since #1834, `--since`/`--until` were the remaining hole).
+It does **not** accept `--as-agent` or `--include-archived` —
 those are `search`/`recall` flags. Conversely `search` has no
 `--offset` and no `--valid-at`.
 
@@ -1337,9 +1340,14 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 Fail-safe recovery of agent context from a host's per-turn transcript
 file after an ungraceful session end (SIGKILL, tmux lockup, host
 crash). Designed for SessionStart-hook chaining after `ai-memory boot`.
-There is currently no MCP-tool counterpart — `recover-previous-session`
-is CLI-only; in-session recovery goes through `memory_recall` /
-`memory_session_start` instead.
+`--host` must be one of `auto` / `claude-code` / `codex` / `gemini`
+(unknown values refuse; they are not swallowed into `auto`). An
+explicit `--transcript` that cannot be opened refuses with exit 1
+([#3413](https://github.com/alphaonedev/ai-memory-mcp/issues/3413)).
+A missing transcript when `--transcript` is omitted is still the
+benign SessionStart miss (exit 0). There is currently no MCP-tool
+counterpart — `recover-previous-session` is CLI-only; in-session
+recovery goes through `memory_recall` / `memory_session_start` instead.
 
 ### Additional v0.7.0 subcommands
 
