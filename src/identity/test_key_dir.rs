@@ -4,9 +4,14 @@
 //! Shared key-directory sandbox for unit and integration tests.
 //! Armed test processes use it as their default; an explicit environment
 //! override is still checked and panics if it resolves under HOME.
-//! Child processes must receive `AI_MEMORY_KEY_DIR` with [`install`] as its
-//! value (and, when the spawner calls `env_clear()`, the
-//! [`TEST_KEY_GUARD_ENV`] marker alongside it).
+//!
+//! [`install`] is authoritative for `AI_MEMORY_KEY_DIR` (#3584): it points
+//! that variable at the sandbox it created, so an ambient harness override
+//! cannot leak into a test that asked for isolation. The previous value is
+//! restored when the process-lifetime bind drops. Child processes inherit
+//! the sandbox path unless the spawner `env_remove`s it (the #3355 pin) or
+//! `env_clear()`s; a clearer must pass `AI_MEMORY_KEY_DIR` = [`install`]
+//! and, when the child is meant to be guarded, [`TEST_KEY_GUARD_ENV`].
 //!
 //! # The guard is ARMED per PROCESS, never inferred from a Cargo feature (#3516)
 //!
@@ -36,6 +41,7 @@
 //! of the three, so it resolves the real `dirs::config_dir()` key store
 //! exactly as production intends and can never panic on the #3355 message.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +57,29 @@ pub const TEST_KEY_GUARD_ENV: &str = "AI_MEMORY_TEST_KEY_GUARD";
 
 static DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
 static ARMED: AtomicBool = AtomicBool::new(false);
+static KEY_DIR_BIND: OnceLock<KeyDirEnvBind> = OnceLock::new();
+
+/// Snapshot+restore of `AI_MEMORY_KEY_DIR` for the process lifetime of
+/// [`install`] (#3584, OWNERSHIP-24 / OWNERSHIP-25).
+///
+/// Field `prev` is restored on drop so an ambient harness value does not
+/// leak out of a test binary that asked for isolation. [`Drop`] is infallible.
+struct KeyDirEnvBind {
+    prev: Option<OsString>,
+}
+
+impl Drop for KeyDirEnvBind {
+    fn drop(&mut self) {
+        // Restore is the EnvGuard pattern (#3539 / #3577): the value
+        // captured at bind time is written back, including `None` → unset.
+        // Drop runs at process teardown of a test binary (the bind lives in
+        // a `OnceLock`). No production path constructs it.
+        match &self.prev {
+            Some(v) => set_env(super::keypair::KEY_DIR_ENV, v),
+            None => unset_env(super::keypair::KEY_DIR_ENV),
+        }
+    }
+}
 
 /// Whether the #3355 key-directory guard is armed for THIS process (#3516).
 #[must_use]
@@ -68,14 +97,16 @@ pub fn armed() -> bool {
 
 /// Arm the process sandbox and return its path.
 ///
-/// Call this from test setup. It exports [`TEST_KEY_GUARD_ENV`] once so child
-/// processes stay guarded; nothing else in the process environment is touched.
+/// Call this from test setup. It exports [`TEST_KEY_GUARD_ENV`] and points
+/// `AI_MEMORY_KEY_DIR` at the sandbox (#3584) so an ambient override cannot
+/// leak into `default_key_dir()`. The previous `AI_MEMORY_KEY_DIR` value is
+/// restored when the process-lifetime bind drops.
 ///
 /// # Panics
 /// Panics if a private temporary directory cannot be allocated outside HOME.
 #[must_use]
 pub fn install() -> &'static Path {
-    DIRECTORY
+    let path = DIRECTORY
         .get_or_init(|| {
             arm();
             let root = std::env::temp_dir()
@@ -83,9 +114,17 @@ pub fn install() -> &'static Path {
                 .expect("#3355 resolve temporary root");
             let dir = tempfile::tempdir_in(root).expect("#3355 allocate isolated key directory");
             assert_isolated(dir.path());
+            bind_key_dir_env(dir.path());
             dir
         })
-        .path()
+        .path();
+    // Integration-test binaries compile this module without `cfg(test)`.
+    // Re-assert so an ambient override set after the first `install()` still
+    // cannot defeat the helper. Lib tests (`cfg(test)`) leave `AI_MEMORY_KEY_DIR`
+    // to the tests that hold `key_dir_env_lock` (`default_key_dir_honours_env_override`).
+    #[cfg(not(test))]
+    bind_key_dir_env(path);
+    path
 }
 
 /// The shared sandbox, but ONLY for a process that armed the guard (#3516).
@@ -99,16 +138,49 @@ pub(crate) fn armed_sandbox() -> Option<&'static Path> {
 // Runs exactly once per process, inside `DIRECTORY`'s `OnceLock` initializer.
 fn arm() {
     ARMED.store(true, Ordering::Release);
+    // OnceLock-gated: at most once per process, test-setup window only.
+    set_env(TEST_KEY_GUARD_ENV, "1");
+}
+
+/// Point `AI_MEMORY_KEY_DIR` at `path` (the sandbox), capturing the previous
+/// value for restore-on-drop (#3584).
+fn bind_key_dir_env(path: &Path) {
+    KEY_DIR_BIND.get_or_init(|| {
+        let prev = std::env::var_os(super::keypair::KEY_DIR_ENV);
+        set_key_dir_env(path);
+        KeyDirEnvBind { prev }
+    });
+    #[cfg(not(test))]
+    if std::env::var_os(super::keypair::KEY_DIR_ENV).as_deref() != Some(path.as_os_str()) {
+        set_key_dir_env(path);
+    }
+}
+
+fn set_key_dir_env(path: &Path) {
+    set_env(super::keypair::KEY_DIR_ENV, path);
+}
+
+fn set_env(key: &str, value: impl AsRef<OsStr>) {
     // SAFETY: `std::env::set_var` is `unsafe` on the 2024 edition because the
-    // environment is process-global. This write happens at most ONCE per
-    // process (it is inside the `OnceLock` initializer) and only from
-    // `install`, whose contract is "call from test setup", i.e. the same
-    // window in which `cli::test_utils::ensure_no_config_env` and
-    // `tests/common/mod.rs::ensure_no_config_env` already perform their
-    // `Once`-gated `AI_MEMORY_NO_CONFIG` write — this adds no new hazard
-    // class. The value is a fixed literal, never caller- or
-    // attacker-controlled, and no production code path reaches `install`.
-    unsafe { std::env::set_var(TEST_KEY_GUARD_ENV, "1") };
+    // environment is process-global. Every caller is test-only (`install` /
+    // its Drop bind). The first `AI_MEMORY_KEY_DIR` write is OnceLock-gated
+    // (one thread, once per process); integration-test re-asserts run in a
+    // binary whose parent tests do not concurrently mutate this key; the
+    // #3584 ambient-override pin runs in a child process. Values are the
+    // sandbox path, the captured previous value, or the `TEST_KEY_GUARD_ENV`
+    // literal — never caller- or attacker-controlled. No production path
+    // reaches `install`.
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+fn unset_env(key: &str) {
+    // SAFETY: same contract as `set_env` — test-only restore of the
+    // captured previous `AI_MEMORY_KEY_DIR` (absent → remove).
+    unsafe {
+        std::env::remove_var(key);
+    }
 }
 
 // Lexical normalization happens BEFORE any filesystem access: a rejected path
@@ -158,5 +230,54 @@ pub(crate) fn assert_isolated(path: &Path) {
             break;
         };
         ancestor = parent;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_agrees_with_default_key_dir() {
+        // Serialise against `default_key_dir_honours_env_override`, which
+        // mutates the same key. `install` itself does not take this lock
+        // (a caller already holding it would deadlock on a std Mutex —
+        // CONCURRENCY-04).
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = install();
+        assert_eq!(
+            crate::identity::keypair::default_key_dir().expect("resolve"),
+            dir
+        );
+    }
+
+    /// #3584 — `KeyDirEnvBind` restores the captured `AI_MEMORY_KEY_DIR`
+    /// even when the holder panics (OWNERSHIP-24 / OWNERSHIP-25). The
+    /// process-lifetime `OnceLock` bind is not dropped here; this pin
+    /// constructs a local bind so Drop is observable in-process.
+    #[test]
+    fn key_dir_env_bind_restores_prior_on_panic_3584() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os(crate::identity::keypair::KEY_DIR_ENV);
+        let panicked = std::panic::catch_unwind(|| {
+            let _bind = KeyDirEnvBind {
+                prev: std::env::var_os(crate::identity::keypair::KEY_DIR_ENV),
+            };
+            set_key_dir_env(Path::new("/nonexistent-ai-memory-3584-probe"));
+            panic!("3584-restore-probe");
+        });
+        assert!(
+            panicked.is_err(),
+            "#3584 restore pin must take the panic path"
+        );
+        assert_eq!(
+            std::env::var_os(crate::identity::keypair::KEY_DIR_ENV),
+            prior,
+            "#3584: KeyDirEnvBind must restore AI_MEMORY_KEY_DIR on drop"
+        );
     }
 }

@@ -6,11 +6,14 @@
 //! Include with `#[path = "common/key_dir_sandbox.rs"] mod key_dir_sandbox;`
 //! and call [`pin`] before accessing default keys. This ARMS the key-dir
 //! guard for THIS process (#3516) and exports
-//! `ai_memory::identity::test_key_dir::TEST_KEY_GUARD_ENV` so inherited
+//! `ai_memory::identity::test_key_dir::TEST_KEY_GUARD_ENV` plus
+//! `AI_MEMORY_KEY_DIR` pointing at the sandbox (#3584) so inherited
 //! children stay guarded too.
-//! For child processes also pass `.env("AI_MEMORY_KEY_DIR", pin())`; a
-//! spawner that calls `env_clear()` must additionally pass
+//! For child processes still pass `.env("AI_MEMORY_KEY_DIR", pin())` when
+//! the spawner `env_clear()`s; a clearer must additionally pass
 //! `.env(TEST_KEY_GUARD_ENV, "1")` when the child is meant to be guarded.
+//! `env_remove("AI_MEMORY_KEY_DIR")` is the #3355 pin that the child uses
+//! the armed sandbox without an env override.
 
 #![allow(dead_code)]
 #![allow(clippy::missing_panics_doc, clippy::doc_markdown)]
