@@ -459,6 +459,7 @@ pub struct CheckpointCreateRequest {
     /// Condition type (`approval` / `external_signal` /
     /// `condition_predicate` / `deadline`). Defaults to `approval`.
     #[serde(default)]
+    #[schemars(schema_with = "crate::mcp::schema_enum::condition_type_caller_mintable_optional")]
     pub condition_type: Option<String>,
 
     /// JSON condition spec for the gate. Defaults to `{}`.
@@ -485,6 +486,7 @@ pub struct CheckpointResolveRequest {
     pub id: String,
 
     /// Resolution state — one of `resolved` / `rejected`.
+    #[schemars(schema_with = "crate::mcp::schema_enum::checkpoint_resolution_state")]
     pub state: String,
 
     pub resolved_by: String,
@@ -521,10 +523,12 @@ pub struct CheckpointQueryRequest {
 
     /// Narrow to a single condition type when set.
     #[serde(default)]
+    #[schemars(schema_with = "crate::mcp::schema_enum::condition_type_optional")]
     pub condition_type: Option<String>,
 
     /// Narrow to a single lifecycle state when set.
     #[serde(default)]
+    #[schemars(schema_with = "crate::mcp::schema_enum::checkpoint_state_optional")]
     pub state: Option<String>,
 
     #[serde(default)]

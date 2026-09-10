@@ -465,7 +465,7 @@
       "name": "memory_smart_load"
     },
     {
-      "description": "Get a specific memory by ID,",
+      "description": "Get a specific memory by ID",
       "inputSchema": {
         "properties": {
           "agent_id": {

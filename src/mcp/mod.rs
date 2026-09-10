@@ -54,6 +54,11 @@ pub mod param_names;
 // negative-as-absent / stringy-bool). These helpers refuse instead.
 pub mod param_guard;
 
+// #3378 unit 2 — inline JSON-Schema `enum` lists for closed MCP string
+// fields (`to` / `edge_type` / `signal_type` / `condition_type` / `state`).
+// Discovery-only: request structs stay `String`; handlers still `from_str`.
+pub(crate) mod schema_enum;
+
 // #3365 — table-driven regression suite driving the WHOLE converted
 // coordination-reader family (`action_get`/`_edges`/`_list`,
 // `signal_read`/`_inbox`, `checkpoint_verify`) through one denied-path

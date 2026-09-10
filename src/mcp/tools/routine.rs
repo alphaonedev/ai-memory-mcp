@@ -398,6 +398,7 @@ pub struct RoutineListRequest {
 
     /// Narrow to a single lifecycle state (`draft` / `frozen`) when set.
     #[serde(default)]
+    #[schemars(schema_with = "crate::mcp::schema_enum::routine_state_optional")]
     pub state: Option<String>,
 
     #[serde(default)]

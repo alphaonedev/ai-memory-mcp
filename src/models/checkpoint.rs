@@ -129,6 +129,35 @@ impl ConditionType {
             _ => None,
         }
     }
+
+    /// Every variant, declaration order. MCP `tools/list` enum lists
+    /// (#3378) iterate this so the wire vocabulary cannot drift from
+    /// [`Self::from_str`] / [`Self::as_str`].
+    pub const ALL: [Self; 10] = [
+        Self::Approval,
+        Self::ExternalSignal,
+        Self::ConditionPredicate,
+        Self::Deadline,
+        Self::AuditHeadWitness,
+        Self::GovernanceVerdict,
+        Self::GovernanceEnforcement,
+        Self::EpochAdvance,
+        Self::PeerHeadEntanglement,
+        Self::ReAnchor,
+    ];
+
+    /// Variants a caller may mint via `memory_checkpoint_create`.
+    /// Matches `federation::receive_auth::condition_type_is_reserved`
+    /// inverted: reserved substrate anchors are emitted by the
+    /// substrate itself, never by a caller. `EpochAdvance` is
+    /// caller-mintable (federated freeze-anchor).
+    pub const CALLER_MINTABLE: [Self; 5] = [
+        Self::Approval,
+        Self::ExternalSignal,
+        Self::ConditionPredicate,
+        Self::Deadline,
+        Self::EpochAdvance,
+    ];
 }
 
 /// Lifecycle state of a [`Checkpoint`] (the `checkpoints.state` column).
@@ -173,6 +202,16 @@ impl CheckpointState {
             _ => None,
         }
     }
+
+    /// Every variant, declaration order. MCP `tools/list` enum lists
+    /// (#3378) iterate this so the wire vocabulary cannot drift from
+    /// [`Self::from_str`] / [`Self::as_str`].
+    pub const ALL: [Self; 4] = [Self::Pending, Self::Resolved, Self::Rejected, Self::Expired];
+
+    /// Values `memory_checkpoint_resolve.state` accepts (`resolved` /
+    /// `rejected`). Pending/expired are lifecycle observations, not
+    /// caller-supplied resolutions.
+    pub const RESOLUTION: [Self; 2] = [Self::Resolved, Self::Rejected];
 }
 
 /// A conditional coordination gate — one row in the Pillar-1 `checkpoints`
@@ -210,20 +249,30 @@ mod tests {
 
     #[test]
     fn condition_type_roundtrips_str() {
-        for c in [
-            ConditionType::Approval,
-            ConditionType::ExternalSignal,
-            ConditionType::ConditionPredicate,
-            ConditionType::Deadline,
-            ConditionType::AuditHeadWitness,
-            ConditionType::GovernanceVerdict,
-            ConditionType::GovernanceEnforcement,
-            ConditionType::EpochAdvance,
-            ConditionType::PeerHeadEntanglement,
-            ConditionType::ReAnchor,
-        ] {
+        for c in ConditionType::ALL {
             assert_eq!(ConditionType::from_str(c.as_str()), Some(c));
         }
+        assert_eq!(ConditionType::ALL.len(), 10);
+    }
+
+    #[test]
+    fn caller_mintable_is_exactly_the_non_reserved_kinds() {
+        for c in ConditionType::ALL {
+            let mintable = ConditionType::CALLER_MINTABLE.contains(&c);
+            let reserved = matches!(
+                c,
+                ConditionType::AuditHeadWitness
+                    | ConditionType::GovernanceVerdict
+                    | ConditionType::GovernanceEnforcement
+                    | ConditionType::PeerHeadEntanglement
+                    | ConditionType::ReAnchor
+            );
+            assert_eq!(
+                mintable, !reserved,
+                "CALLER_MINTABLE drifted from reserved-kind SSOT for {c:?}"
+            );
+        }
+        assert_eq!(ConditionType::CALLER_MINTABLE.len(), 5);
     }
 
     #[test]
@@ -240,14 +289,14 @@ mod tests {
 
     #[test]
     fn checkpoint_state_roundtrips_str() {
-        for s in [
-            CheckpointState::Pending,
-            CheckpointState::Resolved,
-            CheckpointState::Rejected,
-            CheckpointState::Expired,
-        ] {
+        for s in CheckpointState::ALL {
             assert_eq!(CheckpointState::from_str(s.as_str()), Some(s));
         }
+        assert_eq!(CheckpointState::ALL.len(), 4);
+        assert_eq!(
+            CheckpointState::RESOLUTION,
+            [CheckpointState::Resolved, CheckpointState::Rejected]
+        );
     }
 
     #[test]

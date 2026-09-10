@@ -592,6 +592,7 @@ pub struct SignalSendRequest {
     /// Signal kind (`authorize` / `notify` / `request` / `response` /
     /// `broadcast`). Defaults to `notify`.
     #[serde(default)]
+    #[schemars(schema_with = "crate::mcp::schema_enum::signal_type_optional")]
     pub signal_type: Option<String>,
 
     /// Threads a `response` back onto its `request` signal id.

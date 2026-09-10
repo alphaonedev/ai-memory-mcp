@@ -896,7 +896,7 @@
       "name": "memory_promote"
     },
     {
-      "description": "Bulk delete memories matching a pattern,",
+      "description": "Bulk delete memories matching a pattern",
       "inputSchema": {
         "properties": {
           "capability": {
@@ -1080,7 +1080,7 @@
       "name": "memory_update"
     },
     {
-      "description": "Get a specific memory by ID,",
+      "description": "Get a specific memory by ID",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1475,7 +1475,7 @@
       "name": "memory_consolidate"
     },
     {
-      "description": "Form 3 multi-step ingest:",
+      "description": "Form 3 multi-step ingest",
       "inputSchema": {
         "properties": {
           "content": {
@@ -1627,6 +1627,14 @@
             "type": "string"
           },
           "to": {
+            "enum": [
+              "pending",
+              "claimed",
+              "in_progress",
+              "done",
+              "failed",
+              "abandoned"
+            ],
             "type": "string"
           }
         },
@@ -1656,6 +1664,15 @@
             ]
           },
           "state": {
+            "enum": [
+              "pending",
+              "claimed",
+              "in_progress",
+              "done",
+              "failed",
+              "abandoned",
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1671,6 +1688,13 @@
       "inputSchema": {
         "properties": {
           "edge_type": {
+            "enum": [
+              "requires",
+              "unlocks",
+              "blocks",
+              "gated_by",
+              "sibling"
+            ],
             "type": "string"
           },
           "from_action": {
@@ -1858,6 +1882,14 @@
           },
           "reference_ids": {},
           "signal_type": {
+            "enum": [
+              "authorize",
+              "notify",
+              "request",
+              "response",
+              "broadcast",
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1968,6 +2000,14 @@
         "properties": {
           "condition": {},
           "condition_type": {
+            "enum": [
+              "approval",
+              "external_signal",
+              "condition_predicate",
+              "deadline",
+              "epoch_advance",
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -2040,6 +2080,10 @@
             ]
           },
           "state": {
+            "enum": [
+              "resolved",
+              "rejected"
+            ],
             "type": "string"
           }
         },
@@ -2057,6 +2101,19 @@
       "inputSchema": {
         "properties": {
           "condition_type": {
+            "enum": [
+              "approval",
+              "external_signal",
+              "condition_predicate",
+              "deadline",
+              "audit_head_witness",
+              "governance_verdict",
+              "governance_enforcement",
+              "epoch_advance",
+              "peer_head_entanglement",
+              "re_anchor",
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -2073,6 +2130,13 @@
             "type": "string"
           },
           "state": {
+            "enum": [
+              "pending",
+              "resolved",
+              "rejected",
+              "expired",
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -2205,6 +2269,11 @@
             "type": "string"
           },
           "state": {
+            "enum": [
+              "draft",
+              "frozen",
+              null
+            ],
             "type": [
               "string",
               "null"
