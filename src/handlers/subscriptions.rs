@@ -301,11 +301,9 @@ pub async fn notify(
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
-        // Issue #851: `mcp::handle_notify` returns Result<_, String> where
-        // the inner string can include raw rusqlite text from
-        // db::insert(...).map_err(|e| e.to_string()). Sanitize via the
-        // standard bad_request_opaque helper.
-        Err(e) => super::bad_request_opaque("notify handler error", &e),
+        // #851 / #3579: typed helper errors can still contain raw database
+        // text. Keep the existing opaque 400 wire response and unprefixed log.
+        Err(e) => super::bad_request_opaque("notify handler error", &e.message()),
     }
 }
 // --- /api/v1/subscriptions (POST / DELETE / GET) ---------------------------

@@ -3,6 +3,7 @@
 
 //! MCP `memory_notify` and `memory_inbox` handlers.
 
+use crate::errors::MemoryError;
 use crate::mcp::param_names;
 use crate::models::ConfidenceSource;
 use crate::models::field_names;
@@ -30,9 +31,9 @@ pub fn handle_notify(
     resolved_ttl: &crate::config::ResolvedTtl,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let input = parse_notify(params)?;
+    let input = parse_notify(params).map_err(|e| e.message())?;
     let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    persist_notify(conn, db_path, input, resolved_ttl, &sender)
+    persist_notify(conn, db_path, input, resolved_ttl, &sender).map_err(|e| e.message())
 }
 
 /// #3579: HTTP has already resolved and validated this sender. Never feed it
@@ -43,7 +44,7 @@ pub(crate) fn handle_notify_as_sender(
     params: &Value,
     resolved_ttl: &crate::config::ResolvedTtl,
     sender: &str,
-) -> Result<Value, String> {
+) -> Result<Value, MemoryError> {
     persist_notify(conn, db_path, parse_notify(params)?, resolved_ttl, sender)
 }
 
@@ -57,14 +58,16 @@ struct NotifyInput<'a> {
     why_trace: Option<&'a str>,
 }
 
-fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, String> {
+fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
     let target = params[param_names::TARGET_AGENT_ID]
         .as_str()
-        .ok_or("target_agent_id is required")?;
+        .ok_or_else(|| MemoryError::ValidationFailed("target_agent_id is required".into()))?;
     let title = params["title"]
         .as_str()
-        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
-    let payload = params["payload"].as_str().ok_or("payload is required")?;
+        .ok_or_else(|| MemoryError::ValidationFailed(crate::errors::msg::TITLE_REQUIRED.into()))?;
+    let payload = params["payload"]
+        .as_str()
+        .ok_or_else(|| MemoryError::ValidationFailed("payload is required".into()))?;
     // B4 (R2-LOW) — clamp instead of panic on out-of-range JSON; an i64 like
     // `9_999_999_999` would have aborted the stdio MCP server before the clamp
     // ran. v1.0.0 batch-2: routed through the shared
@@ -77,12 +80,15 @@ fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, String> {
             .unwrap_or(i64::from(crate::models::DEFAULT_PRIORITY)),
     );
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Short.as_str());
-    let tier =
-        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
+    let tier = Tier::from_str(tier_str).ok_or_else(|| {
+        MemoryError::ValidationFailed(crate::errors::msg::invalid("tier", tier_str))
+    })?;
 
-    validate::validate_agent_id(target).map_err(|e| e.to_string())?;
-    validate::validate_title(title).map_err(|e| e.to_string())?;
-    validate::validate_content(payload).map_err(|e| e.to_string())?;
+    validate::validate_agent_id(target)
+        .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
+    validate::validate_title(title).map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
+    validate::validate_content(payload)
+        .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
 
     Ok(NotifyInput {
         target,
@@ -102,7 +108,7 @@ fn persist_notify(
     input: NotifyInput<'_>,
     resolved_ttl: &crate::config::ResolvedTtl,
     sender: &str,
-) -> Result<Value, String> {
+) -> Result<Value, MemoryError> {
     let NotifyInput {
         target,
         title,
@@ -176,7 +182,7 @@ fn persist_notify(
         bytes: payload_bytes,
     };
     crate::quotas::check_and_record(conn, sender, &mem.namespace, quota_op)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
 
     let actual_id = match db::insert(conn, &mem) {
         Ok(id) => id,
@@ -189,7 +195,7 @@ fn persist_notify(
             {
                 crate::quotas::log_refund_op_failed(sender, &refund_err);
             }
-            return Err(e.to_string());
+            return Err(MemoryError::DatabaseError(e.to_string()));
         }
     };
 
@@ -539,6 +545,32 @@ mod d1_5_986_tests {
     }
 
     #[test]
+    fn notify_validation_keeps_typed_errors_and_mcp_messages_3579() {
+        let conn = rusqlite::Connection::open_in_memory().expect("unmigrated fixture");
+        let path = std::path::Path::new(":memory:");
+        let ttl = crate::config::ResolvedTtl::default();
+        for (params, expected) in [
+            (json!({}), "target_agent_id is required"),
+            (
+                json!({"target_agent_id": "ai:recipient"}),
+                crate::errors::msg::TITLE_REQUIRED,
+            ),
+            (
+                json!({"target_agent_id": "ai:recipient", "title": "message"}),
+                "payload is required",
+            ),
+        ] {
+            let typed = handle_notify_as_sender(&conn, path, &params, &ttl, "ai:sender")
+                .expect_err("validation must precede database access");
+            assert!(matches!(typed, MemoryError::ValidationFailed(_)));
+            assert_eq!(typed.message(), expected);
+            let wire = handle_notify(&conn, path, &params, &ttl, None)
+                .expect_err("validation must precede identity resolution");
+            assert_eq!(wire, expected);
+        }
+    }
+
+    #[test]
     fn notify_tool_metadata_986() {
         assert_eq!(NotifyTool::name(), "memory_notify");
         assert_eq!(NotifyTool::family(), "other");
@@ -657,6 +689,16 @@ mod d1_5_986_tests {
         .expect_err("notify over quota must fail closed");
 
         assert!(err.contains("QUOTA_EXCEEDED"), "unexpected error: {err}");
+        let typed = handle_notify_as_sender(
+            &conn,
+            std::path::Path::new(":memory:"),
+            &params,
+            &ttl,
+            &sender,
+        )
+        .expect_err("pre-resolved sender must hit the same quota refusal");
+        assert!(matches!(typed, MemoryError::DatabaseError(_)));
+        assert_eq!(typed.message(), err);
         let inbox_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories WHERE namespace = ?1",

@@ -251,6 +251,51 @@ fn sqlite_http_notify_retains_key_bound_caller_with_and_without_ambient_3579() {
 }
 
 #[test]
+fn sqlite_notify_insert_failure_keeps_wire_errors_and_refunds_quota_3579() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("notify.db");
+    let app = sqlite_app_state(&path);
+    let conn = ai_memory::db::open(&path).expect("fixture database");
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_notify_3579 BEFORE INSERT ON memories
+         BEGIN SELECT RAISE(ABORT, 'notify insert refused 3579'); END;",
+    )
+    .expect("deterministic downstream insert refusal");
+    let _identity = AgentIdOverride::set(CALLER);
+    let err = ai_memory::mcp::handle_notify(&conn, &path, &body(), &ResolvedTtl::default(), None)
+        .expect_err("insert must fail");
+    assert_eq!(err, "notify insert refused 3579");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let token = uuid::Uuid::new_v4().to_string();
+    let router = router(app, Some(&token));
+    let (status, response) = rt.block_on(post(
+        &router,
+        ai_memory::handlers::routes::NOTIFY,
+        Some(&token),
+        Some(CALLER),
+        &body(),
+    ));
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response, json!({"error": "invalid request"}));
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+        .expect("row count");
+    assert_eq!(rows, 0);
+    let quota = ai_memory::quotas::get_status(
+        &conn,
+        CALLER,
+        &ai_memory::inbox_namespace("ai:recipient-3579"),
+    )
+    .expect("quota after both failed writes");
+    assert_eq!(quota.current_memories_today, 0);
+    assert_eq!(quota.current_storage_bytes, 0);
+}
+
+#[test]
 fn mcp_notify_keeps_host_identity_ladder_and_validation_order_3579() {
     let dir = tempfile::tempdir().expect("fixture directory");
     let path = dir.path().join("notify.db");
