@@ -206,6 +206,33 @@ MCP tool count in:
 | `docs/DEVELOPER_GUIDE.md` | 2 |
 | `docs/USER_GUIDE.md` | 1 |
 
+### 2.7 QUAL-10 module-size ceilings (lockstep)
+
+`tests/qual_10_module_size_ceiling.rs` is the SSOT. A production
+module may not grow past its row without a **same-commit** ceiling
+bump and a dated rationale comment. Thresholds rise for justified
+growth; they do not fall below a measured size (ratchet). These are
+test-gate numbers, not `config.toml` keys — there is no `[qual]`
+section.
+
+[#3587](https://github.com/alphaonedev/ai-memory-mcp/issues/3587) U5a
+(2026-09-10, swarm anti-drift scaffolding, no behaviour) lockstep:
+
+| Module | Was | Now | Why (U5a comment) |
+|---|---|---|---|
+| `src/storage/mod.rs` | 34_000 | **35_200** | Room for U1 `archive_as_superseded` + U2 consumers. Measured 33_848 at the bump (152 headroom under 34_000 — audit-C F12). |
+| `src/config.rs` | 15_120 | **15_500** | Room for U3 `[curator]` stale-ruling keys + U1 `[autonomy]` propose. Measured 15_028 (92 headroom under 15_120). |
+| `src/cli/install.rs` | 3_600 | **3_900** | Room for U4 `--hook capture` + Codex capture leg. Measured 3_558 (42 headroom under 3_600). |
+
+QUAL-6 stays **132** (`tests/qual_6_7_legacy_error_type_ceiling.rs`).
+U5a also landed `crate::models::field_names::RULING_KEY` (`"ruling_key"`)
+as a string SSOT; it does **not** join the preserved-keys set and does
+not change any write path (that is unit U1).
+
+Pointer from the config reference:
+[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) §"Quality-gate module-size
+ceilings".
+
 ---
 
 ## 3. Security Review Standards
