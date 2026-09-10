@@ -942,6 +942,19 @@ re-encoding and refuses an oversized hint at encode time. These tests cover
 the binary hint; handshake/control frames have their own bounds. They do not
 assert a 256-byte limit on the CLI reporting JSON or a JSON-input decoder.
 
+**JSON output pins (#3578).** `tests/qual_wake_json_3578.rs` pins the exact
+closed output key set: `inbox_row_id`, `namespace`, `sender`, `digest`,
+`seq_high_watermark`, `reason`, `hub_driven`, `agent_id`, `hub_id`, `missed`,
+`pending_count`, and `inbox_count`. No `content`, `title`, `body`, or `payload`
+key is admitted. Hint values and all reporting values are checked, including
+bare signals and metadata text that resembles JSON keys. The serialized
+reporting envelope may exceed 256 bytes; the ceiling applies to encoded binary
+`WakeMeta`. The #3578 tests in `wake_client::session` deliver the shared denied
+binary vectors and reserved kinds through a socket pair into the production
+`Session::next_event`: refusal produces no renderable event, while valid hints
+produce exactly the expected metadata. This tests the boundary after admission,
+not credentials, database authority, JSON input validation, or process isolation.
+
 **Dependency gate (#3578).** `tests/qual_wake_hub_zero_authority_3578.rs`
 walks every Rust source under `src/wake_hub`, scanning all feature branches
 and resuming after complete inline test modules. Its reviewed crate-edge
