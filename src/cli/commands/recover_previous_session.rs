@@ -41,7 +41,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 
 use crate::cli::CliOutput;
@@ -117,16 +117,19 @@ pub struct RecoverPreviousSessionArgs {
 ///
 /// # Errors
 ///
-/// Propagates DB-open failures from `recover_from_transcript`.
-/// Per-line / per-turn errors are NOT propagated — they surface
-/// under `RecoverReport.errors` so the SessionStart-hook chain
-/// can't be wedged by a single bad transcript line.
+/// Propagates unknown-`--host` and unreadable-`--transcript` refusals
+/// from [`build_opts`] (#3413 — these are operator-supplied values, not
+/// the benign "no transcript located" SessionStart path). DB-open
+/// failures from `recover_from_transcript` still fold into the quiet
+/// exit-0 / operator exit-2 arm so a hook cannot be wedged by a missing
+/// store. Per-line / per-turn errors are NOT propagated — they surface
+/// under `RecoverReport.errors`.
 pub fn run(
     db_path: &Path,
     args: &RecoverPreviousSessionArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
-    let opts = build_opts(args);
+    let opts = build_opts(args)?;
     let report = match recover_from_transcript(db_path, &opts) {
         Ok(r) => r,
         Err(e) => {
@@ -149,15 +152,17 @@ pub fn run(
 ///
 /// # Errors
 ///
-/// Propagates report-serialization failures; store/parse failures fold into
-/// `RecoverReport.errors` (the SessionStart-hook chain must not be wedged).
+/// Propagates unknown-`--host` / unreadable-`--transcript` refusals from
+/// [`build_opts`] (#3413). Report-serialization failures propagate;
+/// store/parse failures fold into `RecoverReport.errors` (the
+/// SessionStart-hook chain must not be wedged).
 #[cfg(feature = "sal")]
 pub async fn run_store(
     store: &dyn crate::store::MemoryStore,
     args: &RecoverPreviousSessionArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
-    let opts = build_opts(args);
+    let opts = build_opts(args)?;
     let report = match crate::recover::recover_from_transcript_store(store, &opts).await {
         Ok(r) => r,
         Err(e) => {
@@ -170,14 +175,27 @@ pub async fn run_store(
 
 /// Map CLI args → [`RecoverOpts`]. Shared by the sqlite [`run`] and the
 /// postgres [`run_store`] paths.
-fn build_opts(args: &RecoverPreviousSessionArgs) -> RecoverOpts {
-    let host = parse_host_kind(&args.host).unwrap_or(HostKind::Auto);
+///
+/// # Errors
+/// Unknown `--host` (previously swallowed to `Auto`) and an unreadable
+/// explicit `--transcript` (previously folded into `report.errors` with
+/// exit 0).
+fn build_opts(args: &RecoverPreviousSessionArgs) -> Result<RecoverOpts> {
+    let host = parse_host_kind(&args.host).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown --host {:?}; expected auto, claude-code, codex, or gemini",
+            args.host
+        )
+    })?;
+    if let Some(path) = args.transcript.as_ref() {
+        refuse_unreadable_transcript(path)?;
+    }
     // agent_id resolution lives in the dispatch caller for now —
     // the slice C1 work threads the resolved agent_id through here.
     // Until that lands, we use a placeholder that the stub respects.
     let agent_id = std::env::var("AI_MEMORY_AGENT_ID")
         .unwrap_or_else(|_| "ai:recover-cli:placeholder".to_string());
-    RecoverOpts {
+    Ok(RecoverOpts {
         host,
         transcript_override: args.transcript.clone(),
         since_iso: args.since.clone(),
@@ -189,7 +207,16 @@ fn build_opts(args: &RecoverPreviousSessionArgs) -> RecoverOpts {
         // CLI recovery keeps the watermark fast-path (its latency
         // optimisation); only the L3 poll watcher bypasses it (#2126).
         bypass_fast_path: false,
-    }
+    })
+}
+
+/// #3413 — an explicit `--transcript` the process cannot open is a
+/// caller error, not the benign "no transcript located" miss. `File::open`
+/// is the readability check (existence, permissions, not-a-directory).
+fn refuse_unreadable_transcript(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("--transcript {} is unreadable", path.display()))
+        .map(|_| ())
 }
 
 /// Serialize a [`crate::recover::RecoverReport`] to the CLI surface (JSON or
@@ -294,6 +321,21 @@ fn emit_human(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_utils::TestEnv;
+
+    fn default_args() -> RecoverPreviousSessionArgs {
+        RecoverPreviousSessionArgs {
+            host: "auto".to_string(),
+            transcript: None,
+            since: None,
+            namespace: None,
+            limit: 100,
+            dry_run: true,
+            quiet: false,
+            json: false,
+            store_url: None,
+        }
+    }
 
     #[test]
     fn parse_host_kind_known_values() {
@@ -307,5 +349,54 @@ mod tests {
     fn parse_host_kind_unknown_returns_none() {
         assert_eq!(parse_host_kind("cursor"), None);
         assert_eq!(parse_host_kind(""), None);
+    }
+
+    #[test]
+    fn unknown_host_is_refused_not_swallowed_to_auto_3413() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut args = default_args();
+        args.host = "cursor".to_string();
+        let err = run(&db, &args, &mut env.output()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown --host"), "got: {msg}");
+        assert!(msg.contains("cursor"), "got: {msg}");
+        assert!(
+            env.stdout_str().is_empty(),
+            "denied path must not emit a success report: {}",
+            env.stdout_str()
+        );
+    }
+
+    #[test]
+    fn unreadable_transcript_is_refused_3413() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let missing = db
+            .parent()
+            .expect("temp db has a parent")
+            .join("no-such-transcript.jsonl");
+        let mut args = default_args();
+        args.transcript = Some(missing);
+        let err = run(&db, &args, &mut env.output()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--transcript") && msg.contains("unreadable"),
+            "got: {msg}"
+        );
+        assert!(
+            env.stdout_str().is_empty(),
+            "denied path must not emit a success report: {}",
+            env.stdout_str()
+        );
+    }
+
+    #[test]
+    fn auto_host_without_transcript_still_exits_zero_3413() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = default_args();
+        let code = run(&db, &args, &mut env.output()).unwrap();
+        assert_eq!(code, 0);
     }
 }

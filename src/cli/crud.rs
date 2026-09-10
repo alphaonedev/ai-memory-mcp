@@ -145,6 +145,20 @@ pub fn cmd_list(
     if let Some(ref v) = args.valid_at {
         validate::validate_valid_at(v)?;
     }
+    // #3413 — same #3366 parse-or-refuse for `--since`/`--until` that
+    // `search` already applies. Without this, a malformed bound is bound
+    // as TEXT (`canonical_valid_time_opt` keeps raw bytes) and SQLite
+    // `strftime` matches nothing → empty list, exit 0.
+    for (field, value) in [
+        ("since", args.since.as_deref()),
+        ("until", args.until.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate::validate_rfc3339_timestamp(field, value)?;
+        }
+    }
+    let since = args.since.as_deref().map(validate::canonical_rfc3339);
+    let until = args.until.as_deref().map(validate::canonical_rfc3339);
     // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `--tier` (was
     // `.and_then(Tier::from_str)`, which dropped the filter and listed
     // EVERY tier as if the operator had asked for it).
@@ -162,8 +176,8 @@ pub fn cmd_list(
         args.limit,
         args.offset,
         None,
-        args.since.as_deref(),
-        args.until.as_deref(),
+        since.as_deref(),
+        until.as_deref(),
         args.tags.as_deref(),
         args.agent_id.as_deref(),
         // v1.0.0 #1834 — claim-bitemporal AS-OF.
@@ -582,6 +596,62 @@ mod tests {
         let mut out = env.output();
         let res = cmd_list(&db, &args, false, &cfg, &mut out);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn list_malformed_since_until_refused_3413() {
+        let cfg = config::AppConfig::default();
+        for (since, until) in [(Some("garbage"), None), (None, Some("not-a-date"))] {
+            let mut env = TestEnv::fresh();
+            let db = env.db_path.clone();
+            let _ = seed_memory(&db, "ns", "kept", "c");
+            let mut args = list_args();
+            args.since = since.map(str::to_string);
+            args.until = until.map(str::to_string);
+            let err = cmd_list(&db, &args, true, &cfg, &mut env.output()).unwrap_err();
+            assert!(
+                err.to_string().contains("RFC3339"),
+                "expected RFC3339 refusal, got: {err}"
+            );
+            assert!(
+                env.stdout_str().is_empty(),
+                "denied path must not emit a zero-row success: {}",
+                env.stdout_str()
+            );
+        }
+    }
+
+    #[test]
+    fn list_valid_since_until_filters_3413() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "old", "c");
+        seed_memory(&db, "ns", "new", "c");
+        {
+            let conn = db::open(&db).unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1 WHERE title = ?2",
+                rusqlite::params!["2026-01-01T00:00:00.000000Z", "old"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1 WHERE title = ?2",
+                rusqlite::params!["2026-03-01T02:00:00.000000Z", "new"],
+            )
+            .unwrap();
+        }
+        let cfg = config::AppConfig::default();
+        let mut args = list_args();
+        args.since = Some("2026-03-01T00:00:00+00:00".to_string());
+        args.until = Some("2026-03-02T00:00:00Z".to_string());
+        {
+            let mut out = env.output();
+            cmd_list(&db, &args, true, &cfg, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        let mems = v["memories"].as_array().unwrap();
+        assert_eq!(mems.len(), 1, "got: {v}");
+        assert_eq!(mems[0]["title"].as_str().unwrap(), "new");
     }
 
     #[test]
