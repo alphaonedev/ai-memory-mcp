@@ -1200,9 +1200,10 @@ fn build_tool_definitions_for_profile(profile: &crate::profile::Profile) -> Valu
 ///    bytes, whichever is shorter). A cut that would end on a dangling
 ///    preposition or `+` is extended up to
 ///    [`COMPACT_DESCRIPTION_EXTEND_MAX`] so the verb-noun gist
-///    survives (#3378). The verbose drilldown
-///    (`memory_capabilities { verbose=true }`) still carries the
-///    full short-form description; the wire form stays inside the
+///    survives (#3378). Every compacted label then points at
+///    `memory_capabilities` for the rest (#3378 unit 3). The verbose
+///    drilldown (`memory_capabilities { verbose=true }`) still carries
+///    the full short-form description; the wire form stays inside the
 ///    budget gate at 11000 cl100k tokens (post-D1.6 schemars expansion, was 3500 in pre-D1.6 hand-coded macro).
 /// 2. **Strip** numeric / boolean schema defaults that match the
 ///    JSON-Schema validation no-op (e.g. `"default": 0` on an
@@ -1217,11 +1218,16 @@ fn wire_compact_descriptions(defs: &mut Value) {
         let Some(obj) = tool.as_object_mut() else {
             continue;
         };
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let Some(desc) = obj.get("description").and_then(Value::as_str) else {
             continue;
         };
-        let compact = compact_description(desc);
-        if compact.len() != desc.len() {
+        let compact = with_capabilities_pointer(compact_description(desc), &name);
+        if compact != desc {
             obj.insert("description".to_string(), Value::String(compact));
         }
     }
@@ -1241,6 +1247,27 @@ const COMPACT_DANGLING_LAST_TOKENS: &[&str] = &[
     "+", "-", "/", "to", "for", "of", "with", "from", "a", "an", "the", "and", "or", "per", "by",
     "in", "on", "at", "as", "into", "onto", "between", "over", "under", "via",
 ];
+
+/// Suffix pointing every compacted `tools/list` description at the
+/// verbose drilldown (#3378 unit 3). Full prose / schema lives on
+/// `memory_capabilities { verbose=true }`; the wire label stays budgeted.
+/// Pinned to [`tool_names::MEMORY_CAPABILITIES`] by
+/// `capabilities_pointer_names_the_canonical_tool_3378`.
+const CAPABILITIES_POINTER: &str = " See memory_capabilities.";
+
+/// Append [`CAPABILITIES_POINTER`] unless this *is* the capabilities
+/// tool or the compact label already names it (no `description()`
+/// edits — the pointer is a wire-trimmer concern).
+fn with_capabilities_pointer(compact: String, tool_name: &str) -> String {
+    if tool_name == tool_names::MEMORY_CAPABILITIES
+        || compact.contains(tool_names::MEMORY_CAPABILITIES)
+    {
+        return compact;
+    }
+    let mut out = compact;
+    out.push_str(CAPABILITIES_POINTER);
+    out
+}
 
 /// Truncate a tool's short-form description to the first sentence
 /// (or a word-boundary cut at [`COMPACT_DESCRIPTION_MAX`]), preserving
@@ -1379,8 +1406,8 @@ fn drop_trailing_dangling(s: &str) -> String {
 #[cfg(test)]
 mod compact_description_3378_tests {
     use super::{
-        COMPACT_DESCRIPTION_EXTEND_MAX, COMPACT_DESCRIPTION_MAX, compact_description,
-        compact_ends_dangling,
+        CAPABILITIES_POINTER, COMPACT_DESCRIPTION_EXTEND_MAX, COMPACT_DESCRIPTION_MAX,
+        compact_description, compact_ends_dangling, tool_names, with_capabilities_pointer,
     };
 
     #[test]
@@ -1465,6 +1492,38 @@ mod compact_description_3378_tests {
         assert!(
             got.contains("query"),
             "gist must include the object: {got:?}"
+        );
+    }
+
+    #[test]
+    fn capabilities_pointer_names_the_canonical_tool_3378() {
+        assert!(
+            CAPABILITIES_POINTER.contains(tool_names::MEMORY_CAPABILITIES),
+            "pointer must name the canonical tool, got {CAPABILITIES_POINTER:?}"
+        );
+    }
+
+    #[test]
+    fn capabilities_pointer_appended_for_ordinary_tool_3378() {
+        let gist = compact_description("Calibrate confidence baselines. output_format is ignored.");
+        let got = with_capabilities_pointer(gist, "memory_calibrate_confidence");
+        assert!(
+            got.ends_with(CAPABILITIES_POINTER),
+            "ordinary tool must point at capabilities, got {got:?}"
+        );
+        assert!(
+            got.contains("Calibrate confidence baselines"),
+            "gist must survive the pointer, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn capabilities_pointer_skipped_for_capabilities_tool_3378() {
+        let gist = compact_description("List advertised tool families and schemas.");
+        let got = with_capabilities_pointer(gist.clone(), tool_names::MEMORY_CAPABILITIES);
+        assert_eq!(
+            got, gist,
+            "memory_capabilities must not point at itself: {got:?}"
         );
     }
 }
@@ -2132,10 +2191,11 @@ mod d1_6_987_tests {
     /// #3397 — `output_format` is inert and its field description is
     /// stripped from `tools/list`. compact_description MAX=32 keeps only
     /// the first sentence of `description()`, so that sentence must be
-    /// the tool PURPOSE (≤32 bytes). The IGNORED disclosure lives in
-    /// `docs()` (verbose drilldown); wire-level survival of a trailing
-    /// caveat is #3378. Denied path: a compacted description that is
-    /// not the purpose, or docs() that omit the inert-field caveat.
+    /// the tool PURPOSE (≤32 bytes). #3378 unit 3 then appends
+    /// [`super::CAPABILITIES_POINTER`] on the wire. The IGNORED
+    /// disclosure lives in `docs()` (verbose drilldown). Denied path:
+    /// a compacted gist that is not the purpose, or docs() that omit
+    /// the inert-field caveat.
     #[test]
     fn calibrate_tools_list_description_keeps_ignored_after_compact_3397() {
         let defs = super::tool_definitions_for_profile(&crate::profile::Profile::full());
@@ -2156,9 +2216,17 @@ mod d1_6_987_tests {
             "compacted tools/list description must carry the tool purpose, got: {desc:?}"
         );
         assert!(
-            desc.len() <= 32,
-            "tools/list description is compacted to ≤32 bytes, got len={} {desc:?}",
-            desc.len()
+            desc.contains(super::tool_names::MEMORY_CAPABILITIES),
+            "UNIT3: tools/list description must point at memory_capabilities, got: {desc:?}"
+        );
+        let gist = desc
+            .strip_suffix(super::CAPABILITIES_POINTER)
+            .unwrap_or(desc);
+        assert!(
+            gist.len() <= 32,
+            "tools/list gist is compacted to ≤32 bytes before the capabilities pointer, \
+             got gist len={} {desc:?}",
+            gist.len()
         );
         let docs = crate::mcp::calibrate_confidence::CalibrateConfidenceTool::docs();
         assert!(

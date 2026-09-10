@@ -51,7 +51,17 @@ impl RoutineState {
     /// (#3378) iterate this so the wire vocabulary cannot drift from
     /// [`Self::from_str`] / [`Self::as_str`].
     pub const ALL: [Self; 2] = [Self::Draft, Self::Frozen];
+
+    /// Completeness pin (#3378 unit 3): a new variant not listed in
+    /// [`Self::ALL`] fails to compile because this match is exhaustive.
+    const fn all_exhaustive(self) {
+        match self {
+            Self::Draft | Self::Frozen => {}
+        }
+    }
 }
+
+const _: fn(RoutineState) = RoutineState::all_exhaustive;
 
 /// Lifecycle state of a [`RoutineRun`] (the `routine_runs.state` column).
 ///

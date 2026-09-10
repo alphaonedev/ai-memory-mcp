@@ -74,6 +74,19 @@ impl ActionState {
         Self::Abandoned,
     ];
 
+    /// Completeness pin (#3378 unit 3): a new variant not listed in
+    /// [`Self::ALL`] fails to compile because this match is exhaustive.
+    const fn all_exhaustive(self) {
+        match self {
+            Self::Pending
+            | Self::Claimed
+            | Self::InProgress
+            | Self::Done
+            | Self::Failed
+            | Self::Abandoned => {}
+        }
+    }
+
     /// Whether `self → to` is a legal coordination transition.
     #[must_use]
     pub fn can_transition_to(self, to: Self) -> bool {
@@ -175,7 +188,18 @@ impl EdgeType {
         Self::GatedBy,
         Self::Sibling,
     ];
+
+    /// Completeness pin (#3378 unit 3): a new variant not listed in
+    /// [`Self::ALL`] fails to compile because this match is exhaustive.
+    const fn all_exhaustive(self) {
+        match self {
+            Self::Requires | Self::Unlocks | Self::Blocks | Self::GatedBy | Self::Sibling => {}
+        }
+    }
 }
+
+const _: fn(ActionState) = ActionState::all_exhaustive;
+const _: fn(EdgeType) = EdgeType::all_exhaustive;
 
 /// A typed edge in the action dependency DAG. Mirrors the v59
 /// `action_edges` table.

@@ -67,7 +67,17 @@ impl SignalType {
         Self::Response,
         Self::Broadcast,
     ];
+
+    /// Completeness pin (#3378 unit 3): a new variant not listed in
+    /// [`Self::ALL`] fails to compile because this match is exhaustive.
+    const fn all_exhaustive(self) {
+        match self {
+            Self::Authorize | Self::Notify | Self::Request | Self::Response | Self::Broadcast => {}
+        }
+    }
 }
+
+const _: fn(SignalType) = SignalType::all_exhaustive;
 
 /// A typed, signed inter-agent signal — one row in the Pillar-1 `signals`
 /// table. Mirrors the v60 `signals` table 1:1.

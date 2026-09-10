@@ -158,6 +158,41 @@ impl ConditionType {
         Self::Deadline,
         Self::EpochAdvance,
     ];
+
+    /// Completeness pin (#3378 unit 3): a new variant not listed in
+    /// [`Self::ALL`] fails to compile because this match is exhaustive.
+    const fn all_exhaustive(self) {
+        match self {
+            Self::Approval
+            | Self::ExternalSignal
+            | Self::ConditionPredicate
+            | Self::Deadline
+            | Self::AuditHeadWitness
+            | Self::GovernanceVerdict
+            | Self::GovernanceEnforcement
+            | Self::EpochAdvance
+            | Self::PeerHeadEntanglement
+            | Self::ReAnchor => {}
+        }
+    }
+
+    /// Completeness pin (#3378 unit 3): a new variant must be classified
+    /// as caller-mintable or reserved, so [`Self::CALLER_MINTABLE`] cannot
+    /// silently omit it.
+    const fn caller_mintable_exhaustive(self) -> bool {
+        match self {
+            Self::Approval
+            | Self::ExternalSignal
+            | Self::ConditionPredicate
+            | Self::Deadline
+            | Self::EpochAdvance => true,
+            Self::AuditHeadWitness
+            | Self::GovernanceVerdict
+            | Self::GovernanceEnforcement
+            | Self::PeerHeadEntanglement
+            | Self::ReAnchor => false,
+        }
+    }
 }
 
 /// Lifecycle state of a [`Checkpoint`] (the `checkpoints.state` column).
@@ -212,7 +247,29 @@ impl CheckpointState {
     /// `rejected`). Pending/expired are lifecycle observations, not
     /// caller-supplied resolutions.
     pub const RESOLUTION: [Self; 2] = [Self::Resolved, Self::Rejected];
+
+    /// Completeness pin (#3378 unit 3): a new variant not listed in
+    /// [`Self::ALL`] fails to compile because this match is exhaustive.
+    const fn all_exhaustive(self) {
+        match self {
+            Self::Pending | Self::Resolved | Self::Rejected | Self::Expired => {}
+        }
+    }
+
+    /// Completeness pin (#3378 unit 3): a new variant must be classified
+    /// as a caller-supplied resolution or a lifecycle observation.
+    const fn resolution_exhaustive(self) -> bool {
+        match self {
+            Self::Resolved | Self::Rejected => true,
+            Self::Pending | Self::Expired => false,
+        }
+    }
 }
+
+const _: fn(ConditionType) = ConditionType::all_exhaustive;
+const _: fn(ConditionType) -> bool = ConditionType::caller_mintable_exhaustive;
+const _: fn(CheckpointState) = CheckpointState::all_exhaustive;
+const _: fn(CheckpointState) -> bool = CheckpointState::resolution_exhaustive;
 
 /// A conditional coordination gate — one row in the Pillar-1 `checkpoints`
 /// table. Mirrors the v61 `checkpoints` table 1:1.
@@ -271,6 +328,11 @@ mod tests {
                 mintable, !reserved,
                 "CALLER_MINTABLE drifted from reserved-kind SSOT for {c:?}"
             );
+            assert_eq!(
+                mintable,
+                c.caller_mintable_exhaustive(),
+                "CALLER_MINTABLE drifted from caller_mintable_exhaustive for {c:?}"
+            );
         }
         assert_eq!(ConditionType::CALLER_MINTABLE.len(), 5);
     }
@@ -297,6 +359,13 @@ mod tests {
             CheckpointState::RESOLUTION,
             [CheckpointState::Resolved, CheckpointState::Rejected]
         );
+        for s in CheckpointState::ALL {
+            assert_eq!(
+                CheckpointState::RESOLUTION.contains(&s),
+                s.resolution_exhaustive(),
+                "RESOLUTION drifted from resolution_exhaustive for {s:?}"
+            );
+        }
     }
 
     #[test]

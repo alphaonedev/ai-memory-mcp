@@ -151,3 +151,41 @@ fn no_compacted_full_profile_description_ends_on_comma_or_colon_3378() {
         offenders.join("\n")
     );
 }
+
+#[test]
+fn every_non_capabilities_description_points_at_memory_capabilities_3378() {
+    let defs = tool_definitions_for_profile(&Profile::full());
+    let tools = defs["tools"].as_array().expect("tools array");
+    let mut missing: Vec<String> = Vec::new();
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>");
+        if name == "memory_capabilities" {
+            continue;
+        }
+        let desc = tool
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        if !desc.contains("memory_capabilities") {
+            missing.push(format!("{name}: {desc:?}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "every compacted tools/list description except memory_capabilities \
+         itself must point at memory_capabilities (#3378 unit 3):\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn memory_capabilities_description_does_not_self_point_3378() {
+    let got = compacted_description("memory_capabilities");
+    assert!(
+        !got.contains("See memory_capabilities"),
+        "memory_capabilities must not point at itself: {got:?}"
+    );
+}
