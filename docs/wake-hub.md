@@ -931,6 +931,20 @@ with the resolved caller. Ordinary principal names such as `ai:alice` and
 matrix is pinned by `tests/wake_hub_identity_domain_3578.rs`. This wire
 reservation does not change the internal-bootstrap shape-only validator.
 
+**Dependency gate (#3578).** `tests/qual_wake_hub_zero_authority_3578.rs`
+walks every Rust source under `src/wake_hub`, scanning all feature branches
+and resuming after complete inline test modules. Its reviewed crate-edge
+allowlist admits the public delegation verification vocabulary, snapshot-age
+constant, binding-authority type, producer sentinel, and shared visibility
+predicates. `identity::keypair::decode_public_base64` is the sole keypair
+exception; its public decoder body and imported dependencies are pinned.
+Module/glob imports cannot widen that exception. Mutation fixtures cover
+aliased/grouped imports, fully qualified paths, the production tail after
+tests, database/configuration literals, signing material, and source inclusion.
+This lexical qualification gate does not prove filesystem isolation or replace
+the OS permissions below; runtime credential refusal and content-plane checks
+are separate controls.
+
 **Process isolation (#3578).** The systemd unit runs as `User=ai-memory-hub`
 (not the daemon's `ai-memory`), jails `/var/lib/ai-memory` with
 `InaccessiblePaths=`, and restricts the address family to `AF_UNIX`: the wake
