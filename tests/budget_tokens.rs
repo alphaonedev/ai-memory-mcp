@@ -119,7 +119,17 @@ use serde_json::json;
 // structural (the new tool's name/description + property KEYS + type
 // shapes), not prose (the trim already strips per-property descriptions).
 // 7760 = 7684 + 76 margin; still 3240 below the 11000 structural backstop.
-const FULL_PROFILE_TOKEN_CEILING: usize = 7_760;
+// 2026-09-10 — raised 7760 -> 8110 (lockstep, Conductor ruling on the
+// 869b4d49 campaign): #3378 units 1-2 deliberately grew the wire — tool
+// descriptions no longer cut at a dangling 32-byte boundary (extend up to
+// 80 bytes) and closed params advertise their inline JSON-Schema enum
+// lists from the domain enums, so MCP clients see the exact accepted
+// values instead of a bare string. Measured 8029 on 869b4d49; 8110 =
+// 8029 + 81 margin (~1%); still 2890 below the 11000 structural backstop.
+// Lesson: the CI gate runs this #[ignore]d test explicitly; every f2
+// merge-result gate for a tools/list-touching lane now runs
+// `cargo test --test budget_tokens -- --ignored` as well.
+const FULL_PROFILE_TOKEN_CEILING: usize = 8_110;
 
 fn mem_with_content(id: &str, content: &str) -> Memory {
     Memory {
