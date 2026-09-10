@@ -30,6 +30,34 @@ pub fn handle_notify(
     resolved_ttl: &crate::config::ResolvedTtl,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    let input = parse_notify(params)?;
+    let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    persist_notify(conn, db_path, input, resolved_ttl, &sender)
+}
+
+/// #3579: HTTP has already resolved and validated this sender. Never feed it
+/// through the MCP client-name or ambient-identity ladder.
+pub(crate) fn handle_notify_as_sender(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    params: &Value,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    sender: &str,
+) -> Result<Value, String> {
+    persist_notify(conn, db_path, parse_notify(params)?, resolved_ttl, sender)
+}
+
+/// Validated notification fields; both entries validate before any write.
+struct NotifyInput<'a> {
+    target: &'a str,
+    title: &'a str,
+    payload: &'a str,
+    priority: i32,
+    tier: Tier,
+    why_trace: Option<&'a str>,
+}
+
+fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, String> {
     let target = params[param_names::TARGET_AGENT_ID]
         .as_str()
         .ok_or("target_agent_id is required")?;
@@ -56,7 +84,33 @@ pub fn handle_notify(
     validate::validate_title(title).map_err(|e| e.to_string())?;
     validate::validate_content(payload).map_err(|e| e.to_string())?;
 
-    let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    Ok(NotifyInput {
+        target,
+        title,
+        payload,
+        priority,
+        tier,
+        why_trace: params[param_names::WHY_TRACE]
+            .as_str()
+            .filter(|wt| !wt.trim().is_empty()),
+    })
+}
+
+fn persist_notify(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    input: NotifyInput<'_>,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    sender: &str,
+) -> Result<Value, String> {
+    let NotifyInput {
+        target,
+        title,
+        payload,
+        priority,
+        tier,
+        why_trace,
+    } = input;
     let namespace = crate::inbox_namespace(target);
 
     let now = chrono::Utc::now();
@@ -65,7 +119,7 @@ pub fn handle_notify(
         .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
 
     let mut metadata = json!({
-        "agent_id": sender.clone(),
+        "agent_id": sender,
         (field_names::TARGET_AGENT_ID): target,
         "notify": true,
     });
@@ -76,9 +130,7 @@ pub fn handle_notify(
     // rationale via the optional `why_trace` param. Under
     // AI_MEMORY_REQUIRE_WHY_TRACE=1 a why_trace-less notify is refused by
     // the `db::insert` gate; default posture is unchanged (advisory).
-    if let Some(wt) = params[param_names::WHY_TRACE].as_str()
-        && !wt.trim().is_empty()
-    {
+    if let Some(wt) = why_trace {
         metadata[param_names::WHY_TRACE] = json!(wt);
     }
 
@@ -123,7 +175,7 @@ pub fn handle_notify(
     let quota_op = crate::quotas::QuotaOp::Memory {
         bytes: payload_bytes,
     };
-    crate::quotas::check_and_record(conn, &sender, &mem.namespace, quota_op)
+    crate::quotas::check_and_record(conn, sender, &mem.namespace, quota_op)
         .map_err(|e| e.to_string())?;
 
     let actual_id = match db::insert(conn, &mem) {
@@ -133,9 +185,9 @@ pub fn handle_notify(
             // every downstream refusal/failure so only durable notifications
             // remain charged.
             if let Err(refund_err) =
-                crate::quotas::refund_op(conn, &sender, &mem.namespace, quota_op)
+                crate::quotas::refund_op(conn, sender, &mem.namespace, quota_op)
             {
-                crate::quotas::log_refund_op_failed(&sender, &refund_err);
+                crate::quotas::log_refund_op_failed(sender, &refund_err);
             }
             return Err(e.to_string());
         }
@@ -152,7 +204,7 @@ pub fn handle_notify(
         db_path,
         &crate::write_events::AgentNotified {
             recipient_agent_id: target,
-            sender_agent_id: &sender,
+            sender_agent_id: sender,
             inbox_row_id: &actual_id,
             namespace: &namespace,
             content: payload,
@@ -161,7 +213,7 @@ pub fn handle_notify(
 
     Ok(notify_receipt(
         &actual_id,
-        &sender,
+        sender,
         target,
         &namespace,
         &mem.tier,
