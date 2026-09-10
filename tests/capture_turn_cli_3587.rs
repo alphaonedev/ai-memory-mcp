@@ -38,8 +38,15 @@ fn scratch(tag: &str) -> (tempfile::TempDir, PathBuf) {
 /// `stdin` piped in, `AI_MEMORY_NO_CONFIG=1` pinned so no developer config
 /// leaks in.
 fn run_cli(db: &Path, args: &[&str], stdin: &str) -> Output {
-    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"))
-        .env("AI_MEMORY_NO_CONFIG", "1")
+    run_cli_env(db, args, stdin, &[])
+}
+
+/// As [`run_cli`], with extra child-process environment pairs layered on
+/// top (used to pin `AI_MEMORY_SECRET_SCREEN_MODE=redact` for the
+/// storage-form dedup probe).
+fn run_cli_env(db: &Path, args: &[&str], stdin: &str, extra_env: &[(&str, &str)]) -> Output {
+    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"));
+    cmd.env("AI_MEMORY_NO_CONFIG", "1")
         .arg("--db")
         .arg(db)
         .arg("--agent-id")
@@ -47,9 +54,11 @@ fn run_cli(db: &Path, args: &[&str], stdin: &str) -> Output {
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ai-memory");
+        .stderr(Stdio::piped());
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("spawn ai-memory");
     child
         .stdin
         .as_mut()
@@ -285,5 +294,247 @@ fn capture_turn_cli_stop_payload_null_message_is_noop_3587() {
         out.stdout.is_empty(),
         "no-op emits no envelope; stdout={}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// #3587 U4 round-2 — an `A,B,A` turn sequence in ONE session is THREE
+/// distinct turns, not two. Guard 1 compares the incoming content only
+/// against the session's LATEST stored turn, so the third delivery (A
+/// again, after B) does not match B and must be captured; the auto index
+/// ladder advances contiguously 0,1,2.
+#[test]
+fn capture_turn_cli_stop_payload_a_b_a_keeps_three_3587() {
+    let (_dir, db) = scratch("stop-aba");
+    let session = "sess-aba-3587";
+    let turns = ["turn A body", "turn B body", "turn A body"];
+
+    let mut ids = Vec::new();
+    for text in turns {
+        let stop = json!({
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "last_assistant_message": text,
+        })
+        .to_string();
+        let out = run_cli(&db, &["capture-turn", "--json"], &stop);
+        assert!(
+            out.status.success(),
+            "A,B,A delivery must capture; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let env: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+        assert_eq!(
+            env["dedup_hit"],
+            Value::Bool(false),
+            "A,B,A must never dedup (latest-row-only guard); got {env}"
+        );
+        ids.push(env["memory_id"].as_str().expect("memory_id").to_string());
+    }
+
+    assert_eq!(ids.len(), 3, "three deliveries for A,B,A");
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "A,B,A must produce three distinct memories; got {ids:?}"
+    );
+
+    let conn = ai_memory::db::open(&db).expect("open capture db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT host_turn_index FROM transcript_line_dedup \
+             WHERE host_session_id = ?1 ORDER BY host_turn_index",
+        )
+        .expect("prepare index probe");
+    let indices: Vec<i64> = stmt
+        .query_map([session], |row| row.get(0))
+        .expect("query indices")
+        .collect::<std::result::Result<_, _>>()
+        .expect("collect indices");
+    assert_eq!(
+        indices,
+        vec![0, 1, 2],
+        "A,B,A auto indices must be the contiguous ladder 0,1,2"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM transcript_line_dedup WHERE host_session_id = ?1",
+            [session],
+            |row| row.get(0),
+        )
+        .expect("count dedup rows");
+    assert_eq!(count, 3, "A,B,A must leave exactly three dedup rows");
+}
+
+/// #3587 U4 round-2 — under `AI_MEMORY_SECRET_SCREEN_MODE=redact` the
+/// storage funnel masks credential material, so the stored `content` is
+/// NOT byte-equal to the raw host payload. Guard 1 must compare against
+/// the incoming text both raw and in its redacted storage form, else the
+/// identical redacted turn is re-captured on every host re-delivery.
+#[test]
+fn capture_turn_cli_stop_payload_dedups_redacted_storage_form_3587() {
+    /// The canonical anchored AWS access-key-id fixture the screen fires
+    /// on (`AKIA` + 16 uppercase-alnum).
+    const AWS_ACCESS_KEY_FIXTURE: &str = "AKIAIOSFODNN7EXAMPLE";
+    let (_dir, db) = scratch("stop-redact");
+    let session = "sess-redact-3587";
+    let stop = json!({
+        "hook_event_name": "Stop",
+        "session_id": session,
+        "last_assistant_message": format!("rotate the key {AWS_ACCESS_KEY_FIXTURE} now"),
+    })
+    .to_string();
+
+    let redact = [("AI_MEMORY_SECRET_SCREEN_MODE", "redact")];
+    let first = run_cli_env(&db, &["capture-turn", "--json"], &stop, &redact);
+    assert!(
+        first.status.success(),
+        "redact-mode capture must succeed; stderr={}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_env: Value = serde_json::from_slice(&first.stdout).expect("first envelope");
+    assert_eq!(
+        first_env["dedup_hit"],
+        Value::Bool(false),
+        "first redacted capture must write; got {first_env}"
+    );
+
+    // Identical re-delivery under the same redact posture → storage-form
+    // dedup hit on the original memory id.
+    let second = run_cli_env(&db, &["capture-turn", "--json"], &stop, &redact);
+    assert!(
+        second.status.success(),
+        "redacted re-delivery must succeed; stderr={}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_env: Value = serde_json::from_slice(&second.stdout).expect("second envelope");
+    assert_eq!(
+        second_env["dedup_hit"],
+        Value::Bool(true),
+        "redacted re-delivery must dedup on the storage form; got {second_env}"
+    );
+    assert_eq!(
+        second_env["memory_id"], first_env["memory_id"],
+        "storage-form dedup returns the original memory id"
+    );
+
+    let conn = ai_memory::db::open(&db).expect("open capture db");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .expect("count memories");
+    assert_eq!(
+        count, 1,
+        "redacted re-delivery must leave exactly one memory"
+    );
+    let stored: String = conn
+        .query_row("SELECT content FROM memories LIMIT 1", [], |row| row.get(0))
+        .expect("stored content");
+    assert!(
+        !stored.contains(AWS_ACCESS_KEY_FIXTURE),
+        "stored content must be redacted, not the raw credential; got {stored}"
+    );
+}
+
+/// #3587 U4 (21:03Z session-salting note) — identical content delivered in
+/// two DIFFERENT sessions must produce TWO memories: the dedup `sha256` is
+/// computed over the session-salted canonical bytes
+/// `session\0index\0role\0content`, and Guard 1 is scoped by
+/// `host_session_id`. Re-delivering one of them is still a dedup hit.
+#[test]
+fn capture_turn_cli_stop_payload_same_content_two_sessions_3587() {
+    let (_dir, db) = scratch("stop-two-sessions");
+    let text = "identical assistant message in two separate sessions";
+    let sessions = ["sess-salt-a-3587", "sess-salt-b-3587"];
+
+    let mut ids = Vec::new();
+    for session in sessions {
+        let stop = json!({
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "last_assistant_message": text,
+        })
+        .to_string();
+        let out = run_cli(&db, &["capture-turn", "--json"], &stop);
+        assert!(
+            out.status.success(),
+            "per-session capture must succeed; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let env: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+        assert_eq!(
+            env["dedup_hit"],
+            Value::Bool(false),
+            "a different session must not dedup; got {env}"
+        );
+        ids.push(env["memory_id"].as_str().expect("memory_id").to_string());
+    }
+    assert_ne!(
+        ids[0], ids[1],
+        "identical content in two sessions must be two memories"
+    );
+
+    let conn = ai_memory::db::open(&db).expect("open capture db");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .expect("count memories");
+    assert_eq!(
+        count, 2,
+        "session-salting must yield two memories for identical content"
+    );
+
+    // Re-delivering the SAME (session, turn) is still a dedup hit.
+    let stop = json!({
+        "hook_event_name": "Stop",
+        "session_id": sessions[0],
+        "last_assistant_message": text,
+    })
+    .to_string();
+    let again = run_cli(&db, &["capture-turn", "--json"], &stop);
+    assert!(again.status.success());
+    let again_env: Value = serde_json::from_slice(&again.stdout).expect("envelope");
+    assert_eq!(
+        again_env["dedup_hit"],
+        Value::Bool(true),
+        "same (session, content) re-delivery must dedup; got {again_env}"
+    );
+    assert_eq!(again_env["memory_id"], ids[0]);
+}
+
+/// #3587 U4 round-2 — the hook / parity stdin read is hard-capped at
+/// `capture_turn::MAX_CAPTURE_TURN_STDIN_BYTES`: an over-cap payload
+/// refuses with `INVALID_INPUT` before the JSON parse (CWE-400), and the
+/// read never consumes more than the cap.
+#[test]
+fn capture_turn_cli_refuses_over_cap_stdin_3587() {
+    /// Mirrors `src/cli/commands/capture_turn.rs::MAX_CAPTURE_TURN_STDIN_BYTES`
+    /// (kept as a local literal so the test asserts the shipped 16 MiB).
+    const CAPTURE_TURN_STDIN_CAP_BYTES: usize = 16 * 1024 * 1024;
+    let (_dir, db) = scratch("stdin-cap");
+
+    // Exactly one byte over the ceiling. Deliberately not valid JSON — the
+    // cap must refuse BEFORE the parse.
+    let over_cap = "a".repeat(CAPTURE_TURN_STDIN_CAP_BYTES + 1);
+    let out = run_cli(&db, &["capture-turn"], &over_cap);
+    assert!(
+        !out.status.success(),
+        "over-cap stdin without --quiet must refuse; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeds") && stderr.contains("MiB"),
+        "refusal must name the cap; stderr={stderr}"
+    );
+
+    // Under --quiet the hook contract still refuses without failing.
+    let quiet = run_cli(&db, &["capture-turn", "--quiet"], &over_cap);
+    assert!(
+        quiet.status.success(),
+        "--quiet must never fail a hook; stderr={}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert!(
+        quiet.stdout.is_empty(),
+        "quiet refusal writes nothing to stdout"
     );
 }

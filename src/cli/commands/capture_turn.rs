@@ -58,6 +58,14 @@ const PARAM_HOST_SESSION_ID: &str = "host_session_id";
 const PARAM_HOST_TURN_INDEX: &str = "host_turn_index";
 const PARAM_SESSION_ID: &str = "session_id";
 
+/// Hard ceiling on the hook / parity stdin payload. A real host turn is
+/// KB-scale; the cap bounds the read + JSON parse so an unbounded (or
+/// hostile) pipe cannot exhaust memory before validation (CWE-400).
+/// Over-cap refuses with `INVALID_INPUT` (or, under `--quiet`, a
+/// never-fail stderr line).
+const MAX_CAPTURE_TURN_STDIN_MIB: u64 = 16;
+const MAX_CAPTURE_TURN_STDIN_BYTES: u64 = MAX_CAPTURE_TURN_STDIN_MIB * 1024 * 1024;
+
 /// CLI args for `ai-memory capture-turn`.
 #[derive(Args, Debug, Clone)]
 pub struct CaptureTurnArgs {
@@ -143,9 +151,23 @@ fn run_capture_turn(
     {
         use std::io::Read;
         // Non-TTY hook invocations always pipe the payload; a TTY would
-        // block, so only read when stdin is not a terminal.
+        // block, so only read when stdin is not a terminal. The read is
+        // hard-capped at [`MAX_CAPTURE_TURN_STDIN_BYTES`] (+1 probe byte)
+        // so an unbounded pipe cannot exhaust memory before the JSON
+        // parse; over-cap refuses with `INVALID_INPUT`.
         if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            std::io::stdin().read_to_string(&mut stdin_text)?;
+            let mut raw = Vec::new();
+            std::io::stdin()
+                .take(MAX_CAPTURE_TURN_STDIN_BYTES + 1)
+                .read_to_end(&mut raw)?;
+            if u64::try_from(raw.len()).unwrap_or(u64::MAX) > MAX_CAPTURE_TURN_STDIN_BYTES {
+                bail!(
+                    "INVALID_INPUT: stdin payload exceeds the \
+                     {MAX_CAPTURE_TURN_STDIN_MIB} MiB capture-turn cap"
+                );
+            }
+            stdin_text = String::from_utf8(raw)
+                .map_err(|e| anyhow!("INVALID_INPUT: stdin is not valid UTF-8: {e}"))?;
         }
     }
     let stdin_text = stdin_text.trim();

@@ -2686,9 +2686,16 @@ pub fn capture_turn_idempotent(
 /// same-index dedup hit.
 ///
 /// Two in-transaction dedup guards:
-/// 1. **content guard** — a `transcript_line_dedup` row already exists
-///    for this session whose stored `memories.content` is byte-identical
-///    (host re-delivery of the same turn) → returned as a `dedup_hit`;
+/// 1. **content guard** — the session's LATEST stored turn
+///    (`ORDER BY host_turn_index DESC LIMIT 1`) is compared against the
+///    incoming content in its STORAGE form: a host re-delivery of the
+///    same turn is a `dedup_hit` iff the stored `memories.content`
+///    equals the raw incoming text OR its redacted twin
+///    ([`crate::secret_screen::redact_for_storage`], which `insert`
+///    applies under `AI_MEMORY_SECRET_SCREEN_MODE=redact`). Comparing
+///    only the raw text would never match a redacted turn, and scanning
+///    every historical row (rather than just the latest) would swallow a
+///    legitimate A,B,A turn sequence as two memories;
 /// 2. the derived index is `MAX(host_turn_index) + 1` for the session,
 ///    so it cannot collide with an existing row.
 ///
@@ -2716,30 +2723,43 @@ where
     let write_txn =
         connection::WriteTxn::begin(conn).map_err(|e| idempotent_err(ERR_TX_BEGIN, e))?;
 
-    // Guard 1 — same session + byte-identical stored content is the same
-    // turn re-delivered. The join is scoped by `host_session_id`, so the
-    // scan walks that session's dedup rows (indexed), not the memories
-    // table.
-    let existing: Option<String> = conn
+    // Guard 1 — the session's LATEST turn (MAX host_turn_index) is the
+    // one a host re-delivery repeats. Compare its STORED content against
+    // the incoming text both raw and in the storage form `insert` applies
+    // (`redact_memory_for_storage` ⇒ `redact_for_storage` under any
+    // non-`Off` screen mode): a redacted turn never equals its raw input,
+    // so a raw-only compare would re-capture it on every re-delivery.
+    // Limiting to the latest row (not every historical row) keeps a
+    // legitimate A,B,A sequence as three distinct turns.
+    let latest: Option<(String, String)> = conn
         .prepare_cached(
-            "SELECT d.memory_id FROM transcript_line_dedup d \
+            "SELECT d.memory_id, m.content FROM transcript_line_dedup d \
              JOIN memories m ON m.id = d.memory_id \
              WHERE d.host_session_id IS NOT NULL \
                AND d.host_session_id = ?1 \
-               AND m.content = ?2 \
+             ORDER BY d.host_turn_index DESC \
              LIMIT 1",
         )
         .and_then(|mut stmt| {
-            stmt.query_row(params![host_session_id, content], |row| row.get(0))
-                .optional()
+            stmt.query_row(params![host_session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
         })
         .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
-    if let Some(memory_id) = existing {
-        write_txn.commit().map_err(tx_commit_failed)?;
-        return Ok(crate::models::CaptureTurnResult {
-            memory_id,
-            dedup_hit: true,
-        });
+    if let Some((memory_id, stored)) = latest {
+        // `stored == raw || stored == redacted(raw)`: the raw compare runs
+        // first so a clean re-delivery never pays for the screen pass.
+        let matches = stored == content
+            || crate::secret_screen::redact_for_storage(content)
+                .is_some_and(|redacted| redacted == stored);
+        if matches {
+            write_txn.commit().map_err(tx_commit_failed)?;
+            return Ok(crate::models::CaptureTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
     }
 
     // Guard 2 — derive the next per-session index in-tx (race-free).
