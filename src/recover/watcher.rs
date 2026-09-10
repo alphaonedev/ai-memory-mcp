@@ -75,6 +75,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use super::line_file::{self, LineFileState, WatchSource};
 use super::transcript_paths::{self, HostKind};
 use super::{DEFAULT_RECOVER_LIMIT, RecoverOpts, RecoverReport, recover_from_transcript};
 
@@ -252,10 +253,17 @@ fn exhaustion_warning(host: HostKind, transcript: &std::path::Path, stranded: us
 
 /// Poll-loop configuration. Built once at CLI dispatch time and moved
 /// into the blocking daemon body.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written: the SAL `store` field is `Arc<dyn MemoryStore>`,
+/// which is not `Debug` (E0277 under `--features sal`). Presence is logged;
+/// the handle itself is not (API-04 — the store is not a printable value).
+#[derive(Clone)]
 pub struct WatchConfig {
     /// Hosts to poll every tick. See [`default_watch_hosts`].
     pub hosts: Vec<HostKind>,
+    /// #3587 U2 — line-file sources (`--host file:<path>`, repeatable).
+    /// [`HostKind`] stays transcript-only; these live beside it.
+    pub line_files: Vec<PathBuf>,
     /// Interval between ticks. Always pre-clamped via
     /// [`clamp_poll_interval`] by the CLI surface.
     pub poll_interval: Duration,
@@ -268,6 +276,32 @@ pub struct WatchConfig {
     pub limit: usize,
     /// Parse + report only, no writes.
     pub dry_run: bool,
+    /// #3587 U2 — when set (sal build, postgres store URL), transcript
+    /// recovery and line-file ingest write through the SAL
+    /// `recover_turn_idempotent` path instead of the local sqlite file.
+    #[cfg(feature = "sal")]
+    pub store: Option<std::sync::Arc<dyn crate::store::MemoryStore>>,
+}
+
+impl std::fmt::Debug for WatchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ds = f.debug_struct("WatchConfig");
+        ds.field("hosts", &self.hosts)
+            .field("line_files", &self.line_files)
+            .field("poll_interval", &self.poll_interval)
+            .field("agent_id", &self.agent_id)
+            .field("namespace", &self.namespace)
+            .field("limit", &self.limit)
+            .field("dry_run", &self.dry_run);
+        #[cfg(feature = "sal")]
+        {
+            ds.field(
+                "store",
+                &self.store.as_ref().map(|_| "Arc<dyn MemoryStore>"),
+            );
+        }
+        ds.finish()
+    }
 }
 
 impl WatchConfig {
@@ -277,11 +311,14 @@ impl WatchConfig {
     pub fn new(agent_id: String) -> Self {
         Self {
             hosts: default_watch_hosts(),
+            line_files: Vec::new(),
             poll_interval: Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
             agent_id,
             namespace: None,
             limit: DEFAULT_WATCH_LIMIT,
             dry_run: false,
+            #[cfg(feature = "sal")]
+            store: None,
         }
     }
 }
@@ -291,8 +328,10 @@ impl WatchConfig {
 /// tracing summary.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HostTickOutcome {
-    /// Which host this outcome is for.
-    pub host: HostKind,
+    /// Which source this outcome is for. Transcript hosts serialize as
+    /// the kebab-case [`HostKind`] tag (byte-identical `--json` wire);
+    /// line-file sources serialize as `file:<abs path>`.
+    pub host: WatchSource,
     /// `true` when this tick detected a change (new/modified/grown
     /// transcript) and ran a recovery parse.
     pub changed: bool,
@@ -307,12 +346,30 @@ pub struct HostTickOutcome {
 impl HostTickOutcome {
     fn unchanged(host: HostKind) -> Self {
         Self {
-            host,
+            host: WatchSource::Transcript(host),
             changed: false,
             recover_report: None,
             error: None,
         }
     }
+
+    fn unchanged_file(path: PathBuf) -> Self {
+        Self {
+            host: WatchSource::LineFile(path),
+            changed: false,
+            recover_report: None,
+            error: None,
+        }
+    }
+}
+
+/// Per-run poll watermarks for transcript hosts and line-file sources.
+#[derive(Debug, Default)]
+pub struct WatchPollState {
+    /// Last-observed `(path, mtime, len)` per [`HostKind`].
+    pub hosts: HashMap<HostKind, HostPollState>,
+    /// Last-observed `(dev, ino, len, offset)` per line-file path.
+    pub files: HashMap<PathBuf, LineFileState>,
 }
 
 /// Cumulative report across one or more ticks — the `--once`/`--json`
@@ -394,7 +451,7 @@ impl WatchReport {
 pub fn poll_once(
     db_path: &std::path::Path,
     cfg: &WatchConfig,
-    states: &mut HashMap<HostKind, HostPollState>,
+    states: &mut WatchPollState,
 ) -> Vec<HostTickOutcome> {
     poll_once_with_resolver(db_path, cfg, states, transcript_paths::resolve_transcript)
 }
@@ -413,21 +470,21 @@ pub fn poll_once(
 pub fn poll_once_with_resolver<R>(
     db_path: &std::path::Path,
     cfg: &WatchConfig,
-    states: &mut HashMap<HostKind, HostPollState>,
+    states: &mut WatchPollState,
     resolve: R,
 ) -> Vec<HostTickOutcome>
 where
     R: Fn(HostKind, &std::path::Path) -> Result<Option<PathBuf>, transcript_paths::ResolveError>,
 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut outcomes = Vec::with_capacity(cfg.hosts.len());
+    let mut outcomes = Vec::with_capacity(cfg.hosts.len().saturating_add(cfg.line_files.len()));
 
     for &host in &cfg.hosts {
         let candidate = match resolve(host, &cwd) {
             Ok(p) => p,
             Err(e) => {
                 outcomes.push(HostTickOutcome {
-                    host,
+                    host: WatchSource::Transcript(host),
                     changed: false,
                     recover_report: None,
                     error: Some(format!("resolve_transcript: {e}")),
@@ -436,7 +493,7 @@ where
             }
         };
 
-        let entry = states.entry(host).or_default();
+        let entry = states.hosts.entry(host).or_default();
 
         // Observe this tick's freshness (a no-candidate tick observes
         // nothing), then let the pure decider pick the branch.
@@ -505,7 +562,7 @@ where
                     bypass_fast_path: true,
                 };
 
-                match recover_from_transcript(db_path, &opts) {
+                match recover_one(db_path, cfg, &opts) {
                     Ok(report) => {
                         // Issue #2150 — bounded retry of the `Ok`-with-
                         // embedded-errors case. A recovery that returns
@@ -595,7 +652,7 @@ where
                         // (issue #2126 case (b)).
                         entry.pending_drain = !cfg.dry_run && report.lines_skipped_limit > 0;
                         outcomes.push(HostTickOutcome {
-                            host,
+                            host: WatchSource::Transcript(host),
                             changed: true,
                             recover_report: Some(report),
                             error: None,
@@ -618,7 +675,7 @@ where
                         // kind. Embedded per-turn `RecoverReport.errors` on
                         // the `Ok` arm are surfaced separately (issue #2136).
                         outcomes.push(HostTickOutcome {
-                            host,
+                            host: WatchSource::Transcript(host),
                             changed: true,
                             recover_report: None,
                             error: Some(e.to_string()),
@@ -629,7 +686,95 @@ where
         }
     }
 
+    outcomes.extend(poll_line_files_sqlite(db_path, cfg, &mut states.files));
     outcomes
+}
+
+fn recover_one(
+    db_path: &std::path::Path,
+    cfg: &WatchConfig,
+    opts: &RecoverOpts,
+) -> Result<RecoverReport, super::RecoverError> {
+    #[cfg(not(feature = "sal"))]
+    let _ = cfg;
+    #[cfg(feature = "sal")]
+    if let Some(store) = cfg.store.as_ref()
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        return handle.block_on(super::recover_from_transcript_store(store.as_ref(), opts));
+    }
+    recover_from_transcript(db_path, opts)
+}
+
+fn poll_line_files_sqlite(
+    db_path: &std::path::Path,
+    cfg: &WatchConfig,
+    file_states: &mut HashMap<PathBuf, LineFileState>,
+) -> Vec<HostTickOutcome> {
+    let mut out = Vec::with_capacity(cfg.line_files.len());
+    for path in &cfg.line_files {
+        let state = file_states.entry(path.clone()).or_default();
+        let prev_offset = state.offset;
+        let prev_ino = state.ino;
+        match ingest_one_line_file(db_path, cfg, path, state) {
+            Ok(report) => {
+                let changed = report.lines_atomised > 0
+                    || report.lines_skipped_dedup > 0
+                    || report.lines_skipped_limit > 0
+                    || !report.errors.is_empty()
+                    || state.offset != prev_offset
+                    || state.ino != prev_ino;
+                if changed {
+                    out.push(HostTickOutcome {
+                        host: WatchSource::LineFile(path.clone()),
+                        changed: true,
+                        recover_report: Some(report),
+                        error: None,
+                    });
+                } else {
+                    out.push(HostTickOutcome::unchanged_file(path.clone()));
+                }
+            }
+            Err(e) => out.push(HostTickOutcome {
+                host: WatchSource::LineFile(path.clone()),
+                changed: true,
+                recover_report: None,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+    out
+}
+
+fn ingest_one_line_file(
+    db_path: &std::path::Path,
+    cfg: &WatchConfig,
+    path: &std::path::Path,
+    state: &mut LineFileState,
+) -> Result<RecoverReport, line_file::LineFileError> {
+    #[cfg(feature = "sal")]
+    if let Some(store) = cfg.store.as_ref()
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        return handle.block_on(line_file::ingest_line_file_store(
+            store.as_ref(),
+            path,
+            &cfg.agent_id,
+            cfg.namespace.as_deref(),
+            cfg.limit,
+            cfg.dry_run,
+            state,
+        ));
+    }
+    line_file::ingest_line_file_sqlite(
+        db_path,
+        path,
+        &cfg.agent_id,
+        cfg.namespace.as_deref(),
+        cfg.limit,
+        cfg.dry_run,
+        state,
+    )
 }
 
 /// Emit the per-host tracing summary for the CHANGED outcomes of one
@@ -640,12 +785,12 @@ where
 fn log_changed_outcomes(outcomes: &[HostTickOutcome]) {
     for o in outcomes.iter().filter(|o| o.changed) {
         if let Some(e) = &o.error {
-            tracing::warn!("L3 watch: {} tick error: {e}", o.host.as_str());
+            tracing::warn!("L3 watch: {} tick error: {e}", o.host.as_label());
         } else if let Some(r) = &o.recover_report {
             tracing::info!(
                 "L3 watch: {} captured {} new memories \
                  (skipped_dedup={}, skipped_limit={}, errors={})",
-                o.host.as_str(),
+                o.host.as_label(),
                 // `lines_atomised`, not the quiet-truncated
                 // `memories_created.len()` (issue #2116).
                 r.lines_atomised,
@@ -693,7 +838,7 @@ pub fn run_watch_daemon_with_resolver<R>(
 ) where
     R: Fn(HostKind, &std::path::Path) -> Result<Option<PathBuf>, transcript_paths::ResolveError>,
 {
-    let mut states: HashMap<HostKind, HostPollState> = HashMap::new();
+    let mut states = WatchPollState::default();
     let mut report = WatchReport::default();
     let hosts_str: Vec<&str> = cfg.hosts.iter().map(|h| h.as_str()).collect();
     tracing::info!(
@@ -742,6 +887,13 @@ fn run_watch_daemon_notify(
     let mut dirs = Vec::new();
     for &host in &cfg.hosts {
         dirs.extend(transcript_paths::watch_dirs(host, &cwd));
+    }
+    // #3587 U2 — native fs-notify for line-file sources is a parent-directory
+    // watch; polling is the fallback only when that directory is unwatchable.
+    for path in &cfg.line_files {
+        if let Some(parent) = path.parent() {
+            dirs.push(parent.to_path_buf());
+        }
     }
     notify_backed_watch(
         db_path,
@@ -846,12 +998,12 @@ where
         cfg.dry_run,
     );
 
-    let mut states: HashMap<HostKind, HostPollState> = HashMap::new();
+    let mut states = WatchPollState::default();
     let mut report = WatchReport::default();
 
     // A single recovery pass — shared by the initial catch-up tick, every
     // event-driven tick, and the periodic backstop tick.
-    let mut run_tick = |states: &mut HashMap<HostKind, HostPollState>, report: &mut WatchReport| {
+    let mut run_tick = |states: &mut WatchPollState, report: &mut WatchReport| {
         let outcomes = poll_once_with_resolver(db_path, cfg, states, &resolve);
         on_outcomes(&outcomes);
         report.absorb_tick(outcomes);
@@ -949,11 +1101,14 @@ mod tests {
     fn base_config(agent_id: &str) -> WatchConfig {
         WatchConfig {
             hosts: vec![HostKind::ClaudeCode],
+            line_files: Vec::new(),
             poll_interval: Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
             agent_id: agent_id.to_string(),
             namespace: Some("test-watch".to_string()),
             limit: DEFAULT_WATCH_LIMIT,
             dry_run: false,
+            #[cfg(feature = "sal")]
+            store: None,
         }
     }
 
@@ -990,7 +1145,7 @@ mod tests {
         // issue #2118). A no-candidate tick must not touch the DB — a
         // hard failure here would mean we opened a connection for a
         // no-op tick.
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
         let outcomes = poll_once_with_resolver(&db, &cfg, &mut states, |_host, _cwd| Ok(None));
         assert_eq!(outcomes.len(), 1);
         assert!(!outcomes[0].changed);
@@ -1016,7 +1171,7 @@ mod tests {
         let cfg = base_config("ai:test:detect");
         let resolve = |_host: HostKind, _cwd: &std::path::Path| Ok(Some(transcript.clone()));
 
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
 
         // First tick: fresh transcript → detect + capture.
         let outcomes = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
@@ -1042,14 +1197,14 @@ mod tests {
         rr.memories_created = vec!["a".to_string(), "b".to_string()];
         report.absorb_tick(vec![
             HostTickOutcome {
-                host: HostKind::ClaudeCode,
+                host: HostKind::ClaudeCode.into(),
                 changed: true,
                 recover_report: Some(rr),
                 error: None,
             },
             HostTickOutcome::unchanged(HostKind::Codex),
             HostTickOutcome {
-                host: HostKind::Gemini,
+                host: HostKind::Gemini.into(),
                 changed: true,
                 recover_report: None,
                 error: Some("boom".to_string()),
@@ -1088,7 +1243,7 @@ mod tests {
             .collect();
         assert_eq!(rr.memories_created.len(), QUIET_MEMORY_ID_PREVIEW_CAP);
         report.absorb_tick(vec![HostTickOutcome {
-            host: HostKind::ClaudeCode,
+            host: HostKind::ClaudeCode.into(),
             changed: true,
             recover_report: Some(rr),
             error: None,
@@ -1246,14 +1401,14 @@ mod tests {
         let mut cfg = base_config("ai:test:2126");
         cfg.limit = 1; // one turn/tick → a two-tick tail to drain
         let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
 
         // Tick 1: capture turn 1, skip the rest → pending_drain armed.
         let o1 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
         let r1 = o1[0].recover_report.as_ref().expect("report");
         assert_eq!(r1.lines_atomised, 1);
         assert!(r1.lines_skipped_limit >= 1);
-        assert!(states[&HostKind::ClaudeCode].pending_drain);
+        assert!(states.hosts[&HostKind::ClaudeCode].pending_drain);
 
         // Advance the agent watermark PAST the static file's mtime — the
         // exact #2126 trigger (a same-agent wall-clock L1 write mid-drain).
@@ -1285,7 +1440,7 @@ mod tests {
         assert_eq!(r3.lines_atomised, 1);
         assert_eq!(r3.lines_skipped_limit, 0);
         assert!(
-            !states[&HostKind::ClaudeCode].pending_drain,
+            !states.hosts[&HostKind::ClaudeCode].pending_drain,
             "pending_drain must clear once the tail is fully drained"
         );
 
@@ -1314,7 +1469,7 @@ mod tests {
         cfg.limit = 1;
         cfg.dry_run = true;
         let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
 
         // Tick 1: inspect (count a would-be write + a skipped tail) but
         // MUST NOT arm pending_drain.
@@ -1323,7 +1478,7 @@ mod tests {
         assert_eq!(r1.lines_atomised, 1);
         assert!(r1.lines_skipped_limit >= 1);
         assert!(
-            !states[&HostKind::ClaudeCode].pending_drain,
+            !states.hosts[&HostKind::ClaudeCode].pending_drain,
             "dry-run must never arm pending_drain (busy-loop guard, #2126 (b))"
         );
 
@@ -1360,7 +1515,7 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
         let cfg = base_config("ai:test:2134");
         let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
 
         // Tick 1: change detected, but recovery fails (DB-open) → `changed`
         // with an error and NO report. The watermark must stay UNADVANCED.
@@ -1443,7 +1598,7 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
         let cfg = base_config("ai:test:2150-transient");
         let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
 
         // Tick 1: poisoned db → the per-turn write fails → `Ok(report)` with
         // embedded errors (NOT an outcome-level `Err`) and NOTHING captured.
@@ -1461,7 +1616,7 @@ mod tests {
         );
         assert_eq!(r1.lines_atomised, 0, "the failed turn is NOT captured");
         assert_eq!(
-            states[&HostKind::ClaudeCode].retry_attempts,
+            states.hosts[&HostKind::ClaudeCode].retry_attempts,
             1,
             "the transient-embedded-error tick arms the retry budget"
         );
@@ -1486,7 +1641,7 @@ mod tests {
             "the previously-failed turn is captured on retry"
         );
         assert_eq!(
-            states[&HostKind::ClaudeCode].retry_attempts,
+            states.hosts[&HostKind::ClaudeCode].retry_attempts,
             0,
             "a successful capture resets the retry budget"
         );
@@ -1515,7 +1670,7 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
         let cfg = base_config("ai:test:2150-persistent");
         let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
 
         // Run well past the budget; record which ticks re-parsed (changed).
         let total_ticks = u32::from(WATCH_RECOVERY_MAX_RETRIES) + 5;
@@ -1547,7 +1702,7 @@ mod tests {
             );
         }
         assert_eq!(
-            states[&HostKind::ClaudeCode].retry_attempts,
+            states.hosts[&HostKind::ClaudeCode].retry_attempts,
             0,
             "the budget is reset to 0 on give-up (armed state cleared)"
         );
@@ -1565,13 +1720,13 @@ mod tests {
         let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
         let cfg = base_config("ai:test:2150-reset");
         let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
-        let mut states = HashMap::new();
+        let mut states = WatchPollState::default();
 
         // Tick 1 on delta A → embedded error → retry budget armed at 1.
         let o1 = poll_once_with_resolver(&poisoned, &cfg, &mut states, resolve);
         assert!(!o1[0].recover_report.as_ref().unwrap().errors.is_empty());
         assert_eq!(
-            states[&HostKind::ClaudeCode].retry_attempts,
+            states.hosts[&HostKind::ClaudeCode].retry_attempts,
             1,
             "delta A arms the retry budget at 1"
         );
@@ -1598,7 +1753,7 @@ mod tests {
             "the fresh delta still errors (same poisoned db)"
         );
         assert_eq!(
-            states[&HostKind::ClaudeCode].retry_attempts,
+            states.hosts[&HostKind::ClaudeCode].retry_attempts,
             1,
             "a fresh (mtime, len) delta RESETS the budget (would be 2 without the reset)"
         );
@@ -1643,7 +1798,7 @@ mod tests {
             "skipping turn with malformed sha256: zz".to_string(),
         ];
         report.absorb_tick(vec![HostTickOutcome {
-            host: HostKind::ClaudeCode,
+            host: HostKind::ClaudeCode.into(),
             changed: true,
             recover_report: Some(rr),
             error: None,
@@ -1661,13 +1816,13 @@ mod tests {
         rr2.errors = vec!["parse failed: x".to_string()];
         report.absorb_tick(vec![
             HostTickOutcome {
-                host: HostKind::ClaudeCode,
+                host: HostKind::ClaudeCode.into(),
                 changed: true,
                 recover_report: None,
                 error: Some("db-open boom".to_string()),
             },
             HostTickOutcome {
-                host: HostKind::Codex,
+                host: HostKind::Codex.into(),
                 changed: true,
                 recover_report: Some(rr2),
                 error: None,

@@ -22,8 +22,8 @@ use anyhow::Result;
 use clap::Args;
 
 use crate::cli::CliOutput;
-use crate::recover::HostKind;
-use crate::recover::watcher::{self, WatchConfig};
+use crate::recover::WatchSource;
+use crate::recover::watcher::{self, WatchConfig, WatchPollState};
 
 #[derive(Args, Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -41,7 +41,9 @@ pub struct WatchArgs {
     #[arg(long, default_value_t = watcher::DEFAULT_POLL_INTERVAL_SECS)]
     pub interval_secs: u64,
     /// Restrict polling to specific hosts (`claude-code` | `codex` |
-    /// `gemini`). Repeat the flag for multiple. Default: all three.
+    /// `gemini`) or line-file sources (`file:<path>`). Repeat the flag
+    /// for multiple. Default: all three transcript hosts. `file:` paths
+    /// are #3587 U2 swarm line-file sources.
     #[arg(long = "host", value_name = "HOST")]
     pub hosts: Vec<String>,
     /// Namespace override for captured memories. Defaults to the
@@ -59,29 +61,18 @@ pub struct WatchArgs {
     pub json: bool,
 }
 
-/// Parse a `--host` string into a [`HostKind`]. Unrecognized values are
-/// rejected up front (fail-fast CLI validation) rather than silently
+/// Parse a `--host` string into a [`WatchSource`]. Unrecognized values
+/// are rejected up front (fail-fast CLI validation) rather than silently
 /// falling back to a default host.
 ///
-/// Matches against [`HostKind::as_str`] (the SSOT for the host-tag
-/// vocabulary) rather than embedding a second copy of the per-vendor
-/// literal strings — vendor-identifier duplication outside the
-/// allowlisted carve-out files (`scripts/check-vendor-literals.sh`) is
-/// a lint-gated regression class this deliberately avoids.
-fn parse_host(s: &str) -> Result<HostKind> {
-    watcher::default_watch_hosts()
-        .into_iter()
-        .find(|h| h.as_str() == s)
-        .ok_or_else(|| {
-            let expected: Vec<&str> = watcher::default_watch_hosts()
-                .iter()
-                .map(|h| h.as_str())
-                .collect();
-            anyhow::anyhow!(
-                "unrecognized --host '{s}' (expected one of: {})",
-                expected.join(", ")
-            )
-        })
+/// Matches against [`crate::recover::HostKind::as_str`] (the SSOT for
+/// the host-tag vocabulary) plus `file:<path>` (#3587 U2) rather than
+/// embedding a second copy of the per-vendor literal strings — vendor-
+/// identifier duplication outside the allowlisted carve-out files
+/// (`scripts/check-vendor-literals.sh`) is a lint-gated regression class
+/// this deliberately avoids.
+fn parse_host(s: &str) -> Result<WatchSource> {
+    WatchSource::parse_host_token(s).map_err(anyhow::Error::msg)
 }
 
 /// Build the watcher's runtime config from CLI args + the resolved
@@ -89,21 +80,29 @@ fn parse_host(s: &str) -> Result<HostKind> {
 /// that threads `cli_agent_id` through from `daemon_runtime::run`).
 fn build_config(args: &WatchArgs, cli_agent_id: Option<&str>) -> Result<WatchConfig> {
     let agent_id = crate::identity::resolve_agent_id(cli_agent_id, None)?;
-    let hosts = if args.hosts.is_empty() {
-        watcher::default_watch_hosts()
+    let (hosts, line_files) = if args.hosts.is_empty() {
+        (watcher::default_watch_hosts(), Vec::new())
     } else {
-        args.hosts
-            .iter()
-            .map(|h| parse_host(h))
-            .collect::<Result<Vec<_>>>()?
+        let mut hosts = Vec::new();
+        let mut line_files = Vec::new();
+        for h in &args.hosts {
+            match parse_host(h)? {
+                WatchSource::Transcript(k) => hosts.push(k),
+                WatchSource::LineFile(p) => line_files.push(p),
+            }
+        }
+        (hosts, line_files)
     };
     Ok(WatchConfig {
         hosts,
+        line_files,
         poll_interval: watcher::clamp_poll_interval(args.interval_secs),
         agent_id,
         namespace: args.namespace.clone(),
         limit: args.limit.max(1),
         dry_run: args.dry_run,
+        #[cfg(feature = "sal")]
+        store: None,
     })
 }
 
@@ -117,7 +116,7 @@ fn print_watch_report(r: &watcher::WatchReport, out: &mut CliOutput<'_>) -> Resu
         write!(
             out.stdout,
             "  host={} changed={}",
-            o.host.as_str(),
+            o.host.as_label(),
             o.changed
         )?;
         if let Some(e) = &o.error {
@@ -167,9 +166,25 @@ pub async fn run(
 
     let cfg = build_config(args, cli_agent_id)?;
 
+    // #3587 U2 — fail closed on a Postgres store in the default (non-sal)
+    // build. Under `--features sal` the line-file (and transcript) path
+    // writes through `recover_turn_idempotent` so U6 can target the f1 hive.
+    #[cfg(not(feature = "sal"))]
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "watch", out)?;
+    #[cfg(feature = "sal")]
+    let db_path = db_path.to_path_buf();
+    #[cfg(feature = "sal")]
+    {
+        if let Some(url) = crate::store_url::resolve_store_url(None)?
+            && crate::store_url::is_postgres_url(&url)
+        {
+            return run_via_store(url, args, cfg, out).await;
+        }
+    }
+
     if args.once {
-        let mut states = std::collections::HashMap::new();
-        let outcomes = watcher::poll_once(db_path, &cfg, &mut states);
+        let mut states = WatchPollState::default();
+        let outcomes = watcher::poll_once(&db_path, &cfg, &mut states);
         let mut report = watcher::WatchReport::default();
         report.absorb_tick(outcomes);
         if args.json {
@@ -216,7 +231,68 @@ pub async fn run(
         shutdown_for_signal.notify_one();
     });
 
-    run_watch_daemon_with_primitives(db_path.to_path_buf(), cfg, shutdown).await
+    run_watch_daemon_with_primitives(db_path, cfg, shutdown).await
+}
+
+/// Postgres store-URL path under `--features sal`: line-file (and
+/// transcript) writes go through `MemoryStore::recover_turn_idempotent`.
+#[cfg(feature = "sal")]
+async fn run_via_store(
+    url: String,
+    args: &WatchArgs,
+    mut cfg: WatchConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let store = crate::migrate::open_store(&url).await?;
+    cfg.store = Some(std::sync::Arc::from(store));
+    if args.once {
+        // `poll_once` is sync and, with `cfg.store` set, drives
+        // `Handle::block_on` for `recover_turn_idempotent`. Calling that
+        // from this async frame panics (CONCURRENCY-20 / tokio: cannot
+        // block the runtime worker). The daemon arm already uses
+        // `spawn_blocking`; `--once` must too.
+        let outcomes = tokio::task::spawn_blocking(move || {
+            let mut states = WatchPollState::default();
+            watcher::poll_once(std::path::Path::new(""), &cfg, &mut states)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("watch --once join: {e}"))?;
+        let mut report = watcher::WatchReport::default();
+        report.absorb_tick(outcomes);
+        if args.json {
+            writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+        } else {
+            print_watch_report(&report, out)?;
+        }
+        return Ok(());
+    }
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_signal = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate()).ok();
+            let term_fut = async {
+                match term.as_mut() {
+                    Some(t) => {
+                        t.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                () = term_fut => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        shutdown_for_signal.notify_one();
+    });
+    run_watch_daemon_with_primitives(std::path::PathBuf::from(""), cfg, shutdown).await
 }
 
 /// `Command::Watch` dispatch entry (invoked from
@@ -289,6 +365,7 @@ async fn run_watch_daemon_with_primitives(
 mod tests {
     use super::*;
     use crate::cli::test_utils::TestEnv;
+    use crate::recover::HostKind;
 
     fn default_args() -> WatchArgs {
         WatchArgs {
@@ -385,6 +462,8 @@ mod tests {
         assert!(parse_host("claude-code").is_ok());
         assert!(parse_host("codex").is_ok());
         assert!(parse_host("gemini").is_ok());
+        assert!(parse_host("file:/tmp/outbox.log").is_ok());
+        assert!(parse_host("file:").is_err());
     }
 
     /// `dispatch --once` routes through the stdout-locking (non-sink)
@@ -413,7 +492,7 @@ mod tests {
         rr.errors = vec!["parse failed: bad json".to_string()];
         let mut report = watcher::WatchReport::default();
         report.absorb_tick(vec![watcher::HostTickOutcome {
-            host: HostKind::ClaudeCode,
+            host: HostKind::ClaudeCode.into(),
             changed: true,
             recover_report: Some(rr),
             error: None,
@@ -453,11 +532,14 @@ mod tests {
         let db = env.db_path.clone();
         let cfg = WatchConfig {
             hosts: Vec::new(),
+            line_files: Vec::new(),
             poll_interval: watcher::clamp_poll_interval(1),
             agent_id: "ai:test:watch".to_string(),
             namespace: Some("test-watch".to_string()),
             limit: watcher::DEFAULT_WATCH_LIMIT,
             dry_run: false,
+            #[cfg(feature = "sal")]
+            store: None,
         };
         let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         shutdown.notify_one();

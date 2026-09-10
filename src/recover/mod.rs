@@ -34,6 +34,8 @@ pub mod transcript_paths;
 // v1.0.0 #1978 — L3 substrate watcher: std-only poll-based filesystem
 // capture daemon feeding this module's `recover_from_transcript` pipeline.
 pub mod watcher;
+// v1.0.0 #3587 U2 — line-file watch source (`--host file:<path>`).
+pub mod line_file;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -41,6 +43,7 @@ use std::time::Instant;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
+pub use line_file::{FILE_HOST_KIND, SWARM_LINE_TAGS, WatchSource};
 pub use transcript_paths::{HostKind, resolve_transcript};
 
 /// Tag stamped on every memory L2-recovered from a host transcript

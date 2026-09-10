@@ -71,6 +71,12 @@ src/cli/stop.rs:AI_OPERATOR
 # ctx keys the covenant clause-1 substrate why_trace stamp, matching the
 # direct-sqlite path's substrate_authored=true.
 src/recover/mod.rs:opts.agent_id
+# #3587 U2 — L3 line-file ingest (`ingest_line_file_store`): the watch CLI
+# SAL twin of recover_from_transcript_store. Operator-owned line files
+# (outbox/inbox), never a tenant-facing handler; bypass keys the covenant
+# why_trace stamp so sqlite (`substrate_authored=true`) and postgres agree
+# under AI_MEMORY_REQUIRE_WHY_TRACE=1.
+src/recover/line_file.rs:cfg_agent_id
 # #3498 follow-up — read-only anchor admission probes. The binding #944/#941
 # decision requires inspecting the row before applying the handler's gate:
 # timeline hides inaccessible substrate anchors but returns 403 for ordinary
