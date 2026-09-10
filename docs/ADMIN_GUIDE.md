@@ -836,11 +836,11 @@ body):
 
 | Surface | Endpoint / tool |
 |---|---|
-| HTTP | `GET /api/v1/pending` (list), `POST /api/v1/approvals/{pending_id}` (decide — body `{"decision":"approve\|deny","remember":"once\|session\|forever"}`), plus the per-id `POST /api/v1/pending/{id}/approve` / `…/reject` pair |
+| HTTP | `GET /api/v1/pending` (list), `POST /api/v1/approvals/{pending_id}` (decide — body `{"decision":"approve\|deny","remember":"once\|session"}`; `remember='forever'` is refused), plus the per-id `POST /api/v1/pending/{id}/approve` / `…/reject` pair |
 | SSE | `GET /api/v1/approvals/stream` (live `approval_requested` / `approval_decided` events for human-in-the-loop UIs) |
 | MCP | `memory_pending_list`, `memory_pending_approve(id)`, `memory_pending_reject(id)` (the v0.7-alpha draft names `memory_approval_pending` / `memory_approval_decide` did not ship) |
 
-Set `remember: "forever"` on a decide call to enable **progressive trust** — subsequent identical requests auto-approve. Use sparingly; an over-eager `remember=forever` on a sensitive rule effectively turns enforcement off for that request shape.
+Set `remember: "session"` on a decide call to remember the decision **for this process** (a synthetic rule in memory, lost on restart). `remember: "forever"` is refused: it cannot be honoured durably on the GA line (durable store is #3580).
 
 **G1 inheritance fix (behavior change for pre-v0.6.3.1 v0.6.x users):** `resolve_governance_policy(namespace)` now walks the full namespace chain and honors the first non-null policy encountered, instead of stopping at the leaf. A parent `Approve` policy now blocks child writes that previously slipped through. To preserve pre-v0.6.3.1 behavior on a specific child, set `inherit = false` on its policy. See [MIGRATION § G1 inheritance fix](MIGRATION_v0.7.html#g1-inheritance-fix-behavior-change) for the worked example.
 

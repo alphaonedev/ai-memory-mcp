@@ -2,76 +2,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::needless_update)]
-// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(clippy::redundant_closure_for_method_calls)]
-//! v0.7.0 K10 — `remember=forever` writes a synthetic permission rule.
+//! #3394 — `remember='forever'` is a false success and is refused.
 //!
-//! The K10 contract: any of the three transports (HTTP, SSE-driven,
-//! MCP) accepting `remember=forever` MUST register a
-//! [`SyntheticPermissionRule`] in the process-wide registry so K9's
-//! permission resolver auto-decides the same `(action_type,
-//! namespace, agent_id)` tuple next time without re-asking.
+//! The K10 registry is process-local (`SYNTHETIC_RULES`). Advertising
+//! `forever` as durable was a lie (lost on every MCP stdio exit; never
+//! consulted by `enforce_governance`). GA truthfulness:
 //!
-//! Until K9's resolver lands on the same branch, the registry's
-//! consumer-facing surface is `approvals::list_synthetic_rules` —
-//! we assert against that.
+//! - `forever` → refused, pending row untouched, no synthetic rule.
+//! - `session` → accepted, synthetic rule recorded for this process.
+//!
+//! Durable persistence is #3580 (v1.1.0).
 
-// `await_holding_lock` lints fire on `std::sync::Mutex` — but the
-// lock is purely a test-serialisation primitive (the registry
-// mutation that follows is itself thread-safe), so the lint is a
-// false positive in this context. We allow it at the file level
-// instead of at every test fn.
 #![allow(clippy::await_holding_lock)]
 
-use ai_memory::approvals::{
-    Decision, Remember, SyntheticPermissionRule, clear_synthetic_rules_for_test,
-    list_synthetic_rules, record_synthetic_rule,
-};
+use ai_memory::approvals::{clear_synthetic_rules_for_test, list_synthetic_rules};
 use ai_memory::models::ConfidenceSource;
 use serde_json::json;
 use std::sync::Mutex;
 
-// TEST-2 (med/low review batch) — module-scoped mutex rationale.
-// The tests in this file mutate the process-global synthetic-rule
-// registry (`record_synthetic_rule` / `clear_synthetic_rules_for_test`
-// in `ai_memory::approvals`). Without serialisation two tests can
-// interleave their `clear` + `record` calls and observe each other's
-// state, producing spurious assertion failures under `cargo test`'s
-// default thread-pool parallelism. See `tests/dispatch_integration.rs`
-// and `tests/security_admin_wildcard_980.rs` for the established
-// idiom this lock follows.
 static REMEMBER_LOCK: Mutex<()> = Mutex::new(());
 
-#[test]
-fn forever_rule_round_trips_through_registry() {
-    let _g = REMEMBER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    clear_synthetic_rules_for_test();
-    let rule = SyntheticPermissionRule {
-        action_type: "store".into(),
-        namespace: "scratch".into(),
-        agent_id: Some("alice".into()),
-        decision: "approve".into(),
-        recorded_at: "2026-05-05T00:00:00Z".into(),
-    };
-    record_synthetic_rule(rule.clone());
-    let snap = list_synthetic_rules();
-    assert!(snap.contains(&rule), "rule absent: {snap:?}");
-}
-
-#[tokio::test]
-async fn mcp_pending_approve_with_forever_records_rule() {
-    let _g = REMEMBER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    clear_synthetic_rules_for_test();
-
+fn seed_delete_pending(namespace: &str, requested_by: &str) -> (rusqlite::Connection, String) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
-    // Seed a real memory + delete-pending row so `execute_pending_action`
-    // takes the delete branch (which only needs `memory_id`, no full
-    // Memory payload to forge).
     let mem = ai_memory::models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier: ai_memory::models::Tier::Long,
-        namespace: "ns-forever".into(),
-        title: "k10-forever".into(),
+        namespace: namespace.into(),
+        title: "k10-3394".into(),
         content: "x".into(),
         tags: vec![],
         priority: 5,
@@ -97,84 +55,103 @@ async fn mcp_pending_approve_with_forever_records_rule() {
         ..ai_memory::models::Memory::default()
     };
     let mem_id = ai_memory::db::insert(&conn, &mem).expect("insert memory");
-    let payload = json!({"reason": "k10-forever"});
+    let payload = json!({"reason": "k10-3394"});
     let pending_id = ai_memory::db::queue_pending_action(
         &conn,
         ai_memory::models::GovernedAction::Delete,
-        "ns-forever",
+        namespace,
         Some(&mem_id),
-        "alice",
+        requested_by,
         &payload,
     )
     .expect("queue_pending_action");
+    (conn, pending_id)
+}
+
+#[tokio::test]
+async fn mcp_pending_approve_forever_is_refused_nothing_recorded_3394() {
+    let _g = REMEMBER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_synthetic_rules_for_test();
+    let (conn, pending_id) = seed_delete_pending("ns-forever", "alice");
 
     let args = json!({
         "id": pending_id,
         "agent_id": "operator-1",
         "remember": "forever",
     });
+    let err = ai_memory::mcp::handle_pending_approve(&conn, &args, None)
+        .expect_err("forever must refuse");
+    assert_eq!(err, ai_memory::errors::msg::REMEMBER_FOREVER_UNHONOURABLE);
+
+    let row = ai_memory::db::get_pending_action(&conn, &pending_id)
+        .expect("read")
+        .expect("row present");
+    assert_eq!(row.status, "pending", "refused forever must not decide");
+    assert!(row.decided_by.is_none(), "no decider may be recorded");
+    assert!(
+        list_synthetic_rules().is_empty(),
+        "no synthetic rule on a refused forever"
+    );
+}
+
+#[tokio::test]
+async fn mcp_pending_reject_forever_is_refused_nothing_recorded_3394() {
+    let _g = REMEMBER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_synthetic_rules_for_test();
+    let (conn, pending_id) = seed_delete_pending("ns-deny", "bob");
+
+    let args = json!({
+        "id": pending_id,
+        "agent_id": "operator-1",
+        "remember": "forever",
+    });
+    let err =
+        ai_memory::mcp::handle_pending_reject(&conn, &args, None).expect_err("forever must refuse");
+    assert_eq!(err, ai_memory::errors::msg::REMEMBER_FOREVER_UNHONOURABLE);
+
+    let row = ai_memory::db::get_pending_action(&conn, &pending_id)
+        .expect("read")
+        .expect("row present");
+    assert_eq!(row.status, "pending", "refused forever must not decide");
+    assert!(
+        list_synthetic_rules().is_empty(),
+        "no synthetic deny rule on a refused forever"
+    );
+}
+
+#[tokio::test]
+async fn mcp_pending_approve_session_records_rule_3394() {
+    let _g = REMEMBER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_synthetic_rules_for_test();
+    let (conn, pending_id) = seed_delete_pending("ns-session", "alice");
+
+    let args = json!({
+        "id": pending_id,
+        "agent_id": "operator-1",
+        "remember": "session",
+    });
     let resp = ai_memory::mcp::handle_pending_approve(&conn, &args, None)
-        .expect("memory_pending_approve handler");
+        .expect("session remember must work");
     assert_eq!(resp["approved"], json!(true), "approve failed: {resp}");
-    assert_eq!(resp["remember"], json!("forever"));
+    assert_eq!(resp["remember"], json!("session"));
 
     let snap = list_synthetic_rules();
     let found = snap.iter().any(|r| {
         r.action_type == "delete"
-            && r.namespace == "ns-forever"
+            && r.namespace == "ns-session"
             && r.agent_id.as_deref() == Some("alice")
             && r.decision == "approve"
     });
     assert!(
         found,
-        "forever rule not recorded after MCP approve; snap={snap:?}"
+        "session rule not recorded after MCP approve; snap={snap:?}"
     );
-}
-
-#[tokio::test]
-async fn mcp_pending_reject_with_forever_records_deny_rule() {
-    let _g = REMEMBER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    clear_synthetic_rules_for_test();
-
-    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
-    let payload = json!({"title": "k10-deny", "content": "x", "namespace": "ns-deny"});
-    let pending_id = ai_memory::db::queue_pending_action(
-        &conn,
-        ai_memory::models::GovernedAction::Delete,
-        "ns-deny",
-        None,
-        "bob",
-        &payload,
-    )
-    .expect("queue_pending_action");
-
-    let args = json!({
-        "id": pending_id,
-        "agent_id": "operator-1",
-        "remember": "forever",
-    });
-    let resp = ai_memory::mcp::handle_pending_reject(&conn, &args, None)
-        .expect("memory_pending_reject handler");
-    assert_eq!(resp["rejected"], json!(true), "reject failed: {resp}");
-    assert_eq!(resp["remember"], json!("forever"));
-
-    let snap = list_synthetic_rules();
-    let found = snap.iter().any(|r| {
-        r.action_type == "delete"
-            && r.namespace == "ns-deny"
-            && r.agent_id.as_deref() == Some("bob")
-            && r.decision == "deny"
-    });
-    assert!(found, "deny rule not recorded; snap={snap:?}");
 }
 
 #[test]
 fn remember_once_does_not_record_a_rule() {
     let _g = REMEMBER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     clear_synthetic_rules_for_test();
-
-    // Sanity: just constructing decisions doesn't alter the registry.
-    let _ = (Decision::Approve, Remember::Once);
     let snap = list_synthetic_rules();
     assert!(snap.is_empty(), "registry should start empty: {snap:?}");
 }

@@ -72,7 +72,7 @@ pub struct PendingApproveRequest {
     /// Pending action id.
     pub id: String,
 
-    /// K10 persistence horizon.
+    /// once|session (this process). forever refused (#3394).
     #[serde(default)]
     pub remember: Option<String>,
 
@@ -98,10 +98,10 @@ impl McpTool for PendingApproveTool {
         crate::mcp::registry::tool_names::MEMORY_PENDING_APPROVE
     }
     fn description() -> &'static str {
-        "Approve a pending action; `remember` auto-decides next time."
+        "Approve a pending action."
     }
     fn docs() -> &'static str {
-        "Task 1.9 approve. decided_by = caller. K10: remember (once|session|forever) writes a synthetic permit rule."
+        "Task 1.9 approve. decided_by = caller. remember once|session (this process); forever refused (#3394)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<PendingApproveRequest>()
@@ -118,7 +118,7 @@ pub struct PendingRejectRequest {
     /// Pending action id.
     pub id: String,
 
-    /// K10 persistence horizon.
+    /// once|session (this process). forever refused (#3394).
     #[serde(default)]
     pub remember: Option<String>,
 
@@ -137,10 +137,10 @@ impl McpTool for PendingRejectTool {
         crate::mcp::registry::tool_names::MEMORY_PENDING_REJECT
     }
     fn description() -> &'static str {
-        "Reject a pending action; `remember` auto-decides next time."
+        "Reject a pending action."
     }
     fn docs() -> &'static str {
-        "Task 1.9 reject. decided_by = caller. K10: remember writes a synthetic deny rule."
+        "Task 1.9 reject. decided_by = caller. remember once|session (this process); forever refused (#3394)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<PendingRejectRequest>()
@@ -260,13 +260,11 @@ pub(super) fn handle_pending_list(
 
 /// v0.7 K10 — parse the optional `remember` MCP param.
 ///
-/// Defaults to `Once` when absent or invalid (the K10 contract is
-/// best-effort: a typoed `remember` value MUST NOT block the underlying
-/// approve/reject path). Validation drift is logged at WARN so
-/// operators can see the regression without it surfacing as a
-/// caller-facing error.
-fn parse_remember_param(params: &Value) -> crate::approvals::Remember {
-    match params["remember"].as_str() {
+/// Defaults to `Once` when absent or an unknown value (a typo must
+/// not block the underlying approve/reject). `forever` is refused
+/// (#3394) because it cannot be honoured durably.
+fn parse_remember_param(params: &Value) -> Result<crate::approvals::Remember, String> {
+    let parsed = match params["remember"].as_str() {
         Some("session") => crate::approvals::Remember::Session,
         Some("forever") => crate::approvals::Remember::Forever,
         Some("once") | None => crate::approvals::Remember::Once,
@@ -276,7 +274,8 @@ fn parse_remember_param(params: &Value) -> crate::approvals::Remember {
             );
             crate::approvals::Remember::Once
         }
-    }
+    };
+    crate::approvals::honourable_remember(parsed).map_err(str::to_string)
 }
 
 /// R40 (#1957) — parse the optional `approvals` array of human-key approver
@@ -326,10 +325,8 @@ fn record_mcp_decision(
         namespace: evt_namespace,
         requested_by: evt_requested_by,
     });
-    if matches!(
-        remember,
-        crate::approvals::Remember::Forever | crate::approvals::Remember::Session
-    ) && let Some(snap) = pa
+    if matches!(remember, crate::approvals::Remember::Session)
+        && let Some(snap) = pa
     {
         crate::approvals::record_synthetic_rule(crate::approvals::SyntheticPermissionRule {
             action_type: snap.action_type,
@@ -408,7 +405,7 @@ pub fn handle_pending_approve(
         );
         e.to_string()
     })?;
-    let remember = parse_remember_param(params);
+    let remember = parse_remember_param(params)?;
 
     // #913 + #2634 / CB-24 — admin governance audit. Pre-fix a
     // `record_decision("allow")` fired UNCONDITIONALLY here, BEFORE the
@@ -707,28 +704,29 @@ mod tests {
     // parse_remember_param: each of the four branches.
     #[test]
     fn parse_remember_param_returns_session() {
-        let r = super::parse_remember_param(&json!({"remember": "session"}));
+        let r = super::parse_remember_param(&json!({"remember": "session"})).expect("session");
         assert!(matches!(r, crate::approvals::Remember::Session));
     }
     #[test]
-    fn parse_remember_param_returns_forever() {
-        let r = super::parse_remember_param(&json!({"remember": "forever"}));
-        assert!(matches!(r, crate::approvals::Remember::Forever));
+    fn parse_remember_param_refuses_forever_3394() {
+        let err =
+            super::parse_remember_param(&json!({"remember": "forever"})).expect_err("forever");
+        assert_eq!(err, crate::errors::msg::REMEMBER_FOREVER_UNHONOURABLE);
     }
     #[test]
     fn parse_remember_param_returns_once_when_explicit() {
-        let r = super::parse_remember_param(&json!({"remember": "once"}));
+        let r = super::parse_remember_param(&json!({"remember": "once"})).expect("once");
         assert!(matches!(r, crate::approvals::Remember::Once));
     }
     #[test]
     fn parse_remember_param_returns_once_when_absent() {
-        let r = super::parse_remember_param(&json!({}));
+        let r = super::parse_remember_param(&json!({})).expect("absent");
         assert!(matches!(r, crate::approvals::Remember::Once));
     }
     // Unknown value defaults to Once (with WARN log).
     #[test]
     fn parse_remember_param_unknown_defaults_to_once() {
-        let r = super::parse_remember_param(&json!({"remember": "weird-value"}));
+        let r = super::parse_remember_param(&json!({"remember": "weird-value"})).expect("typo");
         assert!(matches!(r, crate::approvals::Remember::Once));
     }
 
@@ -871,7 +869,7 @@ mod tests {
         let id = queue_pending_promote_unbound(&conn, "ai:tester");
         let result = handle_pending_approve(
             &conn,
-            &json!({"id": id, "agent_id": "ai:approver", "remember": "forever"}),
+            &json!({"id": id, "agent_id": "ai:approver", "remember": "session"}),
             None,
         );
         // Either Ok (memory_id was None, executed flag false) or Err with
@@ -879,7 +877,7 @@ mod tests {
         match result {
             Ok(resp) => {
                 assert_eq!(resp["approved"], true);
-                assert_eq!(resp["remember"].as_str(), Some("forever"));
+                assert_eq!(resp["remember"].as_str(), Some("session"));
             }
             Err(e) => assert!(!e.is_empty()),
         }
@@ -1178,7 +1176,7 @@ pub fn handle_pending_reject(
         );
         e.to_string()
     })?;
-    let remember = parse_remember_param(params);
+    let remember = parse_remember_param(params)?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     // Reject is the privileged-gate denial; mirror approve so both

@@ -1782,8 +1782,8 @@
       "name": "memory_pending_list"
     },
     {
-      "description": "Approve a pending action; `remember` auto-decides next time.",
-      "docs": "Task 1.9 approve. decided_by = caller. K10: remember (once|session|forever) writes a synthetic permit rule.",
+      "description": "Approve a pending action.",
+      "docs": "Task 1.9 approve. decided_by = caller. remember once|session (this process); forever refused (#3394).",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1792,7 +1792,7 @@
           },
           "remember": {
             "default": "once",
-            "description": "K10 persistence horizon.",
+            "description": "once|session (this process). forever refused (#3394).",
             "enum": [
               "once",
               "session",
@@ -1833,8 +1833,8 @@
       "name": "memory_pending_approve"
     },
     {
-      "description": "Reject a pending action; `remember` auto-decides next time.",
-      "docs": "Task 1.9 reject. decided_by = caller. K10: remember writes a synthetic deny rule.",
+      "description": "Reject a pending action.",
+      "docs": "Task 1.9 reject. decided_by = caller. remember once|session (this process); forever refused (#3394).",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1843,7 +1843,7 @@
           },
           "remember": {
             "default": "once",
-            "description": "K10 persistence horizon.",
+            "description": "once|session (this process). forever refused (#3394).",
             "enum": [
               "once",
               "session",

@@ -318,3 +318,81 @@ async fn http_approve_with_wrong_signature_returns_401() {
     );
     set_active_hooks_hmac_secret(None);
 }
+
+#[tokio::test]
+async fn http_approve_forever_is_refused_nothing_recorded_3394() {
+    let _g = K10_HTTP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_active_hooks_hmac_secret(Some("k10-test-secret".to_string()));
+    ai_memory::approvals::clear_synthetic_rules_for_test();
+    let (router, db) = build_router_with_db();
+    let pending_id = seed_pending_row_via_db(&db, "scratch-forever", "alice").await;
+
+    let body = json!({"decision": "approve", "remember": "forever"}).to_string();
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let sig = sign("k10-test-secret", &timestamp, &pending_id, &body);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/approvals/{pending_id}"))
+        .header("content-type", "application/json")
+        .header("x-ai-memory-timestamp", &timestamp)
+        .header("x-ai-memory-signature", sig)
+        .header("x-agent-id", "operator-1")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={v}");
+    assert_eq!(
+        v["error"],
+        json!(ai_memory::errors::msg::REMEMBER_FOREVER_UNHONOURABLE)
+    );
+
+    let lock = db.lock().await;
+    let row = ai_memory::db::get_pending_action(&lock.0, &pending_id)
+        .expect("read")
+        .expect("row present");
+    assert_eq!(row.status, "pending");
+    assert!(ai_memory::approvals::list_synthetic_rules().is_empty());
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn http_approve_session_records_rule_3394() {
+    let _g = K10_HTTP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_active_hooks_hmac_secret(Some("k10-test-secret".to_string()));
+    ai_memory::approvals::clear_synthetic_rules_for_test();
+    let (router, db) = build_router_with_db();
+    let pending_id = seed_pending_row_via_db(&db, "scratch-session", "alice").await;
+
+    let body = json!({"decision": "approve", "remember": "session"}).to_string();
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let sig = sign("k10-test-secret", &timestamp, &pending_id, &body);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/approvals/{pending_id}"))
+        .header("content-type", "application/json")
+        .header("x-ai-memory-timestamp", &timestamp)
+        .header("x-ai-memory-signature", sig)
+        .header("x-agent-id", "operator-1")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(status, StatusCode::OK, "body={v}");
+    assert_eq!(v["approved"], json!(true));
+    assert_eq!(v["remember"], json!("session"));
+    let snap = ai_memory::approvals::list_synthetic_rules();
+    assert!(
+        snap.iter().any(|r| r.namespace == "scratch-session"),
+        "session must record a synthetic rule; got {snap:?}"
+    );
+    set_active_hooks_hmac_secret(None);
+}

@@ -2716,7 +2716,7 @@
       "name": "memory_pending_list"
     },
     {
-      "description": "Approve a pending action",
+      "description": "Approve a pending action.",
       "inputSchema": {
         "definitions": {
           "ApproverSignatureArg": {
@@ -2768,7 +2768,7 @@
       "name": "memory_pending_approve"
     },
     {
-      "description": "Reject a pending action",
+      "description": "Reject a pending action.",
       "inputSchema": {
         "properties": {
           "agent_id": {

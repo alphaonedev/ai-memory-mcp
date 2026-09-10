@@ -184,6 +184,10 @@ pub mod msg {
     /// it themselves (enforced only under the multi-tenant opt-in).
     pub const SELF_APPROVAL_REFUSED: &str =
         "self-approval refused: the requester cannot approve their own Human-gated pending action";
+    /// #3394 — `remember='forever'` cannot be honoured durably (process-local
+    /// `SYNTHETIC_RULES` only; durable store is #3580). Shared by MCP
+    /// `memory_pending_approve`/`reject` and HTTP `POST /api/v1/approvals/{id}`.
+    pub const REMEMBER_FOREVER_UNHONOURABLE: &str = "remember='forever' cannot be honoured durably (process-local only; durable store is #3580). Use remember='session' for this process, or omit remember";
 
     // ---- ownership / identity ---------------------------------------------------
     pub const CALLER_NOT_SOURCE_MEMORY_OWNER: &str = "caller does not own this source memory";

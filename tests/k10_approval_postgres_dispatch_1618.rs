@@ -253,6 +253,74 @@ async fn deny_dispatches_to_sal_store_on_postgres_backend_1618() {
     set_active_hooks_hmac_secret(None);
 }
 
+#[tokio::test]
+async fn approve_forever_is_refused_on_postgres_backend_3394() {
+    let _g = K10_PG_DISPATCH_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
+    ai_memory::approvals::clear_synthetic_rules_for_test();
+    let (router, store_path) = build_disjoint_fake_pg_router();
+    let pending_id = seed_pending_row_in_store(&store_path, "alice");
+
+    let body = json!({"decision": "approve", "remember": "forever"}).to_string();
+    let resp = router
+        .clone()
+        .oneshot(signed_approval_request(&pending_id, &body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={v}");
+    assert_eq!(
+        v["error"],
+        json!(ai_memory::errors::msg::REMEMBER_FOREVER_UNHONOURABLE)
+    );
+
+    let conn = ai_memory::db::open(&store_path).expect("reopen store backing file");
+    let row = ai_memory::db::get_pending_action(&conn, &pending_id)
+        .expect("get_pending_action")
+        .expect("pending row exists in SAL store");
+    assert_eq!(row.status, "pending");
+    assert!(ai_memory::approvals::list_synthetic_rules().is_empty());
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn approve_session_records_rule_on_postgres_backend_3394() {
+    let _g = K10_PG_DISPATCH_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
+    ai_memory::approvals::clear_synthetic_rules_for_test();
+    let (router, store_path) = build_disjoint_fake_pg_router();
+    let pending_id = seed_pending_row_in_store(&store_path, "alice");
+
+    let body = json!({"decision": "approve", "remember": "session"}).to_string();
+    let resp = router
+        .clone()
+        .oneshot(signed_approval_request(&pending_id, &body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(status, StatusCode::OK, "body={v}");
+    assert_eq!(v["approved"], json!(true));
+    assert_eq!(v["remember"], json!("session"));
+    let snap = ai_memory::approvals::list_synthetic_rules();
+    assert!(
+        snap.iter().any(|r| r.namespace == "scratch"),
+        "session must record a synthetic rule on the postgres dispatch path; got {snap:?}"
+    );
+    set_active_hooks_hmac_secret(None);
+}
+
 /// Live postgres (skip-if-env-unset): a missing pending id surfaces
 /// `StoreError::NotFound` from `governance_approve_with_consensus` →
 /// 404 on the K10 wire. Pre-#1618 the request fell through to the
@@ -344,6 +412,102 @@ mod live_pg {
             resp.status(),
             StatusCode::NOT_FOUND,
             "#1618 — missing pending id on live postgres must be 404 (StoreError::NotFound), not the pre-fix scratch-sqlite 403"
+        );
+        set_active_hooks_hmac_secret(None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approvals_decide_forever_is_400_on_live_postgres_3394() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping approvals_decide_forever_is_400_on_live_postgres_3394");
+            return;
+        };
+        let _g = K10_PG_DISPATCH_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
+
+        let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let scratch =
+            ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
+        let db: Db = Arc::new(tokio::sync::Mutex::new((
+            scratch,
+            std::path::PathBuf::from(":memory:"),
+            ai_memory::config::ResolvedTtl::default(),
+            true,
+        )));
+        let app_state = AppState {
+            db,
+            embedder: Arc::new(None),
+            vector_index: Arc::new(tokio::sync::Mutex::new(None)),
+            federation: Arc::new(None),
+            tier_config: Arc::new(ai_memory::config::FeatureTier::Keyword.config()),
+            scoring: Arc::new(ai_memory::config::ResolvedScoring::default()),
+            profile: Arc::new(ai_memory::profile::Profile::core()),
+            mcp_config: Arc::new(None),
+            active_keypair: Arc::new(None),
+            family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+            storage_backend: StorageBackend::Postgres,
+            store,
+            llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
+            auto_tag_model: Arc::new(None),
+            llm_call_timeout: std::time::Duration::from_secs(30),
+            replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+            verify_require_nonce: false,
+            federation_nonce_cache: Arc::new(
+                ai_memory::identity::replay::FederationNonceCache::default(),
+            ),
+            autonomous_hooks: false,
+            auto_tag_queue: None,
+            atomise_queue: None,
+            recall_scope: Arc::new(None),
+            deferred_audit_queue: Arc::new(None),
+            admin_agent_ids: Arc::new(Vec::new()),
+            rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+            resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+                ai_memory::config::ResolvedModels::default(),
+            )),
+            runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+            max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+            enrolled_agent_keys: std::sync::Arc::new(
+                ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+            ),
+            http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+            enrolled_agent_keys: std::sync::Arc::new(
+                ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+            ),
+            identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        };
+        let router = ai_memory::build_router(api_key_state, app_state);
+
+        let bogus = uuid::Uuid::new_v4().to_string();
+        let body = json!({"decision": "approve", "remember": "forever"}).to_string();
+        let resp = router
+            .clone()
+            .oneshot(signed_approval_request(&bogus, &body))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "#3394 — forever must 400 on live postgres before NotFound; body={v}"
+        );
+        assert_eq!(
+            v["error"],
+            json!(ai_memory::errors::msg::REMEMBER_FOREVER_UNHONOURABLE)
         );
         set_active_hooks_hmac_secret(None);
     }
