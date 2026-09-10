@@ -2506,6 +2506,22 @@ fn tx_commit_failed(err: impl std::fmt::Display) -> String {
     format!("TX_COMMIT_FAILED: {err}")
 }
 
+/// v1.0.0 #3587 U4 — the `<CODE>: <source>` shape shared by the L4 capture
+/// and L2 recovery idempotent writers. The code strings are `const`s below
+/// and the separator lives here ONCE (pm-v3.1 hardcoded-literal gate: no
+/// `"<CODE>: {e}"` literal repeats across the three write funnels).
+fn idempotent_err(code: &str, err: impl std::fmt::Display) -> String {
+    format!("{code}: {err}")
+}
+
+/// String-stable idempotent-writer error codes (see the `# Errors` section
+/// of [`capture_turn_idempotent`]).
+const ERR_TX_BEGIN: &str = "TX_BEGIN_FAILED";
+const ERR_DEDUP_QUERY: &str = "DEDUP_QUERY_FAILED";
+const ERR_MEMORY_INSERT: &str = "MEMORY_INSERT_FAILED";
+const ERR_DEDUP_INSERT: &str = "DEDUP_INSERT_FAILED";
+const ERR_DEDUP_BUILD: &str = "DEDUP_BUILD_FAILED";
+
 /// v0.7.0 #1416 / RFC-0001 — sqlite SSOT for the L4 layered-capture
 /// idempotent write. Both the MCP `memory_capture_turn` handler (which
 /// holds a raw `&rusqlite::Connection`) and `SqliteStore::
@@ -2564,7 +2580,7 @@ pub fn capture_turn_idempotent(
             )
             .optional()
         })
-        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
 
     if let Some(memory_id) = existing {
         return Ok(crate::models::CaptureTurnResult {
@@ -2574,7 +2590,7 @@ pub fn capture_turn_idempotent(
     }
 
     let write_txn =
-        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+        connection::WriteTxn::begin(conn).map_err(|e| idempotent_err(ERR_TX_BEGIN, e))?;
 
     // #3231 — in-tx re-probe. BEGIN IMMEDIATE serializes writers, so a
     // racing first-capture that committed while we waited is now visible.
@@ -2595,7 +2611,7 @@ pub fn capture_turn_idempotent(
             )
             .optional()
         })
-        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
     if let Some(memory_id) = existing_in_tx {
         write_txn.commit().map_err(tx_commit_failed)?;
         return Ok(crate::models::CaptureTurnResult {
@@ -2617,7 +2633,7 @@ pub fn capture_turn_idempotent(
             stamp_substrate_why_trace(&mut captured.metadata);
         }
         let inserted_id =
-            insert(conn, &captured).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &captured).map_err(|e| idempotent_err(ERR_MEMORY_INSERT, e))?;
 
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
@@ -2635,7 +2651,7 @@ pub fn capture_turn_idempotent(
                 write.recovered_at_ms,
             ])
         })
-        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
 
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
@@ -2698,7 +2714,7 @@ where
     use rusqlite::OptionalExtension;
 
     let write_txn =
-        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+        connection::WriteTxn::begin(conn).map_err(|e| idempotent_err(ERR_TX_BEGIN, e))?;
 
     // Guard 1 — same session + byte-identical stored content is the same
     // turn re-delivered. The join is scoped by `host_session_id`, so the
@@ -2717,7 +2733,7 @@ where
             stmt.query_row(params![host_session_id, content], |row| row.get(0))
                 .optional()
         })
-        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
     if let Some(memory_id) = existing {
         write_txn.commit().map_err(tx_commit_failed)?;
         return Ok(crate::models::CaptureTurnResult {
@@ -2733,9 +2749,9 @@ where
              WHERE host_session_id IS NOT NULL AND host_session_id = ?1",
         )
         .and_then(|mut stmt| stmt.query_row(params![host_session_id], |row| row.get(0)))
-        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
 
-    let write = build(next_index).map_err(|e| format!("DEDUP_BUILD_FAILED: {e}"))?;
+    let write = build(next_index).map_err(|e| idempotent_err(ERR_DEDUP_BUILD, e))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
         let mut captured = write.memory.clone();
@@ -2743,7 +2759,7 @@ where
             stamp_substrate_why_trace(&mut captured.metadata);
         }
         let inserted_id =
-            insert(conn, &captured).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &captured).map_err(|e| idempotent_err(ERR_MEMORY_INSERT, e))?;
 
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
@@ -2761,7 +2777,7 @@ where
                 write.recovered_at_ms,
             ])
         })
-        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
 
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
@@ -2858,7 +2874,7 @@ pub fn recover_turn_idempotent(
     }
 
     let write_txn =
-        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+        connection::WriteTxn::begin(conn).map_err(|e| idempotent_err(ERR_TX_BEGIN, e))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — stamp the
@@ -2869,7 +2885,7 @@ pub fn recover_turn_idempotent(
             stamp_substrate_why_trace(&mut recovered.metadata);
         }
         let inserted_id =
-            insert(conn, &recovered).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &recovered).map_err(|e| idempotent_err(ERR_MEMORY_INSERT, e))?;
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
              (sha256, memory_id, host_kind, transcript_path, \
@@ -2887,7 +2903,7 @@ pub fn recover_turn_idempotent(
                 write.recovered_at_ms,
             ])
         })
-        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
         Ok(inserted_id)
     })();
 

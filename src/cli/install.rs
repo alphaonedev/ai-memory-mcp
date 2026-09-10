@@ -1645,6 +1645,15 @@ mod tests {
     use crate::cli::test_utils::TestEnv;
     use std::fs;
 
+    /// #3587 U4 — the shipped `run` gained a `cli_agent_id` argument (the
+    /// capture hook embeds `--agent-id`). The in-file tests exercise
+    /// non-agent surfaces, so they call through this 2-arg shim; a LOCAL
+    /// `run` shadows the `use super::*` glob, leaving every existing call
+    /// site unchanged (and `run`'s shipped 3-arg arity intact).
+    fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
+        super::run(args, None, out)
+    }
+
     fn args_for(target: Target, config: PathBuf) -> InstallArgs {
         let t = TargetArgs {
             config: Some(config),

@@ -51,6 +51,13 @@ pub const HOST_TURN_INDEX_AUTO: &str = "auto";
 pub const HOOK_EVENT_STOP: &str = "Stop";
 pub const HOST_KIND_CLAUDE_CODE: &str = "claude-code";
 
+/// Canonical `memory_capture_turn` param keys, single-sourced so the CLI
+/// flag merge, the required-field check, and the Stop-payload mapper
+/// cannot drift from one another (pm-v3.1 hardcoded-literal gate).
+const PARAM_HOST_SESSION_ID: &str = "host_session_id";
+const PARAM_HOST_TURN_INDEX: &str = "host_turn_index";
+const PARAM_SESSION_ID: &str = "session_id";
+
 /// CLI args for `ai-memory capture-turn`.
 #[derive(Args, Debug, Clone)]
 pub struct CaptureTurnArgs {
@@ -150,8 +157,20 @@ fn run_capture_turn(
 
     // Map the Claude Code Stop payload (if that's what arrived) to the
     // canonical capture params. `None` => use the raw body/flags.
+    let is_stop_payload = payload
+        .as_ref()
+        .and_then(|p| p.get("hook_event_name"))
+        .and_then(Value::as_str)
+        == Some(HOOK_EVENT_STOP);
     let hook_params = payload.as_ref().and_then(map_stop_payload);
-    let body = payload.as_ref().filter(|_| hook_params.is_none());
+    // A Stop-shaped payload is NEVER reinterpreted as a raw
+    // `memory_capture_turn` body: when the mapping declines (absent/null
+    // `last_assistant_message`, or no `session_id`) it is a no-op below.
+    let body = if hook_params.is_none() && !is_stop_payload {
+        payload.as_ref()
+    } else {
+        None
+    };
 
     // Merge precedence: explicit flags > Stop-payload mapping > body.
     let base = hook_params.as_ref().or(body).cloned();
@@ -159,13 +178,8 @@ fn run_capture_turn(
         Some(v) => v,
         None => {
             // Stop payload with a null/absent `last_assistant_message`
-            // is an explicit no-op, not a refusal.
-            if payload
-                .as_ref()
-                .and_then(|p| p.get("hook_event_name"))
-                .and_then(Value::as_str)
-                == Some(HOOK_EVENT_STOP)
-            {
+            // (or no session id) is an explicit no-op, not a refusal.
+            if is_stop_payload {
                 return Ok(());
             }
             bail!(
@@ -180,7 +194,7 @@ fn run_capture_turn(
     let mut params = obj.clone();
 
     if let Some(v) = &args.host_session_id {
-        params.insert("host_session_id".to_string(), json!(v));
+        params.insert(PARAM_HOST_SESSION_ID.to_string(), json!(v));
     }
     if let Some(v) = &args.role {
         params.insert("role".to_string(), json!(v));
@@ -206,11 +220,11 @@ fn run_capture_turn(
             let n: i64 = raw.parse().map_err(|_| {
                 anyhow!("INVALID_INPUT: --host-turn-index must be an integer or `auto`")
             })?;
-            params.insert("host_turn_index".to_string(), json!(n));
+            params.insert(PARAM_HOST_TURN_INDEX.to_string(), json!(n));
             false
         }
         None => {
-            if params.get("host_turn_index").is_some() {
+            if params.get(PARAM_HOST_TURN_INDEX).is_some() {
                 false
             } else {
                 true
@@ -220,11 +234,16 @@ fn run_capture_turn(
     if auto_index {
         // Placeholder only: the real index is derived in-transaction.
         // Kept a valid i64 so the request struct + gates parse uniformly.
-        params.insert("host_turn_index".to_string(), json!(0));
+        params.insert(PARAM_HOST_TURN_INDEX.to_string(), json!(0));
     }
 
     // Every required capture field must be present by now.
-    for required in ["host_session_id", "role", "content", "host_turn_index"] {
+    for required in [
+        PARAM_HOST_SESSION_ID,
+        "role",
+        "content",
+        PARAM_HOST_TURN_INDEX,
+    ] {
         if params.get(required).is_none() {
             bail!(
                 "INVALID_INPUT: missing `{required}` — supply it on stdin or via the CLI flag \
@@ -247,6 +266,13 @@ fn run_capture_turn(
 
     if json_out {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
+        return Ok(());
+    }
+    // Hook contract: `--quiet` is silent on success (a Claude Code `Stop`
+    // hook's stdout is host-visible; a per-turn status line would be
+    // context noise). Only the `--json` machine envelope is emitted under
+    // quiet, and only when the caller explicitly asked for it.
+    if args.quiet {
         return Ok(());
     }
 
@@ -272,12 +298,12 @@ fn map_stop_payload(payload: &Value) -> Option<Value> {
     if event != HOOK_EVENT_STOP {
         return None;
     }
-    let session = payload.get("session_id").and_then(Value::as_str)?;
+    let session = payload.get(PARAM_SESSION_ID).and_then(Value::as_str)?;
     let content = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)?;
     Some(json!({
-        "host_session_id": session,
+        (PARAM_HOST_SESSION_ID): session,
         "role": "assistant",
         "content": content,
         "host_kind": HOST_KIND_CLAUDE_CODE,

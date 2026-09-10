@@ -24,7 +24,7 @@
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tempfile::TempDir;
 
 const AGENT_ID: &str = "test-agent-3587";
