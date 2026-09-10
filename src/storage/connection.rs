@@ -882,6 +882,34 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// #3411 / #3434 — slug for a missing database on a read-only verb
+/// (`boot`, `doctor`). `Connection::open` would CREATE the file and
+/// [`open`] would then migrate it; these verbs are advertised
+/// read-only and must refuse instead.
+pub const MISSING_DATABASE_REFUSAL: &str =
+    "database does not exist; refusing to create (read-only)";
+
+/// Open an **existing** database read-only. A missing path is a
+/// typed refusal — never a create-and-migrate (the `boot` / `doctor`
+/// contract: ERRORS-01, the advertised "never mutates" clap docs).
+///
+/// # Errors
+///
+/// Returns [`MISSING_DATABASE_REFUSAL`] when `path` does not exist,
+/// plus every error [`open_read_only`] can produce.
+pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
+    match path.try_exists() {
+        Ok(false) => anyhow::bail!("{}: {}", MISSING_DATABASE_REFUSAL, path.display()),
+        Ok(true) => {}
+        Err(e) => anyhow::bail!("cannot stat {}: {e}", path.display()),
+    }
+    let conn = open_read_only(path)?;
+    // Diagnose schema-ahead / poisoned / zeroed WITHOUT migrating so
+    // boot/doctor keep the #2445/#2555/#2564 typed refusals.
+    assert_schema_not_ahead(&conn, &path.display().to_string())?;
+    Ok(conn)
+}
+
 /// Apply the defense-in-depth CHECK triggers from migration 0023.
 ///
 /// `CREATE TRIGGER IF NOT EXISTS` is idempotent — re-running is a
@@ -1051,6 +1079,32 @@ mod tests {
         assert_eq!(offset, Some(1_767_225_600_000_000));
         assert_eq!(null_value, None);
         assert_eq!(malformed, None);
+    }
+
+    #[test]
+    fn open_existing_read_only_refuses_missing_path_3411() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("no-such.db");
+        assert!(!missing.exists());
+        let err = open_existing_read_only(&missing).expect_err("missing path must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(MISSING_DATABASE_REFUSAL),
+            "refusal must name the read-only contract: {msg}"
+        );
+        assert!(!missing.exists(), "must not create the missing file");
+    }
+
+    #[test]
+    fn open_existing_read_only_opens_a_migrated_file_3411() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("exists.db");
+        drop(open(&path).expect("create"));
+        let reader = open_existing_read_only(&path).expect("open existing");
+        let query_only: i64 = reader
+            .pragma_query_value(None, "query_only", |row| row.get(0))
+            .expect("query_only");
+        assert_ne!(query_only, 0, "existing open must stay query_only");
     }
 
     #[test]

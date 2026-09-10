@@ -19,7 +19,10 @@
 //!
 //! impl TestEnv {
 //!     /// Allocate a fresh tempdir + DB path. Schema is NOT initialized;
-//!     /// production code paths (db::open) handle migrations idempotently.
+//!     /// write funnels (`db::open`) materialize it. Read-only verbs
+//!     /// (`boot`, `doctor`) refuse a missing file — call
+//!     /// [`materialize_empty_schema`] first when the test wants a
+//!     /// healthy empty store (#3411 / #3434).
 //!     pub fn fresh() -> Self;
 //!
 //!     /// Returns a `CliOutput` borrowing `self.stdout` / `self.stderr`
@@ -108,7 +111,9 @@ pub struct TestEnv {
 
 impl TestEnv {
     /// Allocate a fresh tempdir + DB path. The DB file is *not* created;
-    /// `db::open` will materialize it on first use.
+    /// `db::open` will materialize it on first use. Read-only verbs
+    /// (`boot`, `doctor`) refuse a missing file — use
+    /// [`materialize_empty_schema`] when the test needs an empty store.
     pub fn fresh() -> Self {
         // TEST-5 + TEST-6 — pin `AI_MEMORY_NO_CONFIG=1` for the test
         // process so `AppConfig::load()` never reads the developer's
@@ -152,6 +157,14 @@ impl TestEnv {
     pub fn stderr_str(&self) -> &str {
         std::str::from_utf8(&self.stderr).expect("stderr utf-8")
     }
+}
+
+/// Materialize an empty schema at `db_path` via the write funnel, then
+/// drop the connection. Read-only verbs (`boot`, `doctor`) refuse a
+/// missing `--db` (#3411 / #3434); tests that want a healthy empty
+/// store must create it here first.
+pub fn materialize_empty_schema(db_path: &Path) {
+    drop(db::open(db_path).expect("materialize empty schema"));
 }
 
 /// Insert one deterministic memory row directly via `db::insert`.

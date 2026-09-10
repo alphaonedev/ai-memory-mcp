@@ -919,6 +919,8 @@ pub use doctor::{
 pub use connection::open;
 // #1580 — read-only connection opener for the HTTP WAL read-pool.
 pub use connection::open_read_only;
+// #3411 / #3434 — missing-path refusal for advertised-read-only verbs.
+pub use connection::{MISSING_DATABASE_REFUSAL, open_existing_read_only};
 // v1.0.0 #2445 — the EGRESS + guard surface (see `schema_guard` module docs).
 pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stamp};
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time

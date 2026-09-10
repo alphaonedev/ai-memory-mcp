@@ -188,6 +188,24 @@ pub fn json_support(command: &Command) -> JsonSupport {
     }
 }
 
+/// Honour the global `--json` flag on a [`JsonSupport::Local`] verb
+/// whose own selector is `--format` (boot `--format json`,
+/// export-reflections `--format json`). #3411: clap accepts the global
+/// flag on every subcommand, and Local classification means the intent
+/// is honoured either way — silently keeping `--format`'s default
+/// while `--json` is set is the reports-success-doing-nothing class
+/// #3436 closed for Unsupported verbs.
+pub fn apply_global_json_to_format(
+    format: &mut String,
+    global_json: bool,
+    default: &str,
+    json_value: &str,
+) {
+    if global_json && format.eq_ignore_ascii_case(default) {
+        *format = json_value.to_string();
+    }
+}
+
 /// The refusal message for a subcommand with no JSON form.
 ///
 /// Deliberately does not try to name the verb: [`Command`] derives only
@@ -241,5 +259,21 @@ mod tests {
         assert!(msg.contains("--json"), "{msg}");
         assert!(msg.contains("REFUSED"), "{msg}");
         assert!(msg.contains("NOTHING WAS EXECUTED"), "{msg}");
+    }
+
+    #[test]
+    fn apply_global_json_overrides_default_format_3411() {
+        let mut format = "text".to_string();
+        apply_global_json_to_format(&mut format, true, "text", "json");
+        assert_eq!(format, "json");
+        let mut already = "toon".to_string();
+        apply_global_json_to_format(&mut already, true, "text", "json");
+        assert_eq!(already, "toon", "an explicit --format must win");
+        let mut md = "md".to_string();
+        apply_global_json_to_format(&mut md, true, "md", "json");
+        assert_eq!(md, "json");
+        let mut untouched = "text".to_string();
+        apply_global_json_to_format(&mut untouched, false, "text", "json");
+        assert_eq!(untouched, "text");
     }
 }

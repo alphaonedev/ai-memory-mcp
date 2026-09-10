@@ -305,7 +305,8 @@ enum BootStatus {
     /// First-run condition for greenfield checkouts. Not an error.
     InfoEmpty,
     /// Requested DB path does not exist or could not be opened. With
-    /// `--quiet` we still exit 0, but the header surfaces the warning so
+    /// `--quiet` stdout is empty (hooks); without it the header surfaces
+    /// the warning so
     /// the agent can say "I would have loaded context but couldn't" rather
     /// than silently appearing memory-less.
     WarnDbUnavailable,
@@ -580,19 +581,22 @@ pub fn run(
     let limit = args.limit.clamp(1, BOOT_PAYLOAD_LIST_CAP);
     let namespace = resolve_namespace(args);
 
-    // Open the DB. On failure, honor `--quiet` (exit 0 with empty stdout
-    // when `--no-header` is also set; otherwise emit a warning header so
-    // the agent always sees that boot ran, even on failure).
-    let conn = match db::open(db_path) {
+    // Open the DB read-only. A missing path is a refusal, never a
+    // create-and-migrate (#3411). On failure, honour `--quiet` as
+    // empty stdout (clap + module docs + CLI_REFERENCE): a hook that
+    // cannot load context must not inject a warn header into the
+    // agent's first turn.
+    let conn = match db::open_existing_read_only(db_path) {
         Ok(c) => c,
         Err(e) => {
-            if !args.quiet {
-                writeln!(
-                    out.stderr,
-                    "ai-memory boot: db unavailable at {}: {e}",
-                    db_path.display()
-                )?;
+            if args.quiet {
+                return Ok(());
             }
+            writeln!(
+                out.stderr,
+                "ai-memory boot: db unavailable at {}: {e}",
+                db_path.display()
+            )?;
             if !args.no_header {
                 // v1.0.0 #2445 — a schema-AHEAD refusal is reported as the
                 // schema-drift warn it actually is, NOT as "db unavailable".
@@ -1073,7 +1077,7 @@ fn emit_toon(out: &mut CliOutput<'_>, mems: &[ClusteredMemory], redact_titles: b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_utils::{TestEnv, seed_memory};
+    use crate::cli::test_utils::{TestEnv, materialize_empty_schema, seed_memory};
 
     // ---- #3348 — substrate namespaces on the `ai-memory boot` funnel -----
     //
@@ -1478,12 +1482,10 @@ mod tests {
     }
 
     #[test]
-    fn boot_quiet_with_unreachable_db_emits_warn_header_no_stderr() {
-        // The user-facing diagnostic header MUST appear so the agent (and
-        // a human looking at the agent log) sees that boot ran but
-        // couldn't load context. --quiet suppresses *only* stderr.
-        // PR-4: the warn variant still emits the manifest fields, with
-        // `<unavailable>` in slots that need a live DB to fill.
+    fn boot_quiet_with_unreachable_db_is_silent_3411() {
+        // Clap + module docs + CLI_REFERENCE: `--quiet` + missing DB
+        // exits 0 with empty stdout (a hook must not inject a warn
+        // header into the agent's first turn). #3411.
         let _g = test_lock();
         let mut env = TestEnv::fresh();
         let bad_path = env
@@ -1496,40 +1498,36 @@ mod tests {
         args.quiet = true;
         let mut out = env.output();
         run(&bad_path, &args, &cfg, &mut out).unwrap();
-        let stdout = std::str::from_utf8(&env.stdout).unwrap();
         assert!(
-            stdout.contains("# ai-memory boot: warn"),
-            "warn header should always appear under --quiet: {stdout}"
-        );
-        assert!(
-            stdout.contains("db unavailable"),
-            "header should explain the warning cause: {stdout}"
-        );
-        // What the warn variant CAN surface even without the DB.
-        assert!(
-            stdout.contains("#   version:"),
-            "warn manifest should still carry version: {stdout}"
-        );
-        assert!(
-            stdout.contains(env!("CARGO_PKG_VERSION")),
-            "warn manifest version should be CARGO_PKG_VERSION: {stdout}"
-        );
-        assert!(
-            stdout.contains("#   tier:"),
-            "warn manifest should still carry tier: {stdout}"
-        );
-        assert!(
-            stdout.contains("#   latency:"),
-            "warn manifest should still carry latency: {stdout}"
-        );
-        // Slots that need a live DB degrade to the sentinel.
-        assert!(
-            stdout.contains(UNAVAILABLE),
-            "warn manifest should mark unreachable fields as <unavailable>: {stdout}"
+            env.stdout.is_empty(),
+            "--quiet must yield empty stdout: {}",
+            String::from_utf8_lossy(&env.stdout)
         );
         assert!(
             env.stderr.is_empty(),
             "stderr should be silent under --quiet"
+        );
+    }
+
+    #[test]
+    fn boot_missing_file_in_existing_dir_is_not_created_3411() {
+        // The pre-fix funnel used `db::open` → `Connection::open`, which
+        // CREATES a missing file in an existing parent and then migrates
+        // it. A parent-missing path already failed; this is the path
+        // that lied about "read-only".
+        let _g = test_lock();
+        let mut env = TestEnv::fresh();
+        let missing = env.db_path.parent().unwrap().join("no-such-boot.db");
+        assert!(!missing.exists());
+        let cfg = default_config();
+        let args = default_args();
+        let mut out = env.output();
+        run(&missing, &args, &cfg, &mut out).unwrap();
+        assert!(!missing.exists(), "boot must not create a missing --db");
+        let stderr = std::str::from_utf8(&env.stderr).unwrap();
+        assert!(
+            stderr.contains(crate::db::MISSING_DATABASE_REFUSAL),
+            "refusal must name the read-only contract: {stderr}"
         );
     }
 
@@ -1611,6 +1609,7 @@ mod tests {
     fn boot_empty_namespace_emits_info_empty_status() {
         let _g = test_lock();
         let mut env = TestEnv::fresh();
+        materialize_empty_schema(&env.db_path);
         let db_path = env.db_path.clone();
         let cfg = default_config();
         let mut args = default_args();
@@ -1666,7 +1665,6 @@ mod tests {
         let cfg = default_config();
         let mut args = default_args();
         args.format = "json".to_string();
-        args.quiet = true;
         let mut out = env.output();
         run(&bad_path, &args, &cfg, &mut out).unwrap();
         let stdout = std::str::from_utf8(&env.stdout).unwrap();

@@ -689,10 +689,12 @@ These seven subcommands land in v0.6.3.1.
 ### `boot`
 
 Universal session-boot CLI primitive. Read-only, fast (no embedder, no
-daemon). Always emits a 5-field diagnostic manifest (version, db_path +
+daemon). A missing `--db` is refused — the file is never created or
+migrated (#3411). Always emits a 5-field diagnostic manifest (version, db_path +
 schema_version + memory count, tier with embedder/reranker/llm, latency,
 namespace + loaded count) so the agent and the human always see what
-loaded and why.
+loaded and why. Global `--json` is honoured as `--format json` when
+`--format` is left at its default.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
@@ -701,7 +703,7 @@ loaded and why.
 | `--budget-tokens` | int | `4096` | Optional context-budget cap (0 = unlimited). |
 | `--format` | enum | `text` | `text` / `json` / `toon`. |
 | `--no-header` | bool | `false` | Suppress the manifest header. NOT recommended for production hooks (silent failure becomes indistinguishable from "no memories yet"). |
-| `--quiet` | bool | `false` | Exit 0 silently when DB unavailable. |
+| `--quiet` | bool | `false` | Exit 0 with empty stdout when the DB is unavailable. |
 | `--cwd <PATH>` | path | `.` | Override the working-directory inference for auto-namespace. |
 
 `AI_MEMORY_BOOT_ENABLED=0` is the highest-precedence privacy opt-out
@@ -883,7 +885,10 @@ see the `*[advisory]*` rows in `PERFORMANCE.md`.
 **10-section** health dashboard (v0.7.x post-#1146/#1598): Storage /
 Index / Recall / Governance / Sync / Webhook / Capabilities /
 Reflection Health / **LLM Reachability (#1146)** / **Embeddings
-Reachability (#1598)**. Each section is severity-tagged.
+Reachability (#1598)**. Each section is severity-tagged. Read-only —
+never mutates the database. A missing `--db` is reported as Critical
+Storage and is never created (#3434). Identity reports the resolved
+caller id and whether a signing key for THAT id is enrolled.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
