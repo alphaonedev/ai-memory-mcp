@@ -334,11 +334,16 @@ fn mcp_notify_keeps_host_identity_ladder_and_validation_order_3579() {
 fn live_postgres_http_notify_retains_key_bound_caller_with_and_without_ambient_3579() {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .expect("own live PostgreSQL required; never skip");
-    assert_ne!(
-        reqwest::Url::parse(&url).expect("URL").path(),
-        "/ai_memory_test",
-        "never operator DB"
-    );
+    // Refuse the LIVE operator database (the certified twin on :5445 on both
+    // hosts). CI's ephemeral service database is also named `ai_memory_test`
+    // but listens on :5432, so key the guard on name AND port.
+    {
+        let parsed = reqwest::Url::parse(&url).expect("URL");
+        assert!(
+            !(parsed.path() == "/ai_memory_test" && parsed.port() == Some(5445)),
+            "never the live operator DB on :5445"
+        );
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

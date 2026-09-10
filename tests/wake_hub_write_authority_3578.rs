@@ -610,7 +610,13 @@ fn live_postgres_http_and_forwarded_mcp_write_authority_3578() {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .expect("own LIVE postgres required; never skip");
     let parsed = reqwest::Url::parse(&url).expect("postgres URL");
-    assert_ne!(parsed.path(), "/ai_memory_test", "never use operator DB");
+    // Refuse the LIVE operator database (the certified twin on :5445 on both
+    // hosts). CI's ephemeral service database is also named `ai_memory_test`
+    // but listens on :5432, so key the guard on name AND port.
+    assert!(
+        !(parsed.path() == "/ai_memory_test" && parsed.port() == Some(5445)),
+        "never the live operator DB on :5445"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
