@@ -194,13 +194,18 @@
 #         new call site is exactly what a reviewer should see.
 #
 #   * DOCUMENTED-EXEMPT cross-file fixtures -- `identity::test_key_dir`
-#     (`install` / `arm`) and `cli::test_utils::ensure_no_config_env`. Both
-#     write a FIXED, isolation-PRESERVING value (a per-process test key
-#     directory; `AI_MEMORY_NO_CONFIG=1`) and both are near-mandatory
-#     boilerplate on new tests. Counting them would make arm (e) fire on
-#     almost every added test -- the shape that gets a gate switched off
-#     within a week -- while catching nothing an operator would act on.
-#     They are named here so the exemption is a decision, not an oversight.
+#     (`install` / `arm` / `bind_key_dir_env`, #3584) and
+#     `cli::test_utils::ensure_no_config_env`. Both write a FIXED,
+#     isolation-PRESERVING value (a per-process test key directory, now
+#     also `AI_MEMORY_KEY_DIR` pointed at that sandbox so an ambient
+#     harness override cannot leak in; `AI_MEMORY_NO_CONFIG=1`) and both
+#     are near-mandatory boilerplate on new tests. Counting them would
+#     make arm (e) fire on almost every added test -- the shape that gets
+#     a gate switched off within a week -- while catching nothing an
+#     operator would act on. They are named here so the exemption is a
+#     decision, not an oversight. The helper file's OWN set_var lines
+#     still count in arm (d); only CALL SITES of install() are exempt
+#     from arm (e).
 #
 # Like arm (d) this is a per-file CENSUS RATCHET, against its OWN baseline
 # (scripts/qc-allowlists/test-env-helper-mutation-baseline.txt) so the
@@ -815,10 +820,11 @@ fn contrived_helper_routed_env_install() {
 EOF
 
     # Case 10 (arm (e) NEAR MISS): the documented-exempt isolation fixture.
-    # `test_key_dir::install()` writes a FIXED, isolation-PRESERVING value and
-    # is near-mandatory boilerplate on new tests, so counting it would fire on
-    # almost every added test. It must be SPARED -- a gate that flags this is
-    # over-widened and will be switched off.
+    # `test_key_dir::install()` writes a FIXED, isolation-PRESERVING value
+    # (the sandbox path, plus `AI_MEMORY_KEY_DIR` pointed at it — #3584)
+    # and is near-mandatory boilerplate on new tests, so counting it would
+    # fire on almost every added test. It must be SPARED -- a gate that
+    # flags this is over-widened and will be switched off.
     cat > "$probe_arm_e_exempt" <<'EOF'
 // CONTRIVED COMPLIANT FIXTURE for scripts/check-test-env-lock.sh
 // --self-test. Uses ONLY the documented-exempt isolation fixture; arm (e)

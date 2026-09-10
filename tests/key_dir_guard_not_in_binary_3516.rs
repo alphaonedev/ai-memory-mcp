@@ -21,8 +21,9 @@
 //!
 //! Leg 1 (the regression): an UNMARKED child — `env_clear()`, an isolated
 //! HOME, `AI_MEMORY_KEY_DIR` UNDER that HOME, no `TEST_KEY_GUARD_ENV` — runs
-//! `rules keygen` and `doctor --json` to completion. It never panics and the
-//! `#3355` text never appears.
+//! `rules keygen` to success and `doctor --json` without a panic. It never
+//! panics and the `#3355` text never appears. (Doctor against a missing db
+//! is CRITICAL / exit 2 after #3411 — that is not a guard failure.)
 //!
 //! Leg 2 (the protection is intact): the SAME command with the marker set is
 //! still refused by the guard, so #3355's isolation for test processes is
@@ -134,7 +135,11 @@ fn unmarked_binary_never_reaches_the_key_dir_guard() {
     );
 
     // 2. `doctor` — resolves the key directory for its Identity section, so it
-    //    hit the same guard. Warnings keep exit 0; only a CRITICAL exits 2.
+    //    hit the same guard. The pin is "no #3355 panic" (exit 101), not a
+    //    healthy report: #3411 made doctor read-only, so a missing db is
+    //    CRITICAL (exit 2). That is operator-correct and independent of the
+    //    key-dir guard. `rules keygen` above already proves a write-path
+    //    command whose key dir is under HOME completes in an unmarked binary.
     let db = home.join("m.db");
     let out = operator_cmd(&home, &keys)
         .arg("--db")
@@ -143,13 +148,6 @@ fn unmarked_binary_never_reaches_the_key_dir_guard() {
         .output()
         .expect("spawn ai-memory doctor");
     assert_no_guard_panic("doctor --json", &out);
-    assert!(
-        out.status.success(),
-        "doctor must run to completion for an operator whose key dir is under \
-         HOME\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
