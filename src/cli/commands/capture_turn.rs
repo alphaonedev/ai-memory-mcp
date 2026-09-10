@@ -121,7 +121,11 @@ pub fn cmd_capture_turn(
     match run_capture_turn(db_path, args, json_out, cli_agent_id, out) {
         Ok(()) => Ok(()),
         Err(e) if args.quiet => {
-            writeln!(out.stderr, "ai-memory capture-turn: {e}")?;
+            // Hook contract: exit 0 even if the diagnostic cannot be
+            // written (same never-fail posture as
+            // `recover-previous-session`). A broken stderr must not turn
+            // a capture into a failed host turn.
+            let _ = writeln!(out.stderr, "ai-memory capture-turn: {e}");
             Ok(())
         }
         Err(e) => Err(e),
