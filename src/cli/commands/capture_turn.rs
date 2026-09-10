@@ -265,6 +265,7 @@ fn run_capture_turn(
         crate::mcp::handle_capture_turn_auto(&conn, &Value::Object(params), Some(&caller))
     } else {
         crate::mcp::handle_capture_turn(&conn, &Value::Object(params), Some(&caller))
+            .map_err(anyhow::Error::msg)
     }
     .map_err(|e| anyhow!("{e}"))?;
 
