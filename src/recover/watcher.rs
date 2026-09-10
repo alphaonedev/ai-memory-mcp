@@ -698,10 +698,17 @@ fn recover_one(
     #[cfg(not(feature = "sal"))]
     let _ = cfg;
     #[cfg(feature = "sal")]
-    if let Some(store) = cfg.store.as_ref()
-        && let Ok(handle) = tokio::runtime::Handle::try_current()
-    {
-        return handle.block_on(super::recover_from_transcript_store(store.as_ref(), opts));
+    if let Some(store) = cfg.store.as_ref() {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                return handle.block_on(super::recover_from_transcript_store(store.as_ref(), opts));
+            }
+            Err(_) => {
+                return Err(super::RecoverError::InvalidOpts(
+                    "SAL recover requires a tokio runtime (no silent sqlite fallback)".to_string(),
+                ));
+            }
+        }
     }
     recover_from_transcript(db_path, opts)
 }
@@ -753,18 +760,26 @@ fn ingest_one_line_file(
     state: &mut LineFileState,
 ) -> Result<RecoverReport, line_file::LineFileError> {
     #[cfg(feature = "sal")]
-    if let Some(store) = cfg.store.as_ref()
-        && let Ok(handle) = tokio::runtime::Handle::try_current()
-    {
-        return handle.block_on(line_file::ingest_line_file_store(
-            store.as_ref(),
-            path,
-            &cfg.agent_id,
-            cfg.namespace.as_deref(),
-            cfg.limit,
-            cfg.dry_run,
-            state,
-        ));
+    if let Some(store) = cfg.store.as_ref() {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                return handle.block_on(line_file::ingest_line_file_store(
+                    store.as_ref(),
+                    path,
+                    &cfg.agent_id,
+                    cfg.namespace.as_deref(),
+                    cfg.limit,
+                    cfg.dry_run,
+                    state,
+                ));
+            }
+            Err(_) => {
+                return Err(line_file::LineFileError(
+                    "line-file SAL ingest requires a tokio runtime (no silent sqlite fallback)"
+                        .to_string(),
+                ));
+            }
+        }
     }
     line_file::ingest_line_file_sqlite(
         db_path,

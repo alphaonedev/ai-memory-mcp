@@ -180,7 +180,7 @@ fn watch_file_host_refuses_binary_or_oversized_line_3587() {
 }
 
 #[test]
-fn watch_file_host_refuses_path_outside_allowed_roots_3587() {
+fn watch_file_host_refuses_foreign_uid_path_3587() {
     let err = line_file::inspect_line_file(std::path::Path::new("/etc/passwd"));
     match err {
         Err(e) => assert!(
@@ -199,6 +199,98 @@ fn watch_file_host_refuses_path_outside_allowed_roots_3587() {
         }
         Ok(None) => {}
     }
+}
+
+#[test]
+fn watch_file_dedup_is_per_file_not_global_3587() {
+    let dir = scratch();
+    let db = dir.path().join("mem.db");
+    let a = dir.path().join("outbox-a.log");
+    let b = dir.path().join("outbox-b.log");
+    std::fs::write(&a, "ACK same-bytes-across-files\n").unwrap();
+    std::fs::write(&b, "ACK same-bytes-across-files\n").unwrap();
+    let cfg = cfg("ai:watch:perfile", vec![a, b], 100, false);
+    let mut states = WatchPollState::default();
+    poll(&db, &cfg, &mut states);
+    let conn = ai_memory::db::open(&db).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "same line in two files must mint two memories");
+    let d: i64 = conn
+        .query_row("SELECT COUNT(*) FROM transcript_line_dedup", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(d, 2, "per-file salt must yield two dedup rows");
+}
+
+#[test]
+fn watch_file_oversized_line_does_not_block_next_3587() {
+    let dir = scratch();
+    let db = dir.path().join("mem.db");
+    let file = dir.path().join("outbox.log");
+    let mut f = std::fs::File::create(&file).unwrap();
+    let big = vec![b'X'; line_file::MAX_LINE_BYTES.saturating_mul(3)];
+    f.write_all(&big).unwrap();
+    f.write_all(b"\n").unwrap();
+    f.write_all(b"READY after-oversize\n").unwrap();
+    f.flush().unwrap();
+    let cfg = cfg("ai:watch:stream", vec![file.clone()], 100, false);
+    let mut states = WatchPollState::default();
+    let outcomes = watcher::poll_once(&db, &cfg, &mut states);
+    let r = outcomes[0].recover_report.as_ref().unwrap();
+    assert!(
+        r.errors.iter().any(|e| e.contains("oversized")),
+        "{:?}",
+        r.errors
+    );
+    assert_eq!(r.lines_atomised, 1, "{:?}", r.errors);
+    let conn = ai_memory::db::open(&db).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    let len = std::fs::metadata(&file).unwrap().len();
+    let st = states.files.get(&file).expect("state");
+    assert_eq!(st.offset, len);
+    assert!(!st.skip_to_newline);
+}
+
+#[test]
+fn watch_file_skips_whitespace_only_lines_3587() {
+    let dir = scratch();
+    let db = dir.path().join("mem.db");
+    let file = dir.path().join("outbox.log");
+    std::fs::write(&file, "READY a\n\n   \nREADY b\n").unwrap();
+    let cfg = cfg("ai:watch:blank", vec![file], 100, false);
+    let mut states = WatchPollState::default();
+    poll(&db, &cfg, &mut states);
+    let conn = ai_memory::db::open(&db).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn watch_file_quiet_tick_does_not_open_db_3587() {
+    let dir = scratch();
+    let db = dir.path().join("mem.db");
+    let file = dir.path().join("outbox.log");
+    std::fs::write(&file, "READY first\n").unwrap();
+    let cfg = cfg("ai:watch:quiet", vec![file], 100, false);
+    let mut states = WatchPollState::default();
+    poll(&db, &cfg, &mut states);
+    assert!(db.exists());
+    let blocker = dir.path().join("not-a-db-dir");
+    std::fs::create_dir(&blocker).unwrap();
+    let outcomes = watcher::poll_once(&blocker, &cfg, &mut states);
+    assert!(
+        outcomes.iter().all(|o| o.error.is_none()),
+        "quiet tick must not open db: {:?}",
+        outcomes.iter().map(|o| &o.error).collect::<Vec<_>>()
+    );
 }
 
 #[test]

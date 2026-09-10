@@ -9,9 +9,14 @@
 //! path; in-memory [`LineFileState`] `(dev, ino, len, offset)` is only the
 //! change detector and is reset on inode change or shrink. A trailing line
 //! without a newline is never consumed.
+//!
+//! Dedup keys are per-file: `normalized_sha256`/`raw_sha256` =
+//! `sha256(abs_path ‖ 0x00 ‖ line)`; `metadata.line_sha256` stays
+//! `sha256(line)` (R1). Reads are streamed (R2); quiet ticks do not
+//! open the DB (R4); the open is `O_NOFOLLOW` + fstat identity (R5).
 
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -36,6 +41,11 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Whole-file ceiling. A regular file larger than this is refused.
 pub const MAX_LINE_FILE_BYTES: u64 = 1 << 30;
+
+/// Shared phrase of the R5 symlink refusal (inspect + `O_NOFOLLOW` + fstat).
+/// Interpolated via `format!("line-file {} {LINE_FILE_REFUSES_SYMLINK}", path)`
+/// — `format!` requires a string literal (not a const format template).
+const LINE_FILE_REFUSES_SYMLINK: &str = "refuses symlink";
 
 /// Hex prefix length used in `title = <basename>:<sha8>`.
 const TITLE_SHA_PREFIX: usize = 8;
@@ -118,6 +128,9 @@ impl<'de> Deserialize<'de> for WatchSource {
         if let Some(rest) = s.strip_prefix(FILE_PREFIX) {
             return Ok(Self::LineFile(PathBuf::from(rest)));
         }
+        // Wire form accepts `auto` (`HostKind::Auto`) for JSON round-trip of
+        // `WatchConfig`. [`Self::parse_host_token`] rejects `auto` as a CLI
+        // `--host` value (operator must name a concrete host or `file:<path>`).
         for host in [
             HostKind::Auto,
             HostKind::ClaudeCode,
@@ -143,6 +156,9 @@ pub struct LineFileState {
     pub len: u64,
     pub offset: u64,
     pub pending_drain: bool,
+    /// Mid-skip of an oversized line whose terminating newline has not
+    /// been seen yet (R2). Next tick resumes the skip without loading it.
+    pub skip_to_newline: bool,
 }
 
 /// Path-safety refusal (regular file, no symlink components, same uid,
@@ -157,6 +173,13 @@ impl std::fmt::Display for LineFileError {
 }
 
 impl std::error::Error for LineFileError {}
+
+fn symlink_refusal(path: &Path) -> LineFileError {
+    LineFileError(format!(
+        "line-file {} {LINE_FILE_REFUSES_SYMLINK}",
+        path.display()
+    ))
+}
 
 /// Fail-closed path safety. Missing files return `Ok(None)` so a daemon
 /// can start before the outbox exists.
@@ -178,10 +201,7 @@ pub fn inspect_line_file(path: &Path) -> Result<Option<fs::Metadata>, LineFileEr
         }
     };
     if meta.file_type().is_symlink() {
-        return Err(LineFileError(format!(
-            "line-file {} refuses symlink",
-            path.display()
-        )));
+        return Err(symlink_refusal(path));
     }
     if meta.is_dir() {
         return Err(LineFileError(format!(
@@ -262,9 +282,7 @@ fn contains_token(line: &str, token: &str) -> bool {
     let needle = token.as_bytes();
     let mut i = 0usize;
     while i + needle.len() <= bytes.len() {
-        if bytes[i..].len() >= needle.len()
-            && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle)
-        {
+        if bytes[i..i + needle.len()] == *needle {
             let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             let after = i + needle.len();
             let after_ok = after == bytes.len() || !bytes[after].is_ascii_alphanumeric();
@@ -278,7 +296,7 @@ fn contains_token(line: &str, token: &str) -> bool {
 }
 
 /// Untrusted actor prefix: left of `→` after an optional timestamp, else
-/// the first whitespace token.
+/// the first whitespace token when it looks like an identity (`:` or `@`).
 #[must_use]
 pub fn observed_actor(line: &str) -> Option<String> {
     let rest = strip_leading_timestamp(line);
@@ -288,9 +306,12 @@ pub fn observed_actor(line: &str) -> Option<String> {
             return Some(actor.to_string());
         }
     }
-    rest.split_whitespace()
-        .next()
-        .map(|s| s.trim_end_matches(':').to_string())
+    let first = rest.split_whitespace().next()?;
+    if first.contains(':') || first.contains('@') {
+        Some(first.trim_end_matches(':').to_string())
+    } else {
+        None
+    }
 }
 
 fn strip_leading_timestamp(line: &str) -> &str {
@@ -334,15 +355,55 @@ pub fn sha256_hex(line: &[u8]) -> String {
     hex::encode(sha256_bytes(line))
 }
 
-/// Complete newline-terminated lines starting at `state.offset`, plus the
-/// offset of the first unconsumed byte. A trailing fragment without `\n`
-/// is never returned and never advances the offset.
+/// Per-file dedup digest: `sha256(abs_path_bytes ‖ 0x00 ‖ line_bytes)` (R1).
+#[must_use]
+pub fn salted_sha256(path: &Path, line: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        h.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        h.update(path.to_string_lossy().as_bytes());
+    }
+    h.update([0u8]);
+    h.update(line);
+    let d = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
+    out
+}
+
+fn is_whitespace_only(line: &[u8]) -> bool {
+    line.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Complete newline-terminated lines starting at `state.offset`. A trailing
+/// fragment without `\n` is never returned and never advances the offset.
+/// Peak allocation is O([`MAX_LINE_BYTES`]) (R2).
 pub fn take_complete_lines(
     path: &Path,
     state: &mut LineFileState,
     meta: &fs::Metadata,
     limit: usize,
 ) -> Result<(Vec<Vec<u8>>, bool), LineFileError> {
+    take_complete_lines_inner(path, state, meta, limit).map(|t| (t.lines, t.hit_limit))
+}
+
+struct TakenLines {
+    lines: Vec<Vec<u8>>,
+    hit_limit: bool,
+    errors: Vec<String>,
+}
+
+fn take_complete_lines_inner(
+    path: &Path,
+    state: &mut LineFileState,
+    meta: &fs::Metadata,
+    limit: usize,
+) -> Result<TakenLines, LineFileError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -350,66 +411,189 @@ pub fn take_complete_lines(
         let ino = meta.ino();
         if (state.dev != 0 || state.ino != 0) && (state.dev != dev || state.ino != ino) {
             state.offset = 0;
+            state.skip_to_newline = false;
         }
         state.dev = dev;
         state.ino = ino;
     }
     if meta.len() < state.offset {
         state.offset = 0;
+        state.skip_to_newline = false;
     }
     state.len = meta.len();
-    if state.offset >= meta.len() && !state.pending_drain {
-        return Ok((Vec::new(), false));
+    if state.offset >= meta.len() && !state.pending_drain && !state.skip_to_newline {
+        return Ok(TakenLines {
+            lines: Vec::new(),
+            hit_limit: false,
+            errors: Vec::new(),
+        });
     }
 
-    let mut f = File::open(path)
-        .map_err(|e| LineFileError(format!("line-file {} open failed: {e}", path.display())))?;
+    let mut f = open_line_file_nofollow(path, meta)?;
     f.seek(SeekFrom::Start(state.offset))
         .map_err(|e| LineFileError(format!("line-file {} seek failed: {e}", path.display())))?;
-    let want = usize::try_from(meta.len().saturating_sub(state.offset)).unwrap_or(usize::MAX);
-    let mut buf = vec![0u8; want];
-    let n = f
-        .read(&mut buf)
-        .map_err(|e| LineFileError(format!("line-file {} read failed: {e}", path.display())))?;
-    buf.truncate(n);
+    let mut reader = BufReader::new(f);
+    let mut out = TakenLines {
+        lines: Vec::new(),
+        hit_limit: false,
+        errors: Vec::new(),
+    };
 
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    let mut hit_limit = false;
-    for i in 0..buf.len() {
-        if buf[i] != b'\n' {
-            continue;
+    if state.skip_to_newline {
+        match skip_until_newline(&mut reader, path, &mut state.offset)? {
+            true => state.skip_to_newline = false,
+            false => return Ok(out),
         }
-        if lines.len() >= limit {
-            hit_limit = true;
+    }
+
+    let max_incl_nl = MAX_LINE_BYTES.saturating_add(1);
+    loop {
+        if out.lines.len() >= limit {
+            out.hit_limit = true;
             break;
         }
-        let mut end = i;
-        if end > start && buf[end - 1] == b'\r' {
-            end -= 1;
+        let mut buf = Vec::new();
+        let n = read_bounded_line(&mut reader, &mut buf, max_incl_nl)
+            .map_err(|e| LineFileError(format!("line-file {} read failed: {e}", path.display())))?;
+        if n == 0 {
+            break;
         }
-        lines.push(buf[start..end].to_vec());
-        start = i + 1;
+        let ended_nl = buf.last() == Some(&b'\n');
+        if ended_nl {
+            let mut end = buf.len() - 1;
+            if end > 0 && buf[end - 1] == b'\r' {
+                end -= 1;
+            }
+            state.offset = state
+                .offset
+                .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            out.lines.push(buf[..end].to_vec());
+        } else if buf.len() > MAX_LINE_BYTES {
+            out.errors.push(format!(
+                "oversized line refused ({} bytes > {MAX_LINE_BYTES})",
+                buf.len()
+            ));
+            state.offset = state
+                .offset
+                .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            match skip_until_newline(&mut reader, path, &mut state.offset)? {
+                true => state.skip_to_newline = false,
+                false => {
+                    state.skip_to_newline = true;
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
     }
-    state.offset += u64::try_from(start).unwrap_or(u64::MAX);
-    Ok((lines, hit_limit))
+    Ok(out)
+}
+
+fn open_line_file_nofollow(path: &Path, expected: &fs::Metadata) -> Result<File, LineFileError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|e| {
+        #[cfg(unix)]
+        {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                return symlink_refusal(path);
+            }
+        }
+        LineFileError(format!("line-file {} open failed: {e}", path.display()))
+    })?;
+    let opened = file
+        .metadata()
+        .map_err(|e| LineFileError(format!("line-file {} fstat failed: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+            return Err(symlink_refusal(path));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = opened;
+    }
+    Ok(file)
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_incl_nl: usize,
+) -> std::io::Result<usize> {
+    loop {
+        if buf.len() >= max_incl_nl {
+            return Ok(buf.len());
+        }
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            return Ok(buf.len());
+        }
+        if let Some(i) = avail.iter().position(|&b| b == b'\n') {
+            let n = i + 1;
+            let room = max_incl_nl.saturating_sub(buf.len());
+            let take = n.min(room);
+            buf.extend_from_slice(&avail[..take]);
+            reader.consume(take);
+            return Ok(buf.len());
+        }
+        let room = max_incl_nl.saturating_sub(buf.len());
+        let take = avail.len().min(room);
+        buf.extend_from_slice(&avail[..take]);
+        reader.consume(take);
+        if buf.len() >= max_incl_nl {
+            return Ok(buf.len());
+        }
+    }
+}
+
+fn skip_until_newline<R: BufRead>(
+    reader: &mut R,
+    path: &Path,
+    offset: &mut u64,
+) -> Result<bool, LineFileError> {
+    loop {
+        let avail = reader
+            .fill_buf()
+            .map_err(|e| LineFileError(format!("line-file {} skip failed: {e}", path.display())))?;
+        if avail.is_empty() {
+            return Ok(false);
+        }
+        if let Some(i) = avail.iter().position(|&b| b == b'\n') {
+            let n = i + 1;
+            reader.consume(n);
+            *offset = offset.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            return Ok(true);
+        }
+        let n = avail.len();
+        reader.consume(n);
+        *offset = offset.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+    }
 }
 
 fn prepare_line_write(
     path: &Path,
     line: &[u8],
-    sha: &[u8; 32],
     agent_id: &str,
     namespace: &str,
 ) -> RecoverTurnWrite {
-    let sha_hex = hex::encode(sha);
+    let line_sha_hex = sha256_hex(line);
+    let dedup = salted_sha256(path, line);
     let text = String::from_utf8_lossy(line);
     let actor = observed_actor(&text);
     let mut metadata = serde_json::json!({
         "agent_id": agent_id,
         "host_kind": FILE_HOST_KIND,
         "transcript_path": path.display().to_string(),
-        "line_sha256": sha_hex,
+        "line_sha256": line_sha_hex,
         "capture_layer": "L3",
     });
     if let Some(actor) = actor {
@@ -425,7 +609,7 @@ fn prepare_line_write(
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: namespace.to_string(),
-        title: title_for(path, &sha_hex),
+        title: title_for(path, &line_sha_hex),
         content: text.into_owned(),
         tags: tags_for_line(&String::from_utf8_lossy(line)),
         priority: 5,
@@ -440,8 +624,8 @@ fn prepare_line_write(
     };
     RecoverTurnWrite {
         memory: mem,
-        normalized_sha256: sha.to_vec(),
-        raw_sha256: sha.to_vec(),
+        normalized_sha256: dedup.to_vec(),
+        raw_sha256: dedup.to_vec(),
         host_kind: FILE_HOST_KIND.to_string(),
         transcript_path: path.display().to_string(),
         host_session_id: None,
@@ -485,15 +669,27 @@ pub fn ingest_line_file_sqlite(
         report.elapsed_ms = timer.overall_ms();
         return Ok(report);
     };
-    let (lines, hit_limit) = take_complete_lines(path, state, &meta, limit)?;
-    report.lines_total = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+    let taken = take_complete_lines_inner(path, state, &meta, limit)?;
+    report.errors.extend(taken.errors);
+    report.lines_total = u32::try_from(taken.lines.len()).unwrap_or(u32::MAX);
     report.elapsed_ms_parse = timer.phase_lap();
+    if taken.hit_limit {
+        report.lines_skipped_limit = report.lines_skipped_limit.saturating_add(1);
+    }
+    state.pending_drain = taken.hit_limit;
+    if taken.lines.is_empty() {
+        report.elapsed_ms = timer.overall_ms();
+        return Ok(report);
+    }
     let ns = namespace
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
     if dry_run {
-        for line in &lines {
+        for line in &taken.lines {
+            if is_whitespace_only(line) {
+                continue;
+            }
             if let Err(e) = classify_line(line) {
                 report.errors.push(e.to_string());
                 continue;
@@ -507,13 +703,15 @@ pub fn ingest_line_file_sqlite(
 
     let conn = crate::storage::open(db_path)
         .map_err(|e| LineFileError(format!("line-file db open failed: {e}")))?;
-    for line in &lines {
+    for line in &taken.lines {
+        if is_whitespace_only(line) {
+            continue;
+        }
         if let Err(e) = classify_line(line) {
             report.errors.push(e.to_string());
             continue;
         }
-        let sha = sha256_bytes(line);
-        let write = prepare_line_write(path, line, &sha, cfg_agent_id, &ns);
+        let write = prepare_line_write(path, line, cfg_agent_id, &ns);
         match crate::storage::recover_turn_idempotent(&conn, &write, true) {
             Ok(res) if res.dedup_hit => {
                 report.lines_skipped_dedup = report.lines_skipped_dedup.saturating_add(1);
@@ -525,10 +723,6 @@ pub fn ingest_line_file_sqlite(
             Err(e) => report.errors.push(e),
         }
     }
-    if hit_limit {
-        report.lines_skipped_limit = report.lines_skipped_limit.saturating_add(1);
-    }
-    state.pending_drain = hit_limit;
     report.elapsed_ms_writes = timer.phase_lap();
     report.elapsed_ms = timer.overall_ms();
     Ok(report)
@@ -556,15 +750,27 @@ pub async fn ingest_line_file_store(
         report.elapsed_ms = timer.overall_ms();
         return Ok(report);
     };
-    let (lines, hit_limit) = take_complete_lines(path, state, &meta, limit)?;
-    report.lines_total = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+    let taken = take_complete_lines_inner(path, state, &meta, limit)?;
+    report.errors.extend(taken.errors);
+    report.lines_total = u32::try_from(taken.lines.len()).unwrap_or(u32::MAX);
     report.elapsed_ms_parse = timer.phase_lap();
+    if taken.hit_limit {
+        report.lines_skipped_limit = report.lines_skipped_limit.saturating_add(1);
+    }
+    state.pending_drain = taken.hit_limit;
+    if taken.lines.is_empty() {
+        report.elapsed_ms = timer.overall_ms();
+        return Ok(report);
+    }
     let ns = namespace
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
     if dry_run {
-        for line in &lines {
+        for line in &taken.lines {
+            if is_whitespace_only(line) {
+                continue;
+            }
             if let Err(e) = classify_line(line) {
                 report.errors.push(e.to_string());
                 continue;
@@ -582,13 +788,15 @@ pub async fn ingest_line_file_store(
     // `recover_from_transcript_store` (C8 allowlist:
     // `scripts/qc-codegraph-allowlists/for-admin-bypass.txt`).
     let ctx = crate::store::CallerContext::for_admin(cfg_agent_id);
-    for line in &lines {
+    for line in &taken.lines {
+        if is_whitespace_only(line) {
+            continue;
+        }
         if let Err(e) = classify_line(line) {
             report.errors.push(e.to_string());
             continue;
         }
-        let sha = sha256_bytes(line);
-        let write = prepare_line_write(path, line, &sha, cfg_agent_id, &ns);
+        let write = prepare_line_write(path, line, cfg_agent_id, &ns);
         match store.recover_turn_idempotent(&ctx, &write).await {
             Ok(res) if res.dedup_hit => {
                 report.lines_skipped_dedup = report.lines_skipped_dedup.saturating_add(1);
@@ -600,10 +808,6 @@ pub async fn ingest_line_file_store(
             Err(e) => report.errors.push(e.to_string()),
         }
     }
-    if hit_limit {
-        report.lines_skipped_limit = report.lines_skipped_limit.saturating_add(1);
-    }
-    state.pending_drain = hit_limit;
     report.elapsed_ms_writes = timer.phase_lap();
     report.elapsed_ms = timer.overall_ms();
     Ok(report)
@@ -633,6 +837,10 @@ mod tests {
             assert!(tags_for_line(t).contains(&t.to_ascii_lowercase()));
         }
         assert!(!tags_for_line("no swarm tokens here").contains(&"ready".to_string()));
+        assert!(
+            !tags_for_line("the build is ready").contains(&"ready".to_string()),
+            "tag match is case-sensitive"
+        );
     }
 
     #[test]
@@ -644,6 +852,11 @@ mod tests {
         assert_eq!(
             observed_actor("2026-09-10T15:59Z ai:fable→f1: READY").as_deref(),
             Some("ai:fable")
+        );
+        assert_eq!(observed_actor("READY #3587 U2").as_deref(), None);
+        assert_eq!(
+            observed_actor("ai:grok STATUS hello").as_deref(),
+            Some("ai:grok")
         );
     }
 
@@ -773,5 +986,22 @@ mod tests {
         assert_eq!(serde_json::to_string(&t).unwrap(), "\"codex\"");
         let f = WatchSource::LineFile(PathBuf::from("/a/b.log"));
         assert_eq!(serde_json::to_string(&f).unwrap(), "\"file:/a/b.log\"");
+        let auto: WatchSource = serde_json::from_str("\"auto\"").unwrap();
+        assert!(matches!(auto, WatchSource::Transcript(HostKind::Auto)));
+        assert!(WatchSource::parse_host_token("auto").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_file_take_refuses_symlink_path_with_target_meta_3587() {
+        let dir = fresh_dir();
+        let real = dir.path().join("real.log");
+        std::fs::write(&real, "READY one\n").unwrap();
+        let link = dir.path().join("link.log");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let meta = fs::metadata(&real).unwrap();
+        let mut state = LineFileState::default();
+        let err = take_complete_lines(&link, &mut state, &meta, 100).unwrap_err();
+        assert!(err.0.contains("symlink"), "{err}");
     }
 }
