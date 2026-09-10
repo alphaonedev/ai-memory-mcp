@@ -153,10 +153,10 @@ fn no_compacted_full_profile_description_ends_on_comma_or_colon_3378() {
 }
 
 #[test]
-fn every_non_capabilities_description_points_at_memory_capabilities_3378() {
+fn ordinary_tools_do_not_carry_uniform_capabilities_suffix_3378() {
     let defs = tool_definitions_for_profile(&Profile::full());
     let tools = defs["tools"].as_array().expect("tools array");
-    let mut missing: Vec<String> = Vec::new();
+    let mut offenders: Vec<String> = Vec::new();
     for tool in tools {
         let name = tool
             .get("name")
@@ -169,23 +169,28 @@ fn every_non_capabilities_description_points_at_memory_capabilities_3378() {
             .get("description")
             .and_then(|d| d.as_str())
             .unwrap_or("");
-        if !desc.contains("memory_capabilities") {
-            missing.push(format!("{name}: {desc:?}"));
+        if desc.contains("See memory_capabilities") {
+            offenders.push(format!("{name}: {desc:?}"));
         }
     }
     assert!(
-        missing.is_empty(),
-        "every compacted tools/list description except memory_capabilities \
-         itself must point at memory_capabilities (#3378 unit 3):\n{}",
-        missing.join("\n")
+        offenders.is_empty(),
+        "ordinary tools/list descriptions must not carry a uniform \
+         capabilities suffix (#3378 unit 3 ruling):\n{}",
+        offenders.join("\n")
     );
 }
 
 #[test]
-fn memory_capabilities_description_does_not_self_point_3378() {
+fn memory_capabilities_compact_is_the_verbose_pointer_3378() {
     let got = compacted_description("memory_capabilities");
+    assert_eq!(
+        got, "Full per-tool docs: verbose=true",
+        "memory_capabilities compact must be the one-time verbose pointer"
+    );
     assert!(
-        !got.contains("See memory_capabilities"),
-        "memory_capabilities must not point at itself: {got:?}"
+        got.len() <= 32,
+        "capabilities compact must fit the 32-byte gist, got len={} {got:?}",
+        got.len()
     );
 }

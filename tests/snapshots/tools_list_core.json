@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Store a memory See memory_capabilities.",
+      "description": "Store a memory",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -142,7 +142,7 @@
       "name": "memory_store"
     },
     {
-      "description": "Recall memories relevant to a context (ranked) See memory_capabilities.",
+      "description": "Recall memories relevant to a context (ranked)",
       "inputSchema": {
         "definitions": {
           "KindsFilter": {
@@ -297,7 +297,7 @@
       "name": "memory_recall"
     },
     {
-      "description": "Search memories by exact See memory_capabilities.",
+      "description": "Search memories by exact",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -362,7 +362,7 @@
       "name": "memory_search"
     },
     {
-      "description": "List memories, optionally See memory_capabilities.",
+      "description": "List memories, optionally",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -409,7 +409,7 @@
       "name": "memory_list"
     },
     {
-      "description": "Load top-k recent + high-priority memories from a Family See memory_capabilities.",
+      "description": "Load top-k recent + high-priority memories from a Family",
       "inputSchema": {
         "properties": {
           "family": {
@@ -437,7 +437,7 @@
       "name": "memory_load_family"
     },
     {
-      "description": "Intent-routed loader: free-text See memory_capabilities.",
+      "description": "Intent-routed loader: free-text",
       "inputSchema": {
         "properties": {
           "intent": {
@@ -465,7 +465,7 @@
       "name": "memory_smart_load"
     },
     {
-      "description": "Get a specific memory by ID See memory_capabilities.",
+      "description": "Get a specific memory by ID",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -487,7 +487,7 @@
       "name": "memory_get"
     },
     {
-      "description": "Discover runtime capabilities",
+      "description": "Full per-tool docs: verbose=true",
       "inputSchema": {
         "properties": {
           "accept": {

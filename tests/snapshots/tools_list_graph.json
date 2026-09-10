@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Store a memory See memory_capabilities.",
+      "description": "Store a memory",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -142,7 +142,7 @@
       "name": "memory_store"
     },
     {
-      "description": "Recall memories relevant to a context (ranked) See memory_capabilities.",
+      "description": "Recall memories relevant to a context (ranked)",
       "inputSchema": {
         "definitions": {
           "KindsFilter": {
@@ -297,7 +297,7 @@
       "name": "memory_recall"
     },
     {
-      "description": "Search memories by exact See memory_capabilities.",
+      "description": "Search memories by exact",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -362,7 +362,7 @@
       "name": "memory_search"
     },
     {
-      "description": "List memories, optionally See memory_capabilities.",
+      "description": "List memories, optionally",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -409,7 +409,7 @@
       "name": "memory_list"
     },
     {
-      "description": "Load top-k recent + high-priority memories from a Family See memory_capabilities.",
+      "description": "Load top-k recent + high-priority memories from a Family",
       "inputSchema": {
         "properties": {
           "family": {
@@ -437,7 +437,7 @@
       "name": "memory_load_family"
     },
     {
-      "description": "Intent-routed loader: free-text See memory_capabilities.",
+      "description": "Intent-routed loader: free-text",
       "inputSchema": {
         "properties": {
           "intent": {
@@ -465,7 +465,7 @@
       "name": "memory_smart_load"
     },
     {
-      "description": "Return a hierarchical tree of namespaces with memory counts See memory_capabilities.",
+      "description": "Return a hierarchical tree of namespaces with memory counts",
       "inputSchema": {
         "properties": {
           "depth": {
@@ -494,7 +494,7 @@
       "name": "memory_get_taxonomy"
     },
     {
-      "description": "Register an entity (canonical See memory_capabilities.",
+      "description": "Register an entity (canonical",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -529,7 +529,7 @@
       "name": "memory_entity_register"
     },
     {
-      "description": "Resolve an alias to its See memory_capabilities.",
+      "description": "Resolve an alias to its",
       "inputSchema": {
         "properties": {
           "alias": {
@@ -550,7 +550,7 @@
       "name": "memory_entity_get_by_alias"
     },
     {
-      "description": "Ordered fact timeline for an entity (outbound KG links by valid_from) See memory_capabilities.",
+      "description": "Ordered fact timeline for an entity (outbound KG links by valid_from)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -584,7 +584,7 @@
       "name": "memory_kg_timeline"
     },
     {
-      "description": "Mark a KG link as superseded by setting its valid_until column See memory_capabilities.",
+      "description": "Mark a KG link as superseded by setting its valid_until column",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -620,7 +620,7 @@
       "name": "memory_kg_invalidate"
     },
     {
-      "description": "Outbound KG traversal from a source memory (<=5 hops) See memory_capabilities.",
+      "description": "Outbound KG traversal from a source memory (<=5 hops)",
       "inputSchema": {
         "properties": {
           "allowed_agents": {
@@ -689,7 +689,7 @@
       "name": "memory_kg_query"
     },
     {
-      "description": "Enumerate up to N paths through See memory_capabilities.",
+      "description": "Enumerate up to N paths through",
       "inputSchema": {
         "properties": {
           "include_invalidated": {
@@ -728,7 +728,7 @@
       "name": "memory_find_paths"
     },
     {
-      "description": "Walk a memory's derivation See memory_capabilities.",
+      "description": "Walk a memory's derivation",
       "inputSchema": {
         "properties": {
           "direction": {
@@ -756,7 +756,7 @@
       "name": "memory_lineage"
     },
     {
-      "description": "Get a specific memory by ID See memory_capabilities.",
+      "description": "Get a specific memory by ID",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -778,7 +778,7 @@
       "name": "memory_get"
     },
     {
-      "description": "Create a typed link between two See memory_capabilities.",
+      "description": "Create a typed link between two",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -810,7 +810,7 @@
       "name": "memory_link"
     },
     {
-      "description": "Get all links for a memory See memory_capabilities.",
+      "description": "Get all links for a memory",
       "inputSchema": {
         "properties": {
           "id": {
@@ -825,7 +825,7 @@
       "name": "memory_get_links"
     },
     {
-      "description": "Re-verify a stored memory_links See memory_capabilities.",
+      "description": "Re-verify a stored memory_links",
       "inputSchema": {
         "properties": {
           "link_id": {
@@ -858,7 +858,7 @@
       "name": "memory_verify"
     },
     {
-      "description": "Reconstruct the conversation See memory_capabilities.",
+      "description": "Reconstruct the conversation",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -892,7 +892,7 @@
       "name": "memory_replay"
     },
     {
-      "description": "Discover runtime capabilities",
+      "description": "Full per-tool docs: verbose=true",
       "inputSchema": {
         "properties": {
           "accept": {

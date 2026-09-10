@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Store a memory See memory_capabilities.",
+      "description": "Store a memory",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -142,7 +142,7 @@
       "name": "memory_store"
     },
     {
-      "description": "Recall memories relevant to a context (ranked) See memory_capabilities.",
+      "description": "Recall memories relevant to a context (ranked)",
       "inputSchema": {
         "definitions": {
           "KindsFilter": {
@@ -297,7 +297,7 @@
       "name": "memory_recall"
     },
     {
-      "description": "Search memories by exact See memory_capabilities.",
+      "description": "Search memories by exact",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -362,7 +362,7 @@
       "name": "memory_search"
     },
     {
-      "description": "List memories, optionally See memory_capabilities.",
+      "description": "List memories, optionally",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -409,7 +409,7 @@
       "name": "memory_list"
     },
     {
-      "description": "Load top-k recent + high-priority memories from a Family See memory_capabilities.",
+      "description": "Load top-k recent + high-priority memories from a Family",
       "inputSchema": {
         "properties": {
           "family": {
@@ -437,7 +437,7 @@
       "name": "memory_load_family"
     },
     {
-      "description": "Intent-routed loader: free-text See memory_capabilities.",
+      "description": "Intent-routed loader: free-text",
       "inputSchema": {
         "properties": {
           "intent": {
@@ -465,7 +465,7 @@
       "name": "memory_smart_load"
     },
     {
-      "description": "Pre-write near-duplicate check See memory_capabilities.",
+      "description": "Pre-write near-duplicate check",
       "inputSchema": {
         "properties": {
           "content": {
@@ -497,7 +497,7 @@
       "name": "memory_check_duplicate"
     },
     {
-      "description": "Get a specific memory by ID See memory_capabilities.",
+      "description": "Get a specific memory by ID",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -519,7 +519,7 @@
       "name": "memory_get"
     },
     {
-      "description": "Persist a reflection memory See memory_capabilities.",
+      "description": "Persist a reflection memory",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -598,7 +598,7 @@
       "name": "memory_reflect"
     },
     {
-      "description": "Render a single reflection See memory_capabilities.",
+      "description": "Render a single reflection",
       "inputSchema": {
         "properties": {
           "format": {
@@ -619,7 +619,7 @@
       "name": "memory_export_reflection"
     },
     {
-      "description": "Fetch the latest Persona See memory_capabilities.",
+      "description": "Fetch the latest Persona",
       "inputSchema": {
         "properties": {
           "entity_id": {
@@ -640,7 +640,7 @@
       "name": "memory_persona"
     },
     {
-      "description": "Generate/regen a Persona See memory_capabilities.",
+      "description": "Generate/regen a Persona",
       "inputSchema": {
         "properties": {
           "entity_id": {
@@ -661,7 +661,7 @@
       "name": "memory_persona_generate"
     },
     {
-      "description": "Inspect the cross-peer See memory_capabilities.",
+      "description": "Inspect the cross-peer",
       "inputSchema": {
         "properties": {
           "memory_id": {
@@ -676,7 +676,7 @@
       "name": "memory_reflection_origin"
     },
     {
-      "description": "List dependents flagged by the L2-3 invalidation walker See memory_capabilities.",
+      "description": "List dependents flagged by the L2-3 invalidation walker",
       "inputSchema": {
         "properties": {
           "memory_id": {
@@ -695,7 +695,7 @@
       "name": "memory_dependents_of_invalidated"
     },
     {
-      "description": "Atomically intercept and unwind See memory_capabilities.",
+      "description": "Atomically intercept and unwind",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -738,7 +738,7 @@
       "name": "memory_swarm_rewind"
     },
     {
-      "description": "Consolidate multiple memories See memory_capabilities.",
+      "description": "Consolidate multiple memories",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -778,7 +778,7 @@
       "name": "memory_consolidate"
     },
     {
-      "description": "Form 3 multi-step ingest See memory_capabilities.",
+      "description": "Form 3 multi-step ingest",
       "inputSchema": {
         "properties": {
           "content": {
@@ -806,7 +806,7 @@
       "name": "memory_ingest_multistep"
     },
     {
-      "description": "Decompose a memory into 2-10 See memory_capabilities.",
+      "description": "Decompose a memory into 2-10",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -841,7 +841,7 @@
       "name": "memory_atomise"
     },
     {
-      "description": "Share a memory with another See memory_capabilities.",
+      "description": "Share a memory with another",
       "inputSchema": {
         "properties": {
           "source_memory_id": {
@@ -866,7 +866,7 @@
       "name": "memory_share"
     },
     {
-      "description": "Create a coordination action See memory_capabilities.",
+      "description": "Create a coordination action",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -902,7 +902,7 @@
       "name": "memory_action_create"
     },
     {
-      "description": "Fetch a coordination action by id (#1709) See memory_capabilities.",
+      "description": "Fetch a coordination action by id (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -917,7 +917,7 @@
       "name": "memory_action_get"
     },
     {
-      "description": "State-guarded transition of a coordination action (#1709) See memory_capabilities.",
+      "description": "State-guarded transition of a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "claimed_by": {
@@ -950,7 +950,7 @@
       "name": "memory_action_transition"
     },
     {
-      "description": "List coordination actions by namespace/state (#1709) See memory_capabilities.",
+      "description": "List coordination actions by namespace/state (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -987,7 +987,7 @@
       "name": "memory_action_list"
     },
     {
-      "description": "Add a typed DAG edge between two coordination actions (#1709) See memory_capabilities.",
+      "description": "Add a typed DAG edge between two coordination actions (#1709)",
       "inputSchema": {
         "properties": {
           "edge_type": {
@@ -1017,7 +1017,7 @@
       "name": "memory_action_add_edge"
     },
     {
-      "description": "List DAG edges for a coordination action (#1709) See memory_capabilities.",
+      "description": "List DAG edges for a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1032,7 +1032,7 @@
       "name": "memory_action_edges"
     },
     {
-      "description": "Rank the UNBLOCKED See memory_capabilities.",
+      "description": "Rank the UNBLOCKED",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1054,7 +1054,7 @@
       "name": "memory_action_frontier"
     },
     {
-      "description": "Return the top UNBLOCKED See memory_capabilities.",
+      "description": "Return the top UNBLOCKED",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1075,7 +1075,7 @@
       "name": "memory_action_next"
     },
     {
-      "description": "Acquire a single-holder lease See memory_capabilities.",
+      "description": "Acquire a single-holder lease",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1101,7 +1101,7 @@
       "name": "memory_lease_acquire"
     },
     {
-      "description": "Heartbeat-renew an owned lease See memory_capabilities.",
+      "description": "Heartbeat-renew an owned lease",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1127,7 +1127,7 @@
       "name": "memory_lease_renew"
     },
     {
-      "description": "Release an owned lease on a coordination action (#1709) See memory_capabilities.",
+      "description": "Release an owned lease on a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1146,7 +1146,7 @@
       "name": "memory_lease_release"
     },
     {
-      "description": "Read the lease on a coordination action (#1709) See memory_capabilities.",
+      "description": "Read the lease on a coordination action (#1709)",
       "inputSchema": {
         "properties": {
           "action_id": {
@@ -1161,7 +1161,7 @@
       "name": "memory_lease_get"
     },
     {
-      "description": "Send a typed, optionally See memory_capabilities.",
+      "description": "Send a typed, optionally",
       "inputSchema": {
         "properties": {
           "body": {},
@@ -1225,7 +1225,7 @@
       "name": "memory_signal_send"
     },
     {
-      "description": "Read one signal by id, mark it See memory_capabilities.",
+      "description": "Read one signal by id, mark it",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1240,7 +1240,7 @@
       "name": "memory_signal_read"
     },
     {
-      "description": "List UNACKED signals for a namespace/recipient — direct + broadcast (#1709) See memory_capabilities.",
+      "description": "List UNACKED signals for a namespace/recipient — direct + broadcast (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1268,7 +1268,7 @@
       "name": "memory_signal_inbox"
     },
     {
-      "description": "List a signal correlation See memory_capabilities.",
+      "description": "List a signal correlation",
       "inputSchema": {
         "properties": {
           "correlation_id": {
@@ -1283,7 +1283,7 @@
       "name": "memory_signal_thread"
     },
     {
-      "description": "Acknowledge a signal by id See memory_capabilities.",
+      "description": "Acknowledge a signal by id",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1298,7 +1298,7 @@
       "name": "memory_signal_ack"
     },
     {
-      "description": "Create a pending See memory_capabilities.",
+      "description": "Create a pending",
       "inputSchema": {
         "properties": {
           "condition": {},
@@ -1346,7 +1346,7 @@
       "name": "memory_checkpoint_create"
     },
     {
-      "description": "Resolve a checkpoint See memory_capabilities.",
+      "description": "Resolve a checkpoint",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1400,7 +1400,7 @@
       "name": "memory_checkpoint_resolve"
     },
     {
-      "description": "Query checkpoints by namespace/condition_type/state, newest-first (#1709) See memory_capabilities.",
+      "description": "Query checkpoints by namespace/condition_type/state, newest-first (#1709)",
       "inputSchema": {
         "properties": {
           "condition_type": {
@@ -1454,7 +1454,7 @@
       "name": "memory_checkpoint_query"
     },
     {
-      "description": "Fetch a checkpoint by id and verify its attested resolution (#1709) See memory_capabilities.",
+      "description": "Fetch a checkpoint by id and verify its attested resolution (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1469,7 +1469,7 @@
       "name": "memory_checkpoint_verify"
     },
     {
-      "description": "Create a draft routine — a parameterised action+edge template (#1709) See memory_capabilities.",
+      "description": "Create a draft routine — a parameterised action+edge template (#1709)",
       "inputSchema": {
         "properties": {
           "created_by": {
@@ -1497,7 +1497,7 @@
       "name": "memory_routine_create"
     },
     {
-      "description": "Freeze a routine (draft -> See memory_capabilities.",
+      "description": "Freeze a routine (draft ->",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1512,7 +1512,7 @@
       "name": "memory_routine_freeze"
     },
     {
-      "description": "Run a frozen routine — See memory_capabilities.",
+      "description": "Run a frozen routine —",
       "inputSchema": {
         "properties": {
           "arguments": {},
@@ -1536,7 +1536,7 @@
       "name": "memory_routine_run"
     },
     {
-      "description": "Fetch a routine run by id, with its state and created action ids (#1709) See memory_capabilities.",
+      "description": "Fetch a routine run by id, with its state and created action ids (#1709)",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1558,7 +1558,7 @@
       "name": "memory_routine_status"
     },
     {
-      "description": "List a namespace's routines by state, newest-first (#1709) See memory_capabilities.",
+      "description": "List a namespace's routines by state, newest-first (#1709)",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1591,7 +1591,7 @@
       "name": "memory_routine_list"
     },
     {
-      "description": "Calibrate confidence baselines See memory_capabilities.",
+      "description": "Calibrate confidence baselines",
       "inputSchema": {
         "properties": {
           "days": {
@@ -1613,7 +1613,7 @@
       "name": "memory_calibrate_confidence"
     },
     {
-      "description": "Discover runtime capabilities",
+      "description": "Full per-tool docs: verbose=true",
       "inputSchema": {
         "properties": {
           "accept": {
@@ -1646,7 +1646,7 @@
       "name": "memory_capabilities"
     },
     {
-      "description": "LLM-expand a search query into related terms (smart/autonomous tier) See memory_capabilities.",
+      "description": "LLM-expand a search query into related terms (smart/autonomous tier)",
       "inputSchema": {
         "properties": {
           "query": {
@@ -1661,7 +1661,7 @@
       "name": "memory_expand_query"
     },
     {
-      "description": "LLM-generate tags for a memory See memory_capabilities.",
+      "description": "LLM-generate tags for a memory",
       "inputSchema": {
         "properties": {
           "id": {
@@ -1676,7 +1676,7 @@
       "name": "memory_auto_tag"
     },
     {
-      "description": "LLM-check whether two memories See memory_capabilities.",
+      "description": "LLM-check whether two memories",
       "inputSchema": {
         "properties": {
           "id_a": {
@@ -1695,7 +1695,7 @@
       "name": "memory_detect_contradiction"
     },
     {
-      "description": "List messages sent to an agent See memory_capabilities.",
+      "description": "List messages sent to an agent",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1723,7 +1723,7 @@
       "name": "memory_inbox"
     },
     {
-      "description": "Replay subscription_events See memory_capabilities.",
+      "description": "Replay subscription_events",
       "inputSchema": {
         "properties": {
           "since": {
@@ -1742,7 +1742,7 @@
       "name": "memory_subscription_replay"
     },
     {
-      "description": "List subscription_dlq rows See memory_capabilities.",
+      "description": "List subscription_dlq rows",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1764,7 +1764,7 @@
       "name": "memory_subscription_dlq_list"
     },
     {
-      "description": "Report per-agent + per-namespace quota usage (read-only) See memory_capabilities.",
+      "description": "Report per-agent + per-namespace quota usage (read-only)",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1785,7 +1785,7 @@
       "name": "memory_quota_status"
     },
     {
-      "description": "Check action vs See memory_capabilities.",
+      "description": "Check action vs",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1869,7 +1869,7 @@
       "name": "memory_check_agent_action"
     },
     {
-      "description": "List substrate-level See memory_capabilities.",
+      "description": "List substrate-level",
       "inputSchema": {
         "properties": {
           "enabled_only": {
@@ -1890,7 +1890,7 @@
       "name": "memory_rule_list"
     },
     {
-      "description": "Offload verbatim content See memory_capabilities.",
+      "description": "Offload verbatim content",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1925,7 +1925,7 @@
       "name": "memory_offload"
     },
     {
-      "description": "Dereference a memory_offload See memory_capabilities.",
+      "description": "Dereference a memory_offload",
       "inputSchema": {
         "properties": {
           "agent_id": {
