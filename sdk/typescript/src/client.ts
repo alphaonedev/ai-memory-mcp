@@ -112,6 +112,21 @@ export interface UpdateOptions extends RequestOptions {
   expectedVersion?: number | string;
 }
 
+/**
+ * Strip every trailing `/` in linear time.
+ *
+ * Replaces `String.prototype.replace(/\/+$/, "")` (#3592, CodeQL
+ * `js/polynomial-redos`). The quantified `/` backtracks quadratically on
+ * a long run of slashes; an end-index scan is O(n) with one slice.
+ */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === "/") {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
+}
+
 export class AiMemoryClient {
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
@@ -125,7 +140,7 @@ export class AiMemoryClient {
     if (!opts.baseUrl) {
       throw new Error("AiMemoryClient: baseUrl is required");
     }
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes(opts.baseUrl);
     this.apiKey = opts.apiKey;
     this.agentId = opts.agentId;
     this.defaultHeaders = opts.headers ?? {};

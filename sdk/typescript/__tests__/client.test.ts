@@ -119,6 +119,29 @@ describe("AiMemoryClient constructor", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((c as any).baseUrl).toBe("http://localhost:9077");
   });
+
+  test("strips multiple trailing slashes; leaves a slash-free URL unchanged (#3592)", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const base = (url: string) => (new AiMemoryClient({ baseUrl: url }) as any).baseUrl;
+    expect(base("https://host:port/")).toBe("https://host:port");
+    expect(base("https://host:port")).toBe("https://host:port");
+    expect(base("https://host:port///")).toBe("https://host:port");
+    expect(base("http://localhost:9077/api/v1/")).toBe(
+      "http://localhost:9077/api/v1",
+    );
+    expect(base("http://localhost:9077//v1")).toBe("http://localhost:9077//v1");
+  });
+
+  test("trailing-slash trim is linear on a 100k-slash input (#3592)", () => {
+    const prefix = "https://host:port";
+    const input = `${prefix}${"/".repeat(100_000)}`;
+    const started = process.hrtime.bigint();
+    const c = new AiMemoryClient({ baseUrl: input });
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((c as any).baseUrl).toBe(prefix);
+    expect(elapsedMs).toBeLessThan(1000);
+  });
 });
 
 describe("AiMemoryClient bind proof-of-possession (#3464)", () => {
