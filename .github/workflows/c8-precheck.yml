@@ -77,6 +77,12 @@ on:
   merge_group:
     types: [checks_requested]
 
+# #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
+# Default contents: read. The one job that talks to the GitHub API
+# (`external-pr-operator-approval-gate`) widens below.
+permissions:
+  contents: read
+
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
 # PR events; isolates fork PRs by PR number. See ci.yml for full
 # rationale.
@@ -918,6 +924,12 @@ jobs:
     name: "External-PR operator-approval gate (author outside team => @alphaonedev review)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # #3591 — `Evaluate external-PR approval requirement` calls
+    # `gh api repos/$REPO/pulls/$PR_NUMBER/reviews` (read-only). Job-level
+    # permissions replace the workflow default, so contents: read stays listed.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Evaluate external-PR approval requirement
         env:

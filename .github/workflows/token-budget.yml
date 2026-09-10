@@ -56,6 +56,11 @@ on:
   pull_request:
     branches: [main, develop, "release/**"]
 
+# #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
+# Checkout + cargo/scripts only; no PR comments, SARIF, or checks writes.
+permissions:
+  contents: read
+
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
 # PR events; isolates fork PRs by PR number. See ci.yml for full
 # rationale.
