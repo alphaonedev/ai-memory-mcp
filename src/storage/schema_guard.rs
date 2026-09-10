@@ -438,6 +438,84 @@ pub fn schema_ahead_of(err: &anyhow::Error) -> Option<&SchemaAheadOfBinary> {
     err.downcast_ref::<SchemaAheadOfBinary>()
 }
 
+/// v1.0.0 #3411 / #3434 — slug for a schema-behind refusal on a read-only
+/// verb (`boot`, `doctor`). A writer would migrate; these verbs must not.
+pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str =
+    crate::errors::error_codes::SCHEMA_BEHIND_READ_ONLY_REFUSAL;
+
+/// Repair verb named in the schema-behind refusal (and in `boot` / `doctor`
+/// copy). One spelling so the hardcoded-literals ratchet does not re-grow.
+pub const SCHEMA_BEHIND_REPAIR: &str = "ai-memory migrate --in-place";
+
+/// Companion repair: starting the daemon runs [`crate::db::open`], which
+/// migrates. Named next to [`SCHEMA_BEHIND_REPAIR`] because the default
+/// build has no `migrate` subcommand (`Migrate` is `--features sal`).
+pub const SCHEMA_BEHIND_REPAIR_DAEMON: &str = "start the daemon";
+
+/// v1.0.0 #3411 / #3434 — the typed refusal: this database's schema is
+/// BEHIND what this binary's migration ladder produces, and the caller is
+/// a read-only verb that must not migrate.
+///
+/// Distinct from [`SchemaAheadOfBinary`] (run a newer binary) and from
+/// [`SchemaStampZeroed`] (the stamp row was destroyed). The operator
+/// action is to migrate this database, then re-run the verb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaBehindReadOnly {
+    /// The version recorded in the database's `schema_version` relation.
+    pub observed: i64,
+    /// The tip this binary's ladder produces (`CURRENT_SCHEMA_VERSION`).
+    pub supported: i64,
+    /// [`BACKEND_SQLITE`] or [`BACKEND_POSTGRES`].
+    pub backend: &'static str,
+    /// The database file path (sqlite) or a redacted store label (postgres).
+    pub target: String,
+    /// The fully rendered operator-facing message.
+    pub detail: String,
+}
+
+impl SchemaBehindReadOnly {
+    /// Build the refusal, rendering both versions and the repair verbs.
+    #[must_use]
+    pub fn new(observed: i64, backend: &'static str, target: &str) -> Self {
+        let supported = crate::storage::migrations::current_schema_version();
+        Self {
+            observed,
+            supported,
+            backend,
+            target: target.to_string(),
+            detail: render_behind(observed, supported, backend, target),
+        }
+    }
+}
+
+impl fmt::Display for SchemaBehindReadOnly {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SchemaBehindReadOnly {}
+
+fn render_behind(observed: i64, supported: i64, backend: &str, target: &str) -> String {
+    format!(
+        "{slug}: database schema is BEHIND this binary: {target} ({backend}) is on schema \
+         v{observed}, but ai-memory {bin} is at v{supported}. This read-only verb will not \
+         migrate. Repair: `{repair}` or {daemon}, then re-run.",
+        slug = SCHEMA_BEHIND_READ_ONLY_REFUSAL,
+        bin = crate::PKG_VERSION,
+        repair = SCHEMA_BEHIND_REPAIR,
+        daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
+    )
+}
+
+/// v1.0.0 #3411 / #3434 — recover the schema-behind verdict from an
+/// `anyhow` chain so `boot` / `doctor` report the drift (and the repair)
+/// instead of an opaque open / raw-SQL failure.
+#[must_use]
+pub fn schema_behind_read_only(err: &anyhow::Error) -> Option<&SchemaBehindReadOnly> {
+    err.downcast_ref::<SchemaBehindReadOnly>()
+}
+
 /// v1.0.0 #2555 — the typed refusal for a POISONED `schema_version` ledger: a
 /// stamp ABOVE [`crate::storage::migrations::MAX_SCHEMA_VERSION`], the absolute
 /// ceiling no real migration ladder can reach.
@@ -668,5 +746,35 @@ mod tests {
     fn stamp_fresh_is_version_zero() {
         assert_eq!(SchemaStamp::Fresh.version(), 0);
         assert_eq!(SchemaStamp::Known(87).version(), 87);
+    }
+
+    #[test]
+    fn schema_behind_read_only_names_both_versions_and_the_repair() {
+        let supported = crate::storage::migrations::current_schema_version();
+        let observed = supported - 1;
+        let err = SchemaBehindReadOnly::new(observed, BACKEND_SQLITE, "/db");
+        assert_eq!(err.observed, observed);
+        assert_eq!(err.supported, supported);
+        assert!(
+            err.detail.contains(&format!("v{observed}")),
+            "{}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains(&format!("v{supported}")),
+            "{}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains(SCHEMA_BEHIND_READ_ONLY_REFUSAL),
+            "{}",
+            err.detail
+        );
+        assert!(err.detail.contains(SCHEMA_BEHIND_REPAIR), "{}", err.detail);
+        assert!(
+            err.detail.contains(SCHEMA_BEHIND_REPAIR_DAEMON),
+            "{}",
+            err.detail
+        );
     }
 }

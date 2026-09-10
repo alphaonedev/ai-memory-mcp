@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 use super::migrations::{SCHEMA, migrate};
-use super::schema_guard::{BACKEND_SQLITE, SchemaStamp};
+use super::schema_guard::{BACKEND_SQLITE, SchemaBehindReadOnly, SchemaStamp};
 
 /// Shared `anyhow` context for the valid-time UDF registration, referenced by
 /// name at every open funnel (`open`, `open_read_only`, `open_unmigrated`)
@@ -896,7 +896,10 @@ pub const MISSING_DATABASE_REFUSAL: &str =
 /// # Errors
 ///
 /// Returns [`MISSING_DATABASE_REFUSAL`] when `path` does not exist,
-/// plus every error [`open_read_only`] can produce.
+/// [`super::schema_guard::SchemaBehindReadOnly`] when the stamp is
+/// strictly behind this binary (a writer would migrate; this verb
+/// must not), plus every error [`open_read_only`] / the #2445/#2555/#2564
+/// guards can produce.
 pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
     match path.try_exists() {
         Ok(false) => anyhow::bail!("{}: {}", MISSING_DATABASE_REFUSAL, path.display()),
@@ -904,9 +907,21 @@ pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
         Err(e) => anyhow::bail!("cannot stat {}: {e}", path.display()),
     }
     let conn = open_read_only(path)?;
+    let target = path.display().to_string();
     // Diagnose schema-ahead / poisoned / zeroed WITHOUT migrating so
     // boot/doctor keep the #2445/#2555/#2564 typed refusals.
-    assert_schema_not_ahead(&conn, &path.display().to_string())?;
+    assert_schema_not_ahead(&conn, &target)?;
+    // #3411 / #3434 — a stamp strictly BEHIND this binary used to be a
+    // silent migrate (`db::open`). After the read-only funnel, the first
+    // query against a missing column failed as raw rusqlite. Probe the
+    // stamp and refuse with a typed error naming both versions + the
+    // repair (`ai-memory migrate --in-place` / start the daemon).
+    let stamp = probe_schema_stamp(&conn)?;
+    let observed = stamp.version();
+    let supported = super::migrations::current_schema_version();
+    if observed < supported {
+        return Err(SchemaBehindReadOnly::new(observed, BACKEND_SQLITE, &target).into());
+    }
     Ok(conn)
 }
 
@@ -1105,6 +1120,48 @@ mod tests {
             .pragma_query_value(None, "query_only", |row| row.get(0))
             .expect("query_only");
         assert_ne!(query_only, 0, "existing open must stay query_only");
+    }
+
+    #[test]
+    fn open_existing_read_only_refuses_schema_behind_3411() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("behind.db");
+        drop(open(&path).expect("create"));
+        let supported = crate::storage::migrations::current_schema_version();
+        let behind = supported - 1;
+        {
+            let conn = Connection::open(&path).expect("raw reopen");
+            conn.execute("DELETE FROM schema_version", [])
+                .expect("clear stamp");
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                rusqlite::params![behind],
+            )
+            .expect("plant CURRENT-1");
+        }
+        let err = open_existing_read_only(&path).expect_err("behind stamp must refuse");
+        let behind_err = crate::storage::schema_guard::schema_behind_read_only(&err)
+            .expect("typed SCHEMA_BEHIND_READ_ONLY_REFUSAL");
+        assert_eq!(behind_err.observed, behind);
+        assert_eq!(behind_err.supported, supported);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(crate::storage::schema_guard::SCHEMA_BEHIND_READ_ONLY_REFUSAL),
+            "refusal must name the slug: {msg}"
+        );
+        assert!(
+            msg.contains(crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR),
+            "refusal must name the repair: {msg}"
+        );
+        let still: i64 = Connection::open(&path)
+            .expect("raw reopen after refusal")
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .expect("stamp readable");
+        assert_eq!(still, behind, "read-only refusal must not migrate");
     }
 
     #[test]

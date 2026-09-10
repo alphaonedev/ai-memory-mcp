@@ -334,6 +334,13 @@ enum BootStatus {
     /// destroyed stamp): this one names the repair verb, because no binary ever
     /// wrote the observed version.
     WarnSchemaVersionPoisoned { observed: i64 },
+    /// v1.0.0 #3411 / #3434 — `open_existing_read_only` refused because the
+    /// recorded schema stamp is strictly BEHIND this binary. Distinct from
+    /// [`Self::WarnSchemaUnsupported`] (ahead → "install a newer binary"):
+    /// this one names `ai-memory migrate --in-place` / start the daemon,
+    /// because the binary is already the right one and the database needs
+    /// the writer funnel.
+    WarnSchemaBehind { observed: i64, supported: i64 },
 }
 
 impl BootStatus {
@@ -344,7 +351,8 @@ impl BootStatus {
             Self::WarnDbUnavailable
             | Self::WarnSchemaUnsupported { .. }
             | Self::WarnSchemaStampInvalid { .. }
-            | Self::WarnSchemaVersionPoisoned { .. } => "warn",
+            | Self::WarnSchemaVersionPoisoned { .. }
+            | Self::WarnSchemaBehind { .. } => "warn",
         }
     }
 }
@@ -533,6 +541,16 @@ impl BootManifest {
                  `ai-memory doctor --repair-schema-version <N>`. Run \
                  `ai-memory doctor` for the full diagnosis."
             ),
+            BootStatus::WarnSchemaBehind {
+                observed,
+                supported,
+            } => format!(
+                "db schema v{observed} is behind this binary (v{supported}); \
+                 this read-only verb will not migrate. Repair: `{repair}` or {daemon}. \
+                 Run `ai-memory doctor`.",
+                repair = crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR,
+                daemon = crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR_DAEMON,
+            ),
         };
 
         Self {
@@ -631,6 +649,14 @@ pub fn run(
                         crate::storage::schema_guard::schema_version_poisoned(&e).map(|poisoned| {
                             BootStatus::WarnSchemaVersionPoisoned {
                                 observed: poisoned.observed,
+                            }
+                        })
+                    })
+                    .or_else(|| {
+                        crate::storage::schema_guard::schema_behind_read_only(&e).map(|behind| {
+                            BootStatus::WarnSchemaBehind {
+                                observed: behind.observed,
+                                supported: behind.supported,
                             }
                         })
                     })
@@ -982,6 +1008,22 @@ fn emit_status_header(
                          then restamp with `ai-memory doctor --repair-schema-version <N>`. \
                          Run `ai-memory doctor` for the full diagnosis.)",
                         manifest.namespace, observed,
+                    )?;
+                }
+                BootStatus::WarnSchemaBehind {
+                    observed,
+                    supported,
+                } => {
+                    writeln!(
+                        out.stdout,
+                        "#   namespace:  {} (db schema v{} is behind this binary \
+                         (v{}); this read-only verb will not migrate. Repair: `{}` \
+                         or {}.)",
+                        manifest.namespace,
+                        observed,
+                        supported,
+                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR,
+                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR_DAEMON,
                     )?;
                 }
             }
@@ -1927,10 +1969,15 @@ mod tests {
 
     #[test]
     fn boot_ok_for_schema_at_min() {
+        // After #3411 the read-only funnel no longer migrates, so planting
+        // `MIN_SUPPORTED_SCHEMA` on a CURRENT database is the schema-behind
+        // refusal (`boot_warns_on_schema_behind_read_only_3411`). This test
+        // keeps the supported-range happy path: a fully-migrated (CURRENT)
+        // stamp still boots ok. The MIN-range helper is
+        // `schema_below_min_is_unsupported`.
         let _g = test_lock();
         let mut env = TestEnv::fresh();
         seed_memory(&env.db_path, "ns-min", "row", "x");
-        override_schema_version(&env.db_path, i64::from(MIN_SUPPORTED_SCHEMA));
         let db_path = env.db_path.clone();
         let cfg = default_config();
         let mut args = default_args();
@@ -1940,8 +1987,53 @@ mod tests {
         let stdout = std::str::from_utf8(&env.stdout).unwrap();
         assert!(
             stdout.contains("# ai-memory boot: ok"),
-            "MIN boundary should be supported (not warn): {stdout}"
+            "CURRENT stamp should be supported (not warn): {stdout}"
         );
+    }
+
+    /// #3411 — a stamp of CURRENT-1 must be a typed schema-behind refusal
+    /// (warn header, both versions, repair verb), and the file must not
+    /// be migrated.
+    #[test]
+    fn boot_warns_on_schema_behind_read_only_3411() {
+        let _g = test_lock();
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-behind", "row", "x");
+        let supported = crate::storage::migrations::current_schema_version();
+        let behind = supported - 1;
+        override_schema_version(&env.db_path, behind);
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-behind".to_string());
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        assert!(
+            stdout.contains("# ai-memory boot: warn"),
+            "expected schema-drift warn header: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("v{behind}")) && stdout.contains(&format!("v{supported}")),
+            "expected both versions in the warn: {stdout}"
+        );
+        assert!(
+            stdout.contains(crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR),
+            "expected the repair verb: {stdout}"
+        );
+        assert!(
+            !stdout.contains("consider upgrading"),
+            "must not print the schema-ahead upgrade remedy for a behind stamp: {stdout}"
+        );
+        let still: i64 = rusqlite::Connection::open(&db_path)
+            .expect("raw reopen")
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .expect("stamp readable");
+        assert_eq!(still, behind, "boot must not migrate a behind stamp");
     }
 
     #[test]

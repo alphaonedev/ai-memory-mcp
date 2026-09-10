@@ -136,6 +136,16 @@ pub mod error_codes {
     /// A SEPARATE slug because the operator action differs ("restamp the
     /// poisoned ledger", not "run a newer binary").
     pub const SCHEMA_VERSION_POISONED: &str = "SCHEMA_VERSION_POISONED";
+
+    /// v1.0.0 #3411 / #3434 — a read-only verb (`boot`, `doctor`) opened a
+    /// database whose schema stamp is STRICTLY BEHIND this binary. A writer
+    /// (`db::open`, the daemon, `ai-memory migrate --in-place`) would migrate;
+    /// these verbs must not. Un-prefixed for the same reason as
+    /// [`SCHEMA_AHEAD_OF_BINARY`]: a deliberate refusal STATE shared across
+    /// surfaces, not a backend fault. A SEPARATE slug because the operator
+    /// action is the opposite of ahead ("migrate this database / start the
+    /// daemon", not "run a newer binary").
+    pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str = "SCHEMA_BEHIND_READ_ONLY_REFUSAL";
 }
 
 // ---------------------------------------------------------------------------

@@ -690,7 +690,9 @@ These seven subcommands land in v0.6.3.1.
 
 Universal session-boot CLI primitive. Read-only, fast (no embedder, no
 daemon). A missing `--db` is refused — the file is never created or
-migrated (#3411). Always emits a 5-field diagnostic manifest (version, db_path +
+migrated (#3411). A `--db` whose schema stamp is behind this binary is
+refused (not migrated); repair with `ai-memory migrate --in-place` or
+start the daemon. Always emits a 5-field diagnostic manifest (version, db_path +
 schema_version + memory count, tier with embedder/reranker/llm, latency,
 namespace + loaded count) so the agent and the human always see what
 loaded and why. Global `--json` is honoured as `--format json` when
@@ -887,7 +889,9 @@ Index / Recall / Governance / Sync / Webhook / Capabilities /
 Reflection Health / **LLM Reachability (#1146)** / **Embeddings
 Reachability (#1598)**. Each section is severity-tagged. Read-only —
 never mutates the database. A missing `--db` is reported as Critical
-Storage and is never created (#3434). Identity reports the resolved
+Storage and is never created (#3434). A `--db` whose schema stamp is
+behind this binary is Critical Storage naming `ai-memory migrate --in-place`
+(or start the daemon); the file is not migrated. Identity reports the resolved
 caller id and whether a signing key for THAT id is enrolled.
 
 | Flag | Type | Default | Notes |

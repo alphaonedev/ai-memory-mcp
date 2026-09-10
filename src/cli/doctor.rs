@@ -59,9 +59,10 @@ use std::time::Duration;
 /// JSON payload and the `Configuration` report section. One name, one spelling.
 const FACT_CONFIG_PATH: &str = "config_path";
 /// #2555 — schema-refusal fact labels, shared by the schema-ahead / zeroed /
-/// poisoned Storage-Critical arms so the three refusals report one spelling.
+/// poisoned / behind Storage-Critical arms so the four refusals report one spelling.
 const FACT_DB_SCHEMA: &str = "db_schema";
 const FACT_BINARY_SUPPORTS_SCHEMA: &str = "binary_supports_schema";
+const FACT_SCHEMA_STAMP: &str = "schema_stamp";
 const FACT_DIM_VIOLATIONS: &str = "dim_violations";
 
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
@@ -1014,6 +1015,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
             // flattening it into "could not open database" would hide the one
             // fact the operator needs.
             let poisoned = crate::storage::schema_guard::schema_version_poisoned(&e);
+            let behind = crate::storage::schema_guard::schema_behind_read_only(&e);
             let mut facts = vec![("error".into(), e.to_string())];
             if let Some(a) = ahead {
                 facts.push((FACT_DB_SCHEMA.into(), a.observed.to_string()));
@@ -1022,13 +1024,18 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
             if let Some(z) = zeroed {
                 facts.push((FACT_DB_SCHEMA.into(), z.observed.to_string()));
                 facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), z.supported.to_string()));
-                facts.push(("schema_stamp".into(), "invalid".into()));
+                facts.push((FACT_SCHEMA_STAMP.into(), "invalid".into()));
             }
             if let Some(p) = poisoned {
                 facts.push((FACT_DB_SCHEMA.into(), p.observed.to_string()));
                 facts.push(("max_schema_version".into(), p.max.to_string()));
                 facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), p.supported.to_string()));
-                facts.push(("schema_stamp".into(), "poisoned".into()));
+                facts.push((FACT_SCHEMA_STAMP.into(), "poisoned".into()));
+            }
+            if let Some(b) = behind {
+                facts.push((FACT_DB_SCHEMA.into(), b.observed.to_string()));
+                facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), b.supported.to_string()));
+                facts.push((FACT_SCHEMA_STAMP.into(), "behind".into()));
             }
             sections.push(section_identity_3147(None, db_path, caller_agent_id));
             sections.push(ReportSection {
@@ -1062,6 +1069,18 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                          still works against this database: snapshot it, then restamp \
                          with `ai-memory doctor --repair-schema-version <N>`.",
                         db_path.display()
+                    )
+                } else if let Some(b) = behind {
+                    format!(
+                        "database at {} is on schema v{}, behind this binary (v{}) — \
+                         refusing to operate it (read-only; {}). Repair: `{}` or {}. \
+                         Every other section is N/A.",
+                        db_path.display(),
+                        b.observed,
+                        b.supported,
+                        crate::storage::schema_guard::SCHEMA_BEHIND_READ_ONLY_REFUSAL,
+                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR,
+                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR_DAEMON,
                     )
                 } else if e.to_string().contains(db::MISSING_DATABASE_REFUSAL) {
                     format!(
@@ -6514,5 +6533,52 @@ mod cov_doctor_identity_posture_3521 {
                 || stdout.contains(crate::db::MISSING_DATABASE_REFUSAL),
             "report must name the read-only refusal: {stdout}"
         );
+    }
+
+    /// #3434 — a stamp of CURRENT-1 is Critical Storage naming the repair
+    /// verb, and the file is not migrated.
+    #[test]
+    fn doctor_schema_behind_is_critical_storage_3434() {
+        let mut env = crate::cli::test_utils::TestEnv::fresh();
+        drop(crate::db::open(&env.db_path).expect("create"));
+        let supported = crate::storage::migrations::current_schema_version();
+        let behind = supported - 1;
+        {
+            let conn = rusqlite::Connection::open(&env.db_path).expect("raw reopen");
+            conn.execute("DELETE FROM schema_version", [])
+                .expect("clear stamp");
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                rusqlite::params![behind],
+            )
+            .expect("plant CURRENT-1");
+        }
+        let db_path = env.db_path.clone();
+        let mut out = env.output();
+        let code = run(&db_path, &DoctorArgs::default(), &mut out).unwrap();
+        assert_eq!(code, 2, "a behind schema is Critical");
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        assert!(
+            stdout.contains("Storage") && stdout.contains("CRIT"),
+            "expected Critical Storage: {stdout}"
+        );
+        assert!(
+            stdout.contains(crate::storage::schema_guard::SCHEMA_BEHIND_READ_ONLY_REFUSAL)
+                || stdout.contains("behind this binary"),
+            "expected the typed behind refusal: {stdout}"
+        );
+        assert!(
+            stdout.contains(crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR),
+            "expected the repair verb: {stdout}"
+        );
+        let still: i64 = rusqlite::Connection::open(&db_path)
+            .expect("raw reopen after refusal")
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .expect("stamp readable");
+        assert_eq!(still, behind, "doctor must not migrate a behind stamp");
     }
 }

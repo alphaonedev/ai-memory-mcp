@@ -8,10 +8,11 @@
 //! These tests prove `ai-memory boot` survives the failure modes that
 //! actually wedge AI agents in the wild:
 //!
-//! 1. **Schema migration on first boot after upgrade.** A user upgrading
-//!    from v0.6.3.0 → v0.6.3.1 has a v17 schema; their first session boot
-//!    must trigger v17→v18→v19 cleanly and still return the seeded
-//!    memories.
+//! 1. **Schema-behind on first boot after upgrade.** A user upgrading
+//!    from an older schema has a stamp below this binary; `boot` is
+//!    read-only and must WARN with the typed behind refusal (repair:
+//!    `ai-memory migrate --in-place` / start the daemon) rather than
+//!    silently migrating. The writer funnel (`db::open`) still migrates.
 //! 2. **Corrupted DB.** Disk error, partial write, malware quarantine —
 //!    boot must exit 0 with a `warn` status rather than crashing the
 //!    agent's first turn.
@@ -81,25 +82,22 @@ fn seed_one(db: &Path, namespace: &str, title: &str, content: &str) -> String {
 
 #[test]
 fn boot_after_v18_to_v19_migration() {
-    // Simulate a v0.6.3.0 install: open the DB at the current version,
-    // seed a memory, then forcibly roll `schema_version` back. The next
-    // `db::open` (which is what `ai-memory boot` calls under the hood)
-    // must re-run the v18→v19 migration block and still return the row.
+    // Simulate an older install: open the DB at the current version,
+    // seed a memory, then forcibly roll `schema_version` back. `boot` is
+    // read-only (#3411): it must WARN with the typed behind refusal and
+    // leave the stamp untouched. The writer funnel (`db::open`) is what
+    // re-runs the ladder and keeps the seeded row.
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("legacy.db");
 
     let id = seed_one(&db_path, "lifecycle-ns", "pre-migration-row", "x");
     {
         let conn = db::open(&db_path).unwrap();
-        // Roll schema_version back so the next open() forces a re-migrate
-        // through the most-recent migration block. v18 + v19 are the
-        // current targets; rolling to 17 covers both.
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute("INSERT INTO schema_version (version) VALUES (17)", [])
             .unwrap();
     }
 
-    // Now invoke the binary — boot calls db::open which runs migrate().
     let assert = ai_memory(&db_path)
         .args([
             "boot",
@@ -114,21 +112,24 @@ fn boot_after_v18_to_v19_migration() {
         .success();
     let stdout = std::str::from_utf8(&assert.get_output().stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("expected JSON output post-migration; err={e}; got: {stdout}"));
-    assert_eq!(parsed["status"], "ok");
-    assert_eq!(parsed["count"].as_u64(), Some(1));
-    let titles: Vec<String> = parsed["memories"]
-        .as_array()
-        .expect("memories array")
-        .iter()
-        .map(|m| m["title"].as_str().unwrap().to_string())
-        .collect();
+        .unwrap_or_else(|e| panic!("expected JSON output; err={e}; got: {stdout}"));
+    assert_eq!(parsed["status"], "warn");
+    let note = parsed["note"].as_str().unwrap_or_default();
     assert!(
-        titles.iter().any(|t| t == "pre-migration-row"),
-        "expected seeded row to survive migration; got titles: {titles:?}"
+        note.contains("behind") || note.contains("migrate --in-place"),
+        "boot must name the behind repair, got note: {note}"
     );
+    let still: i64 = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(still, 17, "boot must not migrate a behind stamp");
 
-    // Verify the DB is now at the current schema version.
+    // The writer funnel still migrates and the seeded row survives.
     let conn = db::open(&db_path).unwrap();
     let v: i64 = conn
         .query_row(
@@ -166,8 +167,19 @@ fn boot_after_db_corruption_recovery() {
     // open() returns an error.
     std::fs::write(&db_path, b"this is not a sqlite database file").unwrap();
 
-    let assert = ai_memory(&db_path)
+    // #3411 — `--quiet` + unavailable DB is empty stdout (hook contract).
+    let quiet = ai_memory(&db_path)
         .args(["boot", "--namespace", "ns-corrupt", "--quiet"])
+        .assert()
+        .success();
+    assert!(
+        quiet.get_output().stdout.is_empty(),
+        "--quiet must yield empty stdout, got: {}",
+        String::from_utf8_lossy(&quiet.get_output().stdout)
+    );
+
+    let assert = ai_memory(&db_path)
+        .args(["boot", "--namespace", "ns-corrupt"])
         .assert()
         .success(); // Exit 0 — graceful degrade is the contract.
     let stdout = std::str::from_utf8(&assert.get_output().stdout).unwrap();
