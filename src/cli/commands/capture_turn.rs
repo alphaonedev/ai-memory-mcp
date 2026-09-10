@@ -203,9 +203,9 @@ fn run_capture_turn(
     let auto_index = match args.host_turn_index.as_deref() {
         Some(HOST_TURN_INDEX_AUTO) => true,
         Some(raw) => {
-            let n: i64 = raw
-                .parse()
-                .map_err(|_| anyhow!("INVALID_INPUT: --host-turn-index must be an integer or `auto`"))?;
+            let n: i64 = raw.parse().map_err(|_| {
+                anyhow!("INVALID_INPUT: --host-turn-index must be an integer or `auto`")
+            })?;
             params.insert("host_turn_index".to_string(), json!(n));
             false
         }
@@ -235,8 +235,8 @@ fn run_capture_turn(
 
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "capture-turn", out)?;
     let conn = db::open(&db_path)?;
-    let caller = crate::identity::resolve_agent_id(cli_agent_id, None)
-        .map_err(|e| anyhow!("{e}"))?;
+    let caller =
+        crate::identity::resolve_agent_id(cli_agent_id, None).map_err(|e| anyhow!("{e}"))?;
 
     let envelope = if auto_index {
         crate::mcp::handle_capture_turn_auto(&conn, &Value::Object(params), Some(&caller))
@@ -250,7 +250,10 @@ fn run_capture_turn(
         return Ok(());
     }
 
-    let id = envelope.get("memory_id").and_then(Value::as_str).unwrap_or("?");
+    let id = envelope
+        .get("memory_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
     let dedup = envelope
         .get("dedup_hit")
         .and_then(Value::as_bool)
@@ -301,7 +304,8 @@ mod tests {
 
     #[test]
     fn map_stop_payload_none_when_message_absent() {
-        let p = json!({"hook_event_name": "Stop", "session_id": "s", "last_assistant_message": null});
+        let p =
+            json!({"hook_event_name": "Stop", "session_id": "s", "last_assistant_message": null});
         assert!(map_stop_payload(&p).is_none());
     }
 

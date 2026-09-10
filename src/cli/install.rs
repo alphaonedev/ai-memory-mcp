@@ -338,8 +338,7 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
     // command (the hook process inherits no shell environment).
     let hook_agent_id = match t_args.hook {
         Some(HookKind::Capture) => Some(
-            crate::identity::resolve_agent_id(cli_agent_id, None)
-                .map_err(|e| anyhow!("{e}"))?,
+            crate::identity::resolve_agent_id(cli_agent_id, None).map_err(|e| anyhow!("{e}"))?,
         ),
         _ => None,
     };
@@ -500,6 +499,13 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
                 writeln!(
                     out.stdout,
                     "installed PreToolUse hook -> {}",
+                    config_path.display(),
+                )?;
+            }
+            HookKind::Capture => {
+                writeln!(
+                    out.stdout,
+                    "installed Stop capture hook -> {}",
                     config_path.display(),
                 )?;
             }

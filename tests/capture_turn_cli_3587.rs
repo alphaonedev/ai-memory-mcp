@@ -96,12 +96,8 @@ fn capture_turn_cli_envelope_matches_mcp_tool_3587() {
     // MCP surface: same handler the MCP dispatch calls, same params.
     let (_mcp_dir, mcp_db) = scratch("parity-mcp");
     let conn = ai_memory::db::open(&mcp_db).expect("open scratch DB");
-    let mcp_envelope = ai_memory::mcp::handle_capture_turn(
-        &conn,
-        &params,
-        Some("test-agent-3587"),
-    )
-    .expect("in-process MCP capture");
+    let mcp_envelope = ai_memory::mcp::handle_capture_turn(&conn, &params, Some("test-agent-3587"))
+        .expect("in-process MCP capture");
 
     assert_eq!(
         normalise(cli_envelope),
@@ -165,7 +161,11 @@ fn capture_turn_cli_stop_payload_auto_index_dedups_3587() {
         String::from_utf8_lossy(&first.stderr)
     );
     let first_env: Value = serde_json::from_slice(&first.stdout).expect("first envelope");
-    assert_eq!(first_env["dedup_hit"], Value::Bool(false), "got {first_env}");
+    assert_eq!(
+        first_env["dedup_hit"],
+        Value::Bool(false),
+        "got {first_env}"
+    );
 
     // Host re-delivery of the identical turn → content-guarded dedup hit.
     let second = run_cli(&db, &["capture-turn", "--json"], &stop);

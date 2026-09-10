@@ -6,7 +6,7 @@
 //! # The defect this closes
 //!
 //! `--json` is declared `global = true` on [`crate::daemon_runtime::Cli`],
-//! so **clap accepts it on all 95 subcommands**. Only some of them do
+//! so **clap accepts it on all 96 subcommands**. Only some of them do
 //! anything with it. `ai-memory install --json`, `wrap --json`,
 //! `man --json`, `config check --json` and `export-forensic-bundle --json`
 //! parsed fine, exited 0, and emitted their ordinary human output — a flag

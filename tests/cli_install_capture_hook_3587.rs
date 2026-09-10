@@ -87,7 +87,10 @@ fn install_capture_hook_is_idempotent_3587() {
     assert_eq!(entry["hooks"][0]["type"], "command", "got {entry}");
     assert_eq!(entry["hooks"][0]["async"], Value::Bool(true), "got {entry}");
     // Managed-keys allowlist is `["hooks"]` for this block.
-    assert_eq!(entry["// ai-memory:managed-keys"][0], "hooks", "got {entry}");
+    assert_eq!(
+        entry["// ai-memory:managed-keys"][0], "hooks",
+        "got {entry}"
+    );
 
     let command = entry["hooks"][0]["command"]
         .as_str()
@@ -151,7 +154,9 @@ fn install_capture_hook_rejected_on_non_claude_code_3587() {
     install_cmd("cursor", &cursor_cfg, &["--hook", "capture", "--apply"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("only supported for `claude-code`"));
+        .stderr(predicates::str::contains(
+            "only supported for `claude-code`",
+        ));
 
     // Codex has no installable turn-capture hook (see the installer's
     // cited Codex-leg rationale), so it refuses with the documented
