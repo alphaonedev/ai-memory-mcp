@@ -992,6 +992,50 @@ This lexical qualification gate does not prove filesystem isolation or replace
 the OS permissions below; runtime credential refusal and content-plane checks
 are separate controls.
 
+**Forward-binding content-plane allowance (#3578).**
+`tests/qual_wake_content_boundary_3578.rs` runs in the qualification family.
+Its reviewed source manifest covers the hub, both producer sinks, Rust client,
+CLI consumer, wake bus, spawn-audit wrapper, and Python/TypeScript listeners
+(including the Python swarm adapter). It admits the existing flow:
+
+- A committed notify emits metadata to the bus; the in-process and UDS sinks
+  encode a `WakeMeta` hint. The producer's inbound hub frames handle liveness
+  and refusals; they do not dispatch memory writes.
+- The Rust client decodes a hint into a signal. `wake-listen` calls
+  `catch_up_read` with the operator-resolved listener identity, through the
+  existing `handle_inbox` funnel. The hint never selects that identity.
+  Rendering receives metadata and the resulting count, not inbox content.
+- An operator-supplied `--exec` command goes through
+  `spawn_audit::audited_tokio_command`. This explicitly admitted edge can open
+  the seeded audit database and append a content-free signed spawn-audit row.
+  The eleven `AI_MEMORY_WAKE_*` fields attached by the listener are pinned by
+  exact key **and value expression**: reason, listener identity, hub identity,
+  row ID, namespace, sender, digest, sequence, missed/pending counts, and inbox
+  count. No hint content/title becomes an environment value or shell program.
+
+The hook and SDK `on_signal` / `onSignal` callbacks are **external operator
+trust boundaries**, not SDK-screened content paths. They may independently
+read or write using their own credentials. The hook also inherits its operator
+environment; the pin covers the fields the listener attaches, not a sanitized
+process environment. GA has no automatic A2A decoder-to-notify/store content
+write in these reviewed paths. A future payload decoder requires a reviewed
+SDK-edge screen and an explicit allowlist change; an operator callback is not
+that screen.
+
+The manifest is a conservative source-change gate: Rust production tokens
+(including imports, all feature branches and code after inline test modules)
+and SDK source bytes must match, and the three Rust directory inventories must
+remain exact. Rust formatting/comments and complete inline `cfg(test)` modules
+may change without updating the pin. Mutation tests refuse added writes and
+aliases, caller substitution, content/title environment fields, command
+substitution, SDK callback-to-write changes, and production appended after
+tests. Updating a digest requires boundary review, even for a harmless code
+change; do not regenerate the manifest merely to make a gate green. This is
+not a compiler call-graph proof, macro-expansion analysis, proof of unchanged
+external dependency implementations, or a sandbox for arbitrary application
+callbacks. Runtime codec/credential tests and the OS isolation contract remain
+separate evidence.
+
 **Process isolation (#3578).** The systemd unit runs as `User=ai-memory-hub`
 (not the daemon's `ai-memory`), jails `/var/lib/ai-memory` with
 `InaccessiblePaths=`, and restricts the address family to `AF_UNIX`: the wake
