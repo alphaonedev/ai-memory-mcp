@@ -1,0 +1,63 @@
+# CodeQL for the Rust substrate — advanced setup (the default-setup API does not
+# accept `rust` for this repository; default setup covers javascript-typescript,
+# python and actions). Advisory only: NOT a required status check until its first
+# full runs have been reviewed (operator approval 2026-09-10). `build-mode: none`
+# uses the CodeQL Rust extractor without a cargo build; the toolchain pin matches
+# rust-toolchain.toml so `cargo metadata` resolves the same graph CI builds.
+name: CodeQL (Rust)
+
+on:
+  push:
+    branches: [main, "release/**"]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/codeql-rust.yml"
+  pull_request:
+    branches: [main, "release/**"]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/codeql-rust.yml"
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: CodeQL Rust analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+
+      - name: Initialize CodeQL (rust, build-mode none)
+        uses: github/codeql-action/init@c20e34f438d671fc35777cc9820dd7adf8252874 # v3
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-and-quality
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@c20e34f438d671fc35777cc9820dd7adf8252874 # v3
+        with:
+          category: "/language:rust"
