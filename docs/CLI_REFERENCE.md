@@ -745,7 +745,7 @@ Multi-target config-file installer. 10 targets:
 | `--uninstall` | bool | `false` | Remove the managed marker block precisely. Combine with `--apply` to actually delete. |
 | `--config <PATH>` | path | per-target canonical | Override discovery for targets where the canonical path can't be auto-detected. |
 | `--binary <PATH>` | path | resolved on `PATH` | Override the resolved `ai-memory` binary path. |
-| `--hook <KIND>` | enum | — | Also install the named hook (`claude-code` only today). |
+| `--hook <KIND>` | enum | — | Also install the named hook (`claude-code` only). `pretool` = the policy-engine `PreToolUse` gate; `capture` = the `Stop` hook that volunteers each finished assistant turn to `ai-memory capture-turn` ([#3587](https://github.com/alphaonedev/ai-memory-mcp/issues/3587) U4). |
 | `--force` | bool | `false` | Overwrite an existing managed block. |
 
 Behaviours:
@@ -761,6 +761,38 @@ ai-memory install claude-code               # preview the diff
 ai-memory install claude-code --apply       # actually write
 ai-memory install claude-code --uninstall --apply
 ```
+
+#### Capture hook (Claude Code `Stop`) — #3587 U4
+
+`ai-memory install claude-code --hook capture --apply` writes ONE managed
+`hooks.Stop` entry into `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": [
+    {
+      "type": "command",
+      "command": "/abs/path/ai-memory capture-turn --host-kind claude-code --quiet --agent-id <resolved>",
+      "async": true
+    }
+  ]
+}
+```
+
+- `async: true` keeps turn capture off the host's critical path.
+- no `matcher` — the `Stop` event has no tool selector.
+- `--quiet` makes `capture-turn` exit 0 on every path, so the hook can
+  never block the operator's turn; failures are a stderr line only.
+- `--agent-id <resolved>` is embedded explicitly because the spawned hook
+  process inherits no shell environment. The agent id charset is
+  `[A-Za-z0-9_:@./-]`, so it is shell-safe unquoted.
+- Managed keys are `["hooks"]`; re-running is idempotent and the uninstall
+  removes only the managed entry, preserving operator-authored `Stop`
+  hooks.
+- Non-`claude-code` targets refuse `--hook capture`. Codex has no
+  installable turn-capture hook (its user hooks are trust-gated), so the
+  refusal names the documented transcript source: `ai-memory watch --host
+  codex`.
 
 ### `wrap <agent>`
 
@@ -1345,6 +1377,7 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 | `recall-observations` | `memory_recall_observations` | List rows from the recall-consumption ledger (#886). |
 | `check-duplicate` | `memory_check_duplicate` | Pre-write near-duplicate check (cosine over stored embeddings; requires semantic tier+). |
 | `replay` | `memory_replay` | Reconstruct the transcript chain that produced a memory. |
+| `capture-turn` | `memory_capture_turn` | #3587 U4 — L4 host-volunteered turn capture (CLI twin + Claude Code `Stop` hook sink). Reads a `memory_capture_turn` body or a host `Stop` payload on stdin; `--host-turn-index auto` derives `MAX+1` inside the write transaction; `--quiet` never fails. `refuse_pg_store`. |
 | `reflect` | `memory_reflect` | Synthesize a reflection over source memories (CLI dispatcher runs unsigned / no LLM dedup — use MCP/HTTP for those). |
 | `subscribe` / `unsubscribe` / `list-subscriptions` | `memory_subscribe` / `memory_unsubscribe` / `memory_list_subscriptions` | Webhook subscription CRUD. `created_by` / the #870/#872 owner gate is the global `--agent-id` ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
 | `subscription-replay` / `subscription-dlq-list` | `memory_subscription_replay` / `memory_subscription_dlq_list` | Webhook DLQ replay + inspection. |

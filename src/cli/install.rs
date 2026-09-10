@@ -305,18 +305,25 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
     if let Some(kind) = t_args.hook
         && target != Target::ClaudeCode
     {
-        // v1.0.0 #3587 U4 / operator ruling — the Codex `Stop` hook DOES
-        // deliver `last_assistant_message` on stdin, but Codex gates
-        // user-level command hooks behind a per-handler trust hash
-        // (`HookTrustStatus` / `trusted_hash` over a normalized TOML
-        // identity), which a third-party installer cannot set. An
-        // installed Codex hook would be `Untrusted` and never run, so the
-        // documented line-file equivalent is named instead.
+        // v1.0.0 #3587 U4 / operator ruling — verified Codex leg. The
+        // current Codex CLI (0.153.3, 2026-09; docs
+        // https://learn.chatgpt.com/docs/hooks) DOES deliver the finished
+        // turn text on stdin via its `Stop` event
+        // (`codex-rs/hooks/src/events/stop.rs::StopRequest.last_assistant_message`),
+        // BUT every non-managed command hook is trust-gated: discovery
+        // registers a handler only when `trust_status` is Managed/Trusted,
+        // and an installer-written user hook is `HookTrustStatus::Untrusted`
+        // unless the operator trusts it in `/hooks` or launches Codex with
+        // `--dangerously-bypass-hook-trust`. Writing that hook would install
+        // a dead entry (and pointing the operator at a "DANGEROUS" bypass
+        // flag is not an acceptable installer default), so Codex turns are
+        // captured through the already-shipped, trust-free transcript
+        // source over Codex's session log instead.
         if kind == HookKind::Capture && target == Target::Codex {
             bail!(
-                "--hook capture is not supported for `codex`: Codex gates user hooks behind \
-                 a per-handler trust hash the installer cannot set, so the hook would never \
-                 run. Capture Codex turns with the line-file source instead: \
+                "--hook capture is not supported for `codex`: Codex trust-gates user command \
+                 hooks (an installer-written hook stays untrusted and never runs), so capture \
+                 Codex turns from its session log with the documented transcript source: \
                  `ai-memory watch --host codex`."
             );
         }
