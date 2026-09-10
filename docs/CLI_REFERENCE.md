@@ -793,6 +793,15 @@ ai-memory wrap codex -- "draft a release note"
 ai-memory wrap aider -- src/main.rs
 ```
 
+When the inner `boot` refuses an unreachable `--db` (missing file, or a
+schema stamp behind/ahead of the binary), `boot --quiet` is deliberately
+silent so the agent's context stays clean. `wrap` recovers the reason and
+reports the refusal in **one line on wrap's own stderr** —
+`ai-memory wrap: memory boot refused (<reason>); running agent without
+boot context` — then runs the agent with the preamble-only system message
+(#3586). No line is emitted for `--no-boot` or a disabled `[boot] enabled`,
+since neither is a refusal.
+
 ### `logs`
 
 Operator CLI for the operational logging facility (default-OFF; opt-in
