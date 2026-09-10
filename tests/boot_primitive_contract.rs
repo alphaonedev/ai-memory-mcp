@@ -75,16 +75,17 @@ fn boot_emits_ok_status_with_seeded_db() {
 #[test]
 fn boot_emits_warn_status_when_db_path_missing() {
     let tmp = TempDir::new().unwrap();
-    // A path inside a directory that does not exist — db::open fails
-    // because the parent dir is missing. Boot's contract: exit 0, surface
-    // `# ai-memory boot: warn — db unavailable` so the agent sees it.
-    let bad_db = tmp.path().join("nope/does-not-exist/db.sqlite");
+    // Missing file in an existing parent — #3411 refuses to create.
+    // Without --quiet: warn header on stdout + refusal on stderr, exit 0.
+    let bad_db = tmp.path().join("does-not-exist.db");
 
     let assert = ai_memory(&bad_db)
-        .args(["boot", "--quiet", "--namespace", "ns"])
+        .args(["boot", "--namespace", "ns"])
         .assert()
         .success();
-    let stdout = std::str::from_utf8(&assert.get_output().stdout).unwrap();
+    let out = assert.get_output();
+    let stdout = std::str::from_utf8(&out.stdout).unwrap();
+    let stderr = std::str::from_utf8(&out.stderr).unwrap();
 
     assert!(
         stdout.starts_with("# ai-memory boot: warn"),
@@ -94,6 +95,12 @@ fn boot_emits_warn_status_when_db_path_missing() {
         stdout.contains("db unavailable"),
         "warn header must explain cause: {stdout}"
     );
+    assert!(
+        stderr.contains("database does not exist; refusing to create (read-only)")
+            && stderr.contains("db unavailable"),
+        "stderr must carry the read-only refusal: {stderr}"
+    );
+    assert!(!bad_db.exists(), "boot must not create a missing --db");
 }
 
 #[test]
@@ -183,26 +190,34 @@ fn boot_json_format_status_is_machine_parseable() {
 }
 
 #[test]
-fn boot_quiet_suppresses_stderr_only() {
+fn boot_quiet_on_missing_db_is_fully_silent() {
     let tmp = TempDir::new().unwrap();
-    let bad_db = tmp.path().join("does/not/exist/db.sqlite");
+    let bad_db = tmp.path().join("does-not-exist.db");
 
+    // Pass --namespace so auto_namespace does not spawn `git` (that
+    // spawn-audit chokepoint would db::open the missing path and
+    // CREATE it before boot's read-only open runs).
     let assert = ai_memory(&bad_db)
-        .args(["boot", "--quiet"])
+        .args(["boot", "--quiet", "--namespace", "ns"])
         .assert()
         .success();
     let out = assert.get_output();
     let stdout = std::str::from_utf8(&out.stdout).unwrap();
     let stderr = std::str::from_utf8(&out.stderr).unwrap();
 
-    // --quiet alone: stderr silent, stdout still has the diagnostic header.
+    // #3411: --quiet + missing DB is empty stdout AND empty stderr
+    // (a SessionStart hook must not inject a warn header).
+    assert!(
+        stdout.is_empty(),
+        "stdout must be empty under --quiet, got: {stdout}"
+    );
     assert!(
         stderr.is_empty(),
         "stderr must be empty under --quiet, got: {stderr}"
     );
     assert!(
-        !stdout.is_empty() && stdout.contains("# ai-memory boot:"),
-        "stdout must still carry the diagnostic header under --quiet: {stdout}"
+        !bad_db.exists(),
+        "boot --quiet must not create a missing --db"
     );
 }
 
