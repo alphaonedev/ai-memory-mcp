@@ -70,8 +70,11 @@ loading the rest of the file, and the next complete line still
 ingests. Whitespace-only lines are skipped. Quiet ticks (no growth)
 return before opening the database.
 
-Title is `<basename>:<first 8 hex of line sha256>` so two identical
-lines from two files never collide on `(title, namespace)`.
+Title is `<basename>:<first 8 hex of line sha256>`. Identical lines in
+same-named files do share a title; that is harmless because
+`recover_turn_idempotent` does a plain insert with a fresh id (no
+`(title, namespace)` upsert) — identity is the per-file dedup row, not
+the title.
 
 ## Authorship and `observed_actor`
 
