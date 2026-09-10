@@ -62,6 +62,18 @@ impl ActionState {
         }
     }
 
+    /// Every variant, declaration order. MCP `tools/list` enum lists
+    /// (#3378) iterate this so the wire vocabulary cannot drift from
+    /// [`Self::from_str`] / [`Self::as_str`].
+    pub const ALL: [Self; 6] = [
+        Self::Pending,
+        Self::Claimed,
+        Self::InProgress,
+        Self::Done,
+        Self::Failed,
+        Self::Abandoned,
+    ];
+
     /// Whether `self → to` is a legal coordination transition.
     #[must_use]
     pub fn can_transition_to(self, to: Self) -> bool {
@@ -152,6 +164,17 @@ impl EdgeType {
             _ => None,
         }
     }
+
+    /// Every variant, declaration order. MCP `tools/list` enum lists
+    /// (#3378) iterate this so the wire vocabulary cannot drift from
+    /// [`Self::from_str`] / [`Self::as_str`].
+    pub const ALL: [Self; 5] = [
+        Self::Requires,
+        Self::Unlocks,
+        Self::Blocks,
+        Self::GatedBy,
+        Self::Sibling,
+    ];
 }
 
 /// A typed edge in the action dependency DAG. Mirrors the v59
@@ -182,17 +205,11 @@ mod tests {
 
     #[test]
     fn action_state_roundtrips_str() {
-        for s in [
-            ActionState::Pending,
-            ActionState::Claimed,
-            ActionState::InProgress,
-            ActionState::Done,
-            ActionState::Failed,
-            ActionState::Abandoned,
-        ] {
+        for s in ActionState::ALL {
             assert_eq!(ActionState::from_str(s.as_str()), Some(s));
         }
         assert_eq!(ActionState::from_str("bogus"), None);
+        assert_eq!(ActionState::ALL.len(), 6);
     }
 
     #[test]
@@ -216,16 +233,11 @@ mod tests {
 
     #[test]
     fn edge_type_roundtrips_str() {
-        for e in [
-            EdgeType::Requires,
-            EdgeType::Unlocks,
-            EdgeType::Blocks,
-            EdgeType::GatedBy,
-            EdgeType::Sibling,
-        ] {
+        for e in EdgeType::ALL {
             assert_eq!(EdgeType::from_str(e.as_str()), Some(e));
         }
         assert_eq!(EdgeType::from_str("gated_by"), Some(EdgeType::GatedBy));
         assert_eq!(EdgeType::from_str("bogus"), None);
+        assert_eq!(EdgeType::ALL.len(), 5);
     }
 }

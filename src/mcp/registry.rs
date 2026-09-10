@@ -1261,6 +1261,18 @@ const COMPACT_DANGLING_LAST_TOKENS: &[&str] = &[
 ///    else walk forward a word at a time up to that extend cap
 ///    (budget-by-tool: only the dangling tools spend the extra bytes).
 fn compact_description(s: &str) -> String {
+    finish_compact(compact_description_inner(s))
+}
+
+/// Strip trailing `,` / `:` (and surrounding whitespace) from a compact
+/// label. A word-walk can stop on a token that still carries list
+/// punctuation (`memory_forget` shipped `"… a pattern,"` after unit 1).
+fn finish_compact(s: String) -> String {
+    s.trim_end_matches(|c: char| matches!(c, ',' | ':') || c.is_whitespace())
+        .to_string()
+}
+
+fn compact_description_inner(s: &str) -> String {
     if s.len() <= COMPACT_DESCRIPTION_MAX {
         return s.to_string();
     }
@@ -1411,6 +1423,21 @@ mod compact_description_3378_tests {
         // First-sentence cut drops the terminator (existing #859 shape).
         assert_eq!(got, "Calibrate confidence baselines");
         assert!(got.len() <= COMPACT_DESCRIPTION_MAX);
+    }
+
+    #[test]
+    fn trailing_comma_stripped_from_forget_gist_3378() {
+        let src = "Bulk delete memories matching a pattern, namespace, or tier \
+                   (archived first when archive-on-gc is on, else permanent).";
+        let got = compact_description(src);
+        assert!(
+            !got.ends_with(',') && !got.ends_with(':'),
+            "denied: compacted forget description kept trailing punctuation: {got:?}"
+        );
+        assert!(
+            got.contains("pattern"),
+            "allowed: gist must keep 'pattern', got {got:?}"
+        );
     }
 
     #[test]

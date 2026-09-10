@@ -56,6 +56,17 @@ impl SignalType {
             _ => None,
         }
     }
+
+    /// Every variant, declaration order. MCP `tools/list` enum lists
+    /// (#3378) iterate this so the wire vocabulary cannot drift from
+    /// [`Self::from_str`] / [`Self::as_str`].
+    pub const ALL: [Self; 5] = [
+        Self::Authorize,
+        Self::Notify,
+        Self::Request,
+        Self::Response,
+        Self::Broadcast,
+    ];
 }
 
 /// A typed, signed inter-agent signal — one row in the Pillar-1 `signals`
@@ -99,15 +110,10 @@ mod tests {
 
     #[test]
     fn signal_type_roundtrips_str() {
-        for s in [
-            SignalType::Authorize,
-            SignalType::Notify,
-            SignalType::Request,
-            SignalType::Response,
-            SignalType::Broadcast,
-        ] {
+        for s in SignalType::ALL {
             assert_eq!(SignalType::from_str(s.as_str()), Some(s));
         }
+        assert_eq!(SignalType::ALL.len(), 5);
     }
 
     #[test]

@@ -681,6 +681,7 @@ pub struct ActionTransitionRequest {
 
     /// Target state name (`pending` / `claimed` / `in_progress` /
     /// `done` / `failed` / `abandoned`).
+    #[schemars(schema_with = "crate::mcp::schema_enum::action_state")]
     pub to: String,
 
     #[serde(default)]
@@ -696,6 +697,7 @@ pub struct ActionListRequest {
 
     /// Optional state-name filter.
     #[serde(default)]
+    #[schemars(schema_with = "crate::mcp::schema_enum::action_state_optional")]
     pub state: Option<String>,
 
     #[serde(default)]
@@ -712,6 +714,7 @@ pub struct ActionAddEdgeRequest {
 
     /// Edge kind (`requires` / `unlocks` / `blocks` / `gated_by` /
     /// `sibling`).
+    #[schemars(schema_with = "crate::mcp::schema_enum::edge_type")]
     pub edge_type: String,
 }
 
@@ -1440,8 +1443,8 @@ mod handler_tests {
             .expect_err("a malformed holder must be refused");
             assert!(!err.is_empty(), "holder {bad:?} must be refused");
             assert!(
-                handle_lease_get(&conn, &json!({ "action_id": id.clone() }))
-                    .expect("lease_get")["lease"]
+                handle_lease_get(&conn, &json!({ "action_id": id.clone() })).expect("lease_get")
+                    ["lease"]
                     .is_null(),
                 "a refused acquire must mint no lease (holder {bad:?})"
             );

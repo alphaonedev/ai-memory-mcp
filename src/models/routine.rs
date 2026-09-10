@@ -46,6 +46,11 @@ impl RoutineState {
             _ => None,
         }
     }
+
+    /// Every variant, declaration order. MCP `tools/list` enum lists
+    /// (#3378) iterate this so the wire vocabulary cannot drift from
+    /// [`Self::from_str`] / [`Self::as_str`].
+    pub const ALL: [Self; 2] = [Self::Draft, Self::Frozen];
 }
 
 /// Lifecycle state of a [`RoutineRun`] (the `routine_runs.state` column).
@@ -144,9 +149,10 @@ mod tests {
 
     #[test]
     fn routine_state_roundtrips_str() {
-        for s in [RoutineState::Draft, RoutineState::Frozen] {
+        for s in RoutineState::ALL {
             assert_eq!(RoutineState::from_str(s.as_str()), Some(s));
         }
+        assert_eq!(RoutineState::ALL.len(), 2);
     }
 
     #[test]

@@ -533,7 +533,7 @@
       "name": "memory_promote"
     },
     {
-      "description": "Bulk delete memories matching a pattern,",
+      "description": "Bulk delete memories matching a pattern",
       "inputSchema": {
         "properties": {
           "capability": {
@@ -709,7 +709,7 @@
       "name": "memory_update"
     },
     {
-      "description": "Get a specific memory by ID,",
+      "description": "Get a specific memory by ID",
       "inputSchema": {
         "properties": {
           "agent_id": {

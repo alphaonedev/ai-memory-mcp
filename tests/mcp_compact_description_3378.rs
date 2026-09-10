@@ -108,3 +108,46 @@ fn no_compacted_full_profile_description_ends_dangling_3378() {
         offenders.join("\n")
     );
 }
+
+#[test]
+fn forget_compact_does_not_keep_trailing_comma_3378() {
+    let got = compacted_description("memory_forget");
+    assert_ne!(
+        got, "Bulk delete memories matching a pattern,",
+        "denied: unit-1 word-walk left memory_forget ending on 'pattern,'"
+    );
+    assert!(
+        !got.ends_with(',') && !got.ends_with(':'),
+        "denied: compacted forget description kept trailing punctuation: {got:?}"
+    );
+    assert!(
+        got.contains("pattern"),
+        "allowed: gist must keep 'pattern', got {got:?}"
+    );
+}
+
+#[test]
+fn no_compacted_full_profile_description_ends_on_comma_or_colon_3378() {
+    let defs = tool_definitions_for_profile(&Profile::full());
+    let tools = defs["tools"].as_array().expect("tools array");
+    let mut offenders: Vec<String> = Vec::new();
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>");
+        let desc = tool
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        if desc.ends_with(',') || desc.ends_with(':') {
+            offenders.push(format!("{name}: {desc:?}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "compacted tools/list descriptions must not end on ',' or ':' \
+         (#3378 unit 2):\n{}",
+        offenders.join("\n")
+    );
+}
