@@ -1,0 +1,75 @@
+{
+  "allowed": [
+    {
+      "name": "empty",
+      "hex": "000000000000000000000000",
+      "expected": {
+        "inbox_row_id": "",
+        "namespace": "",
+        "sender": "",
+        "digest": "",
+        "seq_high_watermark": 0
+      }
+    },
+    {
+      "name": "ordinary",
+      "hex": "08726f772d333537380f5f696e626f782f61693a616c6963650661693a626f6220abababababababababababababababababababababababababababababababab000000000000002a",
+      "expected": {
+        "inbox_row_id": "row-3578",
+        "namespace": "_inbox/ai:alice",
+        "sender": "ai:bob",
+        "digest": "abababababababababababababababababababababababababababababababab",
+        "seq_high_watermark": 42
+      }
+    },
+    {
+      "name": "boundary_256",
+      "hex": "4072727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272406e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e5473737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737320cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd001fffffffffffff",
+      "expected": {
+        "inbox_row_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+        "namespace": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+        "sender": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+        "digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "seq_high_watermark": 9007199254740991
+      }
+    },
+    {
+      "name": "utf8",
+      "hex": "06726f772dc3a905636166c3a90861693a616c696365000000000000000003",
+      "expected": {
+        "inbox_row_id": "row-\u00e9",
+        "namespace": "caf\u00e9",
+        "sender": "ai:alice",
+        "digest": "",
+        "seq_high_watermark": 3
+      }
+    }
+  ],
+  "denied": [
+    {
+      "name": "content",
+      "hex": "08726f772d333537380f5f696e626f782f61693a616c6963650661693a626f6220abababababababababababababababababababababababababababababababab000000000000002a7b22636f6e74656e74223a22696e6a6563746564227d"
+    },
+    {
+      "name": "title",
+      "hex": "08726f772d333537380f5f696e626f782f61693a616c6963650661693a626f6220abababababababababababababababababababababababababababababababab000000000000002a7b227469746c65223a22696e6a6563746564227d"
+    },
+    {
+      "name": "trailing_zero",
+      "hex": "08726f772d333537380f5f696e626f782f61693a616c6963650661693a626f6220abababababababababababababababababababababababababababababababab000000000000002a00"
+    },
+    {
+      "name": "oversize_257",
+      "hex": "4072727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272406e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e5473737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737320cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd001fffffffffffff00"
+    },
+    {
+      "name": "wrong_digest_length",
+      "hex": "0172016e017301ab0000000000000001"
+    }
+  ],
+  "reserved_kinds": [
+    11,
+    12,
+    13
+  ]
+}

@@ -931,6 +931,17 @@ with the resolved caller. Ordinary principal names such as `ai:alice` and
 matrix is pinned by `tests/wake_hub_identity_domain_3578.rs`. This wire
 reservation does not change the internal-bootstrap shape-only validator.
 
+**Binary hint codec pins (#3578).** `tests/qual_wake_meta_codec_3578.rs`,
+`sdk/python/tests/test_wake_meta_3578.py`, and
+`sdk/typescript/__tests__/wake_meta_3578.test.ts` consume the same
+`sdk/fixtures/wake_meta_3578.json` vectors. They pin the five metadata fields,
+empty and UTF-8 hints, a valid 256-byte encoding, 257-byte refusal, appended
+`content`/`title` refusal, every truncation of each valid vector, and reserved
+body kinds 11/12/13 with an allowed wake control. Rust also checks exact
+re-encoding and refuses an oversized hint at encode time. These tests cover
+the binary hint; handshake/control frames have their own bounds. They do not
+assert a 256-byte limit on the CLI reporting JSON or a JSON-input decoder.
+
 **Dependency gate (#3578).** `tests/qual_wake_hub_zero_authority_3578.rs`
 walks every Rust source under `src/wake_hub`, scanning all feature branches
 and resuming after complete inline test modules. Its reviewed crate-edge
