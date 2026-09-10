@@ -647,7 +647,7 @@ async fn sse_http_two_subscribers_isolated() {
 // H10 — a synthetic rule recorded in the registry (the `remember=session` path; `forever` is refused, #3394) actually auto-decides.
 // ---------------------------------------------------------------------------
 
-/// Approve a pending row with `remember=forever`, then re-evaluate
+/// Record a synthetic rule as the `remember=session` path does, then re-evaluate
 /// the same `(action_type, namespace, agent_id)` tuple via the
 /// unified K9 [`Permissions::evaluate`] entry point and assert it
 /// short-circuits to `Allow` without re-prompting.
