@@ -182,15 +182,15 @@ pub fn human_error_message(err: &AtomiseError, source_id: &str) -> String {
             )
         }
         AtomiseError::TierLocked => {
-            "memory_atomise requires smart tier or higher. Current tier: keyword. \
-             Upgrade your deployment or use --tier semantic when running ai-memory mcp."
+            "atomise requires smart tier or higher. Current tier: keyword. \
+             Upgrade your deployment."
                 .to_string()
         }
         AtomiseError::CuratorFailed(detail) => {
             format!("Curator pass failed: {detail}. Check Ollama availability or retry.")
         }
         AtomiseError::SourceTooSmall => format!(
-            "Memory {source_id} body already at or under max_atom_tokens. \
+            "Memory {source_id} body already at or under --max-atom-tokens. \
              No atomisation needed."
         ),
         AtomiseError::GovernanceRefused(detail) => {
@@ -640,6 +640,7 @@ mod tests {
         assert!(msg.contains("requires smart tier"));
         assert!(msg.contains("keyword"));
         assert!(msg.contains("Upgrade your deployment"));
+        assert!(!msg.contains("memory_atomise"), "MCP tool leaked: {msg}");
     }
 
     #[test]
@@ -666,7 +667,8 @@ mod tests {
     fn human_error_message_source_too_small_carries_source_id() {
         let msg = human_error_message(&AtomiseError::SourceTooSmall, "src-x");
         assert!(msg.contains("src-x"));
-        assert!(msg.contains("max_atom_tokens"));
+        assert!(msg.contains("--max-atom-tokens"), "got: {msg}");
+        assert!(!msg.contains("max_atom_tokens"), "MCP param leaked: {msg}");
     }
 
     #[test]

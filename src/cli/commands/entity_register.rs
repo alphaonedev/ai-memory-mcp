@@ -18,6 +18,22 @@ use serde_json::{Value, json};
 use crate::cli::CliOutput;
 use crate::storage as db;
 
+/// #3414 — MCP `validate_title` / `canonical_name` prose mapped onto the
+/// clap flag `--canonical-name` at the CLI boundary. Distinct from the
+/// store-path `"title cannot be empty"` raise site.
+const CANONICAL_NAME_EMPTY: &str = "--canonical-name cannot be empty";
+const CANONICAL_NAME_REQUIRED: &str = "--canonical-name is required";
+
+fn map_entity_register_mcp_err(e: &str) -> String {
+    if e.contains("title cannot be empty") {
+        return CANONICAL_NAME_EMPTY.to_string();
+    }
+    if e.contains("canonical_name is required") {
+        return CANONICAL_NAME_REQUIRED.to_string();
+    }
+    e.replace("canonical_name", "--canonical-name")
+}
+
 /// CLI args for `ai-memory entity-register`.
 #[derive(Args, Debug, Clone)]
 pub struct EntityRegisterArgs {
@@ -69,7 +85,7 @@ pub fn cmd_entity_register(
     }
 
     let envelope = crate::mcp::handle_entity_register(&conn, &params, None)
-        .map_err(|e| anyhow::anyhow!("entity-register: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("entity-register: {}", map_entity_register_mcp_err(&e)))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -130,7 +146,13 @@ mod tests {
         };
         let mut out = env.output();
         let err = cmd_entity_register(&db, &args, &mut out).expect_err("must fail");
-        assert!(err.to_string().contains("entity-register"), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("entity-register"), "got: {msg}");
+        assert!(msg.contains(CANONICAL_NAME_EMPTY), "got: {msg}");
+        assert!(
+            !msg.contains("title cannot be empty"),
+            "MCP validate_title prose leaked: {msg}"
+        );
     }
 
     #[test]
