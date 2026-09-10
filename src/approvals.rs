@@ -8,10 +8,11 @@
 //! decision:
 //!
 //! 1. **HTTP** — `POST /api/v1/approvals/{pending_id}` with the body
-//!    `{"decision":"approve|deny","remember":"once|session|forever"}`.
-//!    Gated behind the K7 `[hooks.subscription] hmac_secret` server-wide
-//!    HMAC: requests without a valid `X-AI-Memory-Signature: sha256=…`
-//!    header are rejected `401`.
+//!    `{"decision":"approve|deny","remember":"once|session"}`.
+//!    `remember='forever'` is refused (#3394). Gated behind the K7
+//!    `[hooks.subscription] hmac_secret` server-wide HMAC: requests
+//!    without a valid `X-AI-Memory-Signature: sha256=…` header are
+//!    rejected `401`.
 //! 2. **SSE** — `GET /api/v1/approvals/stream` server-sent events.
 //!    Subscribers receive `approval_requested` (one per new
 //!    `pending_actions` row) and `approval_decided` (one per
@@ -22,16 +23,17 @@
 //!    `memory_pending_reject` tools gain an optional `remember`
 //!    property. The K10 contract preserves the pre-K10 schema (no new
 //!    tools, no removed properties) — so existing callers keep working
-//!    unchanged and only opt into `remember` when they want
-//!    forever-persisted permission rules.
+//!    unchanged and only opt into `remember` when they want a
+//!    session-scoped synthetic rule (`remember='forever'` is refused).
 //!
-//! When `remember = "forever"`, K10 stamps a synthetic
+//! When `remember = "session"`, K10 stamps a synthetic
 //! [`SyntheticPermissionRule`] into the process-wide registry so the
-//! same `(action, namespace, agent_id)` tuple auto-decides next time.
-//! K9 (the unified permission pipeline) will consult the registry from
-//! its rule-evaluation path; until K9 lands on this branch, the
-//! registry exists as an isolated K10-internal store that the K10 test
-//! suite can introspect to pin the contract.
+//! same `(action, namespace, agent_id)` tuple auto-decides next time
+//! **in this process**. `remember = "forever"` is refused with
+//! [`crate::errors::msg::REMEMBER_FOREVER_UNHONOURABLE`] (#3394): the
+//! registry is process-local and is lost on every MCP stdio exit, and
+//! the durable store is #3580 (v1.1.0). K9 consults the registry;
+//! `enforce_governance` does not.
 
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -60,18 +62,35 @@ pub enum Decision {
 /// How long a `remember` choice persists.
 ///
 /// - `Once` — just this decision; no rule recorded.
-/// - `Session` — recorded in-memory; cleared on restart.
-/// - `Forever` — recorded in-memory AND queued for persistence to the
-///   live `config.toml` `[[permissions.rules]]` table on the next
-///   config write. (The actual disk write is owned by the K9 rule
-///   loader; K10's contract is to populate the registry that K9
-///   consults.)
+/// - `Session` — recorded in-memory; cleared on process exit.
+/// - `Forever` — **wire-parseable so the refusal can name it**. Never
+///   recorded (#3394). Callers that send it get
+///   [`crate::errors::msg::REMEMBER_FOREVER_UNHONOURABLE`]. Durable
+///   persistence is #3580.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Remember {
     Once,
     Session,
     Forever,
+}
+
+/// #3394 — refuse `remember` values that cannot be honoured durably.
+///
+/// `Session` and `Once` pass through. `Forever` is an error: the
+/// synthetic-rule registry is process-local, so advertising "forever"
+/// is a false success. Shared by MCP and HTTP so sqlite and postgres
+/// daemons cannot drift.
+///
+/// # Errors
+///
+/// Returns [`crate::errors::msg::REMEMBER_FOREVER_UNHONOURABLE`] when
+/// `remember` is [`Remember::Forever`].
+pub fn honourable_remember(remember: Remember) -> Result<Remember, &'static str> {
+    match remember {
+        Remember::Forever => Err(crate::errors::msg::REMEMBER_FOREVER_UNHONOURABLE),
+        honoured => Ok(honoured),
+    }
 }
 
 /// One row in the K10 synthetic-permission-rule registry.
@@ -100,8 +119,9 @@ pub struct SyntheticPermissionRule {
     pub recorded_at: String,
 }
 
-/// Process-wide registry of `remember=forever` rules. Populated by
-/// the K10 transports; read by K9's rule resolver (when K9 lands).
+/// Process-wide registry of `remember=session` rules. Populated by
+/// the K10 transports; read by K9's rule resolver. Lost on process
+/// exit — never a durable store (#3394 / #3580).
 static SYNTHETIC_RULES: RwLock<Vec<SyntheticPermissionRule>> = RwLock::new(Vec::new());
 
 /// Append a synthetic rule to the registry.
@@ -458,6 +478,19 @@ mod tests {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn honourable_remember_refuses_forever_3394() {
+        assert_eq!(
+            honourable_remember(Remember::Forever),
+            Err(crate::errors::msg::REMEMBER_FOREVER_UNHONOURABLE)
+        );
+        assert_eq!(honourable_remember(Remember::Once), Ok(Remember::Once));
+        assert_eq!(
+            honourable_remember(Remember::Session),
+            Ok(Remember::Session)
+        );
     }
 
     #[test]

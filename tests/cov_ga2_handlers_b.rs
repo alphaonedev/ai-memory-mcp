@@ -908,8 +908,8 @@ async fn approval_decide_deny_sqlite_publishes_synthetic_rule() {
     let (r, t) = sqlite_router();
     let pending_id = seed_pending_row(t.path(), "scratch", "alice");
 
-    // remember=forever drives the publish_decision_event synthetic-rule arm.
-    let body = json!({"decision": "deny", "remember": "forever"}).to_string();
+    // #3394 — session is the honourable persistence horizon.
+    let body = json!({"decision": "deny", "remember": "session"}).to_string();
     let resp = r
         .clone()
         .oneshot(signed_approval(&pending_id, &body))
@@ -922,7 +922,7 @@ async fn approval_decide_deny_sqlite_publishes_synthetic_rule() {
     let v: Value = serde_json::from_slice(&bytes).unwrap_or_default();
     assert_eq!(status, StatusCode::OK, "body={v}");
     assert_eq!(v["rejected"], json!(true));
-    assert_eq!(v["remember"], json!("forever"));
+    assert_eq!(v["remember"], json!("session"));
 
     let conn = ai_memory::db::open(t.path()).expect("reopen");
     let row = ai_memory::db::get_pending_action(&conn, &pending_id)

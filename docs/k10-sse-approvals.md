@@ -86,7 +86,7 @@ The companion decide path:
 POST /api/v1/approvals/{pending_id}
 ```
 
-with body `{"decision": "approve|deny", "remember": "once|session|forever"}`,
+with body `{"decision": "approve|deny", "remember": "once|session"}` (`forever` is refused, #3394),
 requires two headers when the substrate has an
 `[hooks.subscription].hmac_secret` configured:
 
@@ -283,26 +283,24 @@ construction from the walkthrough above. Validate the response is
 2xx; on 401, log the reason (most likely stale timestamp or replay-
 cache hit) and retry with a fresh timestamp.
 
-## `remember=forever` progressive trust
+## `remember` persistence (#3394)
 
-`POST /api/v1/approvals/{pending_id}` with body
-`{"decision":"deny", "remember":"forever"}` (or
-`memory_pending_reject(remember=forever)`) writes a permanent
-deny-rule into the rule corpus via
-`record_synthetic_rule`
-([`src/approvals.rs:115`](../src/approvals.rs)), so the same action
-shape is auto-rejected without re-prompting. The reverse — `approve`
-+ `remember=forever` — similarly writes a permanent allow. Use
-sparingly; pinned by
+`remember='session'` writes a process-local synthetic rule via
+[`record_synthetic_rule`](../src/approvals.rs) so the same action
+shape can auto-decide **until this process exits**. `remember='forever'`
+is refused with a clear error (`REMEMBER_FOREVER_UNHONOURABLE`): the
+registry is not a durable store (lost on every MCP stdio exit, and
+never consulted by `enforce_governance`). Durable remembered decisions
+are #3580 (v1.1.0). Pinned by
 [`tests/k10_remember_forever.rs`](../tests/k10_remember_forever.rs).
 
-`Remember` variants ([`src/approvals.rs:71`](../src/approvals.rs)):
+`Remember` variants ([`Remember`](../src/approvals.rs)):
 
 | Variant | Effect |
 |---|---|
 | `once` (default) | Decision applies to this row only. |
-| `session` | Decision applies until the agent's session ends. |
-| `forever` | Decision is written to the persistent rule corpus. |
+| `session` | Decision applies until this process exits. |
+| `forever` | Refused. Cannot be honoured durably. |
 
 ## Tuning guidance
 

@@ -1536,7 +1536,7 @@ router in `src/lib.rs`.
 |---|---|---|
 | `POST` | `/api/v1/quota/status` | K8 quota status — read the calling agent's daily quota row. Auto-inserts a default row on first call. See [`docs/k8-quotas.md`](k8-quotas.html). MCP: `memory_quota_status`. |
 | `GET`  | `/api/v1/approvals/stream` | K10 SSE approval channel — server-sent events for pending-approval state changes. See [`docs/k10-sse-approvals.md`](k10-sse-approvals.html). |
-| `POST` | `/api/v1/approvals/{pending_id}` | K10 approval decide path — body `{"decision":"approve|deny","remember":"once|session|forever"}`, HMAC-gated via `X-AI-Memory-Signature`. |
+| `POST` | `/api/v1/approvals/{pending_id}` | K10 approval decide path — body `{"decision":"approve|deny","remember":"once|session"}` (`forever` is refused, #3394), HMAC-gated via `X-AI-Memory-Signature`. |
 | `POST` | `/api/v1/auto_tag` | LLM auto-tag endpoint (v0.7 smart-tier surface; 503 when no LLM is configured). |
 | `POST` | `/api/v1/expand_query` | HTTP parity for the MCP `memory_expand_query` tool. |
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; Cypher on AGE / recursive-CTE on SQLite. |

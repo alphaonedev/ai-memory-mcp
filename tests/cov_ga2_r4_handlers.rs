@@ -1539,7 +1539,7 @@ async fn approval_decide_deny_sqlite_path() {
         )
         .expect("queue pending")
     };
-    let body = json!({"decision": "deny", "remember": "forever"});
+    let body = json!({"decision": "deny", "remember": "session"});
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
     let ts = chrono::Utc::now().timestamp().to_string();

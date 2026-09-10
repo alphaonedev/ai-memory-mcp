@@ -4,7 +4,8 @@
 //! v0.7.0 K10 — Approval API (HTTP + SSE).
 //!
 //! `POST /api/v1/approvals/{pending_id}` — approve / deny a pending row.
-//! Body: `{"decision":"approve|deny","remember":"once|session|forever"}`.
+//! Body: `{"decision":"approve|deny","remember":"once|session"}`.
+//! `remember='forever'` is refused (#3394) before any backend work.
 //! Gated behind the K7 server-wide HMAC: caller MUST present
 //! `X-AI-Memory-Signature: sha256=<hex>` keyed on
 //! `SHA256([hooks.subscription].hmac_secret)` over the canonical
@@ -52,7 +53,9 @@ pub(crate) const APPROVED_BUT_EXECUTION_FAILED: &str = "approved but execution f
 pub struct ApprovalRequestBody {
     /// `"approve"` or `"deny"`.
     pub decision: crate::approvals::Decision,
-    /// `"once"` (default), `"session"`, or `"forever"`.
+    /// `"once"` (default) or `"session"`. `"forever"` deserializes so
+    /// the refusal can name it, then [`crate::approvals::honourable_remember`]
+    /// rejects the request (#3394).
     #[serde(default = "default_remember")]
     pub remember: crate::approvals::Remember,
     /// #2355 — R40 approver signatures presented on the HTTP wire:
@@ -365,6 +368,11 @@ pub async fn approval_decide(
                 .into_response();
         }
     };
+    // #3394 — refuse `remember='forever'` before any sqlite/postgres work
+    // so a false-success cannot land a decision (or a synthetic rule).
+    if let Err(msg) = crate::approvals::honourable_remember(body.remember) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    }
 
     // #913 + #2634 / CB-24 — admin governance audit. Pre-fix, this
     // surface recorded the CALLER'S REQUESTED decision UNCONDITIONALLY
@@ -683,8 +691,8 @@ async fn approval_decide_postgres(
 
 /// Shared post-decision fan-out for both storage-backend branches of
 /// [`approval_decide`]: publish the `ApprovalDecided` event on the
-/// process-wide broadcast bus and (for `remember=session|forever`)
-/// record the synthetic permission rule.
+/// process-wide broadcast bus and (for `remember=session`) record the
+/// synthetic permission rule. `forever` never reaches here (#3394).
 fn publish_decision_event(
     id: &str,
     agent_id: &str,
@@ -726,10 +734,8 @@ fn publish_decision_event(
         namespace: evt_namespace,
         requested_by: evt_requested_by,
     });
-    if matches!(
-        remember,
-        crate::approvals::Remember::Forever | crate::approvals::Remember::Session
-    ) && let Some(snap) = pending_snapshot
+    if matches!(remember, crate::approvals::Remember::Session)
+        && let Some(snap) = pending_snapshot
     {
         crate::approvals::record_synthetic_rule(crate::approvals::SyntheticPermissionRule {
             action_type: snap.action_type,

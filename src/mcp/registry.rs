@@ -1756,6 +1756,10 @@ mod d1_6_987_tests {
     //!   string understated the tool's real surface to every MCP client.
     //!   Corrected to list all 9 plus the `derived_from` /
     //!   `derives_from` directionality footgun.
+    //! - 2026-09-10 (#3394): `memory_pending_approve` / `memory_pending_reject`
+    //!   advertised `remember=forever` progressive trust. Forever cannot be
+    //!   honoured durably (process-local `SYNTHETIC_RULES` only; #3580).
+    //!   description()/docs() now refuse forever and keep session.
     use super::*;
     use std::collections::BTreeSet;
 

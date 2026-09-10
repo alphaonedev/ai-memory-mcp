@@ -345,7 +345,7 @@ async fn approval_decide_deny_missing_row_returns_404() {
 }
 
 #[tokio::test]
-async fn approval_decide_approve_forever_records_synthetic_rule() {
+async fn approval_decide_approve_forever_is_refused_3394() {
     let _g = APPROVALS_GLOBAL_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -354,8 +354,7 @@ async fn approval_decide_approve_forever_records_synthetic_rule() {
     let (router, db_path) = build_sqlite_router();
     let pending_id = seed_pending_row(&db_path, "team-syn", "alice");
 
-    // remember=forever → publish_decision_event records a synthetic
-    // permission rule (the `Forever | Session` branch).
+    // #3394 — remember=forever is refused before any decision is recorded.
     let body = json!({"decision": "approve", "remember": "forever"}).to_string();
     let resp = router
         .oneshot(signed_request(&pending_id, &body))
@@ -366,14 +365,15 @@ async fn approval_decide_approve_forever_records_synthetic_rule() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    assert_eq!(status, StatusCode::OK, "approve forever; body={v}");
-    assert_eq!(v["approved"], json!(true));
-    assert_eq!(v["remember"], json!("forever"));
-
+    assert_eq!(status, StatusCode::BAD_REQUEST, "approve forever; body={v}");
+    assert_eq!(
+        v["error"],
+        json!(ai_memory::errors::msg::REMEMBER_FOREVER_UNHONOURABLE)
+    );
     let synth = ai_memory::approvals::list_synthetic_rules();
     assert!(
-        synth.iter().any(|r| r.namespace == "team-syn"),
-        "remember=forever must record a synthetic permission rule for the namespace; got {synth:?}"
+        synth.is_empty(),
+        "remember=forever must record nothing; got {synth:?}"
     );
     ai_memory::approvals::clear_synthetic_rules_for_test();
     set_active_hooks_hmac_secret(None);
