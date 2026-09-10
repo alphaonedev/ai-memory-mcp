@@ -3,6 +3,7 @@
 
 //! MCP subscription management handlers.
 
+use crate::errors::MemoryError;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::field_names;
@@ -97,13 +98,27 @@ pub fn handle_subscribe(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let url = params["url"].as_str().ok_or("url is required")?;
+    let created_by =
+        crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    handle_subscribe_as_created_by(conn, params, &created_by).map_err(|e| e.message())
+}
+
+/// #3433: CLI has already resolved the caller via the global `--agent-id`
+/// ladder. Never feed it through the MCP client-name / ambient-identity
+/// ladder (that is how FX-C3 stamped `host:<hostname>` and evaluated the
+/// registration gate against the wrong principal).
+pub(crate) fn handle_subscribe_as_created_by(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    created_by: &str,
+) -> Result<Value, MemoryError> {
+    let url = params["url"]
+        .as_str()
+        .ok_or_else(|| MemoryError::ValidationFailed("url is required".into()))?;
     let events = params["events"].as_str().unwrap_or("*");
     let secret = params["secret"].as_str();
     let namespace_filter = params[param_names::NAMESPACE_FILTER].as_str();
     let agent_filter = params[param_names::AGENT_FILTER].as_str();
-    let created_by =
-        crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
 
     // R3-S1.HMAC (v0.7.0 fix campaign 2026-05-13): refuse subscription
     // registration when neither a per-subscription `secret` nor a
@@ -111,14 +126,14 @@ pub fn handle_subscribe(
     // Mirrors the HTTP subscribe handler — see
     // `crate::handlers::subscribe` for the rationale.
     if secret.is_none_or(str::is_empty) && crate::config::active_hooks_hmac_secret().is_none() {
-        return Err(
+        return Err(MemoryError::ValidationFailed(
             "HMAC secret required: configure per-subscription `hmac_secret` or \
              server-wide `[security] hmac_secret`. Pass `secret: <value>` in the \
              tool call, OR set [hooks.subscription] hmac_secret in the daemon \
              config. Unsigned subscription dispatch was disabled in v0.7.0 \
              (fix campaign R3-S1.HMAC, 2026-05-13)."
-                .to_string(),
-        );
+                .into(),
+        ));
     }
 
     // P5 (G9): optional structured per-event-type opt-in. Callers pass
@@ -140,16 +155,17 @@ pub fn handle_subscribe(
     // subscribers closes the "any MCP client owns the webhook fleet"
     // hole flagged by the v0.6.0 security review.
     let registered = crate::db::list_agents(conn)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?
         .into_iter()
         .any(|a| a.agent_id == created_by);
     if !registered {
-        return Err(format!(
+        return Err(MemoryError::ValidationFailed(format!(
             "agent {created_by:?} is not registered; call memory_agent_register before memory_subscribe"
-        ));
+        )));
     }
 
-    crate::subscriptions::validate_url(url).map_err(|e| e.to_string())?;
+    crate::subscriptions::validate_url(url)
+        .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
 
     let id = crate::subscriptions::insert(
         conn,
@@ -159,11 +175,11 @@ pub fn handle_subscribe(
             secret,
             namespace_filter,
             agent_filter,
-            created_by: Some(&created_by),
+            created_by: Some(created_by),
             event_types: event_types.as_deref(),
         },
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
 
     let mut response = json!({
         "id": id,
@@ -184,17 +200,27 @@ pub fn handle_unsubscribe(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"]
-        .as_str()
-        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     // Cross-tenant authorization (#870, security-high, 2026-05-18):
     // scope the DELETE to the caller's resolved agent_id. Without this
     // any tenant could enumerate ids (via lucky guess or by exfiltrating
     // another tenant's list output) and remove the other tenant's
     // webhook fleet. The resolution chain matches `handle_subscribe`.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    let removed =
-        crate::subscriptions::delete(conn, id, Some(&caller)).map_err(|e| e.to_string())?;
+    handle_unsubscribe_as_caller(conn, params, &caller).map_err(|e| e.message())
+}
+
+/// #3433: CLI has already resolved the caller. See
+/// [`handle_subscribe_as_created_by`].
+pub(crate) fn handle_unsubscribe_as_caller(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: &str,
+) -> Result<Value, MemoryError> {
+    let id = params["id"]
+        .as_str()
+        .ok_or_else(|| MemoryError::ValidationFailed(crate::errors::msg::ID_REQUIRED.into()))?;
+    let removed = crate::subscriptions::delete(conn, id, Some(caller))
+        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
     Ok(json!({"id": id, "removed": removed}))
 }
 
@@ -206,7 +232,17 @@ pub fn handle_list_subscriptions(
     // only return subscriptions owned by the caller. Pre-fix this
     // returned every tenant's rows.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    let subs = crate::subscriptions::list(conn, Some(&caller)).map_err(|e| e.to_string())?;
+    handle_list_subscriptions_as_caller(conn, &caller).map_err(|e| e.message())
+}
+
+/// #3433: CLI has already resolved the caller. See
+/// [`handle_subscribe_as_created_by`].
+pub(crate) fn handle_list_subscriptions_as_caller(
+    conn: &rusqlite::Connection,
+    caller: &str,
+) -> Result<Value, MemoryError> {
+    let subs = crate::subscriptions::list(conn, Some(caller))
+        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
     Ok(json!({"count": subs.len(), (field_names::SUBSCRIPTIONS): subs}))
 }
 

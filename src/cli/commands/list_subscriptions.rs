@@ -27,6 +27,9 @@ pub struct ListSubscriptionsArgs {
 
 /// `ai-memory list-subscriptions` dispatch entry.
 ///
+/// `cli_agent_id` is the global `--agent-id` flag. The #872
+/// cross-tenant list gate scopes to that resolved caller (#3433).
+///
 /// # Errors
 ///
 /// - The DB at `db_path` cannot be opened.
@@ -35,11 +38,14 @@ pub struct ListSubscriptionsArgs {
 pub fn cmd_list_subscriptions(
     db_path: &std::path::Path,
     args: &ListSubscriptionsArgs,
+    cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
-    let envelope = crate::mcp::handle_list_subscriptions(&conn, None)
-        .map_err(|e| anyhow::anyhow!("list-subscriptions: {e}"))?;
+    let caller = crate::identity::resolve_agent_id(cli_agent_id, None)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::list_subscriptions(e)))?;
+    let envelope = crate::mcp::handle_list_subscriptions_as_caller(&conn, &caller)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::list_subscriptions(e.message())))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -74,7 +80,7 @@ mod tests {
         let args = ListSubscriptionsArgs { json: true };
         {
             let mut out = env.output();
-            cmd_list_subscriptions(&db, &args, &mut out).expect("ok");
+            cmd_list_subscriptions(&db, &args, None, &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
@@ -88,7 +94,7 @@ mod tests {
         let args = ListSubscriptionsArgs { json: false };
         {
             let mut out = env.output();
-            cmd_list_subscriptions(&db, &args, &mut out).expect("ok");
+            cmd_list_subscriptions(&db, &args, None, &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         assert!(
@@ -116,7 +122,7 @@ mod tests {
         let args = ListSubscriptionsArgs { json: false };
         {
             let mut out = env.output();
-            cmd_list_subscriptions(&db, &args, &mut out).expect("ok");
+            cmd_list_subscriptions(&db, &args, None, &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         assert!(stdout.contains("1 row(s)"), "got: {stdout}");
@@ -124,5 +130,55 @@ mod tests {
             stdout.contains("url=https://example.com/hook"),
             "got: {stdout}"
         );
+    }
+
+    /// DENIED (#3433): `--agent-id alice` does not see bob's subscriptions.
+    #[test]
+    fn list_subscriptions_cli_other_caller_sees_zero_3433() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "ai:bob", "test", &[]).expect("register");
+            crate::mcp::handle_subscribe_as_created_by(
+                &conn,
+                &serde_json::json!({"url": "https://example.com/hook-bob", "secret": "topsecret"}),
+                "ai:bob",
+            )
+            .expect("subscribe");
+        }
+        let args = ListSubscriptionsArgs { json: true };
+        {
+            let mut out = env.output();
+            cmd_list_subscriptions(&db, &args, Some("ai:alice"), &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["count"].as_u64(), Some(0));
+    }
+
+    /// ALLOWED (#3433): `--agent-id bob` lists bob's own subscriptions.
+    #[test]
+    fn list_subscriptions_cli_owner_sees_own_3433() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "ai:bob", "test", &[]).expect("register");
+            crate::mcp::handle_subscribe_as_created_by(
+                &conn,
+                &serde_json::json!({"url": "https://example.com/hook-bob", "secret": "topsecret"}),
+                "ai:bob",
+            )
+            .expect("subscribe");
+        }
+        let args = ListSubscriptionsArgs { json: true };
+        {
+            let mut out = env.output();
+            cmd_list_subscriptions(&db, &args, Some("ai:bob"), &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["count"].as_u64(), Some(1));
     }
 }

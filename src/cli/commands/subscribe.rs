@@ -59,6 +59,9 @@ pub struct SubscribeArgs {
 
 /// `ai-memory subscribe` dispatch entry.
 ///
+/// `cli_agent_id` is the global `--agent-id` flag. The registration
+/// gate and `created_by` stamp use that resolved caller (#3433).
+///
 /// # Errors
 ///
 /// - The DB at `db_path` cannot be opened.
@@ -68,9 +71,12 @@ pub struct SubscribeArgs {
 pub fn cmd_subscribe(
     db_path: &std::path::Path,
     args: &SubscribeArgs,
+    cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
+    let caller = crate::identity::resolve_agent_id(cli_agent_id, None)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::subscribe(e)))?;
 
     let mut params = json!({"url": args.url});
     if let Some(e) = &args.events {
@@ -89,8 +95,8 @@ pub fn cmd_subscribe(
         params[field_names::EVENT_TYPES] = json!(args.event_types);
     }
 
-    let envelope = crate::mcp::handle_subscribe(&conn, &params, None)
-        .map_err(|e| anyhow::anyhow!("subscribe: {e}"))?;
+    let envelope = crate::mcp::handle_subscribe_as_created_by(&conn, &params, &caller)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::subscribe(e.message())))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -124,7 +130,7 @@ mod tests {
         let mut out = env.output();
         // The CLI dispatcher caller is not registered in `_agents` →
         // substrate refuses with the registration-required error.
-        let err = cmd_subscribe(&db, &args, &mut out).expect_err("must fail");
+        let err = cmd_subscribe(&db, &args, None, &mut out).expect_err("must fail");
         assert!(
             err.to_string().contains("subscribe") || err.to_string().contains("register"),
             "got: {err}"
@@ -155,7 +161,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_subscribe(&db, &args, &mut out).expect("subscribe ok");
+            cmd_subscribe(&db, &args, None, &mut out).expect("subscribe ok");
         }
         let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
         assert!(envelope["id"].is_string());
@@ -183,7 +189,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_subscribe(&db, &args, &mut out).expect("subscribe ok");
+            cmd_subscribe(&db, &args, None, &mut out).expect("subscribe ok");
         }
         let stdout = env.stdout_str();
         assert!(stdout.contains("subscribe: id="), "got: {stdout}");
@@ -191,5 +197,56 @@ mod tests {
             stdout.contains("url=https://example.com/hook2"),
             "got: {stdout}"
         );
+    }
+
+    /// DENIED (#3433): `--agent-id alice` is the principal the registration
+    /// gate evaluates — not `host:<hostname>`.
+    #[test]
+    fn subscribe_cli_unregistered_global_agent_id_refused_3433() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = SubscribeArgs {
+            url: "https://example.com/hook".into(),
+            events: None,
+            secret: Some("topsecret".into()),
+            namespace_filter: None,
+            agent_filter: None,
+            event_types: vec![],
+            json: true,
+        };
+        let mut out = env.output();
+        let err = cmd_subscribe(&db, &args, Some("ai:alice"), &mut out).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("ai:alice"), "got: {msg}");
+        assert!(msg.contains("not registered"), "got: {msg}");
+    }
+
+    /// ALLOWED (#3433): registered `--agent-id alice` is `created_by`.
+    #[test]
+    fn subscribe_cli_global_agent_id_is_created_by_3433() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "ai:alice", "test", &[]).expect("register");
+        }
+        let args = SubscribeArgs {
+            url: "https://example.com/hook-alice".into(),
+            events: None,
+            secret: Some("topsecret".into()),
+            namespace_filter: None,
+            agent_filter: None,
+            event_types: vec![],
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_subscribe(&db, &args, Some("ai:alice"), &mut out).expect("subscribe ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope[field_names::CREATED_BY].as_str(), Some("ai:alice"));
+        assert_eq!(envelope["url"], "https://example.com/hook-alice");
     }
 }

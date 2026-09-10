@@ -36,6 +36,9 @@ pub struct UnsubscribeArgs {
 
 /// `ai-memory unsubscribe` dispatch entry.
 ///
+/// `cli_agent_id` is the global `--agent-id` flag. The #870
+/// cross-tenant delete gate scopes to that resolved caller (#3433).
+///
 /// # Errors
 ///
 /// - The DB at `db_path` cannot be opened.
@@ -44,13 +47,16 @@ pub struct UnsubscribeArgs {
 pub fn cmd_unsubscribe(
     db_path: &std::path::Path,
     args: &UnsubscribeArgs,
+    cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
+    let caller = crate::identity::resolve_agent_id(cli_agent_id, None)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::unsubscribe(e)))?;
     let params = json!({"id": args.id});
 
-    let envelope = crate::mcp::handle_unsubscribe(&conn, &params, None)
-        .map_err(|e| anyhow::anyhow!(crate::errors::msg::unsubscribe(e)))?;
+    let envelope = crate::mcp::handle_unsubscribe_as_caller(&conn, &params, &caller)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::unsubscribe(e.message())))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -80,7 +86,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_unsubscribe(&db, &args, &mut out).expect("ok");
+            cmd_unsubscribe(&db, &args, None, &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
@@ -97,7 +103,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_unsubscribe(&db, &args, &mut out).expect("ok");
+            cmd_unsubscribe(&db, &args, None, &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         assert!(
@@ -132,7 +138,65 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_unsubscribe(&db, &args, &mut out).expect("ok");
+            cmd_unsubscribe(&db, &args, None, &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["removed"].as_bool(), Some(true));
+    }
+
+    /// DENIED (#3433): `--agent-id alice` cannot delete bob's subscription.
+    #[test]
+    fn unsubscribe_cli_other_caller_does_not_remove_3433() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let sub_id = {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "ai:bob", "test", &[]).expect("register");
+            let envelope = crate::mcp::handle_subscribe_as_created_by(
+                &conn,
+                &json!({"url": "https://example.com/hook-bob", "secret": "topsecret"}),
+                "ai:bob",
+            )
+            .expect("subscribe");
+            envelope["id"].as_str().unwrap().to_string()
+        };
+        let args = UnsubscribeArgs {
+            id: sub_id.clone(),
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_unsubscribe(&db, &args, Some("ai:alice"), &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["removed"].as_bool(), Some(false));
+    }
+
+    /// ALLOWED (#3433): `--agent-id bob` removes bob's own subscription.
+    #[test]
+    fn unsubscribe_cli_owner_removes_own_3433() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let sub_id = {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "ai:bob", "test", &[]).expect("register");
+            let envelope = crate::mcp::handle_subscribe_as_created_by(
+                &conn,
+                &json!({"url": "https://example.com/hook-bob2", "secret": "topsecret"}),
+                "ai:bob",
+            )
+            .expect("subscribe");
+            envelope["id"].as_str().unwrap().to_string()
+        };
+        let args = UnsubscribeArgs {
+            id: sub_id,
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_unsubscribe(&db, &args, Some("ai:bob"), &mut out).expect("ok");
         }
         let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
         assert_eq!(envelope["removed"].as_bool(), Some(true));

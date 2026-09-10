@@ -373,6 +373,30 @@ pub mod msg {
         format!("unsubscribe: {e}")
     }
 
+    /// `"notify: {e}"` — CLI notify identity/write refusal (#3433).
+    #[must_use]
+    pub fn notify(e: impl std::fmt::Display) -> String {
+        format!("notify: {e}")
+    }
+
+    /// `"subscribe: {e}"` — CLI subscribe identity/registration refusal (#3433).
+    #[must_use]
+    pub fn subscribe(e: impl std::fmt::Display) -> String {
+        format!("subscribe: {e}")
+    }
+
+    /// `"list-subscriptions: {e}"` — CLI list-subscriptions owner-gate (#3433).
+    #[must_use]
+    pub fn list_subscriptions(e: impl std::fmt::Display) -> String {
+        format!("list-subscriptions: {e}")
+    }
+
+    /// `"inbox: {e}"` — CLI inbox owner-gate (#3433).
+    #[must_use]
+    pub fn inbox(e: impl std::fmt::Display) -> String {
+        format!("inbox: {e}")
+    }
+
     /// `"opening {path}"` — fs-open `.with_context` label (#1558 batch 6).
     #[must_use]
     pub fn opening(path: impl std::fmt::Display) -> String {

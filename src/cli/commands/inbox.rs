@@ -18,7 +18,9 @@ use crate::storage as db;
 /// CLI args for `ai-memory inbox`.
 #[derive(Args, Debug, Clone)]
 pub struct InboxArgs {
-    /// Inbox owner. Default = caller agent_id.
+    /// Inbox owner. Default = the resolved caller (global `--agent-id` /
+    /// `AI_MEMORY_AGENT_ID` / host fallback). Must match that caller when
+    /// set — this is a refinement, not a cross-agent read (#3433).
     #[arg(long = "agent-id", value_name = "AGENT_ID")]
     pub agent_id: Option<String>,
 
@@ -60,6 +62,10 @@ pub struct InboxArgs {
 
 /// `ai-memory inbox` dispatch entry.
 ///
+/// `cli_agent_id` is the global `--agent-id` flag. The owner is that
+/// resolved caller; a subcommand `--agent-id` that disagrees is refused
+/// (parity with MCP `memory_inbox` / HTTP `get_inbox`, #3356/#3433).
+///
 /// # Errors
 ///
 /// - The DB at `db_path` cannot be opened.
@@ -68,9 +74,12 @@ pub struct InboxArgs {
 pub fn cmd_inbox(
     db_path: &std::path::Path,
     args: &InboxArgs,
+    cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
+    let caller = crate::identity::resolve_agent_id(cli_agent_id, None)
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::inbox(e)))?;
 
     let mut params = json!({});
     if let Some(a) = &args.agent_id {
@@ -83,10 +92,8 @@ pub fn cmd_inbox(
         params["limit"] = json!(l);
     }
 
-    // CLI is single-tenant (the operator runs it locally) → trust-all caller
-    // (None), preserving the existing `--agent-id`-selects-inbox behavior. #1557.
-    let envelope = crate::mcp::handle_inbox(&conn, &params, None, None)
-        .map_err(|e| anyhow::anyhow!("inbox: {e}"))?;
+    let envelope = crate::mcp::handle_inbox(&conn, &params, None, Some(caller.as_str()))
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::inbox(e)))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -186,7 +193,7 @@ pub async fn cmd_inbox_waiting(
     let mut so = stdout.lock();
     let mut se = stderr.lock();
     let mut out = CliOutput::from_std(&mut so, &mut se);
-    cmd_inbox(db_path, args, &mut out)
+    cmd_inbox(db_path, args, cli_agent_id, &mut out)
 }
 
 #[cfg(test)]
@@ -208,11 +215,12 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_inbox(&db, &args, &mut out).expect("ok");
+            cmd_inbox(&db, &args, Some("ai:alice"), &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert_eq!(envelope["count"].as_u64(), Some(0));
+        assert_eq!(envelope["agent_id"].as_str(), Some("ai:alice"));
     }
 
     #[test]
@@ -231,7 +239,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_inbox(&db, &args, &mut out).expect("ok");
+            cmd_inbox(&db, &args, Some("ai:bob"), &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         assert!(stdout.contains("1 message(s) for ai:bob"), "got: {stdout}");
@@ -255,10 +263,58 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_inbox(&db, &args, &mut out).expect("ok");
+            cmd_inbox(&db, &args, Some("ai:carol"), &mut out).expect("ok");
         }
         let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
         // Freshly seeded row has access_count==0 → unread → still listed.
+        assert_eq!(envelope["count"].as_u64(), Some(1));
+    }
+
+    /// DENIED (#3433): a resolved caller cannot read another agent's inbox.
+    #[test]
+    fn inbox_cli_other_agent_id_refused_3433() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        crate::cli::test_utils::seed_memory(&db, "_inbox/ai:bob", "secret", "payload");
+        let args = InboxArgs {
+            agent_id: Some("ai:bob".into()),
+            unread_only: false,
+            limit: None,
+            json: true,
+            wait: false,
+            timeout: None,
+        };
+        let mut out = env.output();
+        let err = cmd_inbox(&db, &args, Some("ai:alice"), &mut out).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("agent_id mismatch"), "got: {msg}");
+        assert!(msg.contains("ai:alice"), "got: {msg}");
+        assert!(
+            env.stdout_str().trim().is_empty(),
+            "must not leak bob's inbox on refusal"
+        );
+    }
+
+    /// ALLOWED (#3433): omitted subcommand `--agent-id` reads the caller's inbox.
+    #[test]
+    fn inbox_cli_omitted_owner_is_resolved_caller_3433() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        crate::cli::test_utils::seed_memory(&db, "_inbox/ai:alice", "hello alice", "payload");
+        let args = InboxArgs {
+            agent_id: None,
+            unread_only: false,
+            limit: None,
+            json: true,
+            wait: false,
+            timeout: None,
+        };
+        {
+            let mut out = env.output();
+            cmd_inbox(&db, &args, Some("ai:alice"), &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["agent_id"].as_str(), Some("ai:alice"));
         assert_eq!(envelope["count"].as_u64(), Some(1));
     }
 }
