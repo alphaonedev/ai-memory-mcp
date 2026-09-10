@@ -2658,6 +2658,132 @@ pub fn capture_turn_idempotent(
     }
 }
 
+/// v1.0.0 #3587 U4 — auto-index L4 capture for the CLI `capture-turn`
+/// twin and the Claude Code `Stop` hook.
+///
+/// The Claude Code `Stop` payload carries `last_assistant_message` but
+/// no turn index (audit-3587 F8), so the CLI passes
+/// `--host-turn-index auto`. This entry point derives the next index
+/// for `host_session_id` INSIDE the same `BEGIN IMMEDIATE` transaction
+/// that writes the rows, so two Stop hooks racing on one session get
+/// distinct indices instead of one turn being swallowed by a
+/// same-index dedup hit.
+///
+/// Two in-transaction dedup guards:
+/// 1. **content guard** — a `transcript_line_dedup` row already exists
+///    for this session whose stored `memories.content` is byte-identical
+///    (host re-delivery of the same turn) → returned as a `dedup_hit`;
+/// 2. the derived index is `MAX(host_turn_index) + 1` for the session,
+///    so it cannot collide with an existing row.
+///
+/// `build` receives the derived index and returns the fully-prepared
+/// write (signature verification + canonical hashing already done by
+/// the caller), keeping the verification single-sourced in
+/// `prepare_capture_turn`.
+///
+/// # Errors
+///
+/// Same string-stable codes as [`capture_turn_idempotent`], plus
+/// `DEDUP_BUILD_FAILED` when `build` refuses.
+pub fn capture_turn_idempotent_auto<F>(
+    conn: &Connection,
+    host_session_id: &str,
+    content: &str,
+    substrate_authored: bool,
+    build: F,
+) -> std::result::Result<crate::models::CaptureTurnResult, String>
+where
+    F: FnOnce(i64) -> std::result::Result<crate::models::CaptureTurnWrite, String>,
+{
+    use rusqlite::OptionalExtension;
+
+    let write_txn =
+        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+
+    // Guard 1 — same session + byte-identical stored content is the same
+    // turn re-delivered. The join is scoped by `host_session_id`, so the
+    // scan walks that session's dedup rows (indexed), not the memories
+    // table.
+    let existing: Option<String> = conn
+        .prepare_cached(
+            "SELECT d.memory_id FROM transcript_line_dedup d \
+             JOIN memories m ON m.id = d.memory_id \
+             WHERE d.host_session_id IS NOT NULL \
+               AND d.host_session_id = ?1 \
+               AND m.content = ?2 \
+             LIMIT 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(params![host_session_id, content], |row| row.get(0))
+                .optional()
+        })
+        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+    if let Some(memory_id) = existing {
+        write_txn.commit().map_err(tx_commit_failed)?;
+        return Ok(crate::models::CaptureTurnResult {
+            memory_id,
+            dedup_hit: true,
+        });
+    }
+
+    // Guard 2 — derive the next per-session index in-tx (race-free).
+    let next_index: i64 = conn
+        .prepare_cached(
+            "SELECT COALESCE(MAX(host_turn_index), -1) + 1 FROM transcript_line_dedup \
+             WHERE host_session_id IS NOT NULL AND host_session_id = ?1",
+        )
+        .and_then(|mut stmt| stmt.query_row(params![host_session_id], |row| row.get(0)))
+        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+
+    let write = build(next_index).map_err(|e| format!("DEDUP_BUILD_FAILED: {e}"))?;
+
+    let tx_result = (|| -> std::result::Result<String, String> {
+        let mut captured = write.memory.clone();
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut captured.metadata);
+        }
+        let inserted_id =
+            insert(conn, &captured).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+
+        conn.prepare_cached(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                write.sha256,
+                inserted_id,
+                write.host_kind,
+                write.host_session_id,
+                write.host_turn_index,
+                write.recovered_at_ms,
+            ])
+        })
+        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+
+        crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
+            .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
+
+        Ok(inserted_id)
+    })();
+
+    match tx_result {
+        Ok(memory_id) => {
+            write_txn.commit().map_err(tx_commit_failed)?;
+            Ok(crate::models::CaptureTurnResult {
+                memory_id,
+                dedup_hit: false,
+            })
+        }
+        Err(e) => {
+            write_txn.rollback();
+            Err(e)
+        }
+    }
+}
+
 /// #1693 — L2 transcript-recovery idempotent write (sqlite SSOT). The L2
 /// sibling of [`capture_turn_idempotent`]: dedup-probe → `BEGIN IMMEDIATE`
 /// → insert memory + `transcript_line_dedup` row → `COMMIT`. Differs from

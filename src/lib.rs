@@ -532,8 +532,11 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 86;
 /// and never a message body), bumping 92 → 93; v1.0.0 #3470 (EPIC #3466)
 /// added `WakeListen` for the `ai-memory wake-listen` long-lived wake-hub
 /// CLIENT (one authenticated session, one catch-up inbox read per hint, a
-/// bounded `<=60 s` backstop poll), bumping 93 → 94.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 95;
+/// bounded `<=60 s` backstop poll), bumping 93 → 94; v1.0.0 #3587 U4
+/// added `CaptureTurn` for the `ai-memory capture-turn` CLI twin of the
+/// `memory_capture_turn` MCP tool + the Claude Code `Stop` hook sink,
+/// bumping 95 → 96.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 96;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -559,8 +562,10 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 95;
 /// (same-host CONTENT-FREE agent wake plane over a 0600 Unix domain socket),
 /// bumping 94 → 95; v1.0.0 #3470 (EPIC #3466) added `WakeListen` (the
 /// long-lived wake-hub client behind `ai-memory wake-listen`), bumping
-/// 95 → 96.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 97;
+/// 95 → 96; v1.0.0 #3587 U4 added `CaptureTurn` (CLI twin of the
+/// `memory_capture_turn` MCP tool + the Claude Code `Stop` hook sink),
+/// bumping 97 → 98.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 98;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification

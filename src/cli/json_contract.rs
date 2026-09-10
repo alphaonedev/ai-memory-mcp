@@ -101,6 +101,10 @@ pub fn json_support(command: &Command) -> JsonSupport {
         | Command::Backup(..)
         | Command::Restore(..)
         | Command::Features => JsonSupport::Global,
+        // v1.0.0 #3587 U4 — `capture-turn` emits the same envelope the
+        // `memory_capture_turn` MCP tool returns; the global `--json` flag
+        // protects that single JSON document on stdout.
+        | Command::CaptureTurn(..) => JsonSupport::Global,
 
         // Declares its own `--json` / `--format json` at the subcommand level.
         Command::Export(..)

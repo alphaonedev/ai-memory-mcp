@@ -311,6 +311,35 @@ pub fn handle_capture_turn(
     params: &Value,
     caller_agent_id: Option<&str>,
 ) -> Result<Value, String> {
+    handle_capture_turn_inner(conn, params, caller_agent_id, false)
+}
+
+/// v1.0.0 #3587 U4 — auto-index twin of [`handle_capture_turn`] for the
+/// `ai-memory capture-turn` CLI surface when the host Stop payload
+/// carries no turn index.
+///
+/// Identical gates and envelope; the only difference is that the
+/// per-session `host_turn_index` is derived inside the write
+/// transaction (`crate::storage::capture_turn_idempotent_auto`) so two
+/// concurrent Stop hooks on one session cannot collide.
+///
+/// # Errors
+///
+/// Same contract as [`handle_capture_turn`].
+pub fn handle_capture_turn_auto(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller_agent_id: Option<&str>,
+) -> Result<Value, String> {
+    handle_capture_turn_inner(conn, params, caller_agent_id, true)
+}
+
+fn handle_capture_turn_inner(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller_agent_id: Option<&str>,
+    auto_index: bool,
+) -> Result<Value, String> {
     let start = Instant::now();
     let req: MemoryCaptureTurnRequest =
         serde_json::from_value(params.clone()).map_err(|e| format!("INVALID_INPUT: {e}"))?;
@@ -431,7 +460,27 @@ pub fn handle_capture_turn(
     // why_trace exemption (`substrate_authored = false`); under
     // AI_MEMORY_REQUIRE_WHY_TRACE=1 the caller supplies
     // `metadata.why_trace` or the write is refused at the insert gate.
-    let result = crate::storage::capture_turn_idempotent(conn, &write, false)?;
+    //
+    // v1.0.0 #3587 U4 — the auto path derives the per-session index inside
+    // the transaction; every gate above ran on the placeholder-index
+    // `write`, which is identical in namespace + content (the only fields
+    // the gates read), so gating stays uniform across both paths.
+    let result = if auto_index {
+        let req_for_build = req.clone();
+        crate::storage::capture_turn_idempotent_auto(
+            conn,
+            &req.host_session_id,
+            &req.content,
+            false,
+            |derived_index| {
+                let mut indexed = req_for_build.clone();
+                indexed.host_turn_index = derived_index;
+                prepare_capture_turn(&indexed, caller)
+            },
+        )?
+    } else {
+        crate::storage::capture_turn_idempotent(conn, &write, false)?
+    };
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if result.dedup_hit {

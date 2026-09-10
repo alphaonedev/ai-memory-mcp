@@ -817,6 +817,10 @@ pub enum Command {
     /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory notify`. CLI
     /// parity for `memory_notify`.
     Notify(crate::cli::commands::notify::NotifyArgs),
+    /// v1.0.0 #3587 U4 — `ai-memory capture-turn`. CLI twin of the
+    /// `memory_capture_turn` MCP tool and the sink for the Claude Code
+    /// `Stop` hook installed by `install claude-code --hook capture`.
+    CaptureTurn(crate::cli::commands::capture_turn::CaptureTurnArgs),
     /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory inbox`. CLI
     /// parity for `memory_inbox`.
     Inbox(crate::cli::commands::inbox::InboxArgs),
@@ -2513,7 +2517,7 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::install::run(&a, &mut out)
+            cli::install::run(&a, cli_agent_id.as_deref(), &mut out)
         }
         Command::Wrap(a) => {
             // Issue #487 PR-6. Pure-Rust cross-platform replacement for
@@ -2972,6 +2976,22 @@ pub async fn run(
                 &mut out,
             )
         }
+        Command::CaptureTurn(a) => {
+            // v1.0.0 #3587 U4 — the Stop-hook sink + parity twin. `j` is
+            // the global `--json` (json_contract Global).
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::capture_turn::cmd_capture_turn(
+                &db_path,
+                &a,
+                j,
+                cli_agent_id.as_deref(),
+                &mut out,
+            )
+        }
         Command::Inbox(a) => {
             // v1.0.0 #3470 — `--wait` blocks on the wake plane (the hub when
             // one is configured, else the bounded backstop poll) and THEN
@@ -3159,6 +3179,10 @@ pub fn is_write_command(cmd: &Command) -> bool {
             | Command::Subscribe(_)
             | Command::Unsubscribe(_)
             | Command::Notify(_)
+            // v1.0.0 #3587 U4 — `capture-turn` writes `memories` +
+            // `transcript_line_dedup` + `signed_events`, so it trips the
+            // post-run WAL checkpoint.
+            | Command::CaptureTurn(_)
             | Command::IngestMultistep(_)
             | Command::KgInvalidate(_)
             | Command::EntityRegister(_)
