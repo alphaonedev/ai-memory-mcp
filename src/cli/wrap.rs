@@ -631,13 +631,15 @@ mod tests {
     }
 
     #[test]
-    fn wrap_with_unreachable_db_does_not_block_agent() {
-        // Boot honors `--quiet` and exits 0 with a warn header on stdout
-        // when the DB is missing. The captured stdout becomes the body
-        // of the wrap system message. We assert: (a) `run_boot_capture`
-        // returns *something* (the warn header) without erroring, and
-        // (b) the assembled system message still carries the preamble
-        // so the agent knows it has memory access (even if empty).
+    fn wrap_with_unreachable_db_runs_agent_unwrapped_3411() {
+        // #3411 contract: `boot --quiet` with a missing DB exits 0 with
+        // EMPTY stdout (a hook must not inject a warn header into the
+        // agent's context). The captured stdout becomes the body of the
+        // wrap system message, so with an unreachable DB the body is
+        // empty and the agent runs with the preamble alone. We assert:
+        // (a) `run_boot_capture` returns an empty string without
+        // erroring, and (b) the assembled system message is exactly the
+        // preamble so the agent still knows it has memory access.
         let env = TestEnv::fresh();
         let bad = env
             .db_path
@@ -651,12 +653,14 @@ mod tests {
             &crate::config::AppConfig::default(),
         );
         assert!(
-            captured.contains("# ai-memory boot: warn"),
-            "wrap should surface the warn header even with unreachable DB: {captured}"
+            captured.is_empty(),
+            "`boot --quiet` must be silent on an unreachable DB (#3411): {captured}"
         );
         let assembled = build_system_message(&captured);
-        assert!(assembled.starts_with(WRAP_PREAMBLE));
-        assert!(assembled.contains("warn"));
+        assert_eq!(
+            assembled, WRAP_PREAMBLE,
+            "an empty boot body must leave exactly the preamble"
+        );
     }
 
     #[test]

@@ -135,12 +135,26 @@ fn unmarked_binary_never_reaches_the_key_dir_guard() {
     );
 
     // 2. `doctor` — resolves the key directory for its Identity section, so it
-    //    hit the same guard. The pin is "no #3355 panic" (exit 101), not a
-    //    healthy report: #3411 made doctor read-only, so a missing db is
-    //    CRITICAL (exit 2). That is operator-correct and independent of the
-    //    key-dir guard. `rules keygen` above already proves a write-path
-    //    command whose key dir is under HOME completes in an unmarked binary.
+    //    hit the same guard. #3411 made doctor read-only (a missing db is
+    //    CRITICAL, exit 2), so create the database first through the same
+    //    plain binary: `stats` is create-and-migrate and walks the guard
+    //    path too. Doctor then runs to completion; warnings keep exit 0 and
+    //    only a CRITICAL exits 2.
     let db = home.join("m.db");
+    let out = operator_cmd(&home, &keys)
+        .arg("--db")
+        .arg(&db)
+        .arg("stats")
+        .output()
+        .expect("spawn ai-memory stats");
+    assert_no_guard_panic("stats", &out);
+    assert!(
+        out.status.success(),
+        "stats must create the database for an operator whose key dir is under \
+         HOME\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = operator_cmd(&home, &keys)
         .arg("--db")
         .arg(&db)
@@ -148,6 +162,13 @@ fn unmarked_binary_never_reaches_the_key_dir_guard() {
         .output()
         .expect("spawn ai-memory doctor");
     assert_no_guard_panic("doctor --json", &out);
+    assert!(
+        out.status.success(),
+        "doctor must run to completion for an operator whose key dir is under \
+         HOME\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
