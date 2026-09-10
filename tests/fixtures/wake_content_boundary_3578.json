@@ -1,0 +1,176 @@
+[
+  {
+    "path": "src/wake_hub/allowlist_reload.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "28c723598ac8af20a75353a8b696eee923c0fc82f0b62fb1a577ad54db6f1d99"
+  },
+  {
+    "path": "src/wake_hub/codec.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "2d6f0d407fc3c333868179f408a6ef007e0c64a416a73ca17715ef219787ea31"
+  },
+  {
+    "path": "src/wake_hub/conn.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "e8c34fdc7414999bd5a6b9dc6827bfea983c7cc1816fcfb888a6b6e84aefd514"
+  },
+  {
+    "path": "src/wake_hub/delegation_verifier.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "e0a9a4a6e170b4daa9e8368ca781e4576c8f5302411fb6cd6f6bff01f03864a2"
+  },
+  {
+    "path": "src/wake_hub/frame.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "13c85d9b3d54868ff0ab68acf3e94447bb1dc6db42b5b88c1019af9af3dd89ca"
+  },
+  {
+    "path": "src/wake_hub/health.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "92ac0e799302acaa61d00d973d1793ead7bc97111cf7c1cd24c75046dccde135"
+  },
+  {
+    "path": "src/wake_hub/histogram.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "02302ab517e6cf438b2c65bb21efd8e448f94194e85b836a8a5eae3706754f82"
+  },
+  {
+    "path": "src/wake_hub/identity.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "14ed3f5849b15ffa4bd02c95f2e312dcad91d6a62d7117353d9c38339d661e65"
+  },
+  {
+    "path": "src/wake_hub/limits.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "36d0f93010ea92564c5c1a98c00448d3211130ebe0e0d211fde7da63f5a10167"
+  },
+  {
+    "path": "src/wake_hub/metrics.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "0e7b5cd3941b5e6c5a8e8427ba319b95edb79513c9c4b68da8051eb8e4de3e6a"
+  },
+  {
+    "path": "src/wake_hub/mod.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "756798ee1f854797dfd2e85c7a3d4629ba031864c1b31aaf7a910e6c3e878153"
+  },
+  {
+    "path": "src/wake_hub/pending.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "535baad90ef00428392f691a761071b6c60ef974cd3597b83b6c603773c5bc0a"
+  },
+  {
+    "path": "src/wake_hub/routing.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "680990a9359a3c01bb1b254206a699b58e04ec48dc66a8021c48b39b524ad070"
+  },
+  {
+    "path": "src/wake_hub/server.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "e476357870df9136fd8bdbd5c1c49e17ad5aa5d40aac6e3f12e78599067c72c0"
+  },
+  {
+    "path": "src/wake_hub/startup.rs",
+    "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
+    "mode": "rust-production-tokens",
+    "sha256": "b0671b409822027fd665c757b7b289b0d9f33480ae3ef9d30f912a4a38efa592"
+  },
+  {
+    "path": "src/wake_client/bundle.rs",
+    "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
+    "mode": "rust-production-tokens",
+    "sha256": "baadf0ea4cb6fe49154f98d86ea1355c0d739e4eaf2dea5ab0cd8ad9ad70723e"
+  },
+  {
+    "path": "src/wake_client/mod.rs",
+    "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
+    "mode": "rust-production-tokens",
+    "sha256": "230797bdf68e1547c23eb7cadac19f75f8d82a6bc67ed34071aea9f6c9cb3740"
+  },
+  {
+    "path": "src/wake_client/session.rs",
+    "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
+    "mode": "rust-production-tokens",
+    "sha256": "91db62a326c6e46add4b1f4d33cf862aabf23c774c7adf3373eb50898d44aabe"
+  },
+  {
+    "path": "src/wake_sink/boot.rs",
+    "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
+    "mode": "rust-production-tokens",
+    "sha256": "5ba11d7be324b68dea989da871b0ce909b8a2499318f6852211d0c1da5372221"
+  },
+  {
+    "path": "src/wake_sink/in_process.rs",
+    "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
+    "mode": "rust-production-tokens",
+    "sha256": "42292df24015e4524f03e17c7cf1a6c42fe972302299497dc029933699d45d6e"
+  },
+  {
+    "path": "src/wake_sink/mod.rs",
+    "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
+    "mode": "rust-production-tokens",
+    "sha256": "3c764b92ee7029ea8d817187e110aa97101572cad1676113114cf23e72de5c44"
+  },
+  {
+    "path": "src/wake_sink/producer_identity.rs",
+    "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
+    "mode": "rust-production-tokens",
+    "sha256": "0f71cf9153670b6dfc19b6fca50c6923dd3f1755940bb221d46ccc0f67d0db2d"
+  },
+  {
+    "path": "src/wake_sink/uds.rs",
+    "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
+    "mode": "rust-production-tokens",
+    "sha256": "ff383dc5214ae44ce772e44c97461d7502fc5a272bb3c077c9f79fe049cf0731"
+  },
+  {
+    "path": "src/cli/wake_listen.rs",
+    "role": "Operator-resolved caller catch_up_read -> handle_inbox; metadata rendering; operator --exec via audited_tokio_command.",
+    "mode": "rust-production-tokens",
+    "sha256": "d2116bdc1d9eda67c39fd8c84d9eb18403de3c0a6a7f3a25399f527daed41653"
+  },
+  {
+    "path": "src/inbox_wake.rs",
+    "role": "Already-committed notify -> content-free bus event -> installed sink; no reverse content-write edge.",
+    "mode": "rust-production-tokens",
+    "sha256": "85614b48b5256794a085005dfcd1fa08c90e0670dc40a756d51912c693b9e7dd"
+  },
+  {
+    "path": "src/spawn_audit.rs",
+    "role": "Explicit exception: audited operator spawn may open the seeded database and append a content-free signed spawn-audit row.",
+    "mode": "rust-production-tokens",
+    "sha256": "51d5ce1ecb04375061a03104ababd509335bfbe0c41c38724590ed40ac22d637"
+  },
+  {
+    "path": "sdk/python/ai_memory/wake.py",
+    "role": "Python decoder -> metadata WakeSignal -> operator-provided on_signal callback; external trust boundary.",
+    "mode": "sdk-source-bytes",
+    "sha256": "d488d9e67b4df038844125259d9870647e139509bb847157c003a80a4c3cf8af"
+  },
+  {
+    "path": "sdk/python/swarm/wake.py",
+    "role": "Python swarm adapter captures a signal and returns it; application read/write decisions remain outside the decoder.",
+    "mode": "sdk-source-bytes",
+    "sha256": "dbc8bb9502b7d24d8503932de69b96950b2e2bafb3a15addf7a9880f05665bfd"
+  },
+  {
+    "path": "sdk/typescript/src/wake.ts",
+    "role": "TypeScript decoder/state machine -> metadata WakeSignal -> operator-provided onSignal callback; external trust boundary.",
+    "mode": "sdk-source-bytes",
+    "sha256": "10bdca0697a5d9478cd8801ea3032ab44fa9b52d6a2b306ee2464839bc6a9be1"
+  }
+]

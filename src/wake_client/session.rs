@@ -416,6 +416,109 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
+    // A hostile peer after admission: socketpair isolates the actual production
+    // event decoder without bypassing it. This is not credential evidence.
+    async fn received_event_3578(body: Bytes) -> Result<SessionEvent> {
+        let (client, peer) = UnixStream::pair().expect("socket pair");
+        let (reader, writer) = client.into_split();
+        let mut session = Session {
+            reader: FramedRead::new(reader, codec()),
+            writer,
+            agent_id: "ai:listener-3578".into(),
+            welcome: WelcomePayload {
+                session: 1,
+                pending_count: 0,
+                pending_ids: 0,
+                lagged: false,
+                reconnect_base_ms: 25,
+                reconnect_jitter_ms: 0,
+            },
+        };
+        let (_, mut peer_writer) = peer.into_split();
+        write_framed(&mut peer_writer, body)
+            .await
+            .expect("send hostile frame");
+        tokio::time::timeout(Duration::from_secs(5), session.next_event())
+            .await
+            .expect("bounded event read")
+    }
+
+    #[tokio::test]
+    async fn valid_binary_hints_reach_the_renderable_event_boundary_3578() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../sdk/fixtures/wake_meta_3578.json"))
+                .expect("shared vectors");
+        for case in vectors["allowed"].as_array().expect("allowed cases") {
+            let raw = hex::decode(case["hex"].as_str().expect("hex")).expect("bytes");
+            let expected = WakeMeta::decode(&raw).expect("allowed hint");
+            let body = Frame::new(Kind::Wake, "producer", "ai:listener-3578", raw.into())
+                .encode()
+                .expect("allowed frame");
+            assert_eq!(
+                received_event_3578(body).await.expect("wake event"),
+                SessionEvent::Wake(Box::new(expected))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_binary_frames_are_refused_before_a_renderable_event_3578() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../sdk/fixtures/wake_meta_3578.json"))
+                .expect("shared vectors");
+        let allowed = &vectors["allowed"][1];
+        let raw = hex::decode(allowed["hex"].as_str().expect("hex")).expect("bytes");
+        let valid = Frame::new(
+            Kind::Wake,
+            "producer",
+            "ai:listener-3578",
+            raw.clone().into(),
+        )
+        .encode()
+        .expect("valid frame");
+        let mut denied = Vec::new();
+        for case in vectors["denied"].as_array().expect("denied cases") {
+            let payload = hex::decode(case["hex"].as_str().expect("hex")).expect("bytes");
+            // Construct the wire body directly so even the 257-byte fixture
+            // reaches the receiver instead of failing in the local encoder.
+            let mut body = valid[..valid.len() - raw.len()].to_vec();
+            let len = u16::try_from(payload.len())
+                .expect("fixture length")
+                .to_be_bytes();
+            body[10..12].copy_from_slice(&len);
+            body.extend_from_slice(&payload);
+            if payload.len() <= 256 {
+                assert_eq!(
+                    Frame::decode(&body)
+                        .expect("valid frame wrapping bad metadata")
+                        .payload
+                        .as_ref(),
+                    payload
+                );
+            } else {
+                assert!(matches!(
+                    Frame::decode(&body),
+                    Err(crate::wake_hub::frame::FrameError::PayloadTooLarge { .. })
+                ));
+            }
+            denied.push((case["name"].to_string(), Bytes::from(body)));
+        }
+        for kind in [11, 12, 13] {
+            let mut body = valid.to_vec();
+            body[5] = kind;
+            denied.push((format!("reserved kind {kind}"), body.into()));
+        }
+        assert_eq!(
+            denied.len(),
+            8,
+            "five metadata refusals and three reserved kinds"
+        );
+        for (name, body) in denied {
+            let event = received_event_3578(body).await;
+            assert!(event.is_err(), "{name} reached an event: {event:?}");
+        }
+    }
+
     /// DENIED: every socket posture that would let another local user take a
     /// listener's handshake. The listener checks the same two objects the hub
     /// hardened when it bound.

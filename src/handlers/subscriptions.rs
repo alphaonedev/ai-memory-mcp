@@ -268,18 +268,13 @@ pub async fn notify(
 
     let lock = app.db.lock().await;
     let resolved_ttl = lock.2.clone();
-    // Route via the MCP handler so the wire contract stays single-sourced.
-    // `mcp_client = Some(&sender)` makes `resolve_agent_id(None, _)` return
-    // the caller-resolved HTTP id — same effective provenance.
-    let mcp_client = sender.clone();
-    // #3465 — `handle_notify` emits the `agent_notified` write event
-    // (wake bus + webhook lane) itself, so this surface inherits it by
-    // routing through the MCP handler exactly as it already does for
-    // the wire contract. `lock.1` is the daemon's sqlite path, which
-    // the webhook worker pool re-opens per delivery.
+    // #3579: pass the independently resolved HTTP sender directly. The MCP
+    // client-name ladder would synthesize a different principal or select the
+    // daemon's ambient identity. Validation, quota, receipt and write events
+    // remain shared with MCP; the PostgreSQL arm uses the same resolved sender.
     let db_path = lock.1.clone();
     let result =
-        crate::mcp::handle_notify(&lock.0, &db_path, &params, &resolved_ttl, Some(&mcp_client));
+        crate::mcp::handle_notify_as_sender(&lock.0, &db_path, &params, &resolved_ttl, &sender);
 
     // v0.6.2 (S32): capture the just-inserted notify row and fan it out to
     // peers. Without this, alice's notify on node-1 lands in bob's inbox on
@@ -306,11 +301,9 @@ pub async fn notify(
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
-        // Issue #851: `mcp::handle_notify` returns Result<_, String> where
-        // the inner string can include raw rusqlite text from
-        // db::insert(...).map_err(|e| e.to_string()). Sanitize via the
-        // standard bad_request_opaque helper.
-        Err(e) => super::bad_request_opaque("notify handler error", &e),
+        // #851 / #3579: typed helper errors can still contain raw database
+        // text. Keep the existing opaque 400 wire response and unprefixed log.
+        Err(e) => super::bad_request_opaque("notify handler error", &e.message()),
     }
 }
 // --- /api/v1/subscriptions (POST / DELETE / GET) ---------------------------

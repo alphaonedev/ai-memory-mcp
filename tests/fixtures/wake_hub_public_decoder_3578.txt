@@ -1,0 +1,22 @@
+// Reviewed public decoder token pin, #3578. Non-executable fixture.
+pub fn decode_public_base64(s: &str) -> Result<VerifyingKey> {
+    let trimmed = s.trim();
+    let bytes = URL_SAFE_NO_PAD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(trimmed))
+        .with_context(|| "decoding base64 public key".to_string())?;
+    if bytes.len() != PUBLIC_KEY_LEN {
+        bail!(
+            "decoded public key has {} bytes, expected {PUBLIC_KEY_LEN}",
+            bytes.len()
+        );
+    }
+    let mut arr = [0u8; PUBLIC_KEY_LEN];
+    arr.copy_from_slice(&bytes);
+    // COVERAGE: with_context closure (line 326+) reachable when the
+    //           32-byte base64-decoded payload is an invalid Edwards-
+    //           curve point. Same class as load() line 218 — coverage
+    //           depends on the dalek 2.x decode policy for specific
+    //           inputs. Documented per L0.7 playbook §3c.
+    VerifyingKey::from_bytes(&arr).with_context(|| "decoding public key bytes".to_string())
+}

@@ -922,6 +922,120 @@ REFUSES to bind at all when the budget cannot cover `MIN_CONNECTION_CEILING`
 connections plus `FD_HEADROOM` descriptors — a smaller hub is honest, a hub
 that lies about its capacity is not.
 
+**Wire identity domain (#3578).** `a2a-hub` and every `a2a-hub/...` scoped
+form are reserved by `validate::RESERVED_AGENT_IDS` and its scoped-form
+check. HTTP header/body claims and MCP explicit caller claims are refused
+through the shared identity validator, even when the claimed value agrees
+with the resolved caller. Ordinary principal names such as `ai:alice` and
+`a2a-hub-agent` retain their existing grammar. The allowed/refused resolver
+matrix is pinned by `tests/wake_hub_identity_domain_3578.rs`. This wire
+reservation does not change the internal-bootstrap shape-only validator.
+
+**Credential and write-authority pins (#3578, #3579).**
+`tests/wake_hub_write_authority_3578.rs` first admits the exact delegation
+through the production hub hello verifier using a backend-derived possession
+binding. That delegation's wire envelope, root signature, and delegated public
+key cannot replace an enrolled HTTP API key. A hub-domain signature or a memory
+write signed by its delegated key cannot replace the enrolled root's memory-write
+signature. Denied requests leave the complete memory-row snapshot unchanged;
+allowed controls persist the independently resolved caller. Forged wake
+principal/sender/from and namespace fields do not select notification authority
+or its destination namespace. PostgreSQL tests require a live database and
+also check that the SQLite shadow receives no write.
+
+HTTP tests use the real router in per-agent API-key Enforce mode. MCP tests
+use the existing production-handler test entry and its host caller context;
+MCP has no API-key login. The PostgreSQL MCP path forwards over a real loopback
+HTTP listener requiring an enrolled-root write signature. That listener has
+no API-key gate because the existing forwarder sends only `X-Agent-Id`; the
+separate HTTP credential cases cover that gate. These pins do not claim stdio
+framing, a sandbox, or authentication of arbitrary operator code.
+`tests/http_notify_caller_binding_3579.rs` additionally pins the exact HTTP
+sender in both ambient-identity postures on SQLite and live PostgreSQL, and
+preserves MCP's host identity ladder and validation order.
+
+**Binary hint codec pins (#3578).** `tests/qual_wake_meta_codec_3578.rs`,
+`sdk/python/tests/test_wake_meta_3578.py`, and
+`sdk/typescript/__tests__/wake_meta_3578.test.ts` consume the same
+`sdk/fixtures/wake_meta_3578.json` vectors. They pin the five metadata fields,
+empty and UTF-8 hints, a valid 256-byte encoding, 257-byte refusal, appended
+`content`/`title` refusal, every truncation of each valid vector, and reserved
+body kinds 11/12/13 with an allowed wake control. Rust also checks exact
+re-encoding and refuses an oversized hint at encode time. These tests cover
+the binary hint; handshake/control frames have their own bounds. They do not
+assert a 256-byte limit on the CLI reporting JSON or a JSON-input decoder.
+
+**JSON output pins (#3578).** `tests/qual_wake_json_3578.rs` pins the exact
+closed output key set: `inbox_row_id`, `namespace`, `sender`, `digest`,
+`seq_high_watermark`, `reason`, `hub_driven`, `agent_id`, `hub_id`, `missed`,
+`pending_count`, and `inbox_count`. No `content`, `title`, `body`, or `payload`
+key is admitted. Hint values and all reporting values are checked, including
+bare signals and metadata text that resembles JSON keys. The serialized
+reporting envelope may exceed 256 bytes; the ceiling applies to encoded binary
+`WakeMeta`. The #3578 tests in `wake_client::session` deliver the shared denied
+binary vectors and reserved kinds through a socket pair into the production
+`Session::next_event`: refusal produces no renderable event, while valid hints
+produce exactly the expected metadata. This tests the boundary after admission,
+not credentials, database authority, JSON input validation, or process isolation.
+
+**Dependency gate (#3578).** `tests/qual_wake_hub_zero_authority_3578.rs`
+walks every Rust source under `src/wake_hub`, scanning all feature branches
+and resuming after complete inline test modules. Its reviewed crate-edge
+allowlist admits the public delegation verification vocabulary, snapshot-age
+constant, binding-authority type, producer sentinel, and shared visibility
+predicates. `identity::keypair::decode_public_base64` is the sole keypair
+exception; its public decoder body and imported dependencies are pinned.
+Module/glob imports cannot widen that exception. Mutation fixtures cover
+aliased/grouped imports, fully qualified paths, the production tail after
+tests, database/configuration literals, signing material, and source inclusion.
+This lexical qualification gate does not prove filesystem isolation or replace
+the OS permissions below; runtime credential refusal and content-plane checks
+are separate controls.
+
+**Forward-binding content-plane allowance (#3578).**
+`tests/qual_wake_content_boundary_3578.rs` runs in the qualification family.
+Its reviewed source manifest covers the hub, both producer sinks, Rust client,
+CLI consumer, wake bus, spawn-audit wrapper, and Python/TypeScript listeners
+(including the Python swarm adapter). It admits the existing flow:
+
+- A committed notify emits metadata to the bus; the in-process and UDS sinks
+  encode a `WakeMeta` hint. The producer's inbound hub frames handle liveness
+  and refusals; they do not dispatch memory writes.
+- The Rust client decodes a hint into a signal. `wake-listen` calls
+  `catch_up_read` with the operator-resolved listener identity, through the
+  existing `handle_inbox` funnel. The hint never selects that identity.
+  Rendering receives metadata and the resulting count, not inbox content.
+- An operator-supplied `--exec` command goes through
+  `spawn_audit::audited_tokio_command`. This explicitly admitted edge can open
+  the seeded audit database and append a content-free signed spawn-audit row.
+  The eleven `AI_MEMORY_WAKE_*` fields attached by the listener are pinned by
+  exact key **and value expression**: reason, listener identity, hub identity,
+  row ID, namespace, sender, digest, sequence, missed/pending counts, and inbox
+  count. No hint content/title becomes an environment value or shell program.
+
+The hook and SDK `on_signal` / `onSignal` callbacks are **external operator
+trust boundaries**, not SDK-screened content paths. They may independently
+read or write using their own credentials. The hook also inherits its operator
+environment; the pin covers the fields the listener attaches, not a sanitized
+process environment. GA has no automatic A2A decoder-to-notify/store content
+write in these reviewed paths. A future payload decoder requires a reviewed
+SDK-edge screen and an explicit allowlist change; an operator callback is not
+that screen.
+
+The manifest is a conservative source-change gate: Rust production tokens
+(including imports, all feature branches and code after inline test modules)
+and SDK source bytes must match, and the three Rust directory inventories must
+remain exact. Rust formatting/comments and complete inline `cfg(test)` modules
+may change without updating the pin. Mutation tests refuse added writes and
+aliases, caller substitution, content/title environment fields, command
+substitution, SDK callback-to-write changes, and production appended after
+tests. Updating a digest requires boundary review, even for a harmless code
+change; do not regenerate the manifest merely to make a gate green. This is
+not a compiler call-graph proof, macro-expansion analysis, proof of unchanged
+external dependency implementations, or a sandbox for arbitrary application
+callbacks. Runtime codec/credential tests and the OS isolation contract remain
+separate evidence.
+
 **Process isolation (#3578).** The systemd unit runs as `User=ai-memory-hub`
 (not the daemon's `ai-memory`), jails `/var/lib/ai-memory` with
 `InaccessiblePaths=`, and restricts the address family to `AF_UNIX`: the wake

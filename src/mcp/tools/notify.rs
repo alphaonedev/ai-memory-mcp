@@ -3,6 +3,7 @@
 
 //! MCP `memory_notify` and `memory_inbox` handlers.
 
+use crate::errors::MemoryError;
 use crate::mcp::param_names;
 use crate::models::ConfidenceSource;
 use crate::models::field_names;
@@ -30,13 +31,43 @@ pub fn handle_notify(
     resolved_ttl: &crate::config::ResolvedTtl,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    let input = parse_notify(params).map_err(|e| e.message())?;
+    let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    persist_notify(conn, db_path, input, resolved_ttl, &sender).map_err(|e| e.message())
+}
+
+/// #3579: HTTP has already resolved and validated this sender. Never feed it
+/// through the MCP client-name or ambient-identity ladder.
+pub(crate) fn handle_notify_as_sender(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    params: &Value,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    sender: &str,
+) -> Result<Value, MemoryError> {
+    persist_notify(conn, db_path, parse_notify(params)?, resolved_ttl, sender)
+}
+
+/// Validated notification fields; both entries validate before any write.
+struct NotifyInput<'a> {
+    target: &'a str,
+    title: &'a str,
+    payload: &'a str,
+    priority: i32,
+    tier: Tier,
+    why_trace: Option<&'a str>,
+}
+
+fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
     let target = params[param_names::TARGET_AGENT_ID]
         .as_str()
-        .ok_or("target_agent_id is required")?;
+        .ok_or_else(|| MemoryError::ValidationFailed("target_agent_id is required".into()))?;
     let title = params["title"]
         .as_str()
-        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
-    let payload = params["payload"].as_str().ok_or("payload is required")?;
+        .ok_or_else(|| MemoryError::ValidationFailed(crate::errors::msg::TITLE_REQUIRED.into()))?;
+    let payload = params["payload"]
+        .as_str()
+        .ok_or_else(|| MemoryError::ValidationFailed("payload is required".into()))?;
     // B4 (R2-LOW) — clamp instead of panic on out-of-range JSON; an i64 like
     // `9_999_999_999` would have aborted the stdio MCP server before the clamp
     // ran. v1.0.0 batch-2: routed through the shared
@@ -49,14 +80,43 @@ pub fn handle_notify(
             .unwrap_or(i64::from(crate::models::DEFAULT_PRIORITY)),
     );
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Short.as_str());
-    let tier =
-        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
+    let tier = Tier::from_str(tier_str).ok_or_else(|| {
+        MemoryError::ValidationFailed(crate::errors::msg::invalid("tier", tier_str))
+    })?;
 
-    validate::validate_agent_id(target).map_err(|e| e.to_string())?;
-    validate::validate_title(title).map_err(|e| e.to_string())?;
-    validate::validate_content(payload).map_err(|e| e.to_string())?;
+    validate::validate_agent_id(target)
+        .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
+    validate::validate_title(title).map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
+    validate::validate_content(payload)
+        .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
 
-    let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    Ok(NotifyInput {
+        target,
+        title,
+        payload,
+        priority,
+        tier,
+        why_trace: params[param_names::WHY_TRACE]
+            .as_str()
+            .filter(|wt| !wt.trim().is_empty()),
+    })
+}
+
+fn persist_notify(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    input: NotifyInput<'_>,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    sender: &str,
+) -> Result<Value, MemoryError> {
+    let NotifyInput {
+        target,
+        title,
+        payload,
+        priority,
+        tier,
+        why_trace,
+    } = input;
     let namespace = crate::inbox_namespace(target);
 
     let now = chrono::Utc::now();
@@ -65,7 +125,7 @@ pub fn handle_notify(
         .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
 
     let mut metadata = json!({
-        "agent_id": sender.clone(),
+        "agent_id": sender,
         (field_names::TARGET_AGENT_ID): target,
         "notify": true,
     });
@@ -76,9 +136,7 @@ pub fn handle_notify(
     // rationale via the optional `why_trace` param. Under
     // AI_MEMORY_REQUIRE_WHY_TRACE=1 a why_trace-less notify is refused by
     // the `db::insert` gate; default posture is unchanged (advisory).
-    if let Some(wt) = params[param_names::WHY_TRACE].as_str()
-        && !wt.trim().is_empty()
-    {
+    if let Some(wt) = why_trace {
         metadata[param_names::WHY_TRACE] = json!(wt);
     }
 
@@ -123,8 +181,8 @@ pub fn handle_notify(
     let quota_op = crate::quotas::QuotaOp::Memory {
         bytes: payload_bytes,
     };
-    crate::quotas::check_and_record(conn, &sender, &mem.namespace, quota_op)
-        .map_err(|e| e.to_string())?;
+    crate::quotas::check_and_record(conn, sender, &mem.namespace, quota_op)
+        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
 
     let actual_id = match db::insert(conn, &mem) {
         Ok(id) => id,
@@ -133,11 +191,11 @@ pub fn handle_notify(
             // every downstream refusal/failure so only durable notifications
             // remain charged.
             if let Err(refund_err) =
-                crate::quotas::refund_op(conn, &sender, &mem.namespace, quota_op)
+                crate::quotas::refund_op(conn, sender, &mem.namespace, quota_op)
             {
-                crate::quotas::log_refund_op_failed(&sender, &refund_err);
+                crate::quotas::log_refund_op_failed(sender, &refund_err);
             }
-            return Err(e.to_string());
+            return Err(MemoryError::DatabaseError(e.to_string()));
         }
     };
 
@@ -152,7 +210,7 @@ pub fn handle_notify(
         db_path,
         &crate::write_events::AgentNotified {
             recipient_agent_id: target,
-            sender_agent_id: &sender,
+            sender_agent_id: sender,
             inbox_row_id: &actual_id,
             namespace: &namespace,
             content: payload,
@@ -161,7 +219,7 @@ pub fn handle_notify(
 
     Ok(notify_receipt(
         &actual_id,
-        &sender,
+        sender,
         target,
         &namespace,
         &mem.tier,
@@ -487,6 +545,32 @@ mod d1_5_986_tests {
     }
 
     #[test]
+    fn notify_validation_keeps_typed_errors_and_mcp_messages_3579() {
+        let conn = rusqlite::Connection::open_in_memory().expect("unmigrated fixture");
+        let path = std::path::Path::new(":memory:");
+        let ttl = crate::config::ResolvedTtl::default();
+        for (params, expected) in [
+            (json!({}), "target_agent_id is required"),
+            (
+                json!({"target_agent_id": "ai:recipient"}),
+                crate::errors::msg::TITLE_REQUIRED,
+            ),
+            (
+                json!({"target_agent_id": "ai:recipient", "title": "message"}),
+                "payload is required",
+            ),
+        ] {
+            let typed = handle_notify_as_sender(&conn, path, &params, &ttl, "ai:sender")
+                .expect_err("validation must precede database access");
+            assert!(matches!(typed, MemoryError::ValidationFailed(_)));
+            assert_eq!(typed.message(), expected);
+            let wire = handle_notify(&conn, path, &params, &ttl, None)
+                .expect_err("validation must precede identity resolution");
+            assert_eq!(wire, expected);
+        }
+    }
+
+    #[test]
     fn notify_tool_metadata_986() {
         assert_eq!(NotifyTool::name(), "memory_notify");
         assert_eq!(NotifyTool::family(), "other");
@@ -605,6 +689,16 @@ mod d1_5_986_tests {
         .expect_err("notify over quota must fail closed");
 
         assert!(err.contains("QUOTA_EXCEEDED"), "unexpected error: {err}");
+        let typed = handle_notify_as_sender(
+            &conn,
+            std::path::Path::new(":memory:"),
+            &params,
+            &ttl,
+            &sender,
+        )
+        .expect_err("pre-resolved sender must hit the same quota refusal");
+        assert!(matches!(typed, MemoryError::DatabaseError(_)));
+        assert_eq!(typed.message(), err);
         let inbox_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories WHERE namespace = ?1",

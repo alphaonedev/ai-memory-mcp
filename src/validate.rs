@@ -342,6 +342,8 @@ pub fn validate_source(source: &str) -> Result<()> {
 ///   SUBSTRATE-originated wake frame is stamped with on the wake-hub
 ///   plane. Reserved so a wire caller cannot register the name and
 ///   forge a substrate-originated wake.
+/// - `"a2a-hub"` and its `/...` scoped forms → the hub delegation's
+///   authority domain (#3578), never a wire caller principal.
 /// - `"system"` → `src/handlers/hook_subscribers.rs` (stamped on
 ///   legacy-rewrite rows; also matched as the unowned-marker sentinel
 ///   in cross-tenant gates, so wire spoofing it would let the caller
@@ -357,6 +359,7 @@ pub const RESERVED_AGENT_IDS: &[&str] = &[
     crate::identity::sentinels::GOVERNANCE_INTERNAL,
     crate::identity::sentinels::EMBEDDING_BACKFILL,
     crate::identity::sentinels::WAKE_HUB_PRODUCER,
+    crate::identity::hub_delegation::A2A_HUB_SCOPE,
 ];
 
 /// Shape-only validation for an agent identifier — the pre-#977
@@ -421,7 +424,8 @@ pub fn validate_agent_id_shape(agent_id: &str) -> Result<()> {
 /// Validate an agent identifier (NHI-hardened) for wire-side use.
 ///
 /// Calls [`validate_agent_id_shape`] for the shape check, then rejects
-/// the [`RESERVED_AGENT_IDS`] reserved-name set (issue #977) so wire
+/// the [`RESERVED_AGENT_IDS`] reserved-name set (issue #977), including
+/// `a2a-hub/...` scoped forms (#3578), so wire
 /// callers cannot spoof an internal `CallerContext` principal. Internal
 /// callers constructing `CallerContext::for_admin` directly do not
 /// traverse this validator and remain unaffected; internal keypair
@@ -441,7 +445,10 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
     // signal. Internal `CallerContext::for_admin(...)` constructions +
     // the daemon's own keypair load (via `validate_agent_id_shape`)
     // skip this reserved-name reject by design.
-    if RESERVED_AGENT_IDS.contains(&agent_id) {
+    let hub_scoped_form = agent_id
+        .strip_prefix(crate::identity::hub_delegation::A2A_HUB_SCOPE)
+        .is_some_and(|suffix| suffix.starts_with('/'));
+    if RESERVED_AGENT_IDS.contains(&agent_id) || hub_scoped_form {
         bail!(
             "agent_id '{agent_id}' is reserved for internal use and cannot be supplied by wire \
              callers"
