@@ -8,6 +8,12 @@ on:
         required: false
         default: '60'
 
+# #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
+# Checkout + cargo-fuzz + upload-artifact; artifact upload does not need a
+# wider GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: Cargo Fuzz

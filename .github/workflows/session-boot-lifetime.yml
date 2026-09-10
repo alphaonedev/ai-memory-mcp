@@ -22,6 +22,11 @@ on:
       - 'scripts/run-session-boot-lifetime-tests.sh'
       - '.github/workflows/session-boot-lifetime.yml'
 
+# #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
+# Checkout + cargo/scripts only; no PR comments, SARIF, or checks writes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export

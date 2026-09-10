@@ -52,6 +52,12 @@ on:
   merge_group:
     types: [checks_requested]
 
+# #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
+# Default contents: read. `per-module-thresholds` widens below for the sticky
+# coverage PR comment.
+permissions:
+  contents: read
+
 # v0.7.x (#1148) — cancel stale runs on a PR when a new push lands.
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
 # PR events; isolates fork PRs by PR number. See ci.yml for full
@@ -165,6 +171,10 @@ jobs:
     # pinning a runner for hours. Root cause fixed in
     # embeddings::Embedder::download_within; this is the backstop.
     timeout-minutes: 75
+    # #3591 — `Post coverage to PR (sticky)` uses
+    # marocchino/sticky-pull-request-comment (creates/updates a PR comment).
+    # Job-level permissions replace the workflow default, so contents: read
+    # stays listed.
     permissions:
       contents: read
       pull-requests: write

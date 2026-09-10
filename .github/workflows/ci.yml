@@ -93,6 +93,12 @@ on:
   merge_group:
     types: [checks_requested]
 
+# #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
+# Every job here is checkout + cargo/scripts; none posts PR comments, uploads
+# SARIF, or writes checks.
+permissions:
+  contents: read
+
 # Concurrency: coalesces `push` + same-branch internal `pull_request`
 # events while keeping fork PRs isolated.
 #
