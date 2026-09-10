@@ -2443,8 +2443,9 @@ pub async fn run(
             }
             let args = cli::doctor::DoctorArgs {
                 remote: a.remote,
-                json: a.json,
+                json: a.json || j,
                 fail_on_warn: a.fail_on_warn,
+                agent_id: cli_agent_id.clone(),
                 // #2815 — transport-auth knobs for the `--remote` fleet path.
                 // Inert (and byte-identical to the pre-#2815 client) when the
                 // operator passes none of them.
@@ -2470,7 +2471,15 @@ pub async fn run(
                 Err(e) => Err(anyhow::anyhow!("doctor task join failed: {e}")),
             }
         }
-        Command::Boot(a) => {
+        Command::Boot(mut a) => {
+            // #3411 — honour global `--json` as `--format json` when the
+            // operator did not pick an explicit format (Local json_support).
+            crate::cli::json_contract::apply_global_json_to_format(
+                &mut a.format,
+                j,
+                "text",
+                "json",
+            );
             // Issue #487. Read-only, fast, no embedder, no daemon. Suitable
             // for invocation from any AI-agent integration (Claude Code
             // SessionStart hook, Cursor / Cline / Continue / Windsurf
@@ -2624,7 +2633,9 @@ pub async fn run(
                 code => std::process::exit(code),
             }
         }
-        Command::ExportReflections(a) => {
+        Command::ExportReflections(mut a) => {
+            // #3411 — honour global `--json` as `--format json`.
+            crate::cli::json_contract::apply_global_json_to_format(&mut a.format, j, "md", "json");
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();
