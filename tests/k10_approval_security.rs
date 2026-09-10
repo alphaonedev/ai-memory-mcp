@@ -20,8 +20,8 @@
 //!     two SSE subscribers, each identifying as a distinct agent, and
 //!     fires one `approval_requested` per agent. Each subscriber must
 //!     see only its own event, never the other tenant's.
-//!   * **H10 (`remember=forever` actually remembers)** —
-//!     `remember_forever_actually_remembers`. After approving a pending
+//!   * **H10 (a recorded synthetic rule actually auto-decides; `remember=forever` itself is refused, #3394)** —
+//!     `session_rule_in_registry_auto_decides_next_call_h10`. After approving a pending
 //!     row with `remember=forever`, asserts that
 //!     `Permissions::evaluate` auto-decides the same `(action_type,
 //!     namespace, agent_id)` tuple to `Allow` without re-prompting.
@@ -644,7 +644,7 @@ async fn sse_http_two_subscribers_isolated() {
 }
 
 // ---------------------------------------------------------------------------
-// H10 — `remember=forever` actually remembers.
+// H10 — a synthetic rule recorded in the registry (the `remember=session` path; `forever` is refused, #3394) actually auto-decides.
 // ---------------------------------------------------------------------------
 
 /// Approve a pending row with `remember=forever`, then re-evaluate
@@ -656,7 +656,7 @@ async fn sse_http_two_subscribers_isolated() {
 /// recorded in a separate registry that K9 never consulted, so the
 /// next call still landed in `Ask` (or its mode-default fallback).
 #[tokio::test]
-async fn remember_forever_actually_remembers() {
+async fn session_rule_in_registry_auto_decides_next_call_h10() {
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     clear_synthetic_rules_for_test();
 
@@ -702,7 +702,7 @@ async fn remember_forever_actually_remembers() {
 /// Counter-control: the same evaluator MUST still ask (or fall
 /// through to the mode default) when no synthetic rule is recorded.
 /// Without this assertion a buggy synthetic-rule reader that always
-/// returned `Allow` would silently pass `remember_forever_actually_remembers`.
+/// returned `Allow` would silently pass `session_rule_in_registry_auto_decides_next_call_h10`.
 #[tokio::test]
 async fn evaluate_without_synthetic_rule_does_not_auto_allow() {
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());

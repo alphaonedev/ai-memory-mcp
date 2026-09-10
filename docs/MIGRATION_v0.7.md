@@ -112,7 +112,7 @@ post-grand-slam inventory: [`docs/internal/v070-feature-inventory.md`](internal/
 | `memory_verify(link_id)` | Graph | H4 | Returns `{signature_verified, attest_level, signed_by, signed_at}` for a link. |
 | `memory_pending_list` | Power | K10 | Lists pending approval requests. **Note:** the original v0.7-alpha drafts called this `memory_approval_pending`; the shipped name is `memory_pending_list`. |
 | `memory_pending_approve(id, …)` | Power | K10 | Approves a pending action. HMAC-signed body required. |
-| `memory_pending_reject(id, …, remember=forever?)` | Power | K10 | Rejects a pending action; `remember=forever` enables progressive trust. |
+| `memory_pending_reject(id, …, remember=once|session?)` | Power | K10 | Rejects a pending action; `remember=session` remembers it for this process (`remember=forever` is refused, #3394). |
 | `memory_subscription_dlq_list` | Power | K7 | Lists dead-letter subscription deliveries. |
 | `memory_subscription_replay` | Power | K7 | Replays a DLQ entry. |
 | `memory_quota_status` | Power | K8 | Returns the caller's per-agent daily quota row. See [`docs/k8-quotas.md`](k8-quotas.html). |
