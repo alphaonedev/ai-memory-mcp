@@ -427,6 +427,13 @@ pub const RETIRED: &str = "retired";
 pub const RETIRED_AT: &str = "retired_at";
 /// `retired_by` — #2024 skill-retire lifecycle wire/row field name.
 pub const RETIRED_BY: &str = "retired_by";
+/// `ruling_key` — #3587 U1 swarm anti-drift metadata key: a store carrying
+/// `metadata.ruling_key = K` in namespace N archives the previous live
+/// memory with the same `(N, K)` via `archive_as_superseded`. Write-once
+/// (U1 joins the preserved-keys set); this const is the SSOT so later
+/// units never scatter the literal (pm-v3.1 hardcoded-literal gate).
+/// U5a lands the const only — no write-path behaviour in this unit.
+pub const RULING_KEY: &str = "ruling_key";
 /// `schema_version` — wire/row field name.
 pub const SCHEMA_VERSION: &str = "schema_version";
 /// `scope_status` — wire/row field name.
