@@ -47,11 +47,14 @@ fn no_candidate(_host: HostKind, _cwd: &Path) -> Result<Option<PathBuf>, Resolve
 fn base_cfg(poll_interval: Duration) -> WatchConfig {
     WatchConfig {
         hosts: vec![HostKind::ClaudeCode],
+        line_files: Vec::new(),
         poll_interval,
         agent_id: "ai:test:notify".to_string(),
         namespace: Some("test-watch".to_string()),
         limit: watcher::DEFAULT_WATCH_LIMIT,
         dry_run: true,
+        #[cfg(feature = "sal")]
+        store: None,
     }
 }
 
@@ -153,11 +156,14 @@ fn no_watchable_dir_reports_fallback() {
 fn run_watch_daemon_falls_back_and_honors_preset_shutdown() {
     let cfg = WatchConfig {
         hosts: Vec::new(),
+        line_files: Vec::new(),
         poll_interval: watcher::clamp_poll_interval(1),
         agent_id: "ai:test:notify".to_string(),
         namespace: None,
         limit: watcher::DEFAULT_WATCH_LIMIT,
         dry_run: true,
+        #[cfg(feature = "sal")]
+        store: None,
     };
     let shutdown = Arc::new(AtomicBool::new(true));
     // Must return promptly via the poll-fallback path (notify sees zero

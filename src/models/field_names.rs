@@ -375,6 +375,11 @@ pub const NAMESPACE_FILTER: &str = "namespace_filter";
 pub const NEXT_SINCE: &str = "next_since";
 /// `observations` — wire/row field name.
 pub const OBSERVATIONS: &str = "observations";
+/// `observed_actor` — #3587 U2 line-file watch metadata: untrusted actor
+/// prefix parsed from a swarm line (`MASTER→…` / `ai:fable→…`). The watch
+/// process's resolved `--agent-id` is the memory author; this key never
+/// becomes `metadata.agent_id`.
+pub const OBSERVED_ACTOR: &str = "observed_actor";
 /// `observed_by` — wire/row field name.
 pub const OBSERVED_BY: &str = "observed_by";
 /// `older_than_days` — wire/row field name.
