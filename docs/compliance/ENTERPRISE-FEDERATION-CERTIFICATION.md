@@ -12,30 +12,30 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `release/v1.0.0` @ `e22bc93c` (the merge tip after the Wave-3b
-§5.2/§5.3 cutline PRs #2909/#2907/#2905 landed). Any change to the federation
-wire path or the `AI_MEMORY_FED_*` surface **voids this certification and
-triggers re-cert** (see §7).
+**Binds to:** `ad60beadf602823c4451ff82067f62091aba9a04` (`origin/chain/next`
+at the 2026-09-11 re-issue; Merge #3593 on Merge #3582). The original
+2026-08-12 mint remains `e22bc93c` as a historical record. Any change to the
+federation wire path or the `AI_MEMORY_FED_*` surface **voids this
+certification and triggers re-cert** (see §7).
 
-> ## STATUS — **VOID / EXPIRED as of 2026-09-05**
+> ## STATUS — **LIVE as of 2026-09-11** (re-issued after #3582)
 >
-> The federation wire path changed again under
-> [**#3502**](https://github.com/alphaonedev/ai-memory-mcp/issues/3502)
-> (branch `hotfix/3502-v97-acceptance-and-attest-parity`; the wire-path
-> commit is `7e8f96bef9c4ccd48aee7f8552fe9e7a9f327ceb` and this expiry
-> record is the second commit of that same change). The §7 expiry trigger
-> has therefore **FIRED**, and this certification is **VOID pending
-> re-validation and re-issue** — see the #3502 record at the end of §7 for
-> the files, the reason and the scope.
+> Re-validated and re-issued against `ad60beadf602823c4451ff82067f62091aba9a04`
+> by [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595).
+> [#3582](https://github.com/alphaonedev/ai-memory-mcp/issues/3582) changed
+> the federation wire contract (absent allowlist ⇒ inbound namespace
+> writes and catchup pulls refused by default) and **voided** the prior
+> certification; this document is the re-issue. The #3502 VOID record and
+> the 2026-08-12 mint at `e22bc93c` stay in §7/§8 as history.
 >
-> **Do not cite this document as a live certification while this banner
-> stands.** Re-running §5.4(2)–(5) on the certified tier and re-issuing
-> this document against the new SHA is a Conductor task, tracked by
-> [**#3501**](https://github.com/alphaonedev/ai-memory-mcp/issues/3501);
-> the certification returns to a live state only when #3501 lands that
-> re-issue. The historical bind remains `e22bc93c`, and §8's 2026-08-12
-> determination is retained as the HISTORICAL record of what was
-> certified at that SHA — it is not a current claim.
+> **Operator upgrade note.** Set `AI_MEMORY_FED_PEER_ATTESTATION` (a
+> per-peer `allowed_namespaces` map) **before** deploying this SHA on a
+> federated node. Without that map, inbound namespace writes and catchup
+> pulls are refused by default. A valid `{}` permits boot while denying
+> all peers. Standard-only escape hatch:
+> `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` (legacy replication);
+> `asi-hard` refuses that override. See the #3595 record at the end of §7
+> for the evidence table and the behaviour-change paragraph.
 
 > **Landing-SHA note (why the binding SHA and the SHA you are reading
 > first differ).** The certification **binds to** `e22bc93c`, but the
@@ -386,7 +386,14 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
    `team-x/**` cannot write, relocate, delete, rebind-governance, or resolve a
    coordination checkpoint for any namespace outside its declared scope. This
    is enforced at the runtime `/sync/push` guards, not merely documented — and
-   each guard is proven load-bearing (§5.4.5, see §4).
+   each guard is proven load-bearing (§5.4.5, see §4). **After #3582** an
+   *absent* `AI_MEMORY_FED_PEER_ATTESTATION` map is itself a refusal on
+   both backends: inbound namespace writes and catchup pulls no longer
+   proceed under faith replication. A valid `{}` permits boot while
+   denying all peers. Standard may set
+   `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` for the legacy opt-out;
+   `asi-hard` refuses that override and also refuses boot when explicit
+   federation peers are configured without a usable allowlist.
 2. **Peer identity is attested, and the outer transport gates are
    no-disable under `asi-hard`.** Peer enrollment is required
    (`AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`), per-message Ed25519 signatures +
@@ -1126,7 +1133,9 @@ is observed:**
    `.github/workflows/cert-postgres-age.yml`) hard-fails the job on any
    mismatch against those pins.
 
-**Expiry / re-cert trigger.** This certification binds to `e22bc93c` and
+**Expiry / re-cert trigger.** This certification binds to
+`ad60beadf602823c4451ff82067f62091aba9a04` (2026-09-11 re-issue; historical
+mint `e22bc93c`) and
 **expires on any change to the federation wire path (`src/federation/**`,
 `src/handlers/federation_receive.rs`, `src/handlers/federation_signing_check.rs`)
 or the `AI_MEMORY_FED_*` env surface.** Any such change requires re-running
@@ -1344,6 +1353,73 @@ the certification against a reviewed SHA remains the Conductor's
 [#3501](https://github.com/alphaonedev/ai-memory-mcp/issues/3501) task. The
 historical bind stays `e22bc93c`; the VOID banner stays in force.
 
+**Re-cert trigger — DISCHARGED by re-issue (#3595, 2026-09-11).**
+[#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595) re-ran the
+cert §7 acceptance under the #3582 contract on **both** backends and
+re-issues this document against `ad60beadf602823c4451ff82067f62091aba9a04`
+(`origin/chain/next` at lane start: Merge #3593 on Merge #3582). The top
+STATUS banner is **LIVE**. The #3502 and #3582 VOID records above stay as
+the firing ledger; they are not current claims.
+
+*Behaviour change (#3582, now certified).* A node without
+`AI_MEMORY_FED_PEER_ATTESTATION` refuses inbound federated namespace writes
+and catchup pulls by default (SQLite and PostgreSQL: write / by-id /
+pending / checkpoint / catchup / archive-restore / namespace-meta).
+Configured-map enrollment and declared nonempty scopes stay enforced.
+`asi-hard` refuses boot when explicit federation peers are configured
+without a usable allowlist, when that map is malformed, or when explicit
+federation bindings cannot be read; Standard warns. A valid `{}` permits
+boot while denying all peers. Shared identity-key enrollment (or a read
+error of that directory) only warns in both postures — key enrollment is
+identity, not namespace permission. Doctor remains runnable;
+capabilities v2/v3 carry the last completed in-process boot snapshot
+(`federation_security`: enum observations only — `present` / `absent` /
+`unobservable`, verdicts `allowed` / `warning` / `refused` / … — no peer
+IDs, paths, or key material). v1 is unchanged. No new environment knob
+and no schema rung. The §5.4(2) four-leg 20-check `cert-55/` bundle is
+**unchanged** as the posture-leg evidence of record (`ENTERPRISE_FEDERATION_CHECK_COUNT`
+stays 20); #3582 did not add or remove a posture-check row.
+
+*Operator upgrade note.* Set `AI_MEMORY_FED_PEER_ATTESTATION` (per-peer
+`allowed_namespaces`) **before** upgrading a federated node to this SHA.
+Without it, replication that used to land under an absent map is now
+refused. Standard-only legacy opt-out:
+`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0`. `asi-hard` refuses that
+override.
+
+*Evidence (exact `test result:` lines; zero `skip:`; zero `FAILED`).*
+Captured 2026-09-11T02:04:09Z–02:09:51Z on f1; live pg db
+`ai_memory_grok_cert`; raw named-test listing in
+`docs/compliance/evidence/cert-3595/`. Cargo `--no-fail-fast`.
+
+| Invocation | Exact `test result:` line |
+|---|---|
+| default `--test doctor_posture_exit_code_3003` | `ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s` |
+| default `--test federation_catchup_posture_3582` | `ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.43s` |
+| default `--test federation_namespace_gate_3582` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s` |
+| default `--test federation_peer_posture_3582` | `ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s` |
+| default `--test federation_write_ns_scope_2447` | `ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s` |
+| default `--lib enterprise_federation_posture` | `ok. 36 passed; 0 failed; 0 ignored; 0 measured; 8281 filtered out; finished in 0.06s` |
+| default `--lib federation::peer_posture` | `ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8312 filtered out; finished in 0.02s` |
+| salpg `--test doctor_posture_exit_code_3003` | `ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.84s` |
+| salpg `--test federation_catchup_posture_3582` | `ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.55s` |
+| salpg `--test federation_namespace_gate_3582` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s` |
+| salpg `--test federation_peer_posture_3582` | `ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s` |
+| salpg `--test federation_write_ns_scope_2447` | `ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s` |
+| salpg `--test federation_write_ns_scope_2447_pg` | `ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s` |
+| salpg `--lib enterprise_federation_posture` | `ok. 36 passed; 0 failed; 0 ignored; 0 measured; 8894 filtered out; finished in 0.06s` |
+| salpg `--lib federation::peer_posture` | `ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8925 filtered out; finished in 0.03s` |
+
+Acceptance names that map onto the issue's §7 battery:
+
+- `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1` boot on asi-hard with a valid scoped allowlist → `scoped_allowlist_clears_peer_gate_but_preserves_other_boot_gates_3582`
+- signed + nonce'd push accepted only inside declared scope, refused outside → `federated_write_outside_peer_scope_refused_2447` + `_pg` twin; `no_allowlist_write_posture_matrix_3582` + `_pg`
+- `{}` deny-all → `empty_declaration_allows_boot_but_invalid_config_obeys_posture_3582`
+- catchup posture preserving rows + cursor → `sqlite_catchup_posture_preserves_rows_and_cursor_3582` + `postgres_catchup_posture_preserves_rows_and_cursor_3582`
+- doctor/capabilities snapshot content-free → `capabilities_preserve_daemon_argv_evaluation_in_v2_and_v3_3582` (v2/v3 `federation_security` is enum observations only; v1 omits the field) + `doctor_posture_exits_two_on_fail_even_when_boot_gate_armed`
+
+No product bytes were changed in this lane. No defects were filed.
+
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
 operator account (`alphaonedev`). GitHub signature verification is
@@ -1361,6 +1437,17 @@ this document does not self-authorize a tag cut.
 ---
 
 ## 8. Current determination
+
+**Status at `ad60beadf602823c4451ff82067f62091aba9a04` (2026-09-11
+re-issue, [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595);
+#3582 wire contract now certified).** The seven §5.4 falsifiability
+requirements hold on this SHA as follows — §5.4(1) canonical doc = this
+document (LIVE banner); §5.4(2) machine-checked posture = CLOSED at 20
+checks (`cert-55/`, unchanged count; #3582 added no posture row);
+§5.4(7) disconfirmation = §7, discharged for the #3582 watched-path
+change by this re-issue's both-backend acceptance battery
+(`docs/compliance/evidence/cert-3595/`). The 2026-08-12 mint at
+`e22bc93c` remains the historical ratification record (next paragraph).
 
 **Status at `e22bc93c` (original artifacts at `580d8427`; this re-issue
 amended through the merged 2026-08-13 remediation wave — #2915-#2920,

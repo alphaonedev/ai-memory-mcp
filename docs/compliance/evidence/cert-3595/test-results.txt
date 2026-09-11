@@ -1,0 +1,40 @@
+# cert-3595 exact `test result:` lines
+# HEAD=ad60beadf602823c4451ff82067f62091aba9a04
+# BATTERY_OK 2026-09-11T02:09:51Z  pid=94972
+# cargo test --no-fail-fast; zero skip:; zero ignored>0
+
+## default features (sqlite)
+
+# --test doctor_posture_exit_code_3003
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+# --test federation_catchup_posture_3582 (sqlite only under default)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.43s
+# --test federation_namespace_gate_3582
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+# --test federation_peer_posture_3582
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+# --test federation_write_ns_scope_2447
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+# --lib enterprise_federation_posture
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 8281 filtered out; finished in 0.06s
+# --lib federation::peer_posture
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8312 filtered out; finished in 0.02s
+
+## --features sal,sal-postgres (sqlite twins + live pg on ai_memory_grok_cert)
+
+# --test doctor_posture_exit_code_3003
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.84s
+# --test federation_catchup_posture_3582 (sqlite + postgres)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.55s
+# --test federation_namespace_gate_3582
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+# --test federation_peer_posture_3582
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+# --test federation_write_ns_scope_2447
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+# --test federation_write_ns_scope_2447_pg
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+# --lib enterprise_federation_posture
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 8894 filtered out; finished in 0.06s
+# --lib federation::peer_posture
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8925 filtered out; finished in 0.03s

@@ -1,0 +1,42 @@
+# cert-3595 exact `test <name> ... ok` lines (acceptance names)
+
+## default features — doctor / catchup / namespace-gate / peer-posture / scoped push
+
+test non_diagnostic_command_still_refuses_with_actionable_remediation ... ok
+test doctor_posture_exits_two_on_fail_even_when_boot_gate_armed ... ok
+test sqlite_catchup_posture_preserves_rows_and_cursor_3582 ... ok
+test configured_empty_allowlist_cannot_use_opt_out_3582 ... ok
+test no_allowlist_requires_explicit_opt_out_on_every_helper_3582 ... ok
+test configured_scope_keeps_stored_namespace_requirement_3582 ... ok
+test direct_entry_points_and_shared_capabilities_keep_the_gate_3582 ... ok
+test capabilities_preserve_daemon_argv_evaluation_in_v2_and_v3_3582 ... ok
+test no_peers_and_reserved_local_key_do_not_trigger_peer_refusal_3582 ... ok
+test configured_fingerprint_certificate_and_issuer_sources_refuse_3582 ... ok
+test scoped_allowlist_clears_peer_gate_but_preserves_other_boot_gates_3582 ... ok
+test inbound_only_public_enrollment_warns_and_doctor_still_reports_3582 ... ok
+test unreadable_bindings_is_never_reported_as_safe_absence_3582 ... ok
+test quorum_zero_and_sync_daemon_refuse_before_database_open_3582 ... ok
+test unreadable_shared_enrollment_warns_without_refusing_boot_3582 ... ok
+test empty_declaration_allows_boot_but_invalid_config_obeys_posture_3582 ... ok
+test double_star_scope_is_the_per_peer_allow_all_escape_2447 ... ok
+test enrolled_peer_without_declared_namespaces_denied_by_default_2447 ... ok
+test federated_write_cannot_relocate_foreign_row_by_id_collision_2447 ... ok
+test federated_archive_and_restore_outside_peer_scope_refused_2447 ... ok
+test federated_write_outside_peer_scope_refused_2447 ... ok
+test no_allowlist_write_posture_matrix_3582 ... ok
+
+## --features sal,sal-postgres — additional live-pg twins (same sqlite names plus)
+
+test postgres_catchup_posture_preserves_rows_and_cursor_3582 ... ok
+test federated_deletion_outside_peer_scope_refused_1934_pg ... ok
+test scope_private_victim_row_still_blocks_the_merge_2447_pg ... ok
+test no_allowlist_write_posture_matrix_3582_pg ... ok
+test federated_write_outside_peer_scope_refused_2447_pg ... ok
+
+## --lib federation::peer_posture (both feature sets: 5 passed)
+
+test federation::peer_posture::tests::unknown_is_not_absent_and_known_inbound_still_finds_gap_3582 ... ok
+test federation::peer_posture::tests::shared_enrollment_only_warns_in_both_postures_3582 ... ok
+test federation::peer_posture::tests::every_configured_peer_source_requires_allowlist_3582 ... ok
+test federation::peer_posture::tests::enrollment_directory_cycles_are_unobservable_3582 ... ok
+test federation::peer_posture::tests::recursive_public_enrollment_never_reads_private_material_3582 ... ok
