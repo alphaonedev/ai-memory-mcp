@@ -888,11 +888,11 @@ pg_test!(pg_memory_dependents_not_501_3064, url, {
     assert_eq!(deps[0]["id"], json!(child), "body={body}");
 });
 
-/// #3599 — the pg HTTP arm's read gate is lifecycle-NEUTRAL: a dependent the
-/// #3324 `supersedes` path stamped `contaminated` stays listed for its OWNER
-/// (a non-admin caller, so the gate actually runs) and is still hidden from a
-/// stranger. Pre-fix the gate read through the trait `get`, whose lifecycle
-/// fold turned every contaminated dependent into `NotFound` → count 0.
+// #3599 — the pg HTTP arm's read gate is lifecycle-NEUTRAL: a dependent the
+// #3324 `supersedes` path stamped `contaminated` stays listed for its OWNER
+// (a non-admin caller, so the gate actually runs) and is still hidden from a
+// stranger. Pre-fix the gate read through the trait `get`, whose lifecycle
+// fold turned every contaminated dependent into `NotFound` → count 0.
 pg_test!(
     pg_memory_dependents_contaminated_listed_for_owner_3599,
     url,
