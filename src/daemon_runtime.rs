@@ -6100,6 +6100,8 @@ fn cert_peer_binding_boot_warnings(
 
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
+/// The peer-posture gate also protects library callers; CLI serve already ran
+/// it pre-runtime in main. Re-evaluation updates the same boot snapshot.
 ///
 /// DOC-6: this function reads several legacy `AppConfig` fields
 /// (`auto_tag_model`, `llm_model`, `ollama_url`) directly for v0.7.x

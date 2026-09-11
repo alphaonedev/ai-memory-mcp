@@ -157,6 +157,8 @@ pub struct PeerAttestationConfig {
     /// #2504 — true when `AI_MEMORY_FED_PEER_ATTESTATION` was present
     /// (non-empty). Distinguishes Unset from `{}` / parse-error.
     env_present: bool,
+    /// Only malformed configured input sets this; `{}` is a valid deny-all map.
+    broken: bool,
 }
 
 /// Reason a body-claimed `sender_agent_id` failed attestation against
@@ -196,6 +198,7 @@ impl PeerAttestationConfig {
         Self {
             peers,
             env_present: true,
+            broken: false,
         }
     }
 
@@ -274,6 +277,7 @@ impl PeerAttestationConfig {
             Ok(peers) => Self {
                 peers,
                 env_present: true,
+                broken: false,
             },
             Err(e) => {
                 tracing::warn!(
@@ -304,6 +308,7 @@ impl PeerAttestationConfig {
         Self {
             peers: HashMap::new(),
             env_present: true,
+            broken: true,
         }
     }
 
@@ -327,6 +332,12 @@ impl PeerAttestationConfig {
     #[must_use]
     pub fn has_allowlist(&self) -> bool {
         self.env_present || !self.peers.is_empty()
+    }
+
+    /// Whether configured input could not be parsed (#3582).
+    #[must_use]
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// #2504 — env was present but peers are empty (parse error or `{}`).
@@ -530,6 +541,18 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect();
         PeerAttestationConfig::from_peers(peers)
+    }
+
+    #[test]
+    fn empty_and_broken_configs_have_distinct_boot_state_3582() {
+        for value in ["{}", "invalid-json", r#"{"peer":{"unknown":true}}"#] {
+            let config = PeerAttestationConfig::from_present_value(value);
+            assert!(config.has_allowlist());
+            assert!(config.is_configured_empty());
+            assert_eq!(config.is_broken(), value != "{}");
+        }
+        assert!(!PeerAttestationConfig::default().is_broken());
+        assert!(!PeerAttestationConfig::from_peers(HashMap::new()).is_broken());
     }
 
     // ---- attest_sender ---------------------------------------------------

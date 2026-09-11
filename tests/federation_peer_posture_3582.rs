@@ -43,13 +43,7 @@ fn quorum_zero_and_sync_daemon_refuse_before_database_open_3582() {
         ],
         vec!["sync-daemon", "--peers", "https://127.0.0.1:1"],
     ] {
-        for allowlist in [
-            None,
-            Some(""),
-            Some("   "),
-            Some("{}"),
-            Some("invalid-json"),
-        ] {
+        for allowlist in [None, Some(""), Some("   "), Some("invalid-json")] {
             let root = tempfile::tempdir().unwrap();
             let mut cmd = command(root.path(), "asi-hard");
             cmd.args(&args);
@@ -66,7 +60,7 @@ fn quorum_zero_and_sync_daemon_refuse_before_database_open_3582() {
 }
 
 #[test]
-fn inbound_only_public_enrollment_refuses_and_doctor_still_reports_3582() {
+fn inbound_only_public_enrollment_warns_and_doctor_still_reports_3582() {
     for posture in ["standard", "asi-hard"] {
         let root = tempfile::tempdir().unwrap();
         let key = ai_memory::identity::keypair::generate("region/peer").unwrap();
@@ -78,9 +72,13 @@ fn inbound_only_public_enrollment_refuses_and_doctor_still_reports_3582() {
             .unwrap();
         assert!(!out.status.success());
         assert!(stderr(&out).contains("#3582"), "{}", stderr(&out));
-        if posture == "standard" {
-            assert!(stderr(&out).contains("WARN #3582"));
-        }
+        assert!(stderr(&out).contains("WARN #3582"));
+        // Reaching the independent enterprise gate proves the peer gate allowed boot.
+        assert!(
+            stderr(&out).contains("enterprise-federation"),
+            "{}",
+            stderr(&out)
+        );
         assert!(!root.path().join("store.db").exists());
         let out = command(root.path(), posture)
             .args(["doctor", "--json"])
@@ -95,14 +93,7 @@ fn inbound_only_public_enrollment_refuses_and_doctor_still_reports_3582() {
             .iter()
             .find(|s| s["name"] == "Federation peer authorization")
             .unwrap();
-        assert_eq!(
-            section["severity"],
-            if posture == "asi-hard" {
-                "critical"
-            } else {
-                "warning"
-            }
-        );
+        assert_eq!(section["severity"], "warning");
         let facts = section["facts"].to_string();
         assert!(facts.contains("unobservable from this process"));
         assert!(facts.contains("present"));
@@ -213,6 +204,7 @@ fn capabilities_preserve_daemon_argv_evaluation_in_v2_and_v3_3582() {
         let report = &value["federation_security"];
         assert_eq!(report["outbound_peers"], "present");
         assert_eq!(report["inbound_bindings"], "absent");
+        assert_eq!(report["inbound_enrollment"], "absent");
         assert_eq!(report["verdict"], "warning");
         assert_eq!(report["key_enrollment_required"], true);
         assert_eq!(report["require_push_namespace_scope"], true);
@@ -290,7 +282,7 @@ fn no_peers_and_reserved_local_key_do_not_trigger_peer_refusal_3582() {
 }
 
 #[test]
-fn unreadable_enrollment_is_never_reported_as_safe_absence_3582() {
+fn unreadable_bindings_is_never_reported_as_safe_absence_3582() {
     for posture in ["standard", "asi-hard"] {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing-bindings");
@@ -323,5 +315,102 @@ fn unreadable_enrollment_is_never_reported_as_safe_absence_3582() {
             .unwrap();
         assert!(!out.status.success());
         assert!(stderr(&out).contains("#3582"), "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn empty_declaration_allows_boot_but_invalid_config_obeys_posture_3582() {
+    for posture in ["standard", "asi-hard"] {
+        for value in ["{}", "invalid-json"] {
+            for peers in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let mut cmd = command(root.path(), posture);
+                cmd.env("AI_MEMORY_FED_PEER_ATTESTATION", value)
+                    .env("AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE", "1")
+                    .arg("serve");
+                if peers {
+                    cmd.args([
+                        "--quorum-writes",
+                        "0",
+                        "--quorum-peers",
+                        "https://127.0.0.1:1",
+                    ]);
+                }
+                let out = cmd.output().unwrap();
+                let err = stderr(&out);
+                assert!(!out.status.success());
+                if value == "{}" {
+                    assert!(!err.contains("#3582"), "{err}");
+                    assert!(err.contains("enterprise-federation"), "{err}");
+                } else if posture == "asi-hard" {
+                    assert!(
+                        err.contains("#3582") && err.contains("AI_MEMORY_FED_PEER_ATTESTATION"),
+                        "{err}"
+                    );
+                    assert!(!err.contains("enterprise-federation"), "{err}");
+                } else {
+                    assert!(err.contains("WARN #3582"), "{err}");
+                    assert!(err.contains("enterprise-federation"), "{err}");
+                }
+                assert!(!root.path().join("store.db").exists());
+                let out = command(root.path(), posture)
+                    .env("AI_MEMORY_FED_PEER_ATTESTATION", value)
+                    .args(["doctor", "--json"])
+                    .output()
+                    .unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                let section = report["sections"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["name"] == "Federation peer authorization")
+                    .unwrap();
+                let state = if value == "{}" {
+                    "ConfiguredEmpty"
+                } else {
+                    "Invalid"
+                };
+                assert!(section["facts"].to_string().contains(state));
+            }
+        }
+    }
+}
+
+#[test]
+fn unreadable_shared_enrollment_warns_without_refusing_boot_3582() {
+    for posture in ["standard", "asi-hard"] {
+        let root = tempfile::tempdir().unwrap();
+        let keys = root.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        std::fs::write(keys.join("peer.pub"), b"invalid public key").unwrap();
+        let out = command(root.path(), posture)
+            .env("AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE", "1")
+            .arg("serve")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains("WARN #3582"), "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("enterprise-federation"),
+            "{}",
+            stderr(&out)
+        );
+        let out = command(root.path(), posture)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let section = report["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Federation peer authorization")
+            .unwrap();
+        assert_eq!(section["severity"], "warning");
+        let facts = section["facts"].as_array().unwrap();
+        assert!(
+            facts.iter().any(|fact| fact[0] == "inbound_enrollment"
+                && fact[1] == "unobservable from this process")
+        );
     }
 }

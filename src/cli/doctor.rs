@@ -991,6 +991,10 @@ fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report)
             "inbound_bindings".into(),
             report.inbound_bindings.as_str().into(),
         ),
+        (
+            "inbound_enrollment".into(),
+            report.inbound_enrollment.as_str().into(),
+        ),
         ("listener_mtls".into(), report.listener_mtls.as_str().into()),
         (
             "peer_allowlist".into(),
@@ -1013,9 +1017,11 @@ fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report)
     );
     let note = match report.verdict {
         Verdict::Refused | Verdict::Warning => Some(
-            "#3582: peers configured, no usable peer allowlist. Configure a valid, nonempty \
-             AI_MEMORY_FED_PEER_ATTESTATION. Key enrollment establishes identity, not namespace \
-             authorization. Standard warns; asi-hard refuses boot."
+            "#3582: peer authorization needs attention or shared key enrollment is present/unobservable. \
+             Configure AI_MEMORY_FED_PEER_ATTESTATION for federation; {} declares no peers. \
+             Key enrollment establishes identity, not namespace authorization, and only warns \
+             in either posture. Missing scope with explicit peers or invalid federation \
+             configuration refuses asi-hard boot; Standard warns."
                 .into(),
         ),
         Verdict::Unobservable => Some(
@@ -5276,6 +5282,7 @@ mod tests {
                 Observation::Present,
                 Observation::Absent,
                 Observation::Absent,
+                Observation::Absent,
                 Allowlist::Absent,
             );
             let mut caps = crate::config::FeatureTier::Keyword.config().capabilities();
@@ -5303,6 +5310,7 @@ mod tests {
             );
             assert_eq!(fact(&section, "outbound_peers"), "present");
             assert_eq!(fact(&section, "inbound_bindings"), "absent");
+            assert_eq!(fact(&section, "inbound_enrollment"), "absent");
             assert!(section.note.as_ref().unwrap().contains("#3582"));
         }
     }

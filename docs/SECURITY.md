@@ -347,8 +347,10 @@ byte-for-byte replays via per-peer nonce freshness
 key enrollment is also required by default. The separate peer attestation
 map (`AI_MEMORY_FED_PEER_ATTESTATION`) scopes authorship and namespaces.
 Default-required namespace checks refuse inbound writes without that map
-(#3582). With peers configured, Standard warns and `asi-hard` refuses boot
-if the map is absent, empty or invalid. Standard retains the explicit
+(#3582). With explicit peers configured, Standard warns and `asi-hard` refuses
+boot if the map is absent; malformed maps also refuse hardened boot. Valid `{}`
+permits boot while denying all peers. Shared identity key enrollment or its
+read errors only warn in both postures. Standard retains the explicit
 require-scope `0` opt-out; it does not disable other checks. Ordinary doctor
 and capabilities expose the posture as described in
 [federation hardening](federation.html#current-defaults-and-boot-posture-3582).

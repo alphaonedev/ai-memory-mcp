@@ -38,12 +38,13 @@ impl Observation {
     }
 }
 
-/// A malformed or empty map must never be advertised as usable authorization.
+/// Valid empty maps declare no authorized peers; malformed maps are errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Allowlist {
     Absent,
-    EmptyOrInvalid,
+    ConfiguredEmpty,
+    Invalid,
     Configured,
 }
 
@@ -64,6 +65,7 @@ pub struct Report {
     pub security_posture: String,
     pub outbound_peers: Observation,
     pub inbound_bindings: Observation,
+    pub inbound_enrollment: Observation,
     pub listener_mtls: Observation,
     pub peer_allowlist: Allowlist,
     pub verdict: Verdict,
@@ -89,20 +91,30 @@ pub fn evaluate(
     posture: SecurityPosture,
     outbound_peers: Observation,
     inbound_bindings: Observation,
+    inbound_enrollment: Observation,
     listener_mtls: Observation,
     peer_allowlist: Allowlist,
 ) -> Report {
     let observations = [outbound_peers, inbound_bindings, listener_mtls];
     let present = observations.contains(&Observation::Present);
     let unknown = observations.contains(&Observation::Unobservable);
-    let verdict = if peer_allowlist == Allowlist::Configured {
-        Verdict::Allowed
-    } else if present {
+    let verdict = if peer_allowlist == Allowlist::Invalid
+        || (peer_allowlist == Allowlist::Absent && present)
+    {
         if posture == SecurityPosture::AsiHard {
             Verdict::Refused
         } else {
             Verdict::Warning
         }
+    } else if inbound_enrollment != Observation::Absent {
+        // Shared identity keys may belong entirely to local agents. Neither
+        // their presence nor a read error establishes federation configuration.
+        Verdict::Warning
+    } else if matches!(
+        peer_allowlist,
+        Allowlist::Configured | Allowlist::ConfiguredEmpty
+    ) {
+        Verdict::Allowed
     } else if unknown {
         Verdict::Unobservable
     } else {
@@ -112,6 +124,7 @@ pub fn evaluate(
         security_posture: posture.as_str().into(),
         outbound_peers,
         inbound_bindings,
+        inbound_enrollment,
         listener_mtls,
         peer_allowlist,
         verdict,
@@ -164,11 +177,9 @@ fn inbound_configured() -> Result<bool> {
     let fingerprints = crate::tls::peer_fingerprint_map_from_env()?;
     let bindings = crate::tls::cert_peer_binding_map_from_env()?;
     let trust = super::identity::trust_bundle::TrustBundle::load_from_env()?;
-    let key_dir = crate::identity::keypair::default_key_dir()?;
     Ok(fingerprints.is_some_and(|m| !m.is_empty())
         || bindings.is_some_and(|m| !m.is_empty())
-        || !trust.is_empty()
-        || has_enrolled_public_key(&key_dir)?)
+        || !trust.is_empty())
 }
 
 /// Observe this process's configuration. `None` means argv is unavailable,
@@ -186,11 +197,17 @@ pub fn observe(argv: Option<(bool, Option<&Path>)>) -> Report {
     let inbound = match inbound_configured() {
         Ok(present) => Observation::from_present(present),
         Err(_) => {
-            errors.push(
-                "inbound public enrollment or certificate configuration could not be read".into(),
-            );
+            errors.push("inbound certificate configuration could not be read".into());
             Observation::Unobservable
         }
+    };
+    let enrollment = match crate::identity::keypair::default_key_dir()
+        .and_then(|dir| has_enrolled_public_key(&dir))
+    {
+        Ok(present) => Observation::from_present(present),
+        // Keep this separate from errors that refuse hardened boot: the shared
+        // key directory cannot tell us whether a federation peer is configured.
+        Err(_) => Observation::Unobservable,
     };
     let (outbound, mtls) = match argv {
         // An explicit inbound fingerprint-file argument configures peers.
@@ -205,12 +222,14 @@ pub fn observe(argv: Option<(bool, Option<&Path>)>) -> Report {
     let cfg = super::peer_attestation::PeerAttestationConfig::from_env();
     let allowlist = if !cfg.has_allowlist() {
         Allowlist::Absent
+    } else if cfg.is_broken() {
+        Allowlist::Invalid
     } else if cfg.is_configured_empty() {
-        Allowlist::EmptyOrInvalid
+        Allowlist::ConfiguredEmpty
     } else {
         Allowlist::Configured
     };
-    let mut report = evaluate(posture, outbound, inbound, mtls, allowlist);
+    let mut report = evaluate(posture, outbound, inbound, enrollment, mtls, allowlist);
     report.key_enrollment_required =
         crate::handlers::federation_signing_check::require_peer_enrollment_enabled()
             && !crate::handlers::federation_signing_check::allow_unenrolled_peers_enabled();
@@ -233,11 +252,11 @@ pub fn boot_report() -> Option<Report> {
 }
 
 /// Refuse asi-hard before starting workers or opening a database. Standard
-/// retains a loud warning. Unknown enrollment cannot establish safe absence.
+/// retains a loud warning. Shared key enrollment only warns in either posture.
 ///
 /// # Errors
-/// Missing/empty/broken authorization with configured peers under asi-hard,
-/// or an incomplete asi-hard boot observation.
+/// Missing authorization with configured peers, invalid authorization, or
+/// unreadable explicit federation configuration under asi-hard.
 pub fn enforce_at_boot(outbound_peers: bool, mtls: Option<&Path>) -> Result<()> {
     let report = observe(Some((outbound_peers, mtls)));
     enforce_report(&report)?;
@@ -248,8 +267,9 @@ pub fn enforce_at_boot(outbound_peers: bool, mtls: Option<&Path>) -> Result<()> 
 fn enforce_report(report: &Report) -> Result<()> {
     if report.refuses_boot() {
         anyhow::bail!(
-            "{} #3582: peers configured or enrollment unobservable; require a valid, nonempty \
-             AI_MEMORY_FED_PEER_ATTESTATION namespace allowlist and readable enrollment. \
+            "{} #3582: peers configured without an allowlist or federation configuration invalid; \
+             require valid AI_MEMORY_FED_PEER_ATTESTATION ({{}} explicitly denies all peers) \
+             and readable federation bindings. \
              Key enrollment alone grants no namespace scope. Run `ai-memory doctor`.",
             crate::security_profile::ASI_HARD_REFUSAL_PREFIX
         );
@@ -257,8 +277,8 @@ fn enforce_report(report: &Report) -> Result<()> {
     if report.verdict == Verdict::Warning || !report.observation_errors.is_empty() {
         // stderr also works in the pre-tracing main entry point.
         eprintln!(
-            "ai-memory: WARN #3582: peers configured, no usable peer allowlist, or enrollment \
-             unobservable; configure AI_MEMORY_FED_PEER_ATTESTATION. Key enrollment alone \
+            "ai-memory: WARN #3582: peer authorization needs attention or shared key enrollment \
+             is present/unobservable; configure AI_MEMORY_FED_PEER_ATTESTATION. Key enrollment alone \
              grants no namespace scope; required push scope refuses unscoped writes. \
              Run `ai-memory doctor`."
         );
@@ -276,13 +296,24 @@ mod tests {
             for source in 0..3 {
                 for allowlist in [
                     Allowlist::Absent,
-                    Allowlist::EmptyOrInvalid,
+                    Allowlist::ConfiguredEmpty,
+                    Allowlist::Invalid,
                     Allowlist::Configured,
                 ] {
                     let mut facts = [Observation::Absent; 3];
                     facts[source] = Observation::Present;
-                    let report = evaluate(posture, facts[0], facts[1], facts[2], allowlist);
-                    let expected = if allowlist == Allowlist::Configured {
+                    let report = evaluate(
+                        posture,
+                        facts[0],
+                        facts[1],
+                        Observation::Absent,
+                        facts[2],
+                        allowlist,
+                    );
+                    let expected = if matches!(
+                        allowlist,
+                        Allowlist::Configured | Allowlist::ConfiguredEmpty
+                    ) {
                         Verdict::Allowed
                     } else if posture == SecurityPosture::AsiHard {
                         Verdict::Refused
@@ -306,14 +337,13 @@ mod tests {
                 posture,
                 Observation::Unobservable,
                 Observation::Absent,
+                Observation::Absent,
                 Observation::Unobservable,
                 Allowlist::Absent,
             );
             assert_eq!(unknown.verdict, Verdict::Unobservable);
             let mut broken = unknown.clone();
-            broken
-                .observation_errors
-                .push("unreadable enrollment".into());
+            broken.observation_errors.push("unreadable bindings".into());
             assert_eq!(
                 enforce_report(&broken).is_err(),
                 posture == SecurityPosture::AsiHard
@@ -322,6 +352,7 @@ mod tests {
                 posture,
                 Observation::Unobservable,
                 Observation::Present,
+                Observation::Absent,
                 Observation::Unobservable,
                 Allowlist::Absent,
             );
@@ -331,10 +362,47 @@ mod tests {
                 Observation::Absent,
                 Observation::Absent,
                 Observation::Absent,
+                Observation::Absent,
                 Allowlist::Absent,
             );
             assert_eq!(absent.verdict, Verdict::NoPeersObserved);
             assert!(enforce_report(&absent).is_ok());
+        }
+    }
+
+    #[test]
+    fn shared_enrollment_only_warns_in_both_postures_3582() {
+        for posture in [SecurityPosture::Standard, SecurityPosture::AsiHard] {
+            for enrollment in [Observation::Present, Observation::Unobservable] {
+                for allowlist in [
+                    Allowlist::Absent,
+                    Allowlist::ConfiguredEmpty,
+                    Allowlist::Configured,
+                ] {
+                    let report = evaluate(
+                        posture,
+                        Observation::Absent,
+                        Observation::Absent,
+                        enrollment,
+                        Observation::Absent,
+                        allowlist,
+                    );
+                    assert_eq!(report.verdict, Verdict::Warning);
+                    assert!(enforce_report(&report).is_ok());
+                }
+            }
+            let invalid = evaluate(
+                posture,
+                Observation::Absent,
+                Observation::Absent,
+                Observation::Absent,
+                Observation::Absent,
+                Allowlist::Invalid,
+            );
+            assert_eq!(
+                enforce_report(&invalid).is_err(),
+                posture == SecurityPosture::AsiHard
+            );
         }
     }
 

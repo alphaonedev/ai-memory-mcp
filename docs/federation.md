@@ -79,7 +79,10 @@ catchup acceptance, by-id operations, pending decisions and namespace metadata.
 
 | Configuration | Standard | `asi-hard` |
 |---|---|---|
-| Peers configured; allowlist absent, empty or invalid | Boot WARN; default namespace requirement refuses writes | Boot refused |
+| Explicit peers configured; allowlist absent | Boot WARN; default namespace requirement refuses writes | Boot refused |
+| Invalid allowlist, even without peers | Boot WARN; inbound replication refused | Boot refused |
+| Valid empty allowlist `{}` | Boot accepted; inbound replication refused | Same |
+| Shared identity key enrollment present or unreadable | Boot WARN only | Boot WARN only |
 | Valid, nonempty allowlist | Boot accepted; every operation still needs its peer scope and other checks | Same scope checks; hard floors enforced |
 | Allowlist absent; explicit `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` | Legacy namespace opt-out; configured peers still produce the WARN | Refused: the hard profile forbids this override |
 
@@ -91,12 +94,13 @@ malformed configured maps never become the absent-map opt-out.
 
 “Peers configured” includes a nonempty `serve --quorum-peers` or
 `sync-daemon --peers` list, regardless of `quorum_writes`, plus inbound peer
-fingerprints, certificate bindings, trusted credential issuers and enrolled
-public peer keys (including slashed peer IDs). An explicit listener
+fingerprints, certificate bindings and trusted credential issuers. An explicit listener
 `--mtls-allowlist` also counts as configured intent; the existing TLS loader
 still validates the file. The boot observer reads public configuration only.
-An incomplete inbound enrollment observation warns under Standard and
-refuses `asi-hard` boot; it is never evidence of a peerless deployment.
+Unreadable explicit federation bindings warn under Standard and refuse `asi-hard`
+boot. Shared public-key enrollment (including slashed agent IDs) is a separate
+observation: local agents also use this directory, so presence or read errors
+only warn in both postures. Receive authorization remains fail-closed.
 
 Ordinary `ai-memory doctor` remains runnable under this peer-allowlist boot
 refusal in either posture, with a **Federation peer authorization** section.
@@ -110,16 +114,17 @@ uses the daemon's capabilities snapshot. The existing
 HTTP `/api/v1/capabilities` and MCP `memory_capabilities` v2/v3 expose the
 optional `federation_security` object, shared by SQLite and PostgreSQL. It
 contains `security_posture`, `outbound_peers`, `inbound_bindings`,
-`listener_mtls`, `peer_allowlist`, `verdict`, `key_enrollment_required`,
+`inbound_enrollment`, `listener_mtls`, `peer_allowlist`, `verdict`, `key_enrollment_required`,
 `require_push_namespace_scope` and `observation_errors`. Observations are
 `present`, `absent` or `unobservable`; allowlist status is `absent`,
-`empty_or_invalid` or `configured`. Verdicts are `no_peers_observed`,
+`configured_empty`, `invalid` or `configured`. Verdicts are `no_peers_observed`,
 `allowed`, `warning`, `refused` or `unobservable`.
 
 This is the last completed **in-process boot evaluation**, not a live rescan
 of enrolled keys and not a grant for any particular operation. Observation
 errors remain relevant even with an `allowed` verdict: `asi-hard` refuses
-boot on incomplete observation. The report contains no peer IDs, paths or
+boot on unreadable explicit federation configuration. Shared enrollment
+read errors remain warnings. The report contains no peer IDs, paths or
 key material. It is omitted when no boot evaluation exists, and v1 remains
 unchanged; an absent field is not evidence of an allowed or peerless posture.
 

@@ -1327,9 +1327,11 @@ consulting the default-on namespace requirement. The shared write/by-id/
 metadata gates now refuse that case on SQLite and PostgreSQL; only
 Standard's existing explicit require-scope `0` opt-out retains legacy
 namespace acceptance. Configured-map enrollment and declared scopes remain
-enforced. `asi-hard` additionally refuses boot when peers are configured
-without a valid, nonempty authorization map, or when inbound observation
-is incomplete. Standard warns. Doctor remains runnable; capabilities v2/v3
+enforced. `asi-hard` additionally refuses boot when explicit peers are configured
+without an authorization map, when that map is malformed, or when explicit
+federation bindings cannot be read. Standard warns. Valid `{}` permits boot
+while denying all peers. Shared identity key enrollment or its read errors
+only warn in both postures. Doctor remains runnable; capabilities v2/v3
 reports the completed daemon boot evaluation. No new environment knob,
 schema rung, fixed posture pin or certified permission bypass is introduced.
 

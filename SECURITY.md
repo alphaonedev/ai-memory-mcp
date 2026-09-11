@@ -23,8 +23,10 @@ Peer key enrollment, per-message signatures and nonce freshness are required
 by default. Namespace permission is a separate check: the default-on
 `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` now refuses inbound writes
 when `AI_MEMORY_FED_PEER_ATTESTATION` is absent. Configure explicit scopes
-for each peer. With any outbound peers or inbound enrollment/bindings,
-`asi-hard` refuses boot on an absent, empty or invalid map; Standard warns.
+for each peer. With explicit outbound peers or inbound bindings,
+`asi-hard` refuses boot on an absent map; invalid maps also refuse hardened boot.
+Standard warns. Valid `{}` permits boot while denying all peers. Shared identity
+key enrollment or its read errors only warn in both postures.
 Only Standard permits the existing explicit namespace opt-out (`=0`), which
 does not disable identity or signature checks. Ordinary doctor remains
 runnable. See [federation posture and capabilities](docs/federation.md#current-defaults-and-boot-posture-3582).
