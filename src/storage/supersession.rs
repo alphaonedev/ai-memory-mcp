@@ -4,7 +4,7 @@
 //! #3587 deterministic store supersession. Authority, both row reads, fresh
 //! insertion, production archive and pointers share one write transaction.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::identity::supersession::{
@@ -120,6 +120,41 @@ pub fn ruling_key(metadata: &serde_json::Value) -> Result<Option<&str>> {
         .transpose()
 }
 
+// SQLite's julianday loses sub-millisecond precision. Compare RFC3339 instants
+// without floating point (PERF-25), retaining only one id/time pair while scanning
+// this key. Load the full selected row under the caller's write transaction.
+// Invalid persisted time fails closed instead of silently excluding a candidate.
+fn newest_predecessor(conn: &Connection, namespace: &str, key: &str) -> Result<Option<Memory>> {
+    let mut statement = conn.prepare(
+        "SELECT id, created_at FROM memories WHERE namespace = ?1 \
+         AND json_type(metadata, '$.ruling_key') = 'text' \
+         AND json_extract(metadata, '$.ruling_key') = ?2",
+    )?;
+    let rows = statement.query_map(params![namespace, key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut newest = None;
+    for row in rows {
+        let (id, created_at) = row?;
+        let instant = chrono::DateTime::parse_from_rfc3339(&created_at)
+            .context("invalid supersession predecessor timestamp")?;
+        let candidate = (instant, id);
+        if newest.as_ref().is_none_or(|current| &candidate > current) {
+            newest = Some(candidate);
+        }
+    }
+    newest
+        .map(|(_, id)| {
+            conn.query_row(
+                super::SQL_SELECT_MEMORY_ROW_BY_ID,
+                [id],
+                super::row_to_memory,
+            )
+            .map_err(Into::into)
+        })
+        .transpose()
+}
+
 /// Store a fresh keyed row and archive its authorized predecessor atomically.
 ///
 /// # Errors
@@ -135,16 +170,7 @@ pub fn store(
     let key = ruling_key(&memory.metadata)?
         .ok_or_else(|| anyhow::anyhow!("supersession store requires ruling_key"))?;
     let tx = super::connection::WriteTxn::begin(conn)?;
-    let old = conn
-        .query_row(
-            "SELECT * FROM memories WHERE namespace = ?1 \
-         AND json_type(metadata, '$.ruling_key') = 'text' \
-         AND json_extract(metadata, '$.ruling_key') = ?2 \
-         ORDER BY julianday(created_at) DESC, id DESC LIMIT 1",
-            params![memory.namespace, key],
-            super::row_to_memory,
-        )
-        .optional()?;
+    let old = newest_predecessor(conn, &memory.namespace, key)?;
     let id = super::insert_no_overwrite(conn, memory)?;
     ensure!(id == memory.id, "fresh supersession insert changed id");
     let mut result = SupersessionResult {
