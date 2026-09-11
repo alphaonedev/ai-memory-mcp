@@ -1006,7 +1006,9 @@ impl Surface for Http {
 async fn http_extras(http: &Http) {
     let name = http.name();
 
-    // F2 ALLOWED — a v1 signature verified against the bound key, no header.
+    // F2 ALLOWED — a v1 signature verified against the bound key. HTTP
+    // authenticates by header only (#907), so the header names the signer;
+    // it is merely claimed, and the verified signature is what hardens it.
     let o = owner();
     let kp = ai_memory::identity::keypair::generate(&o).expect("keypair");
     http.bind_key(&o, &kp).await;
@@ -1014,10 +1016,36 @@ async fn http_extras(http: &Http) {
     let old = predecessor(&ns, Some(&o), PAST);
     http.seed(&old).await;
     let env = http
-        .post_create(None, &signed_body(&kp, &o, &ns))
+        .post_create(Some(&o), &signed_body(&kp, &o, &ns))
         .await
         .expect("verified signer store");
     assert_superseded(http, &old.id, &env).await;
+
+    // F2 DENIED — the same keyed write signed by a key NOT bound to the signer
+    // is refused before any write, header or not; OLD is untouched.
+    let rogue = ai_memory::identity::keypair::generate(&o).expect("rogue keypair");
+    let ns = uniq("http-v1-forged");
+    let old = predecessor(&ns, Some(&o), PAST);
+    let before = seeded(http, &old).await;
+    let outcome = http
+        .post_create(Some(&o), &signed_body(&rogue, &o, &ns))
+        .await;
+    assert!(
+        outcome.as_ref().is_err_and(|e| e.starts_with("403")),
+        "{name}: unbound signer: {outcome:?}"
+    );
+    assert!(
+        http.live_ids_titled(&ns, "signed-replacement")
+            .await
+            .is_empty(),
+        "{name}: a refused write stores nothing"
+    );
+    assert_eq!(
+        http.live_meta(&old.id).await.as_ref(),
+        Some(&before),
+        "{name}: OLD untouched"
+    );
+    assert!(http.archived(&old.id).await.is_none(), "{name}");
 
     // F2 per channel — the body and the metadata claim are each refused alone.
     for (body_channel, refusal) in [
