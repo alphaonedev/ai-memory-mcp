@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "issue": 3547,
+  "description": "SSOT of every published evidence figure and the tracked script that produces it. A figure with no producer is a defect. Every producer.script path must be git-tracked.",
+  "binding": {
+    "run_id": "required uuid/token unique per invocation",
+    "daemon_binary_sha256": "sha256 of the executable the harness addressed (Linux /proc/<pid>/exe; macOS lsof txt)",
+    "source_commit": "git rev-parse HEAD of the tree the binary was built from",
+    "rule": "a bundle is unbound unless run_id, daemon_binary_sha256 and source_commit are all present and daemon_binary_sha256 equals the independently hashed addressed exe"
+  },
+  "producers": [
+    {
+      "id": "continuity-cycle",
+      "script": "scripts/evidence/continuity-cycle.py",
+      "outputs": ["continuity-cycle.json"],
+      "figures": ["clock_1_harness_restart_to_health_ok_ms"],
+      "binds": ["run_id", "daemon_binary_sha256", "source_commit"]
+    },
+    {
+      "id": "big10-regression",
+      "script": "scripts/evidence/big10-regression.sh",
+      "outputs": ["big10-regression.json"],
+      "figures": ["plaintext_listener_absent", "anonymous_write_refused"],
+      "binds": ["run_id", "daemon_binary_sha256", "source_commit"]
+    },
+    {
+      "id": "mcp-tools-state",
+      "script": "scripts/evidence/mcp-tools-state.py",
+      "outputs": ["mcp-tools-state.json"],
+      "figures": ["mcp_tools_functional", "mcp_tools_validated", "mcp_tools_failclosed"],
+      "binds": ["run_id", "source_commit"],
+      "note": "Refuses to invent a percentage. Requires --run-dir of a named tools/list capture. The unpublished 95 % dashboard figure has no producer and is retired until a named run is supplied."
+    },
+    {
+      "id": "collect-evidence-2921",
+      "script": "scripts/bench/collect-evidence.sh",
+      "outputs": ["docs/bench/evidence-2921/"],
+      "figures": ["ops_p50_p99", "mesh_rung_summary"],
+      "binds": ["run_id"],
+      "note": "Existing tracked sanitiser. Does not produce continuity or Big-10."
+    },
+    {
+      "id": "test-attestation",
+      "script": "infra/do-hive/crypto/test-attestation.sh",
+      "outputs": ["attestation-summary"],
+      "figures": ["attest_level_agent_attested"],
+      "binds": ["run_id", "daemon_binary_sha256"],
+      "note": "Predicate rewrite (INFO oracle → fail-closed attest_level) is #3543."
+    },
+    {
+      "id": "swarm-coverage",
+      "script": "sdk/python/swarm/coverage.py",
+      "outputs": ["coverage-matrix"],
+      "figures": ["swarm_covered", "swarm_pending"],
+      "binds": ["run_id"],
+      "note": "pending != covered rewrite is #3543."
+    }
+  ]
+}
