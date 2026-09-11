@@ -201,8 +201,10 @@ def main() -> int:
     if not ok:
         print(
             "qualify-sha: REFUSED — this commit was not qualified by CI. Pushing the tag starts a full "
-            "ci.yml run on this SHA (a new tag ref has no base, so classify runs everything); wait for "
-            "it, re-run any failed workflow on this exact SHA, then re-dispatch the release.",
+            "ci.yml run on this SHA (a new tag ref has no base, so classify runs everything). While the "
+            "release branch tip is this SHA, coverage.yml, cert-postgres-age.yml and postgres-ignored.yml "
+            "can be dispatched with `gh workflow run <file> --ref <release branch>`; a dispatch also "
+            "classifies docs_only=false. Re-run any failed workflow, then re-dispatch the release.",
             file=sys.stderr,
         )
         return 1
