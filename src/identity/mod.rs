@@ -1026,11 +1026,12 @@ pub fn preserve_provenance_keys(
 /// ([`preserve_provenance_keys`]) must let a FRESH re-store's attestation win
 /// (a signed re-store upgrading `claimed`→`agent_attested`), so they keep the
 /// narrower 3-key immutable set.
-pub const UPDATE_PRESERVED_ATTESTATION_KEYS: [&str; 4] = [
+pub const UPDATE_PRESERVED_ATTESTATION_KEYS: [&str; 5] = [
     crate::models::field_names::ATTEST_LEVEL,
     crate::models::field_names::WRITE_SIGNATURE,
     crate::models::memory::METADATA_KIND_PROVENANCE_KEY,
     crate::models::field_names::VERSION_VECTOR,
+    crate::models::field_names::RULING_KEY,
 ];
 
 /// [`preserve_provenance_keys`] extended for the UPDATE funnel: preserves the

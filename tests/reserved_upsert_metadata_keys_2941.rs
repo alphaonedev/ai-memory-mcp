@@ -104,6 +104,11 @@ fn both_backends_preserve_the_same_reserved_key_set() {
             include_str!("../src/store/postgres.rs"),
             "WHERE prov.k IN (",
         ),
+        (
+            "postgres transaction insert",
+            include_str!("../src/store/postgres/insert_tx.rs"),
+            "WHERE prov.k IN (",
+        ),
     ] {
         let sites: Vec<&str> = src.match_indices(marker).map(|(i, _)| &src[i..]).collect();
         assert!(

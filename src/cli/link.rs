@@ -20,6 +20,9 @@ pub struct LinkArgs {
 
 #[derive(Args)]
 pub struct ResolveArgs {
+    /// Resolve as an allowlisted hardened process principal.
+    #[arg(long)]
+    pub as_admin: bool,
     /// ID of the memory that wins (supersedes)
     pub winner_id: String,
     /// ID of the memory that loses (superseded)
@@ -147,8 +150,7 @@ pub fn cmd_link(
     Ok(())
 }
 
-/// `resolve` handler — record `winner supersedes loser`, demote loser
-/// priority/confidence, and refresh winner's TTL.
+/// Archive the older loser under hardened authority; preserve the winner bytes.
 pub fn cmd_resolve(
     db_path: &Path,
     args: &ResolveArgs,
@@ -164,59 +166,26 @@ pub fn cmd_resolve(
         &args.loser_id,
         crate::models::MemoryLinkRelation::Supersedes.as_str(),
     )?;
-    db::create_link(
+    let principal =
+        crate::identity::supersession::SupersessionPrincipal::from_process_environment()?;
+    let result = crate::storage::supersession::resolve(
         &conn,
-        &args.winner_id,
         &args.loser_id,
-        crate::models::MemoryLinkRelation::Supersedes.as_str(),
+        &args.winner_id,
+        crate::storage::supersession::SupersessionRequest {
+            principal: principal.as_ref(),
+            as_admin: args.as_admin,
+        },
     )?;
-    // v1.0.0 #3403 — `resolve` is a link write like `link` is, so it fires
-    // the same `memory_link_created` event through the same shared funnel.
-    // The funnel belongs at the WRITE, not at the verb name: a subscriber
-    // watching edges must not miss one because the operator reached for a
-    // differently-named CLI verb.
-    {
-        let (event_namespace, event_agent_id) =
-            crate::write_events::link_event_origin(&conn, &args.winner_id);
-        crate::write_events::link_created(
-            &conn,
-            db_path,
-            &args.winner_id,
-            &event_namespace,
-            event_agent_id.as_deref(),
-            &crate::subscriptions::LinkCreatedEventDetails {
-                target_id: args.loser_id.clone(),
-                relation: crate::models::MemoryLinkRelation::Supersedes
-                    .as_str()
-                    .to_string(),
-            },
-        );
+    if let Some(reason) = result.refusal {
+        anyhow::bail!("supersession refused: {reason:?}");
     }
-    let _ = db::update(
-        &conn,
-        &args.loser_id,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(1),
-        Some(0.1),
-        None,
-        None,
-    )?;
-    db::touch(
-        &conn,
-        &args.winner_id,
-        models::SHORT_TTL_EXTEND_SECS,
-        models::MID_TTL_EXTEND_SECS,
-    )?;
     if json_out {
-        writeln!(
-            out.stdout,
-            "{}",
-            serde_json::json!({"resolved": true, "winner": args.winner_id, "loser": args.loser_id})
-        )?;
+        writeln!(out.stdout, "{}", {
+            let mut response = serde_json::json!({"resolved": true, "winner": args.winner_id, "loser": args.loser_id});
+            result.add_response_fields(&mut response);
+            response
+        })?;
     } else {
         writeln!(
             out.stdout,
@@ -461,6 +430,7 @@ mod tests {
         let winner = seed_memory(&db, "ns", "winner", "wins");
         let loser = seed_memory(&db, "ns", "loser", "loses");
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: winner.clone(),
             loser_id: loser.clone(),
         };
@@ -484,6 +454,7 @@ mod tests {
         let winner = seed_memory(&db, "ns", "winner", "wins");
         let loser = seed_memory(&db, "ns", "loser", "loses");
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: winner,
             loser_id: loser.clone(),
         };
@@ -509,6 +480,7 @@ mod tests {
         let pre_access = pre.access_count;
         drop(conn);
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: winner.clone(),
             loser_id: loser,
         };
@@ -536,6 +508,7 @@ mod tests {
         let db = env.db_path.clone();
         let only = seed_memory(&db, "ns", "only", "self");
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: only.clone(),
             loser_id: only,
         };
@@ -581,6 +554,7 @@ mod tests {
         // not from a missing table.
         drop(db::open(&db).unwrap());
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: "nonexistent-winner-id".into(),
             loser_id: "nonexistent-loser-id".into(),
         };
@@ -611,6 +585,7 @@ mod tests {
         .unwrap();
         drop(conn);
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: winner,
             loser_id: loser,
         };
@@ -644,6 +619,7 @@ mod tests {
         .unwrap();
         drop(conn);
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: winner,
             loser_id: loser,
         };
@@ -703,6 +679,7 @@ mod tests {
         let winner = seed_memory(&db, "ns", "winner", "wins");
         let loser = seed_memory(&db, "ns", "loser", "loses");
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: winner,
             loser_id: loser,
         };
@@ -723,6 +700,7 @@ mod tests {
         let winner = seed_memory(&db, "ns", "winner", "wins");
         let loser = seed_memory(&db, "ns", "loser", "loses");
         let args = ResolveArgs {
+            as_admin: false,
             winner_id: winner,
             loser_id: loser,
         };

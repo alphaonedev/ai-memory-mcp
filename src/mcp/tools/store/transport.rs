@@ -106,10 +106,44 @@ pub(super) fn forward_store_to_http(
     // The HTTP request body mirrors the MCP params; pass them through
     // and let the HTTP handler do all validation, governance, quota,
     // dedup, embedding, audit, and federation broadcast.
-    let body = params.clone();
-    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
-
-    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+    let mut body = params.clone();
+    let mut headers = Vec::new();
+    if crate::storage::supersession::ruling_key(&params["metadata"])
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        // #3587: do not upgrade clientInfo/body claims into hardened HTTP evidence.
+        if let Some(principal) =
+            crate::identity::supersession::SupersessionPrincipal::from_process_environment()
+                .map_err(|e| e.to_string())?
+        {
+            headers.push((crate::HEADER_AGENT_ID, principal.agent_id().to_owned()));
+        }
+        if headers.is_empty()
+            && (params["signature"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty())
+                || params["write_v2"].is_object())
+        {
+            // The HTTP edge MUST verify this presented envelope before the
+            // header can authorize supersession; invalid signatures hard-refuse.
+            headers.push((crate::HEADER_AGENT_ID, agent_id.clone()));
+        }
+        if headers.is_empty() {
+            // No evidence: store anonymously; never elevate a fallback claim.
+            if let Some(object) = body.as_object_mut() {
+                object.remove("agent_id");
+            }
+            if let Some(metadata) = body["metadata"].as_object_mut() {
+                metadata.remove("agent_id");
+            }
+        } else {
+            body["agent_id"] = serde_json::json!(agent_id);
+        }
+    } else {
+        headers.push((crate::HEADER_AGENT_ID, agent_id));
+    }
+    forward_to_http(reqwest::Method::POST, &url, Some(&body), &headers)
 }
 
 /// #1718 — MCP `memory_action_transition` → HTTP

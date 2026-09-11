@@ -1548,6 +1548,12 @@ impl Default for Memory {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateMemory {
+    /// Certified v2 envelope for a keyed supersession write.
+    #[serde(default)]
+    pub write_v2: Option<Value>,
+    /// Explicit supersession admin mode; requires a hardened allowlisted principal.
+    #[serde(default)]
+    pub as_admin: bool,
     #[serde(default = "default_tier")]
     pub tier: Tier,
     #[serde(default = "default_namespace")]

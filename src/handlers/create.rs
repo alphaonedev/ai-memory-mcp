@@ -717,7 +717,7 @@ fn insert_create_with_quota(
             bool,
         ),
     >,
-    mem: &Memory,
+    mem: &mut Memory,
     embedding: &Option<Vec<f32>>,
     // #2167 — the live embedder's space fingerprint, stamped alongside the
     // vector. `None` when embeddings are disabled (then `embedding` is `None`
@@ -728,6 +728,8 @@ fn insert_create_with_quota(
     // REFUSED atomically (409 CONFLICT) instead of upsert-merged. `false`
     // (`merge`/`version`) keeps the legacy `db::insert` upsert.
     fail_on_conflict: bool,
+    request: crate::storage::supersession::SupersessionRequest<'_>,
+    supersession_result: &mut Option<crate::storage::supersession::SupersessionResult>,
 ) -> Result<String, axum::response::Response> {
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
@@ -817,7 +819,18 @@ fn insert_create_with_quota(
         }
     }
 
-    let insert_result = if fail_on_conflict {
+    let keyed_store = mem.metadata.get(field_names::RULING_KEY).is_some();
+    let insert_result = if keyed_store {
+        crate::storage::supersession::store(&lock.0, mem, request, embedding.as_deref().zip(space))
+            .map(|result| {
+                let id = result.id.clone();
+                if let Some(old) = &result.superseded {
+                    mem.metadata[field_names::SUPERSEDED_ID] = json!(old);
+                }
+                *supersession_result = Some(result);
+                id
+            })
+    } else if fail_on_conflict {
         db::insert_no_overwrite(&lock.0, mem)
     } else {
         db::insert(&lock.0, mem)
@@ -830,7 +843,8 @@ fn insert_create_with_quota(
             // silently excluding every HTTP-authored memory from
             // semantic search. HNSW index warm-up happens after the
             // lock drops in the orchestrator.
-            if let Some(vec) = embedding.as_ref()
+            if !keyed_store
+                && let Some(vec) = embedding.as_ref()
                 && let Some(sp) = space
                 && let Err(e) = db::set_embedding(&lock.0, &actual_id, vec, sp)
             {
@@ -921,6 +935,7 @@ async fn fanout_and_assemble_create_response(
     atomise_disposition: Option<crate::hooks::pre_store::AtomiseDisposition>,
     contradiction_ids: Vec<String>,
     embed_status: EmbedStatus,
+    supersession_result: Option<&crate::storage::supersession::SupersessionResult>,
 ) -> axum::response::Response {
     // #1566 / #1579 B1 — embed-once-replicate-vector: capture the
     // just-computed vector for the federation fanout BEFORE the HNSW
@@ -983,6 +998,9 @@ async fn fanout_and_assemble_create_response(
         "title": mem.title,
         "agent_id": resolved_agent_id,
     });
+    if let Some(result) = supersession_result {
+        result.add_response_fields(&mut response);
+    }
     if !contradiction_ids.is_empty() {
         response["potential_contradictions"] = json!(contradiction_ids);
     }
@@ -1093,7 +1111,9 @@ async fn create_memory_postgres(
     // v0.9.0 G10.1 (#1827) — the edge-parsed capability token (or None),
     // parsed once by `create_memory` from `X-AI-Memory-Capability`.
     capability: Option<&crate::governance::capability::CapabilityToken>,
+    mut supersession_principal: Option<crate::identity::supersession::SupersessionPrincipal>,
 ) -> axum::response::Response {
+    let keyed_store = body.metadata.get(field_names::RULING_KEY).is_some();
     let now = Utc::now();
     // #2587 — `auto_tag` no longer fires here. Pre-#2587 this awaited the
     // LLM chat-completion call INLINE, before the canonical `Memory` row
@@ -1204,33 +1224,127 @@ async fn create_memory_postgres(
     // #1985 required-attestation (HTTP-direct default) rejects an unsigned
     // write.
     {
-        let presented_sig = body
-            .signature
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(sig_b64) = presented_sig {
-            let (sig_bytes, signed_created_at) = match crate::identity::attest::prepare_signed_store(
-                sig_b64,
-                body.created_at.as_deref(),
-            ) {
-                Ok(v) => v,
-                Err(msg) => {
-                    return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+        if keyed_store && let Some(envelope) = body.write_v2.as_ref() {
+            let presented =
+                match crate::identity::attest_v2::parse_presented(&json!({"write_v2": envelope})) {
+                    Ok(Some(presented)) => presented,
+                    Ok(None) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "missing v2 envelope"})),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => {
+                        return (StatusCode::FORBIDDEN, Json(json!({"error": e.to_string()})))
+                            .into_response();
+                    }
+                };
+            supersession_principal =
+                match crate::identity::supersession::SupersessionPrincipal::verify_v2_async(
+                    app.store.as_ref(),
+                    &mut mem,
+                    agent_id,
+                    &presented,
+                )
+                .await
+                {
+                    Ok(principal) => Some(principal),
+                    Err(e) => {
+                        return (StatusCode::FORBIDDEN, Json(json!({"error": e.to_string()})))
+                            .into_response();
+                    }
+                };
+        } else {
+            let presented_sig = body
+                .signature
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(sig_b64) = presented_sig {
+                let (sig_bytes, signed_created_at) =
+                    match crate::identity::attest::prepare_signed_store(
+                        sig_b64,
+                        body.created_at.as_deref(),
+                    ) {
+                        Ok(v) => v,
+                        Err(msg) => {
+                            return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})))
+                                .into_response();
+                        }
+                    };
+                mem.created_at = signed_created_at.to_string();
+                // #1801→#1954 item 4 — redact to storage form BEFORE the gate
+                // verifies (and before EMIT) so the signed bytes equal the
+                // persisted bytes; the SAL store re-redacts idempotently.
+                crate::identity::attest::redact_before_sign(&mut mem);
+                // #1985 — HTTP direct-write is the network surface (HttpDirect):
+                // required by default.
+                if let Err(e) = crate::identity::attest::stamp_attestation_async(
+                    app.store.as_ref(),
+                    &mut mem,
+                    agent_id,
+                    Some(&sig_bytes),
+                    crate::identity::attest::WriteSurface::HttpDirect,
+                )
+                .await
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                            "error": e.to_string(),
+                        })),
+                    )
+                        .into_response();
                 }
-            };
-            mem.created_at = signed_created_at.to_string();
-            // #1801→#1954 item 4 — redact to storage form BEFORE the gate
-            // verifies (and before EMIT) so the signed bytes equal the
-            // persisted bytes; the SAL store re-redacts idempotently.
-            crate::identity::attest::redact_before_sign(&mut mem);
-            // #1985 — HTTP direct-write is the network surface (HttpDirect):
-            // required by default.
-            if let Err(e) = crate::identity::attest::stamp_attestation_async(
+                // #3419 (security-high) — admit-once replay guard. The signature has
+                // now VERIFIED; consult the durable ledger before the row is stored.
+                // An Ed25519 signature is re-verifiable forever, so without this a
+                // captured signed body re-POSTed inside the ±300 s freshness window
+                // mints duplicate rows (or resurrects a deleted memory) as
+                // `agent_attested`. A ledger fault refuses the write (fail-closed).
+                if let Some(resp) = crate::handlers::errors::attested_write_admission_response(
+                    &crate::identity::attest::admit_attested_write_async(
+                        app.store.as_ref(),
+                        agent_id,
+                        &mem.created_at,
+                        &sig_bytes,
+                    )
+                    .await,
+                ) {
+                    return resp;
+                }
+                // #1801→#1954 item 2 — sender EMIT: persist the author's presented
+                // signature so it propagates verbatim across federation relay hops.
+                crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
+                if keyed_store {
+                    supersession_principal =
+                        match crate::identity::supersession::SupersessionPrincipal::verify_v1_async(
+                            app.store.as_ref(),
+                            &mem,
+                            agent_id,
+                            &sig_bytes,
+                        )
+                        .await
+                        {
+                            Ok(principal) => Some(principal),
+                            Err(e) => {
+                                return (
+                                    StatusCode::FORBIDDEN,
+                                    Json(json!({"error": e.to_string()})),
+                                )
+                                    .into_response();
+                            }
+                        };
+                }
+            } else if crate::identity::attest::require_agent_attestation_for(
+                crate::identity::attest::WriteSurface::HttpDirect,
+            ) && let Err(e) = crate::identity::attest::stamp_attestation_async(
                 app.store.as_ref(),
                 &mut mem,
                 agent_id,
-                Some(&sig_bytes),
+                None,
                 crate::identity::attest::WriteSurface::HttpDirect,
             )
             .await
@@ -1244,45 +1358,6 @@ async fn create_memory_postgres(
                 )
                     .into_response();
             }
-            // #3419 (security-high) — admit-once replay guard. The signature has
-            // now VERIFIED; consult the durable ledger before the row is stored.
-            // An Ed25519 signature is re-verifiable forever, so without this a
-            // captured signed body re-POSTed inside the ±300 s freshness window
-            // mints duplicate rows (or resurrects a deleted memory) as
-            // `agent_attested`. A ledger fault refuses the write (fail-closed).
-            if let Some(resp) = crate::handlers::errors::attested_write_admission_response(
-                &crate::identity::attest::admit_attested_write_async(
-                    app.store.as_ref(),
-                    agent_id,
-                    &mem.created_at,
-                    &sig_bytes,
-                )
-                .await,
-            ) {
-                return resp;
-            }
-            // #1801→#1954 item 2 — sender EMIT: persist the author's presented
-            // signature so it propagates verbatim across federation relay hops.
-            crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
-        } else if crate::identity::attest::require_agent_attestation_for(
-            crate::identity::attest::WriteSurface::HttpDirect,
-        ) && let Err(e) = crate::identity::attest::stamp_attestation_async(
-            app.store.as_ref(),
-            &mut mem,
-            agent_id,
-            None,
-            crate::identity::attest::WriteSurface::HttpDirect,
-        )
-        .await
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                    "error": e.to_string(),
-                })),
-            )
-                .into_response();
         }
     }
 
@@ -1401,9 +1476,29 @@ async fn create_memory_postgres(
     // silently overwriting the durable content. `merge`/`version` keep the
     // upsert. Boxed because the two async methods are distinct future types.
     let store_error_mode = matches!(on_conflict_mode, OnConflictMode::Error);
+    let mut supersession_result = None;
     let store_fut: std::pin::Pin<
         Box<dyn std::future::Future<Output = crate::store::StoreResult<String>> + Send>,
-    > = if store_error_mode {
+    > = if keyed_store {
+        Box::pin(async {
+            let result = app
+                .store
+                .store_with_supersession(
+                    &ctx,
+                    &mem,
+                    embedding.as_deref(),
+                    embedding_space.as_deref(),
+                    crate::storage::supersession::SupersessionRequest {
+                        principal: supersession_principal.as_ref(),
+                        as_admin: body.as_admin,
+                    },
+                )
+                .await?;
+            let id = result.id.clone();
+            supersession_result = Some(result);
+            Ok(id)
+        })
+    } else if store_error_mode {
         Box::pin(app.store.store_with_embedding_no_overwrite(
             &ctx,
             &mem,
@@ -1418,7 +1513,7 @@ async fn create_memory_postgres(
             embedding_space.as_deref(),
         ))
     };
-    let (id, quorum_outcome) = match app.federation.as_ref() {
+    let (id, mut quorum_outcome) = match app.federation.as_ref().filter(|_| !keyed_store) {
         Some(fed) => {
             tracing::debug!(
                 target: crate::federation::SYNC_TRACE_TARGET,
@@ -1470,6 +1565,29 @@ async fn create_memory_postgres(
             }
         }
     };
+    if let Some(result) = &supersession_result {
+        if let Some(old) = &result.superseded {
+            mem.metadata[field_names::SUPERSEDED_ID] = json!(old);
+        }
+        if let Some(fed) = app.federation.as_ref() {
+            let shipped = match (&embedding, app.embedder.as_ref().as_ref()) {
+                (Some(vector), Some(embedder)) => Some(crate::federation::ShippedEmbedding::new(
+                    mem.id.clone(),
+                    embedder.model_description(),
+                    vector.clone(),
+                )),
+                _ => None,
+            };
+            quorum_outcome = Some(
+                crate::federation::broadcast_store_quorum_with_embedding(
+                    fed,
+                    &mem,
+                    shipped.as_ref(),
+                )
+                .await,
+            );
+        }
+    }
 
     // Local write succeeded. Audit + webhook dispatch fire on local
     // durability REGARDLESS of the quorum outcome — the local write is
@@ -1576,13 +1694,16 @@ async fn create_memory_postgres(
     if let Some(d) = atomise_disposition {
         d.merge_into_response(&mut payload);
     }
+    if let Some(result) = &supersession_result {
+        result.add_response_fields(&mut payload);
+    }
     (StatusCode::CREATED, Json(payload)).into_response()
 }
 
 pub async fn create_memory(
     State(app): State<AppState>,
     headers: HeaderMap,
-    JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
+    JsonOrBadRequest(mut body): JsonOrBadRequest<CreateMemory>,
 ) -> impl IntoResponse {
     // Input validation (cheapest gate first).
     if let Err(e) = validate::RequestValidator::validate_create(&body) {
@@ -1592,6 +1713,32 @@ pub async fn create_memory(
         )
             .into_response();
     }
+
+    let keyed_store = match crate::storage::supersession::ruling_key(&body.metadata) {
+        Ok(key) => key.is_some(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let mut supersession_principal = if keyed_store {
+        body.on_conflict = Some("error".into());
+        match crate::identity::supersession::SupersessionPrincipal::from_http_headers(&headers) {
+            Ok(principal) => principal,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
 
     // Stage 1 — agent_id resolution (consumes `body.metadata`, returns
     // canonical metadata). Consumed by the postgres SAL branch and, since
@@ -1637,7 +1784,15 @@ pub async fn create_memory(
     // sqlite stages below stay focused.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return create_memory_postgres(&app, &body, &agent_id, metadata, capability.as_ref()).await;
+        return create_memory_postgres(
+            &app,
+            &body,
+            &agent_id,
+            metadata,
+            capability.as_ref(),
+            supersession_principal,
+        )
+        .await;
     }
 
     // #2587 — `auto_tag` no longer fires here (see the comment at the
@@ -1740,33 +1895,111 @@ pub async fn create_memory(
     // network surface `WriteSurface::HttpDirect`, required by default) —
     // only `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opts this surface out.
     {
-        let presented_sig = body
-            .signature
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(sig_b64) = presented_sig {
-            let (sig_bytes, signed_created_at) = match crate::identity::attest::prepare_signed_store(
-                sig_b64,
-                body.created_at.as_deref(),
-            ) {
-                Ok(v) => v,
-                Err(msg) => {
-                    return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+        if keyed_store && let Some(envelope) = body.write_v2.as_ref() {
+            let presented =
+                match crate::identity::attest_v2::parse_presented(&json!({"write_v2": envelope})) {
+                    Ok(Some(presented)) => presented,
+                    Ok(None) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "missing v2 envelope"})),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => {
+                        return (StatusCode::FORBIDDEN, Json(json!({"error": e.to_string()})))
+                            .into_response();
+                    }
+                };
+            supersession_principal =
+                match crate::identity::supersession::SupersessionPrincipal::verify_v2_sync(
+                    &lock.0, &mut mem, &agent_id, &presented,
+                ) {
+                    Ok(principal) => Some(principal),
+                    Err(e) => {
+                        return (StatusCode::FORBIDDEN, Json(json!({"error": e.to_string()})))
+                            .into_response();
+                    }
+                };
+        } else {
+            let presented_sig = body
+                .signature
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(sig_b64) = presented_sig {
+                let (sig_bytes, signed_created_at) =
+                    match crate::identity::attest::prepare_signed_store(
+                        sig_b64,
+                        body.created_at.as_deref(),
+                    ) {
+                        Ok(v) => v,
+                        Err(msg) => {
+                            return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})))
+                                .into_response();
+                        }
+                    };
+                mem.created_at = signed_created_at.to_string();
+                // #1801→#1954 item 4 — redact to storage form BEFORE the gate
+                // verifies (and before EMIT) so the signed bytes equal the
+                // persisted bytes; `db::insert` re-redacts idempotently.
+                crate::identity::attest::redact_before_sign(&mut mem);
+                // #1985 — HTTP direct-write is the network surface (HttpDirect):
+                // required by default.
+                if let Err(e) = crate::identity::attest::stamp_attestation_sync(
+                    &lock.0,
+                    &mut mem,
+                    &agent_id,
+                    Some(&sig_bytes),
+                    crate::identity::attest::WriteSurface::HttpDirect,
+                ) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                            "error": e.to_string(),
+                        })),
+                    )
+                        .into_response();
                 }
-            };
-            mem.created_at = signed_created_at.to_string();
-            // #1801→#1954 item 4 — redact to storage form BEFORE the gate
-            // verifies (and before EMIT) so the signed bytes equal the
-            // persisted bytes; `db::insert` re-redacts idempotently.
-            crate::identity::attest::redact_before_sign(&mut mem);
-            // #1985 — HTTP direct-write is the network surface (HttpDirect):
-            // required by default.
-            if let Err(e) = crate::identity::attest::stamp_attestation_sync(
+                // #3419 (security-high) — admit-once replay guard, sqlite twin of
+                // the postgres branch above. Same durable ledger contract, same
+                // fail-closed disposition, same wire refusal helper.
+                if let Some(resp) = crate::handlers::errors::attested_write_admission_response(
+                    &crate::identity::attest::admit_attested_write_sync(
+                        &lock.0,
+                        &agent_id,
+                        &mem.created_at,
+                        &sig_bytes,
+                    ),
+                ) {
+                    return resp;
+                }
+                // #1801→#1954 item 2 — sender EMIT: persist the author's presented
+                // signature so it propagates verbatim across federation relay hops.
+                crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
+                if keyed_store {
+                    supersession_principal =
+                        match crate::identity::supersession::SupersessionPrincipal::verify_v1_sync(
+                            &lock.0, &mem, &agent_id, &sig_bytes,
+                        ) {
+                            Ok(principal) => Some(principal),
+                            Err(e) => {
+                                return (
+                                    StatusCode::FORBIDDEN,
+                                    Json(json!({"error": e.to_string()})),
+                                )
+                                    .into_response();
+                            }
+                        };
+                }
+            } else if crate::identity::attest::require_agent_attestation_for(
+                crate::identity::attest::WriteSurface::HttpDirect,
+            ) && let Err(e) = crate::identity::attest::stamp_attestation_sync(
                 &lock.0,
                 &mut mem,
                 &agent_id,
-                Some(&sig_bytes),
+                None,
                 crate::identity::attest::WriteSurface::HttpDirect,
             ) {
                 return (
@@ -1778,39 +2011,6 @@ pub async fn create_memory(
                 )
                     .into_response();
             }
-            // #3419 (security-high) — admit-once replay guard, sqlite twin of
-            // the postgres branch above. Same durable ledger contract, same
-            // fail-closed disposition, same wire refusal helper.
-            if let Some(resp) = crate::handlers::errors::attested_write_admission_response(
-                &crate::identity::attest::admit_attested_write_sync(
-                    &lock.0,
-                    &agent_id,
-                    &mem.created_at,
-                    &sig_bytes,
-                ),
-            ) {
-                return resp;
-            }
-            // #1801→#1954 item 2 — sender EMIT: persist the author's presented
-            // signature so it propagates verbatim across federation relay hops.
-            crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
-        } else if crate::identity::attest::require_agent_attestation_for(
-            crate::identity::attest::WriteSurface::HttpDirect,
-        ) && let Err(e) = crate::identity::attest::stamp_attestation_sync(
-            &lock.0,
-            &mut mem,
-            &agent_id,
-            None,
-            crate::identity::attest::WriteSurface::HttpDirect,
-        ) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                    "error": e.to_string(),
-                })),
-            )
-                .into_response();
         }
     }
 
@@ -1904,12 +2104,18 @@ pub async fn create_memory(
     // overwrite the durable content between Stage-2's probe and this write.
     // `merge`/`version` keep the upsert path.
     let fail_on_conflict = matches!(on_conflict_mode, crate::mcp::tools::OnConflictMode::Error);
+    let mut supersession_result = None;
     let actual_id = match insert_create_with_quota(
         &lock,
-        &mem,
+        &mut mem,
         &embedding,
         create_space.as_deref(),
         fail_on_conflict,
+        crate::storage::supersession::SupersessionRequest {
+            principal: supersession_principal.as_ref(),
+            as_admin: body.as_admin,
+        },
+        &mut supersession_result,
     ) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -1951,6 +2157,7 @@ pub async fn create_memory(
         atomise_disposition,
         contradiction_ids,
         embed_status,
+        supersession_result.as_ref(),
     )
     .await
 }
@@ -1971,6 +2178,8 @@ mod tests {
     /// (default)]` annotations.
     fn make_body(title: &str) -> CreateMemory {
         CreateMemory {
+            write_v2: None,
+            as_admin: false,
             tier: Tier::Long,
             namespace: "test-ns".to_string(),
             title: title.to_string(),

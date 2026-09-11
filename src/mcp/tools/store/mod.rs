@@ -57,6 +57,8 @@ pub use self::validation::OnConflict as OnConflictMode;
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct StoreRequest {
+    #[serde(default)]
+    pub as_admin: Option<bool>,
     /// Short title
     pub title: String,
 
@@ -378,6 +380,28 @@ pub(crate) fn handle_store(
         return transport::forward_store_to_http(url, params, mcp_client);
     }
 
+    // #3587: force fresh-id error semantics BEFORE title resolution and synthesis.
+    let keyed_store = crate::storage::supersession::ruling_key(&params["metadata"])
+        .map_err(|e| e.to_string())?
+        .is_some();
+    let keyed_params;
+    let params = if keyed_store {
+        keyed_params = {
+            let mut value = params.clone();
+            value["on_conflict"] = json!("error");
+            value
+        };
+        &keyed_params
+    } else {
+        params
+    };
+    let mut supersession_principal = if keyed_store {
+        crate::identity::supersession::SupersessionPrincipal::from_process_environment()
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+
     // #881 — input parse + validation + Memory construction extracted
     // to `super::validation::parse_and_build_memory`. Returns the
     // fully-built Memory plus the resolved `OnConflict`, `agent_id`,
@@ -430,8 +454,17 @@ pub(crate) fn handle_store(
     let presented_v2 =
         crate::identity::attest_v2::parse_presented(params).map_err(|e| e.to_string())?;
     if let Some(v2) = presented_v2 {
-        crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)
-            .map_err(|e| format!("{e:#}"))?;
+        if keyed_store {
+            supersession_principal = Some(
+                crate::identity::supersession::SupersessionPrincipal::verify_v2_sync(
+                    conn, &mut mem, &agent_id, &v2,
+                )
+                .map_err(|e| format!("{e:#}"))?,
+            );
+        } else {
+            crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)
+                .map_err(|e| format!("{e:#}"))?;
+        }
     } else {
         let presented_sig = params["signature"]
             .as_str()
@@ -483,6 +516,14 @@ pub(crate) fn handle_store(
             // #1801→#1954 item 2 — sender EMIT: persist the author's presented
             // signature so it propagates verbatim across federation relay hops.
             crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
+            if keyed_store {
+                supersession_principal = Some(
+                    crate::identity::supersession::SupersessionPrincipal::verify_v1_sync(
+                        conn, &mem, &agent_id, &sig_bytes,
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+            }
         } else {
             // #3018 — stamp `attest_level` UNCONDITIONALLY on the unsigned
             // path (not only under strict), so the permissive MCP surface
@@ -719,13 +760,14 @@ pub(crate) fn handle_store(
     // `let _name = ...` retains the binding for the rest of the
     // function — we want the latter).
     let (_synthesis_depth, _synthesis_depth_guard) = crate::synthesis::enter_synthesis_pass();
-    let synthesis_outcome = if synthesis::synthesis_eligible(
-        autonomous_hooks,
-        llm.is_some(),
-        mem.content.len(),
-        &mem.namespace,
-        &ns_policy,
-    ) {
+    let synthesis_outcome = if !keyed_store
+        && synthesis::synthesis_eligible(
+            autonomous_hooks,
+            llm.is_some(),
+            mem.content.len(),
+            &mem.namespace,
+            &ns_policy,
+        ) {
         if _synthesis_depth > crate::synthesis::MAX_SYNTHESIS_DEPTH {
             tracing::warn!(
                 target: "synthesis",
@@ -999,7 +1041,26 @@ pub(crate) fn handle_store(
     // stdio is sqlite-only per #1675, so `db::insert_no_overwrite` is the
     // path). `merge`/`version` keep the legacy `db::insert` upsert (merge =
     // opt-in upsert; version already suffixed the title to a free slot above).
-    let insert_result = if matches!(on_conflict, OnConflict::Error) {
+    let mut supersession_result = None;
+    let insert_result = if keyed_store {
+        crate::storage::supersession::store(
+            conn,
+            &mem,
+            crate::storage::supersession::SupersessionRequest {
+                principal: supersession_principal.as_ref(),
+                as_admin: params["as_admin"].as_bool().unwrap_or(false),
+            },
+            None,
+        )
+        .map(|result| {
+            let id = result.id.clone();
+            if let Some(old) = &result.superseded {
+                mem.metadata[crate::models::field_names::SUPERSEDED_ID] = json!(old);
+            }
+            supersession_result = Some(result);
+            id
+        })
+    } else if matches!(on_conflict, OnConflict::Error) {
         db::insert_no_overwrite(conn, &mem)
     } else {
         db::insert(conn, &mem)
@@ -1233,6 +1294,9 @@ pub(crate) fn handle_store(
         && autonomous_hooks
     {
         response["autonomy_hook_skipped"] = json!(reason);
+    }
+    if let Some(result) = &supersession_result {
+        result.add_response_fields(&mut response);
     }
     if let Some(counts) = &synthesis_outcome.counts {
         response["synthesis_decisions"] = counts.to_json();

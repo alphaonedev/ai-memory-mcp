@@ -193,6 +193,53 @@ impl SupersessionPrincipal {
     ) -> Result<Self> {
         validate_principal(agent_id)?;
         super::attest_v2::stamp_v2_sync(conn, memory, agent_id, presented)?;
+        anyhow::ensure!(
+            matches!(
+                super::attest::admit_attested_write_sync(
+                    conn,
+                    agent_id,
+                    &memory.created_at,
+                    presented.write_signature()
+                )
+                .map_err(anyhow::Error::msg)?,
+                super::attest::AttestedWriteAdmission::Fresh
+            ),
+            super::attest::ATTESTED_WRITE_REPLAY_REFUSAL
+        );
+        Ok(Self::verified(
+            memory,
+            agent_id,
+            PrincipalSource::VerifiedV2,
+        ))
+    }
+
+    /// Verify v2 on the live SAL backend and admit its signature exactly once.
+    ///
+    /// # Errors
+    /// Verification, revocation, replay and backend errors fail closed.
+    #[cfg(feature = "sal")]
+    pub async fn verify_v2_async(
+        store: &dyn crate::store::MemoryStore,
+        memory: &mut Memory,
+        agent_id: &str,
+        presented: &super::attest_v2::PresentedWriteV2,
+    ) -> Result<Self> {
+        validate_principal(agent_id)?;
+        super::attest_v2::stamp_v2_async(store, memory, agent_id, presented).await?;
+        anyhow::ensure!(
+            matches!(
+                super::attest::admit_attested_write_async(
+                    store,
+                    agent_id,
+                    &memory.created_at,
+                    presented.write_signature()
+                )
+                .await
+                .map_err(anyhow::Error::msg)?,
+                super::attest::AttestedWriteAdmission::Fresh
+            ),
+            super::attest::ATTESTED_WRITE_REPLAY_REFUSAL
+        );
         Ok(Self::verified(
             memory,
             agent_id,
@@ -344,6 +391,30 @@ pub fn authorize_supersession<'a>(
         as_admin,
     })
 }
+
+/// An update cannot introduce, erase, change or mistype a ruling key.
+/// Omission preserves the existing value; an identical explicit string is allowed.
+///
+/// # Errors
+/// Returns a typed refusal before a provenance-preservation merge can hide it.
+pub fn validate_ruling_key_update(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> Result<()> {
+    if let Some(value) = incoming.get(field_names::RULING_KEY) {
+        anyhow::ensure!(
+            value.as_str().is_some_and(|key| !key.is_empty())
+                && existing.get(field_names::RULING_KEY) == Some(value),
+            RulingKeyImmutable
+        );
+    }
+    Ok(())
+}
+
+/// Wire-independent typed write-once refusal.
+#[derive(Debug, thiserror::Error)]
+#[error("ruling_key is immutable after creation")]
+pub struct RulingKeyImmutable;
 
 /// Exact keyed-store match. Missing, null, non-string and empty keys never match.
 #[must_use]

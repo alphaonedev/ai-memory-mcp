@@ -1337,6 +1337,42 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3587: live v2 revocation lookup. Unsupported stores fail closed.
+    async fn subkey_is_revoked(
+        &self,
+        _principal: &str,
+        _instance_key_id: &[u8],
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SUBKEY_REVOCATION".into(),
+        })
+    }
+
+    /// Persist the verified v2 certificate without ever clearing revocation.
+    async fn insert_subkey_cert(
+        &self,
+        _record: &crate::identity::attest_v2::SubkeyCertRecord,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SUBKEY_CERT".into(),
+        })
+    }
+
+    /// #3587 — atomic keyed create with hardened supersession evidence.
+    /// Unsupported adapters fail closed; never fall back to a committing upsert.
+    async fn store_with_supersession(
+        &self,
+        _ctx: &CallerContext,
+        _memory: &Memory,
+        _embedding: Option<&[f32]>,
+        _space: Option<&str>,
+        _request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession::SupersessionResult> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "STORE_WITH_SUPERSESSION".into(),
+        })
+    }
+
     /// v1.0.0 #2887 — RESTORE-SAFE atomic write for the reversible rollback
     /// paths (autonomy `reverse_rollback_entry_store` + curator
     /// `rollback_consolidation`). It re-stores `memory` at its OWN id under an
