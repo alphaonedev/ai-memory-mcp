@@ -17486,6 +17486,13 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         );
         return Ok(mem.id.clone());
     }
+    // #3587 — superseded-archive-wins: a row this node archived as
+    // SUPERSEDED (an owner-authorized replacement) is not revived by a peer
+    // that still holds it live. Same idempotent no-op as the tombstone.
+    if supersession::is_superseded_archive(conn, &mem.id)? {
+        tracing::info!(memory_id = %mem.id, "{}", supersession::SUPERSEDED_ARCHIVE_DROP_MSG);
+        return Ok(mem.id.clone());
+    }
 
     // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT on the
     // federation RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused

@@ -283,6 +283,36 @@ impl Backend {
         }
     }
 
+    /// A federation newer-wins receive of `memory` (a peer re-pushing it).
+    #[cfg_attr(
+        not(feature = "sal"),
+        allow(clippy::unused_async, reason = "awaits the feature-gated SAL arms")
+    )]
+    async fn receive(&self, memory: &Memory) {
+        match self {
+            #[cfg(feature = "sal")]
+            Self::Sqlite {
+                adapter: Some(store),
+                ..
+            } => {
+                store
+                    .merge_inbound(&CallerContext::for_agent(OWNER), memory, false)
+                    .await
+                    .unwrap();
+            }
+            Self::Sqlite { conn, .. } => {
+                ai_memory::db::insert_if_newer(conn, memory).unwrap();
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { store, .. } => {
+                store
+                    .merge_inbound(&CallerContext::for_agent(OWNER), memory, false)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
     /// The PRINCIPAL-LESS executor every federation lane and legacy caller uses.
     #[cfg_attr(
         not(feature = "sal"),
@@ -461,6 +491,17 @@ async fn matrix(b: &Backend) {
         Some(new.id.clone())
     );
     assert!(b.live_metadata(&old.id).await.is_none());
+
+    // Superseded-archive-wins: a peer re-pushing OLD (even "newer") cannot
+    // revive the replaced row through newer-wins merge.
+    let mut revived = old.clone();
+    revived.updated_at = chrono::Utc::now().to_rfc3339();
+    b.receive(&revived).await;
+    assert!(b.live_metadata(&old.id).await.is_none(), "no resurrection");
+    assert_eq!(
+        b.archive_reason(&old.id).await.as_deref(),
+        Some("superseded")
+    );
 
     // A pair that changed author after detection is a stale proposal.
     let (old2, new2) = pair();

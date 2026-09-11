@@ -134,6 +134,25 @@ fn audit_decision(
     );
 }
 
+/// #3587 — log line for an inbound federated write DROPPED because this node
+/// archived that id as superseded (superseded-archive-wins, both backends).
+pub const SUPERSEDED_ARCHIVE_DROP_MSG: &str = "federation receive: dropped an inbound write for \
+     a memory this node archived as superseded (superseded-archive-wins, #3587)";
+
+/// #3587 resurrection guard — was `memory_id` archived here as SUPERSEDED? A
+/// peer that still holds the replaced ruling live must not revive it through
+/// newer-wins merge (the forget-tombstone precedent, #1821 G30).
+///
+/// # Errors
+/// Hard SQLite failures only.
+pub fn is_superseded_archive(conn: &Connection, memory_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = ?1 AND archive_reason = ?2)",
+        params![memory_id, field_names::ARCHIVE_REASON_SUPERSEDED],
+        |r| r.get(0),
+    )?)
+}
+
 /// Bulk cannot decide ordered supersession safely; clients use single creates.
 pub const KEYED_BULK_UNSUPPORTED: &str = "KEYED_BULK_UNSUPPORTED";
 

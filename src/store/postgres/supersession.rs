@@ -14,6 +14,19 @@ use crate::storage::supersession_pending::{ProposalGate, is_supersession, propos
 use crate::store::record_stop::gate_flag as gate_record_stop_cached;
 
 impl PostgresStore {
+    /// #3587 resurrection guard (pg twin of
+    /// `storage::supersession::is_superseded_archive`).
+    pub(super) async fn is_superseded_archive_pg(&self, memory_id: &str) -> StoreResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = $1 AND archive_reason = $2)",
+        )
+        .bind(memory_id)
+        .bind(crate::models::field_names::ARCHIVE_REASON_SUPERSEDED)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("superseded archive check", e))
+    }
+
     pub(super) async fn subkey_is_revoked_pg(
         &self,
         principal: &str,

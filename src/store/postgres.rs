@@ -24671,6 +24671,15 @@ impl MemoryStore for PostgresStore {
             );
             return Ok(memory.id.clone());
         }
+        // #3587 — superseded-archive-wins (sqlite `insert_if_newer` twin).
+        if self.is_superseded_archive_pg(&memory.id).await? {
+            tracing::info!(
+                memory_id = %memory.id,
+                "{}",
+                crate::storage::supersession::SUPERSEDED_ARCHIVE_DROP_MSG
+            );
+            return Ok(memory.id.clone());
+        }
         let screened = crate::secret_screen::redact_memory_for_receive(memory);
         let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
@@ -25170,6 +25179,15 @@ impl MemoryStore for PostgresStore {
                 memory_id = %inbound.id,
                 "{}",
                 crate::storage::FORGET_TOMBSTONE_DROP_MSG
+            );
+            return Ok(inbound.id.clone());
+        }
+        // #3587 — superseded-archive-wins (sqlite `insert_if_newer` twin).
+        if self.is_superseded_archive_pg(&inbound.id).await? {
+            tracing::info!(
+                memory_id = %inbound.id,
+                "{}",
+                crate::storage::supersession::SUPERSEDED_ARCHIVE_DROP_MSG
             );
             return Ok(inbound.id.clone());
         }
