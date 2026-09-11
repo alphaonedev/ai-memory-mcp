@@ -642,14 +642,9 @@ pub fn encryption_enabled(config_flag: Option<bool>) -> bool {
     if matches!(config_flag, Some(true)) || CONFIG_AT_REST.load(Ordering::Relaxed) {
         return true;
     }
-    matches!(
-        std::env::var(ENV_ENCRYPT_AT_REST)
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    // #3621 — the #3200 shared grammar TRIMS, so a padded ` 1` / `true `
+    // no longer leaves at-rest encryption silently off.
+    crate::env_flag::knobs::ENCRYPT_AT_REST.enabled()
 }
 
 /// #228 Commit B — seal a memory's plaintext content for at-rest storage.

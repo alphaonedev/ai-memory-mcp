@@ -238,13 +238,13 @@ pub fn verify_header_with_nonce(
 /// Whether the receiver enforces signature verification.
 #[must_use]
 pub fn require_sig() -> bool {
-    crate::federation::receive_auth::env_flag_default_on(REQUIRE_SIG_ENV)
+    crate::env_flag::knobs::FED_REQUIRE_SIG.enabled()
 }
 
 /// v0.7.0 #922 — whether the receiver enforces per-message nonce freshness.
 #[must_use]
 pub fn require_nonce() -> bool {
-    crate::federation::receive_auth::env_flag_default_on(REQUIRE_NONCE_ENV)
+    crate::env_flag::knobs::FED_REQUIRE_NONCE.enabled()
 }
 
 #[cfg(test)]

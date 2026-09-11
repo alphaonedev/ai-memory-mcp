@@ -102,17 +102,13 @@ pub const FED_REQUIRE_SERVER_VERIFY_OFF: &str = "0";
 
 /// Whether outbound peer server-cert verification is REQUIRED (#2448).
 ///
-/// Uses the house default-ON federation-knob grammar: disabled only by an
-/// explicit falsy token (`0`/`false`/`no`/`off`, trimmed); every other value —
-/// including unset, the empty string, or an unknown word — keeps it enabled.
-/// Mirrors `federation::receive_auth::env_flag_default_on`, re-implemented
-/// here because that module is `--features sal`-gated while `tls` is in the
-/// default build.
+/// Reads through the #3200 shared grammar ([`crate::env_flag`]): disabled
+/// only by an explicit falsy token (`0`/`false`/`no`/`off`, case-insensitive,
+/// trimmed); unset or empty keeps it enabled, and an unrecognised token
+/// refuses boot (a lazy read of one keeps it enabled).
 #[must_use]
 pub fn server_verify_required() -> bool {
-    std::env::var(FED_REQUIRE_SERVER_VERIFY_ENV)
-        .ok()
-        .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+    crate::env_flag::knobs::FED_REQUIRE_SERVER_VERIFY.enabled()
 }
 
 /// #2477 — the staged-rollout escape hatch for the plaintext-peer refusal.
@@ -134,14 +130,7 @@ pub const FED_ALLOW_PLAINTEXT_PEERS_ENV: &str = "AI_MEMORY_FED_ALLOW_PLAINTEXT_P
 /// rule).
 #[must_use]
 pub fn plaintext_peers_allowed() -> bool {
-    std::env::var(FED_ALLOW_PLAINTEXT_PEERS_ENV)
-        .ok()
-        .is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    crate::env_flag::knobs::FED_ALLOW_PLAINTEXT_PEERS.enabled()
 }
 
 /// The loopback host set. SSOT shared by the daemon's inbound bind guard
@@ -2046,7 +2035,8 @@ mod tests {
         // federation-TLS test lock taken above.
         unsafe { std::env::remove_var(FED_REQUIRE_SERVER_VERIFY_ENV) };
         assert!(server_verify_required(), "unset ⇒ required (fail-closed)");
-        for falsy in ["0", "false", "no", "off", " off "] {
+        // #3200: the shared grammar case-folds, so `OFF`/`FALSE` opt out too.
+        for falsy in ["0", "false", "no", "off", " off ", "OFF", "FALSE"] {
             unsafe { std::env::set_var(FED_REQUIRE_SERVER_VERIFY_ENV, falsy) };
             assert!(!server_verify_required(), "{falsy:?} ⇒ permissive");
         }

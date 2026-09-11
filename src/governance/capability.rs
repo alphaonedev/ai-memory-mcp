@@ -1250,9 +1250,7 @@ pub fn capability_from_file(path: &std::path::Path) -> Result<String> {
         })?;
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            let fail_open = std::env::var(CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV)
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            let fail_open = crate::env_flag::knobs::CAPABILITY_FILE_ALLOW_LAX_PERMS.enabled();
             if fail_open {
                 tracing::warn!(
                     target: crate::governance::GOVERNANCE_TRACE_TARGET,
