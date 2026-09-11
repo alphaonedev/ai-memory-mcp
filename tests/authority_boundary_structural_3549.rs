@@ -140,15 +140,17 @@ fn production_part(src: &str) -> String {
         let is_inline_mod = trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ");
         let brace = trimmed.find('{');
         let semi = trimmed.find(';');
-        let inline = is_inline_mod
-            && brace.is_some_and(|b| semi.is_none_or(|sc| b < sc));
+        let inline = is_inline_mod && brace.is_some_and(|b| semi.is_none_or(|sc| b < sc));
         if !inline {
             let keep = attr + "#[cfg(test)]".len();
             out.push_str(&rest[..keep]);
             rest = &rest[keep..];
             continue;
         }
-        let open = attr + "#[cfg(test)]".len() + (after_attr.len() - trimmed.len()) + brace.expect("brace");
+        let open = attr
+            + "#[cfg(test)]".len()
+            + (after_attr.len() - trimmed.len())
+            + brace.expect("brace");
         let mut depth = 0usize;
         let mut end = rest.len();
         for (i, c) in rest[open..].char_indices() {
@@ -346,7 +348,9 @@ fn parse_allowlist(text: &str) -> Vec<AllowEntry> {
         let key = parts.next().unwrap_or("").trim().to_string();
         let reason = parts.next().unwrap_or("").trim().to_string();
         assert!(
-            matches!(surface.as_str(), "http" | "mcp" | "read") && !key.is_empty() && reason.len() >= 20,
+            matches!(surface.as_str(), "http" | "mcp" | "read")
+                && !key.is_empty()
+                && reason.len() >= 20,
             "{ALLOWLIST}:{}: malformed entry {t:?} — expected `<http|mcp|read>\\t<key>\\t<reason>` \
              with a real reason",
             n + 1
@@ -396,7 +400,9 @@ fn mcp_dispatch_table_is_a_complete_inventory_of_ctx_taking_wrappers_3549() {
         );
         assert!(names.insert(name.clone()), "duplicate table entry {name}");
         let params = wrappers.get(f).unwrap_or_else(|| {
-            panic!("table entry {name} names {f}, which is not a `fn dispatch_*` in the wrapper region")
+            panic!(
+                "table entry {name} names {f}, which is not a `fn dispatch_*` in the wrapper region"
+            )
         });
         assert_eq!(
             params, "ctx: &ToolDispatchCtx<'_>",
@@ -418,7 +424,11 @@ fn mcp_dispatch_table_is_a_complete_inventory_of_ctx_taking_wrappers_3549() {
         );
     }
     // Publish the inventory in the test output so the READY can cite it.
-    eprintln!("#3549 mcp inventory: {} table entries, {} wrappers", table.len(), wrappers.len());
+    eprintln!(
+        "#3549 mcp inventory: {} table entries, {} wrappers",
+        table.len(),
+        wrappers.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +437,9 @@ fn mcp_dispatch_table_is_a_complete_inventory_of_ctx_taking_wrappers_3549() {
 
 fn assert_mcp_chokepoint(mcp_src: &str) -> Result<(), String> {
     if !mcp_src.contains(CTX_STRUCT_FIELD) {
-        return Err(format!("ToolDispatchCtx lacks the non-optional field `{CTX_STRUCT_FIELD}`"));
+        return Err(format!(
+            "ToolDispatchCtx lacks the non-optional field `{CTX_STRUCT_FIELD}`"
+        ));
     }
     let arm = tools_call_arm(mcp_src);
     let resolve = arm
@@ -589,7 +601,10 @@ fn http_exempt_paths_are_exactly_the_allowlist_3549() {
     }
     // Every allowlisted path must be registered AND exempt (stale entry fails).
     for path in &http_allow {
-        assert!(registered.contains(path), "allowlist names unregistered path {path}");
+        assert!(
+            registered.contains(path),
+            "allowlist names unregistered path {path}"
+        );
         assert!(
             ai_memory::handlers::authority::is_authority_exempt(path),
             "allowlist names {path}, which the layer DOES gate — stale entry, remove it"
@@ -618,8 +633,12 @@ fn authority_is_constructed_only_inside_its_own_module_3549() {
     collect_rs(&root().join("src"), &mut files);
     collect_rs(&root().join("tests"), &mut files);
     let mut leaks = Vec::new();
+    // This guard names the construction needles as string literals, so it
+    // is the one file besides the definition that legitimately contains them.
+    let self_path = file!().replace('\\', "/");
     for f in &files {
-        if rel(f) == AUTHORITY {
+        let r = rel(f);
+        if r == AUTHORITY || self_path.ends_with(&r) {
             continue;
         }
         let src = strip_line_comments(&fs::read_to_string(f).expect("read"));
@@ -632,7 +651,10 @@ fn authority_is_constructed_only_inside_its_own_module_3549() {
             }
         }
     }
-    assert!(leaks.is_empty(), "Authority constructed outside its module: {leaks:?}");
+    assert!(
+        leaks.is_empty(),
+        "Authority constructed outside its module: {leaks:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +669,8 @@ fn is_visible_to_caller_is_retired_as_a_public_predicate_3549() {
         "the bare predicate must be a private fn in {VISIBILITY}"
     );
     assert!(
-        !vis.contains("pub fn is_visible_to_caller(") && !vis.contains("pub(crate) fn is_visible_to_caller("),
+        !vis.contains("pub fn is_visible_to_caller(")
+            && !vis.contains("pub(crate) fn is_visible_to_caller("),
         "is_visible_to_caller must not be pub / pub(crate)"
     );
     let mut files = Vec::new();
@@ -689,7 +712,11 @@ fn handler_file_for(tool: &str, tool_files: &[(String, String)]) -> Option<Strin
 fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
     let mcp = read(MCP_MOD);
     let tools = parse_read_only_tools(&mcp);
-    assert!(tools.len() > 40, "read-only inventory unexpectedly small: {}", tools.len());
+    assert!(
+        tools.len() > 40,
+        "read-only inventory unexpectedly small: {}",
+        tools.len()
+    );
     let mut files = Vec::new();
     collect_rs(&root().join("src/mcp/tools"), &mut files);
     let tool_files: Vec<(String, String)> = files
@@ -702,7 +729,11 @@ fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
     for tool in &tools {
         let handler = handler_file_for(tool, &tool_files);
         let calls_funnel = handler.as_ref().is_some_and(|p| {
-            let src = tool_files.iter().find(|(q, _)| q == p).map(|(_, s)| s.as_str()).unwrap_or("");
+            let src = tool_files
+                .iter()
+                .find(|(q, _)| q == p)
+                .map(|(_, s)| s.as_str())
+                .unwrap_or("");
             strip_line_comments(&production_part(src)).contains("is_readable_on_query")
         });
         if calls_funnel {
@@ -712,7 +743,10 @@ fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
                 "{tool} calls the read funnel but is still in the read allowlist — stale entry"
             );
         } else if !read_allow.contains(tool) {
-            missing.push(format!("{tool} (handler: {})", handler.as_deref().unwrap_or("NOT FOUND")));
+            missing.push(format!(
+                "{tool} (handler: {})",
+                handler.as_deref().unwrap_or("NOT FOUND")
+            ));
         }
     }
     assert!(
@@ -721,7 +755,10 @@ fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
          allowlisted with a reason: {missing:?}"
     );
     for key in &read_allow {
-        assert!(tools.contains(key), "read allowlist names {key}, which is not a read-only tool");
+        assert!(
+            tools.contains(key),
+            "read allowlist names {key}, which is not a read-only tool"
+        );
     }
     eprintln!(
         "#3549 read-funnel inventory: {} read-only tools, {funnelled} call the funnel, {} allowlisted",
@@ -757,7 +794,9 @@ fn detector_catches_a_route_registered_after_the_layer_3549() {
     let lib = read(LIB);
     let planted = lib.replacen(
         API_KEY_LAYER,
-        &format!("{API_KEY_LAYER}\n        .route(handlers::routes::HEALTH, get(handlers::health))"),
+        &format!(
+            "{API_KEY_LAYER}\n        .route(handlers::routes::HEALTH, get(handlers::health))"
+        ),
         1,
     );
     let shape = parse_router(&planted);
@@ -787,10 +826,19 @@ fn detector_parses_a_table_entry_and_wrapper_signature_3549() {
     );
     let table = parse_dispatch_table(&synthetic);
     assert_eq!(table.len(), 2);
-    assert_eq!(table[1], ("tool_names::MEMORY_Y".to_string(), "dispatch_memory_y".to_string()));
+    assert_eq!(
+        table[1],
+        (
+            "tool_names::MEMORY_Y".to_string(),
+            "dispatch_memory_y".to_string()
+        )
+    );
     let wrappers = parse_dispatch_wrappers(&synthetic);
     assert_eq!(wrappers["dispatch_memory_x"], "ctx: &ToolDispatchCtx<'_>");
-    assert_ne!(wrappers["dispatch_memory_y"], "ctx: &ToolDispatchCtx<'_>", "a conn-taking wrapper must be distinguishable");
+    assert_ne!(
+        wrappers["dispatch_memory_y"], "ctx: &ToolDispatchCtx<'_>",
+        "a conn-taking wrapper must be distinguishable"
+    );
 }
 
 #[test]

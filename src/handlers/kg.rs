@@ -389,7 +389,11 @@ pub async fn entity_get_by_alias(
                 // Err → hidden (`found: false`).
                 let visible = caller_is_admin
                     || match app.store.get(&ctx_admin, &rec.entity_id).await {
-                        Ok(m) => crate::visibility::is_readable_on_query(&m, Some(&caller), Some(m.namespace.as_str())),
+                        Ok(m) => crate::visibility::is_readable_on_query(
+                            &m,
+                            Some(&caller),
+                            Some(m.namespace.as_str()),
+                        ),
                         Err(_) => false,
                     };
                 if visible {
@@ -498,7 +502,13 @@ pub async fn entity_get_by_alias(
                     .ok()
                     .flatten()
                     .as_ref()
-                    .is_none_or(|m| crate::visibility::is_readable_on_query(m, Some(&caller), Some(m.namespace.as_str())));
+                    .is_none_or(|m| {
+                        crate::visibility::is_readable_on_query(
+                            m,
+                            Some(&caller),
+                            Some(m.namespace.as_str()),
+                        )
+                    });
             if !visible {
                 return Json(json!({
                     "found": false,

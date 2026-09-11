@@ -9372,7 +9372,9 @@ impl PostgresStore {
         }
         Ok(mems
             .into_iter()
-            .filter(|m| crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str())))
+            .filter(|m| {
+                crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str()))
+            })
             .collect())
     }
 
@@ -23143,7 +23145,11 @@ impl MemoryStore for PostgresStore {
                 // Admin/migrate paths set `bypass_visibility`.
                 if mem.lifecycle_state.is_recall_visible()
                     && (ctx.bypass_visibility
-                        || crate::visibility::is_readable_on_query(&mem, Some(ctx.effective_principal()), Some(mem.namespace.as_str())))
+                        || crate::visibility::is_readable_on_query(
+                            &mem,
+                            Some(ctx.effective_principal()),
+                            Some(mem.namespace.as_str()),
+                        ))
                 {
                     Ok(mem)
                 } else {
@@ -23868,7 +23874,9 @@ impl MemoryStore for PostgresStore {
         }
         Ok(mems
             .into_iter()
-            .filter(|m| crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str())))
+            .filter(|m| {
+                crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str()))
+            })
             .collect())
     }
 
@@ -25748,7 +25756,9 @@ impl MemoryStore for PostgresStore {
         // truncate so the limit reflects what the caller can actually
         // see.
         if !ctx.bypass_visibility {
-            results.retain(|(m, _)| crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str())));
+            results.retain(|(m, _)| {
+                crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str()))
+            });
         }
         results.truncate(filter.limit.max(1));
         // v1.0.0 #3180 [data-integrity, BLOCKING] — append the RECALL ACCESS

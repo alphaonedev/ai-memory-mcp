@@ -460,7 +460,11 @@ mod tests {
             .expect("copy present");
         assert_eq!(copy.content, src.content);
         // The copy is authored BY the recipient, so the recipient reads it.
-        assert!(crate::visibility::is_readable_on_query(&copy, Some("ai:bob"), Some(copy.namespace.as_str())));
+        assert!(crate::visibility::is_readable_on_query(
+            &copy,
+            Some("ai:bob"),
+            Some(copy.namespace.as_str())
+        ));
     }
 
     /// #3379 — the recipient owns the delivered copy and may share it again.
@@ -506,7 +510,11 @@ mod tests {
         let mut src = make_mem("collective source", "notes", "ai:alice");
         src.metadata["scope"] = json!("collective");
         let id = db::insert(&conn, &src).expect("seed collective");
-        assert!(crate::visibility::is_readable_on_query(&src, Some("ai:bob"), Some(src.namespace.as_str())));
+        assert!(crate::visibility::is_readable_on_query(
+            &src,
+            Some("ai:bob"),
+            Some(src.namespace.as_str())
+        ));
         let error = handle_share(
             &conn,
             &json!({"source_memory_id": id, "target_agent_id": "ai:carol"}),

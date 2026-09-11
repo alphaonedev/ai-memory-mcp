@@ -80,7 +80,11 @@ pub(super) fn mask_invisible(
     row: Option<crate::models::Memory>,
     caller: Option<&str>,
 ) -> Option<crate::models::Memory> {
-    row.filter(|mem| caller.is_none_or(|c| crate::visibility::is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str()))))
+    row.filter(|mem| {
+        caller.is_none_or(|c| {
+            crate::visibility::is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str()))
+        })
+    })
 }
 
 pub(super) fn handle_get(

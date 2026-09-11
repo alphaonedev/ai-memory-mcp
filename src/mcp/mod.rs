@@ -1388,7 +1388,9 @@ fn lookup_namespace_standard(
     }
     // #2537 — run the predicate on the typed `Memory` BEFORE serialization,
     // so a withheld standard's bytes are never materialised at all.
-    if caller.is_some_and(|c| !crate::visibility::is_readable_on_query(&mem, Some(c), Some(mem.namespace.as_str()))) {
+    if caller.is_some_and(|c| {
+        !crate::visibility::is_readable_on_query(&mem, Some(c), Some(mem.namespace.as_str()))
+    }) {
         tracing::debug!(
             target: "namespace.standard.withheld",
             namespace = %namespace,
@@ -2649,13 +2651,7 @@ fn dispatch_memory_expand_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 
 fn dispatch_memory_auto_tag(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     let caller = ctx.authority.read_caller();
-    handle_auto_tag(
-        ctx.conn,
-        ctx.llm,
-        ctx.arguments,
-        caller,
-        ctx.mcp_client,
-    )
+    handle_auto_tag(ctx.conn, ctx.llm, ctx.arguments, caller, ctx.mcp_client)
 }
 
 fn dispatch_memory_detect_contradiction(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -3677,8 +3673,7 @@ fn handle_request(
             // `Authority` cannot exist unless this resolved). Protocol-level
             // `-32603`: the server cannot act on behalf of anyone until the
             // operator fixes `AI_MEMORY_AGENT_ID`.
-            let authority = match crate::identity::authority::Authority::resolve_mcp(mcp_client)
-            {
+            let authority = match crate::identity::authority::Authority::resolve_mcp(mcp_client) {
                 Ok(authority) => authority,
                 Err(e) => {
                     tracing::error!(
@@ -17525,7 +17520,10 @@ mod authority_dispatch_3549_tests {
             None,
             "authority-3549",
         );
-        assert_eq!(resp.error.expect("must refuse").code, jsonrpc::INTERNAL_ERROR);
+        assert_eq!(
+            resp.error.expect("must refuse").code,
+            jsonrpc::INTERNAL_ERROR
+        );
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
             .expect("count");

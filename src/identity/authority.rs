@@ -497,8 +497,15 @@ mod tests {
     /// ALLOWED — a valid asserted identity with the shared key is `Claimed`.
     #[test]
     fn http_asserted_identity_is_claimed_3549() {
-        let a = http(Some(CALLER), None, HttpIdentityMode::Advisory, false, &[], true)
-            .expect("resolves");
+        let a = http(
+            Some(CALLER),
+            None,
+            HttpIdentityMode::Advisory,
+            false,
+            &[],
+            true,
+        )
+        .expect("resolves");
         assert_eq!(a.surface(), Surface::Http);
         assert_eq!(a.principal(), CALLER);
         assert_eq!(a.binding(), Binding::Claimed);
@@ -546,8 +553,15 @@ mod tests {
     fn http_no_identity_is_anonymous_and_never_admin_3549() {
         let anon_allow = allow(&["anonymous:req-abcdef12"]);
         for header in [None, Some("")] {
-            let a = http(header, None, HttpIdentityMode::Off, false, &anon_allow, true)
-                .expect("resolves");
+            let a = http(
+                header,
+                None,
+                HttpIdentityMode::Off,
+                false,
+                &anon_allow,
+                true,
+            )
+            .expect("resolves");
             assert!(a.is_anonymous(), "{}", a.principal());
             assert!(
                 a.principal()
@@ -578,8 +592,15 @@ mod tests {
     /// DENIED — a RESERVED name (`daemon`) is refused with the #977 reason.
     #[test]
     fn http_reserved_asserted_identity_is_refused_3549() {
-        let err = http(Some("daemon"), None, HttpIdentityMode::Advisory, false, &[], true)
-            .expect_err("must refuse");
+        let err = http(
+            Some("daemon"),
+            None,
+            HttpIdentityMode::Advisory,
+            false,
+            &[],
+            true,
+        )
+        .expect_err("must refuse");
         assert!(
             err.to_string().contains("reserved for internal use"),
             "{err}"
@@ -592,13 +613,37 @@ mod tests {
     fn http_admin_requires_allowlist_trust_and_binding_3549() {
         let admins = allow(&[ADMIN]);
         // ALLOWED: allowlisted + trusted + gate inert (no keys enrolled).
-        let a = http(Some(ADMIN), None, HttpIdentityMode::Enforce, false, &admins, true).unwrap();
+        let a = http(
+            Some(ADMIN),
+            None,
+            HttpIdentityMode::Enforce,
+            false,
+            &admins,
+            true,
+        )
+        .unwrap();
         assert_eq!(a.admin(), Admin::Enrolled);
         // DENIED: header not trusted (keyless deployment, hatch off — #1570).
-        let a = http(Some(ADMIN), None, HttpIdentityMode::Off, false, &admins, false).unwrap();
+        let a = http(
+            Some(ADMIN),
+            None,
+            HttpIdentityMode::Off,
+            false,
+            &admins,
+            false,
+        )
+        .unwrap();
         assert_eq!(a.admin(), Admin::None);
         // DENIED: enforce + keys enrolled + merely claimed (#2044 M1).
-        let a = http(Some(ADMIN), None, HttpIdentityMode::Enforce, true, &admins, true).unwrap();
+        let a = http(
+            Some(ADMIN),
+            None,
+            HttpIdentityMode::Enforce,
+            true,
+            &admins,
+            true,
+        )
+        .unwrap();
         assert_eq!(a.admin(), Admin::None);
         // ALLOWED: enforce + keys enrolled + key-bound to the admin id.
         let a = http(
@@ -612,11 +657,26 @@ mod tests {
         .unwrap();
         assert_eq!(a.admin(), Admin::Enrolled);
         // ALLOWED (advisory soak): keys enrolled, merely claimed, advisory.
-        let a = http(Some(ADMIN), None, HttpIdentityMode::Advisory, true, &admins, true).unwrap();
+        let a = http(
+            Some(ADMIN),
+            None,
+            HttpIdentityMode::Advisory,
+            true,
+            &admins,
+            true,
+        )
+        .unwrap();
         assert_eq!(a.admin(), Admin::Enrolled);
         // DENIED: not allowlisted at all.
-        let a = http(Some(CALLER), Some(CALLER), HttpIdentityMode::Off, true, &admins, true)
-            .unwrap();
+        let a = http(
+            Some(CALLER),
+            Some(CALLER),
+            HttpIdentityMode::Off,
+            true,
+            &admins,
+            true,
+        )
+        .unwrap();
         assert_eq!(a.admin(), Admin::None);
     }
 
@@ -629,12 +689,28 @@ mod tests {
             assert!(http_admin_binding_admitted(mode, Binding::Claimed, false));
         }
         // Key-bound always admits.
-        assert!(http_admin_binding_admitted(M::Enforce, Binding::ApiKey, true));
-        assert!(http_admin_binding_admitted(M::Enforce, Binding::Attested, true));
+        assert!(http_admin_binding_admitted(
+            M::Enforce,
+            Binding::ApiKey,
+            true
+        ));
+        assert!(http_admin_binding_admitted(
+            M::Enforce,
+            Binding::Attested,
+            true
+        ));
         // Claimed under keys: off/advisory admit, enforce refuses.
         assert!(http_admin_binding_admitted(M::Off, Binding::Claimed, true));
-        assert!(http_admin_binding_admitted(M::Advisory, Binding::Claimed, true));
-        assert!(!http_admin_binding_admitted(M::Enforce, Binding::Claimed, true));
+        assert!(http_admin_binding_admitted(
+            M::Advisory,
+            Binding::Claimed,
+            true
+        ));
+        assert!(!http_admin_binding_admitted(
+            M::Enforce,
+            Binding::Claimed,
+            true
+        ));
     }
 
     /// The wire tags are stable (audit surfaces key on them).

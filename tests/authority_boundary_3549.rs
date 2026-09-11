@@ -124,7 +124,9 @@ async fn http_malformed_principal_is_refused_before_the_handler_3549() {
     let v = body_json(resp).await;
     assert_eq!(v["code"], ai_memory::errors::error_codes::VALIDATION_FAILED);
     assert!(
-        v["error"].as_str().is_some_and(|s| s.starts_with("invalid agent_id")),
+        v["error"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("invalid agent_id")),
         "{v}"
     );
 }
@@ -335,7 +337,11 @@ fn spawn_mcp(agent_id: Option<&str>) -> (McpChild, ChildStdin, mpsc::Receiver<St
     (McpChild { child }, stdin, rx)
 }
 
-fn send(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>, req: &serde_json::Value) -> serde_json::Value {
+fn send(
+    stdin: &mut ChildStdin,
+    rx: &mpsc::Receiver<String>,
+    req: &serde_json::Value,
+) -> serde_json::Value {
     writeln!(stdin, "{req}").expect("write request");
     let line = rx
         .recv_timeout(Duration::from_secs(60))
@@ -360,19 +366,32 @@ fn mcp_valid_configured_identity_serves_read_and_write_3549() {
     let stored = send(
         &mut stdin,
         &rx,
-        &call(1, "memory_store", serde_json::json!({
-            "title": "t-3549", "content": "c-3549", "namespace": "ns-3549"
-        })),
+        &call(
+            1,
+            "memory_store",
+            serde_json::json!({
+                "title": "t-3549", "content": "c-3549", "namespace": "ns-3549"
+            }),
+        ),
     );
     assert!(stored["error"].is_null(), "{stored}");
     let listed = send(
         &mut stdin,
         &rx,
-        &call(2, "memory_list", serde_json::json!({"namespace": "ns-3549"})),
+        &call(
+            2,
+            "memory_list",
+            serde_json::json!({"namespace": "ns-3549"}),
+        ),
     );
     assert!(listed["error"].is_null(), "{listed}");
-    let text = listed["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text.contains("t-3549"), "the owner reads back its own row: {text}");
+    let text = listed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("t-3549"),
+        "the owner reads back its own row: {text}"
+    );
 }
 
 /// ALLOWED — the unset identity is the local-operator trust domain (F13):
@@ -380,7 +399,11 @@ fn mcp_valid_configured_identity_serves_read_and_write_3549() {
 #[test]
 fn mcp_unset_identity_is_served_as_the_local_operator_3549() {
     let (_child, mut stdin, rx) = spawn_mcp(None);
-    let listed = send(&mut stdin, &rx, &call(1, "memory_list", serde_json::json!({})));
+    let listed = send(
+        &mut stdin,
+        &rx,
+        &call(1, "memory_list", serde_json::json!({})),
+    );
     assert!(listed["error"].is_null(), "{listed}");
 }
 
@@ -391,10 +414,10 @@ fn mcp_unset_identity_is_served_as_the_local_operator_3549() {
 #[test]
 fn mcp_unusable_configured_identity_never_serves_3549() {
     let (mut child, _stdin, rx) = spawn_mcp(Some("bad id with spaces"));
-    let status = child
-        .child
-        .wait()
-        .expect("child exits");
+    let status = child.child.wait().expect("child exits");
     assert!(!status.success(), "boot must refuse an unusable identity");
-    assert!(rx.recv_timeout(Duration::from_secs(5)).is_err(), "no response line is ever served");
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).is_err(),
+        "no response line is ever served"
+    );
 }
