@@ -5987,8 +5987,21 @@ enabled = true
     #[test]
     fn storage_section_warns_with_stats_error_on_missing_schema() {
         let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        // #3553 — the fixture models "a FUNNELLED connection whose schema is
+        // missing", so it applies the resolved `PRAGMA synchronous` exactly
+        // as every `db::open*` funnel does. A raw `open_in_memory` answers
+        // SQLite's compiled default (FULL) and the Storage section would —
+        // correctly — escalate that funnel drift to Critical; that arm is
+        // pinned by `storage_section_flags_unfunnelled_synchronous_drift_3553`
+        // below, not by this WARN-shape test.
+        conn.pragma_update(
+            None,
+            "synchronous",
+            crate::storage::resolved_synchronous().level.as_str(),
+        )
+        .expect("mirror the funnel's synchronous level");
         let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
-        assert_eq!(section.severity, Severity::Warning);
+        assert_eq!(section.severity, Severity::Warning, "{:?}", section.facts);
         assert!(
             section.facts.iter().any(|(k, _)| k == "stats_error"),
             "facts: {:?}",
@@ -6001,6 +6014,49 @@ enabled = true
                 .any(|(k, v)| k == "dim_violations" && v.contains("not_observed")),
             "facts: {:?}",
             section.facts
+        );
+    }
+
+    /// #3553 — a connection this binary did NOT open through a `db::open*`
+    /// funnel answers a `PRAGMA synchronous` that DISAGREES with the resolved
+    /// level; the Storage section must escalate that to Critical, name both
+    /// levels, and say DISAGREES (an open funnel that did not apply the
+    /// resolved level is a defect, never a green). Pure in-process: no env
+    /// mutation, the drift is planted on the fixture connection itself.
+    #[test]
+    fn storage_section_flags_unfunnelled_synchronous_drift_3553() {
+        use crate::storage::SynchronousLevel;
+        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        let resolved = crate::storage::resolved_synchronous().level;
+        let planted = if resolved == SynchronousLevel::Full {
+            SynchronousLevel::Normal
+        } else {
+            SynchronousLevel::Full
+        };
+        conn.pragma_update(None, "synchronous", planted.as_str())
+            .expect("plant a level that disagrees with the resolved one");
+        let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
+        assert_eq!(
+            section.severity,
+            Severity::Critical,
+            "funnel drift must be Critical: {:?}",
+            section.facts
+        );
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == FACT_SYNCHRONOUS && v == planted.as_str()),
+            "the live fact must name the planted level: {:?}",
+            section.facts
+        );
+        assert!(
+            section
+                .note
+                .as_ref()
+                .is_some_and(|n| n.contains("DISAGREES")),
+            "note: {:?}",
+            section.note
         );
     }
 

@@ -109,11 +109,10 @@ fn storage_facts(v: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 fn fact<'a>(facts: &'a [(String, String)], key: &str) -> &'a str {
-    facts
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
-        .unwrap_or_else(|| panic!("fact {key} missing: {facts:?}"))
+    let Some((_, v)) = facts.iter().find(|(k, _)| k == key) else {
+        panic!("fact {key} missing: {facts:?}")
+    };
+    v.as_str()
 }
 
 #[test]
