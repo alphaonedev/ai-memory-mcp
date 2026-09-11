@@ -315,6 +315,15 @@
 
 set -euo pipefail
 
+# Membership test that is safe under `set -o pipefail` (#3608 / #2414).
+# `printf | grep -q` is a SIGPIPE footgun: grep -q closes the pipe on the
+# first match, printf gets EPIPE, and pipefail makes a HIT look like a miss
+# (the --self-test then reports FAIL even though every probe is in the
+# captured output).
+hay_has() {
+    grep -q "$1" <<<"$2"
+}
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Structural allowlist: files that are NOT required to reference
@@ -906,42 +915,42 @@ EOF
     # fixtures (plain, delegate-wrapper, arm-(e) exempt) NOT reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
-    printf '%s' "$gate_output" | grep -q '\.check_home_lock_violation_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q '\.check_home_lock_handrolled_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q '\.check_home_lock_comment_only_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_handrolled_second_test\|\.check_home_lock_arm_b_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_naked_second_test\|\.check_home_lock_naked_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'check_test_env_arm_d_probe_3475\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'check_test_env_arm_e_probe_3523\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_naked_passphrase_seed\|\.check_passphrase_window_probe_3539\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_naked_plain_sqlite_boot\|bootstrap_serve' || ok=0
-    printf '%s' "$gate_output" | grep -q 'check_test_env_arm_g_probe_3577\.rs' || ok=0
-    if printf '%s' "$gate_output" | grep -q '\.check_home_lock_compliant_probe\.rs'; then
+    hay_has '\.check_home_lock_violation_probe\.rs' "$gate_output" || ok=0
+    hay_has '\.check_home_lock_handrolled_probe\.rs' "$gate_output" || ok=0
+    hay_has '\.check_home_lock_comment_only_probe\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_handrolled_second_test\|\.check_home_lock_arm_b_probe\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_naked_second_test\|\.check_home_lock_naked_probe\.rs' "$gate_output" || ok=0
+    hay_has 'check_test_env_arm_d_probe_3475\.rs' "$gate_output" || ok=0
+    hay_has 'check_test_env_arm_e_probe_3523\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_naked_passphrase_seed\|\.check_passphrase_window_probe_3539\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_naked_plain_sqlite_boot\|bootstrap_serve' "$gate_output" || ok=0
+    hay_has 'check_test_env_arm_g_probe_3577\.rs' "$gate_output" || ok=0
+    if hay_has '\.check_home_lock_compliant_probe\.rs' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: the compliant fixture was flagged)" >&2
         exit 1
     fi
-    if printf '%s' "$gate_output" | grep -q 'contrived_compliant_first_test'; then
+    if hay_has 'contrived_compliant_first_test' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (b) flagged the ARM-B probe's own compliant FIRST test, not just the hand-rolled second one)" >&2
         exit 1
     fi
-    if printf '%s' "$gate_output" | grep -q 'contrived_naked_first_test'; then
+    if hay_has 'contrived_naked_first_test' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (c) flagged the NAKED probe's own compliant FIRST test, not just the naked second one)" >&2
         exit 1
     fi
-    if printf '%s' "$gate_output" | grep -q '\.check_home_lock_delegate_probe\.rs\|contrived_delegate_wrapper_test'; then
+    if hay_has '\.check_home_lock_delegate_probe\.rs\|contrived_delegate_wrapper_test' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (c) false-positived the config.rs delegate-wrapper carve-out)" >&2
         exit 1
     fi
-    if printf '%s' "$gate_output" | grep -q 'check_test_env_arm_e_exempt_probe_3523\.rs'; then
+    if hay_has 'check_test_env_arm_e_exempt_probe_3523\.rs' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (e) flagged the documented-exempt isolation fixture -- a gate that fires on test_key_dir::install() will be switched off)" >&2
         exit 1
     fi
-    if printf '%s' "$gate_output" | grep -q '\.check_passphrase_window_compliant_probe_3539\.rs\|contrived_guarded_'; then
+    if hay_has '\.check_passphrase_window_compliant_probe_3539\.rs\|contrived_guarded_' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (f) flagged the correctly-funnelled passphrase fixture)" >&2
         exit 1

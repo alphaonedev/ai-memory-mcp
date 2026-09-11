@@ -100,8 +100,10 @@
 #       the #2424 v84 bootstrap-inline-index shape (both backends) in a
 #       throwaway copy UNDER the repo (never system /tmp) AND the #3158
 #       metadata-matrix escapes (a ladder arm with no meta row; a tail row
-#       re-keyed to `current_schema_version()`) and confirm the gate rejects
-#       EACH, plus a clean-tree control — proving it is load-bearing.
+#       re-keyed to `current_schema_version()`) AND the #3608 rule-(e)
+#       SIGPIPE false-ORPHAN class (long first-line-match reference list)
+#       and confirm the gate rejects EACH, plus a clean-tree control —
+#       proving it is load-bearing.
 #
 # Path inputs (env-overridable so --self-test can point at planted fixtures):
 #   LADDER_MIGRATIONS_DIR  (default <root>/migrations)
@@ -655,6 +657,13 @@ run_gate() {
     if [[ -d "$src_dir" ]]; then
         referenced="$(grep -rhoE 'migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql' "$src_dir" 2>/dev/null | sort -u || true)"
     fi
+    # Pipe-free membership (#3608 / #2414): `printf | grep -qx` under
+    # pipefail turns a first-line HIT into a miss when grep -q closes the
+    # pipe and printf gets EPIPE (false ORPHAN on a referenced file).
+    local -a refs=()
+    if [[ -n "$referenced" ]]; then
+        mapfile -t refs <<<"$referenced"
+    fi
     for backend in "${BACKENDS[@]}"; do
         dir="$mig_dir/$backend"
         [[ -d "$dir" ]] || continue
@@ -663,7 +672,7 @@ run_gate() {
             base="$(basename "$f")"
             rel="$backend/$base"
             is_exempt_file "$rel" && continue
-            if ! printf '%s\n' "$referenced" | grep -qx "migrations/$rel"; then
+            if ! array_contains "migrations/$rel" "${refs[@]}"; then
                 echo "❌ migration-ladder [$backend]: RULE (e) ORPHAN file (referenced nowhere under src/): $base" >&2
                 echo "     Wire it into the ladder (include_str! or an inline arm), or add it to LADDER_EXEMPT_FILES with a reason." >&2
                 violations=$((violations + 1))
@@ -709,7 +718,7 @@ run_gate() {
                 fb_ptbl="${fb_pair%%.*}"
                 fb_pcol="${fb_pair#*.}"
                 [[ "$fb_ptbl" == "$fb_tbl" ]] || continue
-                if printf '%s' "$fb_rest" | grep -qE "(^|[^A-Za-z0-9_])${fb_pcol}([^A-Za-z0-9_]|$)"; then
+                if grep -qE "(^|[^A-Za-z0-9_])${fb_pcol}([^A-Za-z0-9_]|$)" <<<"$fb_rest"; then
                     echo "❌ migration-ladder [$fb_backend]: RULE (f) BOOTSTRAP↔LADDER FORWARD REFERENCE — bootstrap index \`$fb_idx\` ON $fb_tbl references \`$fb_pcol\`, a column the LADDER adds via ALTER TABLE (#2424 / #1861 class)." >&2
                     echo "     The bootstrap schema replays over LEGACY databases BEFORE the ladder runs; the pre-existing \`$fb_tbl\` makes CREATE TABLE IF NOT EXISTS a no-op, \`$fb_pcol\` is absent, and this CREATE INDEX crashes the open. (CREATE INDEX IF NOT EXISTS does not help — it keys on the INDEX NAME, which a legacy DB below the owning arm does not have.)" >&2
                     echo "     FIX: delete it from the bootstrap and create it ONLY in the migrate arm / migration .sql that adds \`$fb_pcol\`. Fresh installs still get it — they enter the ladder at version 0 and execute every arm, so bootstrap(fresh) stays equivalent to ladder(v0→tip)." >&2
@@ -730,7 +739,7 @@ run_gate() {
         #      lockstep test a tautology.
         local meta_table
         meta_table="$(awk '/^pub const MIGRATION_LADDER:/ { intable = 1 } intable { print } intable && /^\];/ { exit }' "$meta_rs")"
-        if printf '%s' "$meta_table" | grep -q 'current_schema_version()'; then
+        if grep -q 'current_schema_version()' <<<"$meta_table"; then
             echo "❌ migration-ladder: RULE (g) MIGRATION_LADDER carries a row keyed to \`current_schema_version()\` — a SYMBOLIC tail key silently re-labels the new tip with the OLD arm's semantics and makes the lockstep assertion true by construction (#3158). Key every row to a LITERAL version." >&2
             violations=$((violations + 1))
         fi
@@ -788,7 +797,7 @@ run_gate() {
 # --- Self-test --------------------------------------------------------------
 
 run_self_test() {
-    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL; #2424 bootstrap-inline index on a ladder-added column, postgres v84 + sqlite cid -> FAIL; #3158 metadata-matrix missing row + symbolic tail key -> FAIL)"
+    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL; #2424 bootstrap-inline index on a ladder-added column, postgres v84 + sqlite cid -> FAIL; #3158 metadata-matrix missing row + symbolic tail key -> FAIL; #3608 rule-(e) SIGPIPE false-ORPHAN class -> helper still hits)"
     local scratch
     # Project hard rule: scratch UNDER the repo, never system /tmp.
     scratch="$(mktemp -d "$ROOT/.migration-ladder-selftest.XXXXXX")"
@@ -820,7 +829,7 @@ run_self_test() {
     if out_a="$(LADDER_MIGRATIONS_DIR="$dupdir" run_gate 2>&1)"; then
         echo "  [a] same-prefix collision: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_a" | grep -q 'RULE (a) DUPLICATE PREFIX 0041'; then
+    elif grep -q 'RULE (a) DUPLICATE PREFIX 0041' <<<"$out_a"; then
         echo "  [a] same-prefix collision (#2036/#2192 shape): CAUGHT"
     else
         echo "  [a] same-prefix collision: gate failed but without the rule-(a) message — FAIL" >&2
@@ -837,7 +846,7 @@ run_self_test() {
     if out_b="$(LADDER_MIGRATIONS_RS="$duprs" run_gate 2>&1)"; then
         echo "  [b] same-version-two-arms: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_b" | grep -q 'RULE (b)/(c) arm .if version < 84'; then
+    elif grep -q 'RULE (b)/(c) arm .if version < 84' <<<"$out_b"; then
         echo "  [b] same-version-two-arms: CAUGHT"
     else
         echo "  [b] same-version-two-arms: gate failed but without the rule-(b) message — FAIL" >&2
@@ -867,8 +876,7 @@ run_self_test() {
     # moved (#2578: 8 -> 7), which made the self-test report FAIL while the
     # gate underneath was working perfectly — a self-test that cries wolf on
     # a correct gate is worse than none.
-    elif printf '%s' "$out_c" \
-        | grep -q "const-phrased arm count is $((EXPECTED_CONST_ARMS_SQLITE + 1)) but the pin is $EXPECTED_CONST_ARMS_SQLITE"; then
+    elif grep -q "const-phrased arm count is $((EXPECTED_CONST_ARMS_SQLITE + 1)) but the pin is $EXPECTED_CONST_ARMS_SQLITE" <<<"$out_c"; then
         echo "  [c] D1a extra const-phrased arm (invisible to literal scan): CAUGHT"
     else
         echo "  [c] D1a extra const-phrased arm: gate failed but without the count-pin message — FAIL" >&2
@@ -886,7 +894,7 @@ run_self_test() {
     if out_d="$(LADDER_MIGRATIONS_RS="$duprs_d" run_gate 2>&1)"; then
         echo "  [d] D1b literal-at-ceiling arm: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_d" | grep -q "RULE (b) arm .if version < ${csv}. is at/above CURRENT_SCHEMA_VERSION"; then
+    elif grep -q "RULE (b) arm .if version < ${csv}. is at/above CURRENT_SCHEMA_VERSION" <<<"$out_d"; then
         echo "  [d] D1b literal duplicate of const-phrased tip: CAUGHT"
     else
         echo "  [d] D1b literal-at-ceiling arm: gate failed but without the ceiling message — FAIL" >&2
@@ -904,7 +912,7 @@ run_self_test() {
     if out_e="$(LADDER_POSTGRES_RS="$dupg_e" run_gate 2>&1)"; then
         echo "  [e] D2 postgres fn name-variant: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_e" | grep -q 'DUPLICATE migrate fn VERSION'; then
+    elif grep -q 'DUPLICATE migrate fn VERSION' <<<"$out_e"; then
         echo "  [e] D2 postgres migrate_vNN_suffix name-variant: CAUGHT"
     else
         echo "  [e] D2 postgres fn name-variant: gate failed but without the fn-version-dup message — FAIL" >&2
@@ -928,7 +936,7 @@ run_self_test() {
     if out_f1="$(LADDER_PG_SCHEMA_SQL="$pgsql_f1" run_gate 2>&1)"; then
         echo "  [f1] #2424 postgres v84 bootstrap-inline index: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_f1" | grep -q 'RULE (f) BOOTSTRAP.*idx_memories_embedding_space.*embedding_space'; then
+    elif grep -q 'RULE (f) BOOTSTRAP.*idx_memories_embedding_space.*embedding_space' <<<"$out_f1"; then
         echo "  [f1] #2424 postgres v84 bootstrap-inline index (the confirmed brick): CAUGHT"
     else
         echo "  [f1] #2424 postgres v84 shape: gate failed but without the rule-(f) message — FAIL" >&2
@@ -948,7 +956,7 @@ run_self_test() {
     if out_f2="$(LADDER_MIGRATIONS_RS="$mig_rs_f2" run_gate 2>&1)"; then
         echo "  [f2] #1861/#2424 sqlite bootstrap-inline index: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_f2" | grep -q 'migration-ladder \[sqlite\]: RULE (f) BOOTSTRAP.*idx_memories_cid'; then
+    elif grep -q 'migration-ladder \[sqlite\]: RULE (f) BOOTSTRAP.*idx_memories_cid' <<<"$out_f2"; then
         echo "  [f2] #1861/#2424 sqlite bootstrap-inline index (cross-adapter): CAUGHT"
     else
         echo "  [f2] #1861/#2424 sqlite shape: gate failed but without the rule-(f) message — FAIL" >&2
@@ -969,7 +977,7 @@ run_self_test() {
     if out_g1="$(LADDER_MIGRATION_META_RS="$meta_g1" run_gate 2>&1)"; then
         echo "  [g1] #3158 missing meta row: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_g1" | grep -q 'RULE (g) sqlite ladder arm v43 has NO row in MIGRATION_LADDER'; then
+    elif grep -q 'RULE (g) sqlite ladder arm v43 has NO row in MIGRATION_LADDER' <<<"$out_g1"; then
         echo "  [g1] #3158 ladder arm with no metadata row: CAUGHT"
     else
         echo "  [g1] #3158 missing meta row: gate failed but without the rule-(g) coverage message — FAIL" >&2
@@ -987,7 +995,7 @@ run_self_test() {
     if out_g2="$(LADDER_MIGRATION_META_RS="$meta_g2" run_gate 2>&1)"; then
         echo "  [g2] #3158 symbolic tail key: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_g2" | grep -q 'RULE (g) MIGRATION_LADDER carries a row keyed to'; then
+    elif grep -q 'RULE (g) MIGRATION_LADDER carries a row keyed to' <<<"$out_g2"; then
         echo "  [g2] #3158 tail row keyed to current_schema_version(): CAUGHT"
     else
         echo "  [g2] #3158 symbolic tail key: gate failed but without the rule-(g) symbolic-key message — FAIL" >&2
@@ -995,8 +1003,54 @@ run_self_test() {
         fail=1
     fi
 
+    # ---- #3608 rule-(e) SIGPIPE false-ORPHAN class --------------------------
+    #
+    # `printf | grep -qx` under pipefail: grep -q closes on the first match,
+    # printf gets EPIPE, pipefail turns a HIT into a miss (a referenced file
+    # reported as ORPHAN). The production path now uses array_contains; this
+    # leg plants a long reference list whose FIRST line matches and proves
+    # (h1) the old pipeline can false-miss and (h2) the helper still hits
+    # both the first and last entries. (h1) is the flake class; if this
+    # host does not SIGPIPE, (h2) is still the load-bearing proof the fix
+    # is pipe-free.
+    local match_h="migrations/postgres/0034_v75_memory_links_lineage_cid.sql"
+    local last_h="migrations/postgres/pad_07999_padding.sql"
+    local payload_h="$match_h"
+    local hi
+    for (( hi = 0; hi < 8000; hi++ )); do
+        payload_h+=$'\n'"migrations/postgres/pad_$(printf '%05d' "$hi")_padding.sql"
+    done
+    local st_old=0
+    set +e
+    printf '%s\n' "$payload_h" | grep -qx "$match_h"
+    st_old=$?
+    set -e
+    # Force the writer past the pipe buffer after grep -q has closed, so
+    # the false-miss is not load/timing dependent on this host.
+    local st_forced=0
+    set +e
+    {
+        printf '%s\n' "$match_h"
+        dd if=/dev/zero bs=65536 count=16 2>/dev/null
+    } | grep -qx "$match_h"
+    st_forced=$?
+    set -e
+    local -a refs_h=()
+    mapfile -t refs_h <<<"$payload_h"
+    if ! array_contains "$match_h" "${refs_h[@]}"; then
+        echo "  [h] #3608 array_contains missed a first-line hit on a long list — FAIL" >&2
+        fail=1
+    elif ! array_contains "$last_h" "${refs_h[@]}"; then
+        echo "  [h] #3608 array_contains missed a last-line hit on a long list — FAIL" >&2
+        fail=1
+    elif (( st_forced != 0 )); then
+        echo "  [h] #3608 SIGPIPE false-miss reproduced (forced writer-after-close exit=$st_forced, unforced printf|grep -qx exit=$st_old); array_contains hits first+last of 8001-line list: CAUGHT"
+    else
+        echo "  [h] #3608 array_contains hits first+last of 8001-line list (forced pipeline did not SIGPIPE this run; helper is still pipe-free): CAUGHT"
+    fi
+
     if (( fail == 0 )); then
-        echo "migration-ladder gate self-test: PASS (load-bearing — catches the prefix collision, the dup-arm shapes, the #2198 const-phrase arm-lane escapes D1a/D1b/D2, the #2424 bootstrap↔ladder forward reference on BOTH adapters, AND the #3158 metadata-matrix escapes (missing row / symbolic tail key); spares a clean tree)"
+        echo "migration-ladder gate self-test: PASS (load-bearing — catches the prefix collision, the dup-arm shapes, the #2198 const-phrase arm-lane escapes D1a/D1b/D2, the #2424 bootstrap↔ladder forward reference on BOTH adapters, the #3158 metadata-matrix escapes (missing row / symbolic tail key), AND the #3608 rule-(e) SIGPIPE false-ORPHAN class; spares a clean tree)"
         return 0
     fi
     echo "migration-ladder gate self-test: FAIL" >&2
