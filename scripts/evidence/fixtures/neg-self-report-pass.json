@@ -1,0 +1,15 @@
+{
+  "addressed_exe_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "artifact_kind": "daemon",
+  "capacity": {"p99_method": "pooled_raw"},
+  "daemon_binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "finished_at_utc": "2026-09-11T00:01:00Z",
+  "oracle_kind": "self-report",
+  "producer_id": "fixture",
+  "run_id": "neg-self-report-pass",
+  "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "source_tree_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "started_at_utc": "2026-09-11T00:00:00Z",
+  "supersedes_run_id": null,
+  "verdict": "PASS"
+}
