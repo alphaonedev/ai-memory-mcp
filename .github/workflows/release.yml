@@ -4,9 +4,19 @@ name: Release (workflow_dispatch — operator-gated publish)
 # verification only) so that the act of releasing a tag is a separate,
 # intentional action — never an auto-fire side-effect of CI going green.
 #
-# Invoke from a maintainer shell:
+# Invoke from a maintainer shell, FROM THE RELEASE BRANCH (#3546):
 #
-#   gh workflow run release.yml --repo alphaonedev/ai-memory-mcp -f tag=v0.7.0
+#   gh workflow run release.yml --repo alphaonedev/ai-memory-mcp \
+#     --ref release/v1.0.0 -f tag=v1.0.0
+#
+# Without `--ref` GitHub runs the default branch's copy of this file, which
+# may predate the checks below; preflight refuses any dispatch ref that is
+# not a release branch. The tag must be annotated and SSH-signed by a key in
+# scripts/qc-allowlists/release-tag-signers.txt, must sit on the dispatch
+# branch, must be protected by the v* tag ruleset
+# (.github/rulesets/release-tags.json), and every required context must have
+# passed on its commit (the `qualify` job). Every build checks out that
+# verified commit, never the tag name.
 #
 # The 5 jobs below mirror the historical release fanout: binary builds
 # (5 targets), GitHub Release page, crates.io, Homebrew tap, GHCR Docker
@@ -195,7 +205,7 @@ jobs:
   # --------------------------------------------------------------------
   supply-chain:
     name: Supply-chain gates (before build + publish)
-    needs: preflight
+    needs: [preflight, qualify]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -238,7 +248,7 @@ jobs:
   # --------------------------------------------------------------------
   release:
     name: Release (${{ matrix.target }})
-    needs: [preflight, supply-chain]
+    needs: [preflight, qualify, supply-chain]
     runs-on: ${{ matrix.os }}
     # #2487 supply-chain: OIDC-bound Sigstore build provenance for the
     # release binaries + deb/rpm, mirroring the OIDC pattern the SDK
@@ -366,8 +376,21 @@ jobs:
       - name: Build deb and rpm packages
         if: matrix.nfpm_arch
         run: |
+          set -euo pipefail
+          # #3546 — download to a file and check a PINNED digest before
+          # extracting; never `curl | tar`. Digests from goreleaser's
+          # v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing
+          # both downloaded tarballs.
           NFPM_ARCH=$(uname -m | sed 's/aarch64/arm64/')
-          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_$(uname -s)_${NFPM_ARCH}.tar.gz | tar xz -C /usr/local/bin nfpm
+          case "$NFPM_ARCH" in
+            x86_64) NFPM_SHA256=b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430 ;;
+            arm64)  NFPM_SHA256=17350a838c8e2c422c6e573ed379b18424565d2de8a2b1cb1b20211976124eb5 ;;
+            *) echo "::error::no pinned nfpm digest for $NFPM_ARCH"; exit 1 ;;
+          esac
+          NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"
+          curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"
+          echo "${NFPM_SHA256}  ${NFPM_TGZ}" | sha256sum -c -
+          tar xzf "$NFPM_TGZ" -C /usr/local/bin nfpm
 
           VERSION="${TAG#v}"
 
@@ -465,6 +488,19 @@ jobs:
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
 
+      - name: Re-assert the release tag has not moved (#3546)
+        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
+        # is no longer the tag object preflight verified.
+        shell: bash
+        env:
+          REMOTE: https://github.com/${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
+            --tag-object "$TAG_OBJECT" --sha "$SHA"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -504,7 +540,7 @@ jobs:
   # --------------------------------------------------------------------
   sbom:
     name: SBOM (CycloneDX)
-    needs: [preflight, supply-chain]
+    needs: [preflight, qualify, supply-chain]
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the CycloneDX SBOM
     # artifact (same mechanism as the release-binary job above).
@@ -556,6 +592,19 @@ jobs:
         with:
           subject-path: 'dist/ai-memory.cdx.json'
 
+      - name: Re-assert the release tag has not moved (#3546)
+        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
+        # is no longer the tag object preflight verified.
+        shell: bash
+        env:
+          REMOTE: https://github.com/${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
+            --tag-object "$TAG_OBJECT" --sha "$SHA"
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -601,7 +650,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-ios:
     name: Mobile artifact (iOS xcframework)
-    needs: [preflight, supply-chain]
+    needs: [preflight, qualify, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: macos-latest
     # #2487 — OIDC-bound Sigstore provenance for the iOS xcframework
@@ -628,7 +677,9 @@ jobs:
           key: mobile-ios-${{ needs.preflight.outputs.tag }}
 
       - name: Install cbindgen
-        run: cargo install --locked cbindgen
+        # #3546 — pinned, like cargo-cyclonedx above; an unpinned install
+        # would compile whatever cbindgen release is newest on tag day.
+        run: cargo install --locked cbindgen --version 0.29.4
 
       - name: Build static libraries (release, --features sqlite-bundled)
         run: |
@@ -701,6 +752,19 @@ jobs:
         with:
           subject-path: 'dist/ai-memory-ios.xcframework.tar.gz'
 
+      - name: Re-assert the release tag has not moved (#3546)
+        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
+        # is no longer the tag object preflight verified.
+        shell: bash
+        env:
+          REMOTE: https://github.com/${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
+            --tag-object "$TAG_OBJECT" --sha "$SHA"
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -741,7 +805,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-android:
     name: Mobile artifact (Android AAR-compatible)
-    needs: [preflight, supply-chain]
+    needs: [preflight, qualify, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the Android JNI tarball
@@ -865,6 +929,19 @@ jobs:
         with:
           subject-path: 'dist/ai-memory-android.tar.gz'
 
+      - name: Re-assert the release tag has not moved (#3546)
+        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
+        # is no longer the tag object preflight verified.
+        shell: bash
+        env:
+          REMOTE: https://github.com/${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
+            --tag-object "$TAG_OBJECT" --sha "$SHA"
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -887,7 +964,7 @@ jobs:
   # --------------------------------------------------------------------
   crates-io:
     name: Publish to crates.io
-    needs: [preflight, release]
+    needs: [preflight, qualify, release]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
@@ -935,9 +1012,12 @@ jobs:
   # --------------------------------------------------------------------
   homebrew:
     name: Update Homebrew formula
-    needs: [preflight, release]
+    needs: [preflight, qualify, release]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
     steps:
       - name: Extract version from tag
         id: version
@@ -960,6 +1040,8 @@ jobs:
       # any disagreement fails the job instead of minting a formula.
       - name: Download release assets, verify, and pin SHA256
         id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           VERSION=${{ steps.version.outputs.version }}
@@ -982,6 +1064,14 @@ jobs:
               echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to mint a Homebrew formula"
               exit 1
             fi
+
+            # #3546 — the .sha256 comes from the same place as the asset, so a
+            # match proves only that both were uploaded together. Also require
+            # the build provenance the release job attached (#2487): it binds
+            # the asset to release.yml in this repository at this run's commit.
+            gh attestation verify "$ASSET" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
 
             SAFE=$(echo "$TARGET" | tr '-' '_')
             echo "sha_${SAFE}=${ACTUAL}" >> "$GITHUB_OUTPUT"
@@ -1072,7 +1162,7 @@ jobs:
   # --------------------------------------------------------------------
   docker:
     name: Docker (GHCR)
-    needs: [preflight, supply-chain]
+    needs: [preflight, qualify, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -1134,9 +1224,12 @@ jobs:
   # --------------------------------------------------------------------
   copr:
     name: Fedora COPR
-    needs: [preflight, release]
+    needs: [preflight, qualify, release]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -1191,6 +1284,8 @@ jobs:
           rpm --version
 
       - name: Build source RPM
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=${{ steps.version.outputs.version }}
           mkdir -p ~/rpmbuild/{SOURCES,SPECS,SRPMS}
@@ -1222,6 +1317,12 @@ jobs:
               echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to build an SRPM"
               exit 1
             fi
+            # #3546 — require the release job's build provenance too (see the
+            # homebrew job): a matching .sha256 from the same place as the
+            # asset proves nothing about who built it.
+            gh attestation verify ~/rpmbuild/SOURCES/"$ASSET" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
             # The .sha256 is not a spec Source, so keep SOURCES/ clean.
             rm -f ~/rpmbuild/SOURCES/"${ASSET}.sha256"
           done
