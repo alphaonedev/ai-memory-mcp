@@ -841,6 +841,53 @@ async fn http_update_memory_enforces_lifecycle_transition_1726() {
     }
 }
 
+#[tokio::test]
+async fn http_update_illegal_edge_rolls_the_content_patch_back_3152() {
+    // #3152 — a PUT carrying a content patch AND an illegal lifecycle edge is
+    // refused as a whole: 409, and the row keeps its original content and
+    // version. Before #3152 the patch committed before the edge was checked,
+    // so the 409 came back over a row that had already been rewritten.
+    let state = test_state();
+    let now = Utc::now().to_rfc3339();
+    let original = Memory {
+        id: Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: "http-atomicity-3152".into(),
+        title: "http atomicity 3152".into(),
+        content: "http atomicity 3152 original body".into(),
+        source: "test".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        memory_kind: crate::models::MemoryKind::Goal,
+        ..Memory::default()
+    };
+    let id = {
+        let lock = state.lock().await;
+        db::insert(&lock.0, &original).unwrap()
+    };
+    let app = Router::new()
+        .route("/api/v1/memories/{id}", axum::routing::put(update_memory))
+        .with_state(test_app_state(state.clone()));
+    let body = serde_json::json!({ "content": "rewritten body", "lifecycle_state": "done" });
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{id}"))
+                .method("PUT")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "open->done must be 409");
+    let lock = state.lock().await;
+    let row = db::get(&lock.0, &id).unwrap().unwrap();
+    assert_eq!(row.content, original.content, "the patch must roll back");
+    assert_eq!(row.lifecycle_state, crate::models::LifecycleState::Open);
+    assert_eq!(row.version, 1, "no version bump may survive the refusal");
+}
+
 use tests_3582_legacy_push::with_legacy_push_env;
 
 #[cfg(test)]

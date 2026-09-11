@@ -294,6 +294,37 @@ impl Drop for WriteTxn<'_> {
     }
 }
 
+/// v1.0.0 #3152 — run `unit` as ONE write transaction on `conn`.
+///
+/// Opens a [`WriteTxn`] when `conn` is in autocommit, commits it when
+/// `unit` returns `Ok`, and rolls it back on `Err` (or an unwind). When the
+/// caller already holds a transaction, `unit` JOINS it instead of nesting —
+/// a nested `BEGIN` fails with "cannot start a transaction within a
+/// transaction" — and the caller's own commit/rollback decides the outcome,
+/// so an `Err` is propagated untouched for that rollback to act on.
+///
+/// This is how a logical write that spans several statements (a content
+/// patch plus a lifecycle transition, #3152) lands all-or-nothing: no
+/// intermediate COMMIT exists, so a crash or a refusal between the
+/// statements leaves the row exactly as it was.
+///
+/// # Errors
+///
+/// Propagates `BEGIN IMMEDIATE` / `COMMIT` failures and `unit`'s own error.
+pub fn in_write_txn<T>(conn: &Connection, unit: impl FnOnce() -> Result<T>) -> Result<T> {
+    let owned = if conn.is_autocommit() {
+        Some(WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
+    // An `Err` here drops `owned`, which rolls the owned transaction back.
+    let out = unit()?;
+    if let Some(txn) = owned {
+        txn.commit()?;
+    }
+    Ok(out)
+}
+
 /// Tracing target for the #3163 transaction-integrity guards.
 const TXN_GUARD_TRACE_TARGET: &str = "ai_memory::storage::txn_guard";
 
