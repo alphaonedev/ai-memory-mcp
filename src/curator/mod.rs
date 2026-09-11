@@ -983,16 +983,42 @@ fn read_stale_ruling_state(conn: &Connection) -> rusqlite::Result<Option<(String
     }
 }
 
+/// #3587 U3 R3 — the deterministic id of the single notify-dedup state row.
+///
+/// Every digest UPSERTS the one `(STALE_RULING_STATE_TITLE,
+/// STALE_RULING_STATE_NAMESPACE)` row: `db::insert` and `MemoryStore::store`
+/// both resolve that pair through the UNIQUE `(title, namespace)` index, so
+/// the row's identity must be STABLE rather than a fresh `Uuid::new_v4()` per
+/// write. A `UUIDv8` (RFC 9562 custom, name-derived) over
+/// `SHA-256(namespace ‖ 0x00 ‖ title)` is stable, collision-free and needs no
+/// new dependency, and it lets the store-backed reader address the row BY ID
+/// instead of an unordered `LIMIT 1`.
+pub fn stale_ruling_state_id() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(STALE_RULING_STATE_NAMESPACE.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(STALE_RULING_STATE_TITLE.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 9562 UUIDv8 (custom/name-derived) + the RFC 4122 variant bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
 /// #3587 U3 — the single notify-dedup state row body, shared by the sqlite and
 /// store-backed writers so their `(title, namespace)` upsert target and shape
-/// cannot drift.
+/// cannot drift. R3 — the id comes from [`stale_ruling_state_id`], so every
+/// digest targets the ONE deterministic row instead of minting a new one.
 fn stale_ruling_state_memory(set_hash: &str, now: chrono::DateTime<chrono::Utc>) -> Memory {
     let ts = now.to_rfc3339();
     Memory {
         cid: None,
         valid_from: None,
         valid_until: None,
-        id: uuid::Uuid::new_v4().to_string(),
+        id: stale_ruling_state_id(),
         tier: crate::models::Tier::Mid,
         namespace: STALE_RULING_STATE_NAMESPACE.to_string(),
         title: STALE_RULING_STATE_TITLE.to_string(),
@@ -1187,29 +1213,56 @@ async fn store_backed_stale_ruling_body(
 }
 
 /// #3587 U3 — read the single notify-dedup state row through the store, if any.
+///
+/// R3 — the state is ONE deterministic-id row ([`stale_ruling_state_id`]);
+/// every digest upserts it rather than inserting a new row. Reading it BY ID
+/// (not `find_by_title_namespace`, whose bare `LIMIT 1` carries no `ORDER BY`)
+/// makes the reader observe the MOST RECENT state write by construction. The
+/// title/namespace fallback keeps a row written by an older build (random id)
+/// honoured — still a single row under the UNIQUE `(title, namespace)` index,
+/// so it cannot re-open the floor — instead of re-emitting a digest on every
+/// sweep.
 #[cfg(feature = "sal")]
 async fn read_store_stale_ruling_state(
     store: &dyn crate::store::MemoryStore,
     ctx: &crate::store::CallerContext,
 ) -> crate::store::StoreResult<Option<(String, String)>> {
-    let Some(id) = store
-        .find_by_title_namespace(STALE_RULING_STATE_TITLE, STALE_RULING_STATE_NAMESPACE)
-        .await?
-    else {
-        return Ok(None);
+    let mem = match store.get(ctx, &stale_ruling_state_id()).await {
+        Ok(mem) => mem,
+        Err(crate::store::StoreError::NotFound { .. }) => {
+            let Some(id) = store
+                .find_by_title_namespace(STALE_RULING_STATE_TITLE, STALE_RULING_STATE_NAMESPACE)
+                .await?
+            else {
+                return Ok(None);
+            };
+            store.get(ctx, &id).await?
+        }
+        Err(e) => return Err(e),
     };
-    let mem = store.get(ctx, &id).await?;
-    let hash = mem
-        .metadata
+    Ok(stale_ruling_state_hash_and_at(&mem))
+}
+
+/// #3587 U3 — extract the `(set_hash, updated_at)` pair a state row carries,
+/// `None` when the hash key is absent.
+#[cfg(feature = "sal")]
+fn stale_ruling_state_hash_and_at(mem: &Memory) -> Option<(String, String)> {
+    mem.metadata
         .get(STALE_RULING_STATE_HASH_KEY)
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    Ok(hash.map(|h| (h, mem.updated_at)))
+        .map(str::to_string)
+        .map(|h| (h, mem.updated_at.clone()))
 }
 
 /// #3587 U3 — upsert the single notify-dedup state row through the store.
 /// Shares [`stale_ruling_state_memory`] with the sqlite writer so the
-/// `(title, namespace)` upsert target and the row shape cannot drift.
+/// `(title, namespace)` upsert target, the deterministic id
+/// ([`stale_ruling_state_id`]) and the row shape cannot drift.
+/// `MemoryStore::store` IS the update path here: both backends resolve
+/// `(title, namespace)` through the UNIQUE index (sqlite `db::insert`
+/// `ON CONFLICT(title, namespace) DO UPDATE`, postgres `ON CONFLICT (title,
+/// namespace) DO UPDATE`), so a second digest updates the one row rather than
+/// inserting another.
 #[cfg(feature = "sal")]
 async fn write_store_stale_ruling_state(
     store: &dyn crate::store::MemoryStore,

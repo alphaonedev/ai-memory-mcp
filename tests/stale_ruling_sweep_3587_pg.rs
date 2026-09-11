@@ -326,6 +326,47 @@ async fn store_backed_stale_ruling_sweep_notifies_and_dedups_3587_pg() {
     .expect("latest digest body");
     assert!(body.contains(&second), "current set is carried: {body}");
 
+    // R3 — change the set AGAIN inside B's floor. The store-backed reader must
+    // observe the LATEST (B) state row, so this is suppressed; reading an older
+    // row would make the floor look elapsed and re-emit.
+    let third = raw_ruling(
+        &store,
+        &ns,
+        &["ruling"],
+        serde_json::json!({"agent_id": "ai:fable", "ruling_key": "k-store-3"}),
+        now - chrono::Duration::days(30),
+    )
+    .await;
+    let r4 =
+        ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender, &state_ctx)
+            .await;
+    assert!(
+        r4.stale_ruling_ids.contains(&third),
+        "the new ruling is in the current set"
+    );
+    assert_eq!(
+        r4.stale_rulings_notified, 0,
+        "changed set inside B's floor is suppressed: {:?}",
+        r4.errors
+    );
+    assert_eq!(inbox_count_pg(&store, &inbox_ns).await, 2);
+
+    // R3 — ONE deterministic-id state row after the digests.
+    let (state_rows, state_id): (i64, String) = sqlx::query_as::<_, (i64, String)>(
+        "SELECT COUNT(*), MIN(id) FROM memories WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::curator::STALE_RULING_STATE_NAMESPACE)
+    .bind(ai_memory::curator::STALE_RULING_STATE_TITLE)
+    .fetch_one(store.pool())
+    .await
+    .expect("state row");
+    assert_eq!(state_rows, 1, "the state is a single row");
+    assert_eq!(
+        state_id,
+        ai_memory::curator::stale_ruling_state_id(),
+        "the state row carries the deterministic id"
+    );
+
     cleanup(&store, &marker).await;
     let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1 AND title = $2")
         .bind(ai_memory::curator::STALE_RULING_STATE_NAMESPACE)

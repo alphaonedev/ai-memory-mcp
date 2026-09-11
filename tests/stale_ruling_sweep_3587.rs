@@ -296,6 +296,72 @@ fn stale_ruling_floor_is_unconditional_3587() {
     assert!(body.contains(&second), "current set carries the new ruling");
 }
 
+/// #3587 U3 R3 — the state reader must observe the MOST RECENT state write.
+/// Digest A (state row A); advance past the floor; digest the changed set B
+/// (state row B); change the set AGAIN inside B's floor → suppressed (0). If
+/// the reader returned the older A row the floor would look elapsed and the
+/// changed hash would re-emit — the R3 defect. Also pins the single
+/// deterministic-id state row: three digests leave exactly ONE row.
+#[test]
+fn stale_ruling_state_read_observes_latest_write_3587() {
+    let (_dir, conn) = open_db();
+    let a = seed(&conn, &["ruling"], Some("k-r3-a"), json!({}), 30);
+
+    // Digest A.
+    let r1 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep A");
+    assert_eq!(
+        r1.stale_rulings_notified, 1,
+        "digest A emits: {:?}",
+        r1.errors
+    );
+    assert_eq!(inbox_count(&conn), 1);
+
+    // Past the floor, the CHANGED set B emits.
+    backdate_state_row(
+        &conn,
+        i64::try_from(STALE_RULING_NOTIFY_FLOOR_SECS).unwrap() + 60,
+    );
+    let b = seed(&conn, &["ruling"], Some("k-r3-b"), json!({}), 30);
+    let r2 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep B");
+    assert_eq!(
+        r2.stale_rulings_notified, 1,
+        "digest B emits past the floor: {:?}",
+        r2.errors
+    );
+    assert_eq!(inbox_count(&conn), 2);
+
+    // Inside B's floor, a further changed set C must be suppressed.
+    let c = seed(&conn, &["ruling"], Some("k-r3-c"), json!({}), 30);
+    let r3 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep C");
+    for id in [&a, &b, &c] {
+        assert!(
+            r3.stale_ruling_ids_all.contains(id),
+            "the current set carries {id}"
+        );
+    }
+    assert_eq!(
+        r3.stale_rulings_notified, 0,
+        "changed set inside B's floor must be suppressed: {:?}",
+        r3.errors
+    );
+    assert_eq!(inbox_count(&conn), 2, "no new digest row");
+
+    // R3 — ONE deterministic-id state row despite the digests.
+    let (state_rows, state_id): (i64, String) = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(id) FROM memories WHERE namespace = ?1 AND title = ?2",
+            rusqlite::params![STALE_RULING_STATE_NAMESPACE, STALE_RULING_STATE_TITLE],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("state row");
+    assert_eq!(state_rows, 1, "the state is a single row");
+    assert_eq!(
+        state_id,
+        ai_memory::curator::stale_ruling_state_id(),
+        "the state row carries the deterministic id"
+    );
+}
+
 /// #3587 U3 R2 (recommended) — an unparsable state timestamp is surfaced in
 /// `report.errors` and self-heals: the pass re-notifies once and rewrites the
 /// state row with a fresh, parseable timestamp.
