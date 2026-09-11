@@ -1245,14 +1245,21 @@ fn local_signing_key() -> std::result::Result<ed25519_dalek::SigningKey, String>
 }
 
 /// v1.0.0 #3199 — the backup-signing row of `doctor --posture
-/// enterprise-federation` for a SQLite node: `(pass, observed state)`.
+/// enterprise-federation` (check #21): `(pass, observed state)`.
 ///
 /// PASS when the operator public key `restore` verifies against resolves and
 /// any local operator signing key is its private half. A node that only
 /// restores never needs the private key, so its absence passes; a key that
-/// does not match would sign backups this node's `restore` refuses.
+/// does not match would sign backups this node's `restore` refuses. A
+/// postgres node passes as N/A: `backup` / `restore` are SQLite-only.
 #[must_use]
-pub fn signing_posture() -> (bool, String) {
+pub fn signing_posture(backend_is_postgres: bool) -> (bool, String) {
+    if backend_is_postgres {
+        return (
+            true,
+            "N/A (postgres: `ai-memory backup` is SQLite-only)".to_string(),
+        );
+    }
     signing_posture_of(
         crate::governance::rules_store::resolve_operator_pubkey().as_ref(),
         local_signing_key().as_ref(),
@@ -1629,7 +1636,11 @@ fn write_backup_pair_durably(
     // A leftover from a crashed run with the same pid; `create_new` below
     // would refuse it, and removing a planted symlink removes only the link.
     let _ = std::fs::remove_file(&tmp);
-    drop(copy_into_new_file(&mut manifest_text.as_bytes(), &tmp, None)?);
+    drop(copy_into_new_file(
+        &mut manifest_text.as_bytes(),
+        &tmp,
+        None,
+    )?);
     if let Err(e) = std::fs::rename(&tmp, manifest_path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow::Error::new(e).context(format!(

@@ -791,14 +791,8 @@ pub fn evaluate_with_live(
     // rationale and the wording contract are documented there.
     out.push(synchronous::check_synchronous(live_synchronous));
 
-    // ---- 22. backup manifest signing (#3199) ------------------------
-    // `restore` verifies operator-signed manifests; `backup` is SQLite-only,
-    // so a postgres node has nothing to check.
-    let (backup_pass, backup_actual) = if backend_is_postgres {
-        (true, "N/A (postgres: `ai-memory backup` is SQLite-only)".to_string())
-    } else {
-        crate::cli::backup::signing_posture()
-    };
+    // ---- 22. backup manifest signing (#3199; N/A on postgres) ----------
+    let (backup_pass, backup_actual) = crate::cli::backup::signing_posture(backend_is_postgres);
     out.push(check(
         "backup manifest signing",
         "operator public key resolves AND any local operator signing key matches it",
@@ -1023,10 +1017,11 @@ mod tests {
         }
         // #3199 check #21 — the operator public key restore verifies backups
         // against, in the per-process test key sandbox (no env write).
-        let keys = crate::identity::keypair::default_key_dir().expect("sandbox key dir");
-        std::fs::create_dir_all(&keys).expect("create sandbox key dir");
-        std::fs::write(keys.join("operator.key.pub"), approver_pubkey_b64_for_test())
-            .expect("write operator.key.pub");
+        let (keys, pk) = (
+            crate::identity::keypair::default_key_dir(),
+            approver_pubkey_b64_for_test(),
+        );
+        std::fs::write(keys.expect("key dir").join("operator.key.pub"), pk).expect("write pubkey");
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED. Process-global `OnceLock`
         // install, isolated per env-isolated child
@@ -1787,7 +1782,8 @@ mod tests {
         let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let checks = evaluate(&AppConfig::default());
         let c = find(&checks, "backup manifest signing");
-        assert!(!c.pass && c.actual.contains("no operator public key"), "{c:?}");
+        assert!(!c.pass, "{c:?}");
+        assert!(c.actual.contains("no operator public key"), "{c:?}");
         assert!(!all_pass(&checks));
     }
 

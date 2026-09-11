@@ -1065,7 +1065,11 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
         msg.contains("--snapshot") && msg.contains("--latest"),
         "got: {msg}"
     );
-    assert_eq!(file_sha256(&db), live_before, "the live database is untouched");
+    assert_eq!(
+        file_sha256(&db),
+        live_before,
+        "the live database is untouched"
+    );
 
     // #3199 — `--latest` follows the SIGNED created_at: the June snapshot,
     // although the January one carries the newest mtime.

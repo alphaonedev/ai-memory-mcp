@@ -149,20 +149,22 @@ pub(super) enum ManifestVerdict {
 pub(super) fn verify(text: &str, anchor: Option<&VerifyingKey>) -> Result<ManifestVerdict> {
     let manifest: BackupManifest =
         serde_json::from_str(text).context("the manifest is not valid manifest JSON")?;
-    let (payload_b64, signature_b64) =
-        match (manifest.signed_payload.as_deref(), manifest.signature.as_deref()) {
-            (None, None) => {
-                return Ok(ManifestVerdict::Unverified {
-                    manifest,
-                    reason: UnverifiedReason::NoSignature,
-                });
-            }
-            (Some(p), Some(s)) => (p.to_owned(), s.to_owned()),
-            _ => anyhow::bail!(
-                "the manifest carries half a signature (signed_payload without signature, \
+    let (payload_b64, signature_b64) = match (
+        manifest.signed_payload.as_deref(),
+        manifest.signature.as_deref(),
+    ) {
+        (None, None) => {
+            return Ok(ManifestVerdict::Unverified {
+                manifest,
+                reason: UnverifiedReason::NoSignature,
+            });
+        }
+        (Some(p), Some(s)) => (p.to_owned(), s.to_owned()),
+        _ => anyhow::bail!(
+            "the manifest carries half a signature (signed_payload without signature, \
                  or the reverse) — refusing it (#3199)"
-            ),
-        };
+        ),
+    };
     let Some(anchor) = anchor else {
         return Ok(ManifestVerdict::Unverified {
             manifest,

@@ -219,8 +219,13 @@ fn a_signed_backup_restores_and_says_so_3199() {
     let snapshot = dir.join(v["snapshot"].as_str().expect("snapshot name"));
     seed_memory(&db, "ns", "added-after-the-backup", "b");
 
-    restore(&mut env, &db, &args_for(snapshot), test_restore_policy(false))
-        .expect("a signed backup restores");
+    restore(
+        &mut env,
+        &db,
+        &args_for(snapshot),
+        test_restore_policy(false),
+    )
+    .expect("a signed backup restores");
     let e = envelope(&env);
     assert_eq!(e[VERIFICATION], serde_json::json!("signed"));
     assert!(e["audit_sink"].is_null(), "nothing to audit: {e}");
@@ -249,7 +254,12 @@ fn a_swapped_snapshot_under_a_signed_manifest_is_refused_3199() {
 
     let live = sha(&db);
     assert_refused(
-        restore(&mut env, &db, &args_for(snapshot), test_restore_policy(false)),
+        restore(
+            &mut env,
+            &db,
+            &args_for(snapshot),
+            test_restore_policy(false),
+        ),
         "sha256 mismatch",
     );
     assert_eq!(sha(&db), live, "the live database is untouched");
@@ -265,7 +275,12 @@ fn an_attacker_regenerated_unsigned_manifest_is_refused_3199() {
     strip_signature(&manifest_path);
     let live = sha(&db);
     assert_refused(
-        restore(&mut env, &db, &args_for(snapshot), test_restore_policy(false)),
+        restore(
+            &mut env,
+            &db,
+            &args_for(snapshot),
+            test_restore_policy(false),
+        ),
         NOT_VERIFIED,
     );
     assert_eq!(sha(&db), live, "the live database is untouched");
@@ -284,7 +299,12 @@ fn a_renamed_signed_pair_is_refused_3199() {
     std::fs::rename(&manifest_path, dir.join(manifest_file_name(JUNE))).expect("rename manifest");
     let live = sha(&db);
     assert_refused(
-        restore(&mut env, &db, &args_for(renamed), test_restore_policy(false)),
+        restore(
+            &mut env,
+            &db,
+            &args_for(renamed),
+            test_restore_policy(false),
+        ),
         "cannot be renamed",
     );
     assert_eq!(sha(&db), live, "the live database is untouched");
@@ -343,8 +363,15 @@ fn an_unsigned_manifest_restores_only_with_the_flag_3199() {
     restore(&mut env, &db, &args, test_restore_policy(false)).expect("explicitly accepted");
     let e = envelope(&env);
     assert_eq!(e[VERIFICATION], serde_json::json!("unsigned_allowed"));
-    assert!(e["audit_sink"].is_string(), "the audit sink is reported: {e}");
-    assert!(env.stderr_str().contains(UNVERIFIED_WARNING), "{}", env.stderr_str());
+    assert!(
+        e["audit_sink"].is_string(),
+        "the audit sink is reported: {e}"
+    );
+    assert!(
+        env.stderr_str().contains(UNVERIFIED_WARNING),
+        "{}",
+        env.stderr_str()
+    );
     assert_eq!(rows(&db), 1);
 }
 
@@ -358,7 +385,11 @@ fn skip_verify_warns_and_reports_skipped_3199() {
     args.skip_verify = true;
     restore(&mut env, &db, &args, test_restore_policy(false)).expect("standard allows it");
     assert_eq!(envelope(&env)[VERIFICATION], serde_json::json!("skipped"));
-    assert!(env.stderr_str().contains(UNVERIFIED_WARNING), "{}", env.stderr_str());
+    assert!(
+        env.stderr_str().contains(UNVERIFIED_WARNING),
+        "{}",
+        env.stderr_str()
+    );
 }
 
 /// Under asi-hard nothing unverified restores: both escapes are refused, and
@@ -380,7 +411,12 @@ fn asi_hard_refuses_every_unverified_restore_3199() {
     }
     strip_signature(&manifest_path);
     assert_refused(
-        restore(&mut env, &db, &args_for(snapshot), test_restore_policy(true)),
+        restore(
+            &mut env,
+            &db,
+            &args_for(snapshot),
+            test_restore_policy(true),
+        ),
         NOT_VERIFIED,
     );
     assert_eq!(sha(&db), live, "the live database is untouched");
@@ -539,10 +575,19 @@ fn standard_backup_without_a_key_is_unsigned_and_says_so_3199() {
     let v = envelope(&env);
     assert_eq!(v["signed"], serde_json::json!(false));
     assert!(v.get("signature").is_none(), "{v}");
-    assert!(env.stderr_str().contains("UNSIGNED"), "{}", env.stderr_str());
+    assert!(
+        env.stderr_str().contains("UNSIGNED"),
+        "{}",
+        env.stderr_str()
+    );
     let snapshot = dir.join(v["snapshot"].as_str().expect("name"));
     assert_refused(
-        restore(&mut env, &db, &args_for(snapshot), test_restore_policy(false)),
+        restore(
+            &mut env,
+            &db,
+            &args_for(snapshot),
+            test_restore_policy(false),
+        ),
         NOT_VERIFIED,
     );
 }
@@ -649,8 +694,15 @@ fn a_non_durable_backup_is_reported_and_rotates_nothing_3605() {
         }
         assert_eq!(v["durable"], serde_json::json!(false), "{v}");
         assert!(v["rotation"].is_null(), "rotation must be skipped: {v}");
-        assert!(env.stderr_str().contains("NOT durable"), "{}", env.stderr_str());
-        assert!(older.exists(), "asi_hard={asi_hard}: nothing older was rotated");
+        assert!(
+            env.stderr_str().contains("NOT durable"),
+            "{}",
+            env.stderr_str()
+        );
+        assert!(
+            older.exists(),
+            "asi_hard={asi_hard}: nothing older was rotated"
+        );
     }
 }
 
@@ -700,8 +752,15 @@ fn rotation_orders_by_signed_time_and_keeps_what_it_cannot_verify_3604() {
     );
     assert!(!january.exists(), "rotated");
     assert!(june.exists(), "within --keep 2");
-    assert!(junk.iter().all(|p| p.exists()), "never deletes what it cannot verify");
-    assert!(env.stderr_str().contains("never deletes"), "{}", env.stderr_str());
+    assert!(
+        junk.iter().all(|p| p.exists()),
+        "never deletes what it cannot verify"
+    );
+    assert!(
+        env.stderr_str().contains("never deletes"),
+        "{}",
+        env.stderr_str()
+    );
 }
 
 /// A removal that fails is reported, not swallowed, and the file stays.
@@ -726,8 +785,15 @@ fn rotation_reports_a_removal_it_could_not_make_3604() {
         failures[0].as_str().unwrap_or_default().contains(JANUARY),
         "{v}"
     );
-    assert!(january.exists(), "the file it could not remove is still there");
-    assert!(env.stderr_str().contains("could not remove"), "{}", env.stderr_str());
+    assert!(
+        january.exists(),
+        "the file it could not remove is still there"
+    );
+    assert!(
+        env.stderr_str().contains("could not remove"),
+        "{}",
+        env.stderr_str()
+    );
 }
 
 /// The `doctor --posture` check #21 predicate: the anchor must resolve, and a
@@ -741,11 +807,17 @@ fn backup_signing_posture_row_3199() {
     let missing = "governance.no_operator_key: none".to_string();
 
     let (pass, actual) = signing_posture_of(None, Ok(&operator));
-    assert!(!pass && actual.contains("no operator public key"), "{actual}");
+    assert!(
+        !pass && actual.contains("no operator public key"),
+        "{actual}"
+    );
     let (pass, actual) = signing_posture_of(Some(&anchor), Ok(&operator));
     assert!(pass && actual.contains("matches"), "{actual}");
     let (pass, actual) = signing_posture_of(Some(&anchor), Ok(&foreign));
     assert!(!pass && actual.contains("does NOT match"), "{actual}");
     let (pass, actual) = signing_posture_of(Some(&anchor), Err(&missing));
-    assert!(pass && actual.contains("no usable local signing key"), "{actual}");
+    assert!(
+        pass && actual.contains("no usable local signing key"),
+        "{actual}"
+    );
 }
