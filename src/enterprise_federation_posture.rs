@@ -822,7 +822,7 @@ pub fn evaluate_with_live(
              loss: {rpo}",
             level = resolved.level,
             source = resolved.source.as_str(),
-            class = resolved.level.durability_class(),
+            class = crate::storage::DURABILITY_CLASS_LOCAL_ONLY,
             cadence = resolved.level.fsync_cadence(),
             rpo = resolved.level.rpo_on_power_loss(),
         ),

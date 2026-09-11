@@ -673,14 +673,6 @@ impl SynchronousLevel {
             Self::Full | Self::Extra => "none (each acknowledged commit is fsync'd)",
         }
     }
-
-    /// The §0.2 durability class this level places a single-node SQLite
-    /// store in. Always [`DURABILITY_CLASS_LOCAL_ONLY`]: `synchronous` decides
-    /// the fsync cadence INSIDE that class, never the class itself.
-    #[must_use]
-    pub const fn durability_class(self) -> &'static str {
-        DURABILITY_CLASS_LOCAL_ONLY
-    }
 }
 
 impl std::fmt::Display for SynchronousLevel {
@@ -1456,7 +1448,6 @@ mod tests {
         assert_eq!(r.level.as_str(), db_synchronous());
         assert_eq!(r.level, SynchronousLevel::Normal);
         assert_eq!(r.source, SynchronousSource::CompiledDefault);
-        assert_eq!(r.level.durability_class(), DURABILITY_CLASS_LOCAL_ONLY);
         assert_eq!(r.level.fsync_cadence(), "per-checkpoint");
         assert!(!r.level.meets_certified_floor());
     }

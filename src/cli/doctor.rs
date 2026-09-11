@@ -2040,7 +2040,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
                 FACT_DURABILITY_CLASS.into(),
                 format!(
                     "{} (fsync {})",
-                    live.durability_class(),
+                    crate::storage::DURABILITY_CLASS_LOCAL_ONLY,
                     live.fsync_cadence()
                 ),
             ));
