@@ -249,8 +249,9 @@ fn every_class_a_guard_call_is_enumerated_2572() {
 
     let total: usize = GUARDED.iter().map(|(_, n, _)| n).sum();
     assert_eq!(
-        total, 33,
-        "the pinned class-(a) guard total drifted from 33 (#2572; 31 + #3587 U2 watch + U4 capture-turn)"
+        total, 32,
+        "the pinned class-(a) guard total drifted from 32 (#2572; 31 + #3587 U2 watch + U4 \
+         capture-turn - #3587 U1b resolve, which serves PostgreSQL through the SAL twin)"
     );
     assert!(
         problems.is_empty(),
