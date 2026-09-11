@@ -340,7 +340,7 @@ pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_S
 /// unconditionally regardless of this knob (see [`authorize_remote_transition`]).
 #[must_use]
 pub fn require_transition_sig_enabled() -> bool {
-    env_flag_default_on(REQUIRE_TRANSITION_SIG_ENV)
+    crate::env_flag::knobs::FED_REQUIRE_TRANSITION_SIG.enabled()
 }
 
 /// FED-RQ-01 (#1936) — env knob gating the inbound checkpoint-RESOLUTION
@@ -366,42 +366,7 @@ pub const REQUIRE_CHECKPOINT_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_CHECKPOINT_S
 /// (head-entanglement rides checkpoint resolutions over this transport).
 #[must_use]
 pub fn require_checkpoint_sig_enabled() -> bool {
-    env_flag_default_on(REQUIRE_CHECKPOINT_SIG_ENV)
-}
-
-/// Shared grammar for federation security knobs that default **ON**
-/// (fail-closed): the flag is disabled only by an explicit falsy token
-/// (`0`/`false`/`no`/`off`, case- and whitespace-trimmed); every other value
-/// — including the empty string or an unknown word — keeps it enabled.
-///
-/// Centralising this parsing (#1914) stops sibling knobs from diverging, e.g.
-/// `require_sig()` historically disabled only on the literal `"0"`, so
-/// `AI_MEMORY_FED_REQUIRE_SIG=false` silently stayed ON — an operator footgun.
-#[must_use]
-pub fn env_flag_default_on(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_none_or(|v| flag_value_default_on(&v))
-}
-
-/// Value-level half of the [`env_flag_default_on`] grammar: given an
-/// already-resolved value, is a default-ON federation knob still ENABLED?
-/// A trimmed value is DISABLED only by an explicit falsy token
-/// (`0`/`false`/`no`/`off`, case- and whitespace-SENSITIVE per #1914); every
-/// other value — empty string or unknown word — keeps it enabled.
-///
-/// Split out of [`env_flag_default_on`] (#3033) as the ONE grammar SSOT both
-/// the live receive gate AND the `asi-hard` KNOBS `meets_floor` predicate
-/// share: the boot-refusal floor for `AI_MEMORY_FED_REQUIRE_SIG` /
-/// `_NONCE` / `_PUSH_NAMESPACE_SCOPE` must answer "does this value keep the
-/// gate enabled?" using the EXACT same parse the runtime uses, never a
-/// re-derived truthy grammar — the NB1 false-red class
-/// (`src/enterprise_federation_posture.rs` check #4 docs) that treats e.g.
-/// `FED_REQUIRE_SIG=FALSE` (case-mismatched, so the live gate stays ON) as a
-/// loosening and bricks a compliant boot.
-#[must_use]
-pub fn flag_value_default_on(v: &str) -> bool {
-    !matches!(v.trim(), "0" | "false" | "no" | "off")
+    crate::env_flag::knobs::FED_REQUIRE_CHECKPOINT_SIG.enabled()
 }
 
 /// **Secure default for the federation per-write CONTENT-signature lane**
@@ -473,28 +438,6 @@ pub const CAUSE_FORGED_OR_MALFORMED: &str = "forged_or_malformed";
 /// `metrics.rs` quarantine-cause enumeration is deliberately unchanged.
 pub const CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT: &str = "no_eligible_key_at_created_at";
 
-/// Resolve a DATA-lane fed-sig requirement against its (flip-ready) default:
-///
-/// - an explicit FALSY token (`0`/`false`/`no`/`off`, trimmed) is the
-///   escape-hatch opt-out (permissive) — this is the `=0` bridge named in the
-///   flip WARN and the docs;
-/// - an explicit TRUTHY token (`1`/`true`/`yes`/`on`) opts in (required);
-/// - any OTHER set value, or UNSET, falls through to `default_on` — so a typo
-///   never silently WEAKENS a fail-closed default below its floor.
-///
-/// Explicit env always wins over the default (precedence intact, item 6);
-/// under the v1.0.0 flip `default_on = true`, so unset ⇒ required.
-fn resolve_fed_sig_flag(name: &str, default_on: bool) -> bool {
-    match std::env::var(name) {
-        Ok(v) => match v.trim() {
-            "0" | "false" | "no" | "off" => false,
-            "1" | "true" | "yes" | "on" => true,
-            _ => default_on,
-        },
-        Err(_) => default_on,
-    }
-}
-
 /// Env knob gating the inbound per-write CONTENT-signature requirement on
 /// relayed memories (#1464) — the DATA-lane sibling of
 /// [`REQUIRE_TRANSITION_SIG_ENV`].
@@ -521,7 +464,7 @@ pub const REQUIRE_WRITE_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_WRITE_SIG";
 /// [`require_signal_sig_enabled`].
 #[must_use]
 pub fn require_write_sig_enabled() -> bool {
-    resolve_fed_sig_flag(REQUIRE_WRITE_SIG_ENV, FED_REQUIRE_WRITE_SIG_DEFAULT)
+    crate::env_flag::knobs::FED_REQUIRE_WRITE_SIG.enabled()
 }
 
 /// Env knob gating the inbound per-signal AUTHOR-signature requirement on
@@ -552,7 +495,7 @@ pub const REQUIRE_SIGNAL_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_SIGNAL_SIG";
 /// secure-opt-in shape of [`require_write_sig_enabled`] (#1464).
 #[must_use]
 pub fn require_signal_sig_enabled() -> bool {
-    resolve_fed_sig_flag(REQUIRE_SIGNAL_SIG_ENV, FED_REQUIRE_SIGNAL_SIG_DEFAULT)
+    crate::env_flag::knobs::FED_REQUIRE_SIGNAL_SIG.enabled()
 }
 
 /// v1.0.0 Gate-1' (#1954, #1801→#1954) — one-shot boot NOTICE emitted when
@@ -640,9 +583,10 @@ pub const FED_QUARANTINE_UNATTRIBUTED_ENV: &str = "AI_MEMORY_FED_QUARANTINE_UNAT
 /// dequarantine via the route-out attest / operator paths).
 #[must_use]
 pub fn quarantine_unattributed_enabled() -> bool {
-    std::env::var(FED_QUARANTINE_UNATTRIBUTED_ENV)
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+    // #3619 — through the #3200 shared grammar (case-insensitive), the same
+    // object the `asi-hard` floor asks, so `=TRUE` can no longer meet the
+    // floor while this gate reads it as off.
+    crate::env_flag::knobs::FED_QUARANTINE_UNATTRIBUTED.enabled()
 }
 
 // ---------------------------------------------------------------------------
@@ -680,7 +624,7 @@ pub fn quarantine_unattributed_enabled() -> bool {
 
 /// FED-RQ-03 (#1947) — env knob gating the cross-node governance
 /// policy_version REFUSE-STALE gate. Default **ON** (fail-closed for a
-/// DETECTED-stale value) via the shared [`env_flag_default_on`] grammar,
+/// DETECTED-stale value) via the #3200 shared grammar ([`crate::env_flag`]),
 /// mirroring [`REQUIRE_TRANSITION_SIG_ENV`] / [`REQUIRE_CHECKPOINT_SIG_ENV`].
 pub const REQUIRE_POLICY_CURRENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_POLICY_CURRENT";
 
@@ -696,7 +640,7 @@ pub const REQUIRE_POLICY_CURRENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_POLICY_CURRE
 /// escape-hatch shape of [`require_checkpoint_sig_enabled`] (#1936).
 #[must_use]
 pub fn require_policy_current_enabled() -> bool {
-    env_flag_default_on(REQUIRE_POLICY_CURRENT_ENV)
+    crate::env_flag::knobs::FED_REQUIRE_POLICY_CURRENT.enabled()
 }
 
 /// FED-RQ-03 (#1947) — closed-set error tag rendered in the receive-path
@@ -851,8 +795,8 @@ pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_N
 /// parity with the `/sync/since` pull lane, where an empty list already means
 /// "may pull nothing" (`PeerScope::allowed_namespaces`).
 ///
-/// **Default fail-closed (`true`)**, via the shared [`env_flag_default_on`]
-/// grammar every `AI_MEMORY_FED_REQUIRE_*` knob uses (#87/#94/#96/#125/#132 are
+/// **Default fail-closed (`true`)**, via the #3200 shared grammar
+/// ([`crate::env_flag`]) every `AI_MEMORY_FED_REQUIRE_*` knob uses (#87/#94/#96/#125/#132 are
 /// 7-for-7 default-ON at v1.0.0 — federation inbound IS the network surface,
 /// ruling `9e9c3cf2` condition 7). An explicit falsy token
 /// (`0`/`false`/`no`/`off`) is the staged-rollout opt-out.
@@ -896,7 +840,7 @@ pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_N
 /// config that already confines reads and deletes.
 #[must_use]
 pub fn require_push_namespace_scope_enabled() -> bool {
-    env_flag_default_on(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV)
+    crate::env_flag::knobs::FED_REQUIRE_PUSH_NAMESPACE_SCOPE.enabled()
 }
 
 /// Whether the operator has DECLARED a non-empty `allowed_namespaces` scope
@@ -1805,13 +1749,13 @@ mod tests {
                 "{falsy:?} → the staged-rollout opt-out"
             );
         }
-        // The shared `env_flag_default_on` grammar trims but does NOT
-        // case-fold, so an uppercase token is unrecognised and therefore
-        // fail-closed — identical to all 7 sibling FED_REQUIRE_* knobs.
+        // #3200 (rule (e)): the shared grammar case-folds, so `OFF` is the
+        // falsy opt-out now (it stayed strict under the old case-sensitive
+        // reader; the boot sweep prints the meaning-changed WARN).
         unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "OFF") };
         assert!(
-            require_push_namespace_scope_enabled(),
-            "\"OFF\" is not a recognised falsy token → stays strict"
+            !require_push_namespace_scope_enabled(),
+            "\"OFF\" is a recognised falsy token → the staged-rollout opt-out"
         );
         unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "garbage") };
         assert!(
@@ -2204,7 +2148,9 @@ mod tests {
             !quarantine_unattributed_enabled(),
             "unset → permissive default"
         );
-        for truthy in ["1", "true", "yes", "on", "  on  "] {
+        // #3619 — the case variants the asi-hard floor always accepted now
+        // arm the live gate too (the old reader was case-sensitive).
+        for truthy in ["1", "true", "yes", "on", "  on  ", "TRUE", "Yes", "ON"] {
             unsafe { std::env::set_var(FED_QUARANTINE_UNATTRIBUTED_ENV, truthy) };
             assert!(quarantine_unattributed_enabled(), "{truthy:?} → opt-in");
         }

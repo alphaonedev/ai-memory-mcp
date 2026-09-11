@@ -72,9 +72,7 @@ pub const ENV_ADMIN_HEADER_TRUST: &str = "AI_MEMORY_ADMIN_HEADER_TRUST";
 /// trust-the-header posture via [`ENV_ADMIN_HEADER_TRUST`].
 #[must_use]
 pub fn admin_header_trust_enabled() -> bool {
-    std::env::var(ENV_ADMIN_HEADER_TRUST)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::env_flag::knobs::ADMIN_HEADER_TRUST.enabled()
 }
 
 /// #3065 (Wave-2 Cluster B, cert-core) — resolved inputs to the certified-

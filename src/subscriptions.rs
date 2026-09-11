@@ -1797,13 +1797,11 @@ pub(crate) fn validate_url_dns_resolved(
 }
 
 /// `true` when the operator opted into the legacy permissive SSRF
-/// posture via `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` (`1` / `true`).
+/// posture via `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` (#3200 shared grammar).
 /// Shared by the resolution-failure branch and the RFC 1035
 /// hostname-shape branch so the two read the override identically.
 fn ssrf_dns_fail_open() -> bool {
-    std::env::var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::env_flag::knobs::SSRF_GUARD_ALLOW_DNS_FAIL.enabled()
 }
 
 /// RFC 1035 §2.3.4 hostname shape check: every dot-separated label
