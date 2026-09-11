@@ -2,7 +2,7 @@
 
 > **Document classification:** Position review, answering an operator question against a public source. Non-normative; makes no certification or capacity claim. Companion to the certification standard in this directory (`AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md`) and to `docs/compliance/honest-limitations.md`.
 >
-> **Author:** Claude Fable 5.1 (Conductor, sole merger of `release/v1.0.0`). **Date:** 2026-09-11 (revision 2, same day: §3.2 and §5 fold in the v1.0.0 wake plane at the operator's request). **Operator approval to merge under `release/v1.0.0`:** given 2026-09-11.
+> **Author:** Claude Fable 5.1 (Conductor, sole merger of `release/v1.0.0`). **Date:** 2026-09-11 (revision 2, same day: §3.2 and §5 fold in the v1.0.0 wake plane at the operator's request; revision 3, 2026-09-12: §3.3 cross-host wakes and #3631). **Operator approval to merge under `release/v1.0.0`:** given 2026-09-11.
 
 ## 1. Source
 
@@ -46,7 +46,15 @@ Assessed against the problem in §1, it adds in four places and in none of the p
 
 4. **It removes the polling tax that made the multi-agent form of the problem worse.** In §3 the team's shared state already outlives any one agent's context. What remained slow was learning that the state had changed. The wake plane closes that gap on one host at negligible cost, and the acceptance plan (#3473) requires that the store's own read and write throughput is unchanged with the hub on — it buys latency and promises no capacity it does not have.
 
-What it does **not** add: it does not touch the size of any context window, it does not carry or summarise content, it does not cross hosts (a wake plane is per host; cross-host hand-offs still use the inbox poll or webhooks), and its latency claim is a design target until #3473 publishes measurements. On this epic, for example, the coding deputies run on a second build host from the Conductor, so their hand-offs today are still bounded by their pass interval; the wake plane helps a co-hosted team, which is the deployment it was built for.
+What it does **not** add: it does not touch the size of any context window, it does not carry or summarise content, and its latency claim is a design target until #3473 publishes measurements. The hub itself is per host; how a multi-host team reaches millisecond hand-offs anyway is §3.3.
+
+### 3.3 Clusters, swarms and hives: cross-host wakes in millisecond territory (#3631)
+
+A host running a daemon and a hub is a cell. Inside the cell the hub fans out in about a millisecond. Between cells the durable rows travel on ai-memory federation, not on the hub: `memory_notify` is federation-aware, and the fan-out (`broadcast_store_quorum`) pushes the row to every peer **synchronously, inside the notify call**, over TLS 1.3 with mutual authentication and signed pushes, then waits for the quorum acknowledgement. That hop costs one network round trip — single-digit milliseconds on a LAN, tens of milliseconds across the internet — and nothing is batched or held for an interval.
+
+The receiving cell then has to finish the last hop by waking its own listeners. At the time of writing (2026-09-12) that hop is missing: the federation apply path commits the row but does not publish to the local wake bus, so a recipient on the peer host learns of the message only on its ≤60 s backstop poll. Issue #3631 closes the gap — the receiving node fires `agent_notified_wake` after the federation-applied row commits, on both backends, with twin tests — and is in v1.0.0 scope. Once it lands, a cross-host wake is one signed federation push plus one local hub hop: millisecond-class end to end, with the 60-second poll left as the guarantee for a hub that is down and nothing else.
+
+Two things follow for a hive. First, the honest latency floor of a distributed team becomes the network round trip between its hosts, not anything in ai-memory. Second, topology matters more than tuning: agents that hand off most often belong in one cell, cells are joined by federation, and there is no need for the spec's deferred hub-to-hub gateway (loopback TLS behind a `--tcp` flag, not shipped) to reach millisecond cross-host wakes. On this epic the coding deputies run on a second build host from the Conductor; with #3631 and a team daemon per host (#3630) their hand-offs move from a 15-minute pass interval to a federation push.
 
 ## 4. What ai-memory does not solve
 
@@ -64,7 +72,7 @@ Five approaches exist. Only one is a fix rather than a workaround, and it is not
 | 2 | **Different architectures** (state-space models, linear attention, hybrids) | Constant memory per token; unbounded streams | History is squeezed into a fixed-size state. That is compaction moved inside the model, not eliminated. |
 | 3 | **External memory** (retrieval; memory stores; ai-memory) | Unbounded, durable storage; agent turnover survivable | Recall is selective. Solves persistence, not continuity. The only approach that ships reliably today. |
 | 4 | **Learning in the weights** (continual learning, test-time training, per-agent adapters, memory layers) | The model itself changes from the interaction; nothing has to be re-read | Research stage: catastrophic forgetting, cost of per-agent weights, and unauditable — a weight update cannot be inspected for what it "remembered". This is the fix the video's speakers expect from a coming model generation. |
-| 5 | **Hierarchy** (fresh-context workers plus a coordinator holding state) | Long-horizon work from short-horizon agents | An architectural workaround — and the one the v1.0.0 wake plane strengthens most (§3.2): with millisecond hand-offs, short-lived fresh-context agents become the normal unit of work instead of an emergency measure. It is how this project runs its release epic: deputies with clean contexts, a conductor and the memory store holding the ledger. |
+| 5 | **Hierarchy** (fresh-context workers plus a coordinator holding state) | Long-horizon work from short-horizon agents | An architectural workaround — and the one the v1.0.0 wake plane strengthens most (§3.2, and across hosts with #3631 in §3.3): with millisecond hand-offs, short-lived fresh-context agents become the normal unit of work instead of an emergency measure. It is how this project runs its release epic: deputies with clean contexts, a conductor and the memory store holding the ledger. |
 
 Practical answer today: 3 plus 5, with the discipline of writing state down — and, from v1.0.0, the wake plane making 5 fast enough to use routinely on a host. Eventual answer: 4, probably on top of 2.
 
