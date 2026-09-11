@@ -880,7 +880,11 @@ async fn http_update_illegal_edge_rolls_the_content_patch_back_3152() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "open->done must be 409");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "open->done must be 409"
+    );
     let lock = state.lock().await;
     let row = db::get(&lock.0, &id).unwrap().unwrap();
     assert_eq!(row.content, original.content, "the patch must roll back");
