@@ -28,6 +28,9 @@
 
 // v1.0.0 #1961 (R23/R7) — power-loss durability self-test + fault injection.
 pub mod durability;
+// v1.0.0 #3152 — test-only in-transaction fault point + crash-child helpers.
+#[cfg(test)]
+pub(crate) mod in_tx_fault;
 pub mod nag;
 pub mod parsers;
 pub mod transcript_paths;

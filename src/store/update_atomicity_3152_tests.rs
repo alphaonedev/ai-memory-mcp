@@ -21,7 +21,7 @@
 //!   reads the row directly from the store and finds it fully unchanged.
 //!
 //! The fault point itself is test-only
-//! ([`crate::recover::durability::in_tx_fault`]); it does not exist in a
+//! ([`crate::recover::in_tx_fault`]); it does not exist in a
 //! shipped binary.
 
 #![cfg(test)]
@@ -30,7 +30,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::models::{LifecycleState, Memory, Tier};
-use crate::recover::durability::in_tx_fault;
+use crate::recover::in_tx_fault;
+use crate::recover::in_tx_fault::{
+    CHILD_DB_ENV, CHILD_ID_ENV, CHILD_MARKER_ENV, child_role_is, child_var,
+};
 use crate::store::{CallerContext, MemoryStore, StoreError, UpdatePatch};
 
 /// The owner every fixture row is stamped with (and the caller that edits it).
@@ -40,21 +43,7 @@ const ORIGINAL_CONTENT: &str = "atomicity-3152 original content body";
 const PATCHED_TITLE: &str = "atomicity-3152 patched title";
 const PATCHED_CONTENT: &str = "atomicity-3152 patched content body";
 
-/// Env var naming the role a re-executed test plays. Read, never set, in
-/// this process: the parent passes it only to the child's `Command`.
-const CHILD_ROLE_ENV: &str = "AI_MEMORY_TEST_3152_CHILD_ROLE";
-/// Env var carrying the sqlite database path the child acts on.
-const CHILD_DB_ENV: &str = "AI_MEMORY_TEST_3152_CHILD_DB";
-/// Env var carrying the memory id the child updates.
-const CHILD_ID_ENV: &str = "AI_MEMORY_TEST_3152_CHILD_ID";
-/// Env var carrying the file the child writes just before aborting.
-const CHILD_MARKER_ENV: &str = "AI_MEMORY_TEST_3152_CHILD_MARKER";
-
 const ROLE_SQLITE_SAL: &str = "sqlite-sal";
-
-/// POSIX `SIGABRT`: what `std::process::abort()` raises.
-#[cfg(unix)]
-const SIGABRT: i32 = 6;
 
 fn fixture(namespace: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
@@ -98,54 +87,14 @@ fn assert_unchanged(mem: &Memory, why: &str) {
     assert_eq!(mem.version, 1, "{why}: version");
 }
 
-/// Is this process a child re-executed to play `role`?
-fn child_role_is(role: &str) -> bool {
-    std::env::var(CHILD_ROLE_ENV).is_ok_and(|r| r == role)
-}
-
-fn child_var(key: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set in a #3152 child"))
-}
-
 /// Run THIS test binary again as a child executing exactly `test` (a name
 /// in this module) with `env` set, from a clean environment.
 #[cfg(unix)]
 fn spawn_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
-    let mut cmd = std::process::Command::new(std::env::current_exe().expect("lib test binary"));
-    cmd.args([
-        "--exact",
+    crate::test_support::spawn_test_child(
         &format!("store::update_atomicity_3152_tests::{test}"),
-        "--test-threads=1",
-        "--nocapture",
-    ])
-    .env_clear()
-    .env("TMPDIR", std::env::temp_dir())
-    .env("AI_MEMORY_NO_CONFIG", "1");
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    cmd.output().expect("spawn the #3152 child")
-}
-
-/// The child died AT the fault point: by `SIGABRT`, after writing `marker`
-/// with the id it was updating.
-#[cfg(unix)]
-fn assert_aborted_at_fault_point(out: &std::process::Output, marker: &Path, id: &str) {
-    use std::os::unix::process::ExitStatusExt;
-    let detail = format!(
-        "status={:?}\nstdout={}\nstderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        out.status.signal(),
-        Some(SIGABRT),
-        "the child must die by abort() at the fault point: {detail}"
-    );
-    let reached = std::fs::read_to_string(marker)
-        .unwrap_or_else(|e| panic!("fault-point marker {marker:?} missing ({e}): {detail}"));
-    assert_eq!(reached, id, "the abort must happen while updating {id}");
+        env,
+    )
 }
 
 // ------------------------------------------------------------------
@@ -313,7 +262,7 @@ async fn sqlite_sal_crash_between_patch_and_transition_leaves_row_unchanged_3152
             spawn_child(
                 "sqlite_sal_crash_child_3152",
                 &[
-                    (CHILD_ROLE_ENV, ROLE_SQLITE_SAL),
+                    (in_tx_fault::CHILD_ROLE_ENV, ROLE_SQLITE_SAL),
                     (CHILD_DB_ENV, &path.to_string_lossy()),
                     (CHILD_ID_ENV, &id),
                     (CHILD_MARKER_ENV, &marker.to_string_lossy()),
@@ -323,7 +272,7 @@ async fn sqlite_sal_crash_between_patch_and_transition_leaves_row_unchanged_3152
     })
     .await
     .expect("join the child spawn");
-    assert_aborted_at_fault_point(&out, &marker, &mem.id);
+    in_tx_fault::assert_aborted_at_fault_point(&out, &marker, &mem.id);
 
     // Direct store read after the crash: the row is fully unchanged.
     let reopened = crate::store::sqlite::SqliteStore::open(path.clone()).expect("reopen");
@@ -498,13 +447,13 @@ mod pg {
         let out = spawn_child(
             "pg::pg_crash_child_3152",
             &[
-                (CHILD_ROLE_ENV, role),
+                (in_tx_fault::CHILD_ROLE_ENV, role),
                 (PG_URL_ENV, &url),
                 (CHILD_ID_ENV, &mem.id),
                 (CHILD_MARKER_ENV, &marker.to_string_lossy()),
             ],
         );
-        assert_aborted_at_fault_point(&out, &marker, &mem.id);
+        in_tx_fault::assert_aborted_at_fault_point(&out, &marker, &mem.id);
         // Direct store read after the crash: the child's transaction died
         // with its connection, so the row is fully unchanged.
         let row = rt
