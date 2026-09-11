@@ -8585,7 +8585,7 @@ impl PostgresStore {
         // an illegal edge rolls the patch back with it, and the returned
         // version counts the transition's bump too.
         #[cfg(test)]
-        crate::recover::durability::in_tx_fault::patched_before_lifecycle(id);
+        crate::recover::in_tx_fault::patched_before_lifecycle(id);
         let transitioned =
             lifecycle_tx_3152::apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target).await?;
         tx.commit()
@@ -23573,7 +23573,7 @@ impl MemoryStore for PostgresStore {
         // illegal edge or a crash in between leaves the row untouched.
         // `lifecycle_target` was captured before the binds moved `patch`.
         #[cfg(test)]
-        crate::recover::durability::in_tx_fault::patched_before_lifecycle(id);
+        crate::recover::in_tx_fault::patched_before_lifecycle(id);
         lifecycle_tx_3152::apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target).await?;
         tx.commit()
             .await

@@ -755,7 +755,7 @@ impl MemoryStore for SqliteStore {
                 patch.valid_until.as_deref(),
             )?;
             #[cfg(test)]
-            crate::recover::durability::in_tx_fault::patched_before_lifecycle(id);
+            crate::recover::in_tx_fault::patched_before_lifecycle(id);
             // #1726 — apply an optional lifecycle transition through the
             // self-validating storage primitive (SELECT-current →
             // can_transition_to → typed InvalidTransition). A request equal
