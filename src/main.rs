@@ -145,6 +145,12 @@ fn main() -> Result<()> {
     // token aborts the boot right here, before anything else starts. The
     // async body logs the stashed pin report via the READ-ONLY
     // `security_profile::runtime_boot_report`.
+    //
+    // #3200 R2/R4 — the boolean-knob sweep runs FIRST: an unrecognised token
+    // on any registered MANDATE/HATCH knob refuses boot (naming the knob,
+    // the token and the accepted grammar), and a token whose meaning changed
+    // in v1.0.0 gets a one-shot WARN, before the posture pins anything.
+    ai_memory::env_flag::enforce_at_boot_pre_runtime()?;
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
     // #3582: evaluate the argv peer lists even with quorum_writes=0, before

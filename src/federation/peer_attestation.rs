@@ -381,14 +381,14 @@ fn warn_present_but_empty_once() {
 /// (legacy behaviour: trust the body field).
 #[must_use]
 pub fn trust_body_agent_id_bypass() -> bool {
-    matches!(std::env::var(TRUST_BODY_AGENT_ID_ENV).as_deref(), Ok("1"))
+    crate::env_flag::knobs::FED_TRUST_BODY_AGENT_ID.enabled()
 }
 
 /// Whether the operator has explicitly opted out of #239 scope
 /// filtering (legacy behaviour: full database dump per peer).
 #[must_use]
 pub fn sync_trust_peer_bypass() -> bool {
-    matches!(std::env::var(SYNC_TRUST_PEER_ENV).as_deref(), Ok("1"))
+    crate::env_flag::knobs::FED_SYNC_TRUST_PEER.enabled()
 }
 
 /// #238 attestation core.

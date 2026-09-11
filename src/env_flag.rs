@@ -692,10 +692,16 @@ fn unrecognised(knob: &BoolKnob, shown: &str) -> String {
 /// # Errors
 /// One or more registered knobs carry an unrecognised (or non-UTF-8) value.
 pub fn sweep() -> Result<Vec<String>, String> {
+    sweep_with(env_token)
+}
+
+/// [`sweep`] over an injected lookup, so the refusal and warning paths are
+/// proven without mutating the process environment.
+fn sweep_with(lookup: impl Fn(&str) -> Option<Result<String, ()>>) -> Result<Vec<String>, String> {
     let mut refusals = Vec::new();
     let mut warnings = Vec::new();
     for knob in REGISTRY {
-        match env_token(knob.env) {
+        match lookup(knob.env) {
             None => {}
             Some(Err(())) => refusals.push(unrecognised(knob, "<non-UTF-8 value>")),
             Some(Ok(v)) => {
@@ -740,6 +746,130 @@ mod tests {
     ];
     const UNSET: &[&str] = &["", " ", "\t", "\n"];
     const UNRECOGNISED: &[&str] = &["maybe", "2", "enable", "y", "n", "t", "1 1", "truee", "on!"];
+
+    /// Lookup built from literal `(env, value)` pairs; no env mutation.
+    fn lookup_of(
+        pairs: &[(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<Result<String, ()>> {
+        let owned: Vec<(&'static str, String)> =
+            pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+        move |name: &str| {
+            owned
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| Ok(v.clone()))
+        }
+    }
+
+    #[test]
+    fn registry_env_names_are_unique_and_prefixed_3200() {
+        let mut seen = std::collections::HashSet::new();
+        for knob in REGISTRY {
+            assert!(knob.env.starts_with("AI_MEMORY_"), "{}", knob.env);
+            assert!(
+                seen.insert(knob.env),
+                "duplicate registry entry {}",
+                knob.env
+            );
+        }
+    }
+
+    /// R2 — an unrecognised token on a MANDATE and on a HATCH both refuse,
+    /// naming the knob, the token and the accepted grammar; empty is unset.
+    #[test]
+    fn sweep_refuses_unrecognised_on_mandates_and_hatches_3200() {
+        let err = sweep_with(lookup_of(&[
+            (knobs::REQUIRE_TLS.env, "maybe"),
+            (knobs::ALLOW_PLAINTEXT_NONLOOPBACK.env, "sure"),
+            (knobs::REQUIRE_API_KEY.env, ""),
+        ]))
+        .expect_err("unrecognised tokens must refuse boot");
+        for (env, token) in [
+            (knobs::REQUIRE_TLS.env, "\"maybe\""),
+            (knobs::ALLOW_PLAINTEXT_NONLOOPBACK.env, "\"sure\""),
+        ] {
+            assert!(err.contains(env) && err.contains(token), "{err}");
+        }
+        assert!(err.contains(ACCEPTED_GRAMMAR), "{err}");
+        assert!(
+            !err.contains(knobs::REQUIRE_API_KEY.env),
+            "an empty value is unset, never unrecognised: {err}"
+        );
+        let non_utf8 =
+            sweep_with(|name: &str| (name == knobs::REQUIRE_WITNESS.env).then_some(Err(())))
+                .expect_err("a non-UTF-8 value is not a token of the grammar");
+        assert!(non_utf8.contains(knobs::REQUIRE_WITNESS.env), "{non_utf8}");
+        assert_eq!(sweep_with(lookup_of(&[])), Ok(Vec::new()));
+    }
+
+    /// R4 (w2) — a token that changed meaning warns once, in BOTH directions,
+    /// naming the old and the new reading; an unchanged token is silent.
+    #[test]
+    fn sweep_warns_on_changed_meaning_both_directions_3200() {
+        let warnings = sweep_with(lookup_of(&[
+            // Was ignored (old `1|true` reader), now ON.
+            (knobs::REQUIRE_TLS.env, "yes"),
+            // Was ON (old case-sensitive default-on reader), now OFF.
+            (knobs::FED_REQUIRE_SIG.env, "FALSE"),
+            // Unchanged: the old reader also read `1` as ON.
+            (knobs::REQUIRE_API_KEY.env, "1"),
+        ]))
+        .expect("recognised tokens never refuse");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains(knobs::REQUIRE_TLS.env)
+                && w.contains("read it as OFF")
+                && w.contains("reads it as ON")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(knobs::FED_REQUIRE_SIG.env)
+                    && w.contains("read it as ON")
+                    && w.contains("reads it as OFF")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The four findings folded into #3200, pinned at the knob level.
+    #[test]
+    fn folded_findings_read_through_the_shared_grammar_3618_3619_3620_3621() {
+        // #3618 — `yes` meets the asi-hard floor AND arms the live reader.
+        assert!(knobs::REQUIRE_AGENT_ATTESTATION.value_enabled("yes"));
+        assert_eq!(
+            resolve(Some("yes"), knobs::REQUIRE_AGENT_ATTESTATION.polarity),
+            Some(true)
+        );
+        // #3619 — case variants arm the quarantine.
+        for t in ["TRUE", "Yes", "ON"] {
+            assert!(knobs::FED_QUARANTINE_UNATTRIBUTED.value_enabled(t), "{t}");
+        }
+        // #3620 — ONE knob serves both lax-permission readers, so `yes`
+        // opens (or not) the passphrase file and the key file alike.
+        assert!(knobs::PASSPHRASE_FILE_ALLOW_LAX_PERMS.value_enabled("yes"));
+        // #3621 — padded tokens enable at-rest encryption.
+        for t in [" 1", "true ", "YES"] {
+            assert!(knobs::ENCRYPT_AT_REST.value_enabled(t), "{t:?}");
+        }
+    }
+
+    /// Hatches and the attestation-style knobs read garbage as the SECURE
+    /// side, and the attestation knob keeps its per-surface default unset.
+    #[test]
+    fn registered_knobs_fail_closed_by_polarity_3200() {
+        for knob in REGISTRY {
+            let garbage = knob.value_enabled("garbage");
+            assert_eq!(
+                garbage,
+                knob.polarity == Polarity::Mandate,
+                "{} must read garbage as the secure side",
+                knob.env
+            );
+        }
+        assert_eq!(knobs::REQUIRE_AGENT_ATTESTATION.default, None);
+        assert_eq!(knobs::PG_AT_REST_ATTESTED.polarity, Polarity::Hatch);
+    }
 
     #[test]
     fn grammar_table_classifies_every_token_3200() {
