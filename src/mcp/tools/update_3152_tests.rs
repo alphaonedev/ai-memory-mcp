@@ -77,6 +77,21 @@ fn mcp_illegal_edge_rolls_the_patch_back_and_refunds_the_growth_3152() {
         before,
         "the growth charge must be refunded for bytes that never landed"
     );
+
+    // Control: the same growth on a LEGAL edge is charged to OWNER, so the
+    // equality above is a refund, not a charge that never happened.
+    handle_update(
+        &conn,
+        &json!({ "id": id, "content": "x".repeat(20_000), "lifecycle_state": "active" }),
+        None,
+        None,
+        None,
+    )
+    .expect("open -> active is legal");
+    assert!(
+        storage_bytes(&conn) > before,
+        "a landed growth patch must be charged to the row owner"
+    );
 }
 
 /// At the fault point the patch has executed but a second connection still
