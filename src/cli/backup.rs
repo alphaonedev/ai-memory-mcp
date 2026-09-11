@@ -1196,6 +1196,24 @@ struct BackupPolicy {
     signer: std::result::Result<ed25519_dalek::SigningKey, String>,
     /// The operator public key `restore` verifies against on this host.
     anchor: Option<ed25519_dalek::VerifyingKey>,
+    /// v1.0.0 #3605 — directory fsync ([`sync_dir`] in production; tests
+    /// inject a failure).
+    sync_dir: fn(&Path) -> std::io::Result<()>,
+    /// v1.0.0 #3604 — rotation's unlink (`std::fs::remove_file` in
+    /// production; tests inject a failure).
+    remove_file: fn(&Path) -> std::io::Result<()>,
+}
+
+/// v1.0.0 #3604 — what rotation did.
+#[derive(Debug, Default, serde::Serialize)]
+struct RotationReport {
+    /// Snapshot file names removed (with their manifests).
+    removed: Vec<String>,
+    /// Snapshot file names kept because their manifest does not verify:
+    /// rotation never deletes a backup it cannot prove is one.
+    kept_unverified: Vec<String>,
+    /// `<name>: <error>` for every file rotation could not remove.
+    remove_failures: Vec<String>,
 }
 
 /// `backup` handler.
@@ -1212,6 +1230,8 @@ pub fn run_backup(
         asi_hard: crate::security_profile::is_asi_hard(),
         signer,
         anchor: crate::governance::rules_store::resolve_operator_pubkey(),
+        sync_dir,
+        remove_file: |path| std::fs::remove_file(path),
     };
     run_backup_with(db_path, args, json_out, out, &policy)
 }
@@ -1425,14 +1445,41 @@ fn run_backup_with(
         };
         manifest::sign_into(&mut manifest, &payload, key)?;
     }
-    let manifest_path = args.to.join(format!("ai-memory-{ts}.manifest.json"));
+    // v1.0.0 #3605 — the new pair has to be durable before anything older is
+    // rotated away. Each fsync that fails is reported (`durable: false`),
+    // rotation is then skipped, and under asi-hard the command exits non-zero
+    // once the output is written.
+    let manifest_path = args.to.join(manifest_file_name(&format!("ai-memory-{ts}")));
     let manifest_text = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&manifest_path, manifest_text.as_bytes())?;
-
-    // Rotation — newest-first listing, drop everything past `keep`.
-    if args.keep > 0 {
-        prune_old_snapshots(&args.to, args.keep)?;
+    let durability_failures = write_backup_pair_durably(
+        &snapshot_path,
+        &manifest_path,
+        &manifest_text,
+        policy.sync_dir,
+    )?;
+    let durable = durability_failures.is_empty();
+    if !durable {
+        writeln!(
+            out.stderr,
+            "WARNING: the backup was written but is NOT durable ({}); after a power loss it \
+             may be missing or incomplete. Older backups were NOT rotated (#3605)",
+            durability_failures.join("; ")
+        )?;
     }
+
+    // v1.0.0 #3604 — rotation by the SIGNED creation time, only after a
+    // durable pair, never deleting a backup it cannot verify.
+    let rotation = if durable && args.keep > 0 {
+        Some(prune_old_snapshots(
+            &args.to,
+            args.keep,
+            policy.anchor.as_ref(),
+            policy.remove_file,
+            out,
+        )?)
+    } else {
+        None
+    };
 
     // #2444 — an empty corpus is REPORTED, not refused. A row count cannot
     // tell a legitimately-fresh SQLite deployment apart from a wrong-store
@@ -1458,6 +1505,10 @@ fn run_backup_with(
         // alarm on an unsigned one without parsing the signature fields.
         let mut envelope = serde_json::to_value(&manifest)?;
         envelope["signed"] = serde_json::Value::Bool(manifest.signature.is_some());
+        // v1.0.0 #3605/#3604 — durability of the new pair, and what rotation
+        // did (`null` when it was skipped: `--keep 0`, or a non-durable pair).
+        envelope["durable"] = serde_json::Value::Bool(durable);
+        envelope["rotation"] = serde_json::to_value(&rotation)?;
         writeln!(out.stdout, "{envelope}")?;
     } else {
         writeln!(out.stdout, "Snapshot: {}", snapshot_path.display())?;
@@ -1473,24 +1524,149 @@ fn run_backup_with(
                  --allow-unsigned-manifest"
             )?,
         }
+        writeln!(
+            out.stdout,
+            "Durable : {}",
+            if durable {
+                "yes"
+            } else {
+                "NO — see the warning above"
+            }
+        )?;
+    }
+    if !durable && policy.asi_hard {
+        anyhow::bail!(
+            "backup: the new backup is not durable; the asi-hard posture reports this as a \
+             failure (older backups were not rotated) (#3605)"
+        );
     }
     Ok(())
 }
 
-/// Enumerate existing `ai-memory-*.db` snapshot files newest-first and
-/// delete everything past `keep`. Also deletes the matching manifest
-/// for each removed snapshot.
-fn prune_old_snapshots(dir: &Path, keep: usize) -> Result<()> {
-    let snaps = snapshots_newest_first(dir)?;
-    for (_, path) in snaps.into_iter().skip(keep) {
-        let _ = std::fs::remove_file(&path);
-        // Matching manifest (same stem, .manifest.json extension pattern)
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            let manifest = dir.join(manifest_file_name(stem));
-            let _ = std::fs::remove_file(manifest);
+/// v1.0.0 #3605 — make a fresh backup pair durable: fsync the snapshot `VACUUM
+/// INTO` wrote, publish the manifest through a same-directory temp file
+/// (created owner-only, written, fsynced) renamed into place, then fsync the
+/// directory so both entries survive a power cut.
+///
+/// Returns the fsync steps that FAILED (empty = durable); a manifest that
+/// cannot be written at all is an error instead.
+///
+/// # Errors
+/// The manifest's temp file cannot be created, written or renamed.
+fn write_backup_pair_durably(
+    snapshot: &Path,
+    manifest_path: &Path,
+    manifest_text: &str,
+    sync_dir: fn(&Path) -> std::io::Result<()>,
+) -> Result<Vec<String>> {
+    let mut failures = Vec::new();
+    if let Err(e) = std::fs::File::open(snapshot).and_then(|f| f.sync_all()) {
+        failures.push(format!("fsync {}: {e}", snapshot.display()));
+    }
+    let dir = publish_dir(manifest_path);
+    let file_name = manifest_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    // A leftover from a crashed run with the same pid; `create_new` below
+    // would refuse it, and removing a planted symlink removes only the link.
+    let _ = std::fs::remove_file(&tmp);
+    drop(copy_into_new_file(&mut manifest_text.as_bytes(), &tmp, None)?);
+    if let Err(e) = std::fs::rename(&tmp, manifest_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!(
+            "publishing the manifest {}",
+            manifest_path.display()
+        )));
+    }
+    if let Err(e) = sync_dir(dir) {
+        failures.push(format!("fsync {}: {e}", dir.display()));
+    }
+    Ok(failures)
+}
+
+/// v1.0.0 #3604 — keep the `keep` newest backups by their SIGNED creation
+/// time and delete the rest with their manifests.
+///
+/// Before #3604 this ordered by modification time and deleted blindly, so a
+/// writer of the directory could plant future-dated files and have every
+/// real backup rotated away. Now only backups whose manifest verifies under
+/// `anchor` are ordered or counted, and a file that does not verify is NEVER
+/// deleted: it is reported and left alone. A removal that fails is reported
+/// too, never swallowed.
+///
+/// # Errors
+/// The directory cannot be listed, or the report cannot be written.
+fn prune_old_snapshots(
+    dir: &Path,
+    keep: usize,
+    anchor: Option<&ed25519_dalek::VerifyingKey>,
+    remove_file: fn(&Path) -> std::io::Result<()>,
+    out: &mut CliOutput<'_>,
+) -> Result<RotationReport> {
+    let mut report = RotationReport::default();
+    let mut verified: Vec<(chrono::DateTime<chrono::FixedOffset>, String, PathBuf)> = Vec::new();
+    for path in snapshot_files_by_name(dir)? {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let signed_at = std::fs::read_to_string(dir.join(manifest_file_name(&id)))
+            .ok()
+            .and_then(|text| manifest::verify(&text, anchor).ok())
+            .and_then(|verdict| match verdict {
+                manifest::ManifestVerdict::Signed(payload) if payload.snapshot == name => {
+                    chrono::DateTime::parse_from_rfc3339(&payload.created_at).ok()
+                }
+                _ => None,
+            });
+        match signed_at {
+            Some(at) => verified.push((at, name, path)),
+            None => report.kept_unverified.push(name),
         }
     }
-    Ok(())
+    verified.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+    for (_, name, path) in verified.into_iter().skip(keep) {
+        if let Err(e) = remove_file(&path) {
+            report.remove_failures.push(format!("{name}: {e}"));
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let manifest = manifest_file_name(&id);
+        if let Err(e) = remove_file(&dir.join(&manifest)) {
+            report.remove_failures.push(format!("{manifest}: {e}"));
+        }
+        report.removed.push(name);
+    }
+    if !report.kept_unverified.is_empty() {
+        writeln!(
+            out.stderr,
+            "WARNING: rotation kept {} backup(s) whose manifest does not verify under the \
+             operator key and never deletes such a file: {}. Remove them by hand once you \
+             no longer need them (#3604)",
+            report.kept_unverified.len(),
+            report.kept_unverified.join(", ")
+        )?;
+    }
+    if !report.remove_failures.is_empty() {
+        writeln!(
+            out.stderr,
+            "WARNING: rotation could not remove: {} (#3604)",
+            report.remove_failures.join("; ")
+        )?;
+    }
+    Ok(report)
 }
 
 /// v1.0.0 #3550 — how the snapshot being restored was chosen, reported as
@@ -1531,29 +1707,6 @@ const SNAPSHOT_FILE_EXT: &str = "db";
 /// Suffix of a manifest file name (`<id>.manifest.json`); see
 /// [`manifest_file_name`].
 const MANIFEST_FILE_SUFFIX: &str = ".manifest.json";
-
-/// Every `ai-memory-*.db` snapshot in `dir`, with its mtime, newest first.
-fn snapshots_newest_first(dir: &Path) -> Result<Vec<(std::time::SystemTime, PathBuf)>> {
-    let mut snaps: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?.to_owned();
-            let is_snapshot = name.starts_with(SNAPSHOT_FILE_PREFIX)
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case(SNAPSHOT_FILE_EXT));
-            if is_snapshot {
-                let mtime = entry.metadata().ok()?.modified().ok()?;
-                Some((mtime, path))
-            } else {
-                None
-            }
-        })
-        .collect();
-    snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
-    Ok(snaps)
-}
 
 /// v1.0.0 #3550 — the snapshot id `--snapshot` names: the file name, the id
 /// (stem) or the manifest file name all reduce to the stem. `None` when
@@ -2698,10 +2851,25 @@ mod tests {
     /// v1.0.0 #3199 — standard posture, signing with and verifying against
     /// [`test_operator_key`].
     fn test_backup_policy() -> BackupPolicy {
+        backup_policy(
+            false,
+            Ok(test_operator_key()),
+            Some(test_operator_key().verifying_key()),
+        )
+    }
+
+    /// v1.0.0 #3199 — a backup policy with real filesystem hooks.
+    fn backup_policy(
+        asi_hard: bool,
+        signer: std::result::Result<ed25519_dalek::SigningKey, String>,
+        anchor: Option<ed25519_dalek::VerifyingKey>,
+    ) -> BackupPolicy {
         BackupPolicy {
-            asi_hard: false,
-            signer: Ok(test_operator_key()),
-            anchor: Some(test_operator_key().verifying_key()),
+            asi_hard,
+            signer,
+            anchor,
+            sync_dir,
+            remove_file: |path| std::fs::remove_file(path),
         }
     }
 

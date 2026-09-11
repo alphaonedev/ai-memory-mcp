@@ -490,11 +490,7 @@ fn asi_hard_backup_refuses_what_it_could_not_verify_3199() {
     ];
     for (i, (signer, anchor, needle)) in cases.into_iter().enumerate() {
         let dir = db.parent().unwrap().join(format!("backups-3199-hard-{i}"));
-        let policy = BackupPolicy {
-            asi_hard: true,
-            signer,
-            anchor,
-        };
+        let policy = backup_policy(true, signer, anchor);
         let res = {
             let mut out = env.output();
             run_backup_with(
@@ -524,11 +520,7 @@ fn standard_backup_without_a_key_is_unsigned_and_says_so_3199() {
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");
     let dir = db.parent().unwrap().join("backups-3199-nokey");
-    let policy = BackupPolicy {
-        asi_hard: false,
-        signer: Err("no key here".to_owned()),
-        anchor: None,
-    };
+    let policy = backup_policy(false, Err("no key here".to_owned()), None);
     {
         let mut out = env.output();
         run_backup_with(
@@ -587,4 +579,153 @@ fn a_planted_sha_only_manifest_beside_a_bak_is_refused_3199() {
     args.skip_verify = true;
     restore(&mut env, &db, &args, test_restore_policy(false)).expect("the --skip-verify escape");
     assert_eq!(envelope(&env)[VERIFICATION], serde_json::json!("skipped"));
+}
+
+// ---------------------------------------------------------------------------
+// #3605 — a backup is durable before anything older is rotated away.
+// #3604 — rotation orders by the SIGNED creation time and never deletes a
+//         backup it cannot verify.
+// ---------------------------------------------------------------------------
+
+fn failing_sync(_: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("injected fsync failure"))
+}
+
+fn failing_remove(_: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("injected unlink failure"))
+}
+
+/// `backup --json` into `dir` with `policy`; the envelope is returned even
+/// when the command then fails (it is written first).
+fn backup_json(
+    env: &mut TestEnv,
+    db: &Path,
+    dir: &Path,
+    keep: usize,
+    policy: &BackupPolicy,
+) -> (Result<()>, serde_json::Value) {
+    env.stdout.clear();
+    env.stderr.clear();
+    let res = {
+        let mut out = env.output();
+        run_backup_with(
+            db,
+            &BackupArgs {
+                to: dir.to_path_buf(),
+                keep,
+                store_url: None,
+            },
+            true,
+            &mut out,
+            policy,
+        )
+    };
+    (res, envelope(env))
+}
+
+/// A directory fsync that fails: `durable: false`, a WARN, and NO rotation
+/// (the older backup survives); asi-hard additionally exits non-zero.
+#[test]
+fn a_non_durable_backup_is_reported_and_rotates_nothing_3605() {
+    let _g = lock();
+    let mut env = TestEnv::fresh();
+    let db = env.db_path.clone();
+    seed_memory(&db, "ns", "t", "c");
+    for asi_hard in [false, true] {
+        let dir = db
+            .parent()
+            .unwrap()
+            .join(format!("backups-3605-{asi_hard}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let older = super::publish_3550::plant_snapshot(&mut env, &dir, JANUARY, 1);
+        let mut policy = test_backup_policy();
+        policy.asi_hard = asi_hard;
+        policy.sync_dir = failing_sync;
+        let (res, v) = backup_json(&mut env, &db, &dir, 1, &policy);
+        if asi_hard {
+            assert_refused(res, "not durable");
+        } else {
+            res.expect("standard reports, does not fail");
+        }
+        assert_eq!(v["durable"], serde_json::json!(false), "{v}");
+        assert!(v["rotation"].is_null(), "rotation must be skipped: {v}");
+        assert!(env.stderr_str().contains("NOT durable"), "{}", env.stderr_str());
+        assert!(older.exists(), "asi_hard={asi_hard}: nothing older was rotated");
+    }
+}
+
+/// Planted future-dated junk neither counts toward `--keep` nor is deleted;
+/// real backups rotate by their SIGNED time.
+#[test]
+fn rotation_orders_by_signed_time_and_keeps_what_it_cannot_verify_3604() {
+    let _g = lock();
+    let mut env = TestEnv::fresh();
+    let db = env.db_path.clone();
+    seed_memory(&db, "ns", "t", "c");
+    let dir = db.parent().unwrap().join("backups-3604-order");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let january = super::publish_3550::plant_snapshot(&mut env, &dir, JANUARY, 1);
+    let june = super::publish_3550::plant_snapshot(&mut env, &dir, JUNE, 1);
+    let future = std::time::SystemTime::now()
+        + std::time::Duration::from_secs(
+            u64::try_from(crate::SECS_PER_DAY).expect("positive const"),
+        );
+    let mut junk = Vec::new();
+    for month in 1..=3 {
+        let path = dir.join(format!("ai-memory-2099-0{month}-01T000000Z.db"));
+        std::fs::write(&path, b"not a backup").expect("plant junk");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(future))
+            .expect("future mtime");
+        junk.push(path);
+    }
+    let (res, v) = backup_json(&mut env, &db, &dir, 2, &test_backup_policy());
+    res.expect("backup");
+    assert_eq!(v["durable"], serde_json::json!(true), "{v}");
+    let removed = v["rotation"]["removed"].as_array().expect("removed list");
+    assert_eq!(
+        removed,
+        &vec![serde_json::json!(format!("{JANUARY}.db"))],
+        "only the oldest SIGNED backup rotates: {v}"
+    );
+    assert_eq!(
+        v["rotation"]["kept_unverified"]
+            .as_array()
+            .expect("kept list")
+            .len(),
+        3,
+        "{v}"
+    );
+    assert!(!january.exists(), "rotated");
+    assert!(june.exists(), "within --keep 2");
+    assert!(junk.iter().all(|p| p.exists()), "never deletes what it cannot verify");
+    assert!(env.stderr_str().contains("never deletes"), "{}", env.stderr_str());
+}
+
+/// A removal that fails is reported, not swallowed, and the file stays.
+#[test]
+fn rotation_reports_a_removal_it_could_not_make_3604() {
+    let _g = lock();
+    let mut env = TestEnv::fresh();
+    let db = env.db_path.clone();
+    seed_memory(&db, "ns", "t", "c");
+    let dir = db.parent().unwrap().join("backups-3604-fail");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let january = super::publish_3550::plant_snapshot(&mut env, &dir, JANUARY, 1);
+    let mut policy = test_backup_policy();
+    policy.remove_file = failing_remove;
+    let (res, v) = backup_json(&mut env, &db, &dir, 1, &policy);
+    res.expect("a failed removal does not fail the backup");
+    let failures = v["rotation"]["remove_failures"]
+        .as_array()
+        .expect("failures list");
+    assert_eq!(failures.len(), 1, "{v}");
+    assert!(
+        failures[0].as_str().unwrap_or_default().contains(JANUARY),
+        "{v}"
+    );
+    assert!(january.exists(), "the file it could not remove is still there");
+    assert!(env.stderr_str().contains("could not remove"), "{}", env.stderr_str());
 }
