@@ -923,6 +923,8 @@ pub use connection::open_read_only;
 pub use connection::{MISSING_DATABASE_REFUSAL, open_existing_read_only};
 // v1.0.0 #2445 — the EGRESS + guard surface (see `schema_guard` module docs).
 pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stamp};
+// v1.0.0 #3152 — one write transaction for a multi-statement logical write.
+pub use connection::in_write_txn;
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
 // seeding hook (`daemon_runtime::run`); the DEFAULT const is the
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
@@ -3699,6 +3701,13 @@ impl std::error::Error for InvalidTransition {}
 /// Returns `true` when a row was updated, `false` when `id` did not match
 /// a live row (no transition to validate).
 ///
+/// #3152 — the read and the write run in ONE write transaction
+/// ([`in_write_txn`]): standalone, `BEGIN IMMEDIATE` holds the write lock
+/// across both, so two racing transitions can no longer validate from the
+/// same prior state; inside a caller's transaction (the update funnels) it
+/// joins that transaction, so the transition commits or rolls back WITH the
+/// content patch.
+///
 /// # Errors
 ///
 /// * [`InvalidTransition`] — the `current → state` edge is not permitted.
@@ -3708,41 +3717,44 @@ pub fn set_lifecycle_state(
     id: &str,
     state: crate::models::LifecycleState,
 ) -> Result<bool> {
-    // #1726 — read the current state and validate the edge before writing.
-    use rusqlite::OptionalExtension;
-    let current: Option<String> = conn
-        .query_row(
-            "SELECT lifecycle_state FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(current_str) = current else {
-        return Ok(false);
-    };
-    let from = crate::models::LifecycleState::from_str(&current_str).unwrap_or_default();
-    // A no-op (requested == current) is idempotent success, not a self-loop
-    // error — mirrors the `memory_update` handler contract ("a request equal
-    // to the stored state is a no-op, no error"). Lets the patch / HTTP
-    // callers pass the current state through without a pre-check.
-    if from == state {
-        return Ok(true);
-    }
-    if !from.can_transition_to(state) {
-        return Err(InvalidTransition {
-            id: id.to_string(),
-            from,
-            to: state,
+    in_write_txn(conn, || {
+        // #1726 — read the current state and validate the edge before writing.
+        use rusqlite::OptionalExtension;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT lifecycle_state FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(current_str) = current else {
+            return Ok(false);
+        };
+        let from = crate::models::LifecycleState::from_str(&current_str).unwrap_or_default();
+        // A no-op (requested == current) is idempotent success, not a
+        // self-loop error — mirrors the `memory_update` handler contract ("a
+        // request equal to the stored state is a no-op, no error"). Lets the
+        // patch / HTTP callers pass the current state through without a
+        // pre-check.
+        if from == state {
+            return Ok(true);
         }
-        .into());
-    }
-    let now = Utc::now().to_rfc3339();
-    let n = conn.execute(
-        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
-         WHERE id = ?3",
-        params![state.as_str(), now, id],
-    )?;
-    Ok(n > 0)
+        if !from.can_transition_to(state) {
+            return Err(InvalidTransition {
+                id: id.to_string(),
+                from,
+                to: state,
+            }
+            .into());
+        }
+        let now = Utc::now().to_rfc3339();
+        let n = conn.execute(
+            "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+             WHERE id = ?3",
+            params![state.as_str(), now, id],
+        )?;
+        Ok(n > 0)
+    })
 }
 
 /// v1.0.0 [#2402] — the operator INSPECTION half of the quarantine route-OUT
@@ -4237,14 +4249,9 @@ pub fn update_with_expected_version(
     // transaction", so we open our own tx ONLY when none is active
     // (`is_autocommit()` is true only outside a transaction); when the
     // caller owns the tx, the archive + UPDATE run inside it and the
-    // caller's commit/rollback covers atomicity.
-    let owns_tx = conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
-    let txn_result = (|| -> Result<(bool, bool)> {
+    // caller's commit/rollback covers atomicity. #3152 — that join is what
+    // lets a caller fold a lifecycle transition into the SAME transaction.
+    connection::in_write_txn(conn, || -> Result<(bool, bool)> {
         if content_changed {
             archive_memory_insert_only(
                 conn,
@@ -4350,23 +4357,7 @@ pub fn update_with_expected_version(
             }
             Err(e) => Err(e.into()),
         }
-    })();
-    match txn_result {
-        Ok(r) => {
-            if let Some(write_txn) = write_txn {
-                write_txn.commit()?;
-            }
-            Ok(r)
-        }
-        Err(e) => {
-            // Only roll back a tx we opened. When the caller owns the tx,
-            // propagating the Err lets THEIR rollback revert the archive.
-            if let Some(write_txn) = write_txn {
-                write_txn.rollback();
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive result

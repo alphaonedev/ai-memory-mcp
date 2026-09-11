@@ -717,50 +717,45 @@ pub async fn update_memory(
         }
         None => None,
     };
-    match db::update_with_expected_version(
-        &lock.0,
-        &resolved_id,
-        body.title.as_deref(),
-        body.content.as_deref(),
-        body.tier.as_ref(),
-        body.namespace.as_deref(),
-        body.tags.as_ref(),
-        body.priority,
-        body.confidence,
-        body.expires_at.as_deref(),
-        preserved_metadata.as_ref(),
-        body.source_uri.as_deref(),
-        if_match_version,
-        // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
-        body.valid_until.as_deref(),
-    ) {
-        Ok((true, _)) => {
-            // v0.8.0 Pillar 2 (#1726) — apply an optional lifecycle
-            // transition through the self-validating storage primitive. An
-            // illegal edge surfaces as a typed `InvalidTransition` → 409
-            // CONFLICT (byte-parity error detail with the postgres branch's
-            // `StoreError::InvalidTransition`); a request equal to the stored
-            // state is an idempotent no-op. `body.lifecycle_state` was already
-            // shape-validated by `validate_update` above.
-            if let Some(target) = body
+    // #3152 — the patch and the optional lifecycle transition are ONE write
+    // transaction (both storage primitives join it), so an illegal edge or a
+    // crash between them leaves the row exactly as it was.
+    let unit = db::in_write_txn(&lock.0, || {
+        let res = db::update_with_expected_version(
+            &lock.0,
+            &resolved_id,
+            body.title.as_deref(),
+            body.content.as_deref(),
+            body.tier.as_ref(),
+            body.namespace.as_deref(),
+            body.tags.as_ref(),
+            body.priority,
+            body.confidence,
+            body.expires_at.as_deref(),
+            preserved_metadata.as_ref(),
+            body.source_uri.as_deref(),
+            if_match_version,
+            // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
+            body.valid_until.as_deref(),
+        )?;
+        // v0.8.0 Pillar 2 (#1726) — apply an optional lifecycle transition
+        // through the self-validating storage primitive. An illegal edge
+        // surfaces as a typed `InvalidTransition` (→ 409 below); a request
+        // equal to the stored state is an idempotent no-op.
+        // `body.lifecycle_state` was already shape-validated by
+        // `validate_update` above.
+        if res.0
+            && let Some(target) = body
                 .lifecycle_state
                 .as_deref()
                 .and_then(crate::models::LifecycleState::from_str)
-                && let Err(e) = db::set_lifecycle_state(&lock.0, &resolved_id, target)
-            {
-                if let Some(it) = e.downcast_ref::<crate::storage::InvalidTransition>() {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({
-                            "status": "conflict",
-                            "id": resolved_id,
-                            "error": it.to_string(),
-                        })),
-                    )
-                        .into_response();
-                }
-                return crate::handlers::errors::handler_error_500(&e);
-            }
+        {
+            db::set_lifecycle_state(&lock.0, &resolved_id, target)?;
+        }
+        Ok(res)
+    });
+    match unit {
+        Ok((true, _)) => {
             let mem = db::get(&lock.0, &resolved_id).ok().flatten();
             // Issue #219: regenerate the embedding when the searchable text
             // (title/content) changed. Without this, the semantic index keeps
@@ -827,6 +822,21 @@ pub async fn update_memory(
             // conflicting update cannot slowly inflate the counter.
             if let Some((ref owner, ref ns, delta)) = quota_charge {
                 let _ = crate::quotas::refund_storage_only(&lock.0, owner, ns, delta);
+            }
+            // #1726 — an illegal lifecycle edge is a 409 CONFLICT (byte-parity
+            // error detail with the postgres branch's
+            // `StoreError::InvalidTransition`). #3152 — the patch rolled back
+            // with it, so the refund above is for bytes that never landed.
+            if let Some(it) = e.downcast_ref::<crate::storage::InvalidTransition>() {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "status": "conflict",
+                        "id": resolved_id,
+                        "error": it.to_string(),
+                    })),
+                )
+                    .into_response();
             }
             // v0.7.0 Provenance Gap 1 (#884) — typed VersionConflict
             // surfaces as 409 with a structured envelope naming both
