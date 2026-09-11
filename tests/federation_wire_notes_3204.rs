@@ -21,7 +21,6 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
-use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
