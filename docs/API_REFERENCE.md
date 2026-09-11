@@ -625,6 +625,35 @@ timestamp that was signed.
 
 This wire is identical across the three store surfaces (MCP
 `memory_store`, this HTTP endpoint, and the CLI `--sign` path).
+
+#### Deterministic supersession (`metadata.ruling_key`) — #3587
+
+A write whose `metadata.ruling_key` is a non-empty string is a **keyed
+store**. It is always inserted under a fresh id (the request is forced to
+`on_conflict = "error"`, so a same-`(title, namespace)` row is a **409**
+conflict, never a merge). In the same transaction the newest live row with
+the same `ruling_key` in the **exact** same namespace (never a prefix) is
+archived with `archive_reason = "superseded"` and
+`metadata.superseded_by = <new id>`, and the new row gets
+`metadata.superseded_id = <old id>` — but only when all of these hold:
+
+- the request carries a **hardened principal**: the single `X-Agent-Id`
+  header, or a `signature` / `write_v2` verified against the signer's
+  bound key. A body `agent_id` or `metadata.agent_id` is a claim and never
+  counts;
+- that principal owns the older row (`metadata.agent_id`), or the body sets
+  `"as_admin": true` and the principal is in the operator admin allowlist
+  (`[admin].agent_ids` / `AI_MEMORY_ADMIN_AGENT_IDS`);
+- the older row has a non-empty owner, and the new row's `created_at` is
+  strictly later.
+
+When a check fails, the new row is still stored, the older row is left
+untouched, a Deny decision is audited, and the response carries
+`"supersede_skipped": "unauthenticated_principal"` (the token never names
+the reason or the older row). On success the response carries
+`"superseded": "<old id>"`. With no matching older row neither field is
+present. A `ruling_key` is write-once: see `PUT` below.
+
 All three generic store surfaces reject namespaces whose trimmed value begins
 with `_`: that prefix is reserved for substrate-owned funnels such as
 `memory_notify` (`_messages/<target>`) and `memory_agent_register` (`_agents`).
@@ -702,6 +731,9 @@ All fields optional. Tier never downgrades.
 ```
 
 - **200** on success, **409** on `(title, namespace)` collision, **404** on missing.
+- **400** when the patch's `metadata` introduces, changes, nulls or retypes
+  `ruling_key` (#3587). Omitting it keeps the stored key; repeating the
+  identical string is accepted.
 
 ### `DELETE /api/v1/memories/{id}` — delete
 
@@ -747,6 +779,11 @@ reconciliation identity a loader can assert on every batch.
 
 Optional `embed_status` / `embed_status_reason` appear only when vectorisation
 degraded — the rows are stored but not yet semantically recallable.
+
+A row carrying `metadata.ruling_key` is rejected with code
+`KEYED_BULK_UNSUPPORTED` (field `ruling_key`) on both backends, and its
+unkeyed siblings still land: supersession is a per-row authority decision,
+so keyed writes go through `POST /api/v1/memories` one at a time (#3587).
 
 **Status.** `200` only when every submitted row landed as its own distinct
 row. `207 Multi-Status` on any partial application. `202 Accepted` when every
@@ -1515,6 +1552,8 @@ authoritative for HTTP.
 | `memory_store` | `expires_at` | ✓ | (via `update`) | HTTP body accepts; documented in the `POST /api/v1/memories` example. On MCP it lives on `memory_update`, not `memory_store`. |
 | `memory_store` | `signature` | ✓ | ✓ | #626 Layer-3 — std-base64 detached Ed25519 over the `SignableWrite` envelope; upgrades `agent_id` claimed→`agent_attested`. Same wire on both transports. |
 | `memory_store` | `created_at` | ✓ | ✓ | #626 Layer-3 — RFC 3339; **required when `signature` is present** (the signed timestamp, adopted verbatim; ±300 s freshness window). #3422 — must be the canonical storage-stable rendering (UTC, `+00:00`, microsecond-truncated). |
+| `memory_store` | `metadata.ruling_key` | ✓ | ✓ | #3587 — keyed store: fresh id, same-title conflict refused, newest same-key row in the exact namespace archived as `superseded` when the hardened principal owns it. Principal channel differs by transport: HTTP reads `X-Agent-Id` or a verified signature; MCP stdio reads `AI_MEMORY_AGENT_ID` or a verified signature (never `clientInfo` or a body `agent_id`). Response adds `superseded` or `supersede_skipped`. |
+| `memory_store` | `as_admin` | ✓ | ✓ | #3587 — cross-owner supersession for a principal in the operator admin allowlist; any other principal is refused (audited), and the new row is still stored. Only meaningful on a keyed store. |
 | `memory_recall` | `format` | ✓ | ✓ | Both transports (#1579 B4). `GET`/`POST /api/v1/recall` negotiate `json` (HTTP default) \| `toon` \| `toon_compact` before doing any work; an unrecognised value is a 400. MCP defaults to `toon_compact`. |
 | `memory_recall` | `context_tokens` | ✓ | ✓ | Both transports. The `POST` body takes a JSON array; the `GET` query string takes the comma-separated form `context_tokens=alpha,beta` (#1622). |
 | `memory_search` | `format` | ✓ | ✓ | Both transports (#1579 B4). `GET /api/v1/search` negotiates the same three values with the same 400-on-unknown rule. |
