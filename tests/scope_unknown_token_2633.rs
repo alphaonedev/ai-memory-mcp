@@ -19,8 +19,8 @@
 //! (`src/store/postgres.rs`), so this predicate was the SOLE scope gate there.
 //!
 //! **The house rule this restores (FBL-14).** An unrecognised token takes the
-//! NARROWEST posture: `federation::receive_auth::env_flag_default_on` keeps
-//! the secure default on an unrecognised token, and `AI_MEMORY_INFERENCE_EGRESS`
+//! NARROWEST posture: `ai_memory::env_flag` reads an unrecognised token as the
+//! secure side of the knob's polarity (#3200), and `AI_MEMORY_INFERENCE_EGRESS`
 //! WARNs and fails closed to `deny` on a typo.
 //!
 //! **Blast-radius / grandfathering.** `scope: "shared"` is a LEGITIMATE
