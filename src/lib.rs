@@ -1578,6 +1578,22 @@ pub fn build_router_with_timeout(
             handlers::routes::MEMORY_CHECK_AGENT_ACTION,
             post(handlers::route_1111::handle_check_agent_action_http),
         )
+        // v1.0.0 #3549 — THE HTTP caller-authority chokepoint. Composed
+        // textually BEFORE (= tower-INSIDE) `api_key_auth`, so it runs
+        // AFTER transport auth has bound `X-Agent-Id` to an enrolled
+        // per-agent key and every `.route(...)` above sits beneath it.
+        // It resolves `identity::authority::Authority` ONCE per request,
+        // refuses a malformed / reserved asserted principal with a typed
+        // 400 before any handler runs, and attaches the result to the
+        // request extensions. `tests/authority_boundary_structural_3549.rs`
+        // enumerates every registration above and proves each is under
+        // this layer or in the checked-in exempt allowlist with a reason.
+        .layer(axum::middleware::from_fn_with_state(
+            handlers::authority::AuthorityLayerState {
+                app: app_state.clone(),
+            },
+            handlers::authority::authority_layer,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
             handlers::api_key_auth,

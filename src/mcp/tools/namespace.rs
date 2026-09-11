@@ -520,7 +520,7 @@ fn handle_namespace_set_standard_inner(
 /// the SAME standard bodies `inject_namespace_standard` serves, so it routes
 /// through the SAME chokepoint ([`super::lookup_namespace_standard`]) and
 /// therefore the SAME canonical
-/// [`crate::visibility::is_visible_to_caller`] predicate — an
+/// `crate::visibility::is_visible_to_caller` predicate — an
 /// injection-only fix would have left an equivalent tool call open. A
 /// withheld standard yields a body-free
 /// [`field_names::STANDARDS_WITHHELD`] count and NO id / title / content /

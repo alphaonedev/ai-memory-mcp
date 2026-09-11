@@ -43,7 +43,15 @@
 //! `true` unconditionally.
 
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
-use ai_memory::visibility::{LEGACY_BROAD_SCOPES, is_visible_to_caller};
+use ai_memory::visibility::{LEGACY_BROAD_SCOPES, is_readable_on_query};
+
+/// #3549 — the bare owner/scope predicate is no longer public; every read
+/// funnel goes through `is_readable_on_query`. Naming the row's OWN namespace
+/// as the requested namespace lifts the #3348 ambient gate, so this is exactly
+/// the retired `is_visible_to_caller(row, caller)` truth table.
+fn is_visible_to_caller(row: &ai_memory::models::Memory, caller: &str) -> bool {
+    is_readable_on_query(row, Some(caller), Some(row.namespace.as_str()))
+}
 
 /// Near-misses of every real scope token, plus the case-variant the
 /// case-sensitive `MemoryScope::from_str` rejects.

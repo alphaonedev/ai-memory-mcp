@@ -107,6 +107,9 @@ pub mod admin_role;
 pub mod agent_api_key;
 pub mod approvals;
 pub mod archive;
+/// v1.0.0 #3549 — the HTTP caller-authority chokepoint (one middleware beneath
+/// `api_key_auth`; every route registration sits under it).
+pub mod authority;
 pub mod bulk;
 pub mod capture_turn;
 pub mod consolidate_federation;

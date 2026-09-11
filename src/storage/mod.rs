@@ -604,7 +604,7 @@ pub(crate) fn compute_visibility_prefixes(as_agent: Option<&str>) -> VisibilityP
 ///
 /// v0.8.0 #1720 A4 — the `Private` arm is now **owner-keyed**, not
 /// namespace-keyed. It delegates to the canonical
-/// [`crate::visibility::is_visible_to_caller`] (owner OR inbox-target)
+/// `crate::visibility::is_visible_to_caller` (owner OR inbox-target)
 /// using `caller` (the agent's `metadata.agent_id`) rather than the
 /// pre-#1720 `&mem.namespace == ns` check, which leaked every private
 /// row in a namespace to any same-namespace caller. `caller` is
@@ -637,9 +637,9 @@ fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes, caller: Option<&str>)
         // v0.8.0 #1720 A4 — owner-keyed: visible iff the caller owns
         // the row or is its inbox target. Fail-closed when `caller` is
         // `None` (no identity → no private rows).
-        MemoryScope::Private => {
-            caller.is_some_and(|c| crate::visibility::is_visible_to_caller(mem, c))
-        }
+        MemoryScope::Private => caller.is_some_and(|c| {
+            crate::visibility::is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str()))
+        }),
         MemoryScope::Team => matches_subtree(&mem.namespace, t.as_deref()),
         MemoryScope::Unit => matches_subtree(&mem.namespace, u.as_deref()),
         MemoryScope::Org => matches_subtree(&mem.namespace, o.as_deref()),
@@ -773,7 +773,7 @@ fn is_archived_source(mem: &Memory) -> bool {
 /// caller owns it (`agent_id_idx = ?caller`) OR the caller is the inbox
 /// recipient (`target_agent_id_idx = ?caller`, the #1720 A1 generated
 /// column projecting `metadata.target_agent_id`). This mirrors the
-/// canonical [`crate::visibility::is_visible_to_caller`] predicate
+/// canonical `crate::visibility::is_visible_to_caller` predicate
 /// (owner OR inbox-target) rather than the pre-#1720 namespace-keyed
 /// `namespace = ?private_ph`, which leaked every private row in a
 /// namespace to any same-namespace caller.
@@ -24701,7 +24701,11 @@ mod tests {
                             && (scope == MemoryScope::Private.as_str()
                                 || scope == MemoryScope::Collective.as_str())
                         {
-                            let canon = crate::visibility::is_visible_to_caller(&m, c);
+                            let canon = crate::visibility::is_readable_on_query(
+                                &m,
+                                Some(c),
+                                Some(m.namespace.as_str()),
+                            );
                             assert_eq!(
                                 sql, canon,
                                 "private/collective must be owner-keyed in ALL THREE — \

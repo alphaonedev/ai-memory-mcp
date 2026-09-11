@@ -109,6 +109,9 @@ pub mod replay;
 // direct write is REJECTED unless AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0;
 // a presented-but-bad sig is always fail-closed regardless of the flag.
 pub mod attest;
+/// v1.0.0 #3549 — the ONE caller-authority resolver beneath every handler
+/// (MCP `tools/call` dispatch + HTTP `authority_layer`).
+pub mod authority;
 // v1.0.0 crypto-core stage 3 (#1942/#1941) — live v2 write-attestation
 // path: composes the stage-1 cbor_array encoder + stage-2 SubkeyCert chain
 // + suite binding into the store-path `write_v2` presentation gate. Additive

@@ -766,7 +766,7 @@ impl CallerContext {
 
     /// The effective principal used by SAL-layer visibility filtering.
     /// Returns `as_agent` when set (Task 1.5 — operator-impersonates-
-    /// agent), else `agent_id`. See [`is_visible_to_caller`].
+    /// agent), else `agent_id`. See `is_visible_to_caller`.
     #[must_use]
     pub fn effective_principal(&self) -> &str {
         self.as_agent.as_deref().unwrap_or(&self.agent_id)
@@ -795,11 +795,10 @@ impl CallerContext {
 /// so the `as_agent` override (operator-impersonates-agent) flows
 /// through correctly.
 /// #951 (Track A QC sweep, 2026-05-20) — single canonical
-/// implementation lives at [`crate::visibility::is_visible_to_caller`].
+/// implementation lives at `crate::visibility::is_visible_to_caller`.
 /// This re-export preserves the existing call-site shape (`crate::
 /// store::is_visible_to_caller`) used by the SAL adapter ports and
 /// substrate code so the move is a no-op for callers.
-pub use crate::visibility::is_visible_to_caller;
 
 /// v1.0.0 #3275 — shared caller-owns-a-link-endpoint predicate for the SAL
 /// `delete_link` funnel. Returns `true` when `caller` may sever the
@@ -1207,7 +1206,7 @@ impl Filter {
 ///
 /// Every query method that returns [`Memory`] rows MUST drop rows the
 /// caller cannot see per the scope=private rule. The canonical
-/// predicate is [`is_visible_to_caller`]; the resolved principal is
+/// predicate is `is_visible_to_caller`; the resolved principal is
 /// [`CallerContext::effective_principal`]. Adapter implementations
 /// apply this filter post-fetch (correctness-equivalent to a SQL
 /// WHERE clause for limit-bounded result sets) so a caller
@@ -4209,7 +4208,7 @@ pub trait MemoryStore: Send + Sync {
     /// signature now requires a [`CallerContext`] and adapters MUST
     /// constrain the DELETE to rows whose `metadata.agent_id`
     /// matches `ctx.effective_principal()` (with the inbox-target
-    /// carve-out preserved by [`is_visible_to_caller`]) UNLESS
+    /// carve-out preserved by `is_visible_to_caller`) UNLESS
     /// `ctx.bypass_visibility` is set — that's the operator/admin
     /// surface (`POST /api/v1/export`'s sibling) and is gated by
     /// the shared admin-role allowlist before the handler ever
@@ -4703,7 +4702,7 @@ pub trait MemoryStore: Send + Sync {
     /// supplies the calling principal so adapters can drop any path
     /// whose node set traverses a scope=private memory the caller
     /// does not own. The fail-closed posture matches the canonical
-    /// [`is_visible_to_caller`] contract — if the predicate cannot
+    /// `is_visible_to_caller` contract — if the predicate cannot
     /// resolve a node, that path is dropped (defense in depth against
     /// race conditions between traversal and fetch).
     ///

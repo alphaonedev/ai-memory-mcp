@@ -881,7 +881,7 @@ pub fn handle_recall(
 /// dispatch layer via
 /// [`crate::identity::resolve_read_visibility_caller`]) into
 /// [`handle_recall_dto`], which post-filters every retrieval branch by
-/// the canonical [`crate::visibility::is_visible_to_caller`] predicate.
+/// the canonical `crate::visibility::is_visible_to_caller` predicate.
 /// `None` preserves the single-tenant trust-all read posture.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_recall_caller(

@@ -68,7 +68,7 @@ pub(super) const NOT_FOUND_MSG: &str = crate::errors::msg::MEMORY_NOT_FOUND;
 /// either id from `memory_get`).
 ///
 /// The predicate is the single canonical
-/// [`crate::visibility::is_visible_to_caller`] — never re-implement it at a
+/// `crate::visibility::is_visible_to_caller` — never re-implement it at a
 /// call site (#951). `caller == None` is the single-tenant trust-all posture
 /// and is preserved unchanged.
 ///
@@ -80,7 +80,11 @@ pub(super) fn mask_invisible(
     row: Option<crate::models::Memory>,
     caller: Option<&str>,
 ) -> Option<crate::models::Memory> {
-    row.filter(|mem| caller.is_none_or(|c| crate::visibility::is_visible_to_caller(mem, c)))
+    row.filter(|mem| {
+        caller.is_none_or(|c| {
+            crate::visibility::is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str()))
+        })
+    })
 }
 
 pub(super) fn handle_get(

@@ -99,7 +99,7 @@ use sqlx::{PgPool, Row};
 use super::{
     CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter, KgBackend,
     KgInvalidateRow, KgQueryRow, KgTimelineRow, MemoryStore, ReplayTranscriptEntry, StoreError,
-    StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
+    StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
@@ -9162,7 +9162,7 @@ impl PostgresStore {
     /// federation catch-up / GC only) sees every row.
     ///
     /// The authority for that contract is the in-process
-    /// [`crate::visibility::is_visible_to_caller`] re-filter, NOT the SQL
+    /// `crate::visibility::is_visible_to_caller` re-filter, NOT the SQL
     /// predicate — the SQL arm is a coarse private-row pre-filter and is
     /// wider than the predicate for non-private scopes.
     ///
@@ -9372,7 +9372,9 @@ impl PostgresStore {
         }
         Ok(mems
             .into_iter()
-            .filter(|m| is_visible_to_caller(m, caller))
+            .filter(|m| {
+                crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str()))
+            })
             .collect())
     }
 
@@ -23143,7 +23145,11 @@ impl MemoryStore for PostgresStore {
                 // Admin/migrate paths set `bypass_visibility`.
                 if mem.lifecycle_state.is_recall_visible()
                     && (ctx.bypass_visibility
-                        || is_visible_to_caller(&mem, ctx.effective_principal()))
+                        || crate::visibility::is_readable_on_query(
+                            &mem,
+                            Some(ctx.effective_principal()),
+                            Some(mem.namespace.as_str()),
+                        ))
                 {
                     Ok(mem)
                 } else {
@@ -23868,7 +23874,9 @@ impl MemoryStore for PostgresStore {
         }
         Ok(mems
             .into_iter()
-            .filter(|m| is_visible_to_caller(m, caller))
+            .filter(|m| {
+                crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str()))
+            })
             .collect())
     }
 
@@ -25748,7 +25756,9 @@ impl MemoryStore for PostgresStore {
         // truncate so the limit reflects what the caller can actually
         // see.
         if !ctx.bypass_visibility {
-            results.retain(|(m, _)| is_visible_to_caller(m, caller));
+            results.retain(|(m, _)| {
+                crate::visibility::is_readable_on_query(m, Some(caller), Some(m.namespace.as_str()))
+            });
         }
         results.truncate(filter.limit.max(1));
         // v1.0.0 #3180 [data-integrity, BLOCKING] — append the RECALL ACCESS
@@ -30954,7 +30964,7 @@ impl MemoryStore for PostgresStore {
         // `metadata.agent_id` matches the caller (with the
         // `_inbox/<target>` carve-out: rows where
         // `metadata.target_agent_id == caller` are also purgeable by
-        // the inbox owner — mirrors the [`is_visible_to_caller`]
+        // the inbox owner — mirrors the `is_visible_to_caller`
         // visibility predicate). The operator/admin surface skips
         // the gate by setting `ctx.bypass_visibility = true` via
         // [`CallerContext::for_admin`], which the SHIP cluster admin

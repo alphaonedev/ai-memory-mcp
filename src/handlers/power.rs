@@ -282,12 +282,24 @@ pub async fn detect_contradictions(
                     .and_then(|v| v.as_str())
                     .is_some_and(|s| s == t)
                     || m.title == t)
-                    && (caller_is_admin || crate::visibility::is_visible_to_caller(m, &caller))
+                    && (caller_is_admin
+                        || crate::visibility::is_readable_on_query(
+                            m,
+                            Some(&caller),
+                            Some(m.namespace.as_str()),
+                        ))
             })
             .collect(),
         None => all
             .into_iter()
-            .filter(|m| caller_is_admin || crate::visibility::is_visible_to_caller(m, &caller))
+            .filter(|m| {
+                caller_is_admin
+                    || crate::visibility::is_readable_on_query(
+                        m,
+                        Some(&caller),
+                        Some(m.namespace.as_str()),
+                    )
+            })
             .collect(),
     };
 
@@ -895,9 +907,11 @@ pub async fn check_duplicate(
                     // apply `is_visible_to_caller` so an adapter that
                     // returns the row cannot leak it.
                     let hide = match app.store.get(&ctx, &near_id).await {
-                        Ok(full_mem) => {
-                            !crate::visibility::is_visible_to_caller(&full_mem, &caller)
-                        }
+                        Ok(full_mem) => !crate::visibility::is_readable_on_query(
+                            &full_mem,
+                            Some(&caller),
+                            Some(full_mem.namespace.as_str()),
+                        ),
                         Err(_) => true,
                     };
                     if hide {
@@ -991,7 +1005,11 @@ pub async fn check_duplicate(
     // private rows authored by other tenants.
     if !caller_is_admin && let Some(near) = check.nearest.as_ref() {
         if let Ok(Some(full_mem)) = db::get(&lock.0, &near.id)
-            && !crate::visibility::is_visible_to_caller(&full_mem, &caller)
+            && !crate::visibility::is_readable_on_query(
+                &full_mem,
+                Some(&caller),
+                Some(full_mem.namespace.as_str()),
+            )
         {
             check.nearest = None;
             check.is_duplicate = false;
