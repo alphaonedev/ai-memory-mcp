@@ -6,9 +6,9 @@ These files are **recorded artifacts** of the enterprise-federation
 certification §7 acceptance battery run on 2026-09-11 against
 `ad60beadf602823c4451ff82067f62091aba9a04` (`origin/chain/next` at
 lane start: Merge #3593 on Merge #3582). They are **not** regenerated
-by CI. Host: f1 macOS; PostgreSQL 18 + AGE + pgvector on `:5445`
-(`sslmode=verify-full`); exclusive live database `ai_memory_grok_cert`
-(never the operator DB, never `ai_memory_test`).
+by CI. Host: a macOS build host; the certified PostgreSQL 18 + AGE + pgvector
+tier over TLS (`sslmode=verify-full`); an exclusive throwaway live database
+created for this run (never an operator or shared database).
 
 This recapture is the #3595 unit: boot / signed+nonce'd scoped push /
 `{}` deny-all / catchup row+cursor preserve / doctor+capabilities
