@@ -111,6 +111,10 @@ const GUARDED: &[(&str, usize, &str)] = &[
          (NOT this wrapper), so they are correctly NOT counted here.",
     ),
     ("src/cli/commands/reflect.rs", 1, "`reflect` write."),
+    // #3587 U2 — `watch` writes captured turns/lines (refuses postgres in the default build; the SAL twin writes through the store).
+    ("src/cli/watch.rs", 1, "`watch` write."),
+    // #3587 U4 — `capture-turn` CLI twin of memory_capture_turn (refuses postgres on the CLI).
+    ("src/cli/commands/capture_turn.rs", 1, "`capture-turn` write."),
     ("src/cli/commands/atomise.rs", 1, "`atomise` write."),
     (
         "src/cli/commands/reembed.rs",
@@ -241,8 +245,8 @@ fn every_class_a_guard_call_is_enumerated_2572() {
 
     let total: usize = GUARDED.iter().map(|(_, n, _)| n).sum();
     assert_eq!(
-        total, 31,
-        "the pinned class-(a) guard total drifted from 31 (#2572)"
+        total, 33,
+        "the pinned class-(a) guard total drifted from 33 (#2572; 31 + #3587 U2 watch + U4 capture-turn)"
     );
     assert!(
         problems.is_empty(),
