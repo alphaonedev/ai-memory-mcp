@@ -185,6 +185,11 @@ pub struct CuratorConfig {
     /// `enabled = false` per ROADMAP §7.5 (opt-in due to Ollama dep).
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// #3587 U1 — resolved `[autonomy] supersede_on_contradiction`. `Propose`
+    /// makes autonomy Pass 2 queue a PENDING supersession for a conserved
+    /// same-author contradiction; `Off` (default) queues nothing.
+    #[serde(default)]
+    pub supersede_on_contradiction: crate::autonomy::SupersedeOnContradiction,
 }
 
 impl Default for CuratorConfig {
@@ -196,6 +201,7 @@ impl Default for CuratorConfig {
             include_namespaces: Vec::new(),
             exclude_namespaces: Vec::new(),
             compaction: CompactionConfig::default(),
+            supersede_on_contradiction: crate::autonomy::SupersedeOnContradiction::Off,
         }
     }
 }
@@ -467,13 +473,16 @@ pub fn run_once(
         "autonomy reserve must survive the auto-tag loop"
     );
     report.autonomy_ops_budget = remaining_ops;
-    let pass_report = crate::autonomy::run_autonomy_passes(
+    let pass_report = crate::autonomy::run_autonomy_passes_with(
         conn,
         llm_client,
         &autonomy_candidates,
-        cfg.dry_run,
-        /* skip_consolidation = */ compaction_owns_consolidation,
-        /* llm_op_budget = */ remaining_ops,
+        crate::autonomy::AutonomyPassOptions {
+            dry_run: cfg.dry_run,
+            skip_consolidation: compaction_owns_consolidation,
+            llm_op_budget: remaining_ops,
+            supersede_on_contradiction: cfg.supersede_on_contradiction,
+        },
         active_keypair,
     );
     report.errors.extend(pass_report.errors.clone());

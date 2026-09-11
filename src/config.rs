@@ -3521,6 +3521,12 @@ pub struct AppConfig {
     /// [`AppConfig::confidence_decay_half_life_for`].
     pub curator: Option<CuratorSection>,
 
+    /// v1.0.0 #3587 U1 — `[autonomy]` block. Carries the config-file-only
+    /// `supersede_on_contradiction` knob (`"off"` default | `"propose"`).
+    /// Resolved via [`AppConfig::resolve_supersede_on_contradiction`]; no env
+    /// twin by design.
+    pub autonomy: Option<AutonomySection>,
+
     /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
     /// Carries `default_namespace`, `archive_on_gc`, `archive_max_days`,
     /// `max_memory_mb` (folded from the previously-flat top-level
@@ -3588,6 +3594,7 @@ impl std::fmt::Debug for AppConfig {
             .field("subscriptions", &self.subscriptions)
             .field("verify", &self.verify)
             .field("wake_hub", &self.wake_hub)
+            .field("autonomy", &self.autonomy)
             .field(
                 "postgres_statement_timeout_secs",
                 &self.postgres_statement_timeout_secs,
@@ -4155,6 +4162,27 @@ pub struct CuratorSection {
     /// [`ENV_TRANSCRIPT_CLASSIFY_ENABLED`]).
     #[serde(default)]
     pub transcript_classify_enabled: Option<bool>,
+}
+
+/// v1.0.0 #3587 U1 — `[autonomy]` block.
+///
+/// ```toml
+/// [autonomy]
+/// supersede_on_contradiction = "propose"   # "off" (default) | "propose"
+/// ```
+///
+/// `propose` makes the curator queue a PENDING `supersede` action (the
+/// existing approval plane) when it conserves a contradiction between two
+/// memories by the same author in one namespace; only an approved replay by
+/// the old row's hardened owner archives anything (5-agent vote 4d3ea1c5).
+/// The value is kept raw so a mistyped or boolean value (`true` — the
+/// synchronous mode stays cut) cannot fail the parse of the whole file: the
+/// resolver refuses it with a WARN and stays `off` (fail closed).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AutonomySection {
+    /// `"off"` (default) or `"propose"`; any other value resolves to `off`.
+    #[serde(default)]
+    pub supersede_on_contradiction: Option<toml::Value>,
 }
 
 /// v0.8.0 #1749 — `[curator.compaction]` activation knobs for the Pillar-2.5
@@ -8641,6 +8669,7 @@ impl AppConfig {
             config_keys::SECTION_EMBEDDINGS,
             "reranker",
             "curator",
+            "autonomy",
             "storage",
             "limits",
             "encryption",
@@ -9759,6 +9788,31 @@ impl AppConfig {
             .and_then(|c| c.compaction.as_ref())
             .and_then(|c| c.enabled)
             .unwrap_or(false)
+    }
+
+    /// #3587 U1 — resolve `[autonomy] supersede_on_contradiction`.
+    /// Config-file only (no env twin). Absent → `Off`; `"off"` / `"propose"`
+    /// (ASCII case-insensitive, trimmed) select the mode; anything else,
+    /// including the cut boolean `true`, WARNs and resolves to `Off`.
+    #[must_use]
+    pub fn resolve_supersede_on_contradiction(&self) -> crate::autonomy::SupersedeOnContradiction {
+        use crate::autonomy::SupersedeOnContradiction as Mode;
+        let Some(raw) = self
+            .autonomy
+            .as_ref()
+            .and_then(|a| a.supersede_on_contradiction.as_ref())
+        else {
+            return Mode::Off;
+        };
+        if let Some(mode) = raw.as_str().and_then(Mode::parse) {
+            return mode;
+        }
+        tracing::warn!(
+            value = %raw,
+            "[autonomy] supersede_on_contradiction accepts only \"off\" or \"propose\" \
+             (synchronous supersession is not supported); staying off"
+        );
+        Mode::Off
     }
 
     /// #1393 sub-unit 2 — resolve the transcript-classify pass activation.
@@ -12479,6 +12533,7 @@ legacy_scoring = false
             embeddings: Some(EmbeddingsSection::default()),
             reranker: Some(RerankerSection::default()),
             curator: Some(CuratorSection::default()),
+            autonomy: Some(AutonomySection::default()),
             storage: Some(StorageSection::default()),
             limits: Some(LimitsSection::default()),
             encryption: Some(EncryptionSection::default()),
@@ -12539,6 +12594,7 @@ legacy_scoring = false
             "embeddings",
             "reranker",
             "curator",
+            "autonomy",
             "storage",
             "limits",
             "encryption",

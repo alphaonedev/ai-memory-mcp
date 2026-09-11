@@ -363,6 +363,7 @@ pub async fn run(
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
         compaction: curator_compaction_config(app_config),
+        supersede_on_contradiction: app_config.resolve_supersede_on_contradiction(),
     };
 
     let feature_tier = app_config.effective_tier(None);
@@ -421,14 +422,10 @@ pub async fn run(
     // `[llm].model` and 400-ing every call on non-Ollama backends.
     crate::daemon_runtime::run_curator_daemon_with_primitives(
         db_path.to_path_buf(),
-        args.interval_secs,
-        args.max_ops,
-        args.dry_run,
-        args.include_namespaces.clone(),
-        args.exclude_namespaces.clone(),
-        // #1749 — resolve compaction.enabled here (the daemon body has no
-        // AppConfig in scope) and thread it as a primitive.
-        app_config.resolve_compaction_enabled(),
+        // #3587 — the SAME resolved config the `--once` path runs (#1749/#1750
+        // compaction + the `[autonomy]` supersede mode); the daemon body has no
+        // `AppConfig` in scope.
+        cfg,
         // #3345 — the curator daemon is the reaper on a curator-only host;
         // hand it the operator's resolved erasure/archive posture.
         app_config.effective_archive_on_gc(),
@@ -533,6 +530,17 @@ async fn run_store_backed_sweep(
     // consolidation sweep. `compaction.enabled` resolved from operator config
     // (#1749, env > [curator.compaction] > default false); the gate mirrors the
     // sqlite `run_once` path.
+    // #3587 U1 — the store-backed sweep runs consolidation + reflection only;
+    // contradiction detection (and so autonomy Pass 2, the only place a
+    // supersession proposal is queued) is SQLite-curator-only. Say so rather
+    // than silently ignoring the operator's `propose`.
+    let supersede_on_contradiction = app_config.resolve_supersede_on_contradiction();
+    if supersede_on_contradiction == crate::autonomy::SupersedeOnContradiction::Propose {
+        tracing::warn!(
+            "[autonomy] supersede_on_contradiction = \"propose\" has no effect on the \
+             store-backed curator: contradiction detection runs only on the SQLite curator"
+        );
+    }
     let curator_cfg = curator::CuratorConfig {
         interval_secs: args.interval_secs,
         max_ops_per_cycle: args.max_ops,
@@ -540,6 +548,7 @@ async fn run_store_backed_sweep(
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
         compaction: curator_compaction_config(app_config),
+        supersede_on_contradiction,
     };
     if args.once {
         // Consolidation BEFORE reflection (dedup, then reflect over survivors).

@@ -276,6 +276,11 @@ pub struct AutonomyPassReport {
     /// [`run_autonomy_passes`].
     #[serde(default)]
     pub rollback_log_degraded: bool,
+    /// #3587 U1 — PENDING supersession proposals queued this pass
+    /// (`[autonomy] supersede_on_contradiction = "propose"`). Always `0` when
+    /// the mode is `off` or the pass is a dry-run.
+    #[serde(default)]
+    pub supersessions_proposed: usize,
     pub errors: Vec<String>,
 }
 
@@ -364,6 +369,75 @@ pub fn run_autonomy_passes(
     llm_op_budget: usize,
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> AutonomyPassReport {
+    run_autonomy_passes_with(
+        conn,
+        llm,
+        candidates,
+        AutonomyPassOptions {
+            dry_run,
+            skip_consolidation,
+            llm_op_budget,
+            supersede_on_contradiction: SupersedeOnContradiction::Off,
+        },
+        active_keypair,
+    )
+}
+
+/// #3587 U1 — resolved `[autonomy] supersede_on_contradiction`. There is
+/// deliberately no synchronous mode: a contradiction never archives anything
+/// on its own (G7, #1824); `Propose` only queues an approval request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersedeOnContradiction {
+    /// Default: Pass 2 conserves the pair and queues nothing.
+    #[default]
+    Off,
+    /// Pass 2 also queues a PENDING supersession for a conserved pair by one
+    /// author in one namespace; only the owner's approval archives the loser.
+    Propose,
+}
+
+impl SupersedeOnContradiction {
+    /// Parse an operator token (ASCII case-insensitive, trimmed).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let token = raw.trim();
+        if token.eq_ignore_ascii_case("off") {
+            Some(Self::Off)
+        } else if token.eq_ignore_ascii_case("propose") {
+            Some(Self::Propose)
+        } else {
+            None
+        }
+    }
+}
+
+/// Knobs for [`run_autonomy_passes_with`]; see [`run_autonomy_passes`] for
+/// the meaning of the first three.
+#[derive(Debug, Clone, Copy)]
+pub struct AutonomyPassOptions {
+    pub dry_run: bool,
+    pub skip_consolidation: bool,
+    pub llm_op_budget: usize,
+    /// #3587 U1 — whether Pass 2 queues supersession proposals.
+    pub supersede_on_contradiction: SupersedeOnContradiction,
+}
+
+/// [`run_autonomy_passes`] with the #3587 `[autonomy]` mode.
+#[must_use]
+pub fn run_autonomy_passes_with(
+    conn: &Connection,
+    llm: &dyn AutonomyLlm,
+    candidates: &[Memory],
+    options: AutonomyPassOptions,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+) -> AutonomyPassReport {
+    let AutonomyPassOptions {
+        dry_run,
+        skip_consolidation,
+        llm_op_budget,
+        supersede_on_contradiction,
+    } = options;
     let mut report = AutonomyPassReport::default();
 
     // Pass 1 — consolidation. Skipped when the SAL ConsolidationPass owns
@@ -407,6 +481,12 @@ pub fn run_autonomy_passes(
             Ok(Some(entry)) => {
                 halted = !note_rollback_write(conn, &entry, dry_run, &mut report);
                 report.memories_forgotten += 1;
+                if !dry_run
+                    && !halted
+                    && supersede_on_contradiction == SupersedeOnContradiction::Propose
+                {
+                    propose_supersession(conn, &entry, &mut report);
+                }
             }
             Ok(None) => {}
             Err(e) => report.errors.push(format!("forget failed: {e}")),
@@ -812,6 +892,48 @@ fn forget_if_superseded(
     // identity-only SUPERSEDE leaf; reversible soft-down-weight marker).
     db::conserve_contradiction(conn, loser, &winner.id, active_keypair)?;
     Ok(Some(entry))
+}
+
+/// #3587 U1 propose mode — after Pass 2 CONSERVED a pair (G7 unchanged),
+/// queue a PENDING supersession of the loser by the winner when the pair is
+/// by ONE author in ONE namespace and the winner is strictly newer by
+/// `created_at`. Both rows are re-read (the candidate snapshot predates the
+/// conserve write). Nothing is archived here; a failure is reported, never
+/// fatal to the pass.
+fn propose_supersession(conn: &Connection, entry: &RollbackEntry, report: &mut AutonomyPassReport) {
+    let RollbackEntry::ConserveContradiction {
+        loser_id,
+        winner_id,
+        ..
+    } = entry
+    else {
+        return;
+    };
+    let pair = db::get_any(conn, loser_id).and_then(|loser| {
+        Ok(loser.zip(db::get_any(conn, winner_id)?))
+    });
+    let proposal = match pair {
+        Ok(Some((loser, winner))) => {
+            crate::identity::supersession::SupersessionProposal::from_pair(&loser, &winner)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("supersession proposal read failed: {e}"));
+            None
+        }
+    };
+    let Some(proposal) = proposal else {
+        return;
+    };
+    match db::supersession_pending::queue_proposal(conn, &proposal) {
+        Ok(Some(_)) => report.supersessions_proposed += 1,
+        Ok(None) => {}
+        Err(e) => report
+            .errors
+            .push(format!("supersession proposal queue failed: {e}")),
+    }
 }
 
 fn apply_priority_feedback(

@@ -13710,13 +13710,15 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
     let handle = tokio::spawn(async move {
         ai_memory::daemon_runtime::run_curator_daemon_with_primitives(
             db_for_daemon,
-            1,    // interval_secs (clamped to 60s by run_daemon, but accepted here)
-            10,   // max_ops_per_cycle
-            true, // dry_run
-            Vec::new(),
-            Vec::new(),
-            false, // compaction_enabled (#1749) — default off
-            true,  // archive_on_gc (#3345) — the curator daemon is the reaper
+            // #3587 — the caller now hands the resolved CuratorConfig over
+            // instead of six primitives (compaction #1749 default off).
+            ai_memory::curator::CuratorConfig {
+                interval_secs: 1, // clamped to 60s by run_daemon, accepted here
+                max_ops_per_cycle: 10,
+                dry_run: true,
+                ..ai_memory::curator::CuratorConfig::default()
+            },
+            true, // archive_on_gc (#3345) — the curator daemon is the reaper
             None,  // llm — keyword-only path, no LLM (#1440)
             shutdown_for_daemon,
         )

@@ -9017,36 +9017,19 @@ pub async fn run_curator_daemon_with_shutdown(
 /// `build_curator_llm` so the `--daemon` path shares the identical
 /// #1146-resolver result with the `--once` path — see #1440). `None`
 /// disables the LLM, leaving keyword-only curation.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_curator_daemon_with_primitives(
     db_path: PathBuf,
-    interval_secs: u64,
-    max_ops_per_cycle: usize,
-    dry_run: bool,
-    include_namespaces: Vec<String>,
-    exclude_namespaces: Vec<String>,
-    // #1749 — Pillar-2.5 consolidation gate, resolved by the caller (which has
-    // the `AppConfig` this daemon body lacks). Default-false at every caller.
-    compaction_enabled: bool,
-    // v1.0.0 #3345 — the operator's resolved `[storage].archive_on_gc`, same
-    // primitive-threading pattern as `compaction_enabled`. The curator daemon
-    // is now the reaper on a curator-only host, and it must honour an explicit
-    // erasure posture rather than assume the safe-looking default.
+    // #3587 — the caller's fully resolved config (it has the `AppConfig` this
+    // body lacks): compaction (#1749 enabled + #1750 cosine threshold, which
+    // the pre-#3587 primitive rebuild dropped) and the `[autonomy]` mode.
+    cfg: crate::curator::CuratorConfig,
+    // v1.0.0 #3345 — the operator's resolved `[storage].archive_on_gc`. The
+    // curator daemon is the reaper on a curator-only host, and it must honour
+    // an explicit erasure posture rather than assume the safe-looking default.
     archive_on_gc: bool,
     llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
-    let cfg = crate::curator::CuratorConfig {
-        interval_secs,
-        max_ops_per_cycle,
-        dry_run,
-        include_namespaces,
-        exclude_namespaces,
-        compaction: crate::curator::CompactionConfig {
-            enabled: compaction_enabled,
-            ..Default::default()
-        },
-    };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_for_signal = shutdown_flag.clone();

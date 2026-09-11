@@ -886,6 +886,7 @@ pub mod model_attest;
 /// default (non-`sal`) sqlite build. The sal surface wraps it.
 pub mod record_stop;
 pub mod supersession;
+pub mod supersession_pending;
 // v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
 // silently open and WRITE a NEWER database). Its own module so the pure
 // verdict is shared verbatim by the sqlite and postgres funnels.
@@ -22875,6 +22876,12 @@ pub fn decide_pending_action(
 /// caller's primary mutation MUST NOT roll back on audit failure.
 /// Mirrors the same posture as `memory_link.invalidated` emit (the
 /// audit chain is allowed to gap, the underlying write is not).
+/// `signed_events.event_type` for an executed pending action (sqlite + pg).
+pub(crate) const EVENT_PENDING_ACTION_APPROVED: &str = "pending_action.approved";
+/// `signed_events.event_type` for an S5-H4 approver-laundering refusal.
+pub(crate) const EVENT_PENDING_ACTION_REFUSED_AGENT_ID_MISMATCH: &str =
+    "pending_action.refused_agent_id_mismatch";
+
 fn emit_pending_action_event(
     conn: &Connection,
     pa: &PendingAction,
@@ -23496,7 +23503,12 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
     // captured by the signed_events chain even when the substrate
     // bails the execute.
     if let Err(e) = verify_payload_agent_id(&pa) {
-        emit_pending_action_event(conn, &pa, "pending_action.refused_agent_id_mismatch", None);
+        emit_pending_action_event(
+            conn,
+            &pa,
+            EVENT_PENDING_ACTION_REFUSED_AGENT_ID_MISMATCH,
+            None,
+        );
         return Err(e);
     }
     let memory_id = match pa.action_type.as_str() {
@@ -23604,6 +23616,22 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
             }
         }
         "reflect" => execute_reflect_from_payload(conn, &pa)?,
+        // #3587 propose mode — a curator supersession proposal archives a
+        // row, so it executes ONLY through the principal-carrying
+        // `supersession_pending::execute_with` a local approve surface calls
+        // with its hardened channel principal. This principal-less entry
+        // (federation decisions, any caller without one) refuses it typed.
+        crate::identity::supersession::PENDING_ACTION_SUPERSEDE => {
+            emit_pending_action_event(
+                conn,
+                &pa,
+                supersession_pending::EVENT_REFUSED_PRINCIPAL_REQUIRED,
+                None,
+            );
+            return Err(anyhow::Error::new(
+                crate::identity::supersession::SupersessionRefusal::UnauthenticatedPrincipal,
+            ));
+        }
         other => {
             // #962 typed envelope.
             return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -23618,7 +23646,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
     emit_pending_action_event(
         conn,
         &pa,
-        "pending_action.approved",
+        EVENT_PENDING_ACTION_APPROVED,
         pa.decided_by.as_deref(),
     );
     Ok(memory_id)

@@ -289,6 +289,9 @@ pub enum SupersessionRefusal {
     NotStrictlyNewer,
     /// An archived row without a supersession pointer cannot be resolved again.
     ArchivedPredecessor,
+    /// #3587 propose mode: the rows no longer match the approved proposal
+    /// (ids, creation instants, namespace or the shared author changed).
+    StaleProposal,
 }
 
 impl std::fmt::Display for SupersessionRefusal {
@@ -362,11 +365,7 @@ pub fn authorize_supersession<'a>(
     if as_admin && !super::is_admin_agent_in(principal.agent_id(), admin_agent_ids) {
         return Refused(Refusal::AdminNotAllowed);
     }
-    let owner = old
-        .metadata
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str);
-    let Some(owner) = owner.filter(|owner| validate_principal(owner).is_ok()) else {
+    let Some(owner) = owner_of(old) else {
         return Refused(Refusal::UnownedPredecessor);
     };
     if !as_admin && owner != principal.agent_id() {
@@ -432,6 +431,133 @@ impl std::fmt::Display for RulingKeyImmutable {
 }
 
 impl std::error::Error for RulingKeyImmutable {}
+
+/// #3587 U1 `[autonomy] supersede_on_contradiction = "propose"` — the
+/// pending-action type the curator queues (5-agent vote 4d3ea1c5). A string
+/// action type, deliberately NOT a `GovernedAction` variant: it is config
+/// driven, carries no policy level and must stay out of capability tokens.
+pub const PENDING_ACTION_SUPERSEDE: &str = "supersede";
+
+const PROPOSAL_OLD_ID: &str = "old_id";
+const PROPOSAL_NEW_ID: &str = "new_id";
+const PROPOSAL_OLD_CREATED_AT: &str = "old_created_at";
+const PROPOSAL_NEW_CREATED_AT: &str = "new_created_at";
+/// Never `agent_id`: `verify_payload_agent_id` compares that key with
+/// `requested_by` (the curator), which would refuse a legitimate proposal.
+const PROPOSAL_OWNER_AGENT_ID: &str = "owner_agent_id";
+
+/// A curator-detected contradiction between two memories by the same author,
+/// proposed for supersession. The payload holds ids and instants only — no
+/// title or content — because pending rows are visible to co-tenants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersessionProposal {
+    old_id: String,
+    new_id: String,
+    old_created_at: String,
+    new_created_at: String,
+    owner_agent_id: String,
+}
+
+fn owner_of(memory: &Memory) -> Option<&str> {
+    memory
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|owner| validate_principal(owner).is_ok())
+}
+
+fn parse_instant(value: &str) -> Option<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(value).ok()
+}
+
+impl SupersessionProposal {
+    /// Build a proposal only for the pair the spec allows: one valid shared
+    /// author, one exact namespace, distinct ids and a strictly newer winner.
+    #[must_use]
+    pub fn from_pair(old: &Memory, new: &Memory) -> Option<Self> {
+        let owner = owner_of(old)?;
+        let newer = parse_instant(&old.created_at)
+            .zip(parse_instant(&new.created_at))
+            .is_some_and(|(old_time, new_time)| new_time > old_time);
+        (owner_of(new) == Some(owner)
+            && old.namespace == new.namespace
+            && old.id != new.id
+            && newer)
+            .then(|| Self {
+                old_id: old.id.clone(),
+                new_id: new.id.clone(),
+                old_created_at: old.created_at.clone(),
+                new_created_at: new.created_at.clone(),
+                owner_agent_id: owner.to_owned(),
+            })
+    }
+
+    /// The minimal pending payload.
+    #[must_use]
+    pub fn to_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            PROPOSAL_OLD_ID: self.old_id,
+            PROPOSAL_NEW_ID: self.new_id,
+            PROPOSAL_OLD_CREATED_AT: self.old_created_at,
+            PROPOSAL_NEW_CREATED_AT: self.new_created_at,
+            PROPOSAL_OWNER_AGENT_ID: self.owner_agent_id,
+        })
+    }
+
+    /// Parse a stored payload; every field must be a nonempty string.
+    ///
+    /// # Errors
+    /// A malformed payload is refused as [`SupersessionRefusal::StaleProposal`].
+    pub fn from_payload(payload: &serde_json::Value) -> Result<Self, SupersessionRefusal> {
+        let field = |key: &str| {
+            payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+                .ok_or(SupersessionRefusal::StaleProposal)
+        };
+        Ok(Self {
+            old_id: field(PROPOSAL_OLD_ID)?,
+            new_id: field(PROPOSAL_NEW_ID)?,
+            old_created_at: field(PROPOSAL_OLD_CREATED_AT)?,
+            new_created_at: field(PROPOSAL_NEW_CREATED_AT)?,
+            owner_agent_id: field(PROPOSAL_OWNER_AGENT_ID)?,
+        })
+    }
+
+    /// The predecessor the proposal would archive.
+    #[must_use]
+    pub fn old_id(&self) -> &str {
+        &self.old_id
+    }
+
+    /// The live replacement that would carry `superseded_id`.
+    #[must_use]
+    pub fn new_id(&self) -> &str {
+        &self.new_id
+    }
+
+    /// True only when freshly read rows are still the proposed pair: ids,
+    /// creation instants, one namespace and the same shared author. A row an
+    /// owner rewrote or re-attributed since detection is not re-proposed by
+    /// approving an old proposal.
+    #[must_use]
+    pub fn binds(&self, old: &Memory, new: &Memory) -> bool {
+        let same_instant = |stored: &str, proposed: &str| {
+            parse_instant(stored)
+                .zip(parse_instant(proposed))
+                .is_some_and(|(a, b)| a == b)
+        };
+        old.id == self.old_id
+            && new.id == self.new_id
+            && same_instant(&old.created_at, &self.old_created_at)
+            && same_instant(&new.created_at, &self.new_created_at)
+            && old.namespace == new.namespace
+            && owner_of(old) == Some(self.owner_agent_id.as_str())
+            && owner_of(new) == Some(self.owner_agent_id.as_str())
+    }
+}
 
 /// Exact keyed-store match. Missing, null, non-string and empty keys never match.
 #[must_use]

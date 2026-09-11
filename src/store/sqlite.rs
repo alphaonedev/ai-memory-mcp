@@ -488,20 +488,8 @@ impl MemoryStore for SqliteStore {
         }
     }
 
-    /// v1.0.0 #2771 — FAIL-CLOSED create: delegates to the sqlite SSOT
-    /// `db::insert_no_overwrite`, which shares `db::insert`'s exact write
-    /// funnel (record-stop / governance / why-trace / secret-screen / cid /
-    /// vector-clock / seal / #2383 reconcile / valid-time canonicalization)
-    /// but refuses a `(title, namespace)` collision atomically instead of
-    /// upsert-merging. A collision surfaces as the legacy
-    /// `crate::storage::ConflictError`, mapped here to the typed
-    /// [`StoreError::Conflict`] carrying the existing row's id. HTTP create
-    /// still writes the vector out-of-band (`None` here). Fable #3237 item 7
-    /// — a SAL caller that DOES pass a vector gets it persisted via
-    /// `db::set_embedding` (refused without a space stamp). This adapter
-    /// still does NOT implement [`MemoryStore::store_with_embedding`]: that
-    /// method's contract is a single inline write postgres has and sqlite
-    /// does not.
+    /// #3587 — live v2 sub-key revocation lookup for the supersession
+    /// verifier; a lookup error propagates (fail closed).
     async fn subkey_is_revoked(
         &self,
         principal: &str,
@@ -518,6 +506,35 @@ impl MemoryStore for SqliteStore {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::db::insert_subkey_cert(&conn, record).map_err(box_err)
+    }
+
+    async fn supersession_gate_before_approve(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+        approver_id: &str,
+        request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession_pending::ProposalGate> {
+        let conn = self.state.lock().await;
+        crate::storage::supersession_pending::gate_before_approve(
+            &conn,
+            pending_id,
+            approver_id,
+            request,
+        )
+        .map_err(box_err)
+    }
+
+    async fn execute_pending_action_with(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+        request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<Option<String>> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        crate::storage::supersession_pending::execute_with(&conn, pending_id, request)
+            .map_err(box_err)
     }
 
     async fn resolve_supersession(
@@ -583,6 +600,20 @@ impl MemoryStore for SqliteStore {
         })
     }
 
+    /// v1.0.0 #2771 — FAIL-CLOSED create: delegates to the sqlite SSOT
+    /// `db::insert_no_overwrite`, which shares `db::insert`'s exact write
+    /// funnel (record-stop / governance / why-trace / secret-screen / cid /
+    /// vector-clock / seal / #2383 reconcile / valid-time canonicalization)
+    /// but refuses a `(title, namespace)` collision atomically instead of
+    /// upsert-merging. A collision surfaces as the legacy
+    /// `crate::storage::ConflictError`, mapped here to the typed
+    /// [`StoreError::Conflict`] carrying the existing row's id. HTTP create
+    /// still writes the vector out-of-band (`None` here). Fable #3237 item 7
+    /// — a SAL caller that DOES pass a vector gets it persisted via
+    /// `db::set_embedding` (refused without a space stamp). This adapter
+    /// still does NOT implement [`MemoryStore::store_with_embedding`]: that
+    /// method's contract is a single inline write postgres has and sqlite
+    /// does not.
     async fn store_with_embedding_no_overwrite(
         &self,
         ctx: &CallerContext,

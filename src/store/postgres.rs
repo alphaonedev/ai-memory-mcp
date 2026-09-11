@@ -22739,6 +22739,27 @@ impl MemoryStore for PostgresStore {
         self.resolve_supersession_pg(old_id, new_id, request).await
     }
 
+    async fn supersession_gate_before_approve(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        approver_id: &str,
+        request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession_pending::ProposalGate> {
+        self.supersession_gate_before_approve_pg(ctx, pending_id, approver_id, request)
+            .await
+    }
+
+    async fn execute_pending_action_with(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<Option<String>> {
+        self.execute_pending_action_with_pg(ctx, pending_id, request)
+            .await
+    }
+
     async fn store_with_supersession(
         &self,
         ctx: &CallerContext,
@@ -31653,7 +31674,11 @@ impl MemoryStore for PostgresStore {
         // (fail closed).
         if let Err(e) = crate::storage::verify_payload_agent_id(&pa) {
             if let Err(audit_err) = self
-                .pg_emit_pending_action_event(&pa, "pending_action.refused_agent_id_mismatch", None)
+                .pg_emit_pending_action_event(
+                    &pa,
+                    crate::storage::EVENT_PENDING_ACTION_REFUSED_AGENT_ID_MISMATCH,
+                    None,
+                )
                 .await
             {
                 tracing::warn!(
@@ -31740,6 +31765,28 @@ impl MemoryStore for PostgresStore {
                     None
                 }
             }
+            // #3587 propose mode — mirror of the sqlite refusal arm: a
+            // supersession proposal archives a row, so it executes only via
+            // `MemoryStore::execute_pending_action_with` and a hardened
+            // approver principal. Refused typed here, audited best-effort.
+            crate::identity::supersession::PENDING_ACTION_SUPERSEDE => {
+                if let Err(e) = self
+                    .pg_emit_pending_action_event(
+                        &pa,
+                        crate::storage::supersession_pending::EVENT_REFUSED_PRINCIPAL_REQUIRED,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(pending_id = %pending_id, "supersession refusal audit failed: {e}");
+                }
+                return Err(StoreError::PermissionDenied {
+                    action: crate::store::EXECUTE_PENDING_ACTION.to_string(),
+                    target: pending_id.to_string(),
+                    reason: crate::identity::supersession::SupersessionRefusal::UnauthenticatedPrincipal
+                        .to_string(),
+                });
+            }
             other => {
                 return Err(StoreError::InvalidInput {
                     detail: format!("unsupported action_type: {other}"),
@@ -31753,7 +31800,11 @@ impl MemoryStore for PostgresStore {
         // an audit-side failure must not roll back a governance decision that
         // already landed (the chain is allowed to gap; the write is not).
         if let Err(e) = self
-            .pg_emit_pending_action_event(&pa, "pending_action.approved", pa.decided_by.as_deref())
+            .pg_emit_pending_action_event(
+                &pa,
+                crate::storage::EVENT_PENDING_ACTION_APPROVED,
+                pa.decided_by.as_deref(),
+            )
             .await
         {
             tracing::warn!(

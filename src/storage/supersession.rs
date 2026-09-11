@@ -8,7 +8,8 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::identity::supersession::{
-    SupersessionDecision, SupersessionPrincipal, SupersessionRefusal, authorize_supersession,
+    AuthorizedSupersession, SupersessionDecision, SupersessionPrincipal, SupersessionProposal,
+    SupersessionRefusal, authorize_supersession,
 };
 use crate::models::{Memory, field_names};
 
@@ -62,6 +63,25 @@ impl SupersessionResult {
 /// Called outside the transaction/retry boundary; never emits an Allow.
 pub(crate) fn audit_failure(request: SupersessionRequest<'_>, new_id: &str, namespace: &str) {
     audit_decision(request, new_id, namespace, None, Some("operation_failed"));
+}
+
+/// #3587 propose mode: audit a refused proposal approval/replay (Deny on both
+/// channels). Names only the proposal's new id and the pending row's
+/// namespace, never the predecessor.
+pub(crate) fn audit_refusal(
+    request: SupersessionRequest<'_>,
+    pa: &crate::models::PendingAction,
+    reason: SupersessionRefusal,
+) {
+    let new_id = SupersessionProposal::from_payload(&pa.payload)
+        .map_or_else(|_| pa.id.clone(), |p| p.new_id().to_owned());
+    audit_decision(
+        request,
+        &new_id,
+        &pa.namespace,
+        None,
+        Some(&format!("{reason:?}")),
+    );
 }
 
 fn audit_decision(
@@ -254,8 +274,46 @@ pub fn resolve(
     new_id: &str,
     request: SupersessionRequest<'_>,
 ) -> Result<SupersessionResult> {
-    resolve_transaction(conn, old_id, new_id, request)
+    resolve_transaction(conn, old_id, new_id, request, None)
         .inspect_err(|_| audit_failure(request, new_id, ""))
+}
+
+/// #3587 propose mode: resolve an APPROVED curator proposal. Identical to
+/// [`resolve`] except that, inside the same write transaction, both freshly
+/// read rows must still be the proposed pair
+/// ([`SupersessionProposal::binds`]); otherwise the result is a
+/// [`SupersessionRefusal::StaleProposal`] refusal and nothing is written.
+///
+/// # Errors
+/// As [`resolve`].
+pub fn resolve_proposal(
+    conn: &Connection,
+    proposal: &SupersessionProposal,
+    request: SupersessionRequest<'_>,
+) -> Result<SupersessionResult> {
+    resolve_transaction(
+        conn,
+        proposal.old_id(),
+        proposal.new_id(),
+        request,
+        Some(proposal),
+    )
+    .inspect_err(|_| audit_failure(request, proposal.new_id(), ""))
+}
+
+/// Read-only authority check for an approve surface, run BEFORE the pending
+/// row is approved so a refusal never leaves an approved-but-unexecuted row.
+/// Mirrors the resolve decision exactly, without the transaction or writes.
+///
+/// # Errors
+/// Missing rows and read failures propagate.
+pub fn precheck_proposal(
+    conn: &Connection,
+    proposal: &SupersessionProposal,
+    request: SupersessionRequest<'_>,
+) -> Result<Option<SupersessionRefusal>> {
+    let (old, new, old_is_archived) = read_pair(conn, proposal.old_id(), proposal.new_id())?;
+    Ok(decide(&old, &new, old_is_archived, request, Some(proposal)).err())
 }
 
 // The transaction guard unwinds here before the outer final-error audit.
@@ -264,9 +322,31 @@ fn resolve_transaction(
     old_id: &str,
     new_id: &str,
     request: SupersessionRequest<'_>,
+    proposal: Option<&SupersessionProposal>,
 ) -> Result<SupersessionResult> {
     super::record_stop::gate_storage_conn(conn)?;
     let tx = super::connection::WriteTxn::begin(conn)?;
+    let (old, new, old_is_archived) = read_pair(conn, old_id, new_id)?;
+    let mut result = SupersessionResult {
+        id: new.id.clone(),
+        superseded: None,
+        refusal: None,
+    };
+    match decide(&old, &new, old_is_archived, request, proposal) {
+        Ok(Some(authorized)) => {
+            archive_as_superseded(conn, &authorized)?;
+            result.superseded = Some(old.id.clone());
+        }
+        Ok(None) => {}
+        Err(reason) => result.refusal = Some(reason),
+    }
+    tx.commit()?;
+    result.audit(request, &new);
+    Ok(result)
+}
+
+/// Read the live replacement and the predecessor (live, else archived).
+fn read_pair(conn: &Connection, old_id: &str, new_id: &str) -> Result<(Memory, Memory, bool)> {
     let new = conn
         .query_row(
             super::SQL_SELECT_MEMORY_ROW_BY_ID,
@@ -294,31 +374,36 @@ fn resolve_transaction(
             .optional()?
             .ok_or_else(|| anyhow::anyhow!(crate::errors::msg::MEMORY_NOT_FOUND))?,
     };
-    let mut result = SupersessionResult {
-        id: new.id.clone(),
-        superseded: None,
-        refusal: None,
-    };
+    Ok((old, new, old_is_archived))
+}
+
+/// The one resolve decision shared by the write path and the approve-surface
+/// precheck on BOTH backends: `Ok(Some)` archive, `Ok(None)` idempotent
+/// no-op, `Err` refusal.
+pub(crate) fn decide<'a>(
+    old: &'a Memory,
+    new: &'a Memory,
+    old_is_archived: bool,
+    request: SupersessionRequest<'a>,
+    proposal: Option<&SupersessionProposal>,
+) -> Result<Option<AuthorizedSupersession<'a>>, SupersessionRefusal> {
+    if proposal.is_some_and(|p| !p.binds(old, new)) {
+        return Err(SupersessionRefusal::StaleProposal);
+    }
     match authorize_supersession(
         request.principal,
         request.as_admin,
         &crate::identity::admin_agent_ids(),
-        &old,
-        &new,
+        old,
+        new,
     ) {
         SupersessionDecision::Authorized(_) if old_is_archived => {
-            result.refusal = Some(SupersessionRefusal::ArchivedPredecessor);
+            Err(SupersessionRefusal::ArchivedPredecessor)
         }
-        SupersessionDecision::Authorized(authorized) => {
-            archive_as_superseded(conn, &authorized)?;
-            result.superseded = Some(old.id);
-        }
-        SupersessionDecision::Refused(reason) => result.refusal = Some(reason),
-        SupersessionDecision::AlreadySuperseded => {}
+        SupersessionDecision::Authorized(authorized) => Ok(Some(authorized)),
+        SupersessionDecision::Refused(reason) => Err(reason),
+        SupersessionDecision::AlreadySuperseded => Ok(None),
     }
-    tx.commit()?;
-    result.audit(request, &new);
-    Ok(result)
 }
 
 /// Consume authority while both row snapshots remain pinned by BEGIN IMMEDIATE.

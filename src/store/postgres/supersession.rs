@@ -5,11 +5,12 @@
 
 use super::{CallerContext, Memory, PostgresStore, StoreError, StoreResult, to_store_err};
 use crate::identity::supersession::{
-    SupersessionDecision, SupersessionRefusal, authorize_supersession,
+    SupersessionDecision, SupersessionProposal, authorize_supersession,
 };
 use crate::storage::supersession::{
-    SupersessionRequest, SupersessionResult, audit_failure, ruling_key,
+    SupersessionRequest, SupersessionResult, audit_failure, audit_refusal, decide, ruling_key,
 };
+use crate::storage::supersession_pending::{ProposalGate, is_supersession, proposal_of};
 use crate::store::record_stop::gate_flag as gate_record_stop_cached;
 
 impl PostgresStore {
@@ -168,12 +169,26 @@ impl PostgresStore {
         new_id: &str,
         request: SupersessionRequest<'_>,
     ) -> StoreResult<SupersessionResult> {
+        self.resolve_supersession_bound(old_id, new_id, request, None)
+            .await
+    }
+
+    /// #3587 propose mode: the pg twin of `storage::supersession::
+    /// resolve_proposal` — the proposal must still bind both rows inside
+    /// the same locked transaction.
+    async fn resolve_supersession_bound(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        request: SupersessionRequest<'_>,
+        proposal: Option<&SupersessionProposal>,
+    ) -> StoreResult<SupersessionResult> {
         async {
             self.gate_record_stop().await?;
             let mut retry = super::tx_retry::TxRetry::new("resolve supersession");
             let (result, new) = loop {
                 match self
-                    .resolve_supersession_attempt(old_id, new_id, request)
+                    .resolve_supersession_attempt(old_id, new_id, request, proposal)
                     .await
                 {
                     Ok(result) => break result,
@@ -192,6 +207,7 @@ impl PostgresStore {
         old_id: &str,
         new_id: &str,
         request: SupersessionRequest<'_>,
+        proposal: Option<&SupersessionProposal>,
     ) -> StoreResult<(SupersessionResult, Memory)> {
         gate_record_stop_cached(&self.record_stop)?;
         let mut tx = self
@@ -235,27 +251,179 @@ impl PostgresStore {
             superseded: None,
             refusal: None,
         };
-        match authorize_supersession(
-            request.principal,
-            request.as_admin,
-            &crate::identity::admin_agent_ids(),
-            old,
-            new,
-        ) {
-            SupersessionDecision::Authorized(_) if old_is_archived => {
-                result.refusal = Some(SupersessionRefusal::ArchivedPredecessor);
-            }
-            SupersessionDecision::Authorized(authorized) => {
+        match decide(old, new, old_is_archived, request, proposal) {
+            Ok(Some(authorized)) => {
                 self.archive_as_superseded(&mut tx, &authorized).await?;
                 result.superseded = Some(old.id.clone());
             }
-            SupersessionDecision::Refused(reason) => result.refusal = Some(reason),
-            SupersessionDecision::AlreadySuperseded => {}
+            Ok(None) => {}
+            Err(reason) => result.refusal = Some(reason),
         }
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit resolve", e))?;
         Ok((result, new.clone()))
+    }
+
+    /// #3587 propose mode: the pg twin of `supersession_pending::
+    /// gate_before_approve` — read-only, no row locks, run before approving.
+    pub(super) async fn supersession_gate_before_approve_pg(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        approver_id: &str,
+        request: SupersessionRequest<'_>,
+    ) -> StoreResult<ProposalGate> {
+        use crate::store::MemoryStore as _;
+        let Some(pa) = self.get_pending(ctx, pending_id).await? else {
+            return Ok(ProposalGate::NotSupersession);
+        };
+        if !is_supersession(&pa) {
+            return Ok(ProposalGate::NotSupersession);
+        }
+        let refusal = match proposal_of(&pa, Some(approver_id), request) {
+            Ok(proposal) => {
+                let (old, new, old_is_archived) = self.read_proposal_pair(&proposal).await?;
+                decide(&old, &new, old_is_archived, request, Some(&proposal)).err()
+            }
+            Err(reason) => Some(reason),
+        };
+        Ok(match refusal {
+            None => ProposalGate::Proceed,
+            Some(reason) => {
+                audit_refusal(request, &pa, reason);
+                ProposalGate::Refused(reason)
+            }
+        })
+    }
+
+    async fn read_proposal_pair(
+        &self,
+        proposal: &SupersessionProposal,
+    ) -> StoreResult<(Memory, Memory, bool)> {
+        let fetch = |table: &'static str, id: &str| {
+            let sql = format!("SELECT * FROM {table} WHERE id = $1");
+            let id = id.to_owned();
+            async move {
+                sqlx::query(&sql)
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("read supersession proposal row", e))?
+                    .as_ref()
+                    .map(Self::row_to_memory)
+                    .transpose()
+            }
+        };
+        let new = fetch("memories", proposal.new_id())
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                id: proposal.new_id().into(),
+            })?;
+        if let Some(old) = fetch("memories", proposal.old_id()).await? {
+            return Ok((old, new, false));
+        }
+        let old = fetch("archived_memories", proposal.old_id())
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                id: proposal.old_id().into(),
+            })?;
+        Ok((old, new, true))
+    }
+
+    /// #3587 propose mode: execute an APPROVED pending row with the approve
+    /// surface's hardened principal (pg twin of `supersession_pending::
+    /// execute_with`).
+    pub(super) async fn execute_pending_action_with_pg(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        request: SupersessionRequest<'_>,
+    ) -> StoreResult<Option<String>> {
+        use crate::store::MemoryStore as _;
+        let pa = match self.get_pending(ctx, pending_id).await? {
+            Some(pa) if is_supersession(&pa) => pa,
+            _ => return self.execute_pending_action(ctx, pending_id).await,
+        };
+        self.gate_record_stop().await?;
+        if pa.status != "approved" {
+            return Err(StoreError::InvalidInput {
+                detail: format!("cannot execute non-approved action (status={})", pa.status),
+            });
+        }
+        let refused = |reason: crate::identity::supersession::SupersessionRefusal| {
+            StoreError::PermissionDenied {
+                action: crate::store::EXECUTE_PENDING_ACTION.to_string(),
+                target: pending_id.to_string(),
+                reason: reason.to_string(),
+            }
+        };
+        if let Err(e) = crate::storage::verify_payload_agent_id(&pa) {
+            self.emit_pending_event_best_effort(
+                &pa,
+                crate::storage::EVENT_PENDING_ACTION_REFUSED_AGENT_ID_MISMATCH,
+                None,
+            )
+            .await;
+            return Err(StoreError::PermissionDenied {
+                action: crate::store::EXECUTE_PENDING_ACTION.to_string(),
+                target: pending_id.to_string(),
+                reason: e.to_string(),
+            });
+        }
+        let proposal = match proposal_of(&pa, pa.decided_by.as_deref(), request) {
+            Ok(proposal) => proposal,
+            Err(reason) => {
+                audit_refusal(request, &pa, reason);
+                self.emit_pending_event_best_effort(
+                    &pa,
+                    crate::storage::supersession_pending::EVENT_REFUSED_SUPERSESSION,
+                    None,
+                )
+                .await;
+                return Err(refused(reason));
+            }
+        };
+        let result = self
+            .resolve_supersession_bound(
+                proposal.old_id(),
+                proposal.new_id(),
+                request,
+                Some(&proposal),
+            )
+            .await?;
+        if let Some(reason) = result.refusal {
+            self.emit_pending_event_best_effort(
+                &pa,
+                crate::storage::supersession_pending::EVENT_REFUSED_SUPERSESSION,
+                None,
+            )
+            .await;
+            return Err(refused(reason));
+        }
+        self.emit_pending_event_best_effort(
+            &pa,
+            crate::storage::EVENT_PENDING_ACTION_APPROVED,
+            pa.decided_by.as_deref(),
+        )
+        .await;
+        Ok(Some(result.id))
+    }
+
+    /// Best-effort pending-action audit append (the governance decision or
+    /// refusal stands even if the chain append fails — the #3180 posture).
+    async fn emit_pending_event_best_effort(
+        &self,
+        pa: &crate::models::PendingAction,
+        event_type: &str,
+        decided_by: Option<&str>,
+    ) {
+        if let Err(e) = self
+            .pg_emit_pending_action_event(pa, event_type, decided_by)
+            .await
+        {
+            tracing::warn!(pending_id = %pa.id, event_type, "pending-action audit append failed: {e}");
+        }
     }
 
     async fn archive_as_superseded(

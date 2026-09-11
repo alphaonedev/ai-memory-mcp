@@ -1386,6 +1386,41 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3587 propose mode — the read-only authority gate every local approve
+    /// surface runs BEFORE `approve_with_approver_type` / consensus, so a
+    /// refused curator supersession proposal is never left approved but
+    /// unexecuted. Non-supersession rows return `NotSupersession`. The
+    /// default fails CLOSED for an adapter without a real implementation.
+    async fn supersession_gate_before_approve(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        _approver_id: &str,
+        _request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession_pending::ProposalGate> {
+        use crate::storage::supersession_pending::{ProposalGate, is_supersession};
+        Ok(match self.get_pending(ctx, pending_id).await? {
+            Some(pa) if is_supersession(&pa) => ProposalGate::Refused(
+                crate::identity::supersession::SupersessionRefusal::UnauthenticatedPrincipal,
+            ),
+            _ => ProposalGate::NotSupersession,
+        })
+    }
+
+    /// #3587 propose mode — execute an APPROVED pending row with the approve
+    /// surface's hardened principal. Supersession proposals replay through
+    /// the resolve transaction; every other type is
+    /// [`Self::execute_pending_action`]. The default is principal-less (so it
+    /// refuses a supersession).
+    async fn execute_pending_action_with(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        _request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<Option<String>> {
+        self.execute_pending_action(ctx, pending_id).await
+    }
+
     /// v1.0.0 #2887 — RESTORE-SAFE atomic write for the reversible rollback
     /// paths (autonomy `reverse_rollback_entry_store` + curator
     /// `rollback_consolidation`). It re-stores `memory` at its OWN id under an
