@@ -349,7 +349,7 @@ fn send(
     serde_json::from_str(&line).expect("json response")
 }
 
-fn call(id: u64, tool: &str, args: serde_json::Value) -> serde_json::Value {
+fn call(id: u64, tool: &str, args: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -402,7 +402,7 @@ fn mcp_unset_identity_is_served_as_the_local_operator_3549() {
     let listed = send(
         &mut stdin,
         &rx,
-        &call(1, "memory_list", serde_json::json!({})),
+        &call(1, "memory_list", &serde_json::json!({})),
     );
     assert!(listed["error"].is_null(), "{listed}");
 }

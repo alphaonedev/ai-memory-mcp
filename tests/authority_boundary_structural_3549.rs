@@ -732,8 +732,7 @@ fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
             let src = tool_files
                 .iter()
                 .find(|(q, _)| q == p)
-                .map(|(_, s)| s.as_str())
-                .unwrap_or("");
+                .map_or("", |(_, s)| s.as_str());
             strip_line_comments(&production_part(src)).contains("is_readable_on_query")
         });
         if calls_funnel {
