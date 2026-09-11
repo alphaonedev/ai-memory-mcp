@@ -160,6 +160,28 @@ signing_posture_note:
   actual_control_ci_job: "Commit-signing posture gate (#2486)"
   issue: "#2486"
 
+# RELEASE TAG RULESET (#3546 D4) — documentation-only mirror, like every
+# block in this file. The live ruleset is created by the Conductor from the
+# payload in `.github/rulesets/release-tags.json`
+# (`gh api -X POST repos/alphaonedev/ai-memory-mcp/rulesets --input
+# .github/rulesets/release-tags.json`). Unlike the rest of this file, its
+# absence is not silent: release.yml's preflight runs
+# `scripts/release/assert-tag-ruleset.sh` and REFUSES to release unless an
+# active tag ruleset forbids update and deletion of refs/tags/v*. The
+# `release` Environment (deployment branches release/** + main, the
+# operator as required reviewer) is Conductor-created too; scoping
+# CARGO_REGISTRY_TOKEN, HOMEBREW_TAP_TOKEN and COPR_CONFIG to it is an
+# operator action.
+release_tag_ruleset:
+  payload: .github/rulesets/release-tags.json
+  target: tag
+  include: ["refs/tags/v*"]
+  rules: [creation, update, deletion, non_fast_forward]
+  bypass: repository admin role (the operator)
+  enforced_by_release_preflight: scripts/release/assert-tag-ruleset.sh
+  environment: release
+  issue: "#3546"
+
 # Auxiliary policy: nightly run-against-develop.
 # The Batman acceptance workflow runs on path-filtered PRs by default;
 # the nightly schedule below catches regressions whose triggering edit

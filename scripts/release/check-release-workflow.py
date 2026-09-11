@@ -33,6 +33,12 @@ checks read the workflow itself:
       `--version`.
   R10 every key line in release-tag-signers.txt appears verbatim in
       enrolled-commit-signers.txt, and the file is not empty.
+  R11 a `dry_run` boolean input defaults to true, and every publish step
+      (provenance attestation, GitHub-release upload, `cargo publish`, the
+      GHCR push, and the Homebrew / COPR jobs) runs only when
+      `github.event.inputs.dry_run == 'false'`.
+  R12 preflight and every job that reads a repository secret other than
+      GITHUB_TOKEN declare `environment: release`.
 
 Usage: check-release-workflow.py --workflow F [--republish F]
                                  [--signers F --enrolled F]
@@ -174,6 +180,36 @@ def check(workflow: str, republish: str | None, signers: str | None, enrolled: s
             if re.search(r"\bcargo install\b", line) and "--version" not in line and not line.strip().startswith("#"):
                 v.append(f"R9: unpinned `cargo install` in {path}: `{line.strip()}`")
 
+    # R11 — dry run by default; nothing publishes without dry_run == 'false'.
+    gate = "github.event.inputs.dry_run == 'false'"
+    if not re.search(r"^      dry_run:\n(?:        .*\n)*?        type: boolean\n(?:        .*\n)*?        default: true$", text, re.M):
+        v.append("R11: no `dry_run` boolean input defaulting to true")
+    for job, jlines in jobs.items():
+        jcode = "\n".join(l for l in jlines if not l.strip().startswith("#"))
+        job_gated = re.search(r"^    if:.*" + re.escape(gate), jcode, re.M) is not None
+        for step in split_steps(jlines):
+            body = step_text(step)
+            publishes = (
+                "actions/attest-build-provenance@" in body
+                or "softprops/action-gh-release@" in body
+                or re.search(r"cargo publish(?![^\n]*--dry-run)", body)
+                or "copr-cli build" in body
+                or ("git push" in body and job == "homebrew")
+            )
+            step_if = re.search(r"^        if:(.*)$", body, re.M)
+            step_gated = step_if is not None and gate in step_if.group(1)
+            if publishes and not job_gated and not step_gated:
+                name = step[0].strip()
+                v.append(f"R11: job `{job}` publishes without the dry_run gate: `{name}`")
+        if re.search(r"^\s+push:\s*true\s*$", jcode, re.M):
+            v.append(f"R11: job `{job}` pushes an image unconditionally (`push: true`)")
+    # R12 — secret-bearing jobs and preflight use the release Environment.
+    for job, jlines in jobs.items():
+        jcode = "\n".join(jlines)
+        needs_env = job == "preflight" or re.search(r"secrets\.(?!GITHUB_TOKEN\b)[A-Z_]+", jcode)
+        if needs_env and not re.search(r"^    environment: release\s*$", jcode, re.M):
+            v.append(f"R12: job `{job}` must declare `environment: release`")
+
     if signers and enrolled:
         def keylines(p):
             out = []
@@ -205,7 +241,7 @@ def main() -> int:
     if violations:
         print(f"check-release-workflow: FAIL — {len(violations)} violation(s) in {args.workflow}", file=sys.stderr)
         return 1
-    print(f"check-release-workflow: OK — {args.workflow} satisfies R1-R10")
+    print(f"check-release-workflow: OK — {args.workflow} satisfies R1-R12")
     return 0
 
 

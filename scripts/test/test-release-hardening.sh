@@ -97,7 +97,7 @@ if python3 "$REPO_ROOT/scripts/release/check-release-workflow.py" \
   --republish "$REPO_ROOT/.github/workflows/mobile-ios-republish.yml" \
   --signers "$REPO_ROOT/scripts/qc-allowlists/release-tag-signers.txt" \
   --enrolled "$REPO_ROOT/scripts/qc-allowlists/enrolled-commit-signers.txt" >"$out" 2>&1; then
-  pass "live release.yml satisfies R1-R10"
+  pass "live release.yml satisfies R1-R12"
 else
   fail "live release.yml: $(cat "$out")"
 fi
@@ -110,13 +110,13 @@ if [ "$rc" -eq 0 ]; then
   fail "R-203: the frozen pre-#3546 release.yml passed the structural check (the check is vacuous)"
 else
   missing=""
-  for rule in R1: R2: R3: R5: R6: R7: R8: R9:; do
+  for rule in R1: R2: R3: R5: R6: R7: R8: R9: R11: R12:; do
     grep -q "VIOLATION $rule" "$out" || missing="$missing $rule"
   done
   if [ -n "$missing" ]; then
     fail "R-203: frozen release.yml did not trip:$missing"
   else
-    pass "R-203: frozen pre-#3546 release.yml trips R1 R2 R3 R5 R6 R7 R8 R9"
+    pass "R-203: frozen pre-#3546 release.yml trips R1 R2 R3 R5 R6 R7 R8 R9 R11 R12"
   fi
 fi
 

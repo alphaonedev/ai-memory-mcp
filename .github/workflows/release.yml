@@ -18,6 +18,11 @@ name: Release (workflow_dispatch — operator-gated publish)
 # passed on its commit (the `qualify` job). Every build checks out that
 # verified commit, never the tag name.
 #
+# DRY RUN IS THE DEFAULT (#3546 D6). The command above builds and verifies
+# everything and publishes nothing. Publishing needs an explicit
+#   ... -f tag=vX.Y.Z -f dry_run=false
+# Rehearse a release as a dry run on the real tag (or a signed rc tag) first.
+#
 # The 5 jobs below mirror the historical release fanout: binary builds
 # (5 targets), GitHub Release page, crates.io, Homebrew tap, GHCR Docker
 # image, Fedora COPR. Pre-release tags (SemVer `-` suffix) auto-skip the
@@ -30,6 +35,15 @@ on:
       tag:
         description: 'Release tag to publish (must already exist on remote, e.g. v0.7.0).'
         required: true
+      dry_run:
+        # #3546 D6 — the default run publishes NOTHING: preflight, qualify,
+        # the supply-chain gates and every build run, and every publish step
+        # (release upload, provenance attestation, crates.io, Homebrew,
+        # GHCR push, COPR) is skipped. Only an explicit `-f dry_run=false`
+        # publishes; a missing or unrecognised value never does.
+        description: 'Build and verify everything but publish nothing. Set to false to publish.'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -58,6 +72,10 @@ jobs:
   preflight:
     name: Preflight (tag exists + is annotated + signed)
     runs-on: ubuntu-latest
+    # #3546 D4 — the `release` Environment (Conductor-created) restricts
+    # deployments to release/** and main and names the operator as required
+    # reviewer, so a release cannot be dispatched from any other ref.
+    environment: release
     permissions:
       contents: read
     outputs:
@@ -461,6 +479,7 @@ jobs:
           path: dist/ai-memory*
 
       - name: Attest build provenance (release binaries + packages)
+        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the existing sha256 checksums (never a
         # replacement): a Rekor-logged, OIDC-bound attestation naming
         # workflow + repo + commit SHA over every released artifact in
@@ -502,6 +521,7 @@ jobs:
             --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Create GitHub Release
+        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -587,6 +607,7 @@ jobs:
           ls -la ai-memory.cdx.json*
 
       - name: Attest build provenance (CycloneDX SBOM)
+        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the sha256 above.
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
@@ -606,6 +627,7 @@ jobs:
             --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
+        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -747,6 +769,7 @@ jobs:
           ls -la ai-memory-ios.xcframework.tar.gz*
 
       - name: Attest build provenance (iOS xcframework)
+        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the sha256 above.
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
@@ -766,6 +789,7 @@ jobs:
             --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
+        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -924,6 +948,7 @@ jobs:
           ls -la ai-memory-android.tar.gz*
 
       - name: Attest build provenance (Android JNI bundle)
+        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the sha256 above.
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
@@ -943,6 +968,7 @@ jobs:
             --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
+        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -967,6 +993,8 @@ jobs:
     needs: [preflight, qualify, release]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
+    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).
+    environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -978,7 +1006,12 @@ jobs:
         # moving compiler on the one job that mints the crates.io artifact).
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
+      - name: Package for crates.io without uploading (dry run)
+        if: github.event.inputs.dry_run != 'false'
+        run: cargo publish --locked --dry-run
+
       - name: Publish to crates.io (with retry)
+        if: github.event.inputs.dry_run == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -1013,8 +1046,12 @@ jobs:
   homebrew:
     name: Update Homebrew formula
     needs: [preflight, qualify, release]
-    if: needs.preflight.outputs.is_prerelease == 'false'
+    # Pure publish (it reads the release page and pushes the tap): a dry run
+    # has no release assets to read, so the whole job is skipped.
+    if: needs.preflight.outputs.is_prerelease == 'false' && github.event.inputs.dry_run == 'false'
     runs-on: ubuntu-latest
+    # HOMEBREW_TAP_TOKEN is scoped to the `release` Environment (#3546 D4).
+    environment: release
     permissions:
       contents: read
       attestations: read
@@ -1198,7 +1235,8 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          push: true
+          # #3546 D6 — a dry run builds the image and pushes nothing.
+          push: ${{ github.event.inputs.dry_run == 'false' }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/ai-memory:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/ai-memory:latest
@@ -1209,6 +1247,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Attest build provenance (Docker image)
+        if: github.event.inputs.dry_run == 'false'
         # #2487 — pins the attestation to the pushed image digest and
         # attaches it to GHCR. Consumers verify with
         # `gh attestation verify oci://ghcr.io/alphaonedev/ai-memory:<ver> \
@@ -1225,8 +1264,12 @@ jobs:
   copr:
     name: Fedora COPR
     needs: [preflight, qualify, release]
-    if: needs.preflight.outputs.is_prerelease == 'false'
+    # Pure publish (it builds the SRPM from the published assets): skipped on
+    # a dry run, which publishes no assets.
+    if: needs.preflight.outputs.is_prerelease == 'false' && github.event.inputs.dry_run == 'false'
     runs-on: ubuntu-latest
+    # COPR_CONFIG is scoped to the `release` Environment (#3546 D4).
+    environment: release
     permissions:
       contents: read
       attestations: read
