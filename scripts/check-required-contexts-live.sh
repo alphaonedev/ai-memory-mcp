@@ -140,7 +140,7 @@ fetch_live() {
         local msg
         msg="$(printf '%s' "$raw" | tr '\n' ' ')"
         case "$msg" in
-            *401* | *403* | *'Must have admin'* | *'Resource not accessible'* | *'Requires authentication'*)
+            *401* | *403* | *'Must have admin'* | *'Resource not accessible'* | *'Requires authentication'* | *'set the GH_TOKEN'* | *'not logged in'* | *'authentication required'*)
                 echo "HTTP 401/403 reading branch protection (token is not administration-scoped): $msg" >&2
                 return 3
                 ;;

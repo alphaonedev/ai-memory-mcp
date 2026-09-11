@@ -655,6 +655,11 @@ jobs:
         # live-pin (regenerated only by --pin-from-live). An admin token
         # compares all three and also asserts enforce_admins=true / strict=true.
         # Sibling of the soundness gate above — no new required context.
+        # GH_TOKEN is set so `gh` answers 401/403 (pin stand-in) instead of
+        # "set the GH_TOKEN environment variable" (hard fail; first push-campaign
+        # run on 2026-09-11 redded here — plumbing, not drift).
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/check-required-contexts-live.sh
       - name: Self-test the declared-vs-live drift gate (#3554)
         # Plants the exact #3554 38-vs-35 shape (MUST fail), extra live
