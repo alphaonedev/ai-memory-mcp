@@ -629,11 +629,19 @@ locked, atomic, durable and reversible — in that order:
    through the copy and the publish, so a daemon that starts
    mid-restore gets `SQLITE_BUSY` instead of writing into the file
    being replaced. Under the lock the old database's WAL is
-   checkpointed into it and the file is fsynced. A target that cannot
-   be opened or locked at all (corrupt, unreadable) is WARNed and
-   allowed through — restoring over a database nothing can open is
-   exactly what this verb is for — and a WAL SQLite cannot fold is
-   WARNed and kept with the rollback copy instead.
+   checkpointed into it and the file is fsynced.
+
+   `restore` only **replaces** a database it can lock and checkpoint.
+   A target it cannot open read-write, cannot lock (not a database,
+   damaged, or encrypted and opened without its key), or whose WAL it
+   cannot fully fold, is **refused** and left exactly as it was —
+   before #3550 the first two were warned about and replaced anyway,
+   which is how a restore run as the wrong user, or without the
+   passphrase, overwrote a database a daemon was still writing. The
+   way through for a genuinely damaged database is to move it, with
+   its `-wal` / `-shm` / `-journal` (they may hold committed data —
+   keep them), out of the way and run the restore again into the now
+   empty target.
 5. **Copy the current database aside** to `<db>.pre-restore-<ts>.db`,
    with its `-wal` / `-journal` (the `-shm` is a rebuildable index and
    is not copied). This is a COPY, not a move: the target path never
@@ -641,13 +649,15 @@ locked, atomic, durable and reversible — in that order:
    restored file takes the old database's permissions, never the
    snapshot's.
 6. **Remove the old sidecars BEFORE publishing.** The staged file is
-   locked too, then the old `-wal` / `-shm` / `-journal` are removed.
-   If one cannot be removed the restore is **refused** and nothing is
-   published: a sidecar left beside the restored database would be
-   replayed into it. (Before #3550 this ran after the swap and only
-   warned.)
+   locked too (if it cannot be, the restore is refused — nothing has
+   been removed yet), then the old `-wal` / `-shm` / `-journal` are
+   removed. If one cannot be removed the restore is **refused** and
+   nothing is published: a sidecar left beside the restored database
+   would be replayed into it. (Before #3550 this ran after the swap and
+   only warned.)
 7. **Publish durably.** The directory is fsynced, the staged file is
-   `rename`d over the target, and the directory is fsynced again — a
+   `rename`d over the target (see below for an empty target), and the
+   directory is fsynced again — a
    lost directory fsync after a power cut can bring the replaced
    database back. `--json` reports `durable_publish: true | false`.
    On the default posture a failed directory fsync is WARNed and the
@@ -655,26 +665,46 @@ locked, atomic, durable and reversible — in that order:
    `asi-hard` a failure before the rename refuses the restore and one
    after it exits non-zero. Platforms that cannot fsync a directory
    (Windows) always report `durable_publish: false`.
-8. **Invalidate the replaced file** (Unix). Once the rename is durable,
-   the header of the old, now-unlinked database file is zeroed, so a
+8. **Invalidate the replaced file** (Unix). Once the rollback copy is
+   durable (the directory fsync before the rename succeeded), the
+   header of the old, now-unlinked database file is zeroed, so a
    process that opened the target during the restore fails with
    "file is not a database" instead of writing a WAL beside the
    restored database. A file that is still hard-linked elsewhere is
-   left intact, with a warning.
+   left intact, with a warning; so is the old file when neither
+   directory fsync succeeded (it may be the only copy a power cut
+   brings back), with a warning naming what that leaves open.
 9. **Print the rollback path.** Human output ends with
    `Rollback: cp <db>.pre-restore-<ts>.db <db>`; `--json` carries the
    same path in a `rollback` field (`null` only when no database
    existed at the target before).
 
+**An empty target.** With no database at the target there is nothing
+to lock or copy aside. A leftover `-wal` / `-shm` / `-journal` there
+(its main file lost) may be the only copy of committed frames, so it is
+**moved** into the rollback set (`<db>.pre-restore-<ts>.db-wal`, …)
+and named on the output, never deleted. The replacement is then
+published with a hard link, which cannot replace anything: if a
+database appeared at the target meanwhile (an MCP server started on
+it), the restore is refused and that database is untouched — stop it
+and run the restore again, which will then lock it and copy it aside.
+On a filesystem without hard links the restore is refused with the
+`cp` command to finish by hand; it never falls back to a replacing
+rename.
+
+**A symlinked `--db`** is resolved first: the restore replaces the
+database the link points at (where SQLite, and so every daemon, reads
+it), not the link.
+
 A crash at any point leaves either the old database or the verified
 replacement at the target path, never a mix, with no sidecar that
-could replay into it; a crash can leave a `.<db>.restore-tmp-<ts>`
-file, which is safe to delete. Two residual windows remain and are
-operator-visible: a process that opens the target in the instant
-between the rename and the invalidation, and a process whose SQLite
-connection was already open before the restore (which the lock probe
-refuses). Stop every daemon / MCP server on the database before a
-restore.
+could replay into it; a crash can leave a `<db>.restore-tmp-<ts>` file,
+which is safe to delete once no restore is running. If `restore`
+reports that a sidecar **appeared** beside the restored database, do
+not delete it while the process that made it is running — it may be
+that process's live WAL; stop the process first, then run the restore
+again or put the rollback copy back. Stop every daemon / MCP server on
+the database before a restore.
 
 ```bash
 ai-memory restore --from /var/backups/ai-memory --snapshot ai-memory-2026-08-22T100000Z --yes

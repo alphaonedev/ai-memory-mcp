@@ -115,11 +115,15 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
          `PRAGMA locking_mode=exclusive` + `BEGIN EXCLUSIVE` detects a live \
          daemon and then keeps every other opener out; it is NOT `db::open` \
          because a lock must not run the bootstrap/ladder against the \
-         operator's live file. Schema-downgrade and rollback-evidence are \
-         applied on the target immediately after the lock via \
-         `assert_schema_not_ahead` (#2445); the staged file was already \
-         schema-checked through `db::open_read_only`. Taking the lock can roll \
-         back a hot journal — that is why consent runs first.",
+         operator's live file. The schema-downgrade guard is applied on the \
+         target immediately after the lock via `assert_schema_not_ahead` \
+         (#2445); the open-time rollback-evidence check is `db::open`'s and \
+         is deliberately NOT run here, because it appends to the audit chain \
+         of the file being replaced. The staged file was already \
+         schema-checked through `db::open_read_only`. The lock sets \
+         `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, so its close writes nothing; \
+         taking it can roll back a hot journal — that is why consent runs \
+         first.",
     ),
 ];
 
