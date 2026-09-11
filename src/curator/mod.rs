@@ -126,6 +126,10 @@ pub const STALE_RULING_FETCH_CAP: usize = STALE_RULING_REPORT_TOP_N * 64;
 /// curator skips `_`-prefixed namespaces when collecting candidates, so this
 /// bookkeeping row is never itself curated.
 pub const STALE_RULING_STATE_NAMESPACE: &str = "_curator/state";
+/// #3587 U3 — key inside the state row's `metadata` / `content` JSON that
+/// carries the stale-id-set hash. One name shared by the sqlite and store
+/// readers / writers so the dedup key cannot drift.
+pub const STALE_RULING_STATE_HASH_KEY: &str = "stale_set_hash";
 /// #3587 U3 — title of the single notify-dedup state row in
 /// [`STALE_RULING_STATE_NAMESPACE`].
 pub const STALE_RULING_STATE_TITLE: &str = "stale-rulings-notify-state";
@@ -959,11 +963,12 @@ fn stale_digest_floor_decision(
 
 /// #3587 U3 — read the single notify-dedup state row, if any.
 fn read_stale_ruling_state(conn: &Connection) -> rusqlite::Result<Option<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT json_extract(metadata, '$.stale_set_hash'), updated_at \
+    let sql = format!(
+        "SELECT json_extract(metadata, '$.{STALE_RULING_STATE_HASH_KEY}'), updated_at \
          FROM memories WHERE namespace = ?1 AND title = ?2 \
-         ORDER BY updated_at DESC LIMIT 1",
-    )?;
+         ORDER BY updated_at DESC LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(rusqlite::params![
         STALE_RULING_STATE_NAMESPACE,
         STALE_RULING_STATE_TITLE
@@ -991,7 +996,8 @@ fn stale_ruling_state_memory(set_hash: &str, now: chrono::DateTime<chrono::Utc>)
         tier: crate::models::Tier::Mid,
         namespace: STALE_RULING_STATE_NAMESPACE.to_string(),
         title: STALE_RULING_STATE_TITLE.to_string(),
-        content: serde_json::json!({ "stale_set_hash": set_hash, "notified_at": ts }).to_string(),
+        content: serde_json::json!({ STALE_RULING_STATE_HASH_KEY: set_hash, "notified_at": ts })
+            .to_string(),
         tags: vec!["_curator".to_string(), "_state".to_string()],
         priority: 1,
         confidence: 1.0,
@@ -1004,7 +1010,7 @@ fn stale_ruling_state_memory(set_hash: &str, now: chrono::DateTime<chrono::Utc>)
         metadata: serde_json::json!({
             "agent_id": crate::identity::sentinels::AI_CURATOR,
             "why_trace": crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM,
-            "stale_set_hash": set_hash,
+            STALE_RULING_STATE_HASH_KEY: set_hash,
         }),
         reflection_depth: 0,
         memory_kind: crate::models::MemoryKind::Observation,
@@ -1192,7 +1198,7 @@ async fn read_store_stale_ruling_state(
     let mem = store.get(ctx, &id).await?;
     let hash = mem
         .metadata
-        .get("stale_set_hash")
+        .get(STALE_RULING_STATE_HASH_KEY)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     Ok(hash.map(|h| (h, mem.updated_at)))
