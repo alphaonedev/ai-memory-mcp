@@ -172,6 +172,17 @@ pub fn materialize_empty_schema(db_path: &Path) {
 /// row's id if the upsert merged on hash). Bypasses the CLI entirely.
 pub fn seed_memory(db_path: &Path, namespace: &str, title: &str, content: &str) -> String {
     let conn = db::open(db_path).expect("db::open");
+    seed_memory_on(&conn, namespace, title, content)
+}
+
+/// [`seed_memory`] on a connection the caller already holds (and has
+/// configured — e.g. one whose close must leave its frames in the `-wal`).
+pub fn seed_memory_on(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    title: &str,
+    content: &str,
+) -> String {
     let now = Utc::now().to_rfc3339();
     let mut metadata = models::default_metadata();
     if let Some(obj) = metadata.as_object_mut() {
@@ -219,5 +230,5 @@ pub fn seed_memory(db_path: &Path, namespace: &str, title: &str, content: &str) 
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
     };
-    db::insert(&conn, &mem).expect("db::insert")
+    db::insert(conn, &mem).expect("db::insert")
 }

@@ -108,13 +108,22 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     (
         "src/cli/backup.rs",
         1,
-        "LIVENESS probe for `restore` (#3131). Opens READ_WRITE so \
-         `PRAGMA locking_mode=exclusive` + `BEGIN EXCLUSIVE` can detect a \
-         live daemon; it is NOT `db::open` because a probe must not run the \
-         bootstrap/ladder against the operator's live file. Schema-downgrade \
-         and rollback-evidence are applied immediately after the exclusive \
-         lock via `assert_schema_not_ahead` (#2445). The probe still \
-         checkpoints a hot WAL on close — that is why consent runs first.",
+        "`lock_exclusive`, the ONE raw open in the module: the LIVENESS \
+         probe for `restore` (#3131) and, since #3550, the exclusive lock \
+         `restore` HOLDS on the old database and on the staged replacement \
+         through the publish. Opens READ_WRITE (never CREATE) so \
+         `PRAGMA locking_mode=exclusive` + `BEGIN EXCLUSIVE` detects a live \
+         daemon and then keeps every other opener out; it is NOT `db::open` \
+         because a lock must not run the bootstrap/ladder against the \
+         operator's live file. The schema-downgrade guard is applied on the \
+         target immediately after the lock via `assert_schema_not_ahead` \
+         (#2445); the open-time rollback-evidence check is `db::open`'s and \
+         is deliberately NOT run here, because it appends to the audit chain \
+         of the file being replaced. The staged file was already \
+         schema-checked through `db::open_read_only`. The lock sets \
+         `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, so its close writes nothing; \
+         taking it can roll back a hot journal — that is why consent runs \
+         first.",
     ),
 ];
 

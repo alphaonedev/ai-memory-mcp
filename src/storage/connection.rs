@@ -552,6 +552,10 @@ fn db_mmap_size() -> i64 {
 /// `asi-hard` hardened profile ([`crate::security_profile`]) pins `FULL`.
 pub const ENV_DB_SYNCHRONOUS: &str = "AI_MEMORY_DB_SYNCHRONOUS";
 
+/// The SQLite pragma name the durability level is applied through (#3550:
+/// shared with `restore`'s pre-checkpoint `synchronous = FULL`).
+pub(crate) const PRAGMA_SYNCHRONOUS: &str = "synchronous";
+
 /// The compiled-default `PRAGMA synchronous` level. `NORMAL` keeps the
 /// #1579 B7 performance posture byte-for-byte for deployments that do not
 /// opt into power-loss durability.
@@ -737,7 +741,7 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
     // v1.0.0 #1961 (R23/R7) — resolved `PRAGMA synchronous`. Default
     // `NORMAL` (perf posture); `AI_MEMORY_DB_SYNCHRONOUS=FULL` upgrades to
     // power-loss durability. The `asi-hard` profile pins `FULL`.
-    conn.pragma_update(None, "synchronous", db_synchronous())?;
+    conn.pragma_update(None, PRAGMA_SYNCHRONOUS, db_synchronous())?;
     // #1579 B7 — memory-mapped I/O. See DEFAULT_DB_MMAP_SIZE_BYTES for
     // the P1 A/B evidence + override ladder.
     conn.pragma_update(None, "mmap_size", db_mmap_size())?;
@@ -1027,7 +1031,7 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
 /// — never silently persist plaintext while a passphrase is set.
 /// `AI_MEMORY_ENCRYPT_AT_REST` is app-level ChaCha and is allowed here.
 #[cfg(feature = "sqlcipher")]
-fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
+pub(crate) fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
     let passphrase = db_passphrase()
         .or_else(|| std::env::var(ENV_DB_PASSPHRASE).ok())
         .ok_or_else(|| {
@@ -1048,7 +1052,7 @@ fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
 }
 
 #[cfg(not(feature = "sqlcipher"))]
-fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
+pub(crate) fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
     refuse_at_rest_requested_without_sqlcipher()
 }
 

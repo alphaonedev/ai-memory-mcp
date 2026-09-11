@@ -84,19 +84,56 @@ SQLite deployments use `ai-memory backup` (a `VACUUM INTO` wrapper that emits a 
 
 ```bash
 ai-memory backup --to /var/backups/ai-memory --keep 48
-ai-memory restore --from /var/backups/ai-memory   # uses newest snapshot; prompts before replacing
+ai-memory restore --from /var/backups/ai-memory --snapshot ai-memory-<ts>   # prompts before replacing
 ```
 
 `--keep` rotates oldest-first. The manifest pins the snapshot's sha256, byte size, source-DB path, and binary version that produced it. `restore` verifies the sha256 before swapping the target file in. Pass `--skip-verify` only if you have already verified out-of-band — the flag exists for restoring from cold storage that has been re-hashed by a separate tool, not as a routine bypass.
 
 Since v1.0.0 `restore` also **refuses a live target** and **stages the replacement before publishing it** ([#3131](https://github.com/alphaonedev/ai-memory-mcp/issues/3131)): stop the daemon first (an exclusive-lock probe detects any other open connection and refuses), the current database is COPIED to `<db>.pre-restore-<ts>.db`, the replacement is fsynced and must pass the whole-database integrity check — `PRAGMA integrity_check` **plus** the whole-file page census that pragma silently skips on a schema carrying a root-less object such as a view or a virtual table ([#3508](https://github.com/alphaonedev/ai-memory-mcp/issues/3508) / [#3510](https://github.com/alphaonedev/ai-memory-mcp/issues/3510)); a build that cannot complete the census refuses rather than publishing a replacement it could not verify — and only then is it swapped in with an atomic `rename` — so a partial copy or a damaged snapshot leaves the live corpus untouched. It asks `Proceed? [y/N]` first; pass `--yes` in scripts and cron (it is **required** with `--json` and whenever stdin is not a terminal). The rollback path is printed, and reported as a `rollback` field under `--json`. See [`CLI_REFERENCE.md §"How restore publishes"`](CLI_REFERENCE.html).
 
-PostgreSQL deployments use the standard tooling:
+Since v1.0.0 [#3550](https://github.com/alphaonedev/ai-memory-mcp/issues/3550) the publish itself is fail-closed and durable: every check runs on the staged copy that is actually published; the exclusive lock is **held** from the liveness check through the swap, so a daemon started mid-restore gets `SQLITE_BUSY` rather than writing into the file being replaced; the old `-wal` / `-shm` / `-journal` are removed **before** the swap and a sidecar that cannot be removed **refuses** the restore; the directory is fsynced before and after the `rename`, and `--json` reports `durable_publish` (`asi-hard` refuses a publish it cannot make durable). Name the snapshot with `--snapshot`: picking "the newest file in the directory" goes by modification time, which is not an integrity signal, so it is WARNed, reported as `selected_by: "mtime"`, and refused under `asi-hard`.
+
+### PostgreSQL recovery
+
+`ai-memory restore` is SQLite-only; a Postgres-backed deployment is recovered with Postgres' own tooling. Native Postgres recovery orchestration inside `ai-memory` is not part of v1.0.0. The procedure below is the supported one ([#3550](https://github.com/alphaonedev/ai-memory-mcp/issues/3550)).
+
+**Logical backups (`pg_dump`).** Take them on a schedule; they are the simplest restore and are portable across Postgres minor versions:
 
 ```bash
-pg_dump --format=custom ai_memory > ai-memory-$(date -u +%Y%m%dT%H%M%SZ).pgdump
-pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
+pg_dump --format=custom --dbname=ai_memory \
+  --file=ai-memory-$(date -u +%Y%m%dT%H%M%SZ).pgdump
+sha256sum ai-memory-*.pgdump > ai-memory.pgdump.sha256   # record and store the checksum separately
 ```
+
+To restore one:
+
+1. **Stop every `ai-memory` process that uses the DSN** — every `serve` daemon and `curator` on every host. The schema is shared by all of them, and a process that keeps running writes into the database while it is being replaced.
+2. Check the dump against the checksum you recorded, from a copy of the checksum that the backup host could not have rewritten. `ai-memory` does not sign Postgres dumps, so this record is your trust anchor.
+3. Restore into the cluster, which must have the `age` and `vector` extensions installed at the versions the dump was taken with:
+
+   ```bash
+   pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
+   ```
+
+4. Start ONE daemon on a binary at least as new as the one that took the dump. A binary older than the restored schema refuses to open it ([#2445](https://github.com/alphaonedev/ai-memory-mcp/issues/2445)). Verify the data before starting the rest of the fleet.
+
+**Point-in-time recovery (PITR).** Use this when an hourly logical dump loses too much, or when you need to stop just before a bad write. It needs continuous WAL archiving, set up before the incident:
+
+```ini
+# postgresql.conf on the primary
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'   # or your archiver
+```
+
+Plus a periodic base backup: `pg_basebackup --pgdata=/backups/base-$(date -u +%Y%m%dT%H%M%SZ) --wal-method=stream --checkpoint=fast`. To recover to a point in time:
+
+1. Stop every `ai-memory` process on the DSN (step 1 above), then stop Postgres.
+2. Move the damaged data directory aside. Do not delete it until the recovery is verified.
+3. Copy the chosen base backup into place as the new data directory.
+4. In `postgresql.conf`, set `restore_command = 'cp /archive/%f %p'` and `recovery_target_time = '<UTC timestamp just before the incident>'`, then create an empty `recovery.signal` in the data directory.
+5. Start Postgres and let it replay to the target. Check the result, then run `SELECT pg_wal_replay_resume();` or promote as your runbook prescribes.
+6. Start one `ai-memory` daemon, verify, then the rest of the fleet.
 
 `ai-memory backup` is **not** an alternative to the above on a Postgres host, and since v1.0.0 it says so instead of failing open ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)). Pointed at a Postgres deployment it used to create an empty SQLite file, snapshot it, write a valid sha256 manifest and exit 0 — the operator learned the truth at the restore. It now resolves the configured store (`--store-url`, or `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`) and errors, naming `pg_dump` / `pg_basebackup`, without writing any artifact. `ai-memory restore` refuses the same store for the same reason. **Pass `--store-url` (or export `AI_MEMORY_STORE_URL`) in the backup cron on every Postgres host** — a daemon started with `--store-url` on argv alone leaves the separate cron process no channel to learn the backend, and the guard cannot fire on a store it cannot see.
 

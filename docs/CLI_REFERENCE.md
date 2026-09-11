@@ -535,7 +535,8 @@ DB; use `--skip-verify` only for forensic recoveries.
 |---|---|---|
 | `--to <dir>` | `backup` | Snapshot + manifest destination. Default `./backups`. |
 | `--keep <n>` | `backup` | Retain at most `n` snapshots, oldest-first rotation. `0` disables. |
-| `--from <path>` | `restore` | A snapshot file, or a directory (newest snapshot wins). |
+| `--from <path>` | `restore` | A snapshot file, or a backup directory (pair it with `--snapshot`). |
+| `--snapshot <name>` | `restore` | The snapshot to restore from a `--from` directory: its file name (`ai-memory-<ts>.db`), its id (`ai-memory-<ts>`), or its manifest's file name. A plain name, never a path; must be a regular file. Without it the newest snapshot **by modification time** is used and a warning names it; the `asi-hard` posture refuses that fallback and lists the candidates (v1.0.0 #3550). |
 | `--skip-verify` | `restore` | Skip the sha256 check. Not routine. |
 | `--yes` | `restore` | Skip the `Proceed? [y/N]` confirmation. REQUIRED with `--json` and whenever stdin is not a terminal (v1.0.0 #3131). |
 | `--store-url <url>` | both | The store this deployment serves, same grammar as `serve` / `curator`. Also read from `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`. |
@@ -563,38 +564,30 @@ Pass `--store-url` explicitly (or export `AI_MEMORY_STORE_URL`) on any
 host where the daemon is Postgres-backed, so the command can refuse
 instead of guessing. The manifest now records `backend`,
 `schema_version` and `memory_count`; a snapshot with zero memories is
-WARNed on stderr. `restore` also clears the `-wal` / `-shm` sidecars
-from beside the restored database, so stale WAL frames can never be
-replayed into the restored corpus.
+WARNed on stderr. `restore` also removes the old `-wal` / `-shm` /
+`-journal` sidecars BEFORE it publishes, and refuses if it cannot, so
+stale frames can never be replayed into the restored corpus (#3550).
 
-### How `restore` publishes (v1.0.0, [#3131](https://github.com/alphaonedev/ai-memory-mcp/issues/3131))
+### How `restore` publishes (v1.0.0, [#3131](https://github.com/alphaonedev/ai-memory-mcp/issues/3131), [#3550](https://github.com/alphaonedev/ai-memory-mcp/issues/3550))
 
-`restore` replaces the live corpus, so it is liveness-gated, staged,
-verified, atomic and reversible — in that order:
+`restore` replaces the live corpus, so it is verified, liveness-gated,
+locked, atomic, durable and reversible — in that order:
 
-1. **Refuse a live target.** A SQLite `locking_mode = EXCLUSIVE` probe
-   (rolled back, so it writes nothing) detects any other open
-   connection. Stop the daemon / MCP server first:
-
-   ```text
-   error: /path/memories.db is open in another process — refusing to
-   restore over a live database … (#3131)
-   ```
-
-   A target that cannot be opened at all (corrupt, unreadable) is
-   WARNed and allowed through — restoring over a database nothing can
-   open is exactly what this verb is for.
-2. **Confirm.** `Proceed? [y/N]` unless `--yes` is passed. `--yes` is
-   **required** with `--json` (a prompt would corrupt the envelope) and
-   whenever stdin is not a terminal (cron, CI, a pipe).
-3. **Copy the current database aside** to `<db>.pre-restore-<ts>.db`
-   (sidecars included). This is a COPY, not a move: the target path
-   never goes empty, so an interrupt cannot leave you with no database.
-4. **Stage and verify.** The replacement is written to a temp file in
-   the same directory, fsynced, and must pass the whole-database
-   integrity check. A partial copy (ENOSPC, interrupt) or a damaged
-   snapshot fails here, the staged file is deleted, and the live
-   database is untouched.
+1. **Select the snapshot.** `--from <file>` names it; `--from <dir>
+   --snapshot <name>` picks it inside a backup directory. Without
+   `--snapshot` the newest snapshot by **modification time** is used and
+   a warning names it: mtime is not an integrity signal (anyone who can
+   write the directory, or a `cp` without `-p`, sets it). Under the
+   `asi-hard` posture that fallback is refused and the candidates are
+   listed. `--json` reports `selected_by: "explicit" | "mtime"`.
+2. **Stage and verify.** The snapshot is copied to a NEW temp file in
+   the target's directory (never over an existing file or a symlink),
+   fsynced, and every check runs on that **staged copy** — the sha256
+   against the manifest, the structural and schema probes, and the
+   whole-database integrity check — so what is published is exactly
+   what was verified, even if the snapshot file changes afterwards. A
+   partial copy (ENOSPC, interrupt) or a damaged snapshot fails here,
+   the staged file is deleted, and the live database is untouched.
 
    Since v1.0.0 that check is `PRAGMA integrity_check` **plus a
    whole-file page census**, because the pragma alone is no longer
@@ -620,19 +613,109 @@ verified, atomic and reversible — in that order:
    pointer-map … + pending-byte …)`), on stderr under `--json` so the
    envelope stays a single machine-readable document. A DR gate that
    cannot tell you what it checked is not a gate you can rely on.
-5. **Swap atomically** with `rename`, then remove the stale
-   `-wal` / `-shm` left over from the replaced database.
-6. **Print the rollback path.** Human output ends with
+3. **Confirm.** `Proceed? [y/N]` unless `--yes` is passed. `--yes` is
+   **required** with `--json` (a prompt would corrupt the envelope) and
+   whenever stdin is not a terminal (cron, CI, a pipe).
+4. **Lock the live database, and keep it locked.** A SQLite
+   `locking_mode = EXCLUSIVE` lock detects any other open connection —
+   stop the daemon / MCP server first:
+
+   ```text
+   error: /path/memories.db is open in another process — refusing to
+   restore over a live database … (#3131)
+   ```
+
+   Since #3550 the lock is not released after the check: it is held
+   through the copy and the publish, so a daemon that starts
+   mid-restore gets `SQLITE_BUSY` instead of writing into the file
+   being replaced. Under the lock the old database's WAL is
+   checkpointed into it and the file is fsynced.
+
+   `restore` only **replaces** a database it can lock and checkpoint.
+   A target it cannot open read-write, cannot lock (not a database,
+   damaged, or encrypted and opened without its key), or whose WAL it
+   cannot fully fold, is **refused** and left exactly as it was —
+   before #3550 the first two were warned about and replaced anyway,
+   which is how a restore run as the wrong user, or without the
+   passphrase, overwrote a database a daemon was still writing. The
+   way through for a genuinely damaged database is to move it, with
+   its `-wal` / `-shm` / `-journal` (they may hold committed data —
+   keep them), out of the way and run the restore again into the now
+   empty target.
+5. **Copy the current database aside** to `<db>.pre-restore-<ts>.db`,
+   with its `-wal` / `-journal` (the `-shm` is a rebuildable index and
+   is not copied). This is a COPY, not a move: the target path never
+   goes empty, so an interrupt cannot leave you with no database. The
+   restored file takes the old database's permissions, never the
+   snapshot's.
+6. **Remove the old sidecars BEFORE publishing.** The staged file is
+   locked too (if it cannot be, the restore is refused — nothing has
+   been removed yet), then the old `-wal` / `-shm` / `-journal` are
+   removed. If one cannot be removed the restore is **refused** and
+   nothing is published: a sidecar left beside the restored database
+   would be replayed into it. (Before #3550 this ran after the swap and
+   only warned.)
+7. **Publish durably.** The directory is fsynced, the staged file is
+   `rename`d over the target (see below for an empty target), and the
+   directory is fsynced again — a
+   lost directory fsync after a power cut can bring the replaced
+   database back. `--json` reports `durable_publish: true | false`.
+   On the default posture a failed directory fsync is WARNed and the
+   restore still completes with `durable_publish: false`; under
+   `asi-hard` a failure before the rename refuses the restore and one
+   after it exits non-zero. Platforms that cannot fsync a directory
+   (Windows) always report `durable_publish: false`.
+8. **Invalidate the replaced file** (Unix). Once the rollback copy is
+   durable (the directory fsync before the rename succeeded), the
+   header of the old, now-unlinked database file is zeroed, so a
+   process that opened the target during the restore fails with
+   "file is not a database" instead of writing a WAL beside the
+   restored database. A file that is still hard-linked elsewhere is
+   left intact, with a warning; so is the old file when neither
+   directory fsync succeeded (it may be the only copy a power cut
+   brings back), with a warning naming what that leaves open.
+9. **Print the rollback path.** Human output ends with
    `Rollback: cp <db>.pre-restore-<ts>.db <db>`; `--json` carries the
    same path in a `rollback` field (`null` only when no database
    existed at the target before).
 
+**An empty target.** With no database at the target there is nothing
+to lock or copy aside. A leftover `-wal` / `-shm` / `-journal` there
+(its main file lost) may be the only copy of committed frames, so it is
+**moved** into the rollback set (`<db>.pre-restore-<ts>.db-wal`, …)
+and named on the output, never deleted. The replacement is then
+published with a hard link, which cannot replace anything: if a
+database appeared at the target meanwhile (an MCP server started on
+it), the restore is refused and that database is untouched — stop it
+and run the restore again, which will then lock it and copy it aside.
+On a filesystem without hard links the restore is refused with the
+`cp` command to finish by hand; it never falls back to a replacing
+rename.
+
+**A symlinked `--db`** is resolved first: the restore replaces the
+database the link points at (where SQLite, and so every daemon, reads
+it), not the link.
+
+A crash at any point leaves either the old database or the verified
+replacement at the target path, never a mix, with no sidecar that
+could replay into it; a crash can leave a `<db>.restore-tmp-<ts>` file,
+which is safe to delete once no restore is running. If `restore`
+reports that a sidecar **appeared** beside the restored database, do
+not delete it while the process that made it is running — it may be
+that process's live WAL; stop the process first, then run the restore
+again or put the rollback copy back. Stop every daemon / MCP server on
+the database before a restore.
+
 ```bash
-ai-memory restore --from /var/backups/ai-memory --yes
+ai-memory restore --from /var/backups/ai-memory --snapshot ai-memory-2026-08-22T100000Z --yes
 # Previous DB copied to /var/lib/ai-memory/memories.pre-restore-2026-08-22T101500Z.db
-# Restored /var/backups/ai-memory/ai-memory-….db → /var/lib/ai-memory/memories.db
+# Restored /var/backups/ai-memory/ai-memory-2026-08-22T100000Z.db → /var/lib/ai-memory/memories.db
 # Rollback: cp /var/lib/ai-memory/memories.pre-restore-2026-08-22T101500Z.db /var/lib/ai-memory/memories.db
 ```
+
+`restore` is SQLite-only. A Postgres-backed deployment is restored
+with Postgres' own tooling — see
+[`production-deployment.md` §"PostgreSQL recovery"](production-deployment.html#postgresql-recovery).
 
 ## Autonomy (v0.6.1)
 

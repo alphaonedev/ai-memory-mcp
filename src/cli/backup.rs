@@ -32,11 +32,16 @@ const VERB_RESTORE: &str = "restore";
 /// refuse a snapshot whose backend disagrees with the resolved target.
 const BACKEND_SQLITE: &str = "sqlite";
 
-/// SQLite WAL sidecar suffixes. A restore that moves `<db>` aside without
-/// these leaves the PREVIOUS database's `-wal` / `-shm` sitting beside the
-/// freshly-copied snapshot, where SQLite may replay stale frames INTO the
-/// restored file (#2444 — silent corruption of the restored corpus).
-const SQLITE_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
+/// SQLite sidecar suffixes. A restore that publishes a new `<db>` while the
+/// PREVIOUS database's `-wal` / `-shm` still sit beside it lets SQLite replay
+/// stale frames INTO the restored file (#2444 — silent corruption of the
+/// restored corpus); a leftover hot `-journal` is rolled back into it the same
+/// way. v1.0.0 #3550 adds `-journal` to the set.
+const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", SQLITE_SHM_SUFFIX, "-journal"];
+
+/// The WAL-index sidecar: rebuilt by SQLite from the `-wal`, so it is never
+/// part of a rollback copy (a copy of it can only be stale).
+const SQLITE_SHM_SUFFIX: &str = "-shm";
 
 /// Append a byte suffix to a path without going through `to_string_lossy`,
 /// so a non-UTF-8 database path keeps its exact bytes.
@@ -46,28 +51,262 @@ fn sidecar_path(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-/// Best-effort unlink of stale `-wal`/`-shm` beside a just-published
-/// restore. The live DB is already swapped: an unlink failure WARNs
-/// with the manual `rm` path and does not fail the restore (Fable
-/// FIX-BEFORE-MERGE).
-fn remove_stale_sidecars(target_db: &Path, out: &mut CliOutput<'_>) -> Result<()> {
+/// Is anything — file, directory, dangling symlink — present at `path`?
+/// `Path::exists` follows symlinks and answers `false` for a dangling one,
+/// which would let a planted link survive beside the published database.
+fn path_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// v1.0.0 #3550 — the publish steps a restore passes through, in order.
+///
+/// `PublishIo::at` is told each one as it is reached; the crash-injection
+/// tests stop the restore at every step and check what is left on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishStep {
+    /// The replacement is staged, fsynced and verified; nothing live touched.
+    Staged,
+    /// The old database is exclusively locked, checkpointed and fsynced.
+    Locked,
+    /// The old database is copied aside and the staged file is locked too.
+    AsideCopied,
+    /// The live sidecars are gone; the old database is still at the target.
+    SidecarsCleared,
+    /// The directory holding the unlinks + staged entry is fsynced; next is
+    /// the rename.
+    PrePublishSynced,
+    /// The rename landed: the verified replacement is at the target.
+    Published,
+    /// The directory entry of the rename is fsynced (or reported not to be).
+    PostPublishSynced,
+}
+
+/// v1.0.0 #3550 — the filesystem operations whose failure changes what the
+/// restore does, behind a seam so tests can inject each failure. Production
+/// uses [`RealPublishIo`], which is exactly the std call.
+trait PublishIo {
+    /// Unlink one live sidecar before the publish.
+    fn remove_sidecar(&mut self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+    /// Fsync the directory `dir`.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        sync_dir(dir)
+    }
+    /// Take and hold the exclusive lock on the staged replacement.
+    fn lock_staged(
+        &mut self,
+        staged: &Path,
+    ) -> std::result::Result<rusqlite::Connection, LockError> {
+        lock_exclusive(staged)
+    }
+    /// Fold the old database's WAL into its main file under the held lock.
+    fn checkpoint(&mut self, conn: &rusqlite::Connection, target: &Path) -> Result<()> {
+        checkpoint_before_sidecar_removal(conn, target)
+    }
+    /// Publish into an empty target without replacing anything.
+    fn hard_link(&mut self, staged: &Path, target: &Path) -> std::io::Result<()> {
+        std::fs::hard_link(staged, target)
+    }
+    /// Observation point: `step` has just been reached.
+    fn at(&mut self, _step: PublishStep, _target: &Path) {}
+}
+
+/// The production [`PublishIo`]: no hooks, real syscalls.
+struct RealPublishIo;
+
+impl PublishIo for RealPublishIo {}
+
+/// v1.0.0 #3550 — remove the live `-wal` / `-shm` / `-journal` BEFORE the
+/// replacement is published, and REFUSE the publish if any of them cannot be
+/// removed.
+///
+/// Before #3550 this ran after the rename and only warned on failure, so for
+/// the whole window between the two a daemon starting on the new file would
+/// replay the old database's WAL into it — and on an unlink failure it did so
+/// indefinitely. Nothing is lost by removing them first: the caller has
+/// already checkpointed the old database under its exclusive lock (so the
+/// `-wal` holds no frames the main file lacks) and copied the whole set
+/// aside, and the `-shm` is a rebuildable index.
+///
+/// # Errors
+/// A sidecar could not be removed, or something is still there afterwards.
+fn clear_live_sidecars(target_db: &Path, io: &mut dyn PublishIo) -> Result<()> {
     for suffix in SQLITE_SIDECAR_SUFFIXES {
         let live_sidecar = sidecar_path(target_db, suffix);
-        if live_sidecar.exists() {
-            if let Err(e) = std::fs::remove_file(&live_sidecar) {
-                writeln!(
-                    out.stderr,
-                    "warning: restored {} but could not remove stale SQLite sidecar {} \
-                     ({e}); remove it manually before starting a daemon — leaving it \
-                     beside the restored database risks replaying old WAL frames into \
-                     it (#2444)",
-                    target_db.display(),
-                    live_sidecar.display()
-                )?;
-            }
+        if !path_present(&live_sidecar) {
+            continue;
+        }
+        io.remove_sidecar(&live_sidecar).with_context(|| {
+            format!(
+                "could not remove the SQLite sidecar {} — refusing to publish the \
+                 restore: a leftover sidecar beside the restored database would replay \
+                 the old database's frames into it. Nothing was published: the \
+                 previous database is still in place (its rollback copy was taken \
+                 first). Remove the sidecar and re-run (#3550)",
+                live_sidecar.display()
+            )
+        })?;
+        if path_present(&live_sidecar) {
+            anyhow::bail!(
+                "the SQLite sidecar {} is still present after it was removed — refusing \
+                 to publish the restore; nothing was published (#3550)",
+                live_sidecar.display()
+            );
         }
     }
     Ok(())
+}
+
+/// v1.0.0 #3550 — the message for a database that appeared at an empty
+/// target while the restore was publishing into it.
+const TARGET_APPEARED: &str = "a database appeared there during the restore — nothing was \
+     replaced and it is untouched. Stop whatever created it (an auto-started MCP server?) \
+     and re-run: the restore will then lock it and take a rollback copy first";
+
+/// v1.0.0 #3550 — with NO database at the target, move any leftover SQLite
+/// sidecar into the rollback set (`<aside>-wal` …) instead of deleting it
+/// (5-agent vote, Q2).
+///
+/// A `-wal` beside a missing database is either debris or the only copy of
+/// committed frames whose main file was lost, and nothing here can tell
+/// which — there is no database to checkpoint it into. It cannot stay (it
+/// would be replayed into the restore), so it is kept under a name nothing
+/// opens. The target is re-checked before each move, so a database created
+/// meanwhile stops the restore instead of losing its WAL.
+///
+/// # Errors
+/// A database appeared at the target, a move fails, or something is still
+/// there afterwards.
+fn move_orphan_sidecars_aside(
+    target_db: &Path,
+    aside: &Path,
+    out: &mut CliOutput<'_>,
+    json_out: bool,
+) -> Result<()> {
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let orphan = sidecar_path(target_db, suffix);
+        if !path_present(&orphan) {
+            continue;
+        }
+        if path_present(target_db) {
+            anyhow::bail!("{}: {TARGET_APPEARED} (#3550)", target_db.display());
+        }
+        let kept = sidecar_path(aside, suffix);
+        if path_present(&kept) {
+            anyhow::bail!(
+                "{} already exists — refusing to move the orphaned sidecar {} over it; \
+                 nothing was published (#3550)",
+                kept.display(),
+                orphan.display()
+            );
+        }
+        std::fs::rename(&orphan, &kept).with_context(|| {
+            format!(
+                "moving the orphaned SQLite sidecar {} to {} — refusing to publish a \
+                 restore beside it; nothing was published (#3550)",
+                orphan.display(),
+                kept.display()
+            )
+        })?;
+        if path_present(&orphan) {
+            anyhow::bail!(
+                "the SQLite sidecar {} is still present after it was moved — refusing to \
+                 publish the restore; nothing was published (#3550)",
+                orphan.display()
+            );
+        }
+        out.human_line(
+            json_out,
+            format_args!(
+                "Moved the orphaned SQLite sidecar {} to {}: there was no database at {}, \
+                 so it may hold the only copy of committed frames (#3550).",
+                orphan.display(),
+                kept.display(),
+                target_db.display()
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// v1.0.0 #3550 — publish into an EMPTY target without being able to
+/// replace anything (5-agent vote, Q2): a hard link fails with
+/// `AlreadyExists` instead of clobbering a database that something created
+/// after the restore looked. The staged file is already locked, so the
+/// published file is held the instant it appears; the staging name is then
+/// removed. There is deliberately no fallback to `rename`.
+///
+/// # Errors
+/// A database appeared at the target, or the link cannot be made.
+fn publish_without_replacing(
+    staged: &Path,
+    target_db: &Path,
+    snapshot: &Path,
+    io: &mut dyn PublishIo,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    match io.hard_link(staged, target_db) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!("{}: {TARGET_APPEARED} (#3550)", target_db.display())
+        }
+        Err(e) => anyhow::bail!(
+            "could not publish the restore into {} without replacing anything ({e}); \
+             restore does not fall back to a rename there, because a database created \
+             meanwhile would be silently replaced. If this filesystem has no hard links, \
+             stop every daemon/MCP server on this database and copy the verified snapshot \
+             into place yourself: cp {} {} (#3550)",
+            target_db.display(),
+            snapshot.display(),
+            target_db.display()
+        ),
+    }
+    if let Err(e) = std::fs::remove_file(staged) {
+        writeln!(
+            out.stderr,
+            "warning: published {} but could not remove the staging name {} ({e}); it is a \
+             second name for the restored database — delete it before starting a daemon \
+             (#3550)",
+            target_db.display(),
+            staged.display()
+        )?;
+    }
+    Ok(())
+}
+
+/// v1.0.0 #3550 — restore the database a symlinked `--db` points at, not
+/// the link. SQLite resolves the link itself (its sidecars sit beside the
+/// real file), so a rename over the LINK published the restore somewhere no
+/// daemon reads while the real database kept its old contents.
+///
+/// # Errors
+/// The link is dangling or cannot be resolved.
+fn resolve_restore_target(
+    target_db: PathBuf,
+    out: &mut CliOutput<'_>,
+    json_out: bool,
+) -> Result<PathBuf> {
+    let is_link = std::fs::symlink_metadata(&target_db).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return Ok(target_db);
+    }
+    let real = std::fs::canonicalize(&target_db).with_context(|| {
+        format!(
+            "{} is a symlink restore cannot resolve — refusing to replace the link \
+             instead of the database it names (#3550)",
+            target_db.display()
+        )
+    })?;
+    out.human_line(
+        json_out,
+        format_args!(
+            "{} is a symlink; restoring the database it points at, {} (#3550).",
+            target_db.display(),
+            real.display()
+        ),
+    )?;
+    Ok(real)
 }
 
 /// v1.0.0 #3131 — filename infix of the pre-restore rollback copy
@@ -101,6 +340,17 @@ pub fn restore_requires_confirmation(args: &RestoreArgs) -> bool {
     !args.yes
 }
 
+/// v1.0.0 #3550 — the one way through every refusal that stands between a
+/// damaged live database and its restore. A database restore cannot lock or
+/// checkpoint is not REPLACED by it (that needs a lock it can hold and a WAL
+/// it can fold); the operator moves the whole set out of the way and
+/// restores into an empty target, which `restore` publishes without
+/// replacing anything.
+const MOVE_ASIDE_REMEDY: &str = "if the database is damaged and nothing is using it, move \
+     it together with its -wal, -shm and -journal files out of the way (they may hold \
+     committed data, so keep them), then re-run: a restore into an empty target replaces \
+     nothing and needs no lock on the old file";
+
 /// v1.0.0 #3131 — refuse the restore while anything still holds the target
 /// database open.
 ///
@@ -113,65 +363,155 @@ pub fn restore_requires_confirmation(args: &RestoreArgs) -> bool {
 /// daemon, MCP server, curator, a second CLI — has the file open. The
 /// transaction is rolled back, so the probe writes nothing of its own.
 ///
-/// Only a POSITIVE liveness signal refuses. Any other failure (a corrupt or
-/// unreadable target, a permissions problem) is WARNed and allowed to
-/// proceed on purpose: restoring over a database nothing can open any more
-/// is precisely the disaster-recovery case this verb exists for, and
-/// refusing there would strand the operator.
+/// v1.0.0 #3550 — on success the probe's connection is RETURNED instead of
+/// dropped: it keeps holding the exclusive lock, and the caller holds it
+/// through the aside copy and the publish, so a writer that starts
+/// mid-restore is refused by SQLite instead of writing into the file being
+/// copied and replaced. `None` means there is no database at the target.
+///
+/// v1.0.0 #3550 — a lock that cannot be taken for ANY reason now refuses
+/// (5-agent vote, Q3). The #3131 contract warned and proceeded when the
+/// target could not be opened read-write or the probe was inconclusive, on
+/// the reasoning that nothing can be using a file nothing can open. Both
+/// halves of that are false: a SQLCipher database opened without its key
+/// reads as "not a database" while a daemon holding the key writes to it,
+/// and a file owned by a service user cannot be opened read-write by an
+/// operator who can still unlink its `-wal` and rename over it. The
+/// disaster-recovery path is [`MOVE_ASIDE_REMEDY`].
 ///
 /// # Errors
-/// The target is open in another connection.
-fn refuse_if_target_in_use(target_db: &Path, out: &mut CliOutput<'_>) -> Result<()> {
-    if !target_db.exists() {
-        return Ok(());
+/// The target is open in another connection, or its lock cannot be taken.
+fn refuse_if_target_in_use(target_db: &Path) -> Result<Option<rusqlite::Connection>> {
+    if !path_present(target_db) {
+        return Ok(None);
     }
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-        | rusqlite::OpenFlags::SQLITE_OPEN_URI
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = match rusqlite::Connection::open_with_flags(target_db, flags) {
-        Ok(conn) => conn,
-        Err(e) => {
-            writeln!(
-                out.stderr,
-                "warning: cannot open {} to check whether it is in use ({e}); \
-                 proceeding — stop any daemon/MCP server on this database first (#3131)",
-                target_db.display()
-            )?;
-            return Ok(());
-        }
-    };
-    // Answer immediately rather than queueing behind a live writer.
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
-    let probe = conn
-        .pragma_update(None, "locking_mode", "exclusive")
-        .and_then(|()| conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;"));
-    match probe {
-        Ok(()) => {
+    match lock_exclusive(target_db) {
+        Ok(conn) => {
             // #2445 — this raw open is off `db::open` on purpose (a
             // liveness probe must not run the bootstrap/ladder against
-            // the live file). Guard the schema-downgrade / rollback-
-            // evidence checks immediately after the exclusive lock is
-            // held so the bypass is not a silent #2488.
+            // the live file). Guard the schema-downgrade check immediately
+            // after the exclusive lock is held so the bypass is not a
+            // silent #2488.
             crate::storage::assert_schema_not_ahead(&conn, &target_db.display().to_string())?;
-            Ok(())
+            Ok(Some(conn))
         }
-        Err(e) if is_busy(&e) => anyhow::bail!(
+        Err(LockError::Busy(e)) => anyhow::bail!(
             "{} is open in another process — refusing to restore over a live \
              database (a daemon / MCP server writing into the file being replaced \
              produces mixed pages plus an orphaned WAL). Stop it and re-run. \
              (#3131: {e})",
             target_db.display()
         ),
-        Err(e) => {
-            writeln!(
-                out.stderr,
-                "warning: liveness probe on {} was inconclusive ({e}); proceeding — \
-                 stop any daemon/MCP server on this database first (#3131)",
-                target_db.display()
-            )?;
-            Ok(())
-        }
+        Err(LockError::Open(e)) => anyhow::bail!(
+            "cannot open {} read-write to lock it ({e}) — refusing to restore: without \
+             the lock restore cannot tell a database nobody can use from one another \
+             user's daemon is writing. Run restore as the database's owner, or, {MOVE_ASIDE_REMEDY} \
+             (#3550)",
+            target_db.display()
+        ),
+        Err(LockError::Probe(e)) => anyhow::bail!(
+            "cannot take SQLite's lock on {} ({e}) — refusing to restore: an unreadable \
+             file may be a damaged database or one opened without its encryption key \
+             while a daemon holding the key writes to it. Supply the passphrase if it is \
+             encrypted, or, {MOVE_ASIDE_REMEDY} (#3550)",
+            target_db.display()
+        ),
     }
+}
+
+/// Why [`lock_exclusive`] did not return a held lock (each carries the
+/// underlying error's message).
+enum LockError {
+    /// The file could not be opened read-write at all.
+    Open(String),
+    /// Another connection holds the database — a POSITIVE liveness signal.
+    Busy(String),
+    /// The lock could not be taken for any other reason (not a database,
+    /// wrong key, unreadable WAL).
+    Probe(String),
+}
+
+/// Open `path` read-write (never CREATE), and take and KEEP SQLite's
+/// exclusive lock on it: `locking_mode = EXCLUSIVE` before the first access,
+/// then `BEGIN EXCLUSIVE; ROLLBACK;`. The transaction writes nothing, and in
+/// exclusive locking mode the lock is retained until the connection closes,
+/// so the returned connection IS the lock. Any other opener meanwhile gets
+/// `SQLITE_BUSY` before it can read a page or create a sidecar.
+///
+/// This is the one raw (off-`db::open`) connection site in this module; the
+/// target probe and the staged-file lock both go through it.
+fn lock_exclusive(path: &Path) -> std::result::Result<rusqlite::Connection, LockError> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(path, flags)
+        .map_err(|e| LockError::Open(e.to_string()))?;
+    // Answer immediately rather than queueing behind a live writer. A
+    // failure to set it only means the probe below may wait; it is not a
+    // reason to stop.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
+    // v1.0.0 #3550 — a SQLCipher database must be keyed before its pages can
+    // be read, or the lock below could never be taken and held (the probe
+    // would read as inconclusive on every encrypted deployment).
+    crate::storage::connection::apply_sqlcipher_key(&conn)
+        .map_err(|e| LockError::Probe(format!("{e:#}")))?;
+    // A lock connection writes nothing, so its close has nothing to
+    // checkpoint — and a close-time checkpoint plus the by-name `-wal` delete
+    // that follows it are exactly what must not happen here: into the
+    // orphaned old inode (undoing `poison_orphaned_inode`), or to a `-wal`
+    // that by then belongs to another connection. SQLite already skips both
+    // once the path points at a different inode (`databaseIsUnmoved`); this
+    // makes the guarantee unconditional instead of platform-dependent.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .map_err(|e| LockError::Probe(e.to_string()))?;
+    conn.pragma_update(None, "locking_mode", "exclusive")
+        .and_then(|()| conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;"))
+        .map_err(|e| {
+            if is_busy(&e) {
+                LockError::Busy(e.to_string())
+            } else {
+                LockError::Probe(e.to_string())
+            }
+        })?;
+    Ok(conn)
+}
+
+/// v1.0.0 #3550 — fold every committed frame of the old database's WAL into
+/// the main file, under the exclusive lock, before its `-wal` is removed.
+/// Anything short of a complete checkpoint is a refusal: removing a `-wal`
+/// that still carries frames the main file lacks would lose them.
+///
+/// # Errors
+/// The checkpoint fails or reports frames it could not move.
+fn checkpoint_before_sidecar_removal(conn: &rusqlite::Connection, target_db: &Path) -> Result<()> {
+    // The checkpoint fsyncs the database file before it truncates the WAL
+    // only at `synchronous >= NORMAL`; ask for FULL rather than inherit.
+    conn.pragma_update(None, crate::storage::connection::PRAGMA_SYNCHRONOUS, "FULL")
+        .with_context(|| format!("setting synchronous=FULL on {}", target_db.display()))?;
+    // (busy, frames in the WAL, frames checkpointed); -1 when not in WAL mode.
+    let (busy, log, checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .with_context(|| {
+            format!(
+                "checkpointing {} before the restore replaces it — refusing to \
+                 remove a WAL that may hold frames the database file lacks (#3550)",
+                target_db.display()
+            )
+        })?;
+    if busy != 0 || log != checkpointed {
+        anyhow::bail!(
+            "could not fully checkpoint {} (busy={busy}, wal frames={log}, \
+             checkpointed={checkpointed}) — refusing to restore: removing its WAL \
+             would lose committed frames. The live database is untouched (#3550)",
+            target_db.display()
+        );
+    }
+    Ok(())
 }
 
 /// Is this rusqlite error a POSITIVE "someone else holds the lock" signal
@@ -185,38 +525,216 @@ fn is_busy(e: &rusqlite::Error) -> bool {
     )
 }
 
-/// Reopen `path` and fsync it, so a file the restore depends on is durable
-/// before anything else is allowed to proceed. NOT best-effort: the caller
-/// treats a failure here as a refusal.
+/// v1.0.0 #3550 — fsync the directory `dir`, so a rename / unlink inside it
+/// survives a power cut, and SAY whether it worked.
+///
+/// This used to be a deliberately infallible `let _ = handle.sync_all()`. A
+/// lost directory fsync after power loss brings the OLD directory entry back
+/// — the replaced database reappears in place of the verified restore — so
+/// the result is reported (`durable_publish` in `--json`) and, under
+/// `asi-hard`, enforced. On a platform where a directory cannot be opened as
+/// a file the answer is an honest `Unsupported`, never a silent pass (the
+/// `governance::deferred_audit::sync_directory` precedent).
 ///
 /// # Errors
-/// The file cannot be reopened for writing, or `fsync` fails.
-fn fsync_file(path: &Path) -> Result<()> {
-    let handle = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .with_context(|| format!("reopening {} to fsync it", path.display()))?;
-    handle
-        .sync_all()
-        .with_context(|| format!("fsyncing {}", path.display()))
-}
-
-/// Best-effort fsync of the directory holding `path`, so the rename that
-/// published the restore is itself durable.
-///
-/// Deliberately infallible: a directory fsync is a durability upgrade, not a
-/// correctness gate, and some platforms cannot open a directory as a file at
-/// all. The restore is already verified and published by the time this runs.
-fn fsync_dir_of(path: &Path) {
-    if let Some(dir) = path.parent()
-        && let Ok(handle) = std::fs::File::open(dir)
+/// The directory cannot be opened, the fsync fails, or the platform has no
+/// directory fsync.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
     {
-        let _ = handle.sync_all();
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory fsync is unsupported on this platform",
+        ))
     }
 }
 
-/// v1.0.0 #3131 — stage the replacement beside its final home, make it
-/// durable, and REFUSE unless the whole file verifies.
+/// The directory a restore publishes into: the target's parent, or `.` for
+/// a bare relative file name (`Path::parent` answers `""` there).
+fn publish_dir(target_db: &Path) -> &Path {
+    match target_db.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Size of the SQLite database file header.
+#[cfg(unix)]
+const SQLITE_HEADER_BYTES: usize = 100;
+
+/// v1.0.0 #3550 — make the orphaned OLD database inode unusable after the
+/// rename has replaced it, so a process that opened the target path during
+/// the restore (and was held off by the exclusive lock) fails loudly with
+/// "file is not a database" once the lock is released, instead of carrying
+/// on against the orphan and creating `<target>-wal` BY NAME beside the
+/// restored database — a WAL SQLite would then replay into the restore,
+/// silently reverting it. (Measured on SQLite 3.53: without this, a reader of
+/// the restored file afterwards sees the OLD rows plus the stray write.)
+///
+/// Only an inode with ZERO remaining links is touched: `old` was opened on
+/// the target path before the rename, the rename unlinked it, and the aside
+/// copy is a separate file. If anything else still links the inode (an
+/// operator's hard link), it is a live database somewhere and is left alone.
+/// Returns whether the header was overwritten.
+///
+/// # Errors
+/// The fstat, the write, or its fsync fails.
+#[cfg(unix)]
+fn poison_orphaned_inode(old: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    if old.metadata()?.nlink() != 0 {
+        return Ok(false);
+    }
+    // The whole 100-byte database header: the magic ("SQLite format 3\0", or
+    // a SQLCipher file's salt) so a cold opener fails, AND the file change
+    // counter at bytes 24..28, so a connection holding a warm page cache sees
+    // the file changed and re-reads page 1 instead of trusting its cache.
+    old.write_all_at(&[0u8; SQLITE_HEADER_BYTES], 0)?;
+    old.sync_all()?;
+    Ok(true)
+}
+
+/// Test helper: [`stage_snapshot`] then [`verify_staged_integrity`] — the
+/// production sequence runs the manifest and schema checks between the two.
+#[cfg(test)]
+fn stage_and_verify(
+    snapshot: &Path,
+    staged: &Path,
+    out: &mut CliOutput<'_>,
+    json_out: bool,
+) -> Result<()> {
+    stage_snapshot(snapshot, staged)?;
+    verify_staged_integrity(staged, out, json_out)
+}
+
+/// Owner-only mode for a file restore creates before it knows better (the
+/// staged replacement, a rollback copy of a target that had no mode to copy).
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// The permission bits of an open file (`0` where the platform has none).
+///
+/// # Errors
+/// The fstat fails.
+fn file_mode(file: &std::fs::File) -> std::io::Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(file.metadata()?.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        file.metadata().map(|_| 0)
+    }
+}
+
+/// Set an open file's permission bits THROUGH ITS HANDLE (`fchmod`), never
+/// by name: a name can be swapped for a symlink, a handle cannot. No-op
+/// where the platform has no mode bits.
+///
+/// # Errors
+/// The fchmod fails.
+fn set_file_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, mode);
+        Ok(())
+    }
+}
+
+/// v1.0.0 #3550 — copy `src` into a file that did NOT exist at `dest`, then
+/// fsync it through the same handle, and hand that handle back.
+///
+/// `create_new` (O_CREAT|O_EXCL) refuses a pre-existing file AND a symlink
+/// planted at the predictable name — `std::fs::copy` would truncate the
+/// first and write through the second. The file starts owner-only and is
+/// widened to `mode`, if given, through the handle before the fsync.
+///
+/// # Errors
+/// `dest` exists, or the copy, the chmod or the fsync fails.
+fn copy_into_new_file(
+    src: &mut impl std::io::Read,
+    dest: &Path,
+    mode: Option<u32>,
+) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, PRIVATE_FILE_MODE);
+    let mut file = options
+        .open(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let written = std::io::copy(src, &mut file)
+        .with_context(|| format!("writing {}", dest.display()))
+        .and_then(|_| match mode {
+            Some(mode) => set_file_mode(&file, mode)
+                .with_context(|| format!("setting the permissions of {}", dest.display())),
+            None => Ok(()),
+        })
+        .and_then(|()| {
+            file.sync_all()
+                .with_context(|| format!("fsyncing {}", dest.display()))
+        });
+    match written {
+        Ok(()) => Ok(file),
+        Err(e) => {
+            // This call created the file, so a partial one is ours to remove.
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            Err(e)
+        }
+    }
+}
+
+/// v1.0.0 #3131/#3550 — copy the snapshot to the staging path beside the
+/// target and make it durable. Durability BEFORE verification: a check that
+/// passes on page-cached bytes proves nothing about what survives a power
+/// cut. Returns the staged file's handle, which the caller keeps open so the
+/// file it verifies is provably the file it publishes.
+///
+/// # Errors
+/// The snapshot cannot be read, the staged file cannot be created
+/// (including because something already sits at its name), written or
+/// fsynced, or a SQLite sidecar already sits beside its name — a planted
+/// `-wal` or `-journal` there would be read into the verification (or rolled
+/// into the file by the lock) without being part of what is published.
+fn stage_snapshot(snapshot: &Path, staged: &Path) -> Result<std::fs::File> {
+    let mut src = std::fs::File::open(snapshot)
+        .with_context(|| format!("opening snapshot {}", snapshot.display()))?;
+    let file = copy_into_new_file(&mut src, staged, None).with_context(|| {
+        format!(
+            "staging the restore at {} (the live database is untouched)",
+            staged.display()
+        )
+    })?;
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let planted = sidecar_path(staged, suffix);
+        if path_present(&planted) {
+            drop(file);
+            let _ = std::fs::remove_file(staged);
+            anyhow::bail!(
+                "{} already exists beside the staged restore — refusing to verify or \
+                 publish through a sidecar restore did not create. The live database is \
+                 untouched (#3550)",
+                planted.display()
+            );
+        }
+    }
+    Ok(file)
+}
+
+/// v1.0.0 #3131 — REFUSE the staged replacement unless the whole file
+/// verifies.
 ///
 /// `staged` lives in the same directory as the target, so the caller's
 /// `rename` is an atomic, same-filesystem swap. A partial copy (ENOSPC, an
@@ -236,26 +754,11 @@ fn fsync_dir_of(path: &Path) {
 /// a gate an operator can rely on.
 ///
 /// # Errors
-/// The copy fails, the staged file cannot be fsynced or opened, it fails the
-/// integrity verdict, or this build cannot COMPLETE the check (no `dbstat`,
-/// an unreadable auto-vacuum geometry) — in which case it refuses rather than
-/// publishing a replacement it could not verify.
-fn stage_and_verify(
-    snapshot: &Path,
-    staged: &Path,
-    out: &mut CliOutput<'_>,
-    json_out: bool,
-) -> Result<()> {
-    std::fs::copy(snapshot, staged).with_context(|| {
-        format!(
-            "staging the restore at {} (the live database is untouched)",
-            staged.display()
-        )
-    })?;
-    // Durability BEFORE verification: an integrity_check that passes on
-    // page-cached bytes proves nothing about what survives a power cut.
-    fsync_file(staged)?;
-
+/// The staged file cannot be opened, it fails the integrity verdict, or this
+/// build cannot COMPLETE the check (no `dbstat`, an unreadable auto-vacuum
+/// geometry) — in which case it refuses rather than publishing a replacement
+/// it could not verify.
+fn verify_staged_integrity(staged: &Path, out: &mut CliOutput<'_>, json_out: bool) -> Result<()> {
     let probe = db::open_read_only(staged).with_context(|| {
         format!(
             "the staged restore {} is not a readable SQLite database — refusing to \
@@ -361,9 +864,19 @@ pub struct BackupArgs {
 #[derive(Args)]
 pub struct RestoreArgs {
     /// Path to a snapshot file OR a backup directory. When a directory is
-    /// supplied, the most recent snapshot is used.
+    /// supplied, pass `--snapshot` to name the snapshot; without it the
+    /// newest snapshot BY MODIFICATION TIME is used, with a warning.
     #[arg(long)]
     pub from: PathBuf,
+    /// v1.0.0 #3550 — the snapshot to restore from a `--from` DIRECTORY:
+    /// its file name (`ai-memory-<ts>.db`), its id (`ai-memory-<ts>`, the
+    /// name without the extension, shared with its manifest), or its
+    /// manifest's file name (`ai-memory-<ts>.manifest.json`). A plain name,
+    /// never a path. Without it the newest snapshot by mtime is used, which
+    /// is not an integrity signal — anyone who can write the directory can
+    /// set it.
+    #[arg(long, value_name = "NAME")]
+    pub snapshot: Option<String>,
     /// Skip sha256 verification against the manifest. Not recommended.
     #[arg(long)]
     pub skip_verify: bool,
@@ -812,24 +1325,7 @@ pub fn run_backup(
 /// delete everything past `keep`. Also deletes the matching manifest
 /// for each removed snapshot.
 fn prune_old_snapshots(dir: &Path, keep: usize) -> Result<()> {
-    let mut snaps: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?.to_owned();
-            let is_snapshot = name.starts_with("ai-memory-")
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db"));
-            if is_snapshot {
-                let mtime = entry.metadata().ok()?.modified().ok()?;
-                Some((mtime, path))
-            } else {
-                None
-            }
-        })
-        .collect();
-    snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let snaps = snapshots_newest_first(dir)?;
     for (_, path) in snaps.into_iter().skip(keep) {
         let _ = std::fs::remove_file(&path);
         // Matching manifest (same stem, .manifest.json extension pattern)
@@ -841,6 +1337,304 @@ fn prune_old_snapshots(dir: &Path, keep: usize) -> Result<()> {
     Ok(())
 }
 
+/// v1.0.0 #3550 — how the snapshot being restored was chosen, reported as
+/// `selected_by` under `--json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotSelection {
+    /// `--from` named the snapshot file, or `--snapshot` named it inside the
+    /// `--from` directory.
+    Explicit,
+    /// `--from` was a directory, no `--snapshot` was given, and the newest
+    /// snapshot by modification time was taken.
+    Mtime,
+}
+
+impl SnapshotSelection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Mtime => "mtime",
+        }
+    }
+}
+
+/// The snapshot a restore will read, its manifest, and how it was chosen.
+struct SelectedSnapshot {
+    snapshot: PathBuf,
+    manifest: PathBuf,
+    selected_by: SnapshotSelection,
+}
+
+/// Filename prefix every `backup` snapshot (and manifest) carries.
+const SNAPSHOT_FILE_PREFIX: &str = "ai-memory-";
+
+/// Snapshot file extension, compared case-insensitively.
+const SNAPSHOT_FILE_EXT: &str = "db";
+
+/// Suffix of a manifest file name (`<id>.manifest.json`); see
+/// [`manifest_file_name`].
+const MANIFEST_FILE_SUFFIX: &str = ".manifest.json";
+
+/// Every `ai-memory-*.db` snapshot in `dir`, with its mtime, newest first.
+fn snapshots_newest_first(dir: &Path) -> Result<Vec<(std::time::SystemTime, PathBuf)>> {
+    let mut snaps: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_owned();
+            let is_snapshot = name.starts_with(SNAPSHOT_FILE_PREFIX)
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(SNAPSHOT_FILE_EXT));
+            if is_snapshot {
+                let mtime = entry.metadata().ok()?.modified().ok()?;
+                Some((mtime, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+    snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
+    Ok(snaps)
+}
+
+/// v1.0.0 #3550 — the snapshot id `--snapshot` names: the file name, the id
+/// (stem) or the manifest file name all reduce to the stem. `None` when
+/// `name` is not a single plain path component (a path, `.`, `..`, empty).
+fn snapshot_id(name: &str) -> Option<&str> {
+    let mut components = Path::new(name).components();
+    let single_normal = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !single_normal || name.contains(['/', '\\']) {
+        return None;
+    }
+    let id = if let Some(id) = name.strip_suffix(MANIFEST_FILE_SUFFIX) {
+        id
+    } else {
+        let path = Path::new(name);
+        match path.extension() {
+            Some(ext) if ext.eq_ignore_ascii_case(SNAPSHOT_FILE_EXT) => {
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or(name)
+            }
+            _ => name,
+        }
+    };
+    (!id.is_empty() && id != "." && id != "..").then_some(id)
+}
+
+/// v1.0.0 #3550 — pick the snapshot and manifest a restore reads.
+///
+/// * `--from <file>` — that file; `--snapshot` alongside it is refused
+///   (it only selects inside a directory).
+/// * `--from <dir> --snapshot <name>` — `<dir>/<id>.db`, which must be a
+///   regular file (not a symlink) directly in `<dir>`.
+/// * `--from <dir>` alone — the newest snapshot by modification time. That
+///   is not an integrity signal (anyone who can write the directory, or a
+///   `cp` without `-p`, sets it), so the choice is WARNed with the pin to
+///   use, and under `asi-hard` it is REFUSED with the candidates listed.
+///
+/// # Errors
+/// See above; also an unreadable directory or an empty one.
+fn select_snapshot(
+    from: &Path,
+    snapshot: Option<&str>,
+    policy: RestorePolicy,
+    out: &mut CliOutput<'_>,
+) -> Result<SelectedSnapshot> {
+    if !from.is_dir() {
+        if snapshot.is_some() {
+            anyhow::bail!(
+                "--snapshot selects a snapshot inside a --from DIRECTORY, but --from {} \
+                 is not a directory; pass the directory, or drop --snapshot (#3550)",
+                from.display()
+            );
+        }
+        let stem = from.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let parent = from.parent().unwrap_or_else(|| Path::new("."));
+        return Ok(SelectedSnapshot {
+            snapshot: from.to_path_buf(),
+            manifest: parent.join(manifest_file_name(stem)),
+            selected_by: SnapshotSelection::Explicit,
+        });
+    }
+    if let Some(name) = snapshot {
+        let id = snapshot_id(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--snapshot {name:?} is not a snapshot name — pass the file name \
+                 (ai-memory-<ts>.db), its id (ai-memory-<ts>) or its manifest's file \
+                 name, never a path (#3550)"
+            )
+        })?;
+        let path = from.join(format!("{id}.{SNAPSHOT_FILE_EXT}"));
+        let meta = std::fs::symlink_metadata(&path).with_context(|| {
+            format!(
+                "--snapshot {name:?}: no snapshot {} in {} (#3550)",
+                path.display(),
+                from.display()
+            )
+        })?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "--snapshot {name:?}: {} is not a regular file (a symlink or a \
+                 directory is refused) (#3550)",
+                path.display()
+            );
+        }
+        return Ok(SelectedSnapshot {
+            snapshot: path,
+            manifest: from.join(manifest_file_name(id)),
+            selected_by: SnapshotSelection::Explicit,
+        });
+    }
+    let snaps = snapshots_newest_first(from)?;
+    let Some((_, newest)) = snaps.first() else {
+        anyhow::bail!("no snapshots found in {}", from.display());
+    };
+    let newest = newest.clone();
+    let stem = newest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned();
+    if policy.asi_hard {
+        let candidates: Vec<String> = snaps
+            .iter()
+            .filter_map(|(_, p)| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+            .collect();
+        anyhow::bail!(
+            "restore: --from {} is a directory and no --snapshot was given; the asi-hard \
+             posture refuses to pick a snapshot by modification time, which anyone who \
+             can write the directory controls. Pass --snapshot <id>. Candidates, newest \
+             mtime first: {} (#3550)",
+            from.display(),
+            candidates.join(", ")
+        );
+    }
+    writeln!(
+        out.stderr,
+        "warning: --from {} is a directory and no --snapshot was given: restoring {}, \
+         the newest snapshot by MODIFICATION TIME. mtime is not an integrity signal — \
+         anyone who can write that directory can set it. Pass --snapshot {stem} to pin \
+         this choice (#3550)",
+        from.display(),
+        newest.display()
+    )?;
+    Ok(SelectedSnapshot {
+        manifest: from.join(manifest_file_name(&stem)),
+        snapshot: newest,
+        selected_by: SnapshotSelection::Mtime,
+    })
+}
+
+/// v1.0.0 #3550 — the posture inputs `restore` enforces, resolved once by
+/// [`run_restore`] and passed down so tests can drive both postures without
+/// mutating the process environment.
+#[derive(Debug, Clone, Copy)]
+struct RestorePolicy {
+    /// `AI_MEMORY_SECURITY_PROFILE=asi-hard`: a directory fsync that fails
+    /// is a refusal (before the publish) or a non-zero exit (after it), and
+    /// the mtime snapshot pick is refused.
+    asi_hard: bool,
+}
+
+/// v1.0.0 #3550 — what a restore holds on the old and the new database
+/// file while it publishes.
+///
+/// FIELD ORDER IS RELEASE ORDER (Rust drops fields in declaration order), on
+/// the success path AND on every early return or unwind, and each step of it
+/// is load-bearing:
+///
+/// 1. `old_lock` first. Its close neither checkpoints nor deletes a sidecar
+///    by name (`lock_exclusive` sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`), so
+///    it cannot write into the invalidated orphan or touch a `-wal` beside
+///    the restored database.
+/// 2. `old_file` after the connection: closing ANY descriptor on a file
+///    drops every POSIX lock the process holds on it, so closing this one
+///    first would release the old lock early.
+/// 3. `new_lock` last, so the restored database stays held until the old
+///    inode is released.
+struct HeldLocks {
+    old_lock: Option<rusqlite::Connection>,
+    old_file: Option<std::fs::File>,
+    new_lock: Option<rusqlite::Connection>,
+}
+
+/// v1.0.0 #3550 — the staged replacement, removed on every path that does
+/// not publish it (an error, a refusal, an unwind). Disarmed by the publish.
+///
+/// The handle stays open from creation to the end of the restore: the
+/// sha256 is read through it and its mode is set through it, and
+/// [`StagedFile::ensure_unswapped`] proves the NAME still points at it before
+/// anything is published. It is declared before [`HeldLocks`] in
+/// `run_restore_with`, so it is closed only after the lock on the same inode
+/// is released — closing a descriptor drops every POSIX lock the process
+/// holds on that file.
+struct StagedFile {
+    path: PathBuf,
+    armed: bool,
+    file: std::fs::File,
+}
+
+impl StagedFile {
+    fn new(path: PathBuf, file: std::fs::File) -> Self {
+        Self {
+            path,
+            armed: true,
+            file,
+        }
+    }
+
+    /// Refuse if the staged NAME no longer refers to the file this restore
+    /// staged and verified (someone with write access to the directory
+    /// swapped it between the verification and the publish).
+    ///
+    /// # Errors
+    /// Either stat fails, or the two identities differ.
+    fn ensure_unswapped(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self
+                .file
+                .metadata()
+                .with_context(|| format!("reading {}", self.path.display()))?;
+            let named = std::fs::symlink_metadata(&self.path)
+                .with_context(|| format!("reading {}", self.path.display()))?;
+            if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+                anyhow::bail!(
+                    "{} is no longer the file this restore staged and verified — \
+                     refusing to publish it; the live database is untouched (#3550)",
+                    self.path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if self.armed {
+            // Never panic in Drop; a leftover temp file is a disk-space
+            // nuisance, not a correctness problem, and carries the restore
+            // infix so the operator can find it.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Best-effort removal of sidecars SQLite may leave beside the STAGED
+/// file's name (a verification open of a WAL-mode snapshot). They are named
+/// after the temp file, never after the target, so they cannot be replayed
+/// into the restored database; this only keeps the directory tidy.
+fn remove_staged_sidecars(staged: &Path) {
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let _ = std::fs::remove_file(sidecar_path(staged, suffix));
+    }
+}
+
 /// `restore` handler.
 pub fn run_restore(
     db_path: &Path,
@@ -848,55 +1642,60 @@ pub fn run_restore(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    use std::io::Read;
+    let policy = RestorePolicy {
+        asi_hard: crate::security_profile::is_asi_hard(),
+    };
+    run_restore_with(db_path, args, json_out, out, policy, &mut RealPublishIo)
+}
+
+/// SHA-256 of an open file, read from its start, lowercase hex.
+fn sha256_hex(mut f: &std::fs::File) -> Result<String> {
+    use sha2::Digest;
+    use std::io::{Read, Seek};
+    let mut hasher = sha2::Sha256::new();
+    f.rewind()?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// [`run_restore`] with the posture and the publish I/O injected.
+#[allow(clippy::too_many_lines)]
+fn run_restore_with(
+    db_path: &Path,
+    args: &RestoreArgs,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+    policy: RestorePolicy,
+    io: &mut dyn PublishIo,
+) -> Result<()> {
     // #2444 — a restore onto a Postgres-backed deployment would copy a SQLite
     // snapshot to a placeholder path, print "Restored", and exit 0 while the
     // real corpus was never touched. That is the false-assurance half of the
     // same defect, and it lands at the exact moment it cannot be fixed.
     let target_db = resolve_sqlite_source(db_path, args.store_url.as_deref(), VERB_RESTORE, out)?;
-    let (snapshot_path, manifest_path) = if args.from.is_dir() {
-        // Pick the newest snapshot in the directory.
-        let mut snaps: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&args.from)?
-            .filter_map(std::result::Result::ok)
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = path.file_name()?.to_str()?.to_owned();
-                let is_snapshot = name.starts_with("ai-memory-")
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("db"));
-                if is_snapshot {
-                    let mtime = entry.metadata().ok()?.modified().ok()?;
-                    Some((mtime, path))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
-        let snap = snaps
-            .into_iter()
-            .next()
-            .map(|(_, p)| p)
-            .ok_or_else(|| anyhow::anyhow!("no snapshots found in {}", args.from.display()))?;
-        let stem = snap.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let manifest = args.from.join(manifest_file_name(stem));
-        (snap, manifest)
-    } else {
-        // File path supplied directly.
-        let snap = args.from.clone();
-        let stem = snap.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let parent = snap.parent().unwrap_or_else(|| Path::new("."));
-        let manifest = parent.join(manifest_file_name(stem));
-        (snap, manifest)
-    };
+    let target_db = resolve_restore_target(target_db, out, json_out)?;
+    let SelectedSnapshot {
+        snapshot: snapshot_path,
+        manifest: manifest_path,
+        selected_by,
+    } = select_snapshot(&args.from, args.snapshot.as_deref(), policy, out)?;
 
     if !snapshot_path.exists() {
         anyhow::bail!("snapshot {} does not exist", snapshot_path.display());
     }
 
-    // SHA-256 verification against manifest.
-    if !args.skip_verify {
+    // Manifest pre-checks that need no bytes: cross-backend and
+    // forward-schema. The sha256 itself is checked on the STAGED copy below.
+    let manifest = if args.skip_verify {
+        None
+    } else {
         if !manifest_path.exists() {
             anyhow::bail!(
                 "manifest {} not found; pass --skip-verify to restore anyway",
@@ -936,20 +1735,44 @@ pub fn run_restore(
                 );
             }
         }
-        let observed = {
-            use sha2::Digest;
-            let mut hasher = sha2::Sha256::new();
-            let mut f = std::fs::File::open(&snapshot_path)?;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            format!("{:x}", hasher.finalize())
-        };
+        Some(manifest)
+    };
+
+    // v1.0.0 #3131 — EXPLICIT INTENT. `restore` REPLACES the operator's live
+    // corpus. The confirmation takes the same posture as the substrate's
+    // other destructive verbs (`forget --confirm-global`, `governance
+    // install-defaults --yes`): an interactive `[y/N]`, overridden by
+    // `--yes`, REQUIRED under `--json` (a prompt would corrupt the envelope)
+    // and whenever stdin is not a terminal (nobody is there to answer, and a
+    // destructive verb must not proceed on silence). The two refusals that
+    // need no answer run first, before any work.
+    let needs_confirmation = restore_requires_confirmation(args);
+    if needs_confirmation {
+        if json_out {
+            anyhow::bail!(RESTORE_JSON_REQUIRES_YES);
+        }
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            anyhow::bail!(RESTORE_NON_INTERACTIVE_REQUIRES_YES);
+        }
+    }
+
+    // v1.0.0 #3131 — STAGE, then VERIFY WHAT WILL BE PUBLISHED. The
+    // replacement is copied to a new file in the SAME directory (so the
+    // publish is an atomic, same-filesystem rename) and fsynced.
+    //
+    // v1.0.0 #3550 — every check below reads the STAGED copy, not the
+    // snapshot. Before, the sha256 and the structural probes read the
+    // snapshot, and the bytes were copied later — after a confirmation prompt
+    // that can wait indefinitely — so a snapshot swapped in that window was
+    // published unverified.
+    let ts = chrono::Utc::now().format(BACKUP_TS_FMT).to_string();
+    let staged_path = sidecar_path(&target_db, &format!(".{RESTORE_TMP_INFIX}-{ts}"));
+    let staged_file = stage_snapshot(&snapshot_path, &staged_path)?;
+    let mut staged = StagedFile::new(staged_path.clone(), staged_file);
+
+    if let Some(manifest) = manifest.as_ref() {
+        let observed = sha256_hex(&staged.file)
+            .with_context(|| format!("hashing the staged restore {}", staged_path.display()))?;
         if observed != manifest.sha256 {
             anyhow::bail!(
                 "sha256 mismatch — manifest says {}, snapshot is {}",
@@ -963,10 +1786,10 @@ pub fn run_restore(
     // sha256 above proves only that the bytes match the manifest WE wrote over
     // whatever `VACUUM INTO` produced (and `--skip-verify` proves nothing at
     // all), so a truncated / foreign / non-SQLite file passes it. Probe the
-    // snapshot read-only: if it is not an ai-memory database this query fails,
-    // and we refuse BEFORE moving the operator's live corpus aside.
+    // staged copy read-only: if it is not an ai-memory database this query
+    // fails, and we refuse BEFORE the operator's live corpus is touched.
     {
-        let probe = db::open_read_only(&snapshot_path).with_context(|| {
+        let probe = db::open_read_only(&staged_path).with_context(|| {
             format!(
                 "snapshot {} is not a readable SQLite database — refusing to restore \
                  it over the live corpus (#2444)",
@@ -988,13 +1811,10 @@ pub fn run_restore(
             })?;
         // v1.0.0 #2445 — MANIFEST-INDEPENDENT forward-schema refusal. The
         // #2444 check above reads `manifest.schema_version`, and the whole
-        // manifest block is nested inside `if !args.skip_verify` — so
-        // `restore --skip-verify` (the ONLY way to restore the manifest-less
-        // pre-migration snapshot that `snapshot_before_migration` writes)
-        // bypassed it entirely and could plant a database nothing on this host
-        // can then open. The probe connection is already here and already
-        // read-only, so re-deriving the truth from the FILE costs one query
-        // and cannot be skipped.
+        // manifest block is skipped under `--skip-verify` — the ONLY way to
+        // restore the manifest-less pre-migration snapshot that
+        // `snapshot_before_migration` writes — so re-derive the truth from the
+        // FILE; it costs one query and cannot be skipped.
         let stamp = crate::storage::probe_schema_stamp(&probe).with_context(|| {
             format!(
                 "cannot read the schema version of snapshot {} — refusing to \
@@ -1019,26 +1839,16 @@ pub fn run_restore(
         )?;
     }
 
-    // v1.0.0 #3131 — EXPLICIT INTENT before any RW open. `restore` REPLACES
-    // the operator's live corpus. The confirmation takes the same posture as
-    // the substrate's other destructive verbs (`forget --confirm-global`,
-    // `governance install-defaults --yes`): an interactive `[y/N]`, overridden
-    // by `--yes`, REQUIRED under `--json` (a prompt would corrupt the envelope)
-    // and whenever stdin is not a terminal (nobody is there to answer, and a
-    // destructive verb must not proceed on silence).
-    //
-    // Fable FIX-BEFORE-MERGE: the liveness probe (`refuse_if_target_in_use`)
-    // opens READ_WRITE and on close recovers+checkpoints a hot WAL, so it is
-    // NOT read-only. Consent MUST run first; otherwise an abort still
-    // checkpointed the live WAL and the "The database was not modified"
-    // line was a lie in the crashed-daemon case.
-    if restore_requires_confirmation(args) {
-        if json_out {
-            anyhow::bail!(RESTORE_JSON_REQUIRES_YES);
-        }
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            anyhow::bail!(RESTORE_NON_INTERACTIVE_REQUIRES_YES);
-        }
+    // #3508/#3510 — the whole-database integrity verdict (PRAGMA
+    // integrity_check plus the page census that pragma skips on this schema).
+    verify_staged_integrity(&staged_path, out, json_out)?;
+    remove_staged_sidecars(&staged_path);
+    // The checks above opened the staged file BY NAME; prove the name still
+    // points at the file that was hashed.
+    staged.ensure_unswapped()?;
+    io.at(PublishStep::Staged, &target_db);
+
+    if needs_confirmation {
         writeln!(
             out.stdout,
             "About to REPLACE {} with {}.",
@@ -1047,10 +1857,9 @@ pub fn run_restore(
         )?;
         writeln!(
             out.stdout,
-            "The current database is copied to <db>.{PRE_RESTORE_INFIX}-<ts>.db first, \
-             and the replacement is published only if it passes PRAGMA integrity_check \
-             AND the whole-file page accounting that check skips on this schema \
-             (#3508/#3510)."
+            "The current database is copied to <db>.{PRE_RESTORE_INFIX}-<ts>.db first. \
+             The replacement has been staged and passed PRAGMA integrity_check AND the \
+             whole-file page accounting that check skips on this schema (#3508/#3510)."
         )?;
         if !confirm_restore(out)? {
             writeln!(out.stdout, "Aborted. The database was not modified.")?;
@@ -1058,83 +1867,293 @@ pub fn run_restore(
         }
     }
 
-    // v1.0.0 #3131 — LIVENESS. The probe opens the target READ_WRITE and
-    // may checkpoint a hot WAL; it therefore runs ONLY after consent.
-    // The pre-#3131 code went straight to `std::fs::copy` onto the live
-    // file, so a daemon / MCP server holding the database open kept
-    // writing into a file being overwritten underneath it — mixed pages
-    // plus an orphaned WAL. Refuse while anything still holds it open.
-    refuse_if_target_in_use(&target_db, out)?;
+    // v1.0.0 #3131 — LIVENESS. The probe opens the target READ_WRITE (it may
+    // roll back a hot journal), so it runs ONLY after consent. A daemon / MCP
+    // server holding the database open is refused.
+    //
+    // v1.0.0 #3550 — and the lock it takes is now HELD, through the aside
+    // copy and the publish, so a writer that starts mid-restore is refused by
+    // SQLite instead of writing into the file being copied and replaced.
+    // Closing ANY descriptor on a file drops every POSIX lock this process
+    // holds on it, so from here until the lock is released the old database
+    // is read only through `old_file`, and `old_lock` is dropped before it.
+    let mut held = HeldLocks {
+        old_lock: refuse_if_target_in_use(&target_db)?,
+        old_file: None,
+        new_lock: None,
+    };
+    // Whether this restore REPLACES a database (held, checkpointed, copied
+    // aside, renamed over) or publishes into an empty target (nothing to
+    // lock; published without replacing anything). Fixed here, before the
+    // non-unix branch releases the locks.
+    let replacing = held.old_lock.is_some();
+    if let Some(conn) = held.old_lock.as_ref() {
+        // Read-write so the orphan can be invalidated after the publish; a
+        // read-only database file still gets its rollback copy.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target_db)
+            .or_else(|_| std::fs::File::open(&target_db))
+            .with_context(|| {
+                format!(
+                    "opening {} to copy it aside — refusing to restore without a \
+                     rollback copy (#3131)",
+                    target_db.display()
+                )
+            })?;
+        // v1.0.0 #3550 — a WAL that cannot be fully folded into the main file
+        // under our lock is a REFUSAL (5-agent vote, Q1): its `-wal` then holds
+        // committed frames the main file lacks, and nothing that runs only on
+        // an error path (a copy-back) can put it back after a kill or a power
+        // cut. The live database and its sidecars are untouched here.
+        io.checkpoint(conn, &target_db)
+            .map_err(|e| anyhow::anyhow!("{e:#} — {MOVE_ASIDE_REMEDY} (#3550)"))?;
+        // The checkpointed pages must be durable BEFORE the `-wal` that also
+        // holds them is removed below.
+        file.sync_all().with_context(|| {
+            format!(
+                "fsyncing {} after its checkpoint — refusing to remove a WAL whose \
+                 frames may not be durable in the database file (#3550)",
+                target_db.display()
+            )
+        })?;
+        held.old_file = Some(file);
+    }
+    io.at(PublishStep::Locked, &target_db);
 
     // v1.0.0 #3131 — REVERSIBILITY FIRST. The pre-restore safety copy is taken
     // by COPY, not by renaming the live file out of the way: a rename leaves NO
-    // database at the target path for the whole window of the copy that follows,
-    // so an interrupt / ENOSPC there left the operator with a vanished corpus
-    // and a differently-named file to go find. Copying keeps the original in
-    // place and intact until the verified replacement is swapped in below.
+    // database at the target path for the whole window of the copy, so an
+    // interrupt / ENOSPC there left the operator with a vanished corpus.
     //
-    // #2444 — the `-wal` / `-shm` sidecars are copied WITH it so the aside set
-    // is a self-consistent database. (In practice the liveness probe above has
-    // already had SQLite checkpoint and remove them, which is strictly better:
-    // the rollback copy then needs no sidecars at all.) The LIVE sidecars
-    // belong to the database being replaced and are removed after the swap —
-    // never left where SQLite could replay stale frames into the restored file.
-    let ts = chrono::Utc::now().format(BACKUP_TS_FMT).to_string();
+    // #2444 — the `-wal` (and a `-journal`) are copied WITH it so the aside set
+    // is a self-consistent database. v1.0.0 #3550 — the `-shm` is not: it is
+    // an index of the `-wal` that SQLite rebuilds, and a copy can only be
+    // stale.
     let aside = target_db.with_extension(format!("{PRE_RESTORE_INFIX}-{ts}.db"));
-    let rollback = if target_db.exists() {
-        std::fs::copy(&target_db, &aside)
+    let old_mode = match held.old_file.as_ref() {
+        Some(file) => Some(
+            file_mode(file)
+                .with_context(|| format!("reading the permissions of {}", target_db.display()))?,
+        ),
+        None => None,
+    };
+    let rollback = if let Some(mut file) = held.old_file.as_ref() {
+        std::io::Seek::rewind(&mut file)
+            .with_context(|| format!("rewinding {}", target_db.display()))?;
+        copy_into_new_file(&mut file, &aside, old_mode)
             .with_context(|| format!("copying the current DB aside to {}", aside.display()))?;
         for suffix in SQLITE_SIDECAR_SUFFIXES {
+            if suffix == SQLITE_SHM_SUFFIX {
+                continue;
+            }
             let live_sidecar = sidecar_path(&target_db, suffix);
-            if live_sidecar.exists() {
-                std::fs::copy(&live_sidecar, sidecar_path(&aside, suffix)).with_context(|| {
+            if !path_present(&live_sidecar) {
+                continue;
+            }
+            let mut src = std::fs::File::open(&live_sidecar).with_context(|| {
+                format!(
+                    "copying SQLite sidecar {} aside — the rollback copy has to be a \
+                     self-consistent database (#2444)",
+                    live_sidecar.display()
+                )
+            })?;
+            copy_into_new_file(&mut src, &sidecar_path(&aside, suffix), None).with_context(
+                || {
                     format!(
                         "copying SQLite sidecar {} aside — the rollback copy has to be a \
-                         self-consistent database (#2444)",
+                     self-consistent database (#2444)",
                         live_sidecar.display()
                     )
-                })?;
-            }
+                },
+            )?;
         }
-        fsync_file(&aside)?;
         if !json_out {
             writeln!(out.stdout, "Previous DB copied to {}", aside.display())?;
         }
-        Some(aside)
+        Some(aside.clone())
     } else {
         None
     };
 
-    // v1.0.0 #3131 — STAGE, VERIFY, THEN SWAP. Write the replacement to a temp
-    // file in the SAME directory (so the publish is an atomic, same-filesystem
-    // rename), fsync it, and open it read-only for the whole-database
-    // integrity check BEFORE it becomes the operator's database. #3508/#3510 —
-    // that check is `storage::sqlite_integrity`, not a bare
-    // `PRAGMA integrity_check`, because on this schema the bare pragma can
-    // answer `ok` without ever examining the unreferenced pages.
-    let staged = sidecar_path(&target_db, &format!(".{RESTORE_TMP_INFIX}-{ts}"));
-    if let Err(e) = stage_and_verify(&snapshot_path, &staged, out, json_out) {
-        // Leave nothing half-written beside the live database.
-        let _ = std::fs::remove_file(&staged);
-        return Err(e);
+    // The replacement takes the permissions of the database it replaces (the
+    // staged copy was created owner-only); with no database there it stays
+    // owner-only. `std::fs::copy` used to carry the SNAPSHOT's mode over, so a
+    // world-writable snapshot published a world-writable corpus. Set through
+    // the staged file's own handle, never by name.
+    if let Some(mode) = old_mode {
+        set_file_mode(&staged.file, mode)
+            .with_context(|| format!("setting the permissions of {}", staged_path.display()))?;
     }
-    if let Err(e) = std::fs::rename(&staged, &target_db) {
-        // Fable FIX-BEFORE-MERGE: a failed rename must not leave
-        // `.<db>.restore-tmp-<ts>` beside the live corpus.
-        let _ = std::fs::remove_file(&staged);
-        return Err(e).with_context(|| {
+
+    // v1.0.0 #3550 — lock the replacement too, so the instant the rename lands
+    // the new file is already held and nothing can open it mid-publish. A
+    // lock that cannot be taken is a REFUSAL (5-agent vote, Q4 5/5): without
+    // it, a daemon could start on the restored file before the publish ends,
+    // and a `-wal` appearing beside it could no longer be told apart from a
+    // stale one. Nothing destructive has happened yet — the live sidecars
+    // are still in place. On non-unix the locks are released instead —
+    // Windows refuses to unlink or rename over a file that is open, which
+    // itself refuses a racing opener.
+    #[cfg(unix)]
+    {
+        held.new_lock = match io.lock_staged(&staged_path) {
+            Ok(conn) => Some(conn),
+            Err(LockError::Open(e) | LockError::Busy(e) | LockError::Probe(e)) => anyhow::bail!(
+                "could not lock the staged restore {} ({e}) — refusing to publish a \
+                 replacement that another process could open mid-publish. Nothing was \
+                 published: the previous database and its sidecars are untouched at {}{} \
+                 (#3550)",
+                staged_path.display(),
+                target_db.display(),
+                rollback
+                    .as_ref()
+                    .map(|p| format!(", and a rollback copy was taken at {}", p.display()))
+                    .unwrap_or_default()
+            ),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        // Field order: the connection before the descriptor.
+        held.old_lock = None;
+        held.old_file = None;
+    }
+    io.at(PublishStep::AsideCopied, &target_db);
+
+    // v1.0.0 #3550 — the old database's sidecars go BEFORE the publish, and a
+    // failure to remove one is a refusal (the #3131 behaviour warned and kept
+    // going, AFTER the rename). With no database at the target there is no
+    // checkpoint to vouch for a leftover `-wal`, which may be the only copy
+    // of committed frames: it is moved into the rollback set, never deleted.
+    if replacing {
+        clear_live_sidecars(&target_db, io)?;
+    } else {
+        move_orphan_sidecars_aside(&target_db, &aside, out, json_out)?;
+    }
+    io.at(PublishStep::SidecarsCleared, &target_db);
+
+    // v1.0.0 #3550 — make the unlinks and the staged directory entry durable
+    // before the rename, then the rename itself after it. A lost directory
+    // fsync after a power cut can bring the replaced database back, so the
+    // outcome is reported (`durable_publish`) and, under asi-hard, enforced.
+    let dir = publish_dir(&target_db);
+    let pre_sync = io.sync_dir(dir);
+    if let Err(e) = pre_sync.as_ref() {
+        if policy.asi_hard {
+            let left = if replacing {
+                format!(
+                    "the previous database is still at {}{}",
+                    target_db.display(),
+                    rollback
+                        .as_ref()
+                        .map(|p| format!(", and its rollback copy is {}", p.display()))
+                        .unwrap_or_default()
+                )
+            } else {
+                format!("there is still no database at {}", target_db.display())
+            };
+            anyhow::bail!(
+                "could not fsync {} before publishing the restore ({e}); the asi-hard \
+                 posture refuses a publish it cannot make durable. Nothing was \
+                 published: {left} (#3550)",
+                dir.display(),
+            );
+        }
+        writeln!(
+            out.stderr,
+            "warning: could not fsync {} before publishing ({e}); continuing, but the \
+             restore will be reported as not durable (#3550)",
+            dir.display()
+        )?;
+    }
+    io.at(PublishStep::PrePublishSynced, &target_db);
+
+    staged.ensure_unswapped()?;
+    if replacing {
+        std::fs::rename(&staged_path, &target_db).with_context(|| {
             format!(
                 "publishing the verified restore over {}",
                 target_db.display()
             )
-        });
+        })?;
+    } else {
+        publish_without_replacing(&staged_path, &target_db, &snapshot_path, io, out)?;
     }
-    // Durability of the swap itself — do this BEFORE sidecar cleanup so a
-    // later sidecar error cannot skip the directory fsync.
-    fsync_dir_of(&target_db);
-    remove_stale_sidecars(&target_db, out)?;
-    fsync_dir_of(&target_db);
+    staged.armed = false;
+    io.at(PublishStep::Published, &target_db);
 
+    let post_sync = io.sync_dir(dir);
+    if let Err(e) = post_sync.as_ref() {
+        writeln!(
+            out.stderr,
+            "warning: restored {} but could not fsync {} ({e}); after a power loss the \
+             previous database may reappear in its place (#3550)",
+            target_db.display(),
+            dir.display()
+        )?;
+    }
+    io.at(PublishStep::PostPublishSynced, &target_db);
+
+    // Defence in depth: with the old sidecars removed and the new file
+    // locked, nothing can have created one. If something did, say so rather
+    // than hand a daemon a WAL to replay.
+    let reappeared: Vec<PathBuf> = SQLITE_SIDECAR_SUFFIXES
+        .iter()
+        .map(|suffix| sidecar_path(&target_db, suffix))
+        .filter(|p| path_present(p))
+        .collect();
+
+    // v1.0.0 #3550 — poison the orphaned old inode (see
+    // `poison_orphaned_inode`) whenever the directory fsync BEFORE the rename
+    // succeeded (5-agent vote, Q5). That fsync made the rollback copy's entry
+    // durable, so if the rename's own entry is lost to a power cut and the
+    // poisoned inode comes back at the target, the old database is still whole
+    // in the rollback copy: a loud "file is not a database" is recoverable.
+    // Not poisoning would let an opener queued on the old inode create
+    // `<target>-wal` beside the restore and have it replayed into it — silent
+    // wrong data. Only when BOTH fsyncs failed is the orphan left alone,
+    // because then it may be the only surviving copy of the old database.
+    #[cfg(unix)]
+    if let Some(file) = held.old_file.as_ref() {
+        if pre_sync.is_ok() {
+            let regular = file.metadata().is_ok_and(|m| m.is_file());
+            match regular.then(|| poison_orphaned_inode(file)) {
+                Some(Ok(true)) => {}
+                Some(Ok(false)) | None => writeln!(
+                    out.stderr,
+                    "warning: the database {} replaced is still linked elsewhere (a hard \
+                     link) or is not a regular file, so it was left intact; anything using \
+                     that other path is still using the OLD database (#3550)",
+                    target_db.display()
+                )?,
+                Some(Err(e)) => writeln!(
+                    out.stderr,
+                    "warning: could not invalidate the replaced database file ({e}); a \
+                     process that opened {} during the restore could still write to it — \
+                     stop and restart any daemon/MCP server on this database, and do not \
+                     delete a sidecar that appears beside it while it runs (#3550)",
+                    target_db.display()
+                )?,
+            }
+        } else {
+            writeln!(
+                out.stderr,
+                "warning: neither directory fsync of the publish succeeded, so the replaced \
+                 database file was left intact (it may be the only copy of the previous \
+                 database a power cut would bring back); a process that opened {} during \
+                 the restore could still write to it — stop and restart any daemon/MCP \
+                 server on this database before relying on the restore (#3550)",
+                target_db.display()
+            )?;
+        }
+    }
+
+    drop(held);
+    remove_staged_sidecars(&staged_path);
+
+    let durable_publish = pre_sync.is_ok() && post_sync.is_ok();
     if json_out {
         writeln!(
             out.stdout,
@@ -1147,6 +2166,11 @@ pub fn run_restore(
                 // put the previous corpus back without guessing the filename.
                 // `null` only when there was no database at the target before.
                 "rollback": rollback.as_ref().map(|p| p.to_string_lossy()),
+                // v1.0.0 #3550 — whether both directory fsyncs of the publish
+                // succeeded, i.e. whether the restore survives a power cut.
+                "durable_publish": durable_publish,
+                // v1.0.0 #3550 — `explicit` or `mtime` (see `--snapshot`).
+                "selected_by": selected_by.as_str(),
             })
         )?;
     } else {
@@ -1170,6 +2194,34 @@ pub fn run_restore(
                 target_db.display()
             )?;
         }
+    }
+    // The publish happened either way (the envelope above says so); these
+    // two make the exit non-zero.
+    if !reappeared.is_empty() {
+        let names: Vec<String> = reappeared.iter().map(|p| p.display().to_string()).collect();
+        anyhow::bail!(
+            "restored {} but SQLite sidecars appeared beside it during the publish ({}) — \
+             something opened the database while it was being replaced, and they may be \
+             that process's live WAL: do NOT delete them while it runs. Stop it first; then \
+             {} (#3550)",
+            target_db.display(),
+            names.join(", "),
+            rollback.as_ref().map_or_else(
+                || "re-run the restore".to_string(),
+                |p| format!(
+                    "either re-run the restore or put the previous database back from {}",
+                    p.display()
+                ),
+            )
+        );
+    }
+    if !durable_publish && policy.asi_hard {
+        anyhow::bail!(
+            "restored {} but the directory entry could not be made durable; the asi-hard \
+             posture reports this as a failure — a power loss may bring the previous \
+             database back (#3550)",
+            target_db.display()
+        );
     }
     Ok(())
 }
@@ -1324,6 +2376,7 @@ mod tests {
         env.stderr.clear();
         let restore_args = RestoreArgs {
             from: backup_dir,
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1360,6 +2413,7 @@ mod tests {
         env.stderr.clear();
         let restore_args = RestoreArgs {
             from: snap_path,
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1403,6 +2457,7 @@ mod tests {
         env.stderr.clear();
         let restore_args = RestoreArgs {
             from: snap_path,
+            snapshot: None,
             skip_verify: true,
             store_url: None,
             yes: true,
@@ -1448,6 +2503,7 @@ mod tests {
         let snap_path = backup_dir.join(&bad.snapshot);
         let restore_args = RestoreArgs {
             from: snap_path,
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1540,6 +2596,7 @@ mod tests {
         let db = env.db_path.clone();
         let args = RestoreArgs {
             from: db.parent().unwrap().join("backups-2444-pg-restore"),
+            snapshot: None,
             skip_verify: false,
             store_url: Some("postgresql://ai_memory:hunter2@127.0.0.1:5432/ai".to_string()),
             yes: true,
@@ -1693,6 +2750,7 @@ mod tests {
 
         let args = RestoreArgs {
             from: snap,
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1726,6 +2784,7 @@ mod tests {
 
         let args = RestoreArgs {
             from: snap,
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1765,6 +2824,7 @@ mod tests {
 
         let args = RestoreArgs {
             from: backup_dir.join(&manifest.snapshot),
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1794,6 +2854,7 @@ mod tests {
         let live_before = std::fs::metadata(&db).unwrap().len();
         let args = RestoreArgs {
             from: bogus,
+            snapshot: None,
             skip_verify: true,
             store_url: None,
             yes: true,
@@ -1849,6 +2910,7 @@ mod tests {
 
         let args = RestoreArgs {
             from: backup_dir.join(&manifest.snapshot),
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1911,6 +2973,7 @@ mod tests {
         let before = std::fs::read(&db).expect("read live db");
         let args = RestoreArgs {
             from: backup_dir.join(&manifest.snapshot),
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -1960,6 +3023,7 @@ mod tests {
         let before = std::fs::read(&db).expect("read live db");
         let args = RestoreArgs {
             from: snap,
+            snapshot: None,
             // The bytes no longer match the manifest sha; this test is about
             // the integrity gate, so skip the checksum and let the structural
             // probe + integrity_check do the refusing.
@@ -2011,6 +3075,7 @@ mod tests {
 
         let args = RestoreArgs {
             from: snap,
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -2059,6 +3124,7 @@ mod tests {
         let manifest = take_backup(&mut env, &db, &backup_dir);
         let args = RestoreArgs {
             from: backup_dir.join(&manifest.snapshot),
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: true,
@@ -2092,6 +3158,7 @@ mod tests {
         let before = std::fs::read(&db).expect("read live db");
         let args = RestoreArgs {
             from: backup_dir.join(&manifest.snapshot),
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: false,
@@ -2116,6 +3183,7 @@ mod tests {
     fn restore_confirmation_predicate_is_lifted_only_by_yes_3131() {
         let base = RestoreArgs {
             from: PathBuf::from("/nonexistent"),
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: false,
@@ -2125,6 +3193,7 @@ mod tests {
             yes: true,
             ..RestoreArgs {
                 from: PathBuf::from("/nonexistent"),
+                snapshot: None,
                 skip_verify: false,
                 store_url: None,
                 yes: false,
@@ -2140,34 +3209,28 @@ mod tests {
     /// proceeding to rewrite the live file.
     #[test]
     fn refuse_if_target_in_use_missing_path_is_ok_3131() {
-        let mut env = TestEnv::fresh();
+        let env = TestEnv::fresh();
         let missing = env
             .db_path
             .parent()
             .unwrap()
             .join("no-such-restore-target.db");
-        {
-            let mut out = env.output();
-            refuse_if_target_in_use(&missing, &mut out)
-                .expect("a missing target is the empty-corpus restore case");
-        }
+        let lock = refuse_if_target_in_use(&missing)
+            .expect("a missing target is the empty-corpus restore case");
+        assert!(
+            lock.is_none(),
+            "there is nothing to lock at a missing target"
+        );
     }
 
     #[test]
     fn refuse_if_target_in_use_idle_current_schema_is_ok_3131() {
-        let mut env = TestEnv::fresh();
+        let env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "idle", "row");
-        {
-            let mut out = env.output();
-            refuse_if_target_in_use(&db, &mut out)
-                .expect("an idle current-schema database must pass the liveness probe");
-        }
-        assert!(
-            !env.stderr_str().contains("warning:"),
-            "idle probe must not warn; stderr was: {}",
-            env.stderr_str()
-        );
+        let lock = refuse_if_target_in_use(&db)
+            .expect("an idle current-schema database must pass the liveness probe");
+        assert!(lock.is_some(), "the probe's lock must be returned, held");
     }
 
     /// `--json` without `--yes` is refused BEFORE the RW probe, so it must
@@ -2184,6 +3247,7 @@ mod tests {
         let manifest = take_backup(&mut env, &db, &backup_dir);
         let args = RestoreArgs {
             from: backup_dir.join(&manifest.snapshot),
+            snapshot: None,
             skip_verify: false,
             store_url: None,
             yes: false,
@@ -2200,51 +3264,9 @@ mod tests {
         assert_eq!(leftovers, 0, "consent refusal must not leave restore-tmp");
     }
 
-    /// Drive `remove_stale_sidecars` directly: a directory planted as
-    /// `-wal` cannot be `remove_file`'d, so the helper WARNs and returns
-    /// Ok. Planting that directory *before* `run_restore` is wrong — the
-    /// pre-swap sidecar *copy* would fail first (macos-fed sqlite red on
-    /// `b68e0a4f`).
-    #[test]
-    fn remove_stale_sidecars_warns_when_unlink_fails_and_does_not_err_3131() {
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        seed_memory(&db, "ns", "t", "c");
-        let wal = sidecar_path(&db, "-wal");
-        std::fs::create_dir(&wal).expect("plant a directory as the -wal sidecar");
-        {
-            let mut out = env.output();
-            remove_stale_sidecars(&db, &mut out)
-                .expect("unlink failure must not fail the published restore");
-        }
-        assert!(
-            env.stderr_str()
-                .contains("could not remove stale SQLite sidecar"),
-            "must WARN with the manual rm path; stderr was: {}",
-            env.stderr_str()
-        );
-        assert!(wal.is_dir(), "the planted directory must still be there");
-        let _ = std::fs::remove_dir(&wal);
-    }
-
-    #[test]
-    fn remove_stale_sidecars_unlinks_a_regular_file_3131() {
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        seed_memory(&db, "ns", "t", "c");
-        let wal = sidecar_path(&db, "-wal");
-        std::fs::write(&wal, b"stale-wal").expect("plant a regular -wal file");
-        {
-            let mut out = env.output();
-            remove_stale_sidecars(&db, &mut out).expect("regular file must unlink");
-        }
-        assert!(!wal.exists(), "stale -wal file must be gone");
-        assert!(
-            !env.stderr_str().contains("could not remove"),
-            "successful unlink must not WARN; stderr was: {}",
-            env.stderr_str()
-        );
-    }
+    // v1.0.0 #3550 — the publish-ordering tests live in
+    // `src/cli/backup/tests/publish_3550.rs`.
+    mod publish_3550;
 
     /// `stage_and_verify` never touches the target: that is the whole point
     /// of staging. Pinned directly so a future refactor cannot quietly move
@@ -2379,6 +3401,15 @@ mod tests {
 
     /// v1.0.0 #3131 — locate the single `<db>.pre-restore-<ts>.db` rollback
     /// copy `restore` leaves beside the target.
+    /// A raw connection on `path`, for tests that play ANOTHER opener (a
+    /// writer, a daemon) against a restore. Defined here, behind the
+    /// `mod tests` boundary the #2445 funnel scanner honours, so the child
+    /// test file (`tests/publish_3550.rs`) never reads as a production
+    /// raw open.
+    fn raw_connection(path: &Path, flags: rusqlite::OpenFlags) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(path, flags).expect("raw open")
+    }
+
     fn find_pre_restore_copy(dir: &Path) -> PathBuf {
         let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
             .expect("read dir")
@@ -2426,12 +3457,14 @@ mod tests {
 /// `restore` REPLACES the live database, so both of the guards below are
 /// data-integrity gates rather than ergonomics:
 ///
-/// * [`refuse_if_target_in_use`] refuses only on a POSITIVE liveness
-///   signal. Its two other arms — the target cannot be opened at all, and
-///   the probe was inconclusive — must WARN and PROCEED, because
-///   restoring over a database nothing can open any more is exactly the
-///   disaster-recovery case the verb exists for. A regression that turned
-///   either into a refusal would strand an operator mid-recovery.
+/// * [`refuse_if_target_in_use`] returns a HELD lock or refuses. Until
+///   #3550 its two non-BUSY arms — the target cannot be opened read-write,
+///   and the probe was inconclusive — warned and proceeded, on the theory
+///   that nothing can be using a file nothing can open. A SQLCipher database
+///   opened without its key, and a file owned by a service user, both break
+///   that theory while a daemon writes to them, so both arms now REFUSE
+///   (5-agent vote, Q3) and name the disaster-recovery way through: move the
+///   damaged set aside and restore into an empty target.
 /// The sibling `resolve_sqlite_store` ambiguity refusals live in
 /// `tests/cov_backup_store_url_3521.rs`: they mutate the process-global
 /// store-URL environment, which `scripts/check-test-env-lock.sh` arm (d)
@@ -2439,47 +3472,46 @@ mod tests {
 /// the shared lib test binary whose cases run on parallel threads.
 #[cfg(test)]
 mod cov_backup_refusal_arms_3521 {
-    use super::{CliOutput, refuse_if_target_in_use};
-
-    fn capture<T>(f: impl FnOnce(&mut CliOutput<'_>) -> T) -> (T, String) {
-        let mut stdout = Vec::<u8>::new();
-        let mut stderr = Vec::<u8>::new();
-        let value = {
-            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-            f(&mut out)
-        };
-        (value, String::from_utf8_lossy(&stderr).into_owned())
-    }
+    use super::refuse_if_target_in_use;
 
     /// A target that EXISTS but cannot be opened read-write (here: a
-    /// directory) is WARNed about and allowed through. Refusing would
-    /// block the recovery this verb exists for.
+    /// directory) is refused, left exactly as it was, and the refusal names
+    /// the move-aside recovery path.
     #[test]
-    fn unopenable_target_warns_and_proceeds() {
+    fn unopenable_target_refuses_and_is_left_untouched_3550() {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("target-is-a-directory.db");
         std::fs::create_dir(&target).expect("mkdir");
-        let (res, stderr) = capture(|out| refuse_if_target_in_use(&target, out));
-        res.expect("an unopenable target must not refuse the restore");
+        let err = refuse_if_target_in_use(&target)
+            .expect_err("a target restore cannot lock must refuse (#3550 Q3)");
+        let msg = format!("{err:#}");
         assert!(
-            stderr.contains("cannot open") && stderr.contains("proceeding"),
-            "the operator must be told the probe could not run; stderr was: {stderr}"
+            msg.contains("cannot open") && msg.contains("out of the way"),
+            "the refusal must say why and name the move-aside path; got: {msg}"
         );
+        assert!(target.is_dir(), "the target must be left exactly as it was");
     }
 
-    /// A target that opens but is not a SQLite database at all makes the
-    /// liveness probe INCONCLUSIVE (not `SQLITE_BUSY`). Same contract:
-    /// warn, proceed — never a false "in use" refusal.
+    /// A target that opens but is not a SQLite database at all — or one
+    /// opened without its encryption key — makes the lock INCONCLUSIVE (not
+    /// `SQLITE_BUSY`). It is refused too, byte-for-byte untouched.
     #[test]
-    fn inconclusive_probe_warns_and_proceeds() {
+    fn inconclusive_probe_refuses_and_is_left_untouched_3550() {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("not-a-database.db");
-        std::fs::write(&target, b"this is not a sqlite header at all\n").expect("write");
-        let (res, stderr) = capture(|out| refuse_if_target_in_use(&target, out));
-        res.expect("an inconclusive probe must not refuse the restore");
+        let bytes = b"this is not a sqlite header at all\n";
+        std::fs::write(&target, bytes).expect("write");
+        let err = refuse_if_target_in_use(&target)
+            .expect_err("an inconclusive lock must refuse (#3550 Q3)");
+        let msg = format!("{err:#}");
         assert!(
-            stderr.contains("inconclusive") && stderr.contains("proceeding"),
-            "the operator must be told the probe was inconclusive; stderr was: {stderr}"
+            msg.contains("cannot take SQLite's lock") && msg.contains("out of the way"),
+            "the refusal must say why and name the move-aside path; got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            bytes,
+            "the target must be byte-for-byte untouched"
         );
     }
 }
