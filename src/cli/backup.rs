@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
 
+mod manifest;
+
 /// `<stem>.manifest.json` — sidecar manifest name for a snapshot stem
 /// (#1558 batch 6).
 fn manifest_file_name(stem: &str) -> String {
@@ -863,23 +865,38 @@ pub struct BackupArgs {
 
 #[derive(Args)]
 pub struct RestoreArgs {
-    /// Path to a snapshot file OR a backup directory. When a directory is
-    /// supplied, pass `--snapshot` to name the snapshot; without it the
-    /// newest snapshot BY MODIFICATION TIME is used, with a warning.
+    /// Path to a snapshot file OR a backup directory. A directory needs
+    /// `--snapshot` (name the backup) or `--latest` (the newest backup whose
+    /// SIGNED manifest verifies).
     #[arg(long)]
     pub from: PathBuf,
     /// v1.0.0 #3550 — the snapshot to restore from a `--from` DIRECTORY:
     /// its file name (`ai-memory-<ts>.db`), its id (`ai-memory-<ts>`, the
     /// name without the extension, shared with its manifest), or its
     /// manifest's file name (`ai-memory-<ts>.manifest.json`). A plain name,
-    /// never a path. Without it the newest snapshot by mtime is used, which
-    /// is not an integrity signal — anyone who can write the directory can
-    /// set it.
-    #[arg(long, value_name = "NAME")]
+    /// never a path.
+    #[arg(long, value_name = "NAME", conflicts_with = "latest")]
     pub snapshot: Option<String>,
-    /// Skip sha256 verification against the manifest. Not recommended.
+    /// v1.0.0 #3199 — with a `--from` DIRECTORY, restore the backup whose
+    /// operator-signed manifest records the newest creation time. Only
+    /// manifests that verify are considered; one whose signature fails
+    /// makes the command refuse, naming it. File modification times are
+    /// never consulted.
+    #[arg(long)]
+    pub latest: bool,
+    /// Restore without reading a manifest at all (the only way to restore a
+    /// manifest-less `.bak` / `.pre-restore` / `.pre-repair` file). Nothing
+    /// vouches for the bytes: WARNs, records an audit event, and is REFUSED
+    /// under the `asi-hard` posture (#3199).
     #[arg(long)]
     pub skip_verify: bool,
+    /// v1.0.0 #3199 — accept a manifest that is not signed by the operator
+    /// key (a pre-#3199 backup, or one taken on a host without the key). The
+    /// sha256, backend, schema and integrity checks still run. WARNs, records
+    /// an audit event, and is REFUSED under the `asi-hard` posture. A
+    /// signature that is present but invalid is refused even with this flag.
+    #[arg(long)]
+    pub allow_unsigned_manifest: bool,
     /// Store URL this deployment serves — see `backup --store-url`. Restoring
     /// a SQLite snapshot onto a Postgres-backed deployment would report
     /// success while leaving the real corpus untouched, so it is REFUSED
@@ -893,7 +910,7 @@ pub struct RestoreArgs {
     pub yes: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BackupManifest {
     pub snapshot: String,
     pub sha256: String,
@@ -917,6 +934,21 @@ pub struct BackupManifest {
     /// a snapshot captured nothing.
     #[serde(default)]
     pub memory_count: Option<i64>,
+    /// v1.0.0 #3199 — `2` on a signed manifest; absent on a legacy one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<i64>,
+    /// v1.0.0 #3199 — base64 of the exact JSON bytes the operator key signed
+    /// (`manifest::SignedPayload`). `restore` decides from THESE bytes once
+    /// they verify, never from the plain fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_payload: Option<String>,
+    /// v1.0.0 #3199 — base64 Ed25519 signature over `signed_payload`'s bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// v1.0.0 #3199 — fingerprint of the signing key, for diagnostics only;
+    /// `restore` verifies against the operator key it resolves itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
 }
 
 /// #2444 — resolve the local SQLite file a `backup` / `restore` invocation is
@@ -1153,12 +1185,97 @@ pub(crate) fn resolve_sqlite_store(
     )
 }
 
+/// v1.0.0 #3199 — the posture and keys `backup` works with, resolved once by
+/// [`run_backup`] and injected by tests (which must never read the operator's
+/// real key directory).
+struct BackupPolicy {
+    /// `AI_MEMORY_SECURITY_PROFILE=asi-hard`: a backup this host could not
+    /// later verify is refused before anything is written.
+    asi_hard: bool,
+    /// The operator key that signs the manifest, or why none could be loaded.
+    signer: std::result::Result<ed25519_dalek::SigningKey, String>,
+    /// The operator public key `restore` verifies against on this host.
+    anchor: Option<ed25519_dalek::VerifyingKey>,
+}
+
 /// `backup` handler.
 pub fn run_backup(
     db_path: &Path,
     args: &BackupArgs,
     json_out: bool,
     out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let signer = crate::identity::keypair::default_key_dir()
+        .and_then(|dir| crate::cli::rules::load_operator_signing_key_from_dir(&dir))
+        .map_err(|e| format!("{e:#}"));
+    let policy = BackupPolicy {
+        asi_hard: crate::security_profile::is_asi_hard(),
+        signer,
+        anchor: crate::governance::rules_store::resolve_operator_pubkey(),
+    };
+    run_backup_with(db_path, args, json_out, out, &policy)
+}
+
+/// v1.0.0 #3199 — the key `backup` signs with.
+///
+/// `None` means the manifest goes out unsigned; that only happens under the
+/// standard posture, with a WARN, and `restore` then refuses it unless told
+/// `--allow-unsigned-manifest`. Under `asi-hard` every reason this host could
+/// not verify its own backup is a REFUSAL, raised before the snapshot is
+/// taken: no signing key, no verification key, or a signing key the
+/// verification key would reject.
+///
+/// # Errors
+/// Under `asi-hard`, any of the three conditions above.
+fn backup_signing_key<'p>(
+    policy: &'p BackupPolicy,
+    out: &mut CliOutput<'_>,
+) -> Result<Option<&'p ed25519_dalek::SigningKey>> {
+    let problem = match (&policy.signer, policy.anchor.as_ref()) {
+        (Err(e), _) => Some(format!("no operator signing key could be loaded ({e})")),
+        (Ok(_), None) => Some(
+            "no operator public key resolves on this host (AI_MEMORY_OPERATOR_PUBKEY or \
+             the key directory), so restore could not verify this backup"
+                .to_string(),
+        ),
+        (Ok(key), Some(anchor)) if key.verifying_key() != *anchor => Some(format!(
+            "the operator signing key ({}) is not the public key restore verifies against \
+             ({}), so restore would refuse this backup",
+            manifest::fingerprint(&key.verifying_key()),
+            manifest::fingerprint(anchor)
+        )),
+        (Ok(_), Some(_)) => None,
+    };
+    if let Some(problem) = problem {
+        if policy.asi_hard {
+            anyhow::bail!(
+                "backup: {problem}. The asi-hard posture refuses to take a backup it could \
+                 not restore; nothing was written. Create the operator key with \
+                 `ai-memory rules keygen` (#3199)"
+            );
+        }
+        writeln!(
+            out.stderr,
+            "WARNING: {problem}. {} (#3199)",
+            if policy.signer.is_ok() {
+                "The manifest is signed anyway"
+            } else {
+                "The manifest is UNSIGNED: `restore` refuses it unless given \
+                 --allow-unsigned-manifest. Create the operator key with \
+                 `ai-memory rules keygen`"
+            }
+        )?;
+    }
+    Ok(policy.signer.as_ref().ok())
+}
+
+/// [`run_backup`] with the posture and keys injected.
+fn run_backup_with(
+    db_path: &Path,
+    args: &BackupArgs,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+    policy: &BackupPolicy,
 ) -> Result<()> {
     use std::io::Read;
     // #2444 — resolve (and where necessary REFUSE) the configured store BEFORE
@@ -1179,6 +1296,9 @@ pub fn run_backup(
             source_db.display()
         );
     }
+    // v1.0.0 #3199 — decided before anything is created, so an asi-hard
+    // refusal leaves no artifact behind.
+    let signing_key = backup_signing_key(policy, out)?;
     std::fs::create_dir_all(&args.to)
         .with_context(|| format!("creating backup dir {}", args.to.display()))?;
     // SQLite VACUUM INTO is hot-backup-safe and produces a defragmented
@@ -1270,17 +1390,41 @@ pub fn run_backup(
         format!("{:x}", hasher.finalize())
     };
 
-    let manifest = BackupManifest {
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let mut manifest = BackupManifest {
         snapshot: snapshot_name.clone(),
         sha256: sha.clone(),
         bytes,
         source_db: source_db.to_string_lossy().into_owned(),
         version: crate::PKG_VERSION.to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: created_at.clone(),
         backend: Some(BACKEND_SQLITE.to_string()),
         schema_version: Some(schema_version),
         memory_count: Some(memory_count),
+        manifest_version: None,
+        signed_payload: None,
+        signature: None,
+        signer: None,
     };
+    // v1.0.0 #3199 — sign every field restore decides on, the file name
+    // included. The plain fields above stay for readers and old tools; a
+    // restore of a signed manifest never consults them.
+    if let Some(key) = signing_key {
+        let payload = manifest::SignedPayload {
+            dst: manifest::MANIFEST_DOMAIN.to_string(),
+            v: manifest::PAYLOAD_VERSION,
+            snapshot: snapshot_name.clone(),
+            sha256: sha.clone(),
+            bytes,
+            source_db: manifest.source_db.clone(),
+            version: manifest.version.clone(),
+            created_at,
+            backend: BACKEND_SQLITE.to_string(),
+            schema_version,
+            memory_count,
+        };
+        manifest::sign_into(&mut manifest, &payload, key)?;
+    }
     let manifest_path = args.to.join(format!("ai-memory-{ts}.manifest.json"));
     let manifest_text = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(&manifest_path, manifest_text.as_bytes())?;
@@ -1310,13 +1454,25 @@ pub fn run_backup(
     }
 
     if json_out {
-        writeln!(out.stdout, "{}", serde_json::to_string(&manifest)?)?;
+        // v1.0.0 #3199 — the manifest plus `signed`, so a scripted backup can
+        // alarm on an unsigned one without parsing the signature fields.
+        let mut envelope = serde_json::to_value(&manifest)?;
+        envelope["signed"] = serde_json::Value::Bool(manifest.signature.is_some());
+        writeln!(out.stdout, "{envelope}")?;
     } else {
         writeln!(out.stdout, "Snapshot: {}", snapshot_path.display())?;
         writeln!(out.stdout, "Manifest: {}", manifest_path.display())?;
         writeln!(out.stdout, "SHA-256 : {sha}")?;
         writeln!(out.stdout, "Bytes   : {bytes}")?;
         writeln!(out.stdout, "Memories: {memory_count}")?;
+        match manifest.signer.as_deref() {
+            Some(signer) => writeln!(out.stdout, "Signed  : operator key {signer}")?,
+            None => writeln!(
+                out.stdout,
+                "Signed  : NO — restore refuses this backup unless given \
+                 --allow-unsigned-manifest"
+            )?,
+        }
     }
     Ok(())
 }
@@ -1344,16 +1500,17 @@ enum SnapshotSelection {
     /// `--from` named the snapshot file, or `--snapshot` named it inside the
     /// `--from` directory.
     Explicit,
-    /// `--from` was a directory, no `--snapshot` was given, and the newest
-    /// snapshot by modification time was taken.
-    Mtime,
+    /// v1.0.0 #3199 — `--latest`: the newest backup by the creation time its
+    /// operator-signed manifest records. (#3550's `mtime` pick is gone:
+    /// anyone who can write the directory controls a modification time.)
+    Latest,
 }
 
 impl SnapshotSelection {
     fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
-            Self::Mtime => "mtime",
+            Self::Latest => "latest",
         }
     }
 }
@@ -1424,22 +1581,150 @@ fn snapshot_id(name: &str) -> Option<&str> {
     (!id.is_empty() && id != "." && id != "..").then_some(id)
 }
 
+/// v1.0.0 #3199 — every `ai-memory-*.db` regular file directly in `dir`,
+/// newest NAME first (the names carry the capture timestamp). Symlinks and
+/// directories are left out. Ordering here is presentation only: nothing is
+/// chosen by it.
+fn snapshot_files_by_name(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut snaps: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading backup directory {}", dir.display()))?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(SNAPSHOT_FILE_PREFIX))
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(SNAPSHOT_FILE_EXT))
+        })
+        .collect();
+    snaps.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(snaps)
+}
+
+/// v1.0.0 #3199 — `--latest`: the backup whose SIGNED manifest records the
+/// newest creation time, among the manifests that verify under the operator
+/// key. A manifest that fails verification is a REFUSAL naming it (choosing
+/// among backups while one of them has been tampered with would let the
+/// tamperer steer the choice); an unsigned, legacy or missing manifest is
+/// skipped and listed.
+///
+/// # Errors
+/// A forged or malformed candidate, a signed name that does not match its
+/// file, an unparseable signed `created_at`, or no verified candidate.
+fn select_latest_signed(
+    from: &Path,
+    policy: RestorePolicy,
+    out: &mut CliOutput<'_>,
+) -> Result<SelectedSnapshot> {
+    let candidates = snapshot_files_by_name(from)?;
+    if candidates.is_empty() {
+        anyhow::bail!("no snapshots found in {}", from.display());
+    }
+    let mut best: Option<(chrono::DateTime<chrono::FixedOffset>, String, PathBuf)> = None;
+    let mut skipped: Vec<String> = Vec::new();
+    for path in candidates {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let Ok(text) = std::fs::read_to_string(from.join(manifest_file_name(&id))) else {
+            skipped.push(format!("{name} (no manifest)"));
+            continue;
+        };
+        let verdict = manifest::verify(&text, policy.anchor.as_ref()).with_context(|| {
+            format!(
+                "restore --latest: the manifest of {name} fails verification; refusing to \
+                 choose among backups while one of them has been altered. Inspect it, or \
+                 name the backup you trust with --snapshot (#3199)"
+            )
+        })?;
+        let payload = match verdict {
+            manifest::ManifestVerdict::Signed(payload) => payload,
+            manifest::ManifestVerdict::Unverified { reason, .. } => {
+                skipped.push(format!("{name} ({})", reason.as_str()));
+                continue;
+            }
+        };
+        if payload.snapshot != name {
+            anyhow::bail!(
+                "restore --latest: {name}'s signed manifest names `{}` — a signed backup was \
+                 renamed. Refusing to choose (#3199)",
+                payload.snapshot
+            );
+        }
+        let at = chrono::DateTime::parse_from_rfc3339(&payload.created_at).with_context(|| {
+            format!(
+                "restore --latest: {name}'s signed created_at `{}` is not RFC 3339 (#3199)",
+                payload.created_at
+            )
+        })?;
+        if best
+            .as_ref()
+            .is_none_or(|(b_at, b_name, _)| (at, &name) > (*b_at, b_name))
+        {
+            best = Some((at, name, path));
+        }
+    }
+    if !skipped.is_empty() {
+        writeln!(
+            out.stderr,
+            "note: --latest only considers backups whose signed manifest verifies; \
+             skipped: {} (#3199)",
+            skipped.join(", ")
+        )?;
+    }
+    let Some((_, _, snapshot)) = best else {
+        anyhow::bail!(
+            "restore --latest: no backup in {} has a manifest that verifies under the \
+             operator public key{}. Name one with --snapshot (a legacy backup also needs \
+             --allow-unsigned-manifest) (#3199)",
+            from.display(),
+            if policy.anchor.is_none() {
+                " (none resolves on this host: set AI_MEMORY_OPERATOR_PUBKEY)"
+            } else {
+                ""
+            }
+        );
+    };
+    let id = snapshot
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    Ok(SelectedSnapshot {
+        manifest: from.join(manifest_file_name(&id)),
+        snapshot,
+        selected_by: SnapshotSelection::Latest,
+    })
+}
+
 /// v1.0.0 #3550 — pick the snapshot and manifest a restore reads.
 ///
-/// * `--from <file>` — that file; `--snapshot` alongside it is refused
-///   (it only selects inside a directory).
+/// * `--from <file>` — that file; `--snapshot` / `--latest` alongside it is
+///   refused (they only select inside a directory).
 /// * `--from <dir> --snapshot <name>` — `<dir>/<id>.db`, which must be a
 ///   regular file (not a symlink) directly in `<dir>`.
-/// * `--from <dir>` alone — the newest snapshot by modification time. That
-///   is not an integrity signal (anyone who can write the directory, or a
-///   `cp` without `-p`, sets it), so the choice is WARNed with the pin to
-///   use, and under `asi-hard` it is REFUSED with the candidates listed.
+/// * `--from <dir> --latest` — see [`select_latest_signed`] (#3199).
+/// * `--from <dir>` alone — REFUSED with the candidates listed (#3199). The
+///   #3550 fallback took the newest snapshot by modification time, which is
+///   not an integrity signal: anyone who can write the directory, or a `cp`
+///   without `-p`, sets it.
 ///
 /// # Errors
 /// See above; also an unreadable directory or an empty one.
 fn select_snapshot(
     from: &Path,
     snapshot: Option<&str>,
+    latest: bool,
     policy: RestorePolicy,
     out: &mut CliOutput<'_>,
 ) -> Result<SelectedSnapshot> {
@@ -1448,6 +1733,13 @@ fn select_snapshot(
             anyhow::bail!(
                 "--snapshot selects a snapshot inside a --from DIRECTORY, but --from {} \
                  is not a directory; pass the directory, or drop --snapshot (#3550)",
+                from.display()
+            );
+        }
+        if latest {
+            anyhow::bail!(
+                "--latest selects a snapshot inside a --from DIRECTORY, but --from {} \
+                 is not a directory; pass the directory, or drop --latest (#3199)",
                 from.display()
             );
         }
@@ -1488,44 +1780,24 @@ fn select_snapshot(
             selected_by: SnapshotSelection::Explicit,
         });
     }
-    let snaps = snapshots_newest_first(from)?;
-    let Some((_, newest)) = snaps.first() else {
-        anyhow::bail!("no snapshots found in {}", from.display());
-    };
-    let newest = newest.clone();
-    let stem = newest
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_owned();
-    if policy.asi_hard {
-        let candidates: Vec<String> = snaps
-            .iter()
-            .filter_map(|(_, p)| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
-            .collect();
-        anyhow::bail!(
-            "restore: --from {} is a directory and no --snapshot was given; the asi-hard \
-             posture refuses to pick a snapshot by modification time, which anyone who \
-             can write the directory controls. Pass --snapshot <id>. Candidates, newest \
-             mtime first: {} (#3550)",
-            from.display(),
-            candidates.join(", ")
-        );
+    if latest {
+        return select_latest_signed(from, policy, out);
     }
-    writeln!(
-        out.stderr,
-        "warning: --from {} is a directory and no --snapshot was given: restoring {}, \
-         the newest snapshot by MODIFICATION TIME. mtime is not an integrity signal — \
-         anyone who can write that directory can set it. Pass --snapshot {stem} to pin \
-         this choice (#3550)",
+    let candidates: Vec<String> = snapshot_files_by_name(from)?
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+        .collect();
+    if candidates.is_empty() {
+        anyhow::bail!("no snapshots found in {}", from.display());
+    }
+    anyhow::bail!(
+        "restore: --from {} is a directory; name the backup with --snapshot <id>, or pass \
+         --latest for the newest backup whose operator-signed manifest verifies. \
+         Modification times are never used to choose. Candidates, newest name first: {} \
+         (#3199)",
         from.display(),
-        newest.display()
-    )?;
-    Ok(SelectedSnapshot {
-        manifest: from.join(manifest_file_name(&stem)),
-        snapshot: newest,
-        selected_by: SnapshotSelection::Mtime,
-    })
+        candidates.join(", ")
+    )
 }
 
 /// v1.0.0 #3550 — the posture inputs `restore` enforces, resolved once by
@@ -1535,8 +1807,80 @@ fn select_snapshot(
 struct RestorePolicy {
     /// `AI_MEMORY_SECURITY_PROFILE=asi-hard`: a directory fsync that fails
     /// is a refusal (before the publish) or a non-zero exit (after it), and
-    /// the mtime snapshot pick is refused.
+    /// `--skip-verify` / `--allow-unsigned-manifest` are refused (#3199).
     asi_hard: bool,
+    /// v1.0.0 #3199 — the operator public key a signed manifest must verify
+    /// under, resolved out of band; never a key the manifest carries.
+    anchor: Option<ed25519_dalek::VerifyingKey>,
+}
+
+/// v1.0.0 #3199 — how much the manifest vouched for the restored bytes,
+/// reported as `manifest_verification` under `--json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestVerification {
+    /// The manifest's signature verified under the operator key.
+    Signed,
+    /// `--allow-unsigned-manifest`: an unverified manifest was accepted.
+    UnsignedAllowed,
+    /// `--skip-verify`: no manifest was read.
+    Skipped,
+}
+
+impl ManifestVerification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Signed => "signed",
+            Self::UnsignedAllowed => "unsigned_allowed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// v1.0.0 #3199 — the manifest values the restore checks run on. For a
+/// signed manifest they come ONLY from the verified payload.
+struct ManifestFacts {
+    sha256: String,
+    backend: Option<String>,
+    schema_version: Option<i64>,
+}
+
+/// v1.0.0 #3199 — the forensic-audit `kind` of a restore that no verified
+/// manifest vouched for (`--skip-verify`, `--allow-unsigned-manifest`).
+const RESTORE_UNVERIFIED_AUDIT_KIND: &str = "backup_restore_unverified";
+
+/// v1.0.0 #3199 — WARN on stderr and record a forensic audit row for a
+/// restore that no verified manifest vouches for. The audit row goes to the
+/// off-database forensic JSONL, which survives the file swap; when that sink
+/// is not configured the `--json` envelope says so.
+fn note_unverified_restore(
+    out: &mut CliOutput<'_>,
+    snapshot: &Path,
+    target: &Path,
+    outcome: ManifestVerification,
+    detail: &str,
+) -> Result<()> {
+    writeln!(
+        out.stderr,
+        "WARNING: restoring {} over {} WITHOUT a verified manifest ({detail}). Nothing \
+         vouches for these bytes beyond the structural and integrity checks (#3199)",
+        snapshot.display(),
+        target.display()
+    )?;
+    let caller = crate::identity::resolve_agent_id(None, None)
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        RESTORE_UNVERIFIED_AUDIT_KIND,
+        "",
+        serde_json::json!({
+            "outcome": outcome.as_str(),
+            "detail": detail,
+            "snapshot": snapshot.to_string_lossy(),
+            "target": target.to_string_lossy(),
+        }),
+    );
+    Ok(())
 }
 
 /// v1.0.0 #3550 — what a restore holds on the old and the new database
@@ -1644,6 +1988,7 @@ pub fn run_restore(
 ) -> Result<()> {
     let policy = RestorePolicy {
         asi_hard: crate::security_profile::is_asi_hard(),
+        anchor: crate::governance::rules_store::resolve_operator_pubkey(),
     };
     run_restore_with(db_path, args, json_out, out, policy, &mut RealPublishIo)
 }
@@ -1675,6 +2020,22 @@ fn run_restore_with(
     policy: RestorePolicy,
     io: &mut dyn PublishIo,
 ) -> Result<()> {
+    // v1.0.0 #3199 — the asi-hard posture restores ONLY what a verified,
+    // operator-signed manifest vouches for, so the two ways around that are
+    // refused before anything else runs.
+    if policy.asi_hard && (args.skip_verify || args.allow_unsigned_manifest) {
+        anyhow::bail!(
+            "restore: {} is refused under the asi-hard posture — it restores bytes no \
+             operator-signed manifest vouches for. Restore a signed backup, or follow the \
+             manual procedure in docs/CLI_REFERENCE.md (restore) for a manifest-less file \
+             (#3199)",
+            if args.skip_verify {
+                "--skip-verify"
+            } else {
+                "--allow-unsigned-manifest"
+            }
+        );
+    }
     // #2444 — a restore onto a Postgres-backed deployment would copy a SQLite
     // snapshot to a placeholder path, print "Restored", and exit 0 while the
     // real corpus was never touched. That is the false-assurance half of the
@@ -1685,26 +2046,106 @@ fn run_restore_with(
         snapshot: snapshot_path,
         manifest: manifest_path,
         selected_by,
-    } = select_snapshot(&args.from, args.snapshot.as_deref(), policy, out)?;
+    } = select_snapshot(
+        &args.from,
+        args.snapshot.as_deref(),
+        args.latest,
+        policy,
+        out,
+    )?;
 
     if !snapshot_path.exists() {
         anyhow::bail!("snapshot {} does not exist", snapshot_path.display());
     }
 
+    // v1.0.0 #3199 — what the manifest proves, decided before any byte is
+    // copied. A signed manifest is verified against the operator key and the
+    // checks below then read ONLY its verified payload.
+    //
     // Manifest pre-checks that need no bytes: cross-backend and
     // forward-schema. The sha256 itself is checked on the STAGED copy below.
-    let manifest = if args.skip_verify {
-        None
+    let (manifest, verification) = if args.skip_verify {
+        note_unverified_restore(
+            out,
+            &snapshot_path,
+            &target_db,
+            ManifestVerification::Skipped,
+            "--skip-verify: no manifest was read",
+        )?;
+        (None, ManifestVerification::Skipped)
     } else {
         if !manifest_path.exists() {
             anyhow::bail!(
-                "manifest {} not found; pass --skip-verify to restore anyway",
+                "manifest {} not found — refusing an unverified restore. A manifest-less \
+                 file (.bak / .pre-restore / .pre-repair) restores only with --skip-verify, \
+                 which the asi-hard posture refuses (#3199)",
                 manifest_path.display()
             );
         }
         let manifest_text = std::fs::read_to_string(&manifest_path)?;
-        let manifest: BackupManifest = serde_json::from_str(&manifest_text)
-            .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
+        let verdict = manifest::verify(&manifest_text, policy.anchor.as_ref())
+            .with_context(|| format!("manifest {}", manifest_path.display()))?;
+        let (manifest, verification) = match verdict {
+            manifest::ManifestVerdict::Signed(payload) => {
+                let file_name = snapshot_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if payload.snapshot != file_name {
+                    anyhow::bail!(
+                        "the signed manifest {} is for snapshot `{}`, not `{file_name}` — a \
+                         signed backup cannot be renamed into another one. Refusing (#3199)",
+                        manifest_path.display(),
+                        payload.snapshot
+                    );
+                }
+                (
+                    ManifestFacts {
+                        sha256: payload.sha256,
+                        backend: Some(payload.backend),
+                        schema_version: Some(payload.schema_version),
+                    },
+                    ManifestVerification::Signed,
+                )
+            }
+            manifest::ManifestVerdict::Unverified {
+                manifest: plain,
+                reason,
+            } => {
+                let detail = match reason {
+                    manifest::UnverifiedReason::NoSignature => {
+                        "the manifest carries no operator signature"
+                    }
+                    manifest::UnverifiedReason::NoAnchor => {
+                        "no operator public key resolves on this host to verify the \
+                         manifest's signature (AI_MEMORY_OPERATOR_PUBKEY or the key directory)"
+                    }
+                };
+                if !args.allow_unsigned_manifest {
+                    anyhow::bail!(
+                        "manifest {} is not verified: {detail}. Refusing to restore it. Pass \
+                         --allow-unsigned-manifest to accept it under the standard posture \
+                         (#3199)",
+                        manifest_path.display()
+                    );
+                }
+                note_unverified_restore(
+                    out,
+                    &snapshot_path,
+                    &target_db,
+                    ManifestVerification::UnsignedAllowed,
+                    detail,
+                )?;
+                (
+                    ManifestFacts {
+                        sha256: plain.sha256,
+                        backend: plain.backend,
+                        schema_version: plain.schema_version,
+                    },
+                    ManifestVerification::UnsignedAllowed,
+                )
+            }
+        };
         // #2444 — cross-backend refusal. The manifest field is `Option` so a
         // pre-#2444 manifest (no `backend` key) still restores; a snapshot that
         // POSITIVELY declares a non-sqlite origin is refused rather than copied
@@ -1735,7 +2176,7 @@ fn run_restore_with(
                 );
             }
         }
-        Some(manifest)
+        (Some(manifest), verification)
     };
 
     // v1.0.0 #3131 — EXPLICIT INTENT. `restore` REPLACES the operator's live
@@ -2175,8 +2616,19 @@ fn run_restore_with(
                 // v1.0.0 #3550 — whether both directory fsyncs of the publish
                 // succeeded, i.e. whether the restore survives a power cut.
                 "durable_publish": durable_publish,
-                // v1.0.0 #3550 — `explicit` or `mtime` (see `--snapshot`).
+                // v1.0.0 #3550/#3199 — `explicit` or `latest`.
                 "selected_by": selected_by.as_str(),
+                // v1.0.0 #3199 — `signed`, `unsigned_allowed` or `skipped`.
+                "manifest_verification": verification.as_str(),
+                // v1.0.0 #3199 — where the audit row for an unverified
+                // restore went; `null` for a signed one (nothing to record).
+                "audit_sink": (verification != ManifestVerification::Signed).then(|| {
+                    if crate::governance::audit::is_enabled() {
+                        "forensic_jsonl"
+                    } else {
+                        "disabled"
+                    }
+                }),
             })
         )?;
     } else {
@@ -2236,6 +2688,62 @@ fn run_restore_with(
 mod tests {
     use super::*;
     use crate::cli::test_utils::{TestEnv, seed_memory};
+
+    /// v1.0.0 #3199 — the fixed operator key every test in this module signs
+    /// and verifies with. Tests never read the operator's real key directory.
+    fn test_operator_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x31; 32])
+    }
+
+    /// v1.0.0 #3199 — standard posture, signing with and verifying against
+    /// [`test_operator_key`].
+    fn test_backup_policy() -> BackupPolicy {
+        BackupPolicy {
+            asi_hard: false,
+            signer: Ok(test_operator_key()),
+            anchor: Some(test_operator_key().verifying_key()),
+        }
+    }
+
+    /// v1.0.0 #3199 — a restore policy that verifies against
+    /// [`test_operator_key`].
+    fn test_restore_policy(asi_hard: bool) -> RestorePolicy {
+        RestorePolicy {
+            asi_hard,
+            anchor: Some(test_operator_key().verifying_key()),
+        }
+    }
+
+    /// v1.0.0 #3199 — the tests' `run_backup`: the production handler with
+    /// the posture and keys injected (this shadows the glob-imported
+    /// `super::run_backup`, whose only extra work is resolving them from the
+    /// environment).
+    fn run_backup(
+        db_path: &Path,
+        args: &BackupArgs,
+        json_out: bool,
+        out: &mut CliOutput<'_>,
+    ) -> Result<()> {
+        run_backup_with(db_path, args, json_out, out, &test_backup_policy())
+    }
+
+    /// v1.0.0 #3199 — the tests' `run_restore`, shadowing `super::run_restore`
+    /// the same way [`run_backup`] does.
+    fn run_restore(
+        db_path: &Path,
+        args: &RestoreArgs,
+        json_out: bool,
+        out: &mut CliOutput<'_>,
+    ) -> Result<()> {
+        run_restore_with(
+            db_path,
+            args,
+            json_out,
+            out,
+            test_restore_policy(false),
+            &mut RealPublishIo,
+        )
+    }
 
     /// v1.0.0 #2572 — the shared class-(a) funnel returns the typed Postgres
     /// refusal (naming the HTTP-daemon remedy, DSN-redacted) on a `postgres://`
@@ -2359,6 +2867,8 @@ mod tests {
         assert_eq!(sha.len(), 64); // hex sha256
     }
 
+    /// v1.0.0 #3199 (rule (e)): a bare directory is refused now, so this
+    /// pin moved to `--latest`, which picks by the SIGNED creation time.
     #[test]
     fn test_restore_from_directory_picks_newest() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
@@ -2384,6 +2894,8 @@ mod tests {
             from: backup_dir,
             snapshot: None,
             skip_verify: false,
+            latest: true,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -2421,6 +2933,8 @@ mod tests {
             from: snap_path,
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -2465,6 +2979,8 @@ mod tests {
             from: snap_path,
             snapshot: None,
             skip_verify: true,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -2502,15 +3018,16 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
         ));
-        // Corrupt sha in manifest.
-        let mut bad = manifest;
-        bad.sha256 = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
-        std::fs::write(&manifest_path, serde_json::to_string(&bad).unwrap()).unwrap();
-        let snap_path = backup_dir.join(&bad.snapshot);
+        // Corrupt sha in manifest. v1.0.0 #3199 — in the SIGNED payload: a
+        // signed restore never reads the plain `sha256` field.
+        resign_manifest(&manifest_path, |p| p.sha256 = "0".repeat(64));
+        let snap_path = backup_dir.join(&manifest.snapshot);
         let restore_args = RestoreArgs {
             from: snap_path,
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -2604,6 +3121,8 @@ mod tests {
             from: db.parent().unwrap().join("backups-2444-pg-restore"),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: Some("postgresql://ai_memory:hunter2@127.0.0.1:5432/ai".to_string()),
             yes: true,
         };
@@ -2749,15 +3268,18 @@ mod tests {
         let backup_dir = db.parent().unwrap().join("backups-2444-xbackend");
         let manifest = take_backup(&mut env, &db, &backup_dir);
         let manifest_path = manifest_path_for(&backup_dir, &manifest.snapshot);
-        let mut tampered = manifest;
-        tampered.backend = Some("postgres".to_string());
-        let snap = backup_dir.join(&tampered.snapshot);
-        std::fs::write(&manifest_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+        // #3199 — the declaration must come from the SIGNED payload (a
+        // plain-field edit is ignored by a signed restore), so re-sign one
+        // that really says postgres.
+        resign_manifest(&manifest_path, |p| p.backend = "postgres".to_string());
+        let snap = backup_dir.join(&manifest.snapshot);
 
         let args = RestoreArgs {
             from: snap,
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -2783,15 +3305,18 @@ mod tests {
         let backup_dir = db.parent().unwrap().join("backups-2444-forward");
         let manifest = take_backup(&mut env, &db, &backup_dir);
         let manifest_path = manifest_path_for(&backup_dir, &manifest.snapshot);
-        let mut tampered = manifest;
-        tampered.schema_version = Some(crate::storage::migrations::current_schema_version() + 1);
-        let snap = backup_dir.join(&tampered.snapshot);
-        std::fs::write(&manifest_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+        // #3199 — declared in the SIGNED payload (see the cross-backend test).
+        resign_manifest(&manifest_path, |p| {
+            p.schema_version = crate::storage::migrations::current_schema_version() + 1;
+        });
+        let snap = backup_dir.join(&manifest.snapshot);
 
         let args = RestoreArgs {
             from: snap,
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -2805,6 +3330,11 @@ mod tests {
     /// A pre-#2444 manifest carries none of the new keys; it must still
     /// restore (`#[serde(default)]`), because refusing every artifact an
     /// operator already holds would be its own data-loss event.
+    ///
+    /// v1.0.0 #3199 (rule (e), old-contract pin changed): a legacy manifest
+    /// is also UNSIGNED, so it is now refused by default and restores only
+    /// with `--allow-unsigned-manifest` (standard posture). The artifact is
+    /// still restorable; it just no longer restores silently.
     #[test]
     fn restore_accepts_a_legacy_manifest_without_the_new_fields_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
@@ -2828,15 +3358,28 @@ mod tests {
         });
         std::fs::write(&manifest_path, serde_json::to_string(&legacy).unwrap()).unwrap();
 
-        let args = RestoreArgs {
+        let mut args = RestoreArgs {
             from: backup_dir.join(&manifest.snapshot),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
+        {
+            let mut out = env.output();
+            let err = run_restore(&db, &args, false, &mut out)
+                .expect_err("an unsigned legacy manifest is refused by default (#3199)");
+            assert!(
+                format!("{err:#}").contains("--allow-unsigned-manifest"),
+                "the refusal names the way through: {err:#}"
+            );
+        }
+        args.allow_unsigned_manifest = true;
         let mut out = env.output();
-        run_restore(&db, &args, false, &mut out).expect("a legacy manifest must still restore");
+        run_restore(&db, &args, false, &mut out)
+            .expect("a legacy manifest must still restore with --allow-unsigned-manifest");
     }
 
     /// The sha256 only proves the bytes match a manifest WE wrote over
@@ -2875,6 +3418,8 @@ mod tests {
             from: bogus,
             snapshot: None,
             skip_verify: true,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -2980,6 +3525,8 @@ mod tests {
             from: backup_dir.join(&manifest.snapshot),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -3043,6 +3590,8 @@ mod tests {
             from: backup_dir.join(&manifest.snapshot),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -3096,6 +3645,8 @@ mod tests {
             // the integrity gate, so skip the checksum and let the structural
             // probe + integrity_check do the refusing.
             skip_verify: true,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -3145,6 +3696,8 @@ mod tests {
             from: snap,
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -3194,6 +3747,8 @@ mod tests {
             from: backup_dir.join(&manifest.snapshot),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
@@ -3228,6 +3783,8 @@ mod tests {
             from: backup_dir.join(&manifest.snapshot),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: false,
         };
@@ -3253,6 +3810,8 @@ mod tests {
             from: PathBuf::from("/nonexistent"),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: false,
         };
@@ -3263,6 +3822,8 @@ mod tests {
                 from: PathBuf::from("/nonexistent"),
                 snapshot: None,
                 skip_verify: false,
+                latest: false,
+                allow_unsigned_manifest: false,
                 store_url: None,
                 yes: false,
             }
@@ -3317,6 +3878,8 @@ mod tests {
             from: backup_dir.join(&manifest.snapshot),
             snapshot: None,
             skip_verify: false,
+            latest: false,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: false,
         };
@@ -3494,6 +4057,23 @@ mod tests {
             "restore must leave exactly one rollback copy; found {found:?}"
         );
         found.remove(0)
+    }
+
+    /// v1.0.0 #3199 — rewrite the SIGNED payload of the manifest at `path`
+    /// with `edit` and re-sign it with [`test_operator_key`]: a manifest the
+    /// operator really signed that says something different.
+    fn resign_manifest(path: &Path, edit: impl FnOnce(&mut manifest::SignedPayload)) {
+        use base64::Engine;
+        let text = std::fs::read_to_string(path).expect("read manifest");
+        let mut m: BackupManifest = serde_json::from_str(&text).expect("manifest json");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(m.signed_payload.as_deref().expect("a signed manifest"))
+            .expect("payload base64");
+        let mut payload: manifest::SignedPayload =
+            serde_json::from_slice(&bytes).expect("payload json");
+        edit(&mut payload);
+        manifest::sign_into(&mut m, &payload, &test_operator_key()).expect("re-sign");
+        std::fs::write(path, serde_json::to_string(&m).expect("json")).expect("write manifest");
     }
 
     fn manifest_path_for(dir: &Path, snapshot: &str) -> PathBuf {
