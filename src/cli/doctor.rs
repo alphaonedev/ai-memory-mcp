@@ -6649,6 +6649,10 @@ enabled = true
             let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
             base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
         };
+        // #3199 check #21 — the operator public key restore verifies backups
+        // against, in the per-process test key sandbox (no env write).
+        let keys = crate::identity::keypair::default_key_dir().expect("sandbox key dir");
+        std::fs::write(keys.join("operator.key.pub"), &approver_pubkey_b64).expect("write pubkey");
         unsafe {
             std::env::set_var(
                 crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
