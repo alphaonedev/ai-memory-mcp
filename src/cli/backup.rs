@@ -126,15 +126,16 @@ fn clear_live_sidecars(target_db: &Path, io: &mut dyn PublishIo) -> Result<()> {
             format!(
                 "could not remove the SQLite sidecar {} — refusing to publish the \
                  restore: a leftover sidecar beside the restored database would replay \
-                 the old database's frames into it. The live database is untouched; \
-                 remove the sidecar and re-run (#3550)",
+                 the old database's frames into it. Nothing was published: the \
+                 previous database is still in place (its rollback copy was taken \
+                 first). Remove the sidecar and re-run (#3550)",
                 live_sidecar.display()
             )
         })?;
         if path_present(&live_sidecar) {
             anyhow::bail!(
                 "the SQLite sidecar {} is still present after it was removed — refusing \
-                 to publish the restore; the live database is untouched (#3550)",
+                 to publish the restore; nothing was published (#3550)",
                 live_sidecar.display()
             );
         }
@@ -1739,9 +1740,14 @@ fn run_restore_with(
         if policy.asi_hard {
             anyhow::bail!(
                 "could not fsync {} before publishing the restore ({e}); the asi-hard \
-                 posture refuses a publish it cannot make durable. The live database \
-                 is untouched (#3550)",
-                dir.display()
+                 posture refuses a publish it cannot make durable. Nothing was \
+                 published: the previous database is still at {}{} (#3550)",
+                dir.display(),
+                target_db.display(),
+                rollback
+                    .as_ref()
+                    .map(|p| format!(", and its rollback copy is {}", p.display()))
+                    .unwrap_or_default()
             );
         }
         writeln!(
