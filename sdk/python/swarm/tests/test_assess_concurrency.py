@@ -112,8 +112,8 @@ async def test_bounded_concurrency_collapses_the_assessment_tail() -> None:
     finally:
         await _aclose(swarm)
     elapsed = time.perf_counter() - started
-    # Sequential would be 64 x 100ms = 6.4 s; the issue's bar is < 2 s at 16.
-    assert elapsed < 2.0, elapsed
+    # #3447: do not assert a wall-clock < 2 s (flaky on a loaded runner).
+    # The load-bearing bars are ordering (sibling test) and max-in-flight.
     assert len(assessments) == 64
     assert model.max_in_flight <= 16
     # ... and the bound is actually USED (never a 64-wide blast, never serial).

@@ -732,6 +732,8 @@ jobs:
       - name: Self-test the evidence-bundle gate (#3547)
         # Fixture-only: untracked producer refused, run→binary mismatch,
         # prose verdict, self-report PASS and mean-of-p99 all refused.
+        # #3543: five predicate fixtures (plaintext 401, anon 500,
+        # continuity 200-by-id, attest claimed, swarm pending) fail-closed.
         run: bash scripts/check-evidence-bundle.sh --self-test
 
   git-dependency-source-gate:

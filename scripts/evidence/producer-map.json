@@ -45,7 +45,7 @@
       "outputs": ["attestation-summary"],
       "figures": ["attest_level_agent_attested"],
       "binds": ["run_id", "daemon_binary_sha256"],
-      "note": "Predicate rewrite (INFO oracle → fail-closed attest_level) is #3543."
+      "note": "#3543: stored attest_level mismatch is a non-zero exit; the inert XDG tier=keyword override is removed."
     },
     {
       "id": "swarm-coverage",
@@ -53,7 +53,7 @@
       "outputs": ["coverage-matrix"],
       "figures": ["swarm_covered", "swarm_pending"],
       "binds": ["run_id"],
-      "note": "pending != covered rewrite is #3543."
+      "note": "#3543: covered requires a persisted memory_id or documented EXPECTED_REFUSAL; pending is its own bucket."
     }
   ]
 }

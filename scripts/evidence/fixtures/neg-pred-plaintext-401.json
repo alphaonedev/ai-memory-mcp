@@ -1,0 +1,11 @@
+{
+  "id": "neg-pred-plaintext-401",
+  "predicate": "plaintext_no_listener",
+  "why": "A plaintext HTTP 401 is still a listener. The old oracle treated any status != 200 as PASS.",
+  "old_pass": true,
+  "new_pass": false,
+  "args": {
+    "curl_exit": 0,
+    "http_status": 401
+  }
+}

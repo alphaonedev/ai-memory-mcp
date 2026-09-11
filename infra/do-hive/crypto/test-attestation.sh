@@ -41,21 +41,13 @@ AI_MEMORY_NO_CONFIG=1 "$BIN" agents bind-key --agent-id "$AGENT" --pubkey "$PUB"
 echo "INFO: bound pubkey $PUB for $AGENT"
 
 # --- 2. launch daemon: HTTPS + mTLS + attestation REQUIRED --------------------
-# Attestation is tier-independent — it needs NO embedder. Boot the daemon at
-# tier=keyword via an ISOLATED XDG config so a fresh host with no MiniLM cache
-# neither logs EMBEDDER LOAD FAILED nor pays a semantic-tier boot delay that
-# RACES the health-poll window. Historically this leg booted the compiled-default
-# tier=semantic (AI_MEMORY_NO_CONFIG=1; serve has NO --tier flag — tier resolves
-# from config.toml only), whose MiniLM-at-boot load exceeded the poll window under
-# machine load, so every subsequent request returned HTTP 000 and the POS/NEG
-# assertions failed spuriously (KNOWN-DO-STAGING.md §2 boot-race — failed 0/2 with
-# got-000 under load, passed 2/2 isolated). Fix mirrors the sibling
-# test-fed-write-sig-attestation.sh: drop AI_MEMORY_NO_CONFIG on the serve line and
-# point XDG_CONFIG_HOME/HOME at an isolated tier=keyword config (same isolation
-# NO_CONFIG gives the offline CLI ops above, but WITH a tier override).
-CFG="$WORK/xdg"; mkdir -p "$CFG/ai-memory"
-printf 'schema_version = 2\ntier = "keyword"\n' > "$CFG/ai-memory/config.toml"
-XDG_CONFIG_HOME="$CFG" HOME="$WORK" AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 \
+# Attestation is tier-independent — it needs NO embedder. The previous
+# XDG_CONFIG_HOME tier=keyword override was inert (#2944: the resolver does
+# not honour that XDG path) so it is REMOVED rather than left as theatre
+# (#3543). AI_MEMORY_NO_CONFIG=1 keeps the serve line from loading the
+# operator config.toml. A 60 s health-poll window covers a slow embedder
+# boot on a loaded host.
+AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 \
 "$BIN" serve --host 127.0.0.1 --port "$PORT" --db "$DB" \
   --tls-cert "$OUT/server.crt" --tls-key "$OUT/server.key" \
   --mtls-allowlist "$OUT/allowlist.txt" >"$LOG" 2>&1 &
@@ -87,11 +79,13 @@ if [ "$code" = "201" ] && [ -n "$id" ]; then
   ok "attest POS: signed write accepted 201 (id=$id)"
 else no "attest POS: expected 201, got '$code' ($jsn)"; fi
 
-# confirm attest_level via a fresh CLI read of the same db
+# confirm attest_level via a fresh CLI read of the same db (#3543: mismatch is FAIL)
 if [ -n "${id:-}" ]; then
   lvl=$(AI_MEMORY_NO_CONFIG=1 "$BIN" get "$id" --db "$DB" --json 2>/dev/null | jq -r '.metadata.attest_level // .attest_level // empty')
   if [ "$lvl" = "agent_attested" ]; then ok "attest POS: stored row attest_level=agent_attested"
-  else echo "INFO: attest_level read-back = '${lvl:-<none>}' (201 accept is the primary proof)"; fi
+  else no "attest POS: stored attest_level='${lvl:-<none>}' want agent_attested (201 is not proof)"; fi
+else
+  no "attest POS: no id to read back attest_level"
 fi
 
 # --- NEGATIVE: unsigned write rejected 403 ATTESTATION_FAILED ----------------

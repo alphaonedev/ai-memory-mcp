@@ -80,6 +80,24 @@ class AgentIdentity:
         return self.namespace
 
 
+def result_is_pending(result: Any) -> bool:
+    """True when the handler returned a 200 ``{"status":"pending"}`` body."""
+    if isinstance(result, dict):
+        return str(result.get("status") or "").lower() == "pending"
+    return False
+
+
+def result_memory_id(result: Any) -> str | None:
+    """Persisted memory id from a store-shaped payload, else None."""
+    if not isinstance(result, dict):
+        return None
+    for key in ("id", "memory_id"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class ToolOutcome:
     """The recorded result of one dispatched tool call."""
@@ -89,6 +107,8 @@ class ToolOutcome:
     fail_closed: bool
     summary: str
     result: Any = None
+    pending: bool = False
+    memory_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -510,8 +530,27 @@ async def dispatch(
         outcome = ToolOutcome(tool_name, ok=False, fail_closed=True,
                               summary=f"{type(exc).__name__}: {exc}")
     else:
-        outcome = ToolOutcome(tool_name, ok=True, fail_closed=False,
-                              summary=_summarize(result), result=result)
+        pending = result_is_pending(result)
+        memory_id = result_memory_id(result)
+        if pending:
+            # 200 {"status":"pending"} is its own bucket, never a success (#3543).
+            outcome = ToolOutcome(
+                tool_name, ok=False, fail_closed=False,
+                summary="pending (not covered)", result=result,
+                pending=True, memory_id=None,
+            )
+        elif spec.kind == KIND_WRITE and spec.name == "store" and not memory_id:
+            outcome = ToolOutcome(
+                tool_name, ok=False, fail_closed=True,
+                summary="store without persisted memory_id", result=result,
+                pending=False, memory_id=None,
+            )
+        else:
+            outcome = ToolOutcome(
+                tool_name, ok=True, fail_closed=False,
+                summary=_summarize(result), result=result,
+                pending=False, memory_id=memory_id,
+            )
     record_dispatch(identity.agent_id, tool_name, args, outcome, module=module)
     return outcome
 
@@ -532,5 +571,7 @@ __all__ = [
     "ToolOutcome",
     "ToolSpec",
     "dispatch",
+    "result_is_pending",
+    "result_memory_id",
     "selectable_schemas",
 ]
