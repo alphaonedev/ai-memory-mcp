@@ -209,6 +209,21 @@ fn cli_resolve_sqlite_authority_archive_replay_and_audits_3587() {
         }
         fixture.assert_audit(&new.id, true);
     }
+    // Either missing row fails without changing the surviving row, and emits
+    // both audit channels even though the policy could not load a checked pair.
+    for missing_new in [false, true] {
+        let (old, new) = pair();
+        let survivor = if missing_new { &old } else { &new };
+        ai_memory::db::insert(&conn, survivor).unwrap();
+        let before = ai_memory::db::get(&conn, &survivor.id).unwrap();
+        let output = fixture.resolve(&old, &new, Some(OWNER), false, None);
+        assert!(!output.status.success());
+        fixture.assert_audit(&new.id, true);
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(ai_memory::db::get(&conn, &survivor.id).unwrap()).unwrap()
+        );
+    }
     // Ordinary archives are not supersession replays. Check the policy failure
     // crosses the real CLI boundary and emits both Deny channels.
     let (old, new) = pair();
@@ -318,6 +333,19 @@ async fn cli_resolve_postgres_authority_archive_replay_and_audits_3587() {
         .unwrap();
         assert_eq!(before, after);
         fixture.assert_audit(&new.id, true);
+    }
+    for missing_new in [false, true] {
+        let (old, new) = pair();
+        let survivor = if missing_new { &old } else { &new };
+        store.store(&owner, survivor).await.unwrap();
+        let before = store.get(&owner, &survivor.id).await.unwrap();
+        let output = fixture.resolve(&old, &new, Some(OWNER), false, Some(&url));
+        assert!(!output.status.success());
+        fixture.assert_audit(&new.id, true);
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(store.get(&owner, &survivor.id).await.unwrap()).unwrap()
+        );
     }
     let (old, new) = pair();
     store.store(&owner, &old).await.unwrap();

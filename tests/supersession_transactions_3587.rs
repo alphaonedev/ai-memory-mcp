@@ -18,6 +18,39 @@ use serde_json::{Value, json};
 const OWNER: &str = "ai:supersession-owner-3587";
 const ADMIN: &str = "ai:supersession-admin-3587";
 
+// One sink for this test binary; never replace it while another matrix runs.
+// UUID targets isolate assertions across the parallel backend tests.
+fn audit_path() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("supersession-audit-")
+            .tempdir_in(root)
+            .unwrap();
+        ai_memory::audit::init(&dir.path().join("audit.log"), true, false).unwrap();
+        dir
+    })
+    .path()
+}
+
+fn assert_error_audit(new_id: &str) {
+    let bytes = std::fs::read(audit_path().join("audit.log")).unwrap();
+    // Another target may be appending concurrently. Only complete JSONL rows
+    // are consumed; this call's emission completed before the operation returned.
+    let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let rows: Vec<Value> = bytes[..end]
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+        .filter(|row| row["action"] == "update" && row["target"]["memory_id"] == new_id)
+        .collect();
+    assert_eq!(rows.len(), 1, "exactly one final-error Update: {rows:?}");
+    assert_eq!(rows[0]["outcome"], "deny");
+    assert_eq!(rows[0]["actor"]["agent_id"], OWNER);
+}
+
 enum Backend {
     Sqlite {
         conn: rusqlite::Connection,
@@ -485,6 +518,7 @@ async fn conflicts_and_namespaces(backend: &Backend) {
                 Some(ai_memory::store::StoreError::Conflict { .. })
             );
         assert!(typed, "expected typed conflict: {error:#}");
+        assert_error_audit(&new.id);
         assert_eq!(backend.snapshot(&old.id, false).await, before);
         assert!(backend.snapshot(&old.id, true).await.is_none());
         if !same_id {
@@ -648,6 +682,7 @@ async fn rollback(backend: &Backend) {
         assert_eq!(backend.snapshot(&old.id, false).await, old_before);
         assert_eq!(backend.snapshot(&new.id, false).await, new_before);
         assert!(backend.snapshot(&old.id, true).await.is_none());
+        assert_error_audit(&new.id);
         // The identical request can commit after the injected failure is removed.
         let result = if resolve {
             backend.resolve(&old, &new, request).await
@@ -660,6 +695,7 @@ async fn rollback(backend: &Backend) {
 }
 
 async fn matrix(backend: &Backend) {
+    audit_path();
     static ADMIN_INIT: std::sync::Once = std::sync::Once::new();
     ADMIN_INIT.call_once(|| ai_memory::identity::set_admin_agent_ids(vec![ADMIN.into()]));
     authority_matrix(backend).await;
@@ -772,6 +808,7 @@ async fn direct_sqlite_supersession_transactions_3587() {
 
 #[tokio::test]
 async fn invalid_sqlite_predecessor_time_fails_closed_3587() {
+    audit_path();
     let backend = Backend::sqlite();
     let (old, new) = pair();
     backend.seed(&old).await;
@@ -806,6 +843,7 @@ async fn invalid_sqlite_predecessor_time_fails_closed_3587() {
     assert_eq!(backend.snapshot(&old.id, false).await, before);
     assert!(backend.snapshot(&old.id, true).await.is_none());
     assert!(backend.snapshot(&new.id, false).await.is_none());
+    assert_error_audit(&new.id);
 }
 
 #[cfg(feature = "sal")]
@@ -824,6 +862,40 @@ async fn sal_sqlite_supersession_transactions_3587() {
         Backend::Postgres { .. } => unreachable!("SQLite fixture"),
     }
     matrix(&backend).await;
+    if let Backend::Sqlite {
+        adapter: Some(store),
+        conn,
+        ..
+    } = &backend
+    {
+        let (old, new) = pair();
+        ai_memory::db::insert_no_overwrite(conn, &old).unwrap();
+        let before = backend.snapshot(&old.id, false).await;
+        let owner = principal(OWNER);
+        let error = store
+            .store_with_supersession(
+                &CallerContext::for_agent(OWNER),
+                &new,
+                Some(&[0.0]),
+                None,
+                SupersessionRequest {
+                    principal: Some(&owner),
+                    as_admin: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ai_memory::store::StoreError::InvalidInput { .. }
+        ));
+        assert_error_audit(&new.id);
+        assert_eq!(backend.snapshot(&old.id, false).await, before);
+        assert!(backend.snapshot(&old.id, true).await.is_none());
+        assert!(backend.snapshot(&new.id, false).await.is_none());
+    } else {
+        panic!("SAL SQLite fixture requires its adapter");
+    }
 }
 
 #[cfg(feature = "sal-postgres")]
