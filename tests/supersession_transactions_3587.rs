@@ -110,7 +110,7 @@ impl Backend {
             reason = "shared backend matrix awaits the feature-gated store implementation"
         )
     )]
-    async fn upsert(&self, memory: &Memory, embedded: bool) -> String {
+    async fn upsert(&self, memory: &Memory, embedded: bool) -> Result<String> {
         match self {
             #[cfg(feature = "sal")]
             Self::Sqlite {
@@ -119,28 +119,22 @@ impl Backend {
             } => {
                 let ctx = CallerContext::for_agent(OWNER);
                 if embedded {
-                    store
-                        .store_with_embedding(&ctx, memory, None, None)
-                        .await
-                        .unwrap()
+                    Ok(store.store_with_embedding(&ctx, memory, None, None).await?)
                 } else {
-                    store.store(&ctx, memory).await.unwrap()
+                    Ok(store.store(&ctx, memory).await?)
                 }
             }
             Self::Sqlite { conn, .. } => {
                 let _ = embedded; // Both direct SQLite arms share insert_inner.
-                ai_memory::db::insert(conn, memory).unwrap()
+                ai_memory::db::insert(conn, memory)
             }
             #[cfg(feature = "sal-postgres")]
             Self::Postgres { store, .. } => {
                 let ctx = CallerContext::for_agent(OWNER);
                 if embedded {
-                    store
-                        .store_with_embedding(&ctx, memory, None, None)
-                        .await
-                        .unwrap()
+                    Ok(store.store_with_embedding(&ctx, memory, None, None).await?)
                 } else {
-                    store.store(&ctx, memory).await.unwrap()
+                    Ok(store.store(&ctx, memory).await?)
                 }
             }
         }
@@ -621,7 +615,34 @@ async fn upsert_preserves_ruling_key(backend: &Backend) {
             .as_object_mut()
             .unwrap()
             .remove("ruling_key");
-        assert_eq!(backend.upsert(&incoming, embedded).await, old.id);
+        let before = backend.snapshot(&old.id, false).await;
+        let upsert = backend.upsert(&incoming, embedded).await;
+        // SAL SQLite deliberately inherits the fail-closed embedding default.
+        // Assert that contract and conservation, never fall back after a refusal.
+        #[cfg(feature = "sal")]
+        let embedding_refused = embedded
+            && matches!(
+                backend,
+                Backend::Sqlite {
+                    adapter: Some(_),
+                    ..
+                }
+            );
+        #[cfg(not(feature = "sal"))]
+        let embedding_refused = false;
+        if embedding_refused {
+            #[cfg(feature = "sal")]
+            assert!(matches!(
+                upsert.unwrap_err().downcast_ref::<ai_memory::store::StoreError>(),
+                Some(ai_memory::store::StoreError::UnsupportedCapability { capability })
+                    if capability == "STORE_WITH_EMBEDDING"
+            ));
+            assert_eq!(backend.snapshot(&old.id, false).await, before);
+        } else {
+            assert_eq!(upsert.unwrap(), old.id);
+        }
+        assert!(backend.snapshot(&incoming.id, false).await.is_none());
+        assert!(backend.snapshot(&old.id, true).await.is_none());
         assert_eq!(
             backend.metadata(&old.id, false).await["ruling_key"],
             "decision"
