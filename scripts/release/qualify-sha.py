@@ -179,6 +179,9 @@ def main() -> int:
         print("qualify-sha: REFUSED — empty carrier workflow set (fail-closed)", file=sys.stderr)
         return 2
     contexts = load_contexts(args.contexts)
+    if not re.fullmatch(r"[0-9a-f]{40}", args.sha):
+        print(f"qualify-sha: REFUSED — --sha must be a full 40-hex commit id, got {args.sha!r} (an abbreviated sha matches no check-run)", file=sys.stderr)
+        return 2
 
     if args.fetch:
         if not args.repo:
