@@ -9027,6 +9027,11 @@ pub async fn run_curator_daemon_with_primitives(
     // is now the reaper on a curator-only host, and it must honour an explicit
     // erasure posture rather than assume the safe-looking default.
     archive_on_gc: bool,
+    // #3587 U3 — resolved `[curator].stale_ruling_days` + the digest RECIPIENT
+    // (`[curator].notify_agent_id`), threaded because this body has no
+    // AppConfig in scope. The recipient was validated at the CLI boot.
+    stale_ruling_days: u64,
+    notify_agent_id: Option<String>,
     llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
@@ -9040,6 +9045,8 @@ pub async fn run_curator_daemon_with_primitives(
             enabled: compaction_enabled,
             ..Default::default()
         },
+        stale_ruling_days,
+        notify_agent_id,
     };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));

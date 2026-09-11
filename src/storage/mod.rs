@@ -16156,6 +16156,71 @@ pub fn size_gc(
     Ok(evicted)
 }
 
+/// #3587 U3 — one live ruling the stale-ruling sweep surfaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRuling {
+    /// The memory id.
+    pub id: String,
+    /// The memory's namespace (a ruling is only stale within its namespace).
+    pub namespace: String,
+    /// `metadata.ruling_key` when the row is keyed (tag-only rulings are `None`).
+    pub ruling_key: Option<String>,
+}
+
+/// #3587 U3 — read-only scan for live stale rulings.
+///
+/// A row qualifies when ALL of:
+/// 1. `updated_at < cutoff_rfc3339` (the caller computes the cutoff from
+///    `[curator].stale_ruling_days`);
+/// 2. it is a ruling — tag `ruling` OR a `metadata.ruling_key`;
+/// 3. it carries NO supersede / verify marker (`superseded_id`,
+///    `superseded_by`, `verified_at` are all absent from `metadata`);
+/// 4. for keyed rows, it is the LATEST for its `(namespace, ruling_key)` —
+///    older same-key rows are already-superseded history and are not
+///    re-reported. `id` breaks `updated_at` ties so the window predicate is
+///    deterministic (API-29).
+///
+/// This is a pure SELECT: it never writes to `memories`, which is the U3
+/// guarantee (ruling `version` / `updated_at` unchanged, `archived_memories`
+/// delta 0). Links are never consulted (a supersede is a metadata pointer,
+/// not a `memory_links` edge).
+pub fn list_stale_rulings(
+    conn: &Connection,
+    cutoff_rfc3339: &str,
+    cap: usize,
+) -> rusqlite::Result<Vec<StaleRuling>> {
+    let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.namespace, json_extract(m.metadata, '$.ruling_key') \
+         FROM memories m \
+         WHERE m.updated_at < ?1 \
+           AND (m.tags IS NOT NULL \
+                AND EXISTS (SELECT 1 FROM json_each(m.tags) AS je WHERE je.value = 'ruling') \
+                OR json_extract(m.metadata, '$.ruling_key') IS NOT NULL) \
+           AND json_extract(m.metadata, '$.superseded_id') IS NULL \
+           AND json_extract(m.metadata, '$.superseded_by') IS NULL \
+           AND json_extract(m.metadata, '$.verified_at') IS NULL \
+           AND NOT EXISTS ( \
+                 SELECT 1 FROM memories n \
+                 WHERE n.namespace = m.namespace \
+                   AND json_extract(n.metadata, '$.ruling_key') IS NOT NULL \
+                   AND json_extract(n.metadata, '$.ruling_key') = \
+                       json_extract(m.metadata, '$.ruling_key') \
+                   AND (n.updated_at > m.updated_at \
+                        OR (n.updated_at = m.updated_at AND n.id > m.id))) \
+         ORDER BY m.updated_at ASC, m.id ASC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![cutoff_rfc3339, cap_i64], |row| {
+        Ok(StaleRuling {
+            id: row.get(0)?,
+            namespace: row.get(1)?,
+            ruling_key: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Live corpus byte size for `namespace` — `SUM(length(title) +
 /// length(content) + length(metadata))` over the non-archived rows.
 /// Mirrors the K8 quota byte definition (`src/quotas.rs`). Shared by

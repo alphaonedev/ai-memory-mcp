@@ -25,11 +25,11 @@ use std::path::Path;
 #[allow(clippy::struct_excessive_bools)]
 pub struct CuratorArgs {
     /// Run exactly one sweep and exit. Mutually exclusive with --daemon.
-    #[arg(long, conflicts_with = "daemon")]
+    #[arg(long, conflicts_with_all = ["daemon", "stale_rulings"])]
     pub once: bool,
     /// Loop forever, sleeping --interval-secs between sweeps. SIGINT /
     /// SIGTERM trigger a clean shutdown between cycles.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["once", "stale_rulings"])]
     pub daemon: bool,
     /// Seconds between daemon sweeps. Clamped to [60, 86400].
     #[arg(long, default_value_t = crate::SECS_PER_HOUR as u64)]
@@ -53,7 +53,7 @@ pub struct CuratorArgs {
     /// each affected UTC day into one daily summary, then stamp the retention
     /// the per-sweep rows should have carried. DRY RUN unless `--apply` is
     /// also given; never deletes (reaping stays with the audited GC path).
-    #[arg(long, conflicts_with_all = ["once", "daemon", "reflect", "rollback", "rollback_last"])]
+    #[arg(long, conflicts_with_all = ["once", "daemon", "reflect", "rollback", "rollback_last", "stale_rulings"])]
     pub prune_reports: bool,
     /// Apply the `--prune-reports` collapse. Without it the command only
     /// reports the counts a real run would act on.
@@ -62,18 +62,25 @@ pub struct CuratorArgs {
     /// Reverse rollback-log entries instead of running a sweep. Accepts
     /// a specific rollback-memory id, or `--last N` for the most recent.
     /// Mutually exclusive with `--once` and `--daemon`.
-    #[arg(long, conflicts_with_all = ["once", "daemon"])]
+    #[arg(long, conflicts_with_all = ["once", "daemon", "stale_rulings"])]
     pub rollback: Option<String>,
     /// With `--rollback`, reverse the N most recent rollback-log entries
     /// instead of a single id.
     #[arg(long)]
     pub rollback_last: Option<usize>,
+    /// #3587 U3 — run ONLY the stale-ruling sweep once and print its report.
+    /// Detection is always read-only w.r.t. the ruling rows; the digest is sent
+    /// once per stale-id set to `[curator].notify_agent_id` and suppressed by
+    /// `--dry-run`. Mutually exclusive with the sweep / reflect / rollback /
+    /// prune modes.
+    #[arg(long, conflicts_with_all = ["once", "daemon", "reflect", "rollback", "rollback_last", "prune_reports"])]
+    pub stale_rulings: bool,
     /// v0.7.0 L2-1 — Run the reflection-pass curator mode. Clusters
     /// co-recalled Observations and synthesises typed Reflection
     /// memories with `reflects_on` provenance. Mutually exclusive with
     /// the sweep / rollback modes. Requires either `--namespace` or
     /// `--all-namespaces`.
-    #[arg(long, conflicts_with_all = ["once", "daemon", "rollback", "rollback_last"])]
+    #[arg(long, conflicts_with_all = ["once", "daemon", "rollback", "rollback_last", "stale_rulings"])]
     pub reflect: bool,
     /// Scope the reflection pass to a single namespace. Pairs with
     /// `--reflect`; ignored otherwise.
@@ -205,8 +212,19 @@ fn print_curator_report(r: &curator::CuratorReport, out: &mut CliOutput<'_>) -> 
     // v1.0.0 — starvation gauge: zero here on a cycle with eligible
     // memories means Pass-1 consolidation got no budget at all.
     writeln!(out.stdout, "  autonomy budget:   {}", r.autonomy_ops_budget)?;
+    // #3587 U3 — stale-ruling sweep (the full id list is on `--json` only).
     writeln!(out.stdout, "  errors:            {}", r.errors.len())?;
     writeln!(out.stdout, "  dry_run:           {}", r.dry_run)?;
+    if r.stale_rulings_found > 0 || r.stale_rulings_notified > 0 {
+        writeln!(
+            out.stdout,
+            "  stale_rulings:     {} found, digest_sent={}",
+            r.stale_rulings_found, r.stale_rulings_notified
+        )?;
+        for id in &r.stale_ruling_ids {
+            writeln!(out.stdout, "    - {id}")?;
+        }
+    }
     for e in &r.errors {
         writeln!(out.stdout, "    - {e}")?;
     }
@@ -312,6 +330,11 @@ pub async fn run(
     app_config: &config::AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // #3587 U3 / audit-A F14 — validate `[curator].notify_agent_id` at BOOT,
+    // not at the first digest hours later (where a reserved id would fail as a
+    // report error and the digest would silently never deliver).
+    curator::validate_notify_agent_id(app_config.resolve_curator_notify_agent_id().as_deref())?;
+
     if args.rollback.is_some() || args.rollback_last.is_some() {
         // #1748 (slice-3c2) — when `--store-url` selects a (postgres) SAL
         // store, reverse the rollback rows the store-backed curator wrote
@@ -338,10 +361,17 @@ pub async fn run(
         return run_prune_reports(db_path, args, out);
     }
 
+    if args.stale_rulings {
+        // #3587 U3 — CLI-only one-shot stale-ruling sweep. Read-only w.r.t. the
+        // ruling rows; the digest (if any) goes through the same pass the
+        // `--once` sweep uses.
+        return run_stale_rulings(db_path, args, app_config, out);
+    }
+
     if !args.once && !args.daemon {
         anyhow::bail!(
             "curator requires --once, --daemon, --reflect, --prune-reports, \
-             --rollback <id>, or --rollback-last N"
+             --stale-rulings, --rollback <id>, or --rollback-last N"
         );
     }
 
@@ -363,6 +393,8 @@ pub async fn run(
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
         compaction: curator_compaction_config(app_config),
+        stale_ruling_days: app_config.resolve_stale_ruling_days(),
+        notify_agent_id: app_config.resolve_curator_notify_agent_id(),
     };
 
     let feature_tier = app_config.effective_tier(None);
@@ -432,10 +464,45 @@ pub async fn run(
         // #3345 — the curator daemon is the reaper on a curator-only host;
         // hand it the operator's resolved erasure/archive posture.
         app_config.effective_archive_on_gc(),
+        // #3587 U3 — the daemon body has no AppConfig, so thread the resolved
+        // stale-ruling knobs like the compaction / archive primitives.
+        app_config.resolve_stale_ruling_days(),
+        app_config.resolve_curator_notify_agent_id(),
         llm.map(std::sync::Arc::new),
         shutdown,
     )
     .await
+}
+
+/// #3587 U3 — `curator --stale-rulings`: run the read-only stale-ruling sweep
+/// once and print its report. A configured (`[curator].notify_agent_id`) and
+/// non-dry-run invocation sends at most one `Tier::Short` digest through the
+/// curator's own notify funnel.
+fn run_stale_rulings(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let cfg = curator::CuratorConfig {
+        interval_secs: args.interval_secs,
+        max_ops_per_cycle: 0,
+        dry_run: args.dry_run,
+        include_namespaces: Vec::new(),
+        exclude_namespaces: Vec::new(),
+        compaction: curator_compaction_config(app_config),
+        stale_ruling_days: app_config.resolve_stale_ruling_days(),
+        notify_agent_id: app_config.resolve_curator_notify_agent_id(),
+    };
+    let conn = db::open(db_path)?;
+    let keypair = load_curator_keypair_best_effort();
+    let report = curator::run_stale_ruling_sweep(&conn, &cfg, keypair.as_ref())?;
+    if args.json {
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+    } else {
+        print_curator_report(&report, out)?;
+    }
+    Ok(())
 }
 
 /// v0.9.0 §25.3 S1 (D3-012, #1870) — record a `loader_observed`
@@ -540,6 +607,8 @@ async fn run_store_backed_sweep(
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
         compaction: curator_compaction_config(app_config),
+        stale_ruling_days: app_config.resolve_stale_ruling_days(),
+        notify_agent_id: app_config.resolve_curator_notify_agent_id(),
     };
     if args.once {
         // Consolidation BEFORE reflection (dedup, then reflect over survivors).
@@ -1551,6 +1620,7 @@ mod tests {
             apply: false,
             rollback: None,
             rollback_last: None,
+            stale_rulings: false,
             reflect: false,
             namespace: None,
             max_depth: None,

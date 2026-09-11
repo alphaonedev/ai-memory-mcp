@@ -87,6 +87,40 @@ pub const DEFAULT_INTERVAL_SECS: u64 = crate::SECS_PER_HOUR as u64;
 /// Default per-cycle operation cap (stops runaway LLM calls).
 pub const DEFAULT_MAX_OPS_PER_CYCLE: usize = 100;
 
+/// #3587 U3 — compiled default for `[curator].stale_ruling_days`.
+///
+/// A live ruling (tag `ruling` or `metadata.ruling_key`) with no
+/// supersede / verify marker that has not been touched for this many days is
+/// reported stale by [`run_stale_ruling_pass`]. Named const (not an inline
+/// literal) so the config resolver, the CLI help and the tests agree.
+pub const DEFAULT_STALE_RULING_DAYS: u64 = 14;
+
+/// #3587 U3 — HARD lower bound (24 h) on the interval between two
+/// stale-ruling digests, independent of the curator's `interval_secs`.
+///
+/// The audit of #3587 (F13) measured that one digest per sweep at the
+/// `interval_secs` floor of 60 s is 1 440 quota-charged inbox rows/day — the
+/// same incident class as the `_curator/reports` flood (#3345). This is a
+/// named const, deliberately NOT an operator knob: no config value can lower
+/// the anti-storm bound. The pass additionally de-duplicates on the
+/// stale-id-set hash, so an unchanged set produces no second digest even
+/// after this floor elapses.
+pub const STALE_RULING_NOTIFY_FLOOR_SECS: u64 = 86_400;
+
+/// #3587 U3 — maximum number of stale-ruling ids carried in the persisted
+/// [`CuratorReport`] (and in the `_curator/reports` self-report body). The
+/// full list is emitted only on the CLI's `--json` stdout, so the durable
+/// row stays bounded (#3345 bloat class).
+pub const STALE_RULING_REPORT_TOP_N: usize = 20;
+
+/// #3587 U3 — namespace for the pass's own notify-dedup state row. The
+/// curator skips `_`-prefixed namespaces when collecting candidates, so this
+/// bookkeeping row is never itself curated.
+pub const STALE_RULING_STATE_NAMESPACE: &str = "_curator/state";
+/// #3587 U3 — title of the single notify-dedup state row in
+/// [`STALE_RULING_STATE_NAMESPACE`].
+pub const STALE_RULING_STATE_TITLE: &str = "stale-rulings-notify-state";
+
 /// v1.0.0 — divisor fixing the autonomy passes' RESERVED share of
 /// [`CuratorConfig::max_ops_per_cycle`].
 ///
@@ -185,6 +219,61 @@ pub struct CuratorConfig {
     /// `enabled = false` per ROADMAP §7.5 (opt-in due to Ollama dep).
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// #3587 U3 — `[curator].stale_ruling_days`: age (days) after which a
+    /// live, un-superseded ruling is reported stale. Config-file-only (no env
+    /// knob). Defaults to [`DEFAULT_STALE_RULING_DAYS`]; a `0` is coerced to
+    /// the default so a typo can never flag the whole corpus as stale.
+    #[serde(default = "default_stale_ruling_days")]
+    pub stale_ruling_days: u64,
+    /// #3587 U3 — `[curator].notify_agent_id`: the RECIPIENT of the stale-ruling
+    /// digest. `None` (the default) disables the digest; detection and the
+    /// report still run. This is never the SENDER — the digest is always sent
+    /// by the curator's own resolved id via
+    /// [`crate::mcp::handle_notify_as_sender`]. Validated against reserved ids
+    /// at curator startup. Config-file-only (no env knob).
+    #[serde(default)]
+    pub notify_agent_id: Option<String>,
+}
+
+/// #3587 U3 — serde default for [`CuratorConfig::stale_ruling_days`].
+#[must_use]
+pub fn default_stale_ruling_days() -> u64 {
+    DEFAULT_STALE_RULING_DAYS
+}
+
+/// #3587 U3 / audit-A F14 — validate `[curator].notify_agent_id` (the digest
+/// RECIPIENT) at curator BOOT rather than at the first digest hours later.
+///
+/// `notify_agent_id` is only ever a recipient; the sender is the curator's own
+/// resolved id. A reserved id (e.g. `daemon`) or a malformed one is refused
+/// with a typed error so the operator finds out at startup.
+pub fn validate_notify_agent_id(notify_agent_id: Option<&str>) -> Result<()> {
+    if let Some(id) = notify_agent_id {
+        crate::validate::validate_agent_id(id)
+            .map_err(|e| anyhow::anyhow!("[curator].notify_agent_id {id:?} is invalid: {e}"))?;
+    }
+    Ok(())
+}
+
+/// #3587 U3 — public entry point for the `curator --stale-rulings` one-shot:
+/// run ONLY the stale-ruling pass and return its report. The full sweep also
+/// calls the pass from [`run_once`], where it precedes the no-LLM early
+/// return.
+pub fn run_stale_ruling_sweep(
+    conn: &Connection,
+    cfg: &CuratorConfig,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+) -> Result<CuratorReport> {
+    let mut report = CuratorReport::new(cfg.dry_run);
+    let started = Instant::now();
+    let sender = active_keypair.map_or_else(
+        || crate::identity::sentinels::AI_CURATOR.to_string(),
+        |k| k.agent_id.clone(),
+    );
+    run_stale_ruling_pass(conn, cfg, &sender, &mut report);
+    report.completed_at = chrono::Utc::now().to_rfc3339();
+    report.cycle_duration_ms = started.elapsed().as_millis();
+    Ok(report)
 }
 
 impl Default for CuratorConfig {
@@ -196,6 +285,8 @@ impl Default for CuratorConfig {
             include_namespaces: Vec::new(),
             exclude_namespaces: Vec::new(),
             compaction: CompactionConfig::default(),
+            stale_ruling_days: DEFAULT_STALE_RULING_DAYS,
+            notify_agent_id: None,
         }
     }
 }
@@ -267,6 +358,28 @@ pub struct CuratorReport {
     /// raising.
     #[serde(default)]
     pub autonomy_ops_budget: usize,
+    /// #3587 U3 — count of live rulings the stale-ruling pass found this cycle
+    /// (tag `ruling` or `metadata.ruling_key`, older than
+    /// `[curator].stale_ruling_days`, with no supersede / verify marker).
+    /// The pass is read-only w.r.t. those rows.
+    #[serde(default)]
+    pub stale_rulings_found: usize,
+    /// #3587 U3 — 1 when this cycle actually emitted a stale-ruling digest to
+    /// `[curator].notify_agent_id`, 0 otherwise (unset recipient, dry-run,
+    /// unchanged set inside [`STALE_RULING_NOTIFY_FLOOR_SECS`], or nothing
+    /// stale). Never counts the inbox row itself.
+    #[serde(default)]
+    pub stale_rulings_notified: usize,
+    /// #3587 U3 — the CAPPED top-N stale-ruling ids (`<=`
+    /// [`STALE_RULING_REPORT_TOP_N`]). This is what the `_curator/reports`
+    /// self-report persists, so the durable row stays bounded (#3345).
+    #[serde(default)]
+    pub stale_ruling_ids: Vec<String>,
+    /// #3587 U3 — the FULL stale-ruling id list, kept in memory for the CLI's
+    /// `--json` stdout only. Deliberately never persisted to
+    /// `_curator/reports`; [`Self::stale_ruling_ids`] is the capped form.
+    #[serde(default)]
+    pub stale_ruling_ids_all: Vec<String>,
     pub errors: Vec<String>,
     pub dry_run: bool,
 }
@@ -342,6 +455,18 @@ pub fn run_once(
     // cap.is_some() && !dry_run). Best-effort: per-namespace errors land
     // in report.errors, never aborting the cycle.
     run_size_gc_pass(conn, &candidates, cfg, &mut report);
+
+    // #3587 U3 — stale-ruling sweep. Like size_gc it is LLM-free and
+    // read-only w.r.t. the rows it inspects, so it runs on EVERY cycle
+    // including LLM-less deployments (the f1/f2 hives are plausibly LLM-less,
+    // which is exactly why it sits BEFORE the no-LLM early return below).
+    // It emits at most one `Tier::Short` digest per stale-set hash per
+    // `STALE_RULING_NOTIFY_FLOOR_SECS`; `cfg.dry_run` suppresses the digest.
+    let stale_ruling_sender = active_keypair.map_or_else(
+        || crate::identity::sentinels::AI_CURATOR.to_string(),
+        |k| k.agent_id.clone(),
+    );
+    run_stale_ruling_pass(conn, cfg, &stale_ruling_sender, &mut report);
 
     let Some(llm_client) = llm else {
         report.errors.push("no LLM client configured".to_string());
@@ -534,6 +659,8 @@ pub fn run_once(
             report.contradictions_found,
             report.personas_generated,
             report.errors.len(),
+            report.stale_rulings_found,
+            &report.stale_ruling_ids,
         )
     {
         tracing::warn!("self-report persist failed: {e}");
@@ -626,6 +753,214 @@ fn run_size_gc_pass(
                 .push(format!("size_gc failed for namespace {ns}: {e}")),
         }
     }
+}
+
+/// #3587 U3 — stale-ruling sweep driver.
+///
+/// Read-only w.r.t. the ruling rows it inspects (the unit's core guarantee):
+/// it SELECTs the live rulings whose `updated_at` is older than
+/// `[curator].stale_ruling_days` and which carry neither a supersede
+/// (`superseded_id` / `superseded_by`) nor a `verified_at` marker, then emits
+/// at most ONE `Tier::Short` digest to `[curator].notify_agent_id`.
+///
+/// Anti-storm (audit-A F13): one digest per *stale-id-set hash*, and no second
+/// digest for the same hash inside [`STALE_RULING_NOTIFY_FLOOR_SECS`] (a hard
+/// named const, independent of the sweep interval). The dedup state is a
+/// single `_curator/state` bookkeeping row — never a ruling row.
+///
+/// `sender` is the curator's OWN resolved id (keypair agent id or
+/// `ai:curator`); `[curator].notify_agent_id` is only ever the RECIPIENT.
+/// `cfg.dry_run` suppresses the digest entirely (the pass still reports).
+fn run_stale_ruling_pass(
+    conn: &Connection,
+    cfg: &CuratorConfig,
+    sender: &str,
+    report: &mut CuratorReport,
+) {
+    let now = chrono::Utc::now();
+    let days = if cfg.stale_ruling_days == 0 {
+        DEFAULT_STALE_RULING_DAYS
+    } else {
+        cfg.stale_ruling_days
+    };
+    let Ok(days_i64) = i64::try_from(days) else {
+        report
+            .errors
+            .push("stale-ruling sweep: stale_ruling_days out of range".to_string());
+        return;
+    };
+    let cutoff = (now - chrono::Duration::days(days_i64)).to_rfc3339();
+    // Over-fetch beyond the report cap so `stale_rulings_found` stays truthful
+    // while the persisted id list is capped (`--json` prints the full list).
+    let fetch_cap = STALE_RULING_REPORT_TOP_N.saturating_mul(64).max(256);
+    let stale = match crate::storage::list_stale_rulings(conn, &cutoff, fetch_cap) {
+        Ok(rows) => rows,
+        Err(e) => {
+            report.errors.push(format!("stale-ruling scan failed: {e}"));
+            return;
+        }
+    };
+    report.stale_rulings_found = stale.len();
+    report.stale_ruling_ids_all = stale.iter().map(|r| r.id.clone()).collect();
+    report.stale_ruling_ids = stale
+        .iter()
+        .take(STALE_RULING_REPORT_TOP_N)
+        .map(|r| r.id.clone())
+        .collect();
+
+    if stale.is_empty() || cfg.dry_run {
+        return;
+    }
+    let Some(recipient) = cfg
+        .notify_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(db_path) = conn.path().map(std::path::Path::new) else {
+        return; // in-memory DB — no inbox to write the digest into.
+    };
+
+    let set_hash = stale_set_hash(&stale);
+    if stale_digest_within_floor(conn, now, &set_hash) {
+        return;
+    }
+
+    let ttl = crate::config::ResolvedTtl::default();
+    let payload = format!(
+        "{} live ruling(s) older than {} day(s) with no supersede/verify marker: {}",
+        stale.len(),
+        days,
+        report.stale_ruling_ids.join(", "),
+    );
+    let params = serde_json::json!({
+        crate::mcp::param_names::TARGET_AGENT_ID: recipient,
+        "title": format!("stale rulings: {} (>{days}d)", stale.len()),
+        "payload": payload,
+        "priority": 5,
+        "tier": "short",
+        "why_trace": "curator stale-ruling sweep (#3587 U3)",
+    });
+    // F8 — the SENDER is the curator's own resolved id, never the configured
+    // recipient. `handle_notify_as_sender` skips the MCP client-name ladder.
+    match crate::mcp::handle_notify_as_sender(conn, db_path, &params, &ttl, sender) {
+        Ok(_) => {
+            report.stale_rulings_notified = 1;
+            if let Err(e) = write_stale_ruling_state(conn, &set_hash, now) {
+                report
+                    .errors
+                    .push(format!("stale-ruling state write failed: {e}"));
+            }
+        }
+        Err(e) => report
+            .errors
+            .push(format!("stale-ruling digest failed: {e}")),
+    }
+}
+
+/// #3587 U3 — stable fingerprint of a stale-id set (order-independent).
+fn stale_set_hash(stale: &[crate::storage::StaleRuling]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut ids: Vec<&str> = stale.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    let mut hasher = Sha256::new();
+    for id in ids {
+        hasher.update(id.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// #3587 U3 — true when the SAME stale-id set was digested less than
+/// [`STALE_RULING_NOTIFY_FLOOR_SECS`] ago. A changed set always re-notifies;
+/// an unchanged set is suppressed until the floor elapses.
+fn stale_digest_within_floor(
+    conn: &Connection,
+    now: chrono::DateTime<chrono::Utc>,
+    set_hash: &str,
+) -> bool {
+    let Ok(Some((last_hash, last_at))) = read_stale_ruling_state(conn) else {
+        return false;
+    };
+    if last_hash != set_hash {
+        return false;
+    }
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&last_at) else {
+        return false;
+    };
+    let elapsed = (now - parsed.with_timezone(&chrono::Utc)).num_seconds();
+    elapsed >= 0 && elapsed < i64::try_from(STALE_RULING_NOTIFY_FLOOR_SECS).unwrap_or(i64::MAX)
+}
+
+/// #3587 U3 — read the single notify-dedup state row, if any.
+fn read_stale_ruling_state(conn: &Connection) -> rusqlite::Result<Option<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(metadata, '$.stale_set_hash'), updated_at \
+         FROM memories WHERE namespace = ?1 AND title = ?2 \
+         ORDER BY updated_at DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        STALE_RULING_STATE_NAMESPACE,
+        STALE_RULING_STATE_TITLE
+    ])?;
+    match rows.next()? {
+        Some(row) => {
+            let hash: Option<String> = row.get(0)?;
+            let at: String = row.get(1)?;
+            Ok(hash.map(|h| (h, at)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// #3587 U3 — upsert the single notify-dedup state row. Uses the substrate
+/// `db::insert` `(title, namespace)` upsert so there is never more than one.
+fn write_stale_ruling_state(
+    conn: &Connection,
+    set_hash: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    let ts = now.to_rfc3339();
+    let mem = Memory {
+        cid: None,
+        valid_from: None,
+        valid_until: None,
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: crate::models::Tier::Mid,
+        namespace: STALE_RULING_STATE_NAMESPACE.to_string(),
+        title: STALE_RULING_STATE_TITLE.to_string(),
+        content: serde_json::json!({ "stale_set_hash": set_hash, "notified_at": ts }).to_string(),
+        tags: vec!["_curator".to_string(), "_state".to_string()],
+        priority: 1,
+        confidence: 1.0,
+        source: crate::autonomy::CURATOR_SOURCE_LABEL.to_string(),
+        access_count: 0,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: serde_json::json!({
+            "agent_id": crate::identity::sentinels::AI_CURATOR,
+            "why_trace": crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM,
+            "stale_set_hash": set_hash,
+        }),
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: crate::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    };
+    crate::db::insert(conn, &mem)?;
+    Ok(())
 }
 
 /// v0.8.0 Pillar-2.5 (#1746 cutover) — SAL `ConsolidationPass` live driver.

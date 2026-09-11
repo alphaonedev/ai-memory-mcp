@@ -49,6 +49,7 @@ fn args_for(store_url: &Path) -> CuratorArgs {
         apply: false,
         rollback: None,
         rollback_last: None,
+        stale_rulings: false,
         reflect: false,
         namespace: None,
         max_depth: None,

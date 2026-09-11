@@ -693,6 +693,7 @@ async fn curator_store_url_postgres_once_builds_store_handle() {
         apply: false,
         rollback: None,
         rollback_last: None,
+        stale_rulings: false,
         reflect: false,
         namespace: None,
         max_depth: None,

@@ -30528,6 +30528,50 @@ impl MemoryStore for PostgresStore {
         Ok(evicted)
     }
 
+    async fn list_stale_rulings(
+        &self,
+        cutoff_rfc3339: &str,
+        cap: usize,
+    ) -> StoreResult<Vec<crate::storage::StaleRuling>> {
+        let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
+        // #3587 U3 — read-only twin of `crate::storage::list_stale_rulings`.
+        // `tags` / `metadata` are JSONB here (see the `tags @>` filter in
+        // `list`); `?` is the JSONB key-exists operator, not a placeholder
+        // (sqlx-postgres binds `$n`).
+        let rows = sqlx::query(
+            "SELECT m.id, m.namespace, m.metadata->>'ruling_key' \
+             FROM memories m \
+             WHERE m.updated_at < $1::timestamptz \
+               AND (m.metadata ? 'ruling_key' OR m.tags @> '[\"ruling\"]'::jsonb) \
+               AND NOT (m.metadata ? 'superseded_id' \
+                        OR m.metadata ? 'superseded_by' \
+                        OR m.metadata ? 'verified_at') \
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM memories n \
+                     WHERE n.namespace = m.namespace \
+                       AND n.metadata ? 'ruling_key' \
+                       AND n.metadata->>'ruling_key' = m.metadata->>'ruling_key' \
+                       AND (n.updated_at > m.updated_at \
+                            OR (n.updated_at = m.updated_at AND n.id > m.id))) \
+             ORDER BY m.updated_at ASC, m.id ASC \
+             LIMIT $2",
+        )
+        .bind(cutoff_rfc3339)
+        .bind(cap_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list stale rulings", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::storage::StaleRuling {
+                id: r.get::<String, _>(0),
+                namespace: r.get::<String, _>(1),
+                ruling_key: r.get::<Option<String>, _>(2),
+            })
+            .collect())
+    }
+
     async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop().await?;
         // v1.0.0 #3520 — routed through the shared bounded-retry funnel. Restore

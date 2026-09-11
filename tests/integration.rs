@@ -13596,6 +13596,8 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
             Vec::new(),
             false, // compaction_enabled (#1749) — default off
             true,  // archive_on_gc (#3345) — the curator daemon is the reaper
+            14,    // stale_ruling_days (#3587 U3) — compiled default
+            None,  // notify_agent_id (#3587 U3) — digest disabled
             None,  // llm — keyword-only path, no LLM (#1440)
             shutdown_for_daemon,
         )
