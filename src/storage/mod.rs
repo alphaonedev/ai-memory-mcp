@@ -214,6 +214,9 @@ use crate::models::{
 mod error;
 pub use error::{LINK_CYCLE_ERR_PREFIX, LINK_PERMISSION_DENIED_ERR_PREFIX, LinkEnd, StorageError};
 
+#[cfg(test)]
+mod archive_transaction_tests;
+
 // ---------------------------------------------------------------------------
 // v0.7.0 L1-6 Deliverable E — governance pre-write hook (issue #691)
 // ---------------------------------------------------------------------------
