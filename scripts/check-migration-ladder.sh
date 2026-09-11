@@ -1031,7 +1031,7 @@ run_self_test() {
     set +e
     {
         printf '%s\n' "$match_h"
-        dd if=/dev/zero bs=65536 count=16 2>/dev/null
+        head -c 1048576 /dev/zero 2>/dev/null
     } | grep -qx "$match_h"
     st_forced=$?
     set -e
