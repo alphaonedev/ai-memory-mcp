@@ -2316,15 +2316,18 @@ impl MemoryStore for SqliteStore {
 
     async fn reown(
         &self,
-        _ctx: &CallerContext,
-        namespace: &str,
+        ctx: &CallerContext,
+        namespace: Option<&str>,
         to_id: &str,
-        claim_unowned: bool,
+        select: crate::storage::ReownSelect,
         dry_run: bool,
     ) -> StoreResult<crate::storage::ReownReport> {
-        self.gate_record_stop()?;
+        if !dry_run {
+            self.gate_record_stop()?;
+        }
         let conn = self.state.lock().await;
-        crate::storage::reown(&conn, namespace, to_id, claim_unowned, dry_run).map_err(box_err)
+        crate::storage::reown(&conn, namespace, to_id, select, dry_run, &ctx.agent_id)
+            .map_err(box_err)
     }
 
     async fn action_create(

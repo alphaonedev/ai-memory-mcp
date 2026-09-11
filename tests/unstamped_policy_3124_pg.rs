@@ -325,3 +325,88 @@ fn pg_census_counts_the_three_classes() {
         assert_eq!(after.2 - before.2, 1, "archived unstamped");
     });
 }
+
+/// #3124 R4 (Conductor condition 4) — the postgres reown: `OnlyUnowned`
+/// rewrites ONLY unstamped rows (never an owned one), bumps `version`, and
+/// appends exactly one `memory.reowned` chain row naming the operator; a dry
+/// run writes nothing.
+#[test]
+fn pg_reown_only_unowned_is_audited_and_never_touches_owned_rows() {
+    let _p = posture(MODE_WARN);
+    runtime().block_on(async {
+        let Some(store) = live_pg().await else { return };
+        let ns = ns();
+        let unowned = seed(&store, &ns, "r-unowned", &json!({})).await;
+        let owned = seed(&store, &ns, "r-owned", &json!({"agent_id": "ai:alice"})).await;
+        let operator = CallerContext::for_admin("ai:reown-operator-3124");
+        let audit = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM signed_events WHERE event_type = $1 AND agent_id = $2",
+            )
+            .bind(ai_memory::signed_events::event_types::MEMORY_REOWNED)
+            .bind("ai:reown-operator-3124")
+            .fetch_one(store.pool())
+            .await
+            .expect("audit count")
+        };
+        let before_audit = audit().await;
+        let version_of = |id: String| {
+            let pool = store.pool().clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT version FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("version")
+            }
+        };
+        let v0 = version_of(unowned.clone()).await;
+        let dry = store
+            .reown(
+                &operator,
+                Some(&ns),
+                "ai:bob",
+                ai_memory::storage::ReownSelect::OnlyUnowned,
+                true,
+            )
+            .await
+            .expect("dry run");
+        assert_eq!(dry.matched, 1);
+        assert_eq!(audit().await, before_audit, "a dry run writes no audit row");
+        let live = store
+            .reown(
+                &operator,
+                Some(&ns),
+                "ai:bob",
+                ai_memory::storage::ReownSelect::OnlyUnowned,
+                false,
+            )
+            .await
+            .expect("live run");
+        assert_eq!(live.rewritten, 1);
+        assert_eq!(
+            audit().await,
+            before_audit + 1,
+            "one audit row per live run"
+        );
+        assert_eq!(version_of(unowned.clone()).await, v0 + 1);
+        let owner = |id: String| {
+            let pool = store.pool().clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT metadata->>'agent_id' FROM memories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("owner")
+            }
+        };
+        assert_eq!(owner(unowned).await.as_deref(), Some("ai:bob"));
+        assert_eq!(
+            owner(owned).await.as_deref(),
+            Some("ai:alice"),
+            "owned row untouched"
+        );
+    });
+}
