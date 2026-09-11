@@ -32,24 +32,57 @@ concurrency:
 
 jobs:
   # --------------------------------------------------------------------
-  # Verify the tag exists + is on a sane sha before any publish fires.
-  # Cheap belt-and-suspenders so an `gh workflow run` typo doesn't burn
-  # 20 minutes building artifacts against the wrong commit.
+  # #3546 — verify the tag before anything is built from it.
+  #
+  # The tag is inspected as DATA only. The verifier script and the release
+  # signer allowlist come from THIS workflow's own commit (github.sha, the
+  # tip of the protected branch the release was dispatched from), never
+  # from the tree the tag points at: a tag pointing at a commit that
+  # carried its own `exit 0` verifier, or an allowlist with an extra key,
+  # would otherwise approve itself.
+  #
+  # Outputs: `sha` (the verified commit every later checkout pins to) and
+  # `tag_object` (what each publish step re-asserts on the remote right
+  # before upload, scripts/release/assert-tag-unmoved.sh).
   # --------------------------------------------------------------------
   preflight:
-    name: Preflight (tag exists + is annotated)
+    name: Preflight (tag exists + is annotated + signed)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.check.outputs.tag }}
-      sha: ${{ steps.check.outputs.sha }}
+      sha: ${{ steps.verify.outputs.sha }}
+      tag_object: ${{ steps.verify.outputs.tag_object }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # The workflow's own commit, NOT the tag: this checkout supplies
+          # the trusted tooling. Full history so the tag object and the
+          # ancestry check below are available.
+          ref: ${{ github.sha }}
           fetch-depth: 0
-          ref: ${{ github.event.inputs.tag }}
 
-      - name: Resolve tag + sha + prerelease flag
+      - name: Refuse a dispatch from anywhere but a release branch
+        # A plain `gh workflow run release.yml` runs the DEFAULT branch's
+        # copy of this file, which may predate every check below. Dispatch
+        # with `--ref release/vX.Y.Z`. The release Environment's deployment
+        # branch policy is what makes this unforgeable; this step catches
+        # the honest mistake.
+        shell: bash
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          case "$DISPATCH_REF" in
+            refs/heads/release/*) echo "::notice::dispatched from $DISPATCH_REF" ;;
+            *)
+              echo "::error::release.yml must be dispatched from a release branch (gh workflow run release.yml --ref release/vX.Y.Z -f tag=vX.Y.Z); got '$DISPATCH_REF'"
+              exit 1 ;;
+          esac
+
+      - name: Resolve tag + prerelease flag
         id: check
         shell: bash
         # #1851 (security review S7, CWE-94) — read the untrusted
@@ -68,10 +101,7 @@ jobs:
             echo "::error::tag '$TAG' does not match SemVer v<MAJ>.<MIN>.<PATCH>(-pre)?"
             exit 1
           fi
-          SHA=$(git rev-parse "$TAG^{commit}")
-          echo "::notice::release tag $TAG -> $SHA"
-          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           # SemVer pre-releases (e.g. v0.6.2-rc.0 / v0.7.0-alpha.1) skip
           # the downstream stable channels.
           if [[ "$TAG" == *-* ]]; then
@@ -80,6 +110,77 @@ jobs:
           else
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify the tag (annotated, SSH-signed by an enrolled release key)
+        id: verify
+        shell: bash
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Refetch the tag ref itself so the verified object is the remote's
+          # current one, not a local leftover.
+          git fetch --no-tags --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          bash scripts/release/verify-tag.sh --repo . --tag "$TAG" \
+            --signers scripts/qc-allowlists/release-tag-signers.txt
+
+      - name: Refuse a tag that is not on the dispatch branch
+        shell: bash
+        env:
+          SHA: ${{ steps.verify.outputs.sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$SHA" "$DISPATCH_SHA"; then
+            echo "::error::tagged commit $SHA is not on the dispatch branch (tip $DISPATCH_SHA); a release ships a commit the protected branch already contains"
+            exit 1
+          fi
+
+      - name: Refuse when no tag ruleset protects v* tags
+        # Without a tag ruleset a tag can be moved or deleted between jobs.
+        # The ruleset is a repository admin action; this step makes its
+        # absence a refusal instead of a silent gap.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bash scripts/release/assert-tag-ruleset.sh --repo "$REPO"
+
+  # --------------------------------------------------------------------
+  # #3546 — refuse to release a commit CI did not qualify.
+  #
+  # Every context declared in scripts/qc-allowlists/required-contexts-release.txt
+  # must have a successful, attributed check-run on the verified SHA. The
+  # declaration and the verdict script come from github.sha (trusted), the
+  # same as preflight's tooling. Every build and publish job needs this job
+  # directly.
+  # --------------------------------------------------------------------
+  qualify:
+    name: Qualify (required contexts green on the tagged SHA)
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Qualify the tagged SHA
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/qualify-sha.py --fetch --repo "$REPO" --sha "$SHA" \
+            --contexts scripts/qc-allowlists/required-contexts-release.txt \
+            --carriers-from scripts/check-required-contexts.sh
 
   # --------------------------------------------------------------------
   # #2895 (§3C release-pipeline supply-chain) — run the SAME supply-chain
@@ -100,7 +201,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
@@ -173,7 +274,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + target std
         # Pin to the rust-toolchain.toml channel (1.98.0). The build below
@@ -414,7 +515,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0
         # Pin to rust-toolchain.toml (1.98.0) so cargo-cyclonedx reads
@@ -512,7 +613,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + iOS targets
         # Pin to rust-toolchain.toml (1.98.0) so the iOS cross-target std
@@ -652,7 +753,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + Android targets
         # Pin to rust-toolchain.toml (1.98.0) so the Android cross-target
@@ -792,7 +893,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         # #2895 — pin the publish toolchain to the same 1.98.0 every other
@@ -984,7 +1085,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -1039,7 +1140,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Extract version from tag
         id: version
