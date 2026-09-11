@@ -12,6 +12,8 @@ use crate::identity::supersession::{
 };
 use crate::models::{Memory, field_names};
 
+const SQL_SELECT_ARCHIVED_MEMORY_ROW_BY_ID: &str = "SELECT * FROM archived_memories WHERE id = ?1";
+
 /// Evidence supplied by the actual transport edge, never deserialized from JSON.
 #[derive(Clone, Copy)]
 pub struct SupersessionRequest<'a> {
@@ -31,7 +33,7 @@ impl SupersessionResult {
     /// Attach the same optional fields to all transport envelopes.
     pub fn add_response_fields(&self, response: &mut serde_json::Value) {
         if let Some(old) = &self.superseded {
-            response["superseded"] = serde_json::json!(old);
+            response[field_names::SUPERSEDED] = serde_json::json!(old);
         }
         if self.refusal.is_some() {
             response["supersede_skipped"] = serde_json::json!("unauthenticated_principal");
@@ -55,7 +57,7 @@ impl SupersessionResult {
             "3587",
             serde_json::json!({
                 "new_id": self.id,
-                "superseded": self.superseded,
+                (field_names::SUPERSEDED): self.superseded,
                 "reason": self.refusal.map(|r| format!("{r:?}")),
             }),
         );
@@ -205,7 +207,7 @@ pub fn resolve(
         Some(old) => old,
         None => conn
             .query_row(
-                "SELECT * FROM archived_memories WHERE id = ?1",
+                SQL_SELECT_ARCHIVED_MEMORY_ROW_BY_ID,
                 [old_id],
                 super::row_to_memory,
             )
@@ -256,7 +258,7 @@ fn archive_as_superseded(
         "supersession cannot archive the replacement id"
     );
     ensure!(
-        super::archive_memory_no_tx(conn, &old.id, Some("superseded"))?,
+        super::archive_memory_no_tx(conn, &old.id, Some(field_names::ARCHIVE_REASON_SUPERSEDED))?,
         "supersession archive lost predecessor"
     );
     ensure!(conn.execute(
