@@ -168,8 +168,8 @@ pub fn is_visible_by_fields(
     // one was public: one character apart, opposite postures.
     //
     // The house rule is the opposite — an unrecognised token takes the
-    // NARROWEST posture (`receive_auth::env_flag_default_on` keeps the
-    // secure default; `AI_MEMORY_INFERENCE_EGRESS` WARNs and fails closed
+    // NARROWEST posture (`crate::env_flag` reads it as the secure side of
+    // the knob's polarity; `AI_MEMORY_INFERENCE_EGRESS` WARNs and fails closed
     // to `deny` on a typo). The arm is now a CLOSED set: the legitimate
     // `#948`/`#978` federation shareable token stays broadly visible via
     // `LEGACY_BROAD_SCOPES`, and everything else falls through to the
