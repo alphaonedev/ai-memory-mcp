@@ -80,6 +80,17 @@ fn is_comment_line(trimmed: &str) -> bool {
         || trimmed.starts_with("*/")
 }
 
+/// Is `path` a test submodule file — one that lives under a `tests/` directory
+/// inside `src/` (the `src/<mod>/tests/<name>.rs` shape a `#[cfg(test)] mod`
+/// split uses)? Such a file is test code end to end and has no `mod tests`
+/// boundary for [`production_spawn_ctor_lines`] to stop at (#3612).
+fn is_test_submodule_file(src_dir: &Path, path: &Path) -> bool {
+    path.strip_prefix(src_dir)
+        .unwrap_or(path)
+        .components()
+        .any(|c| c.as_os_str() == "tests")
+}
+
 /// Scan a file's PRODUCTION lines (everything before the first `mod tests`,
 /// comments stripped) and return the 1-based line numbers that contain a raw
 /// spawn constructor.
@@ -120,6 +131,12 @@ fn chokepoint_no_raw_command_new_in_production() {
     for path in &files {
         if path == &chokepoint {
             continue; // the audited chokepoint IS allowed to build a Command.
+        }
+        if is_test_submodule_file(&src_dir, path) {
+            // #3612 — a `#[cfg(test)]` submodule split out of its parent
+            // (`src/<mod>/tests/<name>.rs`) has no `mod tests` boundary of
+            // its own; it is test code end to end, like the in-file module.
+            continue;
         }
         for line_no in production_spawn_ctor_lines(path) {
             let rel = path.strip_prefix(&src_dir).unwrap_or(path);
