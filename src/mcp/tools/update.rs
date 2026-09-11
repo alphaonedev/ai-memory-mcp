@@ -573,28 +573,68 @@ pub(super) fn handle_update(
         }
     };
 
-    let (found, content_changed) = match db::update_with_expected_version(
-        conn,
-        &resolved_id,
-        title,
-        content,
-        tier.as_ref(),
-        namespace,
-        tags.as_ref(),
-        priority,
-        confidence,
-        expires_at,
-        metadata.as_ref(),
-        source_uri,
-        expected_version,
-        // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
-        valid_until,
-    ) {
+    // #3152 — the patch and the optional lifecycle transition are ONE write
+    // transaction, so an illegal edge or a crash between them can no longer
+    // persist the patch alone (and a refused unit refunds a growth charge
+    // for bytes that genuinely never landed).
+    let unit = db::in_write_txn(conn, || {
+        let (found, content_changed) = db::update_with_expected_version(
+            conn,
+            &resolved_id,
+            title,
+            content,
+            tier.as_ref(),
+            namespace,
+            tags.as_ref(),
+            priority,
+            confidence,
+            expires_at,
+            metadata.as_ref(),
+            source_uri,
+            expected_version,
+            // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
+            valid_until,
+        )?;
+        #[cfg(test)]
+        crate::recover::durability::in_tx_fault::patched_before_lifecycle(&resolved_id);
+        // v0.8.0 Pillar 2 (#1709) — lifecycle transition enforcement. When
+        // the caller supplies a `lifecycle_state` that DIFFERS from the
+        // stored value, enforce `current.can_transition_to(requested)` (the
+        // typed state machine in `models::LifecycleState`). An illegal
+        // transition is rejected with a clear error; a legal one is persisted
+        // (and bumps the Gap-1 `version`). A request equal to the stored
+        // state is a no-op (no self-loop, no error). This is the consumer
+        // that makes the column load-bearing rather than inert.
+        if found && let Some(requested) = requested_lifecycle {
+            let current = db::get(conn, &resolved_id)?
+                .ok_or_else(|| anyhow::anyhow!(crate::errors::msg::MEMORY_NOT_FOUND))?
+                .lifecycle_state;
+            if requested != current {
+                if !current.can_transition_to(requested) {
+                    anyhow::bail!(
+                        "illegal lifecycle transition '{}' -> '{}' (legal: {})",
+                        current.as_str(),
+                        requested.as_str(),
+                        LifecycleState::all()
+                            .iter()
+                            .filter(|s| current.can_transition_to(**s))
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    );
+                }
+                db::set_lifecycle_state(conn, &resolved_id, requested)?;
+            }
+        }
+        Ok((found, content_changed))
+    });
+    let (found, content_changed) = match unit {
         Ok(v) => v,
         Err(e) => {
             // FBL-12 — refund the growth charge when the write itself
-            // fails (e.g. a VersionConflict) so a retry storm on a
-            // conflicting update cannot slowly inflate the counter.
+            // fails (e.g. a VersionConflict, or #3152 an illegal lifecycle
+            // edge that rolled the patch back) so a retry storm cannot
+            // slowly inflate the counter.
             if let Some((ref owner, ref ns, delta)) = quota_charge {
                 let _ = crate::quotas::refund_storage_only(conn, owner, ns, delta);
             }
@@ -609,37 +649,6 @@ pub(super) fn handle_update(
             let _ = crate::quotas::refund_storage_only(conn, owner, ns, delta);
         }
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
-    }
-
-    // v0.8.0 Pillar 2 (#1709) — lifecycle transition enforcement. When the
-    // caller supplies a `lifecycle_state` that DIFFERS from the stored
-    // value, enforce `current.can_transition_to(requested)` (the typed
-    // state machine in `models::LifecycleState`). An illegal transition is
-    // rejected with a clear error; a legal one is persisted (and bumps the
-    // Gap-1 `version`). A request equal to the stored state is a no-op (no
-    // self-loop, no error). This is the consumer that makes the column
-    // load-bearing rather than inert.
-    if let Some(requested) = requested_lifecycle {
-        let current = db::get(conn, &resolved_id)
-            .map_err(|e| e.to_string())?
-            .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?
-            .lifecycle_state;
-        if requested != current {
-            if !current.can_transition_to(requested) {
-                return Err(format!(
-                    "illegal lifecycle transition '{}' -> '{}' (legal: {})",
-                    current.as_str(),
-                    requested.as_str(),
-                    LifecycleState::all()
-                        .iter()
-                        .filter(|s| current.can_transition_to(**s))
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                ));
-            }
-            db::set_lifecycle_state(conn, &resolved_id, requested).map_err(|e| e.to_string())?;
-        }
     }
 
     // Regenerate embedding when title or content changed
@@ -683,6 +692,11 @@ fn conflict_or_string(e: &anyhow::Error) -> String {
         e.to_string()
     }
 }
+
+// v1.0.0 #3152 — one transaction for the patch + lifecycle transition.
+#[cfg(test)]
+#[path = "update_3152_tests.rs"]
+mod update_3152_tests;
 
 #[cfg(test)]
 mod tests {

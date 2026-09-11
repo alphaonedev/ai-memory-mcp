@@ -74,6 +74,12 @@ pub(crate) mod pg_migration_lock;
 /// per-DB sqlite flag registry.
 pub mod record_stop;
 
+/// v1.0.0 #3152 — one commit per logical `update` (patch + lifecycle
+/// transition), proven by refusal, visibility and crash tests on both
+/// backends.
+#[cfg(test)]
+mod update_atomicity_3152_tests;
+
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
