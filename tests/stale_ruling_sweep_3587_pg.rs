@@ -211,6 +211,11 @@ async fn store_backed_stale_ruling_sweep_notifies_and_dedups_3587_pg() {
     let inbox_ns = ai_memory::inbox_namespace(&recipient);
     let now = chrono::Utc::now();
     let sender = "ai:curator";
+    // The dedup state row is substrate bookkeeping owned by the curator
+    // principal; in production the CLI supplies this admin ctx, so the library
+    // defines no privacy bypass of its own.
+    let state_ctx =
+        ai_memory::store::CallerContext::for_admin(ai_memory::identity::sentinels::AI_CURATOR);
 
     // The shared dedup row must start absent so the first sweep actually emits.
     sqlx::query("DELETE FROM memories WHERE namespace = $1 AND title = $2")
@@ -240,7 +245,9 @@ async fn store_backed_stale_ruling_sweep_notifies_and_dedups_3587_pg() {
         ..ai_memory::curator::CuratorConfig::default()
     };
 
-    let r1 = ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender).await;
+    let r1 =
+        ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender, &state_ctx)
+            .await;
     assert!(
         r1.errors.is_empty(),
         "first store-backed sweep must be clean: {:?}",
@@ -271,7 +278,9 @@ async fn store_backed_stale_ruling_sweep_notifies_and_dedups_3587_pg() {
         now - chrono::Duration::days(30),
     )
     .await;
-    let r2 = ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender).await;
+    let r2 =
+        ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender, &state_ctx)
+            .await;
     assert!(
         r2.stale_ruling_ids.contains(&second),
         "the new ruling is in the current set"
@@ -294,7 +303,9 @@ async fn store_backed_stale_ruling_sweep_notifies_and_dedups_3587_pg() {
     .await
     .expect("backdate state row");
 
-    let r3 = ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender).await;
+    let r3 =
+        ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender, &state_ctx)
+            .await;
     assert!(
         r3.errors.is_empty(),
         "post-floor sweep must be clean: {:?}",

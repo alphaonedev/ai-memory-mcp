@@ -512,8 +512,13 @@ async fn run_stale_rulings(
             || crate::identity::sentinels::AI_CURATOR.to_string(),
             |k| k.agent_id.clone(),
         );
+        // #3587 U3 R1 — the dedup state row is substrate bookkeeping owned by
+        // the curator principal; the CLI supplies the admin ctx so the library
+        // constructs no bypass (C8 allowlist: src/cli/curator.rs:AI_CURATOR).
+        let state_ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
         let report =
-            curator::run_store_backed_stale_ruling_pass(store.as_ref(), &cfg, &sender).await;
+            curator::run_store_backed_stale_ruling_pass(store.as_ref(), &cfg, &sender, &state_ctx)
+                .await;
         return print_stale_ruling_report(&report, args, out);
     }
     let conn = db::open(db_path)?;
@@ -633,6 +638,10 @@ async fn run_store_backed_sweep(
         || crate::identity::sentinels::AI_CURATOR.to_string(),
         |k| k.agent_id.clone(),
     );
+    // #3587 U3 R1 — admin ctx for the stale-ruling dedup state row, supplied by
+    // the CLI (C8 allowlist: src/cli/curator.rs:AI_CURATOR); the library takes
+    // it as a parameter so it defines no privacy bypass of its own.
+    let stale_state_ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
     let feature_tier = app_config.effective_tier(None);
     let llm = build_curator_llm(feature_tier, db_path);
 
@@ -670,9 +679,13 @@ async fn run_store_backed_sweep(
         // store-backed cycle: read-only w.r.t. the ruling rows and LLM-free,
         // so a postgres hive detects and digests stale rulings the same way
         // the sqlite `run_once` does.
-        let stale =
-            curator::run_store_backed_stale_ruling_pass(store.as_ref(), &curator_cfg, &sender)
-                .await;
+        let stale = curator::run_store_backed_stale_ruling_pass(
+            store.as_ref(),
+            &curator_cfg,
+            &sender,
+            &stale_state_ctx,
+        )
+        .await;
         log_store_backed_stale_rulings(&stale);
         if args.json {
             // Additive keys on the reflection report; consumers that ignore
@@ -751,9 +764,13 @@ async fn run_store_backed_sweep(
         )
         .await;
         // #3587 U3 R1 — same pass on every daemon cycle.
-        let stale =
-            curator::run_store_backed_stale_ruling_pass(store.as_ref(), &curator_cfg, &sender)
-                .await;
+        let stale = curator::run_store_backed_stale_ruling_pass(
+            store.as_ref(),
+            &curator_cfg,
+            &sender,
+            &stale_state_ctx,
+        )
+        .await;
         log_store_backed_stale_rulings(&stale);
         tracing::info!(
             "curator SAL cycle: namespaces={} observations={} clusters_eligible={} \

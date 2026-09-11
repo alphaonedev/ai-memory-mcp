@@ -1058,10 +1058,11 @@ pub async fn run_store_backed_stale_ruling_pass(
     store: &dyn crate::store::MemoryStore,
     cfg: &CuratorConfig,
     sender: &str,
+    state_ctx: &crate::store::CallerContext,
 ) -> CuratorReport {
     let started = Instant::now();
     let mut report = CuratorReport::new(cfg.dry_run);
-    store_backed_stale_ruling_body(store, cfg, sender, &mut report).await;
+    store_backed_stale_ruling_body(store, cfg, sender, state_ctx, &mut report).await;
     report.completed_at = chrono::Utc::now().to_rfc3339();
     report.cycle_duration_ms = started.elapsed().as_millis();
     report
@@ -1074,6 +1075,7 @@ async fn store_backed_stale_ruling_body(
     store: &dyn crate::store::MemoryStore,
     cfg: &CuratorConfig,
     sender: &str,
+    state_ctx: &crate::store::CallerContext,
     report: &mut CuratorReport,
 ) {
     let now = chrono::Utc::now();
@@ -1114,11 +1116,12 @@ async fn store_backed_stale_ruling_body(
     };
 
     // The state row is substrate bookkeeping owned by the curator principal, so
-    // it is read/written under the same admin context the curator's other store
-    // writes use. The DIGEST is stamped with the caller's own resolved id.
-    let state_ctx = crate::store::CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
+    // it is read/written under the caller-supplied admin context (the CLI passes
+    // `for_admin(AI_CURATOR)`, an already-reviewed C8 allowlist site — the
+    // library constructs no bypass itself). The DIGEST is stamped with the
+    // caller's own resolved id.
     let set_hash = stale_set_hash(&stale);
-    let last = match read_store_stale_ruling_state(store, &state_ctx).await {
+    let last = match read_store_stale_ruling_state(store, state_ctx).await {
         Ok(v) => v,
         Err(e) => {
             report
@@ -1169,7 +1172,7 @@ async fn store_backed_stale_ruling_body(
             Ok(_) => {
                 report.stale_rulings_notified = 1;
                 if let Err(e) =
-                    write_store_stale_ruling_state(store, &state_ctx, &set_hash, now).await
+                    write_store_stale_ruling_state(store, state_ctx, &set_hash, now).await
                 {
                     report
                         .errors
