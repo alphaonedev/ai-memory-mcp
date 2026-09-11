@@ -35,7 +35,7 @@ The multi-model swarm (Fable Conductor, Codex, Grok, Opus subagents) stays coher
 
 ### U4 — `capture-turn` CLI twin + `install claude-code --hook capture` (Grok, after U2)
 - ✎ `HookKind::Capture` on the existing `--hook` extension point (Stop event); no `--capture-hook` bool; non-claude-code targets keep the pinned refusal. **Codex leg dropped** (documented in prose).
-- ✎ The Stop payload provides `last_assistant_message` on stdin (no transcript parsing) and no turn index: `capture-turn --host-turn-index auto` derives `MAX+1` inside the existing `BEGIN IMMEDIATE` transaction; content-hash dedup as the second guard. Hook entry written with `"async": true`, managed keys `["hooks"]`, no `matcher`, explicit `--agent-id <resolved>` in the command; `capture-turn --quiet` never fails (exit 0), no-op when the field is absent; keeps the #1413 agent-id agreement check; `refuse_pg_store`.
+- ✎ The Stop payload provides `last_assistant_message` on stdin (no transcript parsing) and no turn index: `capture-turn --host-turn-index auto` derives `MAX+1` inside the existing `BEGIN IMMEDIATE` transaction; content-hash dedup as the second guard. Hook entry written with `"async": true`, managed keys `["hooks"]`, no `matcher`, explicit `--agent-id <resolved>` in the command; `capture-turn --quiet` never fails (exit 0), no-op when the field is absent; keeps the agent-id agreement check (#1413); `refuse_pg_store`.
 - ✎ SSOT: `EXPECTED_CLI_SUBCOMMANDS_DEFAULT` 95→96 and `_SAL` 97→98, `json_contract` classification `Global`, CLI_REFERENCE twin-table row. Byte-equal envelope parity test vs `memory_capture_turn`; install idempotency and operator-hook preservation tests.
 
 ### U5b — Docs + SSOT reconciliation (Grok, last)
