@@ -1,0 +1,12 @@
+{
+  "id": "neg-pred-anon-write-500",
+  "predicate": "anonymous_write_refused",
+  "why": "HTTP 500 is not a documented refusal. The old oracle treated any status != 201 as PASS, so a 500 (or 202) greened 'anonymous write refused'.",
+  "old_pass": true,
+  "new_pass": false,
+  "args": {
+    "status": 500,
+    "error_code": "",
+    "delta": 0
+  }
+}

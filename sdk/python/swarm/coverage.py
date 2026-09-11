@@ -12,10 +12,13 @@ exercised at least once against a live daemon. This module:
 * tallies every dispatched :class:`swarm.toolset.ToolOutcome`, and
 * renders a coverage matrix + a pass/fail verdict.
 
-A tool counts as COVERED when it was invoked >= 1 time and either succeeded or
-produced a DOCUMENTED fail-closed outcome (an intentional refusal the operator
-recorded as expected for this backend, e.g. skills on postgres). A tool that
-was never invoked, or only ever crashed unexpectedly, is a coverage FAILURE.
+A tool counts as COVERED when it was invoked >= 1 time and either produced a
+persisted ``memory_id`` (or a non-pending non-row success) or produced a
+DOCUMENTED fail-closed outcome (EXPECTED_REFUSAL — an intentional refusal the
+operator recorded as expected for this backend, e.g. skills on postgres). A
+200 ``{"status":"pending"}`` is counted in the pending bucket and is NEVER
+coverage (#3543). A tool that was never invoked, or only ever crashed
+unexpectedly, is a coverage FAILURE.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from dataclasses import dataclass, field
 from collections import deque
 from typing import Any
 
-from swarm.toolset import TOOL_SPECS, ToolOutcome, ToolSpec
+from swarm.toolset import TOOL_SPECS, ToolOutcome, ToolSpec, result_is_pending
 
 
 @dataclass
@@ -36,12 +39,16 @@ class ToolCoverage:
     successes: int = 0
     fail_closed: int = 0
     unexpected_failures: int = 0
+    pending: int = 0
     last_summary: str = ""
     failure_summaries: deque[str] = field(default_factory=lambda: deque(maxlen=5))
 
     @property
     def covered(self) -> bool:
-        """Covered = at least one success, OR only documented fail-closed."""
+        """Covered = a persisted-id / non-pending success, OR documented EXPECTED_REFUSAL.
+
+        Pending is its own bucket and never coverage (#3543).
+        """
         if self.successes > 0:
             return True
         return self.invocations > 0 and self.unexpected_failures == 0 and self.fail_closed > 0
@@ -77,13 +84,16 @@ class CoverageTracker:
             self.tools[outcome.name] = cov
         cov.invocations += 1
         cov.last_summary = outcome.summary
-        if outcome.ok:
+        pending = outcome.pending or result_is_pending(outcome.result)
+        if pending:
+            cov.pending += 1
+            cov.failure_summaries.append(outcome.summary)
+        elif outcome.ok:
             cov.successes += 1
         elif outcome.name in self.documented_fail_closed:
             cov.fail_closed += 1
         else:
             cov.unexpected_failures += 1
-        if not outcome.ok:
             cov.failure_summaries.append(outcome.summary)
 
     def mark_documented_fail_closed(self, *names: str) -> None:
@@ -189,14 +199,15 @@ class CoverageTracker:
         lines = [
             "ai-memory swarm — tool coverage matrix",
             "=" * 60,
-            f"{'TOOL':<{width}}  {'KIND':<6} {'SRC':<12} {'INV':>4} {'OK':>3} {'FC':>3}  COVERED",
+            f"{'TOOL':<{width}}  {'KIND':<6} {'SRC':<12} {'INV':>4} {'OK':>3} {'FC':>3} {'PEND':>4}  COVERED",
             "-" * 60,
         ]
         for name, cov in self.tools.items():
             mark = "yes" if cov.covered else "NO"
             lines.append(
                 f"{name:<{width}}  {cov.spec.kind:<6} {cov.spec.source:<12} "
-                f"{cov.invocations:>4} {cov.successes:>3} {cov.fail_closed:>3}  {mark}"
+                f"{cov.invocations:>4} {cov.successes:>3} {cov.fail_closed:>3} "
+                f"{cov.pending:>4}  {mark}"
             )
         covered = sum(1 for c in self.tools.values() if c.covered)
         lines += [

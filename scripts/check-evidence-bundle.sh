@@ -239,6 +239,11 @@ json.dump(d, open(sys.argv[6], "w"), indent=2)
   fi
 
   echo "PASS: self-test — map clean, untracked producer refused, four negative bundles refused"
+
+  # #3543 — five fail-closed predicate fixtures (old oracle greened the
+  # defect; new oracle FAILs it). Lives in predicates.py so a producer
+  # and this gate cannot drift.
+  python3 "$ROOT/scripts/evidence/predicates.py" --self-test
 }
 
 BUNDLE=""

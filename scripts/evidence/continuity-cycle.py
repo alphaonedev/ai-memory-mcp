@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""continuity-cycle.py — clock-1 continuity producer (#3547).
+"""continuity-cycle.py — clock-1 continuity producer (#3547 / #3543).
 
 Repo-relative: REPO is the git root containing this file, never a
 hard-coded operator path. Readiness is a recall probe that returns a
-seeded row, not the boot-time `embedder_ready` constant. The published
-clock is `clock_1_harness_restart_to_health_ok_ms` (health 200), never
-a sleep-inflated `resume_ms`.
+seeded row, not the boot-time `embedder_ready` constant. Retention
+compares payload digest + version (not GET-by-id HTTP 200). The
+published clock is `clock_1_harness_restart_to_health_ok_ms` (health
+200), never a sleep-inflated `resume_ms`.
 
 The JSON record carries run_id + daemon_binary_sha256 + source_commit
 so a dashboard stamp cannot outlive its source (#3547 binding).
@@ -26,6 +27,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+
+# Predicates live beside this file so the producer and --self-test share one SSOT.
+sys.path.insert(0, str(HERE))
+from predicates import continuity_retained, payload_digest  # noqa: E402
 
 
 def git(*args: str) -> str:
@@ -96,11 +101,15 @@ def main() -> int:
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     health_ok_ms = wait_health(args.base_url.rstrip("/"), timeout_s=30.0)
 
+    seed_title = args.seed_title
+    seed_content = "continuity-cycle seeded row for recall-readiness"
+    seed_ns = "evidence/continuity"
+    expected_digest = payload_digest(seed_title, seed_content, seed_ns)
     seed_body = json.dumps(
         {
-            "title": args.seed_title,
-            "content": "continuity-cycle seeded row for recall-readiness",
-            "namespace": "evidence/continuity",
+            "title": seed_title,
+            "content": seed_content,
+            "namespace": seed_ns,
             "tier": "mid",
         }
     ).encode()
@@ -111,6 +120,10 @@ def main() -> int:
         print(f"FATAL: seed write failed status={status} body={created}", file=sys.stderr)
         return 1
     seed_id = created["id"]
+    expected_version = created.get("version")
+    if expected_version is None:
+        print("FATAL: seed write returned no version", file=sys.stderr)
+        return 1
 
     # Readiness = recall returns the seeded row. Not embedder_ready.
     rec_status, rec = http_json(
@@ -122,6 +135,32 @@ def main() -> int:
     if not ready:
         print(
             f"FATAL: recall readiness failed status={rec_status} seed={seed_id} ids={ids}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Retention oracle: payload digest + version, never GET-by-id 200.
+    get_status, got = http_json(f"{args.base_url.rstrip('/')}/memories/{seed_id}")
+    row = got.get("memory") if isinstance(got.get("memory"), dict) else got
+    stored_digest = payload_digest(
+        str(row.get("title") or ""),
+        str(row.get("content") or ""),
+        str(row.get("namespace") or ""),
+    )
+    stored_version = row.get("version")
+    retained = continuity_retained(
+        ready=ready,
+        stored_digest=stored_digest,
+        stored_version=stored_version,
+        expected_digest=expected_digest,
+        expected_version=expected_version,
+        get_status=get_status,
+    )
+    if not retained:
+        print(
+            f"FATAL: retention failed ready={ready} get_status={get_status} "
+            f"digest_match={stored_digest == expected_digest} "
+            f"version stored={stored_version} expected={expected_version}",
             file=sys.stderr,
         )
         return 1
@@ -144,7 +183,10 @@ def main() -> int:
         "capacity": {"p99_method": "not-applicable"},
         "clock_1_harness_restart_to_health_ok_ms": round(health_ok_ms, 3),
         "readiness": "recall_seeded_row",
+        "retained": True,
         "seed_id": seed_id,
+        "payload_digest": expected_digest,
+        "version": expected_version,
         "repo": str(REPO),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

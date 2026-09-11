@@ -1,0 +1,15 @@
+{
+  "id": "neg-pred-continuity-200-by-id",
+  "predicate": "continuity_retained",
+  "why": "GET-by-id HTTP 200 with a mutated payload is not retention. The old oracle treated status != 200 as missing and 200 as retained, ignoring digest and version.",
+  "old_pass": true,
+  "new_pass": false,
+  "args": {
+    "ready": true,
+    "get_status": 200,
+    "stored_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "stored_version": 2,
+    "expected_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "expected_version": 1
+  }
+}

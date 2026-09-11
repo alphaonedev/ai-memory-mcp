@@ -1,0 +1,15 @@
+{
+  "id": "neg-pred-swarm-pending",
+  "predicate": "swarm_covered",
+  "why": "A 200 {\"status\":\"pending\"} is not coverage. The old oracle counted 'handler returned without exception' as success, producing 22/22.",
+  "old_pass": true,
+  "new_pass": false,
+  "args": {
+    "handler_returned": true,
+    "ok": true,
+    "pending": true,
+    "memory_id": null,
+    "expected_refusal": false,
+    "result": {"status": "pending"}
+  }
+}

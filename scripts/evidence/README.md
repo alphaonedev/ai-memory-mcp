@@ -33,8 +33,16 @@ repo-relative paths. The unpublished dashboard "95 %" MCP-tools figure
 had no producer; `mcp-tools-state.py` writes a state file only from a
 named `--run-dir` capture and never invents a percentage.
 
-Predicate rewrites for attestation INFO-oracle and swarm `pending ==
-covered` are #3543.
+Predicate rewrites (#3543): Big-10 plaintext requires a TLS-layer curl
+exit in {35,52,56}; anonymous write requires 401/403 + error `code` +
+zero delta; continuity readiness is a recall hit and retention compares
+payload digest + version (clock 1 is `clock_1_harness_restart_to_health_ok_ms`);
+stored `attest_level` mismatch is a non-zero exit; swarm `covered`
+requires a persisted `memory_id` or a documented EXPECTED_REFUSAL, and
+`pending` is its own bucket. Five negative fixtures under
+`fixtures/neg-pred-*.json` are red under the legacy oracle and
+green-as-FAIL under the new one (`python3 scripts/evidence/predicates.py
+--self-test`).
 
 ## Writing a bundle
 

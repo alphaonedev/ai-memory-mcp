@@ -1,0 +1,12 @@
+{
+  "id": "neg-pred-attest-level-claimed",
+  "predicate": "attest_level_matches",
+  "why": "A 201 accept with stored attest_level=claimed is not agent_attested. The old oracle demoted the stored-level check to INFO and treated 201 as the primary proof.",
+  "old_pass": true,
+  "new_pass": false,
+  "args": {
+    "http_status": 201,
+    "stored": "claimed",
+    "expected": "agent_attested"
+  }
+}
