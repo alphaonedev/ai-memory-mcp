@@ -1373,6 +1373,19 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3587 — resolve two existing rows under the same hardened authority
+    /// and transaction as keyed store. CallerContext alone grants no authority.
+    async fn resolve_supersession(
+        &self,
+        _old_id: &str,
+        _new_id: &str,
+        _request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession::SupersessionResult> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RESOLVE_SUPERSESSION".into(),
+        })
+    }
+
     /// v1.0.0 #2887 — RESTORE-SAFE atomic write for the reversible rollback
     /// paths (autonomy `reverse_rollback_entry_store` + curator
     /// `rollback_consolidation`). It re-stores `memory` at its OWN id under an

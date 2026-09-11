@@ -520,6 +520,17 @@ impl MemoryStore for SqliteStore {
         crate::db::insert_subkey_cert(&conn, record).map_err(box_err)
     }
 
+    async fn resolve_supersession(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession::SupersessionResult> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        crate::storage::supersession::resolve(&conn, old_id, new_id, request).map_err(box_err)
+    }
+
     async fn store_with_supersession(
         &self,
         ctx: &CallerContext,

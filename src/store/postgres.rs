@@ -22730,6 +22730,15 @@ impl MemoryStore for PostgresStore {
         self.insert_subkey_cert_pg(record).await
     }
 
+    async fn resolve_supersession(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession::SupersessionResult> {
+        self.resolve_supersession_pg(old_id, new_id, request).await
+    }
+
     async fn store_with_supersession(
         &self,
         ctx: &CallerContext,

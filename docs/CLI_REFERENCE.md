@@ -330,8 +330,24 @@ ceiling: `CONSOLIDATE_MAX_CLUSTER_SIZE = 8` (per `src/autonomy.rs`).
 
 ### `resolve`
 
-Mark one memory as superseding another (adds `supersedes` link +
-archives loser).
+Archive the loser with `archive_reason = superseded` and
+`metadata.superseded_by = <winner-id>`, and set
+`metadata.superseded_id = <loser-id>` on the live winner. The winner must
+have a strictly newer `created_at` and the exact same namespace. Priority,
+confidence, content and creation timestamps are preserved.
+
+The hardened process identity (`AI_MEMORY_AGENT_ID`) must own the loser.
+`--as-admin` instead requires that identity in the configured `[admin].agent_ids`
+allowlist. Missing identity, foreign ownership and invalid ordering refuse with a
+typed reason and a Deny audit. Repeating an authorized resolution for a loser
+already carrying `superseded_by` is a no-op. Successful archival emits an Update
+and a governance decision audit.
+
+SQLite and PostgreSQL use the same authority policy and transaction-composable
+archive primitive; PostgreSQL requires a `sal-postgres` build and the configured
+store URL. This verb creates no link. Generic MCP `memory_link` with relation
+`supersedes` continues to link two live rows; MCP deterministic supersession uses
+`memory_store` with `metadata.ruling_key`.
 
 ```bash
 ai-memory resolve winner-id loser-id

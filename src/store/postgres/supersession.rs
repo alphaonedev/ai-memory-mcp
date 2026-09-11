@@ -153,6 +153,96 @@ impl PostgresStore {
         Ok(result)
     }
 
+    /// CLI resolve's SAL twin; each retry rereads and reauthorizes both rows.
+    pub(super) async fn resolve_supersession_pg(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        request: SupersessionRequest<'_>,
+    ) -> StoreResult<SupersessionResult> {
+        self.gate_record_stop().await?;
+        let mut retry = super::tx_retry::TxRetry::new("resolve supersession");
+        let (result, new) = loop {
+            match self
+                .resolve_supersession_attempt(old_id, new_id, request)
+                .await
+            {
+                Ok(result) => break result,
+                Err(error) => retry.consider(error).await?,
+            }
+        };
+        result.audit(request, &new);
+        Ok(result)
+    }
+
+    async fn resolve_supersession_attempt(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        request: SupersessionRequest<'_>,
+    ) -> StoreResult<(SupersessionResult, Memory)> {
+        gate_record_stop_cached(&self.record_stop)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin resolve", e))?;
+        // CONCURRENCY-04: lock both live rows in id order, even when two callers
+        // propose opposite winners. Archived replay is read only after live locks.
+        let rows =
+            sqlx::query("SELECT * FROM memories WHERE id = $1 OR id = $2 ORDER BY id FOR UPDATE")
+                .bind(old_id)
+                .bind(new_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("lock resolve rows", e))?;
+        let memories = rows
+            .iter()
+            .map(Self::row_to_memory)
+            .collect::<StoreResult<Vec<_>>>()?;
+        let new = memories
+            .iter()
+            .find(|m| m.id == new_id)
+            .ok_or_else(|| StoreError::NotFound { id: new_id.into() })?;
+        let archived;
+        let old = match memories.iter().find(|m| m.id == old_id) {
+            Some(old) => old,
+            None => {
+                let row = sqlx::query("SELECT * FROM archived_memories WHERE id = $1 FOR UPDATE")
+                    .bind(old_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("read resolve archive", e))?
+                    .ok_or_else(|| StoreError::NotFound { id: old_id.into() })?;
+                archived = Self::row_to_memory(&row)?;
+                &archived
+            }
+        };
+        let mut result = SupersessionResult {
+            id: new.id.clone(),
+            superseded: None,
+            refusal: None,
+        };
+        match authorize_supersession(
+            request.principal,
+            request.as_admin,
+            &crate::identity::admin_agent_ids(),
+            old,
+            new,
+        ) {
+            SupersessionDecision::Authorized(authorized) => {
+                self.archive_as_superseded(&mut tx, &authorized).await?;
+                result.superseded = Some(old.id.clone());
+            }
+            SupersessionDecision::Refused(reason) => result.refusal = Some(reason),
+            SupersessionDecision::AlreadySuperseded => {}
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit resolve", e))?;
+        Ok((result, new.clone()))
+    }
+
     async fn archive_as_superseded(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
