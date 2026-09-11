@@ -210,10 +210,18 @@ AI_MEMORY_DB="$ALICE_DB" \
 # ---------------------------------------------------------------
 step "Step 5: snapshot alice, corrupt the live DB, restore from snapshot"
 
+# Since v1.0.0 (#3199) the manifest is signed with the operator key and
+# restore verifies that signature, so alice gets an operator key first.
+# Scoped to her key dir so the demo never signs with a real operator key.
 AI_MEMORY_DB="$ALICE_DB" \
+    "$BIN" rules keygen --out "$ALICE_KEYS/operator.key" >>"$LOG" 2>&1 \
+    && record "alice operator key generated" PASS \
+    || record "alice operator key generated" FAIL
+
+AI_MEMORY_DB="$ALICE_DB" AI_MEMORY_KEY_DIR="$ALICE_KEYS" \
     "$BIN" backup --to "$BACKUP_DIR" --keep 4 >>"$LOG" 2>&1 \
-    && record "alice snapshot created with sha256 manifest" PASS \
-    || record "alice snapshot created with sha256 manifest" FAIL
+    && record "alice snapshot created with a signed manifest" PASS \
+    || record "alice snapshot created with a signed manifest" FAIL
 
 # Verify the manifest exists and pins a sha256.
 manifest_count=$(find "$BACKUP_DIR" -name '*.manifest.json' | wc -l | tr -d ' ')
@@ -223,11 +231,11 @@ manifest_count=$(find "$BACKUP_DIR" -name '*.manifest.json' | wc -l | tr -d ' ')
 : > "$ALICE_DB"
 echo "  (corrupted $ALICE_DB to zero bytes)" >>"$LOG"
 
-# Restore from newest snapshot.
-AI_MEMORY_DB="$ALICE_DB" \
-    "$BIN" restore --from "$BACKUP_DIR" >>"$LOG" 2>&1 \
-    && record "alice restored from newest snapshot (sha256-verified)" PASS \
-    || record "alice restored from newest snapshot (sha256-verified)" FAIL
+# Restore the newest backup whose signed manifest verifies (#3199).
+AI_MEMORY_DB="$ALICE_DB" AI_MEMORY_KEY_DIR="$ALICE_KEYS" \
+    "$BIN" restore --from "$BACKUP_DIR" --latest --yes >>"$LOG" 2>&1 \
+    && record "alice restored from newest signed snapshot" PASS \
+    || record "alice restored from newest signed snapshot" FAIL
 
 # Verify the restored DB has the original memory back.
 recovered=$(AI_MEMORY_DB="$ALICE_DB" "$BIN" list --namespace "$NS" --json 2>>"$LOG" | grep -c 'alice-bootstrap' || true)

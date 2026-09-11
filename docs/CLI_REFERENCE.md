@@ -524,20 +524,23 @@ its successor; candidate possession plus an admin role cannot rotate it.
 
 ```bash
 ai-memory backup --to /var/backups/ai-memory --keep 48
-ai-memory restore --from /var/backups/ai-memory
+ai-memory restore --from /var/backups/ai-memory --latest
 ```
 
 `backup` uses SQLite `VACUUM INTO` (hot-backup safe) and writes a
-sha256 manifest. `restore` verifies the manifest before replacing the
-DB; use `--skip-verify` only for forensic recoveries.
+manifest **signed with the operator key**. `restore` verifies that
+signature, then the sha256 it covers, before replacing the DB. See
+[Signed manifests](#signed-manifests-v100-3199) below.
 
 | Flag | Applies to | Notes |
 |---|---|---|
 | `--to <dir>` | `backup` | Snapshot + manifest destination. Default `./backups`. |
-| `--keep <n>` | `backup` | Retain at most `n` snapshots, oldest-first rotation. `0` disables. |
-| `--from <path>` | `restore` | A snapshot file, or a backup directory (pair it with `--snapshot`). |
-| `--snapshot <name>` | `restore` | The snapshot to restore from a `--from` directory: its file name (`ai-memory-<ts>.db`), its id (`ai-memory-<ts>`), or its manifest's file name. A plain name, never a path; must be a regular file. Without it the newest snapshot **by modification time** is used and a warning names it; the `asi-hard` posture refuses that fallback and lists the candidates (v1.0.0 #3550). |
-| `--skip-verify` | `restore` | Skip the sha256 check. Not routine. |
+| `--keep <n>` | `backup` | Retain at most `n` backups, oldest-first by **signed** creation time. Only backups whose manifest verifies are counted; a file that cannot be verified is never deleted (#3604). A backup that is not durable rotates nothing (#3605). `0` disables. |
+| `--from <path>` | `restore` | A snapshot file, or a backup directory. A directory needs `--snapshot` or `--latest`. |
+| `--snapshot <name>` | `restore` | The snapshot to restore from a `--from` directory: its file name (`ai-memory-<ts>.db`), its id (`ai-memory-<ts>`), or its manifest's file name. A plain name, never a path; must be a regular file (v1.0.0 #3550). |
+| `--latest` | `restore` | With a `--from` directory, restore the backup whose **signed** manifest records the newest creation time. Only manifests that verify are considered, and one whose signature fails makes the command refuse, naming it. Modification times are never consulted (v1.0.0 #3199). Conflicts with `--snapshot`. |
+| `--allow-unsigned-manifest` | `restore` | Accept a manifest the operator key did not sign (a pre-v1.0.0 backup, or one taken without the key). The sha256, backend, schema and integrity checks still run. WARNs, records an audit event, and is refused under `asi-hard`. A signature that is present but does not verify is refused even with this flag (v1.0.0 #3199). |
+| `--skip-verify` | `restore` | Read no manifest at all: the only way to restore a manifest-less `.bak` / `.pre-restore` / `.pre-repair` file. WARNs, records an audit event, and is refused under `asi-hard`. Not routine. |
 | `--yes` | `restore` | Skip the `Proceed? [y/N]` confirmation. REQUIRED with `--json` and whenever stdin is not a terminal (v1.0.0 #3131). |
 | `--store-url <url>` | both | The store this deployment serves, same grammar as `serve` / `curator`. Also read from `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`. |
 
@@ -573,13 +576,17 @@ stale frames can never be replayed into the restored corpus (#3550).
 `restore` replaces the live corpus, so it is verified, liveness-gated,
 locked, atomic, durable and reversible — in that order:
 
-1. **Select the snapshot.** `--from <file>` names it; `--from <dir>
-   --snapshot <name>` picks it inside a backup directory. Without
-   `--snapshot` the newest snapshot by **modification time** is used and
-   a warning names it: mtime is not an integrity signal (anyone who can
-   write the directory, or a `cp` without `-p`, sets it). Under the
-   `asi-hard` posture that fallback is refused and the candidates are
-   listed. `--json` reports `selected_by: "explicit" | "mtime"`.
+1. **Select the snapshot and verify its manifest.** `--from <file>`
+   names it; `--from <dir> --snapshot <name>` picks it inside a backup
+   directory; `--from <dir> --latest` picks the newest backup by its
+   SIGNED creation time. A bare `--from <dir>` is refused and lists the
+   candidates: there is no modification-time pick any more, because
+   anyone who can write the directory (or a `cp` without `-p`) sets
+   mtime (#3199; the v1.0.0 #3550 mtime fallback is removed). The
+   manifest is then verified against the operator key; see
+   [Signed manifests](#signed-manifests-v100-3199). `--json` reports
+   `selected_by: "explicit" | "latest"` and
+   `manifest_verification: "signed" | "unsigned_allowed" | "skipped"`.
 2. **Stage and verify.** The snapshot is copied to a NEW temp file in
    the target's directory (never over an existing file or a symlink),
    fsynced, and every check runs on that **staged copy** — the sha256
@@ -712,6 +719,81 @@ ai-memory restore --from /var/backups/ai-memory --snapshot ai-memory-2026-08-22T
 # Restored /var/backups/ai-memory/ai-memory-2026-08-22T100000Z.db → /var/lib/ai-memory/memories.db
 # Rollback: cp /var/lib/ai-memory/memories.pre-restore-2026-08-22T101500Z.db /var/lib/ai-memory/memories.db
 ```
+
+### Signed manifests (v1.0.0, [#3199](https://github.com/alphaonedev/ai-memory-mcp/issues/3199))
+
+A backup directory is writable by whoever can write it. Before v1.0.0 a
+manifest was only a sha256 of its snapshot, so replacing both files
+restored the attacker's bytes. Now:
+
+- **`backup` signs.** The manifest carries a `signed_payload` (the exact
+  bytes that were signed: domain, snapshot **file name**, sha256, size,
+  creation time, backend, schema version and memory count) and an Ed25519
+  `signature` made with the operator key, the same key that signs
+  governance rules (`ai-memory rules keygen` creates it; it is read from
+  the key directory, `AI_MEMORY_KEY_DIR`). `signer` is a fingerprint for
+  diagnostics only. `backup --json` reports `signed`, `durable` and
+  `rotation`.
+- **`restore` verifies against a key it resolves itself.** The anchor
+  is `AI_MEMORY_OPERATOR_PUBKEY`, else `operator.key.pub` in the key
+  directory, and never a key the manifest carries. The stored payload is
+  verified before it is parsed, and every restore decision (sha256,
+  backend, schema, file name) is read from the verified payload. A
+  signed backup cannot be renamed to pass for another one.
+
+| Manifest | Standard posture | `asi-hard` |
+|---|---|---|
+| Signed, verifies | restores (`manifest_verification: "signed"`) | restores |
+| Signed, does NOT verify (altered, other key, half a signature) | **refused**, no flag accepts it | **refused** |
+| Signed, but no operator public key on this host | refused unless `--allow-unsigned-manifest` | refused |
+| Unsigned (pre-v1.0.0, or taken without the key) | refused unless `--allow-unsigned-manifest` | refused |
+| No manifest (`.bak`, `.pre-restore`, `.pre-repair`) | refused unless `--skip-verify` | refused |
+
+Every accepted unverified restore prints a `WARNING` on stderr, records
+a `backup_restore_unverified` decision in the forensic audit log when
+that sink is enabled, and reports it in `--json` (`manifest_verification`
+and `audit_sink`).
+
+**`backup` without a key.** Under the standard posture a host with no
+operator signing key writes an **unsigned** manifest and WARNs; that
+backup restores only with `--allow-unsigned-manifest`, and `--keep`
+rotation never deletes it, because rotation only counts backups it can
+verify. Under `asi-hard`, `backup` refuses before writing anything when
+the signing key is missing, when no operator public key resolves, or
+when the local key does not match that public key.
+`ai-memory doctor --posture enterprise-federation` checks the same
+condition (backup manifest signing).
+
+**Upgrading.** Every backup taken before v1.0.0 has an unsigned
+manifest. Take a fresh `backup` right after upgrading, so a signed
+restore point exists, and keep the older backups for
+`--allow-unsigned-manifest` if you need them.
+
+**Restoring an unsigned or manifest-less file under `asi-hard`.** The
+hardened posture restores only what an operator-signed manifest vouches
+for, so the operator vouches by signing it:
+
+1. On a host that holds the operator signing key, restore the file
+   into a SCRATCH database under the standard posture. This runs every
+   check `restore` has:
+
+   ```bash
+   AI_MEMORY_SECURITY_PROFILE=standard ai-memory --db /srv/scratch/recovered.db \
+     restore --from /path/ai-memory-old.db --skip-verify --yes
+   # an unsigned manifest beside it: use --allow-unsigned-manifest instead of --skip-verify
+   ```
+
+2. Inspect the recovered corpus (`ai-memory --db /srv/scratch/recovered.db stats`, `list`).
+3. Sign it by taking a backup of it:
+   `ai-memory --db /srv/scratch/recovered.db backup --to /srv/scratch/signed`.
+4. On the hardened node, restore the signed backup:
+   `ai-memory restore --from /srv/scratch/signed --latest --yes`.
+
+**Where manifests live.** Manifests stay beside their snapshots. Once
+a manifest is signed and the key it is checked against comes from
+elsewhere, its location adds no integrity: someone who can write the
+directory can delete a backup but cannot make an altered one restore.
+Keep copies off-host. See SECURITY.md, "Backup and restore trust model".
 
 `restore` is SQLite-only. A Postgres-backed deployment is restored
 with Postgres' own tooling — see

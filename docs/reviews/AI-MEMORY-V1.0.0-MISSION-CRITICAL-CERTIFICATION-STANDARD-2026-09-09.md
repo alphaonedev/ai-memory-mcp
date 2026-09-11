@@ -60,7 +60,9 @@ parity on `set_row_metadata`, `list_archived` tag shapes and tombstoned-root lin
 write verbs and MCP stdio against a PostgreSQL store (#2803) · per-(agent, namespace)
 quotas on PostgreSQL (#3209) · hosted MCP transport (#2788) · PostgreSQL row-level
 tenant isolation (#2647) · mobile SDK surface · any "regression vs baseline" performance
-claim until `performance/baseline.json` is regenerated (#3162).
+claim until `performance/baseline.json` is regenerated (#3162) · restore of an unsigned or
+legacy backup (Standard `--allow-unsigned-manifest` / `--skip-verify`; refused under the
+certified `asi-hard` posture, #3199).
 
 **NOT YET EVIDENCED (blocks issuance while any gate depends on it):** 24 h / 72 h soak
 (G5) · CONFIG-2 and E3 on the certified pins (G4) · real power-cut fsync honesty

@@ -73,9 +73,10 @@ seconds is a ceiling, not a target: a client that sees a
 
 ## Backup / restore
 
-Hot-backup-safe snapshot via SQLite `VACUUM INTO` plus a sha256
-manifest. `ai-memory backup --to <dir> --keep N` for retention;
-`ai-memory restore --from <path>` with manifest verification.
+Hot-backup-safe snapshot via SQLite `VACUUM INTO` plus a manifest
+signed with the operator key. `ai-memory backup --to <dir> --keep N` for
+retention; `ai-memory restore --from <path>` verifies the signature
+against the operator public key before it replaces anything (#3199).
 
 ## Chaos harness
 
