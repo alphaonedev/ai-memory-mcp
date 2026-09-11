@@ -30788,11 +30788,19 @@ impl MemoryStore for PostgresStore {
                 // Load the archived row shaped as a `Memory` and fire the hook
                 // BEFORE the INSERT lands.
                 let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
+                // #3124 — an UNSTAMPED row the owner probe above already admitted
+                // (and reported) is not re-decided here: re-running the policy would
+                // WARN + count the same restore twice. Every other row is re-checked
+                // against the loaded candidate (same row, same single predicate).
                 if !ctx.bypass_visibility
+                    && !admit_unstamped_row
                     && !crate::visibility::caller_owns_for_mutation(
                         &candidate,
                         ctx.effective_principal(),
                         true,
+                        crate::identity::owner_stamp::MutationSite::postgres(
+                            crate::identity::owner_stamp::funnel::RESTORE,
+                        ),
                     )
                 {
                     return Ok(false);
