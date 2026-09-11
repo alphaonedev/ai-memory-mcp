@@ -74,18 +74,24 @@
 #   change and this mirror together, and state the intent — not the API
 #   response — in the commit message.
 #
-#   ORDER, when the two halves cannot be atomic (they cannot — the mirror is a
-#   PR and protection is an API call). For an ADDITION: land the mirror FIRST,
-#   then add the context to protection. The gate can only prove a context sound
-#   once the mirror declares it, so mirror-first means the soundness proof is
-#   green in CI BEFORE the context becomes load-bearing — prove, then enforce.
-#   The intermediate state (declared, not yet required) over-claims enforcement
-#   for one visible, diffable window and blocks nothing, because GitHub never
-#   reads this file. The reverse order produces the strictly worse state: a
-#   live-required context that NO in-repo file declares, which this gate cannot
-#   detect (it has no API access, by design) — so its rule coverage silently
-#   narrows while it still exits 0. For a REMOVAL the order inverts for the same
-#   reason: drop it from protection first, then from the mirror.
+#   RATCHET (#3554 / recurrence of #2712). `check-required-contexts.sh` still
+#   has no API access (soundness vs workflows). The sibling
+#   `scripts/check-required-contexts-live.sh` fails CI when this declaration
+#   != the committed live-pin (`required-contexts-live-pin.txt`), and — when
+#   the token can read protection — also when either != live. The pin is
+#   regenerated ONLY by `--pin-from-live` (an admin-token fetch). Never
+#   hand-edit the pin; never copy live names into THIS file (the #2473
+#   laundering class).
+#
+#   ORDER for an ADDITION, after #3554 closed the silent over-claim window:
+#   (1) land the job; rule (f) requires it HERE or in the not-required
+#   ledger — use the ledger until the job has reported on the protected
+#   base; (2) add the context to live protection; (3) `--pin-from-live`;
+#   (4) move the name from the ledger into THIS file in the same commit
+#   as the pin. A declaration-only add (the old mirror-first over-claim)
+#   now fails the live-drift gate — that is the #3554 recurrence. For a
+#   REMOVAL the original invert still holds: drop from protection first,
+#   `--pin-from-live`, then drop from this file.
 #
 # ---------------------------------------------------------------------------
 # Carried by .github/workflows/ci.yml
@@ -237,9 +243,9 @@ Doc surface completeness gate (#2839)
 # shipped the retired "1 to ~1,000,000 AI agents" figure (#2438) while every
 # claims gate was green. Declared REQUIRED per gate 7 rule (f) — a new
 # c8-precheck integrity gate must be declared here (or in the not-required
-# ledger) or it is required-by-nothing (the #2636 class). Mirror-first: this
-# declaration lands before the companion branch-protection API call (KNOWN GAP
-# below), so the gate can prove the context sound before it is enforced.
+# ledger) or it is required-by-nothing (the #2636 class). Live-required as
+# of #3554 (the companion protection call that the original mirror-first
+# window never made).
 Capacity-claim ceiling gate (#2869)
 #
 # #2879 — published-BENCHMARK-CELL truthfulness gate (CERT TRUTHFULNESS).
@@ -249,9 +255,9 @@ Capacity-claim ceiling gate (#2869)
 # shadow keyword figures (97.0% R@5 / 232 q/s) while every claims gate was
 # green. Declared REQUIRED per gate 7 rule (f) — a new c8-precheck integrity
 # gate must be declared here (or in the not-required ledger) or it is
-# required-by-nothing (the #2636 class). Mirror-first: this declaration
-# lands before the companion branch-protection API call (KNOWN GAP below),
-# so the gate can prove the context sound before it is enforced.
+# required-by-nothing (the #2636 class). Live-required as of #3554 (the
+# companion protection call that the original mirror-first window never
+# made).
 Benchmark-claim canon gate (#2879)
 #
 # Cert §7 expiry gate (F7, 2026-08-12 ratification caveat). The
@@ -262,10 +268,9 @@ Benchmark-claim canon gate (#2879)
 # prose-only. Carried by `c8-precheck.yml` (`cert-expiry-gate`).
 # Declared REQUIRED per gate 7 rule (f) — a new c8-precheck integrity
 # gate must be declared here (or in the not-required ledger) or it is
-# required-by-nothing (the #2636 class). Mirror-first: this declaration
-# lands before the companion branch-protection API call (KNOWN GAP
-# below), so the gate can prove the context sound before it is
-# enforced.
+# required-by-nothing (the #2636 class). Live-required as of #3554 (the
+# companion protection call that the original mirror-first window never
+# made). Watch-set / VOID-banner hardening of the script itself is #3556.
 Enterprise-federation cert-expiry gate (cert §7 / F7)
 #
 # EXTERNAL-PR OPERATOR-APPROVAL GATE (2026-08-26 operator directive: "we want
@@ -341,6 +346,21 @@ External-PR operator-approval gate (author outside team => @alphaonedev review)
 #     because those detect static defects rather than policy judgements. The
 #     gate hard-fails if a mirror context ever appears in a workflow outside
 #     the covered set, so this scope cannot silently narrow.
+#   * CLOSED (#3554 / recurrence of #2712). Declaration 38 vs live 35 —
+#     the three later integrity gates (`Capacity-claim ceiling gate
+#     (#2869)`, `Benchmark-claim canon gate (#2879)`,
+#     `Enterprise-federation cert-expiry gate (cert §7 / F7)`) were
+#     declared (mirror-first) and the companion protection API call never
+#     landed. Neither `check-required-contexts.sh` nor
+#     `check-branch-protection.sh` compared declared to live, so the
+#     drift was structurally undetectable. #3554 added the three contexts
+#     to live protection and landed `scripts/check-required-contexts-live.sh`
+#     (wired as extra steps of this job) which fails CI when declaration
+#     != live-pin (and != live, when the token can read protection). The
+#     pin is regenerated ONLY by `--pin-from-live`. Dated live-state
+#     numbers in THIS comment are narrative, not a control — the live
+#     script is the control. Watch-set / VOID-banner hardening of the
+#     cert-expiry *script* remains #3556; certified-pin jobs remain #3552.
 #   * `main` and `develop` require only `Check (ubuntu/macos-latest)`.
 #     That is the #2496 exposure: those two are the vacuous-success job, so
 #     the branch that ships is the least protected in fact. Out of scope here.

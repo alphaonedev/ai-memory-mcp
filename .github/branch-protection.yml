@@ -73,6 +73,8 @@ required_checks_declaration:
   release_branches:
     file: scripts/qc-allowlists/required-contexts-release.txt
     verified_by: scripts/check-required-contexts.sh
+    live_drift_by: scripts/check-required-contexts-live.sh
+    live_pin: scripts/qc-allowlists/required-contexts-live-pin.txt
     verified_in: .github/workflows/c8-precheck.yml
     job: "Required-context + classify-base soundness gate (#2494/#2496/#2508)"
   main_and_develop:
