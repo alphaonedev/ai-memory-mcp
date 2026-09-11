@@ -937,10 +937,19 @@ fn mcp_dispatch_fail_closed_record_stop_b6() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/mod.rs"),
     )
     .expect("read mcp/mod.rs");
-    let start = src
+    // #3549 moved the read-only allowlist into its own QUAL-10 submodule
+    // (`src/mcp/read_only_tools.rs`); the dispatch fence stays in mod.rs.
+    let allow_src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/read_only_tools.rs"),
+    )
+    .expect("read mcp/read_only_tools.rs");
+    let start = allow_src
         .find("fn mcp_tool_is_read_only")
         .expect("mcp_tool_is_read_only must exist");
-    let allow = src[start..].split("\n}\n").next().expect("allowlist body");
+    let allow = allow_src[start..]
+        .split("\n}\n")
+        .next()
+        .expect("allowlist body");
     for write in [
         "MEMORY_FORGET",
         "MEMORY_STORE",
