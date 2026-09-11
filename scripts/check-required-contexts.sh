@@ -197,7 +197,8 @@
 #       runs — wasteful, but no `cancelled` row, so not this defect class.
 #
 #   (f) HARD-FAIL: every job in a GATING workflow (`COVERED_WORKFLOWS` below —
-#       `ci.yml`, `c8-precheck.yml`, `coverage.yml`) must be declared EITHER in
+#       `ci.yml`, `c8-precheck.yml`, `coverage.yml`, `cert-postgres-age.yml`,
+#       `postgres-ignored.yml`) must be declared EITHER in
 #       the mirror OR in the dated not-required ledger
 #       `scripts/qc-allowlists/required-contexts-not-required.txt`.
 #
@@ -262,7 +263,7 @@
 #   RQC_ALLOW_FILE        (default <root>/scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt)
 #   RQC_DUPTRIG_ALLOW_FILE (default <root>/scripts/qc-allowlists/dual-trigger-cancel-allow.txt)
 #   RQC_NOTREQ_FILE       (default <root>/scripts/qc-allowlists/required-contexts-not-required.txt)
-#   RQC_COVERED_WORKFLOWS (default "ci.yml c8-precheck.yml coverage.yml") — rule (f) scope
+#   RQC_COVERED_WORKFLOWS (default "ci.yml c8-precheck.yml coverage.yml cert-postgres-age.yml postgres-ignored.yml") — rule (f) scope
 #   RQC_PROTECTED_BRANCH  (default release/v1.0.0)
 #   RQC_CLASSIFY_JOB      (default classify)  — the job id rule (b3) keys on
 #
@@ -302,7 +303,7 @@ CLASSIFY_JOB="${RQC_CLASSIFY_JOB:-classify}"
 # rules (a)-(c). Declared, the two can be cross-checked — and the gate DOES
 # cross-check, in both directions: a declared workflow with no parsed jobs
 # fails, and a mirror context carried by an undeclared workflow fails.
-COVERED_WORKFLOWS="${RQC_COVERED_WORKFLOWS:-ci.yml c8-precheck.yml coverage.yml}"
+COVERED_WORKFLOWS="${RQC_COVERED_WORKFLOWS:-ci.yml c8-precheck.yml coverage.yml cert-postgres-age.yml postgres-ignored.yml}"
 
 # --- rule (d) PR-HEAD PROBE CORPUS -----------------------------------------
 #

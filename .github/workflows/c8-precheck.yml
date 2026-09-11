@@ -662,6 +662,13 @@ jobs:
         # declaration/pin, stale pin; spares equal sets and an inline-#
         # context name. Fixture-only — no network.
         run: bash scripts/check-required-contexts-live.sh --self-test
+      - name: Self-test the certified-pin non-vacuity ratchet (#3552)
+        # Plants 0-executed, skip:, executed<listed, allowlisted drop,
+        # malformed/stale allow ledger, ANSI log. Fixture-only — no
+        # network, no cargo. The live check rides the cert-postgres-age
+        # / postgres-ignored jobs; this step keeps the checker itself
+        # load-bearing on every PR (the #2444 class).
+        run: bash scripts/check-cert-leg-nonvacuity.sh --self-test
       - name: One-declaration-source gate (#2534 — branch-protection.yml)
         # HARD-FAIL if .github/branch-protection.yml re-declares a bare
         # `required_checks` key. The required-status-check set has ONE

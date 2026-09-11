@@ -21,8 +21,9 @@
 # machine-parsed ledger over a comment.
 #
 # SCOPE, and why it is not repo-wide. Rule (f) covers the workflows declared in
-# `COVERED_WORKFLOWS` in the gate: `ci.yml`, `c8-precheck.yml`, `coverage.yml`.
-# Those are the three that carry required contexts — the PR gating pipeline.
+# `COVERED_WORKFLOWS` in the gate: `ci.yml`, `c8-precheck.yml`, `coverage.yml`,
+# `cert-postgres-age.yml`, `postgres-ignored.yml` (#3552 added the last two).
+# Those are the workflows that carry required contexts — the PR gating pipeline.
 # Rules (d) and (e) ARE repo-wide, and the difference is deliberate: (d) and
 # (e) detect STATIC DEFECTS that are wrong wherever they appear, whereas (f)
 # encodes a POLICY JUDGEMENT ("should this job be required?") that has to be

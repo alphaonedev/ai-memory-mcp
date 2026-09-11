@@ -130,9 +130,11 @@ jobs:
     runs-on: [self-hosted, linux-fed]
     # 2026-08-26 rigid-security-controls: never schedule a fork PR onto the
     # self-hosted enterprise-fed node (defence-in-depth behind the Actions
-    # "require approval for all external contributors" policy). Job-level
-    # `if:` is legitimate here: this job is not a required context and not a
-    # matrix (rule (b1) of scripts/check-required-contexts.sh does not apply).
+    # "require approval for all external contributors" policy). Required
+    # context as of #3552 (N24). Job-level `if:` is same-repo-only; listed
+    # in required-contexts-joblevel-if-allow.txt so rule (b2) is honest
+    # about skip=satisfied on fork PRs. Not a matrix (rule (b1) does not
+    # apply).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 60
     steps:
@@ -258,11 +260,13 @@ jobs:
       - name: Wait for native tier readiness
         run: |
           set -euo pipefail
-          for i in $(seq 1 30); do
+          attempt=1
+          while [ "$attempt" -le 30 ]; do
             if psql "$AI_MEMORY_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
               echo "::notice::native cert tier is up"
               exit 0
             fi
+            attempt=$((attempt + 1))
             sleep 2
           done
           echo "::error::native enterprise-fed tier did not answer within 60s on $RUNNER_NAME"
@@ -338,26 +342,44 @@ jobs:
           # `--include-ignored` also runs the explicitly #[ignore]-gated cells
           # (e.g. age_cypher_param_binding_2511). --test-threads=1 because the
           # sal-postgres suite shares one database with no per-test isolation.
-          cargo test --features sal-postgres \
-            --test secret_screen_postgres_parity_g29 \
-            --test postgres_l2_rehydration_1693 \
-            --test erasure_fanout_postgres_g30 \
-            --test recall_purity_p01_postgres \
-            --test qual_pg_write_funnel_parity_2393_2397 \
-            --test store_parity_gaps \
-            --test age_cypher_param_binding_2511 \
-            --test kg_query_relation_parity_2792 \
-            --test g2_postgres_find_paths_age_param_binding \
-            --test g4_postgres_link_projects_into_age_graph \
-            --test g5_find_paths_cte_served_on_age \
-            --test kg_age_fallback \
-            --test age_cte_equivalence \
-            --test issue_1482_age_cypher_persistent \
-            --test pillar4_4c_deferred_age_cold_path_1735 \
-            --test pillar4_4d_age_unprojection_on_delete_1783 \
-            --test age_deferred_projection_cluster_2375_2376_2377 \
-            --test bootstrap_node_cert_gate_3016 \
-            -- --include-ignored --test-threads=1
+          #
+          # #3552 non-vacuity: list first, then run, then FAIL if executed
+          # < listed or < the committed ratchet (or if any skip: line
+          # appears — live_pg() connect failure is FAIL in a cert leg).
+          mkdir -p .local-runs
+          LIST_OUT=".local-runs/cert-postgres-age-list.txt"
+          TEST_OUT=".local-runs/cert-postgres-age-run.txt"
+          TESTS=(
+            --test secret_screen_postgres_parity_g29
+            --test postgres_l2_rehydration_1693
+            --test erasure_fanout_postgres_g30
+            --test recall_purity_p01_postgres
+            --test qual_pg_write_funnel_parity_2393_2397
+            --test store_parity_gaps
+            --test age_cypher_param_binding_2511
+            --test kg_query_relation_parity_2792
+            --test g2_postgres_find_paths_age_param_binding
+            --test g4_postgres_link_projects_into_age_graph
+            --test g5_find_paths_cte_served_on_age
+            --test kg_age_fallback
+            --test age_cte_equivalence
+            --test issue_1482_age_cypher_persistent
+            --test pillar4_4c_deferred_age_cold_path_1735
+            --test pillar4_4d_age_unprojection_on_delete_1783
+            --test age_deferred_projection_cluster_2375_2376_2377
+            --test bootstrap_node_cert_gate_3016
+          )
+          cargo test --features sal-postgres "${TESTS[@]}" \
+            -- --include-ignored --list | tee "$LIST_OUT"
+          LISTED="$(grep -c ': test$' "$LIST_OUT" || true)"
+          set +e
+          cargo test --features sal-postgres "${TESTS[@]}" \
+            -- --include-ignored --test-threads=1 2>&1 | tee "$TEST_OUT"
+          rc="${PIPESTATUS[0]}"
+          set -e
+          bash scripts/check-cert-leg-nonvacuity.sh \
+            --leg cert-postgres-age --log "$TEST_OUT" --listed "$LISTED"
+          exit "$rc"
 
       - name: Cluster-A cert-posture armability gate (#3061 #3016 #3067)
         run: |

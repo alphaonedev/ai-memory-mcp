@@ -1531,7 +1531,8 @@ against the mirror frozen at
 pre-fix mirror a planted decider `if:` passes the gate SILENTLY, which is
 the blind spot the declaration closes and the proof the leg is not
 tautological. **(f) HARD-FAIL, added #2636** — every job in a GATING
-workflow (`ci.yml`, `c8-precheck.yml`, `coverage.yml`, declared as
+workflow (`ci.yml`, `c8-precheck.yml`, `coverage.yml`,
+`cert-postgres-age.yml`, `postgres-ignored.yml`, declared as
 `COVERED_WORKFLOWS` in the gate) must be declared EITHER in the mirror OR
 in the dated ledger
 `scripts/qc-allowlists/required-contexts-not-required.txt`

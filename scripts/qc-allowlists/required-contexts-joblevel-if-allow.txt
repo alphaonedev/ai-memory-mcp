@@ -50,3 +50,14 @@ Dockerfile build (no push)
 # narrower than the ci.yml seven — but the empty-diff arm was still open until
 # #2494/#2496, and it is still `skipped`-on-docs-only today.
 Per-Module Coverage Thresholds
+#
+# ---------------------------------------------------------------------------
+# 2026-09-11 (#3552) — certified-pin jobs. Same-repo-only job-level `if:`
+# (`github.event.pull_request.head.repo.full_name == github.repository`)
+# because forks cannot be scheduled onto the self-hosted linux-fed pg
+# tier. Skipped-on-fork counts as SATISFIED; that is a dated fail-open
+# for external PRs, not for same-repo traffic (the merge train). Not a
+# matrix, so not a (b1) wedge.
+# ---------------------------------------------------------------------------
+Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)
+Postgres ignored tests (sal-postgres --ignored)

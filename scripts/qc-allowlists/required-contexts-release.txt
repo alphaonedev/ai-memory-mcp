@@ -291,6 +291,25 @@ Enterprise-federation cert-expiry gate (cert §7 / F7)
 External-PR operator-approval gate (author outside team => @alphaonedev review)
 #
 # ---------------------------------------------------------------------------
+# Carried by .github/workflows/cert-postgres-age.yml
+# ---------------------------------------------------------------------------
+# #3552 (N24). The certified pg+AGE cells were in-PR evidence that never
+# merge-blocked. Job-level `if:` is same-repo-only (forks cannot use
+# linux-fed); listed in required-contexts-joblevel-if-allow.txt so rule
+# (b2) is honest about skip=satisfied on fork PRs. Non-vacuity ratchet
+# is scripts/check-cert-leg-nonvacuity.sh. COVERED_WORKFLOWS includes
+# this file so rule (f) cannot lose the job.
+Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)
+#
+# ---------------------------------------------------------------------------
+# Carried by .github/workflows/postgres-ignored.yml
+# ---------------------------------------------------------------------------
+# #3552 (N24). The `#[ignore]`+sal-postgres cells (`--ignored`, not a
+# duplicate `--include-ignored` of the already-required enterprise-fed
+# Check). Same-repo-only `if:` as the cert-postgres-age sibling.
+Postgres ignored tests (sal-postgres --ignored)
+#
+# ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.
 # Closing any of them is a branch-protection edit, deliberately NOT done in
 # this change.
@@ -333,10 +352,9 @@ External-PR operator-approval gate (author outside team => @alphaonedev review)
 #
 #     Rule (f) of `scripts/check-required-contexts.sh` now makes this class
 #     unable to re-land: every job in `ci.yml` / `c8-precheck.yml` /
-#     `coverage.yml` must be declared here or in
-#     `required-contexts-not-required.txt`, dated and issue-tracked. That
-#     ledger is EMPTY today, which is the passing state — every job in every
-#     gating workflow is declared required.
+#     `coverage.yml` / `cert-postgres-age.yml` / `postgres-ignored.yml`
+#     must be declared here or in
+#     `required-contexts-not-required.txt`, dated and issue-tracked.
 #   * NOT COVERED by rule (f), and named here rather than left implicit: the
 #     ~45 jobs in the other fourteen workflows (`release.yml`,
 #     `publish-sdks.yml`, `yank.yml`, `bench.yml`, `fuzz.yml`, …). They do not
@@ -360,7 +378,14 @@ External-PR operator-approval gate (author outside team => @alphaonedev review)
 #     pin is regenerated ONLY by `--pin-from-live`. Dated live-state
 #     numbers in THIS comment are narrative, not a control — the live
 #     script is the control. Watch-set / VOID-banner hardening of the
-#     cert-expiry *script* remains #3556; certified-pin jobs remain #3552.
+#     cert-expiry *script* remains #3556.
+#   * CLOSED (#3552 / N24). The certified-pin jobs
+#     `Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)`
+#     and `Postgres ignored tests (sal-postgres --ignored)` are DECLARED
+#     above. Live protection + `--pin-from-live` land in the same commit
+#     (the #3554 ratchet: declaration == pin; Conductor makes the
+#     protection call). Non-vacuity is
+#     `scripts/check-cert-leg-nonvacuity.sh`.
 #   * `main` and `develop` require only `Check (ubuntu/macos-latest)`.
 #     That is the #2496 exposure: those two are the vacuous-success job, so
 #     the branch that ships is the least protected in fact. Out of scope here.
