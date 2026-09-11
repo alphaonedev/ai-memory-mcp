@@ -346,10 +346,16 @@ pub(crate) fn no_lineage_dag_guard() -> LineageDagIsolation {
 /// shape), so no parallel test's environment leaks into it, and it never
 /// reads the operator config file. The crate's own `cfg(test)` harness arms
 /// the #3355 key-directory guard by itself, so no key-dir variable is
-/// needed.
+/// needed. The spawn goes through the #1937 audited chokepoint (the
+/// `spawn_audit_gate_1937` guard bans a raw process constructor outside
+/// `src/spawn_audit.rs`); its best-effort audit emit is a no-op in a unit
+/// test process, which seeds no spawn-audit database.
 #[cfg(unix)]
 pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
-    let mut cmd = std::process::Command::new(std::env::current_exe().expect("lib test binary"));
+    let mut cmd = crate::spawn_audit::audited_command(
+        std::env::current_exe().expect("lib test binary"),
+        "test_support::spawn_test_child",
+    );
     cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
         .env_clear()
         .env("TMPDIR", std::env::temp_dir())
