@@ -891,8 +891,9 @@ pub fn screen_json_field_for_caller(field: &mut serde_json::Value) -> Result<(),
 // `handlers::federation_receive` called any `secret_screen` entry point, so
 // a peer running `AI_MEMORY_SECRET_SCREEN_MODE=off` (or a hostile peer)
 // could land a credential verbatim in this node's `signals` /
-// `checkpoints` tables, where it is queryable, forensic-exported, and
-// re-egressed on the next `/sync/push`.
+// `checkpoints` tables, where it is queryable on this node. It is NOT
+// forensic-exported and is NOT re-egressed on the next `/sync/push`
+// (those two claims were overstated; #3297).
 //
 // Disposition is REDACT-ONLY, never refuse — a refused inbound row would
 // diverge replicas (the #1821 lesson, and the same rule the memory lane's

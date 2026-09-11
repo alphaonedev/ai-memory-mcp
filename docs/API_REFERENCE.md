@@ -1167,8 +1167,10 @@ link_created_at ASC`.
 
 ### `POST /api/v1/kg/find_paths`
 
-Enumerate paths between two memories. Cypher on AGE / recursive-CTE on
-SQLite. `POST /api/v1/find_paths` is a registered alias of this route
+Enumerate paths between two memories. Relational recursive-CTE (bounded
+BFS) on **both** SQLite and Postgres — including when Apache AGE is
+installed (`KgBackend::Age`). `find_paths` is not an AGE Cypher walk
+(#2582 / #3297). `POST /api/v1/find_paths` is a registered alias of this route
 (#934 — legacy callers). Body fields `from_id` / `to_id` are accepted as
 aliases of `source_id` / `target_id`.
 
@@ -1539,7 +1541,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/approvals/{pending_id}` | K10 approval decide path — body `{"decision":"approve|deny","remember":"once|session"}` (`forever` is refused, #3394), HMAC-gated via `X-AI-Memory-Signature`. |
 | `POST` | `/api/v1/auto_tag` | LLM auto-tag endpoint (v0.7 smart-tier surface; 503 when no LLM is configured). |
 | `POST` | `/api/v1/expand_query` | HTTP parity for the MCP `memory_expand_query` tool. |
-| `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; Cypher on AGE / recursive-CTE on SQLite. |
+| `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; relational recursive-CTE (bounded BFS) on SQLite **and** Postgres (not AGE Cypher — #2582 / #3297). |
 | `POST` | `/api/v1/find_paths` | Alias for `/api/v1/kg/find_paths` (#934 — legacy callers). |
 | `POST` | `/api/v1/links/verify` | Ed25519 link verification surface — wire shape: `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
 | `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": true}` (bool — at least one row removed) or `{"deleted": false}`. |

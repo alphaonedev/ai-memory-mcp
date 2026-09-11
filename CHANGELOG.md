@@ -1971,17 +1971,16 @@ had silently dropped.
   Zero-config stays at ZERO extra reads.
 - **#3197 — `entrypoint.plan-c.sh` interpolated `AI_MEMORY_API_KEY`
   raw into TOML.** A `"`, `\`, or trailing newline (docker-secret
-  artefact) produced invalid TOML; `AppConfig::load_from` fail-opened
-  to defaults (`api_key` absent, `append_only=false`,
-  `require_operator_pubkey=false`, fresh `./ai-memory.db`). Render
-  now goes through `infra/plan-c/config-emit.sh` (TOML basic-string
+  artefact) produced invalid TOML. Boot no longer fail-opens on a
+  parse error (`#3166` `try_load_from_optional` / `EX_CONFIG`); the
+  interpolation still yielded a file `ai-memory config check --file`
+  now refuses before `exec`. Render now goes through
+  `infra/plan-c/config-emit.sh` (TOML basic-string
   escape, trailing-newline strip with WARN, EX_CONFIG 78 on any
   other control character; the key is read from the inherited
-  environment, never python argv / `/proc/<pid>/cmdline`) and
-  `ai-memory config check --file`
-  (parse-only; never echoes the file, never fail-opens) before
-  `exec`. Does **not** bump `EXPECTED_CLI_SUBCOMMANDS_*` — `Check` is
-  a sub-verb of the existing `Config` command.
+  environment, never python argv / `/proc/<pid>/cmdline`). Does
+  **not** bump `EXPECTED_CLI_SUBCOMMANDS_*` — `Check` is a sub-verb
+  of the existing `Config` command.
 ### Security (sqlite SAL adapter enforced LESS than the postgres twin; #3176)
 
 Four result-changing authorization divergences where the **same** SAL call was
@@ -2147,8 +2146,8 @@ decision to a place both adapters share, not by adding a second copy of it.
   was live, but `POST /api/v1/sync/push` `signals[]` / `checkpoints[]` had
   ZERO screening — a peer running `AI_MEMORY_SECRET_SCREEN_MODE=off` (or a
   hostile peer) could land a credential in this node's `signals` /
-  `checkpoints` tables, where it is queryable, forensic-exported, and
-  re-egressed. The receive arm now runs `secret_screen::redact_signal_for_storage`
+  `checkpoints` tables, where it is queryable on this node (not
+  forensic-exported and not re-egressed — #3297). The receive arm now runs `secret_screen::redact_signal_for_storage`
   / `redact_checkpoint_for_storage` AFTER the lane's authorization gates
   (so forged-signature / authorship / namespace-scope still see the bytes
   the peer signed) and BEFORE persist. Disposition is REDACT-only, never

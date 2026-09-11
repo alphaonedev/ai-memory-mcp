@@ -255,7 +255,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The graph</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Memories + edges = the KG.</h2>
-    <p class="lede">Every memory is a node. Every <code>memory_link</code> row is a directed edge with a typed relation and (since v0.6.3) a temporal validity window. The graph is queryable via recursive CTE on the sqlite backend, and via Apache AGE Cypher on the postgres backend (shipped at v0.7.0).</p>
+    <p class="lede">Every memory is a node. Every <code>memory_link</code> row is a directed edge with a typed relation and (since v0.6.3) a temporal validity window. On sqlite every KG read is a recursive CTE. On postgres, <code>kg_query</code> / <code>kg_timeline</code> / <code>kg_invalidate</code> / <code>lineage</code> execute Apache AGE Cypher when the extension is installed (CTE fallback otherwise); <code>memory_find_paths</code> is the relational recursive-CTE (bounded BFS) on <strong>both</strong> backends — it is not an AGE Cypher walk (#2582 / #3297).</p>
     <svg class="kg-svg" viewBox="0 0 1180 420" xmlns="http://www.w3.org/2000/svg">
       <style>
         .nb{stroke-width:2;rx:8;ry:8}
@@ -510,8 +510,8 @@ CREATE INDEX idx_links_relation     (relation, valid_from);</div>
 <section>
   <div class="container">
     <span class="eyebrow">v0.7 — Apache AGE acceleration</span>
-    <h2 style="font-family:var(--font-sans);font-size:1.75rem">From recursive CTE to Cypher.</h2>
-    <p class="lede">v0.6.3's KG queries use Postgres recursive CTEs (or SQLite WITH RECURSIVE). Performance is fine up to a few hundred thousand edges; past that, Apache AGE's Cypher engine is materially faster on graph workloads. v0.7 Bucket 2 (per the v0.7 charter) wraps v0.6.3's KG schema with AGE and replaces the dual-path stubs that v0.6.3 ships as scaffolding.</p>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">AGE Cypher for query/timeline/invalidate; CTE for find_paths.</h2>
+    <p class="lede">v0.6.3's KG queries use Postgres recursive CTEs (or SQLite WITH RECURSIVE). <code>kg_query</code> / <code>kg_timeline</code> / <code>lineage</code> on an AGE-enabled postgres execute Cypher (CTE fallback if the extension is absent). <code>memory_find_paths</code> does <strong>not</strong> — it is the relational recursive-CTE on both <code>KgBackend</code> values (#2582 / #3297). An AGE label on a dashboard is not a query-plan assertion.</p>
     <div class="snip"><span class="cm">// v0.6.3 — recursive CTE walk (current)</span>
 WITH RECURSIVE walk(source, target, depth) <span class="key">AS</span> (
   <span class="key">SELECT</span> source_id, target_id, <span class="num">1</span> <span class="key">FROM</span> memory_links

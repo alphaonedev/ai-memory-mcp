@@ -777,11 +777,13 @@ workload at `benchmarks/v063/canonical_workload.json`.
 ## v0.7 — Apache AGE backend (KG queries)
 
 v0.7.0 introduces an optional **Apache AGE** (Cypher-on-Postgres) backend
-for `memory_kg_query` and `memory_find_paths`, selectable at runtime via
-`KgBackend::Age`. The default `KgBackend::Cte` (recursive SQLite CTE)
-remains unchanged and is the supported single-binary path; AGE is opt-in
-for deployments that already run Postgres and benefit from native
-graph-traversal acceleration.
+for `memory_kg_query` (and `kg_timeline` / `lineage`), selectable at
+runtime via `KgBackend::Age`. `memory_find_paths` is **not** AGE Cypher:
+on Postgres it is the relational recursive-CTE (bounded BFS) on both
+`KgBackend` values (#2582 / #3297). The default `KgBackend::Cte`
+(recursive SQLite CTE) remains the supported single-binary path; AGE is
+opt-in for deployments that already run Postgres and benefit from native
+graph-traversal acceleration on the ops that actually emit Cypher.
 
 ### AGE-vs-CTE speedup — what exists, and what does not
 
