@@ -1788,6 +1788,12 @@ fn run_restore_with(
     // all), so a truncated / foreign / non-SQLite file passes it. Probe the
     // staged copy read-only: if it is not an ai-memory database this query
     // fails, and we refuse BEFORE the operator's live corpus is touched.
+    //
+    // v1.0.0 #3553 — two refusal arms, both fail-closed. The read-only funnel
+    // mirrors the resolved `PRAGMA synchronous`, and SQLite reads the schema
+    // to apply it, so a file that is not SQLite AT ALL is refused by the open
+    // itself (`not a readable SQLite database`); a SQLite file with no
+    // `memories` table is refused by the query (`not an ai-memory database`).
     {
         let probe = db::open_read_only(&staged_path).with_context(|| {
             format!(
@@ -2846,10 +2852,23 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "survivor", "must not be clobbered");
-        let backup_dir = db.parent().unwrap().join("backups-2444-garbage");
+        let backup_dir = db.parent().unwrap().join("backups-2444-foreign");
         std::fs::create_dir_all(&backup_dir).unwrap();
         let bogus = backup_dir.join("ai-memory-2026-01-01T000000Z.db");
-        std::fs::write(&bogus, b"this is not a sqlite database at all").unwrap();
+        // A VALID SQLite database that is not an ai-memory one — the arm this
+        // test names. (Until #3553 the fixture was raw garbage bytes, which
+        // the lazy read-only open let through to the `memories` probe; the
+        // #3553 funnel reads the schema at open, so garbage is now refused
+        // one arm earlier — pinned by the `_not_sqlite_at_all_3553` sibling.)
+        {
+            let foreign = rusqlite::Connection::open(&bogus).unwrap();
+            foreign
+                .execute_batch(
+                    "CREATE TABLE not_ai_memory (x INTEGER); \
+                     INSERT INTO not_ai_memory (x) VALUES (1);",
+                )
+                .unwrap();
+        }
 
         let live_before = std::fs::metadata(&db).unwrap().len();
         let args = RestoreArgs {
@@ -2866,6 +2885,55 @@ mod tests {
                 .to_string();
             assert!(
                 err.contains("not an ai-memory database"),
+                "refusal must say it will not clobber the live corpus; got: {err}"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().len(),
+            live_before,
+            "a refused restore must not touch the live database"
+        );
+    }
+
+    /// v1.0.0 #3553 — the arm BEFORE the `memories` probe: a file that is not
+    /// SQLite at all. The read-only funnel mirrors the resolved
+    /// `PRAGMA synchronous`, which makes SQLite read the schema at open, so
+    /// the refusal fires from the open itself. Same disposition as the #2444
+    /// sibling (refused before the live corpus is touched), more precise
+    /// message.
+    #[test]
+    fn restore_refuses_a_snapshot_that_is_not_sqlite_at_all_3553() {
+        // #2970 — serialize the process-global store-url env read (resolve_store_url).
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "survivor", "must not be clobbered");
+        let backup_dir = db.parent().unwrap().join("backups-3553-garbage");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let bogus = backup_dir.join("ai-memory-2026-01-01T000000Z.db");
+        std::fs::write(&bogus, b"this is not a sqlite database at all").unwrap();
+
+        let live_before = std::fs::metadata(&db).unwrap().len();
+        let args = RestoreArgs {
+            from: bogus,
+            snapshot: None,
+            skip_verify: true,
+            store_url: None,
+            yes: true,
+        };
+        {
+            let mut out = env.output();
+            let err = run_restore(&db, &args, false, &mut out)
+                .expect_err("a non-SQLite snapshot must be refused")
+                .to_string();
+            assert!(
+                err.contains("not a readable SQLite database"),
+                "refusal must name the non-SQLite file; got: {err}"
+            );
+            assert!(
+                err.contains("refusing to restore"),
                 "refusal must say it will not clobber the live corpus; got: {err}"
             );
         }
