@@ -726,47 +726,58 @@ impl MemoryStore for SqliteStore {
         // sqlite SAL adapter honors source_uri rewrites end-to-end.
         // `expected_version=None` preserves the trait's existing
         // last-write-wins contract.
-        let (found, _content_changed) = db::update_with_expected_version(
-            &conn,
-            id,
-            patch.title.as_deref(),
-            patch.content.as_deref(),
-            patch.tier.as_ref(),
-            patch.namespace.as_deref(),
-            patch.tags.as_ref(),
-            patch.priority,
-            patch.confidence,
-            // #1634 — thread the patch's expires_at; the pg trait
-            // update honored it (#1423) while this adapter passed a
-            // literal None, silently dropping the field for any future
-            // sqlite-backed trait caller.
-            patch.expires_at.as_deref(),
-            patch.metadata.as_ref(),
-            patch.source_uri.as_deref(),
-            None,
-            // v1.0.0 #1834 — thread the patch's valid_until (valid_from immutable).
-            patch.valid_until.as_deref(),
-        )
-        .map_err(box_err)?;
+        //
+        // #3152 — the patch and the optional lifecycle transition are ONE
+        // write transaction: `update_with_expected_version` and
+        // `set_lifecycle_state` both join the transaction opened here, so an
+        // illegal edge, an error or a crash between them leaves the row
+        // exactly as it was instead of persisting the patch alone.
+        let found = db::in_write_txn(&conn, || {
+            let (found, _content_changed) = db::update_with_expected_version(
+                &conn,
+                id,
+                patch.title.as_deref(),
+                patch.content.as_deref(),
+                patch.tier.as_ref(),
+                patch.namespace.as_deref(),
+                patch.tags.as_ref(),
+                patch.priority,
+                patch.confidence,
+                // #1634 — thread the patch's expires_at; the pg trait
+                // update honored it (#1423) while this adapter passed a
+                // literal None, silently dropping the field for any future
+                // sqlite-backed trait caller.
+                patch.expires_at.as_deref(),
+                patch.metadata.as_ref(),
+                patch.source_uri.as_deref(),
+                None,
+                // v1.0.0 #1834 — thread the patch's valid_until (valid_from immutable).
+                patch.valid_until.as_deref(),
+            )?;
+            #[cfg(test)]
+            crate::recover::durability::in_tx_fault::patched_before_lifecycle(id);
+            // #1726 — apply an optional lifecycle transition through the
+            // self-validating storage primitive (SELECT-current →
+            // can_transition_to → typed InvalidTransition). A request equal
+            // to the stored state is an idempotent no-op; an illegal edge
+            // surfaces as `StoreError::InvalidTransition` → HTTP 409,
+            // byte-parity with the postgres twin.
+            if found && let Some(target) = patch.lifecycle_state {
+                db::set_lifecycle_state(&conn, id, target)?;
+            }
+            Ok(found)
+        })
+        .map_err(|e| {
+            e.downcast_ref::<crate::storage::InvalidTransition>()
+                .map_or_else(
+                    || box_err(&e),
+                    |it| StoreError::InvalidTransition {
+                        detail: it.to_string(),
+                    },
+                )
+        })?;
         if !found {
             return Err(StoreError::NotFound { id: id.to_string() });
-        }
-        // #1726 — apply an optional lifecycle transition through the
-        // self-validating storage primitive (SELECT-current →
-        // can_transition_to → typed InvalidTransition). A request equal to
-        // the stored state is an idempotent no-op; an illegal edge surfaces
-        // as `StoreError::InvalidTransition` → HTTP 409, byte-parity with the
-        // postgres twin.
-        if let Some(target) = patch.lifecycle_state {
-            db::set_lifecycle_state(&conn, id, target).map_err(|e| {
-                e.downcast_ref::<crate::storage::InvalidTransition>()
-                    .map_or_else(
-                        || box_err(&e),
-                        |it| StoreError::InvalidTransition {
-                            detail: it.to_string(),
-                        },
-                    )
-            })?;
         }
         Ok(())
     }

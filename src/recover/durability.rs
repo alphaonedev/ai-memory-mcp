@@ -224,6 +224,70 @@ pub fn count_rows(conn: &Connection, namespace: &str) -> Result<i64> {
     .context("count_rows")
 }
 
+/// v1.0.0 #3152 — the IN-TRANSACTION fault point of the single-commit update
+/// contract. TEST BUILDS ONLY: nothing here exists in a shipped binary, so
+/// unlike [`ENV_ABORT_AFTER_COMMIT`] it cannot be armed in production.
+///
+/// Every update funnel that applies a content patch AND a lifecycle
+/// transition calls [`in_tx_fault::patched_before_lifecycle`] after the
+/// patch statement has executed and before the transition runs, while both
+/// sit in one uncommitted transaction. A test arms the point for ONE memory
+/// id (so a parallel test on another row can never trip it) and either
+/// observes the database from outside the transaction or hard-aborts the
+/// process there. After an abort the row must read back exactly as it was
+/// before the update: there is no COMMIT between the two statements.
+#[cfg(test)]
+pub(crate) mod in_tx_fault {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, PoisonError};
+
+    /// What reaching the armed point does.
+    pub(crate) enum Action {
+        /// Write `marker`, then `std::process::abort()`: no destructor, no
+        /// rollback, no connection close. A SIGKILL between the statements.
+        Abort { marker: PathBuf },
+        /// Run an observer — e.g. read the row through a second connection.
+        Observe(Box<dyn Fn() + Send>),
+    }
+
+    /// Armed ids with their actions. Several tests may arm concurrently in
+    /// one test binary; each only ever matches its own row.
+    static ARMED: Mutex<Vec<(String, Action)>> = Mutex::new(Vec::new());
+
+    /// Arm the point for memory `id` only.
+    pub(crate) fn arm(id: &str, action: Action) {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((id.to_string(), action));
+    }
+
+    /// Disarm the point for memory `id`.
+    pub(crate) fn disarm(id: &str) {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(armed, _)| armed != id);
+    }
+
+    /// Called by the update funnels between the patch and the transition.
+    /// A no-op unless the point is armed for `id`. An observer runs with
+    /// the registry locked, so it must not itself reach the point.
+    pub(crate) fn patched_before_lifecycle(id: &str) {
+        let armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((_, action)) = armed.iter().find(|(armed, _)| armed == id) else {
+            return;
+        };
+        match action {
+            Action::Abort { marker } => {
+                std::fs::write(marker, id).expect("write the #3152 abort marker");
+                std::process::abort();
+            }
+            Action::Observe(observe) => observe(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
