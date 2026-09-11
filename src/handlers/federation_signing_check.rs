@@ -2145,6 +2145,13 @@ fn spawn_deferred_embedding_refresh_via_store(
 /// reloadable bundle so an operator can rotate the trust root without
 /// a daemon restart; the receiver-verify call sites are unchanged by
 /// that swap because both take `&TrustBundle`.
+///
+/// #3204 (documented design) — until FED-P3 lands this is a PROCESS-LIFETIME
+/// `OnceLock`: the bundle directory is read ONCE on the first federation
+/// request and never again. Adding an issuer, rotating one, or REVOKING one by
+/// removing its `.pub` takes effect only after a daemon restart; a revoked
+/// issuer keeps verifying credentials on a long-running receiver until then
+/// (`docs/federation-identity.md`, trust-bundle row).
 fn cached_trust_bundle() -> &'static TrustBundle {
     static BUNDLE: OnceLock<TrustBundle> = OnceLock::new();
     BUNDLE.get_or_init(|| {
@@ -2355,6 +2362,7 @@ pub(super) fn verify_signature_or_reject(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     tag = e.tag(),
                     peer_id = %peer_id.unwrap_or(""),
+                    remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                     "sync_push: X-Memory-Sig verification failed"
                 );
                 return Some(
@@ -2362,9 +2370,7 @@ pub(super) fn verify_signature_or_reject(
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": e.tag(),
-                            "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
-                                     signatures on /sync/push; set =0 to revert to v0.6.x \
-                                     permissive",
+                            "note": crate::handlers::federation_wire_notes::wire::SIG_INVALID,
                         })),
                     )
                         .into_response(),
@@ -2381,6 +2387,7 @@ pub(super) fn verify_signature_or_reject(
                                 target: crate::federation::SIGNING_TRACE_TARGET,
                                 tag = fed_signing::VerifyError::ReplayedNonce.tag(),
                                 peer_id = %pid_for_cache,
+                                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                                 "sync_push: X-Memory-Nonce replay detected"
                             );
                             Some(
@@ -2388,7 +2395,7 @@ pub(super) fn verify_signature_or_reject(
                                     StatusCode::UNAUTHORIZED,
                                     Json(json!({
                                         "error": fed_signing::VerifyError::ReplayedNonce.tag(),
-                                        "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 enforces per-message nonce freshness.",
+                                        "note": crate::handlers::federation_wire_notes::wire::NONCE_REPLAY,
                                     })),
                                 )
                                     .into_response(),
@@ -2402,6 +2409,7 @@ pub(super) fn verify_signature_or_reject(
                             target: crate::federation::SIGNING_TRACE_TARGET,
                             tag = fed_signing::VerifyError::NonceMissing.tag(),
                             peer_id = %pid_for_cache,
+                            remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                             "sync_push: X-Memory-Nonce header absent — strict refusal"
                         );
                         Some(
@@ -2409,7 +2417,7 @@ pub(super) fn verify_signature_or_reject(
                                 StatusCode::UNAUTHORIZED,
                                 Json(json!({
                                     "error": fed_signing::VerifyError::NonceMissing.tag(),
-                                    "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 requires X-Memory-Nonce; set =0 to bypass.",
+                                    "note": crate::handlers::federation_wire_notes::wire::NONCE_MISSING,
                                 })),
                             )
                                 .into_response(),
@@ -2429,6 +2437,7 @@ pub(super) fn verify_signature_or_reject(
             tracing::warn!(
                 target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
+                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_push: X-Memory-Sig present but no enrolled public key for peer-id"
             );
             Some(
@@ -2436,9 +2445,7 @@ pub(super) fn verify_signature_or_reject(
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
                         "error": "x_memory_sig_no_enrolled_key",
-                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 and the peer sent a signature, \
-                                 but no public key is enrolled for the peer-id; enrol via \
-                                 `ai-memory identity import` or set =0 to bypass.",
+                        "note": crate::handlers::federation_wire_notes::wire::SIG_NO_ENROLLED_KEY,
                     })),
                 )
                     .into_response(),
@@ -2448,6 +2455,7 @@ pub(super) fn verify_signature_or_reject(
             tracing::warn!(
                 target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
+                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_push: enrolled peer omitted X-Memory-Sig header"
             );
             Some(
@@ -2455,9 +2463,7 @@ pub(super) fn verify_signature_or_reject(
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
                         "error": fed_signing::VerifyError::Missing.tag(),
-                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
-                                 signatures for enrolled peers; set =0 to revert to v0.6.x \
-                                 permissive.",
+                        "note": crate::handlers::federation_wire_notes::wire::SIG_MISSING,
                     })),
                 )
                     .into_response(),
@@ -2475,6 +2481,7 @@ pub(super) fn verify_signature_or_reject(
                 tracing::warn!(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
+                    remediation = crate::handlers::federation_wire_notes::remediation::PEER_ENROLLMENT,
                     "sync_push: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
                 return Some(
@@ -2482,13 +2489,7 @@ pub(super) fn verify_signature_or_reject(
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": "peer_not_enrolled",
-                            "note": "Federation requires peer enrollment by default at \
-                                     v0.8 (#1789): X-Peer-Id without an enrolled Ed25519 \
-                                     key is refused. Enroll the peer's key via the operator \
-                                     workflow, or set AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0 \
-                                     to revert to v0.7.x permissive, OR set \
-                                     AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 to allow \
-                                     unenrolled peers during a rollout window.",
+                            "note": crate::handlers::federation_wire_notes::wire::PEER_NOT_ENROLLED,
                         })),
                     )
                         .into_response(),
@@ -2710,6 +2711,7 @@ pub(super) fn verify_get_signature_or_reject(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     tag = e.tag(),
                     peer_id = %peer_id.unwrap_or(""),
+                    remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                     "sync_since: X-Memory-Sig verification failed"
                 );
                 return Some(
@@ -2717,9 +2719,7 @@ pub(super) fn verify_get_signature_or_reject(
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": e.tag(),
-                            "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
-                                     signatures on /sync/since; set =0 to revert to v0.6.x \
-                                     permissive (#1031)",
+                            "note": crate::handlers::federation_wire_notes::wire::SIG_INVALID,
                         })),
                     )
                         .into_response(),
@@ -2736,6 +2736,7 @@ pub(super) fn verify_get_signature_or_reject(
                                 target: crate::federation::SIGNING_TRACE_TARGET,
                                 tag = fed_signing::VerifyError::ReplayedNonce.tag(),
                                 peer_id = %pid_for_cache,
+                                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                                 "sync_since: X-Memory-Nonce replay detected"
                             );
                             Some(
@@ -2743,7 +2744,7 @@ pub(super) fn verify_get_signature_or_reject(
                                     StatusCode::UNAUTHORIZED,
                                     Json(json!({
                                         "error": fed_signing::VerifyError::ReplayedNonce.tag(),
-                                        "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 enforces per-message nonce freshness on /sync/since (#1031).",
+                                        "note": crate::handlers::federation_wire_notes::wire::NONCE_REPLAY,
                                     })),
                                 )
                                     .into_response(),
@@ -2757,6 +2758,7 @@ pub(super) fn verify_get_signature_or_reject(
                             target: crate::federation::SIGNING_TRACE_TARGET,
                             tag = fed_signing::VerifyError::NonceMissing.tag(),
                             peer_id = %pid_for_cache,
+                            remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                             "sync_since: X-Memory-Nonce header absent — strict refusal"
                         );
                         Some(
@@ -2764,7 +2766,7 @@ pub(super) fn verify_get_signature_or_reject(
                                 StatusCode::UNAUTHORIZED,
                                 Json(json!({
                                     "error": fed_signing::VerifyError::NonceMissing.tag(),
-                                    "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 requires X-Memory-Nonce on /sync/since (#1031); set =0 to bypass.",
+                                    "note": crate::handlers::federation_wire_notes::wire::NONCE_MISSING,
                                 })),
                             )
                                 .into_response(),
@@ -2784,6 +2786,7 @@ pub(super) fn verify_get_signature_or_reject(
             tracing::warn!(
                 target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
+                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_since: X-Memory-Sig present but no enrolled public key for peer-id (#1031)"
             );
             Some(
@@ -2791,9 +2794,7 @@ pub(super) fn verify_get_signature_or_reject(
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
                         "error": "x_memory_sig_no_enrolled_key",
-                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 and the peer sent a signature, \
-                                 but no public key is enrolled for the peer-id; enrol via \
-                                 `ai-memory identity import` or set =0 to bypass (#1031).",
+                        "note": crate::handlers::federation_wire_notes::wire::SIG_NO_ENROLLED_KEY,
                     })),
                 )
                     .into_response(),
@@ -2803,6 +2804,7 @@ pub(super) fn verify_get_signature_or_reject(
             tracing::warn!(
                 target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
+                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_since: enrolled peer omitted X-Memory-Sig header (#1031)"
             );
             Some(
@@ -2810,9 +2812,7 @@ pub(super) fn verify_get_signature_or_reject(
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
                         "error": fed_signing::VerifyError::Missing.tag(),
-                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
-                                 signatures on /sync/since for enrolled peers; set =0 to revert \
-                                 to v0.6.x permissive (#1031).",
+                        "note": crate::handlers::federation_wire_notes::wire::SIG_INVALID,
                     })),
                 )
                     .into_response(),
@@ -2830,6 +2830,7 @@ pub(super) fn verify_get_signature_or_reject(
                 tracing::warn!(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
+                    remediation = crate::handlers::federation_wire_notes::remediation::PEER_ENROLLMENT,
                     "sync_since: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
                 return Some(
@@ -2837,14 +2838,7 @@ pub(super) fn verify_get_signature_or_reject(
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": "peer_not_enrolled",
-                            "note": "Federation requires peer enrollment by default at \
-                                     v0.8 (#1789): X-Peer-Id without an enrolled Ed25519 \
-                                     key is refused on /sync/since. Enroll the peer's key \
-                                     via the operator workflow, or set \
-                                     AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0 to revert to \
-                                     v0.7.x permissive, OR set \
-                                     AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 to allow \
-                                     unenrolled peers during a rollout window.",
+                            "note": crate::handlers::federation_wire_notes::wire::PEER_NOT_ENROLLED,
                         })),
                     )
                         .into_response(),

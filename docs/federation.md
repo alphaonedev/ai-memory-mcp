@@ -338,7 +338,11 @@ independently — these are layered on top.
   `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` now defaults to **strict** at
   v0.8.0: UNSET — or any non-falsy value — refuses an `X-Peer-Id`
   without an enrolled Ed25519 key (`401 peer_not_enrolled`) on both
-  `/sync/push` and `/sync/since`. An explicit falsy value
+  `/sync/push` and `/sync/since`. Since #3204 every federation refusal
+  body carries a closed-set `note` that names WHAT was refused and never
+  the knob that disables the control; the operator remediation (the
+  `AI_MEMORY_FED_*` opt-outs) rides the refusal-site WARN as its
+  `remediation` field. An explicit falsy value
   (`0`/`false`/`no`/`off`, case-insensitive, trimmed) reverts to the
   v0.7.x permissive posture. At v0.7.0 (#1088) this defaulted OFF and
   only `1`/`true` opted in. The companion rollout opt-out

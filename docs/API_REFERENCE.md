@@ -654,7 +654,11 @@ Query params: `namespace`, `tier`, `limit` (default 20, capped at
 
 ### `GET /api/v1/memories/{id}` — get
 
-UUID or unique prefix. Returns memory + its links.
+UUID or unique prefix. Returns memory + its links. `links` carries only the
+edges whose FAR endpoint the caller may read (the same filter as
+`GET /api/v1/links/{id}`): an edge to another agent's `scope=private` row, or
+to a substrate namespace the request did not name, is dropped rather than
+disclosing that row's id and relation (#3204).
 
 ```json
 {

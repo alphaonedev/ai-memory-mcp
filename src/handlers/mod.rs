@@ -119,6 +119,7 @@ pub mod errors;
 pub mod federation_receive;
 pub mod federation_signing_check;
 pub mod federation_sync_since;
+pub mod federation_wire_notes;
 pub mod governance;
 pub mod hook_subscribers;
 pub mod http;

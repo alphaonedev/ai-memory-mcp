@@ -301,9 +301,15 @@ async fn policy_read_fault_refuses_503_and_does_not_apply() {
         note.contains("retryable"),
         "note must say it is retryable: {note}"
     );
+    // #3204 item 6 — the opt-out knob is operator remediation and rides the
+    // refusal-site WARN (`remediation` field), never the peer-facing body.
     assert!(
-        note.contains(ai_memory::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV),
-        "note must name the documented opt-out: {note}"
+        !note.contains(ai_memory::handlers::federation_wire_notes::ENV_PREFIX),
+        "wire note must not name the opt-out knob (#3204): {note}"
+    );
+    assert_eq!(
+        note,
+        ai_memory::handlers::federation_wire_notes::wire::POLICY_READ_UNAVAILABLE
     );
     assert_eq!(
         count_ns(&db, NS).await,
