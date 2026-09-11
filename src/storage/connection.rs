@@ -17,11 +17,6 @@ use super::schema_guard::{BACKEND_SQLITE, SchemaBehindReadOnly, SchemaStamp};
 /// rather than repeated as a literal — pm-v3.1 no-hardcoded-literals.
 const MSG_REGISTER_VALID_TIME_FNS: &str = "register valid-time SQL functions";
 
-/// v1.0.0 #3553 — the `PRAGMA synchronous` name, applied by every open funnel
-/// and read back by [`live_synchronous`]; ONE declaration so the writer,
-/// reader and diagnostic sites cannot name different pragmas.
-const PRAGMA_SYNCHRONOUS: &str = "synchronous";
-
 /// v1.0.0 #2445 — probe for the presence of the `schema_version` relation.
 ///
 /// A missing relation is a genuinely FRESH database; a relation that is
@@ -558,7 +553,9 @@ fn db_mmap_size() -> i64 {
 pub const ENV_DB_SYNCHRONOUS: &str = "AI_MEMORY_DB_SYNCHRONOUS";
 
 /// The SQLite pragma name the durability level is applied through (#3550:
-/// shared with `restore`'s pre-checkpoint `synchronous = FULL`).
+/// shared with `restore`'s pre-checkpoint `synchronous = FULL`; #3553: read
+/// back by [`live_synchronous`] so the writer, reader and diagnostic sites
+/// cannot name different pragmas).
 pub(crate) const PRAGMA_SYNCHRONOUS: &str = "synchronous";
 
 /// The compiled-default `PRAGMA synchronous` level. `NORMAL` keeps the

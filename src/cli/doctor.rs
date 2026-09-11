@@ -5996,7 +5996,7 @@ enabled = true
         // below, not by this WARN-shape test.
         conn.pragma_update(
             None,
-            "synchronous",
+            crate::storage::connection::PRAGMA_SYNCHRONOUS,
             crate::storage::resolved_synchronous().level.as_str(),
         )
         .expect("mirror the funnel's synchronous level");
@@ -6033,8 +6033,12 @@ enabled = true
         } else {
             SynchronousLevel::Full
         };
-        conn.pragma_update(None, "synchronous", planted.as_str())
-            .expect("plant a level that disagrees with the resolved one");
+        conn.pragma_update(
+            None,
+            crate::storage::connection::PRAGMA_SYNCHRONOUS,
+            planted.as_str(),
+        )
+        .expect("plant a level that disagrees with the resolved one");
         let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
         assert_eq!(
             section.severity,
