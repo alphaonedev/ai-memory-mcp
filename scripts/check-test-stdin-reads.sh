@@ -134,6 +134,13 @@
 
 set -euo pipefail
 
+# Membership test that is safe under `set -o pipefail` (#3608 / #2414).
+# `printf | grep -q` is a SIGPIPE footgun: grep -q closes the pipe on the
+# first match, printf gets EPIPE, and pipefail makes a HIT look like a miss.
+hay_has() {
+    grep -q "$1" <<<"$2"
+}
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Process-global stdin handle acquisition. Matches `io::stdin(` and
@@ -659,23 +666,23 @@ EOF
     # call NOT reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
-    printf '%s' "$gate_output" | grep -q '\.stdin_gate_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'sibling_reads_real_stdin\|\.stdin_gate_sibling_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_bare_stdin_after_import\|\.stdin_gate_bare_import_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_cfg_gated_reads_stdin\|\.stdin_gate_cfg_boundary_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_cfg_all_reads_stdin\|\.stdin_gate_cfg_all_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'contrived_string_brace_reads_stdin\|\.stdin_gate_string_brace_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'use std::io::stdin as input\|\.stdin_gate_alias_import_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'let f = std::io::stdin\|\.stdin_gate_fn_pointer_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'stdin as input\|\.stdin_gate_grouped_alias_import_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q '\.stdin_gate_tab_grouped_alias_import_probe\.rs' || ok=0
-    printf '%s' "$gate_output" | grep -q 'brace-balance went NEGATIVE.*stdin_gate_multiline_negative_depth_probe' || ok=0
-    if printf '%s' "$gate_output" | grep -q '_sanctioned'; then
+    hay_has '\.stdin_gate_probe\.rs' "$gate_output" || ok=0
+    hay_has 'sibling_reads_real_stdin\|\.stdin_gate_sibling_probe\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_bare_stdin_after_import\|\.stdin_gate_bare_import_probe\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_cfg_gated_reads_stdin\|\.stdin_gate_cfg_boundary_probe\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_cfg_all_reads_stdin\|\.stdin_gate_cfg_all_probe\.rs' "$gate_output" || ok=0
+    hay_has 'contrived_string_brace_reads_stdin\|\.stdin_gate_string_brace_probe\.rs' "$gate_output" || ok=0
+    hay_has 'use std::io::stdin as input\|\.stdin_gate_alias_import_probe\.rs' "$gate_output" || ok=0
+    hay_has 'let f = std::io::stdin\|\.stdin_gate_fn_pointer_probe\.rs' "$gate_output" || ok=0
+    hay_has 'stdin as input\|\.stdin_gate_grouped_alias_import_probe\.rs' "$gate_output" || ok=0
+    hay_has '\.stdin_gate_tab_grouped_alias_import_probe\.rs' "$gate_output" || ok=0
+    hay_has 'brace-balance went NEGATIVE.*stdin_gate_multiline_negative_depth_probe' "$gate_output" || ok=0
+    if hay_has '_sanctioned' "$gate_output"; then
         echo "" >&2
         echo "Test-stdin gate self-test: FAIL (carve-out over-widened: the sanctioned helper line was flagged)" >&2
         exit 1
     fi
-    if printf '%s' "$gate_output" | grep -q 'benign_child_stdin_builder\|cmd_ok_not_flagged'; then
+    if hay_has 'benign_child_stdin_builder\|cmd_ok_not_flagged' "$gate_output"; then
         echo "" >&2
         echo "Test-stdin gate self-test: FAIL (over-widened: a .stdin( child-process builder call was flagged)" >&2
         exit 1

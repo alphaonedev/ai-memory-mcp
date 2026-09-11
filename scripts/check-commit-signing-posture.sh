@@ -111,7 +111,10 @@ assert_registry_usable() {
 is_enrolled_principal() {
   local email_lc="$1"
   local principals="$2"
-  printf '%s\n' "$principals" | grep -qxF "$email_lc"
+  # Pipe-free (#3608 / #2414): `printf | grep -qx` under pipefail turns a
+  # first-line HIT into a miss when grep -q closes the pipe (false
+  # unbound-committer-email on an enrolled principal).
+  grep -qxF "$email_lc" <<<"$principals"
 }
 
 # check_range BASE_SHA HEAD_SHA SIGNERS_FILE REPO_DIR
@@ -277,12 +280,12 @@ self_test() {
     echo "self-test FAILED: #2486 identity-drift shape was NOT rejected" >&2
     failed=1
   else
-    if ! printf '%s\n' "$out" | grep -q "unbound-committer-email"; then
+    if ! grep -q "unbound-committer-email" <<<"$out"; then
       echo "self-test FAILED: identity-drift rejection did not name unbound-committer-email:" >&2
       echo "$out" >&2
       failed=1
     fi
-    if ! printf '%s\n' "$out" | grep -q "signature-not-verified"; then
+    if ! grep -q "signature-not-verified" <<<"$out"; then
       echo "self-test FAILED: identity-drift rejection did not name signature-not-verified:" >&2
       echo "$out" >&2
       failed=1
@@ -295,12 +298,12 @@ self_test() {
     echo "self-test FAILED: unsigned enrolled-identity commit was NOT rejected" >&2
     failed=1
   else
-    if ! printf '%s\n' "$out" | grep -q "signature-not-verified"; then
+    if ! grep -q "signature-not-verified" <<<"$out"; then
       echo "self-test FAILED: unsigned-commit rejection did not name signature-not-verified:" >&2
       echo "$out" >&2
       failed=1
     fi
-    if printf '%s\n' "$out" | grep -q "unbound-.*-email"; then
+    if grep -q "unbound-.*-email" <<<"$out"; then
       echo "self-test FAILED: unsigned-but-enrolled commit incorrectly also flagged an email violation:" >&2
       echo "$out" >&2
       failed=1
@@ -315,7 +318,7 @@ self_test() {
     echo "self-test FAILED: rogue-key signature under a spoofed enrolled email was NOT rejected" >&2
     failed=1
   else
-    if ! printf '%s\n' "$out" | grep -q "signature-not-verified"; then
+    if ! grep -q "signature-not-verified" <<<"$out"; then
       echo "self-test FAILED: rogue-key rejection did not name signature-not-verified:" >&2
       echo "$out" >&2
       failed=1
