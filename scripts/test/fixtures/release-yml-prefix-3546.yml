@@ -1,27 +1,16 @@
+# FROZEN pre-#3546 copy of .github/workflows/release.yml (from 188369ae).
+# Used ONLY by scripts/test/test-release-hardening.sh as the R-203 leg: the
+# static and extracted-block checks must FAIL against this file, proving the
+# harness is not tautological. Never edit it to make a test pass.
 name: Release (workflow_dispatch — operator-gated publish)
 
 # Operator-gated publish pipeline. Lifted out of ci.yml (which now does
 # verification only) so that the act of releasing a tag is a separate,
 # intentional action — never an auto-fire side-effect of CI going green.
 #
-# Invoke from a maintainer shell, FROM THE RELEASE BRANCH (#3546):
+# Invoke from a maintainer shell:
 #
-#   gh workflow run release.yml --repo alphaonedev/ai-memory-mcp \
-#     --ref release/v1.0.0 -f tag=v1.0.0
-#
-# Without `--ref` GitHub runs the default branch's copy of this file, which
-# may predate the checks below; preflight refuses any dispatch ref that is
-# not a release branch. The tag must be annotated and SSH-signed by a key in
-# scripts/qc-allowlists/release-tag-signers.txt, must sit on the dispatch
-# branch, must be protected by the v* tag ruleset
-# (.github/rulesets/release-tags.json), and every required context must have
-# passed on its commit (the `qualify` job). Every build checks out that
-# verified commit, never the tag name.
-#
-# DRY RUN IS THE DEFAULT (#3546 D6). The command above builds and verifies
-# everything and publishes nothing. Publishing needs an explicit
-#   ... -f tag=vX.Y.Z -f dry_run=false
-# Rehearse a release as a dry run on the real tag (or a signed rc tag) first.
+#   gh workflow run release.yml --repo alphaonedev/ai-memory-mcp -f tag=v0.7.0
 #
 # The 5 jobs below mirror the historical release fanout: binary builds
 # (5 targets), GitHub Release page, crates.io, Homebrew tap, GHCR Docker
@@ -35,15 +24,6 @@ on:
       tag:
         description: 'Release tag to publish (must already exist on remote, e.g. v0.7.0).'
         required: true
-      dry_run:
-        # #3546 D6 — the default run publishes NOTHING: preflight, qualify,
-        # the supply-chain gates and every build run, and every publish step
-        # (release upload, provenance attestation, crates.io, Homebrew,
-        # GHCR push, COPR) is skipped. Only an explicit `-f dry_run=false`
-        # publishes; a missing or unrecognised value never does.
-        description: 'Build and verify everything but publish nothing. Set to false to publish.'
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -56,61 +36,24 @@ concurrency:
 
 jobs:
   # --------------------------------------------------------------------
-  # #3546 — verify the tag before anything is built from it.
-  #
-  # The tag is inspected as DATA only. The verifier script and the release
-  # signer allowlist come from THIS workflow's own commit (github.sha, the
-  # tip of the protected branch the release was dispatched from), never
-  # from the tree the tag points at: a tag pointing at a commit that
-  # carried its own `exit 0` verifier, or an allowlist with an extra key,
-  # would otherwise approve itself.
-  #
-  # Outputs: `sha` (the verified commit every later checkout pins to) and
-  # `tag_object` (what each publish step re-asserts on the remote right
-  # before upload, scripts/release/assert-tag-unmoved.sh).
+  # Verify the tag exists + is on a sane sha before any publish fires.
+  # Cheap belt-and-suspenders so an `gh workflow run` typo doesn't burn
+  # 20 minutes building artifacts against the wrong commit.
   # --------------------------------------------------------------------
   preflight:
-    name: Preflight (tag exists + is annotated + signed)
+    name: Preflight (tag exists + is annotated)
     runs-on: ubuntu-latest
-    # #3546 D4 — the `release` Environment (Conductor-created) restricts
-    # deployments to release/** and main and names the operator as required
-    # reviewer, so a release cannot be dispatched from any other ref.
-    environment: release
-    permissions:
-      contents: read
     outputs:
       tag: ${{ steps.check.outputs.tag }}
-      sha: ${{ steps.verify.outputs.sha }}
-      tag_object: ${{ steps.verify.outputs.tag_object }}
+      sha: ${{ steps.check.outputs.sha }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # The workflow's own commit, NOT the tag: this checkout supplies
-          # the trusted tooling. Full history so the tag object and the
-          # ancestry check below are available.
-          ref: ${{ github.sha }}
           fetch-depth: 0
+          ref: ${{ github.event.inputs.tag }}
 
-      - name: Refuse a dispatch from anywhere but a release branch
-        # A plain `gh workflow run release.yml` runs the DEFAULT branch's
-        # copy of this file, which may predate every check below. Dispatch
-        # with `--ref release/vX.Y.Z`. The release Environment's deployment
-        # branch policy is what makes this unforgeable; this step catches
-        # the honest mistake.
-        shell: bash
-        env:
-          DISPATCH_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          case "$DISPATCH_REF" in
-            refs/heads/release/*) echo "::notice::dispatched from $DISPATCH_REF" ;;
-            *)
-              echo "::error::release.yml must be dispatched from a release branch (gh workflow run release.yml --ref release/vX.Y.Z -f tag=vX.Y.Z); got '$DISPATCH_REF'"
-              exit 1 ;;
-          esac
-
-      - name: Resolve tag + prerelease flag
+      - name: Resolve tag + sha + prerelease flag
         id: check
         shell: bash
         # #1851 (security review S7, CWE-94) — read the untrusted
@@ -129,7 +72,10 @@ jobs:
             echo "::error::tag '$TAG' does not match SemVer v<MAJ>.<MIN>.<PATCH>(-pre)?"
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          SHA=$(git rev-parse "$TAG^{commit}")
+          echo "::notice::release tag $TAG -> $SHA"
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"   >> "$GITHUB_OUTPUT"
           # SemVer pre-releases (e.g. v0.6.2-rc.0 / v0.7.0-alpha.1) skip
           # the downstream stable channels.
           if [[ "$TAG" == *-* ]]; then
@@ -138,77 +84,6 @@ jobs:
           else
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Verify the tag (annotated, SSH-signed by an enrolled release key)
-        id: verify
-        shell: bash
-        env:
-          TAG: ${{ steps.check.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # Refetch the tag ref itself so the verified object is the remote's
-          # current one, not a local leftover.
-          git fetch --no-tags --force origin "refs/tags/$TAG:refs/tags/$TAG"
-          bash scripts/release/verify-tag.sh --repo . --tag "$TAG" \
-            --signers scripts/qc-allowlists/release-tag-signers.txt
-
-      - name: Refuse a tag that is not on the dispatch branch
-        shell: bash
-        env:
-          SHA: ${{ steps.verify.outputs.sha }}
-          DISPATCH_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          if ! git merge-base --is-ancestor "$SHA" "$DISPATCH_SHA"; then
-            echo "::error::tagged commit $SHA is not on the dispatch branch (tip $DISPATCH_SHA); a release ships a commit the protected branch already contains"
-            exit 1
-          fi
-
-      - name: Refuse when no tag ruleset protects v* tags
-        # Without a tag ruleset a tag can be moved or deleted between jobs.
-        # The ruleset is a repository admin action; this step makes its
-        # absence a refusal instead of a silent gap.
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          bash scripts/release/assert-tag-ruleset.sh --repo "$REPO"
-
-  # --------------------------------------------------------------------
-  # #3546 — refuse to release a commit CI did not qualify.
-  #
-  # Every context declared in scripts/qc-allowlists/required-contexts-release.txt
-  # must have a successful, attributed check-run on the verified SHA. The
-  # declaration and the verdict script come from github.sha (trusted), the
-  # same as preflight's tooling. Every build and publish job needs this job
-  # directly.
-  # --------------------------------------------------------------------
-  qualify:
-    name: Qualify (required contexts green on the tagged SHA)
-    needs: preflight
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: read
-      actions: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Qualify the tagged SHA
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ needs.preflight.outputs.sha }}
-        run: |
-          set -euo pipefail
-          python3 scripts/release/qualify-sha.py --fetch --repo "$REPO" --sha "$SHA" \
-            --contexts scripts/qc-allowlists/required-contexts-release.txt \
-            --carriers-from scripts/check-required-contexts.sh
 
   # --------------------------------------------------------------------
   # #2895 (§3C release-pipeline supply-chain) — run the SAME supply-chain
@@ -223,13 +98,13 @@ jobs:
   # --------------------------------------------------------------------
   supply-chain:
     name: Supply-chain gates (before build + publish)
-    needs: [preflight, qualify]
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
@@ -266,7 +141,7 @@ jobs:
   # --------------------------------------------------------------------
   release:
     name: Release (${{ matrix.target }})
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, supply-chain]
     runs-on: ${{ matrix.os }}
     # #2487 supply-chain: OIDC-bound Sigstore build provenance for the
     # release binaries + deb/rpm, mirroring the OIDC pattern the SDK
@@ -302,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.98.0 + target std
         # Pin to the rust-toolchain.toml channel (1.98.0). The build below
@@ -394,21 +269,8 @@ jobs:
       - name: Build deb and rpm packages
         if: matrix.nfpm_arch
         run: |
-          set -euo pipefail
-          # #3546 — download to a file and check a PINNED digest before
-          # extracting; never `curl | tar`. Digests from goreleaser's
-          # v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing
-          # both downloaded tarballs.
           NFPM_ARCH=$(uname -m | sed 's/aarch64/arm64/')
-          case "$NFPM_ARCH" in
-            x86_64) NFPM_SHA256=b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430 ;;
-            arm64)  NFPM_SHA256=17350a838c8e2c422c6e573ed379b18424565d2de8a2b1cb1b20211976124eb5 ;;
-            *) echo "::error::no pinned nfpm digest for $NFPM_ARCH"; exit 1 ;;
-          esac
-          NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"
-          curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"
-          echo "${NFPM_SHA256}  ${NFPM_TGZ}" | sha256sum -c -
-          tar xzf "$NFPM_TGZ" -C /usr/local/bin nfpm
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_$(uname -s)_${NFPM_ARCH}.tar.gz | tar xz -C /usr/local/bin nfpm
 
           VERSION="${TAG#v}"
 
@@ -479,7 +341,6 @@ jobs:
           path: dist/ai-memory*
 
       - name: Attest build provenance (release binaries + packages)
-        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the existing sha256 checksums (never a
         # replacement): a Rekor-logged, OIDC-bound attestation naming
         # workflow + repo + commit SHA over every released artifact in
@@ -507,21 +368,7 @@ jobs:
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
 
-      - name: Re-assert the release tag has not moved (#3546)
-        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
-        # is no longer the tag object preflight verified.
-        shell: bash
-        env:
-          REMOTE: https://github.com/${{ github.repository }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
-          SHA: ${{ needs.preflight.outputs.sha }}
-        run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
-
       - name: Create GitHub Release
-        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -560,7 +407,7 @@ jobs:
   # --------------------------------------------------------------------
   sbom:
     name: SBOM (CycloneDX)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, supply-chain]
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the CycloneDX SBOM
     # artifact (same mechanism as the release-binary job above).
@@ -571,7 +418,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.98.0
         # Pin to rust-toolchain.toml (1.98.0) so cargo-cyclonedx reads
@@ -607,27 +454,12 @@ jobs:
           ls -la ai-memory.cdx.json*
 
       - name: Attest build provenance (CycloneDX SBOM)
-        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the sha256 above.
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/ai-memory.cdx.json'
 
-      - name: Re-assert the release tag has not moved (#3546)
-        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
-        # is no longer the tag object preflight verified.
-        shell: bash
-        env:
-          REMOTE: https://github.com/${{ github.repository }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
-          SHA: ${{ needs.preflight.outputs.sha }}
-        run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
-
       - name: Upload to GitHub Release
-        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -672,7 +504,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-ios:
     name: Mobile artifact (iOS xcframework)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: macos-latest
     # #2487 — OIDC-bound Sigstore provenance for the iOS xcframework
@@ -684,7 +516,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.98.0 + iOS targets
         # Pin to rust-toolchain.toml (1.98.0) so the iOS cross-target std
@@ -699,9 +531,7 @@ jobs:
           key: mobile-ios-${{ needs.preflight.outputs.tag }}
 
       - name: Install cbindgen
-        # #3546 — pinned, like cargo-cyclonedx above; an unpinned install
-        # would compile whatever cbindgen release is newest on tag day.
-        run: cargo install --locked cbindgen --version 0.29.4
+        run: cargo install --locked cbindgen
 
       - name: Build static libraries (release, --features sqlite-bundled)
         run: |
@@ -769,27 +599,12 @@ jobs:
           ls -la ai-memory-ios.xcframework.tar.gz*
 
       - name: Attest build provenance (iOS xcframework)
-        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the sha256 above.
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/ai-memory-ios.xcframework.tar.gz'
 
-      - name: Re-assert the release tag has not moved (#3546)
-        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
-        # is no longer the tag object preflight verified.
-        shell: bash
-        env:
-          REMOTE: https://github.com/${{ github.repository }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
-          SHA: ${{ needs.preflight.outputs.sha }}
-        run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
-
       - name: Upload to GitHub Release
-        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -829,7 +644,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-android:
     name: Mobile artifact (Android AAR-compatible)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the Android JNI tarball
@@ -841,7 +656,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.98.0 + Android targets
         # Pin to rust-toolchain.toml (1.98.0) so the Android cross-target
@@ -948,27 +763,12 @@ jobs:
           ls -la ai-memory-android.tar.gz*
 
       - name: Attest build provenance (Android JNI bundle)
-        if: github.event.inputs.dry_run == 'false'
         # #2487 — additive to the sha256 above.
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/ai-memory-android.tar.gz'
 
-      - name: Re-assert the release tag has not moved (#3546)
-        # Assets attach by tag NAME. Refuse if refs/tags/<tag> on the remote
-        # is no longer the tag object preflight verified.
-        shell: bash
-        env:
-          REMOTE: https://github.com/${{ github.repository }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
-          SHA: ${{ needs.preflight.outputs.sha }}
-        run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
-
       - name: Upload to GitHub Release
-        if: github.event.inputs.dry_run == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
@@ -990,15 +790,13 @@ jobs:
   # --------------------------------------------------------------------
   crates-io:
     name: Publish to crates.io
-    needs: [preflight, qualify, release]
+    needs: [preflight, release]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
-    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).
-    environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         # #2895 — pin the publish toolchain to the same 1.98.0 every other
@@ -1006,12 +804,7 @@ jobs:
         # moving compiler on the one job that mints the crates.io artifact).
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
-      - name: Package for crates.io without uploading (dry run)
-        if: github.event.inputs.dry_run != 'false'
-        run: cargo publish --locked --dry-run
-
       - name: Publish to crates.io (with retry)
-        if: github.event.inputs.dry_run == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -1045,16 +838,9 @@ jobs:
   # --------------------------------------------------------------------
   homebrew:
     name: Update Homebrew formula
-    needs: [preflight, qualify, release]
-    # Pure publish (it reads the release page and pushes the tap): a dry run
-    # has no release assets to read, so the whole job is skipped.
-    if: needs.preflight.outputs.is_prerelease == 'false' && github.event.inputs.dry_run == 'false'
+    needs: [preflight, release]
+    if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
-    # HOMEBREW_TAP_TOKEN is scoped to the `release` Environment (#3546 D4).
-    environment: release
-    permissions:
-      contents: read
-      attestations: read
     steps:
       - name: Extract version from tag
         id: version
@@ -1077,8 +863,6 @@ jobs:
       # any disagreement fails the job instead of minting a formula.
       - name: Download release assets, verify, and pin SHA256
         id: sha
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           VERSION=${{ steps.version.outputs.version }}
@@ -1101,14 +885,6 @@ jobs:
               echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to mint a Homebrew formula"
               exit 1
             fi
-
-            # #3546 — the .sha256 comes from the same place as the asset, so a
-            # match proves only that both were uploaded together. Also require
-            # the build provenance the release job attached (#2487): it binds
-            # the asset to release.yml in this repository at this run's commit.
-            gh attestation verify "$ASSET" --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
 
             SAFE=$(echo "$TARGET" | tr '-' '_')
             echo "sha_${SAFE}=${ACTUAL}" >> "$GITHUB_OUTPUT"
@@ -1199,7 +975,7 @@ jobs:
   # --------------------------------------------------------------------
   docker:
     name: Docker (GHCR)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -1212,7 +988,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -1235,8 +1011,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          # #3546 D6 — a dry run builds the image and pushes nothing.
-          push: ${{ github.event.inputs.dry_run == 'false' }}
+          push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/ai-memory:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/ai-memory:latest
@@ -1247,7 +1022,6 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Attest build provenance (Docker image)
-        if: github.event.inputs.dry_run == 'false'
         # #2487 — pins the attestation to the pushed image digest and
         # attaches it to GHCR. Consumers verify with
         # `gh attestation verify oci://ghcr.io/alphaonedev/ai-memory:<ver> \
@@ -1263,20 +1037,13 @@ jobs:
   # --------------------------------------------------------------------
   copr:
     name: Fedora COPR
-    needs: [preflight, qualify, release]
-    # Pure publish (it builds the SRPM from the published assets): skipped on
-    # a dry run, which publishes no assets.
-    if: needs.preflight.outputs.is_prerelease == 'false' && github.event.inputs.dry_run == 'false'
+    needs: [preflight, release]
+    if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
-    # COPR_CONFIG is scoped to the `release` Environment (#3546 D4).
-    environment: release
-    permissions:
-      contents: read
-      attestations: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Extract version from tag
         id: version
@@ -1327,8 +1094,6 @@ jobs:
           rpm --version
 
       - name: Build source RPM
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=${{ steps.version.outputs.version }}
           mkdir -p ~/rpmbuild/{SOURCES,SPECS,SRPMS}
@@ -1360,12 +1125,6 @@ jobs:
               echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to build an SRPM"
               exit 1
             fi
-            # #3546 — require the release job's build provenance too (see the
-            # homebrew job): a matching .sha256 from the same place as the
-            # asset proves nothing about who built it.
-            gh attestation verify ~/rpmbuild/SOURCES/"$ASSET" --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
             # The .sha256 is not a spec Source, so keep SOURCES/ clean.
             rm -f ~/rpmbuild/SOURCES/"${ASSET}.sha256"
           done

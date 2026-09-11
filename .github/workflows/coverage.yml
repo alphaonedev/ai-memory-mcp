@@ -51,6 +51,14 @@ on:
   # full llvm-cov sweep runs, never a docs-only short-circuit. See ci.yml.
   merge_group:
     types: [checks_requested]
+  # #3546 — the release `qualify` job requires `Per-Module Coverage
+  # Thresholds` to have SUCCEEDED on the tagged commit, and a `skipped` run
+  # does not count. A docs-only tip of a release branch gets a docs-only push
+  # run here (skipped), and this workflow does not run on tag pushes, so
+  # without a manual trigger that commit could never be qualified. A
+  # dispatch has no base, so classify fails closed to the full sweep:
+  #   gh workflow run coverage.yml --ref release/vX.Y.Z
+  workflow_dispatch:
 
 # #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
 # Default contents: read. `per-module-thresholds` widens below for the sticky
