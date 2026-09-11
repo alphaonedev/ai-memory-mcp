@@ -596,7 +596,7 @@ pub(super) fn handle_update(
             valid_until,
         )?;
         #[cfg(test)]
-        crate::recover::durability::in_tx_fault::patched_before_lifecycle(&resolved_id);
+        crate::recover::in_tx_fault::patched_before_lifecycle(&resolved_id);
         // v0.8.0 Pillar 2 (#1709) — lifecycle transition enforcement. When
         // the caller supplies a `lifecycle_state` that DIFFERS from the
         // stored value, enforce `current.can_transition_to(requested)` (the
