@@ -15,6 +15,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process scratch-home sequence. The wall clock alone is NOT a unique
+/// name: macOS answers `SystemTime::now()` at microsecond resolution, and two
+/// of the three tests here (they run on parallel threads) minted the SAME
+/// `h-<pid>-<nanos>` directory in one battery run — two connections in one
+/// process then opened and migrated the same `store.db` and the second one
+/// died with `database is locked`. A monotonic counter makes uniqueness a
+/// property of the process, not of the clock (CONCURRENCY-06).
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_home() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,8 +32,9 @@ fn scratch_home() -> PathBuf {
         .join("doctor-synchronous-3553");
     std::fs::create_dir_all(&root).expect("create .local-runs scratch root");
     let unique = format!(
-        "h-{}-{}",
+        "h-{}-{}-{}",
         std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos())
