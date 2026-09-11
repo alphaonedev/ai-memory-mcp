@@ -8310,35 +8310,99 @@ fn test_cli_sync_dry_run_writes_nothing() {
 // within a couple of daemon cycles, no cloud, no login, no manual sync.
 // ---------------------------------------------------------------------------
 
-/// Wait for the `/api/v1/health` endpoint to respond 200 — up to ~10s.
+/// Wait for `/api/v1/health` to respond 200 — up to ~60s (600 × 100 ms).
 ///
-/// Extended from 5s to 10s in the v0.7.0 v0.7.1-fold (2026-05-13) after
-/// the §16 12-gate sweep and L1 wave coordinator both observed
-/// `http_notify_fans_out_to_peers_so_target_inbox_sees_it` flaking on
-/// "leader serve never came up" under high parallel test load. Combined
-/// with `spawn_leader`'s bind-retry the cross-binary readiness race
-/// becomes recoverable rather than fatal.
-fn wait_for_health(port: u16) -> bool {
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(out) = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-m",
-                CURL_PROBE_MAX_SECS,
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                &format!("http://127.0.0.1:{port}/api/v1/health"),
-            ])
-            .output()
-            && String::from_utf8_lossy(&out.stdout) == "200"
-        {
-            return true;
+/// Returns on the first 200, so a healthy spawn pays only time-to-ready.
+/// Raised from 10s in #3615 after a full-suite `cargo test --no-fail-fast`
+/// flake: one of 27 concurrent `DaemonGuard` daemons missed the 10 s
+/// ceiling (`http_namespace_standard_query_string_set_get_clear` panicked
+/// `serve never came up` with stderr discarded). Combined with
+/// `spawn_leader`'s bind-retry the cross-binary readiness race stays
+/// recoverable. Honour `AI_MEMORY_TEST_TIMING_BUDGET_MULT` (env #68) as
+/// a multiplier for saturated hosts.
+const HEALTH_PROBE_INTERVAL_MS: u64 = 100;
+const HEALTH_PROBE_ATTEMPTS: u32 = 600; // 60 s at 100 ms
+const STDERR_TAIL_MAX: usize = 4096;
+
+fn health_probe_attempts() -> u32 {
+    let mult = std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| (1..=100).contains(&n))
+        .unwrap_or(1);
+    HEALTH_PROBE_ATTEMPTS.saturating_mul(mult)
+}
+
+fn serve_stderr_log() -> (std::fs::File, std::path::PathBuf) {
+    let path =
+        integration_scratch_root().join(format!("serve-stderr-{}.log", uuid::Uuid::new_v4()));
+    let file = std::fs::File::create(&path)
+        .unwrap_or_else(|e| panic!("failed to create serve stderr log {}: {e}", path.display()));
+    (file, path)
+}
+
+fn stderr_tail(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.is_empty() => "<empty>".to_owned(),
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(STDERR_TAIL_MAX);
+            String::from_utf8_lossy(&bytes[start..]).into_owned()
+        }
+        Err(e) => format!("<unreadable: {e}>"),
+    }
+}
+
+fn health_is_200(port: u16) -> bool {
+    std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-m",
+            CURL_PROBE_MAX_SECS,
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("http://127.0.0.1:{port}/api/v1/health"),
+        ])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout) == "200")
+}
+
+/// Poll `/api/v1/health` until 200, the child exits, or the 60 s ceiling
+/// elapses. Early-exits on the first healthy probe AND if the child dies
+/// (so a crashed daemon is not waited out for a full minute).
+fn wait_for_health(port: u16, child: &mut std::process::Child) -> Result<(), String> {
+    for _ in 0..health_probe_attempts() {
+        std::thread::sleep(std::time::Duration::from_millis(HEALTH_PROBE_INTERVAL_MS));
+        if health_is_200(port) {
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!("child exited {status} before health 200"));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait error: {e}")),
         }
     }
-    false
+    Err("timed out waiting for health 200".to_owned())
+}
+
+fn panic_health_failed(what: &str, port: u16, why: &str, stderr_log: &std::path::Path) -> ! {
+    panic!(
+        "{what} (port {port}; {why}); stderr tail:\n{}",
+        stderr_tail(stderr_log)
+    );
+}
+
+#[test]
+fn wait_for_health_ceiling_is_sixty_seconds_3615() {
+    assert_eq!(HEALTH_PROBE_ATTEMPTS, 600);
+    assert_eq!(HEALTH_PROBE_INTERVAL_MS, 100);
+    assert_eq!(
+        u64::from(HEALTH_PROBE_ATTEMPTS).saturating_mul(HEALTH_PROBE_INTERVAL_MS),
+        60_000
+    );
 }
 
 #[test]
@@ -8363,6 +8427,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     // during unwind. Bare `Child` would orphan the server to PID 1
     // (the same failure mode #401 fixed in the mTLS test).
     let port_b = free_port();
+    let (stderr_file, stderr_log) = serve_stderr_log();
     let serve_b_child = cmd(bin)
         .args([
             "--db",
@@ -8372,14 +8437,23 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
             &port_b.to_string(),
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    let _serve_b = ChildGuard::new(serve_b_child).with_cleanup([db_a.clone(), db_b.clone()]);
-    assert!(
-        wait_for_health(port_b),
-        "serve B health probe never returned 200"
-    );
+    let mut serve_b = ChildGuard::new(serve_b_child).with_cleanup([
+        db_a.clone(),
+        db_b.clone(),
+        stderr_log.clone(),
+    ]);
+    if let Err(why) = wait_for_health(port_b, serve_b.child_mut()) {
+        panic_health_failed(
+            "serve B health probe never returned 200",
+            port_b,
+            &why,
+            &stderr_log,
+        );
+    }
+    let _serve_b = serve_b;
 
     // 2. Seed memory into db_B via HTTP.
     //
@@ -8889,6 +8963,7 @@ fn test_child_guard_kills_daemon_on_assert_panic() {
     let db_for_inner = db.clone();
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let (stderr_file, stderr_log) = serve_stderr_log();
         let child = cmd(bin)
             .args([
                 "--db",
@@ -8898,14 +8973,17 @@ fn test_child_guard_kills_daemon_on_assert_panic() {
                 &port.to_string(),
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_file))
             .spawn()
             .unwrap();
         captured_pid_inner.store(child.id(), std::sync::atomic::Ordering::SeqCst);
-        let _g = ChildGuard::new(child).with_cleanup([db_for_inner.clone()]);
+        let mut g = ChildGuard::new(child).with_cleanup([db_for_inner.clone(), stderr_log.clone()]);
         // Wait for serve to be live so we're testing real-process
         // cleanup, not a race between spawn and Drop.
-        assert!(wait_for_health(port), "serve never came up");
+        if let Err(why) = wait_for_health(port, g.child_mut()) {
+            panic_health_failed("serve never came up", port, &why, &stderr_log);
+        }
+        let _g = g;
         // Force the exact failure mode pre-fix would leak on.
         panic!("forced panic to verify ChildGuard cleanup on unwind");
     }));
@@ -9413,6 +9491,10 @@ impl ChildGuard {
         self.cleanup_paths.extend(paths);
         self
     }
+
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("ChildGuard child already taken")
+    }
 }
 
 impl Drop for ChildGuard {
@@ -9431,6 +9513,7 @@ struct DaemonGuard {
     child: std::process::Child,
     port: u16,
     db: std::path::PathBuf,
+    stderr_log: std::path::PathBuf,
 }
 
 impl DaemonGuard {
@@ -9442,7 +9525,8 @@ impl DaemonGuard {
         // and `AI_MEMORY_FED_SYNC_TRUST_PEER=1` so the legacy posture
         // applies to /sync/push and /sync/since here too. See `cmd()`
         // for the per-test rationale.
-        let child = cmd(bin)
+        let (stderr_file, stderr_log) = serve_stderr_log();
+        let mut child = cmd(bin)
             .args([
                 "--db",
                 db.to_str().unwrap(),
@@ -9451,11 +9535,18 @@ impl DaemonGuard {
                 &port.to_string(),
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_file))
             .spawn()
             .unwrap();
-        assert!(wait_for_health(port), "serve never came up");
-        DaemonGuard { child, port, db }
+        if let Err(why) = wait_for_health(port, &mut child) {
+            panic_health_failed("serve never came up", port, &why, &stderr_log);
+        }
+        DaemonGuard {
+            child,
+            port,
+            db,
+            stderr_log,
+        }
     }
 }
 
@@ -9464,6 +9555,7 @@ impl Drop for DaemonGuard {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.db);
+        let _ = std::fs::remove_file(&self.stderr_log);
     }
 }
 
@@ -9904,6 +9996,7 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
 /// chain-fail subsequent attempts.
 fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let mut last_fail: Option<(u16, String, std::path::PathBuf)> = None;
     for attempt in 1..=3u8 {
         let db = integration_scratch_db("http-parity-leader");
         let port = free_port();
@@ -9925,25 +10018,45 @@ fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
             args.push("--quorum-timeout-ms".into());
             args.push("15000".into());
         }
+        let (stderr_file, stderr_log) = serve_stderr_log();
         let mut child = cmd(bin)
             .args(&args)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_file))
             .spawn()
             .unwrap();
-        if wait_for_health(port) {
-            return DaemonGuard { child, port, db };
+        match wait_for_health(port, &mut child) {
+            Ok(()) => {
+                return DaemonGuard {
+                    child,
+                    port,
+                    db,
+                    stderr_log,
+                };
+            }
+            Err(why) => {
+                // Kill the stuck child and try again. The most common cause is a
+                // cross-binary port grab between free_port and the child's bind.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&db);
+                eprintln!(
+                    "spawn_leader attempt {attempt}/3 failed on port {port} ({why}); retrying with fresh port"
+                );
+                if let Some((_, _, prev_log)) = last_fail.take() {
+                    let _ = std::fs::remove_file(prev_log);
+                }
+                last_fail = Some((port, why, stderr_log));
+            }
         }
-        // Kill the stuck child and try again. The most common cause is a
-        // cross-binary port grab between free_port and the child's bind.
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&db);
-        eprintln!(
-            "spawn_leader attempt {attempt}/3 failed on port {port}; retrying with fresh port"
-        );
     }
-    panic!("leader serve never came up after 3 attempts");
+    let (port, why, stderr_log) = last_fail.expect("spawn_leader made 3 attempts");
+    panic_health_failed(
+        "leader serve never came up after 3 attempts",
+        port,
+        &why,
+        &stderr_log,
+    );
 }
 
 /// Poll GET `/api/v1/memories` on `peer_port` filtered by `namespace`
@@ -11424,14 +11537,22 @@ fn spawn_leader_with_timeout(
         args.push("--quorum-timeout-ms".into());
         args.push(timeout_ms.to_string());
     }
-    let child = cmd(bin)
+    let (stderr_file, stderr_log) = serve_stderr_log();
+    let mut child = cmd(bin)
         .args(&args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    assert!(wait_for_health(port), "leader serve never came up");
-    DaemonGuard { child, port, db }
+    if let Err(why) = wait_for_health(port, &mut child) {
+        panic_health_failed("leader serve never came up", port, &why, &stderr_log);
+    }
+    DaemonGuard {
+        child,
+        port,
+        db,
+        stderr_log,
+    }
 }
 
 #[allow(dead_code)]
