@@ -461,6 +461,14 @@ In addition, `asi-hard` forces the config-backed governance knob
 check. A loosening override (e.g. `AI_MEMORY_SECRET_SCREEN_MODE=off`
 under `asi-hard`) aborts boot with a clear error naming the knob.
 
+With federation peers configured, `asi-hard` also requires a valid,
+nonempty `AI_MEMORY_FED_PEER_ATTESTATION` map (#3582). This conditional
+read-only boot check adds no entry to `KNOBS`. Standard warns about a
+missing/empty/invalid map, while the default namespace requirement refuses
+inbound writes without authorization. Ordinary doctor remains runnable;
+see [federation posture and capabilities](docs/federation.md#current-defaults-and-boot-posture-3582)
+for inbound/outbound observation and the explicit Standard opt-out.
+
 ## Autonomous-Tier Latency Tax — Batman-Active Write Path
 
 > **v0.7.0 Gap #4 (issue #805) attack plan.** Cross-refs #654 (distilled

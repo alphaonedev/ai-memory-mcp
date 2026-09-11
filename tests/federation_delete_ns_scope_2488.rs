@@ -272,36 +272,35 @@ fn counter(report: &Value, key: &str) -> i64 {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn zero_config_federated_deletion_applies_2491() {
+async fn no_allowlist_deletion_posture_matrix_3582() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
-    // ZERO-CONFIG: no AI_MEMORY_FED_PEER_ATTESTATION and no
-    // AI_MEMORY_FED_SYNC_TRUST_PEER. Pre-fix `namespace_allowed`'s
-    // `scope_for == None` arm returned false here, so the deletion was refused
-    // and the row survived forever on this replica.
-    set_posture(None, None);
-    let (router, db) = build_router_with_db();
-    let id = seed_row(&router, VICTIM_NS, "zero-config-delete-target").await;
-    assert!(row_exists(&db, &id).await, "seed row must exist");
+    // #3582: identical mutations under default/explicit denial, rollout opt-out,
+    // and an explicit peer scope. All environment access holds the binary lock.
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        let allowlist = scoped.then_some(r#"{"ai:evil":{"allowed_namespaces":["secure/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#);
+        set_posture(allowlist, require);
+        let (router, db) = build_router_with_db();
+        let id = seed_row(&router, VICTIM_NS, "zero-config-delete-target").await;
+        assert!(row_exists(&db, &id).await, "seed row must exist");
 
-    let (status, report) = push_deletions(&router, Some(PEER_ID), &[&id]).await;
-    assert!(
-        status.is_success(),
-        "#2491: sync_push must not hard-error; got {status}"
-    );
-    assert!(
-        !row_exists(&db, &id).await,
-        "#2491: a zero-config federated deletion MUST be applied — the row \
-         surviving here is the live delete-replication outage. Since #2341 the \
-         origin does NOT mis-count the refusal as an ack; what it does is log a \
-         warn-only Fail and never retry (no DLQ enqueue, #2498), so the divergence \
-         is permanent and silent rather than mis-reported"
-    );
-    assert_eq!(
-        counter(&report, "deleted"),
-        1,
-        "#2491: the receiver report must count the deletion (secondary to row state)"
-    );
+        let (status, report) = push_deletions(&router, Some(PEER_ID), &[&id]).await;
+        assert!(
+            status.is_success(),
+            "#2491: sync_push must not hard-error; got {status}"
+        );
+        assert_eq!(
+            row_exists(&db, &id).await,
+            !allowed,
+            "#3582: deletion persisted state scoped={scoped} require={require:?}"
+        );
+        assert_eq!(counter(&report, "deleted"), i64::from(allowed));
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -342,6 +341,10 @@ async fn header_absent_federated_deletion_disposition_2491() {
     // `sync_trust_peer_bypass()`, false by default).
     unsafe {
         std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
     }
     let (status2, report2) = push_deletions(&router, None, &[&id]).await;
     assert!(
@@ -351,8 +354,7 @@ async fn header_absent_federated_deletion_disposition_2491() {
     assert!(
         !row_exists(&db, &id).await,
         "#2491: under the legacy header-absent opt-out, a ZERO-CONFIG federated \
-         deletion must be APPLIED — the ENROLLED posture is what arms the \
-         namespace gate, never the presence of a header"
+         deletion applies only after the explicit namespace-scope opt-out"
     );
     assert_eq!(counter(&report2, "deleted"), 1);
 }
@@ -504,8 +506,9 @@ async fn undecryptable_envelope_row_is_still_federated_deleted_2488() {
 //
 // Each cell is asserted under BOTH knob states, because the whole point
 // is that these shapes are refused UNCONDITIONALLY —
-// AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE governs only the ENROLLED
-// peer that declared no scope, never an anonymous or unenrolled one.
+// With a nonempty allowlist, AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE
+// governs only the ENROLLED peer that declared no scope, never an anonymous
+// or unenrolled one. The absent-allowlist posture is separately pinned by #3582.
 // ---------------------------------------------------------------------
 
 /// A peer id that is NOT a key in either allowlist const above.

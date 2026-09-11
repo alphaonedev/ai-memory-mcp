@@ -128,10 +128,17 @@ fn setup_router() -> (axum::Router, Db) {
 }
 
 /// Isolate the #3049 screen: disable the orthogonal federation gates so an
-/// unsigned inbound coordination row reaches the screen arm. Zero-config
-/// (no peer allowlist) so Layer-1 authorship / namespace-scope are no-ops.
+/// unsigned inbound coordination row reaches the screen arm. No peer allowlist
+/// bypasses Layer-1 authorship; the explicit scope opt-out bypasses namespace
+/// authorization (#3582).
 fn relax_orthogonal_gates() {
     unsafe {
+        // #3582: explicit Standard namespace opt-out lets this downstream
+        // control run; the required-scope refusal is pinned in its own suite.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
         std::env::set_var(REQUIRE_SIG_ENV, "0");
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
         std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, "0");
@@ -142,6 +149,7 @@ fn relax_orthogonal_gates() {
 
 fn clear_all_env() {
     unsafe {
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
         std::env::remove_var(REQUIRE_SIG_ENV);
         std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         std::env::remove_var(REQUIRE_SIGNAL_SIG_ENV);

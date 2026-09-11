@@ -6124,6 +6124,8 @@ fn cert_peer_binding_boot_warnings(
 
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
+/// The peer-posture gate also protects library callers; CLI serve already ran
+/// it pre-runtime in main. Re-evaluation updates the same boot snapshot.
 ///
 /// DOC-6: this function reads several legacy `AppConfig` fields
 /// (`auto_tag_model`, `llm_model`, `ollama_url`) directly for v0.7.x
@@ -6136,6 +6138,10 @@ pub async fn bootstrap_serve(
     args: &ServeArgs,
     app_config: &AppConfig,
 ) -> Result<ServeBootstrap> {
+    crate::federation::peer_posture::enforce_at_boot(
+        !args.quorum_peers.is_empty(),
+        args.mtls_allowlist.as_deref(),
+    )?;
     // S5-C1 (v0.7.0 fix campaign 2026-05-13): refuse default-off auth
     // on non-loopback binds. When `api_key` is unset, the `api_key_auth`
     // middleware is a pass-through — every privileged endpoint (write,
@@ -8901,6 +8907,7 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     batch_size: usize,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
+    crate::federation::peer_posture::enforce_at_boot(!peers.is_empty(), None)?;
     let interval = interval_secs.max(1);
     let batch_size = batch_size.max(1);
 

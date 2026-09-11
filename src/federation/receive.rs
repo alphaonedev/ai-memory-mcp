@@ -105,7 +105,8 @@ fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Displa
 /// when that predicate elides the read (zero-config / no declared
 /// scope — ZERO extra reads).
 ///
-/// Zero-config (`!has_allowlist`) short-circuits inside the helper to true.
+/// An absent allowlist fails closed when namespace scope is required; only
+/// the explicit Standard require-scope opt-out permits that case (#3582).
 #[must_use]
 fn catchup_memory_namespace_authorized(
     attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
@@ -1026,11 +1027,15 @@ mod issue_2480_tests {
     }
 
     #[test]
-    fn zero_config_accepts_any_namespace_2480() {
+    fn no_allowlist_catchup_requires_explicit_scope_opt_out_3582() {
         let cfg = PeerAttestationConfig::default();
         assert!(
-            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops"), None),
-            "zero-config must stay byte-identical faith pull"
+            !catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops"), None),
+            "required scope must refuse catchup without an allowlist"
+        );
+        assert!(
+            catchup_memory_namespace_authorized(&cfg, false, "peer-1", &mem("secure/ops"), None),
+            "explicit Standard rollout opt-out retains legacy catchup"
         );
     }
 

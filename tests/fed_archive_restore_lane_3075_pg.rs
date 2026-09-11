@@ -400,3 +400,98 @@ async fn federated_restore_of_tombstoned_id_refused_on_postgres_3075() {
         "the refusal is a no-op: the archived row is neither restored nor destroyed: {report}"
     );
 }
+
+async fn archive_snapshot_3582(pool: &sqlx::PgPool, id: &str) -> Vec<Option<Value>> {
+    let mut rows = Vec::new();
+    for table in ["memories", "archived_memories"] {
+        rows.push(
+            sqlx::query_scalar::<_, Value>(&format!(
+                "SELECT to_jsonb(t) FROM {table} t WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .expect("full archive/live snapshot"),
+        );
+    }
+    rows
+}
+
+/// #3582: both by-id lanes require authorization, including an already archived row.
+#[tokio::test]
+async fn archive_restore_allowlist_postures_preserve_rows_3582() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _lock = FED_ENV_LOCK.lock().await;
+    let _guard = PostureGuard;
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+    let root = uniq("archive3582");
+    let ns = format!("{root}/ok");
+
+    for (label, require, scoped, allowed) in [
+        ("default-required", None, false, false),
+        ("explicit-required", Some("1"), false, false),
+        ("standard-opt-out", Some("0"), false, true),
+        ("scoped", None, true, true),
+    ] {
+        for restore in [false, true] {
+            set_scoped_posture(&root);
+            let id = uuid::Uuid::new_v4().to_string();
+            seed_memory(&store, &id, &ns).await;
+            if restore {
+                let (status, report) = push(
+                    &router,
+                    &json!({"sender_agent_id": PEER_ID,
+                    "sender_clock": {"entries": {}}, "memories": [], "archives": [id]}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "setup: {report}");
+                assert_eq!(report["archived"], json!(1), "setup: {report}");
+            }
+            // SAFETY: the binary's async env lock spans the request and guard cleanup.
+            unsafe {
+                if !scoped {
+                    std::env::remove_var(
+                        ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                    );
+                }
+                if let Some(value) = require {
+                    std::env::set_var(
+                        ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                        value,
+                    );
+                }
+            }
+            let before = archive_snapshot_3582(&pool, &id).await;
+            let lane = if restore { "restores" } else { "archives" };
+            let counter = if restore { "restored" } else { "archived" };
+            let mut body = json!({"sender_agent_id": PEER_ID, "sender_clock": {"entries": {}}, "memories": []});
+            body[lane] = json!([id]);
+            let (status, report) = push(&router, &body).await;
+            assert_eq!(status, StatusCode::OK, "{label}/{lane}: {report}");
+            assert_eq!(
+                report[counter],
+                json!(u64::from(allowed)),
+                "{label}/{lane}: {report}"
+            );
+            let after = archive_snapshot_3582(&pool, &id).await;
+            if allowed {
+                assert_ne!(after, before, "{label}/{lane}: must mutate the target");
+                assert_eq!(live_exists(&pool, &id).await, restore, "{label}/{lane}");
+                assert_eq!(
+                    archived_reason(&pool, &id).await.is_some(),
+                    !restore,
+                    "{label}/{lane}"
+                );
+            } else {
+                assert_eq!(
+                    after, before,
+                    "{label}/{lane}: every live/archive column must survive refusal"
+                );
+            }
+        }
+    }
+}

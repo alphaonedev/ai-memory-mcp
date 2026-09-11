@@ -846,14 +846,17 @@ pub(super) async fn sync_push_via_store(
         // peer shape Layer 2 was voted in to refuse. So the gate was
         // structurally unreachable for that shape and `apply_remote_deletion`
         // ran unguarded: the peer that may not write anywhere could still
-        // destroy anything. The guard is now the ENROLLED posture
-        // (`has_allowlist()`), the shared verdict decides, and the probe stays
+        // destroy anything. #3582 also arms the guard when scope is required
+        // with no allowlist. The shared verdict decides, and the probe stays
         // elided on the Layer-2-only shapes where its answer cannot change the
         // verdict — so the fix costs ZERO extra reads versus pre-#2488.
         // A missing row stays a no-op (the peer may have GC'd it); an
         // UNRESOLVABLE row fails closed with a distinguishable cause.
         // Fable 5 1×7 vote (4d3ea1c5).
-        if attest_cfg.has_allowlist() {
+        if crate::federation::receive_auth::inbound_namespace_gate_enabled(
+            &attest_cfg,
+            require_push_ns_scope,
+        ) {
             let needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
                 peer_header_owned.as_deref(),
                 &attest_cfg,
@@ -931,13 +934,16 @@ pub(super) async fn sync_push_via_store(
         // POSTGRES funnel (sqlite-twin parity; the sqlite lane is #2489). A link
         // binds two endpoints, so BOTH endpoints' STORED namespaces are the
         // subject — a claimed-only gate would let a `public/*`-scoped peer relate
-        // (and thereby relocate-by-reference) a `secure/ops` row by id. Gate only
-        // under the ENROLLED posture (`has_allowlist()`); zero-config stays
-        // byte-identical faith replication. A failed probe fails CLOSED (skip);
+        // (and thereby relocate-by-reference) a `secure/ops` row by id. Gate
+        // under an allowlist OR required scope (#3582); only the explicit
+        // no-allowlist opt-out bypasses it. A failed probe fails CLOSED (skip);
         // a missing endpoint under Layer 1 cannot prove scope, so it fails CLOSED
         // too. The probe is the SCALAR `MemoryStore::namespace_by_id` (never a
         // full-row `get` — the #2488 decrypt-fail-closed / over-read lesson).
-        if attest_cfg.has_allowlist() {
+        if crate::federation::receive_auth::inbound_namespace_gate_enabled(
+            &attest_cfg,
+            require_push_ns_scope,
+        ) {
             let needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
                 peer_header_owned.as_deref(),
                 &attest_cfg,
@@ -1103,8 +1109,8 @@ pub(super) async fn sync_push_via_store(
         // POSTGRES funnel (sqlite-twin parity; the sqlite lane is #2489).
         // Authorship (`signal_author_authorized` above) answers "who authored";
         // this choke answers "may this peer write in the signal's namespace". The
-        // subject is the signal's own claimed namespace. Zero-config short-circuits
-        // inside `inbound_write_namespace_authorized` (`!has_allowlist()`).
+        // subject is the signal's own claimed namespace. With no allowlist,
+        // `inbound_write_namespace_authorized` still enforces required scope (#3582).
         if !crate::federation::receive_auth::inbound_write_namespace_authorized(
             crate::federation::receive_auth::LANE_SIGNALS,
             &sig.id,
@@ -1299,11 +1305,12 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
-    // #2447 (CWE-284) — the by-id sibling lanes (`archives[]` / `restores[]`)
-    // and the governance-STANDARD lanes probe under the whole ENROLLED posture,
-    // not just a declared scope, so Layer 2's disposition of an unscoped
-    // enrolled peer is IDENTICAL on every lane and on both backends.
-    let ns_gate_enrolled = attest_cfg.has_allowlist();
+    // #3582: scope-required mutations must reach authorization even without
+    // an allowlist, identically to SQLite. Probe elision stays independent.
+    let ns_gate_enabled = crate::federation::receive_auth::inbound_namespace_gate_enabled(
+        &attest_cfg,
+        require_push_ns_scope,
+    );
     // ---- pendings / pending_decisions (#2478, #2529, #1920, #3075) -----
     //
     // The GOVERNANCE lanes. `pendings[]` injects UNDECIDED rows; decisions
@@ -1404,7 +1411,7 @@ pub(super) async fn sync_push_via_store(
                 continue;
             }
         }
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             let stored_pending_ns = local_pending.as_ref().map(|row| row.namespace.clone());
             if !pending_effect_namespaces_authorized(
                 &app,
@@ -1487,7 +1494,7 @@ pub(super) async fn sync_push_via_store(
         // Both arms pass the SAME base lane: the destructive
         // `pending_decisions (delete)` variant is selected INSIDE the shared
         // verdict, from the pending action's own effect, not from the wire.
-        if ns_gate_enrolled
+        if ns_gate_enabled
             && !pending_effect_namespaces_authorized(
                 &app,
                 &body.sender_agent_id,
@@ -1799,7 +1806,7 @@ pub(super) async fn sync_push_via_store(
             noop += 1;
             continue;
         }
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             match resolve_stored_namespace(&app, body.sender_agent_id.clone(), arch_id).await {
                 Ok(Some(namespace)) => {
                     if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
@@ -1850,7 +1857,7 @@ pub(super) async fn sync_push_via_store(
             noop += 1;
             continue;
         }
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             let probe_ctx = federation_apply_ctx(body.sender_agent_id.clone());
             match app.store.archived_namespace_by_id(&probe_ctx, res_id).await {
                 Ok(Some(namespace)) => {
@@ -1927,7 +1934,7 @@ pub(super) async fn sync_push_via_store(
             noop += 1;
             continue;
         }
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
                 crate::federation::receive_auth::LANE_NAMESPACE_META,
                 &entry.namespace,
@@ -1989,7 +1996,7 @@ pub(super) async fn sync_push_via_store(
         // DISARMS a namespace (and, by inheritance, its descendants). No
         // `standard_id` rides this lane, hence no parent to gate: the namespace
         // is the whole subject (sqlite-twin reasoning, verbatim).
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
                 crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
                 ns,

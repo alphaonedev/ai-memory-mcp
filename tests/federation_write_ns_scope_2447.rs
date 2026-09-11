@@ -408,36 +408,35 @@ async fn federated_archive_and_restore_outside_peer_scope_refused_2447() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn zero_config_federation_write_still_applies_2447() {
+async fn no_allowlist_write_posture_matrix_3582() {
     let _g = ENV_LOCK.lock().await;
-    // ZERO-CONFIG: no AI_MEMORY_FED_PEER_ATTESTATION at all. Calling
-    // `namespace_allowed` verbatim here would have returned false (its
-    // `scope_for == None` arm falls through to `sync_trust_peer_bypass()`,
-    // which is false by default) and silently black-holed EVERY inbound
-    // memory on every unconfigured deployment.
-    set_posture(None, None);
-    let (router, db) = build_router_with_db();
-
-    let status = push(
-        &router,
-        &push_body(&[wire_memory(
-            &uuid::Uuid::new_v4().to_string(),
-            VICTIM_NS,
-            "zero-config replication",
-            "must still land",
-            "2026-07-01T00:00:00+00:00",
-        )]),
-    )
-    .await;
-    assert!(status.is_success());
-    assert_eq!(
-        count_ns(&db, VICTIM_NS).await,
-        1,
-        "#2447: zero-config federation must be byte-identical to pre-fix — the \
-         namespace gate engages ONLY under an enrolled posture"
-    );
-
-    clear_posture();
+    for (allowlist, require, allowed) in [
+        (None, None, false),
+        (None, Some("1"), false),
+        (None, Some("0"), true),
+        (Some(SCOPED_ALLOWLIST), Some("1"), true),
+    ] {
+        set_posture(allowlist, require);
+        let (router, db) = build_router_with_db();
+        let status = push(
+            &router,
+            &push_body(&[wire_memory(
+                &uuid::Uuid::new_v4().to_string(),
+                IN_SCOPE_NS,
+                "namespace posture matrix",
+                "persist only when authorized",
+                "2026-07-01T00:00:00+00:00",
+            )]),
+        )
+        .await;
+        assert!(status.is_success());
+        assert_eq!(
+            count_ns(&db, IN_SCOPE_NS).await > 0,
+            allowed,
+            "#3582: persisted state, allowlist={allowlist:?} require={require:?}"
+        );
+        clear_posture();
+    }
 }
 
 #[tokio::test]

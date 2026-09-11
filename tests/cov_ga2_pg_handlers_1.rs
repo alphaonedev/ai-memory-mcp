@@ -885,6 +885,23 @@ pg_test!(pg_approval_decide_deny_postgres_arm, url, {
     let ns = uid("cov-ga2-deny");
     let pending_id = seed_pending_store(&store, &ns, &owner, &requester).await;
 
+    // #3448 / #3582: Human vetoes require a registered non-requester.
+    // Seed this fixture independently of the approve test, which uses the
+    // same ADMIN_AGENT. The deny assertions must also pass on a fresh DB.
+    store
+        .register_agent(
+            &CallerContext::for_admin(ADMIN_AGENT),
+            &AgentRegistration {
+                agent_id: ADMIN_AGENT.to_string(),
+                agent_type: "nhi".to_string(),
+                capabilities: vec!["read".to_string(), "write".to_string()],
+                registered_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+        .expect("register admin approver");
+
     let body = json!({"decision": "deny", "remember": "once"});
     let req = signed_approval_request(&pending_id, &body);
     let (status, resp) = decode(&router, req).await;

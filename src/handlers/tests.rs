@@ -841,228 +841,278 @@ async fn http_update_memory_enforces_lifecycle_transition_1726() {
     }
 }
 
+use tests_3582_legacy_push::with_legacy_push_env;
+
+#[cfg(test)]
+mod tests_3582_legacy_push {
+    /// #3582: downstream push controls use the explicit Standard namespace opt-out.
+    /// Each original body runs alone in a child; the parallel parent gains no env
+    /// mutation or blocking guard across await (UNSAFE-01, CONCURRENCY-20).
+    pub(super) fn with_legacy_push_env(name: &str, test: impl std::future::Future<Output = ()>) {
+        const REQUIRE_SCOPE: &str =
+            crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+        let full_name = format!("handlers::tests::{name}");
+        let args: Vec<String> = std::env::args().collect();
+        let isolated = args.iter().any(|arg| arg == "--exact")
+            && args.iter().any(|arg| arg == &full_name)
+            && args.iter().any(|arg| arg == "--test-threads=1")
+            && std::env::var(REQUIRE_SCOPE).as_deref() == Ok("0");
+        if isolated {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("legacy push test runtime")
+                .block_on(test);
+            return;
+        }
+        // These no-peer-header fixtures intentionally retain their legacy posture.
+        // Namespace-enforcement matrices live in separate integration binaries.
+        let output = std::process::Command::new(std::env::current_exe().expect("lib test binary"))
+            .args(["--exact", &full_name, "--test-threads=1", "--nocapture"])
+            .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env(REQUIRE_SCOPE, "0")
+            .output()
+            .expect("isolated legacy push test child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "{full_name}: isolated child must run exactly one passing test\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 // --- Phase 3 foundation HTTP sync tests (issue #224) ---
 
-#[tokio::test]
-async fn http_sync_push_applies_and_advances_clock() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // Smoke test for POST /api/v1/sync/push — memories land in the
-    // receiver's DB and the vector clock records the sender's latest
-    // `updated_at`. Full CRDT semantics are the v0.8.0 follow-up.
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
+#[test]
+fn http_sync_push_applies_and_advances_clock() {
+    with_legacy_push_env("http_sync_push_applies_and_advances_clock", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // Smoke test for POST /api/v1/sync/push — memories land in the
+        // receiver's DB and the vector clock records the sender's latest
+        // `updated_at`. Full CRDT semantics are the v0.8.0 follow-up.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
 
-    let now = Utc::now().to_rfc3339();
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-alice",
-        "sender_clock": {"entries": {}},
-        "memories": [{
-            "id": Uuid::new_v4().to_string(),
-            "tier": Tier::Long.as_str(),
-            "namespace": "sync-smoke",
-            "title": "From peer",
-            "content": "Pushed via HTTP sync endpoint.",
-            "tags": [],
-            "priority": 5,
-            "confidence": 1.0,
-            "source": "api",
-            "access_count": 0,
-            "created_at": now,
-            "updated_at": now,
-            "last_accessed_at": null,
-            "expires_at": null,
-            "metadata": {"agent_id": "peer-alice"}
-        }],
-        "dry_run": false
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "local-receiver")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Row landed.
-    let lock = state.lock().await;
-    let rows = db::list(
-        &lock.0,
-        Some("sync-smoke"),
-        None,
-        10,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // #1834 valid_at (no as-of)
-    )
-    .unwrap();
-    assert_eq!(rows.len(), 1);
-    // Clock advanced — peer-alice registered against local-receiver.
-    let clock = db::sync_state_load(&lock.0, "local-receiver").unwrap();
-    assert!(
-        clock.latest_from("peer-alice").is_some(),
-        "push must record sender in sync_state; got: {:?}",
-        clock.entries
-    );
-}
-
-#[tokio::test]
-async fn http_sync_push_links_over_cap_rejected_1556() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // #1556 — `links` was the sole /sync/push subcollection missing the
-    // max_page_size cap, leaving an unbounded per-link insert+verify loop under
-    // the shared write Mutex (DoS). A body with > max_page_size links must be
-    // rejected with 400 BEFORE the lock is taken, like every sibling collection.
-    let state = test_state();
-    let app_state = test_app_state(state.clone());
-    let cap = app_state.max_page_size;
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(app_state);
-    let link_created_at = Utc::now().to_rfc3339();
-    let over_cap: Vec<serde_json::Value> = (0..=cap)
-        .map(|i| {
-            serde_json::json!({
-                "source_id": format!("s{i}"),
-                "target_id": format!("t{i}"),
-                "relation": "related_to",
-                "created_at": link_created_at,
-            })
-        })
-        .collect();
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-alice",
-        "sender_clock": {"entries": {}},
-        "memories": [],
-        "links": over_cap,
-        "dry_run": false
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "local-receiver")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("links per request"),
-        "expected links-cap rejection; got: {v}"
-    );
-}
-
-#[tokio::test]
-async fn http_sync_push_applies_archives() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // S29 — sync_push must accept an `archives` field and move matching
-    // rows from `memories` to `archived_memories` via
-    // `db::archive_memory`. Missing ids no-op. The response exposes a
-    // new `archived` counter.
-    let state = test_state();
-    // Seed one row that the peer will ask us to archive; one id that
-    // doesn't exist here (must no-op, not error).
-    let id = {
-        let lock = state.lock().await;
         let now = Utc::now().to_rfc3339();
-        let mem = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            namespace: "s29".into(),
-            title: "Archive M1".into(),
-            content: "body".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now,
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
-        };
-        db::insert(&lock.0, &mem).unwrap()
-    };
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-alice",
+            "sender_clock": {"entries": {}},
+            "memories": [{
+                "id": Uuid::new_v4().to_string(),
+                "tier": Tier::Long.as_str(),
+                "namespace": "sync-smoke",
+                "title": "From peer",
+                "content": "Pushed via HTTP sync endpoint.",
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "api",
+                "access_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "last_accessed_at": null,
+                "expires_at": null,
+                "metadata": {"agent_id": "peer-alice"}
+            }],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .header("x-agent-id", "local-receiver")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
 
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
-
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-a",
-        "sender_clock": {"entries": {}},
-        "memories": [],
-        "archives": [id, "missing-on-peer"],
-        "dry_run": false
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
+        // Row landed.
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("sync-smoke"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // #1834 valid_at (no as-of)
         )
-        .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["archived"], 1, "live row must be archived");
-    assert_eq!(v["noop"], 1, "missing id must no-op");
+        assert_eq!(rows.len(), 1);
+        // Clock advanced — peer-alice registered against local-receiver.
+        let clock = db::sync_state_load(&lock.0, "local-receiver").unwrap();
+        assert!(
+            clock.latest_from("peer-alice").is_some(),
+            "push must record sender in sync_state; got: {:?}",
+            clock.entries
+        );
+    });
+}
 
-    // Row is gone from active memories, present in archive, with the
-    // correct `sync_push` reason.
-    let lock = state.lock().await;
-    assert!(db::get(&lock.0, &id).unwrap().is_none());
-    let archived = db::list_archived(&lock.0, None, 10, 0).unwrap();
-    assert_eq!(archived.len(), 1);
-    assert_eq!(archived[0]["id"], id);
-    assert_eq!(archived[0]["archive_reason"], "sync_push");
+#[test]
+fn http_sync_push_links_over_cap_rejected_1556() {
+    with_legacy_push_env("http_sync_push_links_over_cap_rejected_1556", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // #1556 — `links` was the sole /sync/push subcollection missing the
+        // max_page_size cap, leaving an unbounded per-link insert+verify loop under
+        // the shared write Mutex (DoS). A body with > max_page_size links must be
+        // rejected with 400 BEFORE the lock is taken, like every sibling collection.
+        let state = test_state();
+        let app_state = test_app_state(state.clone());
+        let cap = app_state.max_page_size;
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(app_state);
+        let link_created_at = Utc::now().to_rfc3339();
+        let over_cap: Vec<serde_json::Value> = (0..=cap)
+            .map(|i| {
+                serde_json::json!({
+                    "source_id": format!("s{i}"),
+                    "target_id": format!("t{i}"),
+                    "relation": "related_to",
+                    "created_at": link_created_at,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-alice",
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "links": over_cap,
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .header("x-agent-id", "local-receiver")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("links per request"),
+            "expected links-cap rejection; got: {v}"
+        );
+    });
+}
+
+#[test]
+fn http_sync_push_applies_archives() {
+    with_legacy_push_env("http_sync_push_applies_archives", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // S29 — sync_push must accept an `archives` field and move matching
+        // rows from `memories` to `archived_memories` via
+        // `db::archive_memory`. Missing ids no-op. The response exposes a
+        // new `archived` counter.
+        let state = test_state();
+        // Seed one row that the peer will ask us to archive; one id that
+        // doesn't exist here (must no-op, not error).
+        let id = {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let mem = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "s29".into(),
+                title: "Archive M1".into(),
+                content: "body".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            db::insert(&lock.0, &mem).unwrap()
+        };
+
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
+
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-a",
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "archives": [id, "missing-on-peer"],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["archived"], 1, "live row must be archived");
+        assert_eq!(v["noop"], 1, "missing id must no-op");
+
+        // Row is gone from active memories, present in archive, with the
+        // correct `sync_push` reason.
+        let lock = state.lock().await;
+        assert!(db::get(&lock.0, &id).unwrap().is_none());
+        let archived = db::list_archived(&lock.0, None, 10, 0).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["id"], id);
+        assert_eq!(archived[0]["archive_reason"], "sync_push");
+    });
 }
 
 #[tokio::test]
@@ -1434,58 +1484,63 @@ async fn http_bulk_create_fans_out_with_federation() {
     );
 }
 
-#[tokio::test]
-async fn http_sync_push_rejects_oversized_batch_redteam_242() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // Red-team #242 — sync_push must cap memories per request, matching
-    // bulk-create's MAX_BULK_SIZE. Without this a malicious peer can
-    // flood the receiver and bottleneck the SQLite Mutex.
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let now = Utc::now().to_rfc3339();
-    // Build MAX_BULK_SIZE + 1 entries (1001).
-    let mems: Vec<serde_json::Value> = (0..=MAX_BULK_SIZE)
-        .map(|i| {
-            serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "tier": Tier::Long.as_str(),
-                "namespace": "oversize",
-                "title": format!("m{i}"),
-                "content": "x",
-                "tags": [],
-                "priority": 5,
-                "confidence": 1.0,
-                "source": "api",
-                "access_count": 0,
-                "created_at": now,
-                "updated_at": now,
-                "last_accessed_at": null,
-                "expires_at": null,
-                "metadata": {}
-            })
-        })
-        .collect();
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-flood",
-        "sender_clock": {"entries": {}},
-        "memories": mems,
-        "dry_run": false,
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+#[test]
+fn http_sync_push_rejects_oversized_batch_redteam_242() {
+    with_legacy_push_env(
+        "http_sync_push_rejects_oversized_batch_redteam_242",
+        async {
+            // #1789 — downstream-intent test; opt back to permissive enrollment.
+            let _fed = PermissiveFedEnv::new();
+            // Red-team #242 — sync_push must cap memories per request, matching
+            // bulk-create's MAX_BULK_SIZE. Without this a malicious peer can
+            // flood the receiver and bottleneck the SQLite Mutex.
+            let state = test_state();
+            let app = Router::new()
+                .route("/api/v1/sync/push", axum_post(sync_push))
+                .with_state(test_app_state(state));
+            let now = Utc::now().to_rfc3339();
+            // Build MAX_BULK_SIZE + 1 entries (1001).
+            let mems: Vec<serde_json::Value> = (0..=MAX_BULK_SIZE)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": Uuid::new_v4().to_string(),
+                        "tier": Tier::Long.as_str(),
+                        "namespace": "oversize",
+                        "title": format!("m{i}"),
+                        "content": "x",
+                        "tags": [],
+                        "priority": 5,
+                        "confidence": 1.0,
+                        "source": "api",
+                        "access_count": 0,
+                        "created_at": now,
+                        "updated_at": now,
+                        "last_accessed_at": null,
+                        "expires_at": null,
+                        "metadata": {}
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({
+                "sender_agent_id": "peer-flood",
+                "sender_clock": {"entries": {}},
+                "memories": mems,
+                "dry_run": false,
+            });
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/v1/sync/push")
+                        .method("POST")
+                        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        },
+    );
 }
 
 #[tokio::test]
@@ -1542,68 +1597,70 @@ async fn http_bulk_create_honors_operator_resolved_max_page_size() {
     );
 }
 
-#[tokio::test]
-async fn http_sync_push_dry_run_applies_nothing() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // Phase 3 — dry_run=true must not write.
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
+#[test]
+fn http_sync_push_dry_run_applies_nothing() {
+    with_legacy_push_env("http_sync_push_dry_run_applies_nothing", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // Phase 3 — dry_run=true must not write.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
 
-    let now = Utc::now().to_rfc3339();
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-bob",
-        "sender_clock": {"entries": {}},
-        "memories": [{
-            "id": Uuid::new_v4().to_string(),
-            "tier": Tier::Long.as_str(),
-            "namespace": "sync-dryrun",
-            "title": "Must not land",
-            "content": "Preview only.",
-            "tags": [],
-            "priority": 5,
-            "confidence": 1.0,
-            "source": "api",
-            "access_count": 0,
-            "created_at": now,
-            "updated_at": now,
-            "last_accessed_at": null,
-            "expires_at": null,
-            "metadata": {}
-        }],
-        "dry_run": true
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
+        let now = Utc::now().to_rfc3339();
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-bob",
+            "sender_clock": {"entries": {}},
+            "memories": [{
+                "id": Uuid::new_v4().to_string(),
+                "tier": Tier::Long.as_str(),
+                "namespace": "sync-dryrun",
+                "title": "Must not land",
+                "content": "Preview only.",
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "api",
+                "access_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "last_accessed_at": null,
+                "expires_at": null,
+                "metadata": {}
+            }],
+            "dry_run": true
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("sync-dryrun"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // #1834 valid_at (no as-of)
         )
-        .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let lock = state.lock().await;
-    let rows = db::list(
-        &lock.0,
-        Some("sync-dryrun"),
-        None,
-        10,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // #1834 valid_at (no as-of)
-    )
-    .unwrap();
-    assert!(rows.is_empty(), "dry_run must not write rows");
+        assert!(rows.is_empty(), "dry_run must not write rows");
+    });
 }
 
 #[tokio::test]
@@ -1715,357 +1772,364 @@ async fn http_contradictions_requires_topic_or_namespace() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-#[tokio::test]
-async fn http_sync_push_applies_deletions() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // v0.6.0.1 — sync_push's `deletions` field removes the listed ids
-    // from the receiver so peer-side tombstone fanout works for
-    // scenario-10. (a2a-hermes r14.)
-    let state = test_state();
-    let now = Utc::now().to_rfc3339();
+#[test]
+fn http_sync_push_applies_deletions() {
+    with_legacy_push_env("http_sync_push_applies_deletions", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // v0.6.0.1 — sync_push's `deletions` field removes the listed ids
+        // from the receiver so peer-side tombstone fanout works for
+        // scenario-10. (a2a-hermes r14.)
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
 
-    let seeded_id = {
-        let lock = state.lock().await;
-        let mem = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Mid,
-            namespace: "delete-fanout".into(),
-            title: "to-be-deleted".into(),
-            content: "body".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({"agent_id": "ai:seeder"}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
+        let seeded_id = {
+            let lock = state.lock().await;
+            let mem = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "delete-fanout".into(),
+                title: "to-be-deleted".into(),
+                content: "body".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "ai:seeder"}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            db::insert(&lock.0, &mem).unwrap()
         };
-        db::insert(&lock.0, &mem).unwrap()
-    };
 
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
 
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-alice",
-        "sender_clock": {"entries": {}},
-        "memories": [],
-        "deletions": [seeded_id.clone()],
-        "dry_run": false
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-alice",
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "deletions": [seeded_id.clone()],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .header("x-agent-id", "local-receiver")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["deleted"], 1);
+
+        let lock = state.lock().await;
+        let gone = db::get(&lock.0, &seeded_id).unwrap();
+        assert!(
+            gone.is_none(),
+            "row should have been tombstoned by sync_push"
+        );
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "local-receiver")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["deleted"], 1);
-
-    let lock = state.lock().await;
-    let gone = db::get(&lock.0, &seeded_id).unwrap();
-    assert!(
-        gone.is_none(),
-        "row should have been tombstoned by sync_push"
-    );
 }
 
-#[tokio::test]
-async fn http_sync_push_applies_incoming_links() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // v0.6.2 (#325) — sync_push's `links` field applies the listed
-    // (source, target, relation) triples via db::create_link on the
-    // receiver so peer-side link fanout works for scenario-11.
-    // (a2a-hermes-v0.6.1-r15.)
-    let state = test_state();
-    let now = Utc::now().to_rfc3339();
+#[test]
+fn http_sync_push_applies_incoming_links() {
+    with_legacy_push_env("http_sync_push_applies_incoming_links", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // v0.6.2 (#325) — sync_push's `links` field applies the listed
+        // (source, target, relation) triples via db::create_link on the
+        // receiver so peer-side link fanout works for scenario-11.
+        // (a2a-hermes-v0.6.1-r15.)
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
 
-    // Seed two memories on the receiver so the link has valid endpoints.
-    let (m1, m2) = {
+        // Seed two memories on the receiver so the link has valid endpoints.
+        let (m1, m2) = {
+            let lock = state.lock().await;
+            let m1 = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "link-fanout".into(),
+                title: "source".into(),
+                content: "a".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "ai:seeder"}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            let m1_id = db::insert(&lock.0, &m1).unwrap();
+            let m2 = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "link-fanout".into(),
+                title: "target".into(),
+                content: "b".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "ai:seeder"}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            let m2_id = db::insert(&lock.0, &m2).unwrap();
+            (m1_id, m2_id)
+        };
+
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
+
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-alice",
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "links": [{
+                "source_id": m1,
+                "target_id": m2,
+                "relation": "related_to",
+                "created_at": now,
+            }],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .header("x-agent-id", "local-receiver")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["links_applied"], 1);
+
         let lock = state.lock().await;
-        let m1 = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Mid,
-            namespace: "link-fanout".into(),
-            title: "source".into(),
-            content: "a".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({"agent_id": "ai:seeder"}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
-        };
-        let m1_id = db::insert(&lock.0, &m1).unwrap();
-        let m2 = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Mid,
-            namespace: "link-fanout".into(),
-            title: "target".into(),
-            content: "b".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({"agent_id": "ai:seeder"}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
-        };
-        let m2_id = db::insert(&lock.0, &m2).unwrap();
-        (m1_id, m2_id)
-    };
-
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
-
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-alice",
-        "sender_clock": {"entries": {}},
-        "memories": [],
-        "links": [{
-            "source_id": m1,
-            "target_id": m2,
-            "relation": "related_to",
-            "created_at": now,
-        }],
-        "dry_run": false
+        let links = db::get_links(&lock.0, &m1).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target_id, m2);
+        assert_eq!(
+            links[0].relation,
+            crate::models::MemoryLinkRelation::RelatedTo
+        );
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "local-receiver")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["links_applied"], 1);
-
-    let lock = state.lock().await;
-    let links = db::get_links(&lock.0, &m1).unwrap();
-    assert_eq!(links.len(), 1);
-    assert_eq!(links[0].target_id, m2);
-    assert_eq!(
-        links[0].relation,
-        crate::models::MemoryLinkRelation::RelatedTo
-    );
 }
 
 // v0.7.0 fix-campaign A3 (LINK-PARITY, #690) — the federation
 // receive path must refuse a cycle-closing `reflects_on` edge even
 // when the inbound link comes from a peer. mTLS + Ed25519 doesn't
 // grant peers the right to corrupt the local reflection DAG.
-#[tokio::test]
-async fn http_sync_push_refuses_reflection_cycle_from_peer() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    use crate::config::{
-        PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
-    };
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Off);
+#[test]
+fn http_sync_push_refuses_reflection_cycle_from_peer() {
+    with_legacy_push_env("http_sync_push_refuses_reflection_cycle_from_peer", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Off);
 
-    let state = test_state();
-    // Seed two memories on the receiver and a pre-existing
-    // a --reflects_on--> b chain so a fresh b --reflects_on--> a
-    // would close the cycle. #3577 — pin created_at (newer→older pre-seed)
-    // and take the lineage std mutex only after the tokio DB lock
-    // (CONCURRENCY-20).
-    let (a_id, b_id) = {
+        let state = test_state();
+        // Seed two memories on the receiver and a pre-existing
+        // a --reflects_on--> b chain so a fresh b --reflects_on--> a
+        // would close the cycle. #3577 — pin created_at (newer→older pre-seed)
+        // and take the lineage std mutex only after the tokio DB lock
+        // (CONCURRENCY-20).
+        let (a_id, b_id) = {
+            let lock = state.lock().await;
+            let _lineage = crate::test_support::no_lineage_dag_guard();
+            let a = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "a3-fed-cycle".into(),
+                title: "a".into(),
+                content: "a".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: crate::test_support::LINEAGE_FIXTURE_NEWER_AT.into(),
+                updated_at: crate::test_support::LINEAGE_FIXTURE_NEWER_AT.into(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            let a_id = db::insert(&lock.0, &a).unwrap();
+            let b = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "a3-fed-cycle".into(),
+                title: "b".into(),
+                content: "b".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: crate::test_support::LINEAGE_FIXTURE_OLDER_AT.into(),
+                updated_at: crate::test_support::LINEAGE_FIXTURE_OLDER_AT.into(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            let b_id = db::insert(&lock.0, &b).unwrap();
+            db::create_link(&lock.0, &a_id, &b_id, "reflects_on").unwrap();
+            (a_id, b_id)
+        };
+
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
+        // Link-row stamp only (Pass 0 compares memory `created_at`, pinned above).
+        let now = chrono::Utc::now().to_rfc3339();
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-alice",
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "links": [{
+                "source_id": b_id,
+                "target_id": a_id,
+                "relation": "reflects_on",
+                "created_at": now,
+            }],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .header("x-agent-id", "local-receiver")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // sync_push always responds 200; the cycle refusal manifests
+        // as `links_applied=0` and a warn log on the receiver. The
+        // load-bearing assertion is that the cycle edge did NOT land
+        // in the local graph.
+        assert_eq!(resp.status(), StatusCode::OK);
         let lock = state.lock().await;
-        let _lineage = crate::test_support::no_lineage_dag_guard();
-        let a = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            namespace: "a3-fed-cycle".into(),
-            title: "a".into(),
-            content: "a".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: crate::test_support::LINEAGE_FIXTURE_NEWER_AT.into(),
-            updated_at: crate::test_support::LINEAGE_FIXTURE_NEWER_AT.into(),
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
-        };
-        let a_id = db::insert(&lock.0, &a).unwrap();
-        let b = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            namespace: "a3-fed-cycle".into(),
-            title: "b".into(),
-            content: "b".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: crate::test_support::LINEAGE_FIXTURE_OLDER_AT.into(),
-            updated_at: crate::test_support::LINEAGE_FIXTURE_OLDER_AT.into(),
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
-        };
-        let b_id = db::insert(&lock.0, &b).unwrap();
-        db::create_link(&lock.0, &a_id, &b_id, "reflects_on").unwrap();
-        (a_id, b_id)
-    };
-
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
-    // Link-row stamp only (Pass 0 compares memory `created_at`, pinned above).
-    let now = chrono::Utc::now().to_rfc3339();
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-alice",
-        "sender_clock": {"entries": {}},
-        "memories": [],
-        "links": [{
-            "source_id": b_id,
-            "target_id": a_id,
-            "relation": "reflects_on",
-            "created_at": now,
-        }],
-        "dry_run": false
+        let links_from_b = db::get_links(&lock.0, &b_id).unwrap();
+        let landed = links_from_b.iter().any(|l| {
+            l.source_id == b_id
+                && l.target_id == a_id
+                && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
+        });
+        assert!(
+            !landed,
+            "cycle-closing reflects_on must NOT land via sync_push"
+        );
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "local-receiver")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    // sync_push always responds 200; the cycle refusal manifests
-    // as `links_applied=0` and a warn log on the receiver. The
-    // load-bearing assertion is that the cycle edge did NOT land
-    // in the local graph.
-    assert_eq!(resp.status(), StatusCode::OK);
-    let lock = state.lock().await;
-    let links_from_b = db::get_links(&lock.0, &b_id).unwrap();
-    let landed = links_from_b.iter().any(|l| {
-        l.source_id == b_id
-            && l.target_id == a_id
-            && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
-    });
-    assert!(
-        !landed,
-        "cycle-closing reflects_on must NOT land via sync_push"
-    );
 }
 
 // v0.7.0 fix-campaign A3 (LINK-PARITY, #690) — federation receive
@@ -2076,128 +2140,131 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
 //
 // Pre-A3, ALL inbound links bypassed K9 because the gate was
 // MCP-only — A3 closes that with the bypass keyed on attest_level.
-#[tokio::test]
-async fn http_sync_push_governance_bypass_on_peer_attested() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    use crate::config::{
-        PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
-    };
-    let _gate = lock_permissions_mode_for_test();
-    // K9 in Off mode — exercising the cycle-only fast path. (A
-    // full peer_attested verify needs an enrolled pubkey and a
-    // signed CBOR payload; that's covered by the inbound storage
-    // tests in storage/mod.rs::a3_create_link_inbound_*. Here we
-    // assert the wire-level happy path: a federation push lands a
-    // legitimate link even when K9 governance is configured.)
-    override_active_permissions_mode_for_test(PermissionsMode::Off);
-
-    let state = test_state();
-    let now = Utc::now().to_rfc3339();
-    let (s_id, t_id) = {
-        let lock = state.lock().await;
-        let s = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            namespace: "a3-fed-bypass".into(),
-            title: "src".into(),
-            content: "src".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
+#[test]
+fn http_sync_push_governance_bypass_on_peer_attested() {
+    with_legacy_push_env("http_sync_push_governance_bypass_on_peer_attested", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
         };
-        let s_id = db::insert(&lock.0, &s).unwrap();
-        let t = Memory {
-            cid: None,
-            valid_from: None,
-            valid_until: None,
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            namespace: "a3-fed-bypass".into(),
-            title: "tgt".into(),
-            content: "tgt".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "api".into(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: serde_json::json!({}),
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-            lifecycle_state: crate::models::LifecycleState::Open,
-        };
-        let t_id = db::insert(&lock.0, &t).unwrap();
-        (s_id, t_id)
-    };
+        let _gate = lock_permissions_mode_for_test();
+        // K9 in Off mode — exercising the cycle-only fast path. (A
+        // full peer_attested verify needs an enrolled pubkey and a
+        // signed CBOR payload; that's covered by the inbound storage
+        // tests in storage/mod.rs::a3_create_link_inbound_*. Here we
+        // assert the wire-level happy path: a federation push lands a
+        // legitimate link even when K9 governance is configured.)
+        override_active_permissions_mode_for_test(PermissionsMode::Off);
 
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-alice",
-        "sender_clock": {"entries": {}},
-        "memories": [],
-        "links": [{
-            "source_id": s_id,
-            "target_id": t_id,
-            "relation": "related_to",
-            "created_at": now,
-        }],
-        "dry_run": false
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
+        let (s_id, t_id) = {
+            let lock = state.lock().await;
+            let s = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "a3-fed-bypass".into(),
+                title: "src".into(),
+                content: "src".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            let s_id = db::insert(&lock.0, &s).unwrap();
+            let t = Memory {
+                cid: None,
+                valid_from: None,
+                valid_until: None,
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "a3-fed-bypass".into(),
+                title: "tgt".into(),
+                content: "tgt".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
+            };
+            let t_id = db::insert(&lock.0, &t).unwrap();
+            (s_id, t_id)
+        };
+
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-alice",
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "links": [{
+                "source_id": s_id,
+                "target_id": t_id,
+                "relation": "related_to",
+                "created_at": now,
+            }],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .header("x-agent-id", "local-receiver")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["links_applied"], 1);
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "local-receiver")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["links_applied"], 1);
 }
 
 #[tokio::test]
@@ -6538,126 +6605,140 @@ async fn http_get_stats_empty_db() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-#[tokio::test]
-async fn http_sync_push_namespace_meta_clears_garbage_skipped() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // namespace_meta_clears with a malformed namespace must be skipped
-    // (not crash, not cleared).
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-x",
-        "memories": [],
-        "namespace_meta_clears": ["BAD NAMESPACE!"],
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+#[test]
+fn http_sync_push_namespace_meta_clears_garbage_skipped() {
+    with_legacy_push_env(
+        "http_sync_push_namespace_meta_clears_garbage_skipped",
+        async {
+            // #1789 — downstream-intent test; opt back to permissive enrollment.
+            let _fed = PermissiveFedEnv::new();
+            // namespace_meta_clears with a malformed namespace must be skipped
+            // (not crash, not cleared).
+            let state = test_state();
+            let app = Router::new()
+                .route("/api/v1/sync/push", axum_post(sync_push))
+                .with_state(test_app_state(state));
+            let body = serde_json::json!({
+                "sender_agent_id": "peer-x",
+                "memories": [],
+                "namespace_meta_clears": ["BAD NAMESPACE!"],
+            });
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/v1/sync/push")
+                        .method("POST")
+                        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        },
+    );
 }
 
-#[tokio::test]
-async fn http_sync_push_pending_decision_invalid_id_skipped() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // pending_decisions with an invalid id must be skipped (not crash).
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-x",
-        "memories": [],
-        "pending_decisions": [
-            {"id": "BAD ID!", "approved": true, "decider": "alice"}
-        ],
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+#[test]
+fn http_sync_push_pending_decision_invalid_id_skipped() {
+    with_legacy_push_env(
+        "http_sync_push_pending_decision_invalid_id_skipped",
+        async {
+            // #1789 — downstream-intent test; opt back to permissive enrollment.
+            let _fed = PermissiveFedEnv::new();
+            // pending_decisions with an invalid id must be skipped (not crash).
+            let state = test_state();
+            let app = Router::new()
+                .route("/api/v1/sync/push", axum_post(sync_push))
+                .with_state(test_app_state(state));
+            let body = serde_json::json!({
+                "sender_agent_id": "peer-x",
+                "memories": [],
+                "pending_decisions": [
+                    {"id": "BAD ID!", "approved": true, "decider": "alice"}
+                ],
+            });
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/v1/sync/push")
+                        .method("POST")
+                        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        },
+    );
 }
 
-#[tokio::test]
-async fn http_sync_push_namespace_meta_invalid_skipped() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // namespace_meta with an invalid namespace OR invalid standard_id
-    // should be skipped (incremented under skipped, not applied).
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-x",
-        "memories": [],
-        "namespace_meta": [
-            {"namespace": "BAD NS!", "standard_id": "11111111-1111-4111-8111-111111111111", "parent_namespace": null}
-        ],
+#[test]
+fn http_sync_push_namespace_meta_invalid_skipped() {
+    with_legacy_push_env("http_sync_push_namespace_meta_invalid_skipped", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // namespace_meta with an invalid namespace OR invalid standard_id
+        // should be skipped (incremented under skipped, not applied).
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-x",
+            "memories": [],
+            "namespace_meta": [
+                {"namespace": "BAD NS!", "standard_id": "11111111-1111-4111-8111-111111111111", "parent_namespace": null}
+            ],
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
 }
 
-#[tokio::test]
-async fn http_sync_push_dry_run_namespace_meta_no_apply() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    // dry_run: namespace_meta entries are counted as noop, not applied.
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state.clone()));
-    let body = serde_json::json!({
-        "sender_agent_id": "peer-x",
-        "memories": [],
-        "dry_run": true,
-        "namespace_meta_clears": ["preview-ns"],
-        "pending_decisions": [
-            {"id": "11111111-1111-4111-8111-111111111111", "approved": true, "decider": "alice"}
-        ],
+#[test]
+fn http_sync_push_dry_run_namespace_meta_no_apply() {
+    with_legacy_push_env("http_sync_push_dry_run_namespace_meta_no_apply", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        // dry_run: namespace_meta entries are counted as noop, not applied.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-x",
+            "memories": [],
+            "dry_run": true,
+            "namespace_meta_clears": ["preview-ns"],
+            "pending_decisions": [
+                {"id": "11111111-1111-4111-8111-111111111111", "approved": true, "decider": "alice"}
+            ],
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ----------------------------------------------------------------
@@ -14103,328 +14184,355 @@ fn over_max_string_vec(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("id-{i:040}")).collect()
 }
 
-#[tokio::test]
-async fn http_sync_push_oversize_deletions_returns_400() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-        "deletions": over_max_string_vec(MAX_BULK_SIZE + 1),
+#[test]
+fn http_sync_push_oversize_deletions_returns_400() {
+    with_legacy_push_env("http_sync_push_oversize_deletions_returns_400", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "sender_agent_id": "ai:peer",
+            "memories": [],
+            "deletions": over_max_string_vec(MAX_BULK_SIZE + 1),
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("deletions per request"),
+            "{v:?}"
+        );
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap()
-            .contains("deletions per request"),
-        "{v:?}"
+}
+
+#[test]
+fn http_sync_push_oversize_archives_returns_400() {
+    with_legacy_push_env("http_sync_push_oversize_archives_returns_400", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "sender_agent_id": "ai:peer",
+            "memories": [],
+            "archives": over_max_string_vec(MAX_BULK_SIZE + 1),
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("archives"));
+    });
+}
+
+#[test]
+fn http_sync_push_oversize_restores_returns_400() {
+    with_legacy_push_env("http_sync_push_oversize_restores_returns_400", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "sender_agent_id": "ai:peer",
+            "memories": [],
+            "restores": over_max_string_vec(MAX_BULK_SIZE + 1),
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("restores"));
+    });
+}
+
+#[test]
+fn http_sync_push_oversize_namespace_meta_clears_returns_400() {
+    with_legacy_push_env(
+        "http_sync_push_oversize_namespace_meta_clears_returns_400",
+        async {
+            // #1789 — downstream-intent test; opt back to permissive enrollment.
+            let _fed = PermissiveFedEnv::new();
+            let state = test_state();
+            let app = Router::new()
+                .route("/api/v1/sync/push", axum_post(sync_push))
+                .with_state(test_app_state(state));
+            let body = serde_json::json!({
+                "sender_agent_id": "ai:peer",
+                "memories": [],
+                "namespace_meta_clears": over_max_string_vec(MAX_BULK_SIZE + 1),
+            });
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/v1/sync/push")
+                        .method("POST")
+                        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("namespace_meta_clears")
+            );
+        },
     );
 }
 
-#[tokio::test]
-async fn http_sync_push_oversize_archives_returns_400() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-        "archives": over_max_string_vec(MAX_BULK_SIZE + 1),
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(v["error"].as_str().unwrap().contains("archives"));
-}
-
-#[tokio::test]
-async fn http_sync_push_oversize_restores_returns_400() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-        "restores": over_max_string_vec(MAX_BULK_SIZE + 1),
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(v["error"].as_str().unwrap().contains("restores"));
-}
-
-#[tokio::test]
-async fn http_sync_push_oversize_namespace_meta_clears_returns_400() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-        "namespace_meta_clears": over_max_string_vec(MAX_BULK_SIZE + 1),
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap()
-            .contains("namespace_meta_clears")
+#[test]
+fn http_sync_push_invalid_sender_agent_id_returns_400() {
+    with_legacy_push_env(
+        "http_sync_push_invalid_sender_agent_id_returns_400",
+        async {
+            // #1789 — downstream-intent test; opt back to permissive enrollment.
+            let _fed = PermissiveFedEnv::new();
+            let state = test_state();
+            let app = Router::new()
+                .route("/api/v1/sync/push", axum_post(sync_push))
+                .with_state(test_app_state(state));
+            // Spaces aren't valid agent ids.
+            let body = serde_json::json!({
+                "sender_agent_id": "bad agent id",
+                "memories": [],
+            });
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/v1/sync/push")
+                        .method("POST")
+                        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(v["error"].as_str().unwrap().contains("sender_agent_id"));
+        },
     );
 }
 
-#[tokio::test]
-async fn http_sync_push_invalid_sender_agent_id_returns_400() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    // Spaces aren't valid agent ids.
-    let body = serde_json::json!({
-        "sender_agent_id": "bad agent id",
-        "memories": [],
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(v["error"].as_str().unwrap().contains("sender_agent_id"));
-}
-
-#[tokio::test]
-async fn http_sync_push_invalid_x_agent_id_header_returns_400() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-    });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "bad agent id")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+#[test]
+fn http_sync_push_invalid_x_agent_id_header_returns_400() {
+    with_legacy_push_env(
+        "http_sync_push_invalid_x_agent_id_header_returns_400",
+        async {
+            // #1789 — downstream-intent test; opt back to permissive enrollment.
+            let _fed = PermissiveFedEnv::new();
+            let state = test_state();
+            let app = Router::new()
+                .route("/api/v1/sync/push", axum_post(sync_push))
+                .with_state(test_app_state(state));
+            let body = serde_json::json!({
+                "sender_agent_id": "ai:peer",
+                "memories": [],
+            });
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/v1/sync/push")
+                        .method("POST")
+                        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                        .header("x-agent-id", "bad agent id")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        },
+    );
 }
 
 // ---- sync_push: applies pending decisions and namespace_meta paths ----
 
-#[tokio::test]
-async fn http_sync_push_pending_invalid_id_skipped() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let bad_id = "x".repeat(200); // exceeds MAX_ID_LEN
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-        "pendings": [{
-            "id": bad_id,
-            "action_type": "store",
-            "memory_id": null,
-            "namespace": "ns",
-            "payload": {},
-            "requested_by": "ai:peer",
-            "requested_at": "2024-01-01T00:00:00Z",
-            "status": "pending",
-            "approvals": [],
-        }],
+#[test]
+fn http_sync_push_pending_invalid_id_skipped() {
+    with_legacy_push_env("http_sync_push_pending_invalid_id_skipped", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state));
+        let bad_id = "x".repeat(200); // exceeds MAX_ID_LEN
+        let body = serde_json::json!({
+            "sender_agent_id": "ai:peer",
+            "memories": [],
+            "pendings": [{
+                "id": bad_id,
+                "action_type": "store",
+                "memory_id": null,
+                "namespace": "ns",
+                "payload": {},
+                "requested_by": "ai:peer",
+                "requested_at": "2024-01-01T00:00:00Z",
+                "status": "pending",
+                "approvals": [],
+            }],
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["skipped"], 1);
+        assert_eq!(v["pendings_applied"], 0);
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["skipped"], 1);
-    assert_eq!(v["pendings_applied"], 0);
 }
 
-#[tokio::test]
-async fn http_sync_push_links_invalid_id_skipped() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    // Self-link is invalid via validate_link.
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-        "links": [{
-            "source_id": "abc",
-            "target_id": "abc",
-            "relation": "related_to",
-            "created_at": "2024-01-01T00:00:00Z",
-        }],
+#[test]
+fn http_sync_push_links_invalid_id_skipped() {
+    with_legacy_push_env("http_sync_push_links_invalid_id_skipped", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state));
+        // Self-link is invalid via validate_link.
+        let body = serde_json::json!({
+            "sender_agent_id": "ai:peer",
+            "memories": [],
+            "links": [{
+                "source_id": "abc",
+                "target_id": "abc",
+                "relation": "related_to",
+                "created_at": "2024-01-01T00:00:00Z",
+            }],
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["skipped"], 1);
+        assert_eq!(v["links_applied"], 0);
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["skipped"], 1);
-    assert_eq!(v["links_applied"], 0);
 }
 
-#[tokio::test]
-async fn http_sync_push_dry_run_links_no_apply() {
-    // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
-    let state = test_state();
-    let src = insert_test_memory(&state, "dryrun-links", "src").await;
-    let tgt = insert_test_memory(&state, "dryrun-links", "tgt").await;
-    let app = Router::new()
-        .route("/api/v1/sync/push", axum_post(sync_push))
-        .with_state(test_app_state(state));
-    let body = serde_json::json!({
-        "sender_agent_id": "ai:peer",
-        "memories": [],
-        "links": [{
-            "source_id": src,
-            "target_id": tgt,
-            "relation": "related_to",
-            "created_at": "2024-01-01T00:00:00Z",
-        }],
-        "dry_run": true,
+#[test]
+fn http_sync_push_dry_run_links_no_apply() {
+    with_legacy_push_env("http_sync_push_dry_run_links_no_apply", async {
+        // #1789 — downstream-intent test; opt back to permissive enrollment.
+        let _fed = PermissiveFedEnv::new();
+        let state = test_state();
+        let src = insert_test_memory(&state, "dryrun-links", "src").await;
+        let tgt = insert_test_memory(&state, "dryrun-links", "tgt").await;
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "sender_agent_id": "ai:peer",
+            "memories": [],
+            "links": [{
+                "source_id": src,
+                "target_id": tgt,
+                "relation": "related_to",
+                "created_at": "2024-01-01T00:00:00Z",
+            }],
+            "dry_run": true,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["links_applied"], 0);
+        assert_eq!(v["dry_run"], true);
     });
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/push")
-                .method("POST")
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["links_applied"], 0);
-    assert_eq!(v["dry_run"], true);
 }
 
 // ---- consolidate_memories validation: tier=short clamps title ----

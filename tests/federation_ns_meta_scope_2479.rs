@@ -714,54 +714,102 @@ async fn control_global_standard_allowed_under_double_star_scope_2479() {
 // CONTROLS — zero-config, Layer 2, batch survival.
 // ---------------------------------------------------------------------------
 
-/// ZERO-CONFIG must stay BYTE-IDENTICAL: with no `AI_MEMORY_FED_PEER_ATTESTATION`
-/// the whole gate short-circuits, and every body the cells above refuse applies.
-/// This is the #2491 silent-outage control — the delete lane went dark because a
-/// gate ran unconditionally.
+/// #3582: the same body refuses under default/explicit required scope and
+/// applies with a declared scope or the explicit Standard rollout opt-out.
 #[tokio::test]
-async fn zero_config_replication_is_byte_identical_2479() {
+async fn no_allowlist_namespace_meta_posture_matrix_3582() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
-    set_posture(None, Some("1"));
-    let (router, db) = build_router_with_db();
+    // #3582: identical mutations under default/explicit denial, rollout opt-out,
+    // and an explicit peer scope. All environment access holds the binary lock.
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        let allowlist = scoped.then_some(
+            r#"{"ai:evil":{"allowed_namespaces":["**"],"allowed_sender_agent_ids":["ai:evil"]}}"#,
+        );
+        set_posture(allowlist, require);
+        let (router, db) = build_router_with_db();
 
-    let victim_standard = seed_standard_memory(&router, VICTIM_NS, "victim standard", None).await;
-    let evil_standard = seed_standard_memory(&router, IN_SCOPE_NS, "evil standard", None).await;
-    let global_standard = seed_standard_memory(&router, "alpha", "global standard", None).await;
-    bind_standard_locally(&db, VICTIM_NS, &victim_standard, None).await;
-    let doomed = seed_standard_memory(&router, "alpha", "doomed standard", None).await;
-    bind_standard_locally(&db, "beta", &doomed, None).await;
+        let victim_standard =
+            seed_standard_memory(&router, VICTIM_NS, "victim standard", None).await;
+        let evil_standard = seed_standard_memory(&router, IN_SCOPE_NS, "evil standard", None).await;
+        let global_standard = seed_standard_memory(&router, "alpha", "global standard", None).await;
+        bind_standard_locally(&db, VICTIM_NS, &victim_standard, None).await;
+        let doomed = seed_standard_memory(&router, "alpha", "doomed standard", None).await;
+        bind_standard_locally(&db, "beta", &doomed, None).await;
 
-    let (status, report) = push_namespace_meta(
-        &router,
-        vec![
-            meta_entry(VICTIM_NS, &evil_standard, None),
-            meta_entry("*", &global_standard, None),
-            meta_entry("alpha", &evil_standard, Some("victim")),
-        ],
-        vec!["beta"],
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+        let before = {
+            let guard = db.lock().await;
+            [VICTIM_NS, "*", "alpha", "beta"].map(|namespace| {
+                ai_memory::db::get_namespace_meta_entry(&guard.0, namespace)
+                    .expect("snapshot metadata")
+                    .map(|entry| serde_json::to_value(entry).expect("serialize metadata"))
+            })
+        };
 
-    assert_eq!(
-        stored_standard(&db, VICTIM_NS).await.as_deref(),
-        Some(evil_standard.as_str()),
-        "zero-config must keep applying: {report}"
-    );
-    assert_eq!(
-        stored_standard(&db, "*").await.as_deref(),
-        Some(global_standard.as_str()),
-        "zero-config must keep applying to the global standard: {report}"
-    );
-    assert_eq!(stored_parent(&db, "alpha").await.as_deref(), Some("victim"));
-    assert!(
-        stored_standard(&db, "beta").await.is_none(),
-        "clear applied"
-    );
-    assert_eq!(counter(&report, "namespace_meta_applied"), 3, "{report}");
-    assert_eq!(counter(&report, "namespace_meta_cleared"), 1, "{report}");
-    assert_eq!(counter(&report, "namespace_meta_refused"), 0, "{report}");
+        let (status, report) = push_namespace_meta(
+            &router,
+            vec![
+                meta_entry(VICTIM_NS, &evil_standard, None),
+                meta_entry("*", &global_standard, None),
+                meta_entry("alpha", &evil_standard, Some("victim")),
+            ],
+            vec!["beta"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if !allowed {
+            let guard = db.lock().await;
+            let after = [VICTIM_NS, "*", "alpha", "beta"].map(|namespace| {
+                ai_memory::db::get_namespace_meta_entry(&guard.0, namespace)
+                    .expect("snapshot metadata after refusal")
+                    .map(|entry| serde_json::to_value(entry).expect("serialize metadata"))
+            });
+            assert_eq!(after, before, "full metadata rows unchanged: {report}");
+        }
+
+        assert_eq!(
+            stored_standard(&db, VICTIM_NS).await.as_deref(),
+            Some(if allowed {
+                evil_standard.as_str()
+            } else {
+                victim_standard.as_str()
+            }),
+            "#3582: rebind persisted state scoped={scoped} require={require:?}"
+        );
+        assert_eq!(
+            stored_standard(&db, "*").await.as_deref(),
+            allowed.then_some(global_standard.as_str()),
+            "{report}"
+        );
+        assert_eq!(
+            stored_parent(&db, "alpha").await.as_deref(),
+            allowed.then_some("victim")
+        );
+        assert_eq!(
+            stored_standard(&db, "beta").await.as_deref(),
+            (!allowed).then_some(doomed.as_str())
+        );
+        assert_eq!(
+            counter(&report, "namespace_meta_applied"),
+            if allowed { 3 } else { 0 },
+            "{report}"
+        );
+        assert_eq!(
+            counter(&report, "namespace_meta_cleared"),
+            u64::from(allowed),
+            "{report}"
+        );
+        assert_eq!(
+            counter(&report, "namespace_meta_refused"),
+            if allowed { 0 } else { 4 },
+            "{report}"
+        );
+    }
 }
 
 /// LAYER 2 — an ENROLLED peer that declares NO scope is the ONE shape env row

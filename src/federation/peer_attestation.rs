@@ -72,8 +72,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Env var carrying the operator's per-peer attestation allowlist
-/// (JSON). **Absent / empty** = genuine zero-config (faith-based
-/// replication; [`PeerAttestationConfig::has_allowlist`] is false).
+/// (JSON). **Absent / empty** = no configured authorization
+/// ([`PeerAttestationConfig::has_allowlist`] is false). Default-required
+/// namespace checks refuse writes; Standard permits an explicit opt-out.
 /// **Present but unparseable** = configured-broken posture (#2504):
 /// `has_allowlist` is true with an empty peer map so destructive
 /// inbound lanes fail closed rather than degrading to "trust everyone".
@@ -140,8 +141,10 @@ pub struct PeerScope {
 ///
 /// ## Zero-config vs present-but-broken (#2504)
 ///
-/// - **Env unset / empty string** — genuine zero-config: `has_allowlist()` is
-///   false; inbound write/delete lanes keep faith-based replication (#2491).
+/// - **Env unset / empty string** — absent authorization: `has_allowlist()`
+///   is false. Default-required inbound namespace checks refuse writes and
+///   deletes (#3582); Standard's explicit require-scope `0` retains the
+///   legacy namespace opt-out. Key enrollment remains a separate check.
 /// - **Env set to valid JSON (including `{}`)** — configured posture:
 ///   `has_allowlist()` is true. An empty peer map means no peer is enrolled
 ///   (fail closed for namespace + TOFU), **not** zero-config.
@@ -154,6 +157,8 @@ pub struct PeerAttestationConfig {
     /// #2504 — true when `AI_MEMORY_FED_PEER_ATTESTATION` was present
     /// (non-empty). Distinguishes Unset from `{}` / parse-error.
     env_present: bool,
+    /// Only malformed configured input sets this; `{}` is a valid deny-all map.
+    broken: bool,
 }
 
 /// Reason a body-claimed `sender_agent_id` failed attestation against
@@ -193,6 +198,7 @@ impl PeerAttestationConfig {
         Self {
             peers,
             env_present: true,
+            broken: false,
         }
     }
 
@@ -250,9 +256,11 @@ impl PeerAttestationConfig {
                      gates stay ON with an empty peer map (unenrolled peers \
                      refused; federated DELETE is NOT wide-open). Linux env \
                      values are arbitrary bytes — a mis-encoded (e.g. Latin-1) \
-                     EnvironmentFile lands here. Fix the value's encoding (or \
-                     remove the env var for genuine zero-config faith \
-                     replication)."
+                     EnvironmentFile lands here. Fix the encoding and supply \
+                     a valid, nonempty namespace allowlist. Removing the env \
+                     var does not disable default-required namespace checks; \
+                     asi-hard refuses boot with configured peers and no usable \
+                     allowlist (#3582)."
                 );
                 Self::configured_broken()
             }
@@ -269,6 +277,7 @@ impl PeerAttestationConfig {
             Ok(peers) => Self {
                 peers,
                 env_present: true,
+                broken: false,
             },
             Err(e) => {
                 tracing::warn!(
@@ -279,9 +288,12 @@ impl PeerAttestationConfig {
                      treating as CONFIGURED-BROKEN (#2504): confinement \
                      gates stay ON with an empty peer map (unenrolled \
                      peers refused; federated DELETE is NOT wide-open). \
-                     Fix the JSON (or remove the env var for genuine \
-                     zero-config faith replication). deny_unknown_fields \
-                     is enabled on PeerScope — typo'd keys fail here too."
+                     Fix the JSON and supply a valid, nonempty namespace \
+                     allowlist. Removing the env var does not disable \
+                     default-required namespace checks; asi-hard refuses boot \
+                     with configured peers and no usable allowlist (#3582). \
+                     deny_unknown_fields is enabled on PeerScope — typo'd \
+                     keys fail here too."
                 );
                 Self::configured_broken()
             }
@@ -296,6 +308,7 @@ impl PeerAttestationConfig {
         Self {
             peers: HashMap::new(),
             env_present: true,
+            broken: true,
         }
     }
 
@@ -309,7 +322,8 @@ impl PeerAttestationConfig {
     /// Whether the operator has an **active** peer-attestation config.
     ///
     /// - **false** only for genuine zero-config (env unset/empty AND no
-    ///   programmatic peers) — handlers use faith-based replication.
+    ///   programmatic peers). Namespace gates still consult the default-on
+    ///   require-scope flag; absence alone grants no write permission (#3582).
     /// - **true** when the env var was present (even if JSON was `{}` or
     ///   unparseable — #2504) OR when peers were supplied programmatically.
     ///
@@ -318,6 +332,12 @@ impl PeerAttestationConfig {
     #[must_use]
     pub fn has_allowlist(&self) -> bool {
         self.env_present || !self.peers.is_empty()
+    }
+
+    /// Whether configured input could not be parsed (#3582).
+    #[must_use]
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// #2504 — env was present but peers are empty (parse error or `{}`).
@@ -342,12 +362,17 @@ fn warn_present_but_empty_once() {
             target: "federation::peer_attestation",
             env = PEER_ATTESTATION_ENV,
             "peer-attestation env var is present but empty / whitespace-only \
-             — treating as ZERO-CONFIG faith-based replication \
-             (has_allowlist() == false). If you meant to enrol peers, the \
-             value is likely an unexpanded shell reference (e.g. \
+             — no allowlist (has_allowlist() == false). Default-required \
+             namespace checks refuse writes; only Standard's explicit \
+             AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 opt-out permits \
+             absent-allowlist namespace authorization. Other identity and \
+             authorship gates still apply. Asi-hard refuses boot with \
+             configured peers and no usable allowlist (#3582). The value \
+             may be an unexpanded shell reference (e.g. \
              AI_MEMORY_FED_PEER_ATTESTATION=\"${{FED_PEERS}}\" with FED_PEERS \
-             unset): set it to the JSON allowlist, or remove it entirely to \
-             silence this notice."
+             unset): set a valid, nonempty JSON namespace allowlist. Removing \
+             the empty env var silences this notice but grants no namespace \
+             permission."
         );
     });
 }
@@ -516,6 +541,18 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect();
         PeerAttestationConfig::from_peers(peers)
+    }
+
+    #[test]
+    fn empty_and_broken_configs_have_distinct_boot_state_3582() {
+        for value in ["{}", "invalid-json", r#"{"peer":{"unknown":true}}"#] {
+            let config = PeerAttestationConfig::from_present_value(value);
+            assert!(config.has_allowlist());
+            assert!(config.is_configured_empty());
+            assert_eq!(config.is_broken(), value != "{}");
+        }
+        assert!(!PeerAttestationConfig::default().is_broken());
+        assert!(!PeerAttestationConfig::from_peers(HashMap::new()).is_broken());
     }
 
     // ---- attest_sender ---------------------------------------------------
@@ -810,7 +847,7 @@ mod tests {
         // `AI_MEMORY_FED_PEER_ATTESTATION="${FED_PEERS}"`-with-FED_PEERS-unset
         // producer) is documented-intentional zero-config: it must NOT flip
         // into the configured-broken posture, so `has_allowlist()` stays false
-        // and the handlers keep faith-based replication.
+        // while default-required namespace checks still refuse writes (#3582).
         let _g = lock_env();
         unsafe { std::env::set_var(PEER_ATTESTATION_ENV, "   ") };
         let cfg = PeerAttestationConfig::from_env();

@@ -148,6 +148,12 @@ async fn post_sync_push(router: &axum::Router, body: Value, peer_id: &str) -> (S
 /// caller must clear these in a teardown.
 fn relax_fed_gates() {
     unsafe {
+        // #3582: explicit Standard namespace opt-out lets this downstream
+        // control run; the required-scope refusal is pinned in its own suite.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
         std::env::set_var(
@@ -172,6 +178,7 @@ fn relax_fed_gates() {
 
 fn clear_fed_gates() {
     unsafe {
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
         std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_WRITE_SIG_ENV);

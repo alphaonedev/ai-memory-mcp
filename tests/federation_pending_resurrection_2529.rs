@@ -33,14 +33,19 @@ impl Drop for PostureGuard {
     }
 }
 
-fn clear_and_zero_config() {
+fn set_standard_scope_opt_out() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         std::env::set_var(REQUIRE_ATTEST_ENV, "0");
         std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
         std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
         std::env::remove_var(ai_memory::federation::peer_attestation::SYNC_TRUST_PEER_ENV);
-        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        // #3582: explicit Standard opt-out keeps this identity/status control
+        // independent of the default-on namespace admission requirement.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
     }
 }
 
@@ -166,7 +171,7 @@ fn pending_wire(id: &str, status: &str, approvals: &Value) -> Value {
 async fn federated_pending_cannot_resurrect_rejected_row_2529() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
-    clear_and_zero_config();
+    set_standard_scope_opt_out();
     let (router, db) = build_router_with_db();
 
     {
@@ -240,7 +245,7 @@ async fn federated_pending_cannot_resurrect_rejected_row_2529() {
 async fn federated_pending_rejects_wire_non_pending_status_2529() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
-    clear_and_zero_config();
+    set_standard_scope_opt_out();
     let (router, db) = build_router_with_db();
 
     let (st, report) = push_pendings(
@@ -260,7 +265,7 @@ async fn federated_pending_rejects_wire_non_pending_status_2529() {
 async fn control_fresh_pending_still_applies_2529() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
-    clear_and_zero_config();
+    set_standard_scope_opt_out();
     let (router, db) = build_router_with_db();
 
     let (st, report) = push_pendings(

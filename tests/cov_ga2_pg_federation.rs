@@ -67,6 +67,50 @@ use ai_memory::store::postgres::PostgresStore;
 /// serial-guard pattern as `tests/cov3_handlers_postgres`.
 static FED_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// #3582: authorize only this fixture's peer and namespace. The caller holds
+/// FED_ENV_LOCK until after this guard drops, including during panic unwinding.
+struct NamespaceScopeGuard([(&'static str, Option<std::ffi::OsString>); 2]);
+
+impl NamespaceScopeGuard {
+    fn new(peer: &str, namespace: &str) -> Self {
+        use ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV;
+        use ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+        let guard = Self([
+            (PEER_ATTESTATION_ENV, std::env::var_os(PEER_ATTESTATION_ENV)),
+            (
+                REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                std::env::var_os(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV),
+            ),
+        ]);
+        let allowlist = json!({peer: {
+            "allowed_sender_agent_ids": [peer],
+            "allowed_namespaces": [namespace],
+        }});
+        // SAFETY: every caller holds FED_ENV_LOCK; Drop restores both variables
+        // before that async mutex guard is released.
+        unsafe {
+            std::env::set_var(PEER_ATTESTATION_ENV, allowlist.to_string());
+            std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        }
+        guard
+    }
+}
+
+impl Drop for NamespaceScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: the enclosing test still holds FED_ENV_LOCK.
+        for (key, previous) in &self.0 {
+            unsafe {
+                if let Some(value) = previous {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+}
+
 const SIG_HEADER: &str = "x-memory-sig";
 const NONCE_HEADER: &str = "x-memory-nonce";
 const PEER_HEADER: &str = "x-peer-id";
@@ -382,6 +426,7 @@ async fn pg_sync_push_via_store_applies_nonempty_memory_batch() {
     let r = pg_router(&url).await;
     let peer = uniq("ai:cov-ga2-pg-peer");
     let ns = uniq("cov-ga2-pg");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
     let body = serde_json::to_vec(&json!({
         "sender_agent_id": peer,
         "sender_clock": {"entries": {}},
@@ -392,7 +437,7 @@ async fn pg_sync_push_via_store_applies_nonempty_memory_batch() {
         ]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, peer.as_str())])).await;
     clear_fed_env();
     assert!(
         status.is_success(),
@@ -443,6 +488,7 @@ async fn pg_sync_push_via_store_applies_signal() {
     let r = pg_router(&url).await;
     let peer = uniq("ai:cov-ga2-pg-sigpeer");
     let ns = uniq("cov-ga2-pg-sig");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
     let kp = ai_memory::identity::keypair::generate(&peer).expect("keypair");
 
     let mk = |id: String| ai_memory::models::Signal {
@@ -486,7 +532,7 @@ async fn pg_sync_push_via_store_applies_signal() {
         ]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, peer.as_str())])).await;
     clear_fed_env();
     assert!(
         status.is_success(),
@@ -532,6 +578,7 @@ async fn pg_sync_push_via_store_applies_action_transition() {
         std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, keydir.path());
     }
     let ns = uniq("covga2pgtx");
+    let _scope = NamespaceScopeGuard::new(&actor, &ns);
     let aid_signed = uniq("ga2pg-act-signed");
     let aid_unsigned = uniq("ga2pg-act-unsigned");
     // Seed two Pending actions on the same postgres DB the router uses.
@@ -606,7 +653,7 @@ async fn pg_sync_push_via_store_applies_action_transition() {
         ]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, actor.as_str())])).await;
     clear_fed_env();
     assert!(
         status.is_success(),
@@ -657,6 +704,7 @@ async fn pg_sync_push_via_store_shipped_embedding_defers_no_embedder() {
     let r = pg_router(&url).await;
     let peer = uniq("ai:cov-ga2-pg-emb");
     let ns = uniq("cov-ga2-pg-emb");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
     let mid = uniq("ga2pg-emb-m");
     let body = serde_json::to_vec(&json!({
         "sender_agent_id": peer,
@@ -670,7 +718,7 @@ async fn pg_sync_push_via_store_shipped_embedding_defers_no_embedder() {
         }]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, peer.as_str())])).await;
     clear_fed_env();
     assert!(
         status.is_success(),
@@ -717,6 +765,7 @@ async fn pg_sync_push_via_store_shipped_embedding_stamps_space_2167() {
     let (r, active_fp, dim) = pg_router_with_embedder(&url, model).await;
     let peer = uniq("ai:cov-ga2-pg-stamp");
     let ns = uniq("cov-ga2-pg-stamp");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
     let mid = uniq("ga2pg-stamp-m");
     // Unit vector (L2-norm 1) so `sanitize_shipped_vector` accepts it.
     let mut vector = vec![0.0_f32; dim];
@@ -733,7 +782,7 @@ async fn pg_sync_push_via_store_shipped_embedding_stamps_space_2167() {
         }]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, peer.as_str())])).await;
     clear_fed_env();
     assert!(
         status.is_success(),
@@ -836,6 +885,7 @@ async fn pg_sync_push_via_store_invalid_memory_is_skipped() {
     let r = pg_router(&url).await;
     let peer = uniq("ai:cov-ga2-pg-skip");
     let ns = uniq("cov-ga2-pg-skip");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
     let mut bad = memory_json(&uniq("ga2pg-bad-m"), &ns, &peer);
     bad["title"] = json!("");
     bad["content"] = json!("");
@@ -845,7 +895,7 @@ async fn pg_sync_push_via_store_invalid_memory_is_skipped() {
         "memories": [bad, memory_json(&uniq("ga2pg-ok-m"), &ns, &peer)]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, peer.as_str())])).await;
     clear_fed_env();
     assert!(
         status.is_success(),
@@ -890,6 +940,7 @@ async fn pg_sync_push_via_store_deletions_and_links() {
     let r = pg_router(&url).await;
     let peer = uniq("ai:cov-ga2-pg-link");
     let ns = uniq("cov-ga2-pg-link");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
     let src = uniq("ga2pg-src");
     let tgt = uniq("ga2pg-tgt");
     let seed = serde_json::to_vec(&json!({
@@ -898,7 +949,7 @@ async fn pg_sync_push_via_store_deletions_and_links() {
         "memories": [memory_json(&src, &ns, &peer), memory_json(&tgt, &ns, &peer)]
     }))
     .unwrap();
-    let (s_seed, b_seed) = decode(&r, push_req(&seed, &[])).await;
+    let (s_seed, b_seed) = decode(&r, push_req(&seed, &[(PEER_HEADER, peer.as_str())])).await;
     assert!(
         s_seed.is_success(),
         "seed acks; status={s_seed} body={b_seed}"
@@ -928,7 +979,7 @@ async fn pg_sync_push_via_store_deletions_and_links() {
         "memories": []
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, peer.as_str())])).await;
     clear_fed_env();
     assert!(
         status.is_success(),
@@ -1112,6 +1163,7 @@ async fn pg_sync_push_enrolled_signed_nonce_drives_deep_body() {
     let peer = uniq("ai:cov-ga2-pg-signed");
     let (_dir, signing) = enroll_peer(&peer);
     let ns = uniq("cov-ga2-pg-signed");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
     let body = serde_json::to_vec(&json!({
         "sender_agent_id": peer,
         "sender_clock": {"entries": {}},

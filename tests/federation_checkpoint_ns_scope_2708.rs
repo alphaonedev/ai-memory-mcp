@@ -31,7 +31,7 @@
 //!
 //! Every test here is R-203-shaped: the exploit FAILS on the parent commit
 //! (the CAS resolves the out-of-scope anchor) and PASSES after. The posture
-//! guards pin the regressions a naive fix would cause (zero-config unaffected;
+//! guards pin the regressions a naive fix would cause (absent-allowlist denial plus explicit opt-out;
 //! in-scope resolution still applies; first-resolution-wins idempotency held).
 //!
 //! Postgres note (UPDATED at #3075): this file used to say the pg funnel
@@ -126,6 +126,14 @@ fn reset_env(scoped: bool) {
         } else {
             std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         }
+    }
+}
+
+struct PostureGuard;
+
+impl Drop for PostureGuard {
+    fn drop(&mut self) {
+        clear_env();
     }
 }
 
@@ -305,6 +313,7 @@ async fn checkpoint_state(
 #[tokio::test]
 async fn out_of_scope_stored_anchor_cannot_be_resolved_by_wire_namespace_2708() {
     let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
     reset_env(true);
     let (router, db) = build_router_with_db();
 
@@ -360,6 +369,7 @@ async fn out_of_scope_stored_anchor_cannot_be_resolved_by_wire_namespace_2708() 
 #[tokio::test]
 async fn in_scope_stored_anchor_resolution_applies_2708() {
     let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
     reset_env(true);
     let (router, db) = build_router_with_db();
 
@@ -397,6 +407,7 @@ async fn in_scope_stored_anchor_resolution_applies_2708() {
 #[tokio::test]
 async fn first_resolution_wins_idempotency_preserved_under_scope_gate_2708() {
     let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
     reset_env(true);
     let (router, db) = build_router_with_db();
 
@@ -439,41 +450,83 @@ async fn first_resolution_wins_idempotency_preserved_under_scope_gate_2708() {
 }
 
 // ---------------------------------------------------------------------
-// Posture guard — zero-config federation is byte-identical to pre-fix.
+// #3582 — absent-allowlist denial and explicit authorization controls.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn zero_config_checkpoint_federation_unaffected_2708() {
+async fn no_allowlist_checkpoint_posture_matrix_3582() {
     let _g = ENV_LOCK.lock().await;
-    // No AI_MEMORY_FED_PEER_ATTESTATION at all → the namespace gate short-
-    // circuits (`has_allowlist() == false`) and no by-id existence probe runs.
-    reset_env(false);
-    let (router, db) = build_router_with_db();
+    let _posture = PostureGuard;
+    // #3582: identical mutations under default/explicit denial, rollout opt-out,
+    // and an explicit peer scope. All environment access holds the binary lock.
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        reset_env(false);
+        // SAFETY: every test in this binary holds ENV_LOCK.
+        unsafe {
+            if scoped {
+                std::env::set_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                json!({PEER_ID: {"allowed_namespaces": ["secure/**"], "allowed_sender_agent_ids": [PEER_ID]}}).to_string());
+            }
+            if let Some(value) = require {
+                std::env::set_var(
+                    ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                    value,
+                );
+            }
+        }
+        let (router, db) = build_router_with_db();
 
-    // Even a resolution touching a secure/ops anchor applies — zero-config makes
-    // no namespace claim, exactly as before the fix.
-    let anchor_id = "cp-zeroconf-anchor-2708";
-    seed_pending(&db, &pending_checkpoint(anchor_id, VICTIM_NS)).await;
-
-    let (status, resp) = post_push(
-        &router,
-        &push_body(&resolved_checkpoint(
-            anchor_id,
-            VICTIM_NS,
-            "zeroconf-approved",
-        )),
-    )
-    .await;
-    assert!(status.is_success(), "resp={resp}");
-    assert_eq!(
-        resp["checkpoints_applied"],
-        json!(1),
-        "#2708: zero-config checkpoint federation must be byte-identical to pre-fix: resp={resp}"
-    );
-
-    let (state, resolution) = checkpoint_state(&db, anchor_id).await;
-    assert_eq!(state, CheckpointState::Resolved);
-    assert_eq!(resolution.as_deref(), Some("zeroconf-approved"));
-
-    clear_env();
+        // The identical signed mutation covers first landing and a stored anchor.
+        for locally_pending in [false, true] {
+            let anchor_id = if locally_pending {
+                "cp-local-3582"
+            } else {
+                "cp-new-3582"
+            };
+            if locally_pending {
+                seed_pending(&db, &pending_checkpoint(anchor_id, VICTIM_NS)).await;
+            }
+            let before = {
+                let lock = db.lock().await;
+                ai_memory::checkpoints::get(&lock.0, anchor_id)
+                    .expect("snapshot checkpoint")
+                    .map(|cp| serde_json::to_value(cp).expect("serialize snapshot"))
+            };
+            assert_eq!(before.is_some(), locally_pending);
+            let incoming = resolved_checkpoint(anchor_id, VICTIM_NS, "approved");
+            let (status, resp) = post_push(&router, &push_body(&incoming)).await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            assert_eq!(
+                resp["checkpoints_applied"],
+                json!(u64::from(allowed)),
+                "{resp}"
+            );
+            assert_eq!(resp["checkpoints_conflicted"], json!(0), "{resp}");
+            let after = {
+                let lock = db.lock().await;
+                ai_memory::checkpoints::get(&lock.0, anchor_id).expect("snapshot after push")
+            };
+            if allowed {
+                let stored = after.expect("landed anchor");
+                assert_eq!(stored.state, CheckpointState::Resolved);
+                assert_eq!(stored.namespace, VICTIM_NS);
+                assert_eq!(stored.resolution.as_deref(), Some("approved"));
+                assert_eq!(stored.resolved_by, incoming.resolved_by);
+                assert_eq!(stored.signature, incoming.signature);
+                assert_eq!(stored.resolver_pubkey, incoming.resolver_pubkey);
+            } else {
+                assert_eq!(
+                    after.map(|cp| serde_json::to_value(cp).expect("serialize after")),
+                    before,
+                    "full row unchanged: scoped={scoped} require={require:?} local={locally_pending}: {resp}"
+                );
+            }
+        }
+        clear_env();
+    }
 }

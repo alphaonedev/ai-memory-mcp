@@ -349,6 +349,7 @@ fn build_capabilities_overlay(
     // the live LLM / embedder / reranker were wired to, not the
     // compiled tier preset.
     let mut caps = tier_config.capabilities_with_resolved(resolved_models);
+    caps.federation_security = crate::federation::peer_posture::boot_report();
 
     // --- Reranker live state (P1) ---
     caps.features.reranker_active = match reranker {

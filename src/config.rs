@@ -440,6 +440,7 @@ impl TierConfig {
         Capabilities {
             // Capabilities schema v2 — see `Capabilities` doc comment.
             schema_version: "2".to_string(),
+            federation_security: None,
             tier: self.tier.as_str().to_string(),
             version: crate::PKG_VERSION.to_string(),
             features: CapabilityFeatures {
@@ -590,6 +591,10 @@ impl TierConfig {
 ///   `approval.default_timeout_seconds`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// #3582: daemon's own boot evaluation, shared by SQLite/PostgreSQL and
+    /// MCP/HTTP. Absent when this process has not evaluated federation boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_security: Option<crate::federation::peer_posture::Report>,
     /// Schema-version discriminator. Always `"2"` since v0.6.3.
     pub schema_version: String,
     pub tier: String,
@@ -2007,6 +2012,7 @@ impl Capabilities {
     ) -> CapabilitiesV3 {
         CapabilitiesV3 {
             schema_version: "3".to_string(),
+            federation_security: self.federation_security.clone(),
             summary,
             to_describe_to_user,
             tools,
@@ -2124,6 +2130,9 @@ pub struct ToolExample {
 /// default wire shape and seals v3 as the recommended client target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilitiesV3 {
+    /// #3582: same daemon boot snapshot as the v2 projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_security: Option<crate::federation::peer_posture::Report>,
     /// Schema-version discriminator. Always `"3"` in v0.7.0.
     pub schema_version: String,
 

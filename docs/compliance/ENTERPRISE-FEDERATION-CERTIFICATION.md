@@ -1314,6 +1314,36 @@ remains the Conductor task tracked by
 shipped federation posture is UNCHANGED from `e22bc93c`; only its test
 coverage is stronger. The historical bind remains `e22bc93c`.
 
+**Re-cert trigger — FIRED; certification remains VOID (#3582, 2026-09-10).**
+The candidate based on `e34ee46caf0c7db8aff48b2768673918b8a79a85` changes
+`src/federation/receive_auth.rs`, `src/federation/receive.rs`,
+`src/federation/mod.rs`, `src/federation/peer_attestation.rs`,
+`src/handlers/federation_receive.rs`,
+`src/handlers/federation_signing_check.rs` and adds
+`src/federation/peer_posture.rs`. These are §7-watched paths.
+
+The absent-allowlist early return formerly admitted inbound writes before
+consulting the default-on namespace requirement. The shared write/by-id/
+metadata gates now refuse that case on SQLite and PostgreSQL; only
+Standard's existing explicit require-scope `0` opt-out retains legacy
+namespace acceptance. Configured-map enrollment and declared scopes remain
+enforced. `asi-hard` additionally refuses boot when explicit peers are configured
+without an authorization map, when that map is malformed, or when explicit
+federation bindings cannot be read. Standard warns. Valid `{}` permits boot
+while denying all peers. Shared identity key enrollment or its read errors
+only warn in both postures. Doctor remains runnable; capabilities v2/v3
+reports the completed daemon boot evaluation. No new environment knob,
+schema rung, fixed posture pin or certified permission bypass is introduced.
+
+Focused denied/allowed persisted-state and boot/doctor tests are recorded on
+[#3582](https://github.com/alphaonedev/ai-memory-mcp/issues/3582), including
+native PostgreSQL matrices. These are implementation evidence, **not a
+certification re-issue or a claim that the full candidate gate has passed**.
+The author does not approve this control. Re-running §5.4(2)–(5) and issuing
+the certification against a reviewed SHA remains the Conductor's
+[#3501](https://github.com/alphaonedev/ai-memory-mcp/issues/3501) task. The
+historical bind stays `e22bc93c`; the VOID banner stays in force.
+
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
 operator account (`alphaonedev`). GitHub signature verification is

@@ -147,6 +147,21 @@ fn main() -> Result<()> {
     // `security_profile::runtime_boot_report`.
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
+    // #3582: evaluate the argv peer lists even with quorum_writes=0, before
+    // workers or stores start. Doctor must remain able to diagnose refusal.
+    match &cli.command {
+        daemon_runtime::Command::Serve(args) => {
+            ai_memory::federation::peer_posture::enforce_at_boot(
+                !args.quorum_peers.is_empty(),
+                args.mtls_allowlist.as_deref(),
+            )?;
+        }
+        daemon_runtime::Command::SyncDaemon(args) => {
+            ai_memory::federation::peer_posture::enforce_at_boot(!args.peers.is_empty(), None)?;
+        }
+        _ => {}
+    }
+
     // v1.0.0 §5.3 (3x7 cutline ruling, 2026-08-01) — the opt-in
     // enterprise-federation certified-posture boot gate. Same #1889
     // pre-runtime contract as the call directly above (this function is

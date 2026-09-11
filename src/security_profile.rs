@@ -34,6 +34,21 @@
 //! `asi-hard` you cannot run with a weakened security knob — either it is
 //! at the hard floor or the daemon will not start.
 //!
+//! ## Configured federation peers (#3582)
+//!
+//! In addition to the fixed knob pins, the read-only evaluator in
+//! [`crate::federation::peer_posture`] requires valid
+//! `AI_MEMORY_FED_PEER_ATTESTATION` under `asi-hard` whenever outbound
+//! peers or explicit inbound bindings are configured. Valid `{}` denies all peers
+//! and permits boot; malformed configuration refuses `asi-hard` boot. Standard
+//! warns. Shared identity key enrollment and its read errors only warn in both
+//! postures; unreadable explicit bindings still refuse `asi-hard` boot.
+//! Namespace scope is default-required even without an allowlist; only
+//! Standard permits the existing explicit require-scope opt-out (`0`).
+//! Ordinary doctor remains runnable and marks remote argv unobservable;
+//! capabilities v2/v3 reports the daemon's completed boot snapshot.
+//! This conditional check adds no fixed knob pin or environment mutation.
+//!
 //! ## Pinned knobs (the documented hardened set)
 //!
 //! | Env knob | Hard floor | What it forces |

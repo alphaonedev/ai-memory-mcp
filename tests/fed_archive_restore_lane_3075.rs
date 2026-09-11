@@ -449,3 +449,104 @@ async fn federated_restore_of_tombstoned_id_is_noop_3075() {
     );
     assert_eq!(report["restored"].as_u64().unwrap_or(0), 0, "{report}");
 }
+
+async fn archive_snapshot_3582(
+    db: &ai_memory::handlers::Db,
+    id: &str,
+) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    let lock = db.lock().await;
+    ["memories", "archived_memories"]
+        .iter()
+        .map(|table| {
+            let mut stmt = lock
+                .0
+                .prepare(&format!("SELECT * FROM {table} WHERE id = ?1"))
+                .expect("snapshot query");
+            let columns = stmt.column_count();
+            stmt.query_map([id], |row| {
+                (0..columns)
+                    .map(|i| row.get(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("snapshot rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("snapshot values")
+        })
+        .collect()
+}
+
+/// #3582: both by-id lanes require authorization, including an already archived row.
+#[tokio::test]
+async fn archive_restore_allowlist_postures_preserve_rows_3582() {
+    let _lock = ENV_LOCK.lock().await;
+    let _guard = PostureGuard;
+    let (router, db) = build_router_with_db();
+
+    for (label, require, scoped, allowed) in [
+        ("default-required", None, false, false),
+        ("explicit-required", Some("1"), false, false),
+        ("standard-opt-out", Some("0"), false, true),
+        ("scoped", None, true, true),
+    ] {
+        for restore in [false, true] {
+            set_scoped_posture();
+            let id = seed_memory(
+                &router,
+                IN_SCOPE_NS,
+                &format!("archive3582-{label}-{restore}"),
+            )
+            .await;
+            if restore {
+                let (status, report) = push(
+                    &router,
+                    &json!({"sender_agent_id": PEER_ID,
+                    "sender_clock": {"entries": {}}, "memories": [], "archives": [id]}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "setup: {report}");
+                assert_eq!(report["archived"], json!(1), "setup: {report}");
+            }
+            // SAFETY: the binary's async env lock spans the request and guard cleanup.
+            unsafe {
+                if !scoped {
+                    std::env::remove_var(
+                        ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                    );
+                }
+                if let Some(value) = require {
+                    std::env::set_var(
+                        ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                        value,
+                    );
+                }
+            }
+            let before = archive_snapshot_3582(&db, &id).await;
+            let lane = if restore { "restores" } else { "archives" };
+            let counter = if restore { "restored" } else { "archived" };
+            let mut body = json!({"sender_agent_id": PEER_ID, "sender_clock": {"entries": {}}, "memories": []});
+            body[lane] = json!([id]);
+            let (status, report) = push(&router, &body).await;
+            assert_eq!(status, StatusCode::OK, "{label}/{lane}: {report}");
+            assert_eq!(
+                report[counter],
+                json!(u64::from(allowed)),
+                "{label}/{lane}: {report}"
+            );
+            let after = archive_snapshot_3582(&db, &id).await;
+            if allowed {
+                assert_ne!(after, before, "{label}/{lane}: must mutate the target");
+                assert_eq!(live_exists(&db, &id).await, restore, "{label}/{lane}");
+                assert_eq!(
+                    archived_reason(&db, &id).await.is_some(),
+                    !restore,
+                    "{label}/{lane}"
+                );
+            } else {
+                assert_eq!(
+                    after, before,
+                    "{label}/{lane}: every live/archive column must survive refusal"
+                );
+            }
+        }
+    }
+}

@@ -151,7 +151,46 @@ v0.7.0 closes the `attested-cortex` epic (69/69 across 11 tracks A–K), folds i
 - **Signed events V-4 closeout (cross-row hash chain)** (issue [#698](https://github.com/alphaonedev/ai-memory-mcp/issues/698)). Each `signed_events` row carries `prev_hash` + `sequence`; first-row `prev_hash` is zero, subsequent rows chain the SHA-256 of the prior canonical-CBOR payload. `ai-memory verify-signed-events-chain` walks the chain end-to-end. See [`docs/signed-events-v4.md`](docs/signed-events-v4.md).
 - **Hook pipeline (22 lifecycle events).** A programmable extension surface fires on 15 baseline events (`pre_/post_` on `store|delete|promote|link|consolidate|governance_decision`, the read-side `post_recall`/`post_search` notifies, and `on_index_eviction`), plus 5 grand-slam additions (`pre_recall_expand` G10 + `pre_reflect`/`post_reflect` recursive-learning Task 6/8 + `pre_compaction`/`on_compaction_rollback` L1-7) and 2 v0.8.0 signal events (`pre_signal_send`/`post_signal_ack`) — 15+5+2=22, pinned by `HOOK_EVENTS_COUNT` in `src/config.rs`. Five never-fired events were REMOVED at v1.0.0: `pre_archive` ([#2637](https://github.com/alphaonedev/ai-memory-mcp/issues/2637)) and `pre_recall` / `pre_search` / `pre_transcript_store` / `post_transcript_store` ([#2758](https://github.com/alphaonedev/ai-memory-mcp/issues/2758)) — a hook the substrate advertises must actually fire, or it must not be advertised. Hooks return `Allow` / `Modify` / `Deny` / `AskUser`. Default off; opt in via `~/.config/ai-memory/hooks.toml`. **Firing status:** all 10 decision-class `pre_*` events are wired, so hook-based *enforcement* is real — but **11 of the 22 advertised events have no production fire site at v1.0.0** (`post_store`, `post_recall`, `post_search`, `post_delete`, `post_promote`, `post_link`, `post_consolidate`, `post_governance_decision`, `post_reflect`, `on_index_eviction`, `on_compaction_rollback`); a hook configured on one of those parses and lists but never executes. That is the same advertised-but-inert class the removals above addressed, and it is not yet resolved for these 11. See [`docs/hook-pipeline.md`](docs/hook-pipeline.md) for the per-event table.
 - **Sidechain transcripts + replay.** zstd-3 BLOB sidechain stores raw conversation/reasoning trails; `memory_replay(memory_id)` walks `memory_transcript_links` to reconstruct the chain. Opt-in per namespace via `[transcripts.namespaces."team/*"]`. See [`docs/sidechain-transcripts.md`](docs/sidechain-transcripts.md).
-- **Federation hardening.** mTLS + X-API-Key + SHA-256 cert fingerprint allowlist; env vars `AI_MEMORY_FED_PEER_ATTESTATION`, `AI_MEMORY_FED_SYNC_TRUST_PEER`, `AI_MEMORY_FED_TRUST_BODY_AGENT_ID`. See [`docs/federation.md`](docs/federation.md).
+- **Federation hardening.** Behaviour change: a node without `AI_MEMORY_FED_PEER_ATTESTATION` now refuses all inbound federated namespace writes and catchup pulls by default; configure per-peer `allowed_namespaces`, or (Standard posture only) set `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` to keep legacy replication. Peer key enrollment, signatures and nonce freshness remain required. Explicit federation peers without an allowlist, malformed allowlists and unreadable federation bindings refuse `asi-hard` boot; Standard warns. A valid `{}` declares no peers and permits boot while refusing inbound replication. Shared identity key enrollment or enrollment read errors only warn in both postures. Doctor and `/capabilities` v2/v3 report these separate facts. See [`docs/federation.md`](docs/federation.md).
+
+<details>
+<summary>Federation #3582 old-contract fixture census (rule e)</summary>
+
+The following tests previously expected namespace writes without an allowlist.
+Their fixtures now declare `AI_MEMORY_FED_PEER_ATTESTATION` with exact peer and
+namespace scopes and send `X-Peer-Id`; namespace enforcement retains its default.
+Assertions and signature/replay controls are unchanged.
+
+| Suite | Old-contract test | Explicit peer / namespace |
+|---|---|---|
+| `cov_ga2_federation` | `sync_push_applies_signals_sqlite` | `ai:cov-ga2-sigpeer` / `covga2sig` |
+| `cov_ga2_federation` | `sync_push_applies_action_transition_sqlite` | `ai:cov-ga2-txactor` / `covga2tx` |
+| `cov_ga2_federation` | `sync_push_replayed_action_transition_refused_1805` | `ai:cov-ga2-replayactor` / `covga2replay` |
+| `federation_1936_checkpoint_fed` | `epoch_advance_resolution_round_trips_strict` | `peer-1936` / `_epoch` |
+| `federation_1936_checkpoint_fed` | `escape_hatch_permissive_applies_unenrolled` | `peer-1936` / `_epoch` |
+| `federation_1936_checkpoint_fed` | `idempotent_replay_is_noop` | `peer-1936` / `_epoch` |
+| `federation_1936_checkpoint_fed` | `divergent_resolution_conflicts_first_wins` | `peer-1936` / `_epoch` |
+| `cov_ga2_pg_federation` | `pg_sync_push_via_store_applies_nonempty_memory_batch` | `ai:cov-ga2-pg-peer-<uuid>` / `cov-ga2-pg-<uuid>` |
+| `cov_ga2_pg_federation` | `pg_sync_push_via_store_applies_signal` | `ai:cov-ga2-pg-sigpeer-<uuid>` / `cov-ga2-pg-sig-<uuid>` |
+| `cov_ga2_pg_federation` | `pg_sync_push_via_store_applies_action_transition` | `ai:cov-ga2-pg-txactor-<uuid>` / `covga2pgtx-<uuid>` |
+| `cov_ga2_pg_federation` | `pg_sync_push_via_store_shipped_embedding_defers_no_embedder` | `ai:cov-ga2-pg-emb-<uuid>` / `cov-ga2-pg-emb-<uuid>` |
+| `cov_ga2_pg_federation` | `pg_sync_push_via_store_shipped_embedding_stamps_space_2167` | `ai:cov-ga2-pg-stamp-<uuid>` / `cov-ga2-pg-stamp-<uuid>` |
+| `cov_ga2_pg_federation` | `pg_sync_push_via_store_invalid_memory_is_skipped` | `ai:cov-ga2-pg-skip-<uuid>` / `cov-ga2-pg-skip-<uuid>` |
+| `cov_ga2_pg_federation` | `pg_sync_push_via_store_deletions_and_links` | `ai:cov-ga2-pg-link-<uuid>` / `cov-ga2-pg-link-<uuid>` |
+| `cov_ga2_pg_federation` | `pg_sync_push_enrolled_signed_nonce_drives_deep_body` | `ai:cov-ga2-pg-signed-<uuid>` / `cov-ga2-pg-signed-<uuid>` |
+| `cov_ga2_r4_federation` | `pg_sync_push_quota_refusal_returns_429` | `ai:cov-ga2-r4-quota-<uuid>` / `cov-ga2-r4-quota-<uuid>` |
+
+The shared checkpoint fixture also scopes `strict_refuses_unenrolled_resolver`
+and `forged_signature_rejected_even_permissive`, ensuring those refusals reach
+their signature checks. Environment guards restore the prior namespace posture
+under each binary's async environment mutex, including on assertion failure.
+The closed default remains pinned by
+`federation_namespace_gate_3582::no_allowlist_requires_explicit_opt_out_on_every_helper_3582`
+and `federation_checkpoint_ns_scope_2708::no_allowlist_checkpoint_posture_matrix_3582`;
+PostgreSQL parity is covered by `fed_checkpoint_lane_3075_pg`.
+
+</details>
+
 - **K8 quota tool + K10 SSE approvals.** `memory_quota_status` + `/api/v1/quota/status` (K8). `/api/v1/approvals/stream` server-sent events with HMAC nonce, method+pending_id binding, lagged-event count strip (K10). See [`docs/k8-quotas.md`](docs/k8-quotas.md) + [`docs/k10-sse-approvals.md`](docs/k10-sse-approvals.md).
 - **Postgres + Apache AGE first-class backend.** `ai-memory serve --store-url postgres://…`, schema parity, 6-factor recall scoring parity, link migration, KG features (`kg_query`, `kg_timeline`, `kg_invalidate`, `find_paths`) on AGE Cypher with recursive-CTE fallback when AGE is absent, plus a new `ai-memory schema-init` CLI verb. The AGE-vs-CTE comparison is a local bench (`benches/age_vs_cte.rs`) that self-skips with exit 0 unless `AI_MEMORY_TEST_AGE_URL` points at a live AGE-enabled Postgres — **no CI workflow runs it**, so treat any AGE-over-CTE speedup figure as a local measurement, not an enforced exit criterion. Operator how-to: [`docs/postgres-age-guide.md`](docs/postgres-age-guide.md). Migration runbook: [`docs/migration-v0.7.0-postgres.md`](docs/migration-v0.7.0-postgres.md).
 - **Capabilities v3 + smart loaders.** `memory_capabilities` v3 adds `summary`, `to_describe_to_user`, per-tool `callable_now`, `agent_permitted_families`, `schema_version="3"`; the new always-on `memory_load_family(family)` and `memory_smart_load(intent)` tools join the default `core` profile. The pinned phrasings live in [`docs/v0.7/canonical-phrasings.md`](docs/v0.7/canonical-phrasings.md).

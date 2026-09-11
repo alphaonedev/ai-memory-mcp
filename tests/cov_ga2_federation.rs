@@ -51,6 +51,50 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 /// gate flips, yielding spurious 401/403s.
 static FED_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// #3582: authorize only this fixture's peer and namespace. The caller holds
+/// FED_ENV_LOCK until after this guard drops, including during panic unwinding.
+struct NamespaceScopeGuard([(&'static str, Option<std::ffi::OsString>); 2]);
+
+impl NamespaceScopeGuard {
+    fn new(peer: &str, namespace: &str) -> Self {
+        use ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV;
+        use ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+        let guard = Self([
+            (PEER_ATTESTATION_ENV, std::env::var_os(PEER_ATTESTATION_ENV)),
+            (
+                REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                std::env::var_os(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV),
+            ),
+        ]);
+        let allowlist = json!({peer: {
+            "allowed_sender_agent_ids": [peer],
+            "allowed_namespaces": [namespace],
+        }});
+        // SAFETY: every caller holds FED_ENV_LOCK; Drop restores both variables
+        // before that async mutex guard is released.
+        unsafe {
+            std::env::set_var(PEER_ATTESTATION_ENV, allowlist.to_string());
+            std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        }
+        guard
+    }
+}
+
+impl Drop for NamespaceScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: the enclosing test still holds FED_ENV_LOCK.
+        for (key, previous) in &self.0 {
+            unsafe {
+                if let Some(value) = previous {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Router scaffolding (sqlite) — mirrors tests/cov3_handlers_sqlite.rs.
 // ---------------------------------------------------------------------------
@@ -280,6 +324,7 @@ async fn sync_push_empty_batch_acks_and_runs_deferred_embed_noop() {
 #[tokio::test]
 async fn sync_push_applies_signals_sqlite() {
     let _g = FED_ENV_LOCK.lock().await;
+    let _scope = NamespaceScopeGuard::new("ai:cov-ga2-sigpeer", "covga2sig");
     unsafe {
         std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
         std::env::set_var(
@@ -338,7 +383,7 @@ async fn sync_push_applies_signals_sqlite() {
         ]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, "ai:cov-ga2-sigpeer")])).await;
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
@@ -369,6 +414,7 @@ async fn sync_push_applies_signals_sqlite() {
 #[tokio::test]
 async fn sync_push_applies_action_transition_sqlite() {
     let _g = FED_ENV_LOCK.lock().await;
+    let _scope = NamespaceScopeGuard::new("ai:cov-ga2-txactor", "covga2tx");
     let keydir = tempfile::tempdir().expect("keydir");
     let actor = "ai:cov-ga2-txactor";
     let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
@@ -454,7 +500,7 @@ async fn sync_push_applies_action_transition_sqlite() {
         ],
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, "ai:cov-ga2-txactor")])).await;
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
@@ -496,6 +542,7 @@ async fn sync_push_applies_action_transition_sqlite() {
 #[tokio::test]
 async fn sync_push_replayed_action_transition_refused_1805() {
     let _g = FED_ENV_LOCK.lock().await;
+    let _scope = NamespaceScopeGuard::new("ai:cov-ga2-replayactor", "covga2replay");
     let keydir = tempfile::tempdir().expect("keydir");
     let actor = "ai:cov-ga2-replayactor";
     let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
@@ -563,7 +610,7 @@ async fn sync_push_replayed_action_transition_refused_1805() {
         .unwrap()
     };
     // First delivery: fresh nonce → applies.
-    let (s1, b1) = decode(&r, push_req(&make_body(), &[])).await;
+    let (s1, b1) = decode(&r, push_req(&make_body(), &[(PEER_HEADER, actor)])).await;
     assert!(s1.is_success(), "first push acks; status={s1} body={b1}");
     assert_eq!(
         b1["action_transitions_applied"].as_i64().unwrap_or(-1),
@@ -572,7 +619,7 @@ async fn sync_push_replayed_action_transition_refused_1805() {
     );
     // Second delivery: byte-identical signed op, fresh outer envelope →
     // the (peer, base64(nonce)) is already recorded → refused PRE-CAS.
-    let (s2, b2) = decode(&r, push_req(&make_body(), &[])).await;
+    let (s2, b2) = decode(&r, push_req(&make_body(), &[(PEER_HEADER, actor)])).await;
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);

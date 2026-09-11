@@ -81,9 +81,52 @@ use ai_memory::store::postgres::PostgresStore;
 // ───────────────────────────────────────────────────────────────────
 
 /// Serialises the Postgres router tests that touch the process-global
-/// federation env (none here flip env, but the quota-defaults OnceLock +
-/// the shared scratch DB connection are best kept off the parallel path).
+/// federation env, quota-defaults OnceLock, and shared scratch DB connection.
 static FED_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// #3582: authorize only this fixture's peer and namespace. The caller holds
+/// FED_ENV_LOCK until after this guard drops, including during panic unwinding.
+struct NamespaceScopeGuard([(&'static str, Option<std::ffi::OsString>); 2]);
+
+impl NamespaceScopeGuard {
+    fn new(peer: &str, namespace: &str) -> Self {
+        use ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV;
+        use ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+        let guard = Self([
+            (PEER_ATTESTATION_ENV, std::env::var_os(PEER_ATTESTATION_ENV)),
+            (
+                REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                std::env::var_os(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV),
+            ),
+        ]);
+        let allowlist = json!({peer: {
+            "allowed_sender_agent_ids": [peer],
+            "allowed_namespaces": [namespace],
+        }});
+        // SAFETY: every caller holds FED_ENV_LOCK; Drop restores both variables
+        // before that async mutex guard is released.
+        unsafe {
+            std::env::set_var(PEER_ATTESTATION_ENV, allowlist.to_string());
+            std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        }
+        guard
+    }
+}
+
+impl Drop for NamespaceScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: the enclosing test still holds FED_ENV_LOCK.
+        for (key, previous) in &self.0 {
+            unsafe {
+                if let Some(value) = previous {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+}
 
 fn postgres_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
@@ -694,6 +737,7 @@ async fn pg_sync_push_quota_refusal_returns_429() {
     }
     let peer = uid("ai:cov-ga2-r4-quota");
     let ns = uid("cov-ga2-r4-quota");
+    let _scope = NamespaceScopeGuard::new(&peer, &ns);
 
     // #1544 — the federation RECEIVE path now charges the per-agent
     // STORAGE-BYTES ceiling ONLY (not the daily write-count), so a
@@ -730,7 +774,11 @@ async fn pg_sync_push_quota_refusal_returns_429() {
         "memories": [memory_json(&uid("ga2r4-quota-m"), &ns, &peer)]
     }))
     .unwrap();
-    let (status, b) = decode(&r, push_req(&body)).await;
+    let mut request = push_req(&body);
+    request
+        .headers_mut()
+        .insert("x-peer-id", peer.parse().expect("fixture peer header"));
+    let (status, b) = decode(&r, request).await;
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
