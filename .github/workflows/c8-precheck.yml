@@ -212,6 +212,27 @@ jobs:
       - name: Self-test the gate (regression evidence)
         run: bash scripts/check-const-name-literals.sh --self-test
 
+  truthy-grammar-gate:
+    # #3200 (Conductor ruling R1): ONE boolean env-token grammar. Every
+    # MANDATE/HATCH boolean env reader goes through src/env_flag.rs; an inline
+    # boolean-token comparison anywhere else in production src/ FAILS unless
+    # its function has a dated, issue-linked row in
+    # scripts/qc-allowlists/truthy-grammar-neutral-ledger.txt, and a stale row
+    # FAILS too, so the ledger only shrinks (#3622 burns it down). NOT
+    # required at introduction (see required-contexts-not-required.txt).
+    name: Truthy-grammar SSOT ratchet (#3200)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run truthy-grammar gate
+        run: bash scripts/check-truthy-grammar.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants a new inline reader, an attest.rs-named reader, a reader
+        # below a mid-file test module, a stale and a malformed ledger row;
+        # each must fail, and the clean fixture must pass.
+        run: bash scripts/check-truthy-grammar.sh --self-test
+
   docs-vs-ssot-drift:
     # v0.7.0 (operator directive 2026-05-31: "can we use variables in
     # documentation for versions instead of literals?") — Markdown has

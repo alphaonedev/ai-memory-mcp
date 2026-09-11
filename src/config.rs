@@ -13009,8 +13009,10 @@ legacy_scoring = false
     }
 
     #[test]
-    fn effective_allow_loopback_webhooks_env_var_invalid_falls_back_to_config() {
-        // Lines 2286-2292: invalid env value falls back to config.toml.
+    fn effective_allow_loopback_webhooks_env_var_invalid_keeps_hatch_closed() {
+        // #3200 (rule (e)): an invalid env value no longer falls back to
+        // config.toml. The boot sweep refuses it; a lazy read keeps this
+        // SSRF hatch CLOSED regardless of the config layer.
         let _g = env_var_lock();
         let prior = std::env::var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS").ok();
         unsafe {

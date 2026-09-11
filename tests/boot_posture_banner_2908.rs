@@ -157,6 +157,12 @@ fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
 }
 
 /// A stock `ai-memory serve` console MUST render the boot posture banner.
+///
+/// #3200: `asi-hard` now pins `AI_MEMORY_REQUIRE_API_KEY=1`, and this stock
+/// fixture has no config (so no `api_key`), so the boot is REFUSED after the
+/// banner by the keyless-bind guard. The banner is rendered in `run()` before
+/// `bootstrap_serve`, so this assertion is unaffected; the refusal itself is
+/// pinned by `asi_hard_serve_refuses_a_keyless_bind_3200` below.
 #[test]
 fn stock_serve_console_renders_the_boot_posture_banner_2908() {
     let lines = serve_boot_lines(ASI_HARD_BANNER, Duration::from_secs(90));
@@ -168,6 +174,23 @@ fn stock_serve_console_renders_the_boot_posture_banner_2908() {
          ([logging].enabled = off) the asi-hard #1961 report and the §5.3 #2905 banner were \
          emitted into a void, and the certification could not cite the banner as evidence. \
          Captured output:\n{}",
+        lines.join("\n")
+    );
+}
+
+/// #3200 R3 END-TO-END: under `asi-hard` the pinned `AI_MEMORY_REQUIRE_API_KEY`
+/// reaches the live bind guard, so a keyless `serve` is refused even on
+/// loopback, and the refusal names the knob so the operator knows the fix.
+#[test]
+fn asi_hard_serve_refuses_a_keyless_bind_3200() {
+    let lines = serve_boot_lines("AI_MEMORY_REQUIRE_API_KEY", Duration::from_secs(90));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("refusing to start without an API key")
+                && l.contains("AI_MEMORY_REQUIRE_API_KEY")),
+        "#3200: asi-hard pins AI_MEMORY_REQUIRE_API_KEY=1, so a keyless loopback `serve` \
+         must be refused with a message naming the knob. Captured output:\n{}",
         lines.join("\n")
     );
 }
