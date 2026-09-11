@@ -988,7 +988,13 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         .expect("store reown row");
 
     let dry = store
-        .reown(&ctx, &reown_ns, "reown-new-owner", false, true)
+        .reown(
+            &ctx,
+            Some(&reown_ns),
+            "reown-new-owner",
+            ai_memory::storage::ReownSelect::Owned,
+            true,
+        )
         .await
         .expect("reown dry-run");
     assert_eq!(dry.matched, 1, "dry-run matches the one seeded row");
@@ -996,7 +1002,13 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     assert!(dry.dry_run);
 
     let live = store
-        .reown(&ctx, &reown_ns, "reown-new-owner", false, false)
+        .reown(
+            &ctx,
+            Some(&reown_ns),
+            "reown-new-owner",
+            ai_memory::storage::ReownSelect::Owned,
+            false,
+        )
         .await
         .expect("reown live");
     assert_eq!(live.matched, 1);

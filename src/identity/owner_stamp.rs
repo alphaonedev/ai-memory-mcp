@@ -557,8 +557,10 @@ pub fn sqlite_census(conn: &rusqlite::Connection) -> rusqlite::Result<UnstampedC
 }
 
 /// Operator remedy named by the doctor census.
-pub const CENSUS_REMEDY: &str = "re-own them to the principal you actually call as with `ai-memory reown` \
-     (review with `--dry-run` first); set AI_MEMORY_UNSTAMPED_MUTATION=refuse once this census reads 0";
+pub const CENSUS_REMEDY: &str = "re-own them to the principal you actually call as: \
+     `ai-memory reown --all-namespaces --only-unowned --to <agent_id> --dry-run`, then the same \
+     command without `--dry-run` (it never touches an owned row); set \
+     AI_MEMORY_UNSTAMPED_MUTATION=refuse once this census reads 0";
 
 #[cfg(test)]
 mod tests {
