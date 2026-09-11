@@ -340,6 +340,26 @@ pub(crate) fn no_lineage_dag_guard() -> LineageDagIsolation {
     g
 }
 
+/// v1.0.0 #3152 — run THIS test binary again as a child that executes
+/// exactly `test` (its full path inside the lib test binary) with `env` set.
+/// The child starts from a CLEAN environment (the #3550 `publish_3550`
+/// shape), so no parallel test's environment leaks into it, and it never
+/// reads the operator config file. The crate's own `cfg(test)` harness arms
+/// the #3355 key-directory guard by itself, so no key-dir variable is
+/// needed.
+#[cfg(unix)]
+pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("lib test binary"));
+    cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env_clear()
+        .env("TMPDIR", std::env::temp_dir())
+        .env("AI_MEMORY_NO_CONFIG", "1");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("spawn the test child")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
