@@ -390,7 +390,7 @@ fn pg_reown_only_unowned_is_audited_and_never_touches_owned_rows() {
             "one audit row per live run"
         );
         assert_eq!(version_of(unowned.clone()).await, v0 + 1);
-        let owner = |id: String| {
+        let agent_of = |id: String| {
             let pool = store.pool().clone();
             async move {
                 sqlx::query_scalar::<_, Option<String>>(
@@ -402,9 +402,9 @@ fn pg_reown_only_unowned_is_audited_and_never_touches_owned_rows() {
                 .expect("owner")
             }
         };
-        assert_eq!(owner(unowned).await.as_deref(), Some("ai:bob"));
+        assert_eq!(agent_of(unowned).await.as_deref(), Some("ai:bob"));
         assert_eq!(
-            owner(owned).await.as_deref(),
+            agent_of(owned).await.as_deref(),
             Some("ai:alice"),
             "owned row untouched"
         );
