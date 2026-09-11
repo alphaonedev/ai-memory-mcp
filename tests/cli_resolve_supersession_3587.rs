@@ -209,6 +209,30 @@ fn cli_resolve_sqlite_authority_archive_replay_and_audits_3587() {
         }
         fixture.assert_audit(&new.id, true);
     }
+    // Ordinary archives are not supersession replays. Check the policy failure
+    // crosses the real CLI boundary and emits both Deny channels.
+    let (old, new) = pair();
+    ai_memory::db::insert(&conn, &old).unwrap();
+    ai_memory::db::insert(&conn, &new).unwrap();
+    assert!(ai_memory::db::archive_memory(&conn, &old.id, Some("archive")).unwrap());
+    let winner_before = ai_memory::db::get(&conn, &new.id).unwrap().unwrap();
+    assert_output(
+        &fixture.resolve(&old, &new, Some(OWNER), false, None),
+        Some("ArchivedPredecessor"),
+    );
+    fixture.assert_audit(&new.id, true);
+    assert_eq!(
+        serde_json::to_value(ai_memory::db::get(&conn, &new.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(winner_before).unwrap()
+    );
+    let archived_reason: String = conn
+        .query_row(
+            "SELECT archive_reason FROM archived_memories WHERE id = ?1",
+            [&old.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(archived_reason, "archive");
     for (actor, admin) in [(OWNER, false), (ADMIN, true)] {
         let (old, new) = pair();
         ai_memory::db::insert(&conn, &old).unwrap();
@@ -295,6 +319,39 @@ async fn cli_resolve_postgres_authority_archive_replay_and_audits_3587() {
         assert_eq!(before, after);
         fixture.assert_audit(&new.id, true);
     }
+    let (old, new) = pair();
+    store.store(&owner, &old).await.unwrap();
+    store.store(&owner, &new).await.unwrap();
+    assert_eq!(
+        store
+            .archive_by_ids(&owner, std::slice::from_ref(&old.id), Some("archive"))
+            .await
+            .unwrap(),
+        1
+    );
+    let archive_before: Value =
+        sqlx::query_scalar("SELECT to_jsonb(a) FROM archived_memories a WHERE id = $1")
+            .bind(&old.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let winner_before = store.get(&owner, &new.id).await.unwrap();
+    assert_output(
+        &fixture.resolve(&old, &new, Some(OWNER), false, Some(&url)),
+        Some("ArchivedPredecessor"),
+    );
+    fixture.assert_audit(&new.id, true);
+    let archive_after: Value =
+        sqlx::query_scalar("SELECT to_jsonb(a) FROM archived_memories a WHERE id = $1")
+            .bind(&old.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(archive_before, archive_after);
+    assert_eq!(
+        serde_json::to_value(store.get(&owner, &new.id).await.unwrap()).unwrap(),
+        serde_json::to_value(winner_before).unwrap()
+    );
     for (actor, admin) in [(OWNER, false), (ADMIN, true)] {
         let (old, new) = pair();
         store.store(&owner, &old).await.unwrap();

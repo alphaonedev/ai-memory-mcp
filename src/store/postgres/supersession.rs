@@ -4,7 +4,9 @@
 //! #3587 transactional twin of storage::supersession.
 
 use super::{CallerContext, Memory, PostgresStore, StoreError, StoreResult, to_store_err};
-use crate::identity::supersession::{SupersessionDecision, authorize_supersession};
+use crate::identity::supersession::{
+    SupersessionDecision, SupersessionRefusal, authorize_supersession,
+};
 use crate::storage::supersession::{SupersessionRequest, SupersessionResult, ruling_key};
 use crate::store::record_stop::gate_flag as gate_record_stop_cached;
 
@@ -205,8 +207,8 @@ impl PostgresStore {
             .find(|m| m.id == new_id)
             .ok_or_else(|| StoreError::NotFound { id: new_id.into() })?;
         let archived;
-        let old = match memories.iter().find(|m| m.id == old_id) {
-            Some(old) => old,
+        let (old, old_is_archived) = match memories.iter().find(|m| m.id == old_id) {
+            Some(old) => (old, false),
             None => {
                 let row = sqlx::query("SELECT * FROM archived_memories WHERE id = $1 FOR UPDATE")
                     .bind(old_id)
@@ -215,7 +217,7 @@ impl PostgresStore {
                     .map_err(|e| to_store_err("read resolve archive", e))?
                     .ok_or_else(|| StoreError::NotFound { id: old_id.into() })?;
                 archived = Self::row_to_memory(&row)?;
-                &archived
+                (&archived, true)
             }
         };
         let mut result = SupersessionResult {
@@ -230,6 +232,9 @@ impl PostgresStore {
             old,
             new,
         ) {
+            SupersessionDecision::Authorized(_) if old_is_archived => {
+                result.refusal = Some(SupersessionRefusal::ArchivedPredecessor);
+            }
             SupersessionDecision::Authorized(authorized) => {
                 self.archive_as_superseded(&mut tx, &authorized).await?;
                 result.superseded = Some(old.id.clone());
