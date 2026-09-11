@@ -26,9 +26,13 @@
 //! * delegate to another `PostgresStore` method that does.
 //!
 //! The delegation arm is checked, not assumed: the test resolves the callee
-//! name and requires IT to be in the directly-gated set. (`restore_or_conflict`
-//! and `store_with_embedding_no_overwrite` are the two real cases — both are
-//! thin wrappers over the gated `store_with_embedding_inner`.)
+//! name and requires IT to reach the gate. (`restore_or_conflict` and
+//! `store_with_embedding_no_overwrite` are thin wrappers over the gated
+//! `store_with_embedding_inner`.) Since v1.0.0 #3587 the callee may live in a
+//! `src/store/postgres/*.rs` submodule and may itself delegate (e.g.
+//! `resolve_supersession` -> `resolve_supersession_pg` ->
+//! `resolve_supersession_bound`), so callees resolve over every adapter file
+//! to a fixpoint; the twin's own body must still contain the call.
 //!
 //! Text-scanning, not compiled against the adapters, so it runs on every
 //! feature leg and needs no database.
@@ -99,6 +103,66 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// Every `impl PostgresStore` source file: the adapter root plus its direct
+/// `src/store/postgres/*.rs` submodules (sorted, non-recursive, test files
+/// excluded). v1.0.0 #3587 moved gated inherent writers (`*_pg`, the
+/// `*_in_tx` cores) into submodules while the trait twins stay in the root,
+/// so a delegation target must be resolvable across all of them.
+fn pg_adapter_sources() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/postgres");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "rs")
+                && !p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == "tests" || s.ends_with("_tests"))
+        })
+        .collect();
+    files.sort();
+    let mut sources = vec![read("src/store/postgres.rs")];
+    sources.extend(files.iter().map(|p| {
+        std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    }));
+    sources
+}
+
+/// True when `body` calls one of `targets` as `self.<t>(` or through the
+/// fully-qualified inherent form `PostgresStore::<t>(self` (the shape a trait
+/// twin uses to reach a same-named inherent method).
+fn delegates_to(body: &str, targets: &BTreeSet<String>) -> bool {
+    targets.iter().any(|t| {
+        body.contains(&format!("self.{t}(")) || body.contains(&format!("PostgresStore::{t}(self"))
+    })
+}
+
+/// Names of `PostgresStore` methods that reach the record-stop gate: directly,
+/// or through a chain of resolvable delegations ending in a direct gate
+/// (fixpoint over every adapter file). A name only enters the set on the
+/// strength of a body that gates or literally calls a member, never by name
+/// alone — the per-twin check below still inspects the twin's OWN body.
+fn pg_gated_names(sources: &[String]) -> BTreeSet<String> {
+    let entries: Vec<(String, String)> = sources.iter().flat_map(|s| methods(s)).collect();
+    let mut gated: BTreeSet<String> = entries
+        .iter()
+        .filter(|(_, body)| body.contains(GATE_CALL))
+        .map(|(name, _)| name.clone())
+        .collect();
+    loop {
+        let before = gated.len();
+        for (name, body) in &entries {
+            if !gated.contains(name) && delegates_to(body, &gated) {
+                gated.insert(name.clone());
+            }
+        }
+        if gated.len() == before {
+            return gated;
+        }
+    }
+}
+
 #[test]
 fn every_sqlite_record_stop_gated_method_is_gated_on_postgres_3175() {
     let sqlite = methods(&read("src/store/sqlite.rs"));
@@ -116,17 +180,24 @@ fn every_sqlite_record_stop_gated_method_is_gated_on_postgres_3175() {
         sqlite_gated.len()
     );
 
-    let pg_directly_gated: BTreeSet<&String> = postgres
-        .iter()
-        .filter(|(_, body)| body.contains(GATE_CALL))
-        .map(|(name, _)| name)
-        .collect();
+    // v1.0.0 #3587 — delegation targets resolve across the adapter root AND
+    // its submodules, transitively; see `pg_gated_names`.
+    let sources = pg_adapter_sources();
+    assert!(
+        sources.len() > 1,
+        "no src/store/postgres/*.rs submodules found — the scan set drifted"
+    );
+    let pg_gated = pg_gated_names(&sources);
+    assert!(
+        ["insert_subkey_cert_pg", "resolve_supersession_bound"]
+            .iter()
+            .all(|n| pg_gated.contains(*n)),
+        "submodule gate scan did not resolve the #3587 inherent writers — the \
+         parser drifted, so a delegating twin could not be proven gated"
+    );
 
     let mut ungated: Vec<String> = Vec::new();
     for name in &sqlite_gated {
-        if pg_directly_gated.contains(*name) {
-            continue;
-        }
         let Some(pg_body) = postgres.get(*name) else {
             ungated.push(format!(
                 "{name}: sqlite gates it, postgres does not implement it at all \
@@ -134,12 +205,12 @@ fn every_sqlite_record_stop_gated_method_is_gated_on_postgres_3175() {
             ));
             continue;
         };
-        // Delegation arm — RESOLVED, not assumed: the callee must itself be a
-        // directly-gated PostgresStore method.
-        let delegates_to_gated = pg_directly_gated
-            .iter()
-            .any(|target| pg_body.contains(&format!("self.{target}(")));
-        if !delegates_to_gated {
+        if pg_body.contains(GATE_CALL) {
+            continue;
+        }
+        // Delegation arm — RESOLVED, not assumed: the twin's OWN body must call
+        // a PostgresStore method that reaches the gate.
+        if !delegates_to(pg_body, &pg_gated) {
             ungated.push(format!(
                 "{name}: sqlite gates it; the postgres twin neither calls \
                  {GATE_CALL} nor delegates to a gated PostgresStore method"

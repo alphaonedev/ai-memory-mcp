@@ -16,7 +16,8 @@
 //! effectively uncovered.
 //!
 //! This file closes that gap the way the `qual_*` family already does for
-//! module size and legacy error types: it reads `src/store/postgres.rs` off
+//! module size and legacy error types: it reads `src/store/postgres.rs` (plus
+//! the #3587 transaction-core submodules in `PG_TX_CORE_PATHS`) off
 //! disk, extracts each target function's source span by indentation-matched
 //! brace scanning, and asserts the fix tokens are present in the RIGHT
 //! function. It runs under a plain `cargo test` with zero infrastructure.
@@ -37,6 +38,17 @@
 
 /// The postgres SAL adapter, relative to `CARGO_MANIFEST_DIR`.
 const PG_ADAPTER_PATH: &str = "src/store/postgres.rs";
+
+/// v1.0.0 #3587 — `impl PostgresStore` submodules holding the transaction-
+/// scoped write cores (`store_with_embedding_in_tx`, `archive_by_ids_in_tx`)
+/// and the supersession funnel that composes them in ONE transaction. They are
+/// scanned AFTER the adapter root, so a first-match lookup still lands on a
+/// root definition whenever one exists.
+const PG_TX_CORE_PATHS: &[&str] = &[
+    "src/store/postgres/insert_tx.rs",
+    "src/store/postgres/archive.rs",
+    "src/store/postgres/supersession.rs",
+];
 
 /// The v79/#1945 denormalised epistemic-typing column (spec §4).
 const KIND_PROVENANCE_COLUMN: &str = "kind_provenance";
@@ -72,12 +84,15 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     "archive_restore", // #2333 / FBL-03
     // Fixed by #2393 — the three funnels the issue named…
     // #2771 — `store_with_embedding` was refactored into a thin delegator to the
-    // shared inherent `store_with_embedding_inner`, which now holds the INSERT +
-    // every column bind. BOTH create funnels (`store_with_embedding` merge +
-    // `store_with_embedding_no_overwrite` fail-closed) delegate to it, so the
-    // provenance-bind guard follows the INSERT to `_inner` — strictly stronger,
-    // since it now also covers the no-overwrite arm's bind.
-    "store_with_embedding_inner",
+    // shared inherent `store_with_embedding_inner`. BOTH create funnels
+    // (`store_with_embedding` merge + `store_with_embedding_no_overwrite`
+    // fail-closed) delegate to it. #3587 then moved the INSERT + every column
+    // bind one level down into the transaction-scoped core
+    // `store_with_embedding_in_tx`, which `_inner` AND the keyed-supersession
+    // funnel both call, so the provenance-bind guard follows the INSERT there —
+    // strictly stronger, since it now also covers the supersession arm. The
+    // delegation chain itself is pinned by `span_extractor_is_load_bearing`.
+    "store_with_embedding_in_tx",
     "capture_turn_idempotent",
     "recover_turn_idempotent",
     // …and the three the completeness sweep found that it did not.
@@ -98,14 +113,24 @@ const AGE_UNPROJECT_FUNNELS: &[&str] = &[
     "consolidate",
     "run_gc",
     "size_gc",
-    "archive_by_ids",
+    // #3587 — the archive-then-delete body of `archive_by_ids` moved into the
+    // transaction-scoped core both it and the keyed-supersession archive call;
+    // the delegation is pinned by `span_extractor_is_load_bearing`.
+    "archive_by_ids_in_tx",
     "update_with_archive_on_supersede", // #2397 (N17)
 ];
 
 fn adapter_source() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PG_ADAPTER_PATH);
-    let raw =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut raw = String::new();
+    for rel in std::iter::once(&PG_ADAPTER_PATH).chain(PG_TX_CORE_PATHS) {
+        let path = root.join(rel);
+        raw.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+        );
+        raw.push('\n');
+    }
     // Normalise CRLF -> LF once, at the single ingest point, so no downstream
     // consumer in this file has to reason about line endings. On a Windows
     // checkout with `core.autocrlf=true` every line arrives with a two-byte
@@ -140,6 +165,9 @@ fn adapter_source() -> String {
 fn fn_span<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     let sig_a = format!("    async fn {name}(");
     let sig_b = format!("    pub async fn {name}(");
+    // #3587 — the transaction-scoped cores are module-visible inherent methods.
+    let sig_c = format!("    pub(super) async fn {name}(");
+    let sig_d = format!("    pub(crate) async fn {name}(");
 
     // (byte_start, byte_end_past_terminator, content_without_terminator)
     let mut lines: Vec<(usize, usize, &str)> = Vec::new();
@@ -153,9 +181,12 @@ fn fn_span<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     }
 
     // Single-line-signature variants (e.g. `archive_restore`, `delete`).
-    let start = lines
-        .iter()
-        .position(|(_, _, l)| l.starts_with(&sig_a) || l.starts_with(&sig_b))?;
+    let start = lines.iter().position(|(_, _, l)| {
+        l.starts_with(&sig_a)
+            || l.starts_with(&sig_b)
+            || l.starts_with(&sig_c)
+            || l.starts_with(&sig_d)
+    })?;
     let end = lines[start + 1..]
         .iter()
         .position(|(_, _, l)| *l == "    }")
@@ -213,14 +244,44 @@ fn span_extractor_is_load_bearing() {
         &inner[..inner.len().min(80)]
     );
     assert!(
-        inner.contains("INSERT INTO memories"),
-        "the store_with_embedding_inner span must contain the INSERT (#2771 moved \
-         it here from the thin delegator)"
+        inner.contains("store_with_embedding_in_tx("),
+        "store_with_embedding_inner must DELEGATE to store_with_embedding_in_tx \
+         (#3587 moved the INSERT into the transaction-scoped core) — if the \
+         delegation vanishes the kind_provenance guard stops covering it"
     );
     assert!(
         !inner.contains("async fn list_archived_pg("),
         "the inner span must NOT bleed into the following function"
     );
+
+    let in_tx =
+        fn_span(&src, "store_with_embedding_in_tx").expect("store_with_embedding_in_tx must exist");
+    assert!(
+        in_tx.starts_with("    pub(super) async fn store_with_embedding_in_tx("),
+        "the in-tx span must begin EXACTLY at its own signature, got: {:?}",
+        &in_tx[..in_tx.len().min(80)]
+    );
+    assert!(
+        in_tx.contains("INSERT INTO memories"),
+        "the store_with_embedding_in_tx span must contain the INSERT (#3587 moved \
+         it here from store_with_embedding_inner)"
+    );
+
+    // #3587 — the archive-then-delete body moved into `archive_by_ids_in_tx`;
+    // the trait method and the keyed-supersession archive must both reach it,
+    // and supersession's fresh row must reach the shared INSERT core.
+    for (caller, callee) in [
+        ("archive_by_ids", "archive_by_ids_in_tx("),
+        ("archive_as_superseded", "archive_by_ids_in_tx("),
+        ("store_supersession_attempt", "store_with_embedding_in_tx("),
+    ] {
+        let span = fn_span(&src, caller).unwrap_or_else(|| panic!("{caller} must exist"));
+        assert!(
+            span.contains(callee),
+            "{caller} must DELEGATE to {callee}..) — otherwise the #2393/#2397 \
+             guards stop covering its write"
+        );
+    }
 
     // --- LATE function (the accumulated-drift detector) -----------------
     // `apply_remote_memory` is one of the funnels the CRLF drift actually
@@ -345,7 +406,9 @@ fn pg_write_funnels_bind_kind_provenance_2393() {
     let mut missing: Vec<String> = Vec::new();
     for name in KIND_PROVENANCE_FUNNELS {
         let Some(span) = fn_span(&src, name) else {
-            missing.push(format!("  {name}: function not found in {PG_ADAPTER_PATH}"));
+            missing.push(format!(
+                "  {name}: function not found in {PG_ADAPTER_PATH} or {PG_TX_CORE_PATHS:?}"
+            ));
             continue;
         };
         if !span.contains(KIND_PROVENANCE_COLUMN) {
@@ -380,7 +443,9 @@ fn pg_hard_delete_funnels_unproject_from_age_2397() {
     let mut missing: Vec<String> = Vec::new();
     for name in AGE_UNPROJECT_FUNNELS {
         let Some(span) = fn_span(&src, name) else {
-            missing.push(format!("  {name}: function not found in {PG_ADAPTER_PATH}"));
+            missing.push(format!(
+                "  {name}: function not found in {PG_ADAPTER_PATH} or {PG_TX_CORE_PATHS:?}"
+            ));
             continue;
         };
         // `delete` / `apply_remote_deletion` run pool-direct (no surrounding
