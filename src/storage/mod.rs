@@ -331,12 +331,10 @@ pub const REQUIRE_WHY_TRACE_ENV: &str = "AI_MEMORY_REQUIRE_WHY_TRACE";
 pub const META_KEY_WHY_TRACE: &str = "why_trace";
 
 /// `true` when [`REQUIRE_WHY_TRACE_ENV`] is set truthy (`1`/`true`/`yes`/
-/// `on`). Delegates to the shared `governance::audit::env_flag_enabled`
-/// truthy-grammar helper (#2106 review item 6 — one truthy parser, not a
-/// third copy alongside the K2 witness/cause-binding knobs).
+/// `on`), through the #3200 shared grammar ([`crate::env_flag`]).
 #[must_use]
 pub fn require_why_trace_enabled() -> bool {
-    crate::governance::audit::env_flag_enabled(REQUIRE_WHY_TRACE_ENV)
+    crate::env_flag::knobs::REQUIRE_WHY_TRACE.enabled()
 }
 
 /// `true` when `metadata.why_trace` is a non-empty string.
@@ -481,12 +479,11 @@ pub fn consult_why_trace_gate_inbound(mem: &Memory) {
 pub const REQUIRE_IMMUTABLE_AUTHORSHIP_ENV: &str = "AI_MEMORY_REQUIRE_IMMUTABLE_AUTHORSHIP";
 
 /// `true` when [`REQUIRE_IMMUTABLE_AUTHORSHIP_ENV`] is set truthy
-/// (`1`/`true`/`yes`/`on`). Delegates to the shared
-/// `governance::audit::env_flag_enabled` truthy-grammar helper (#2106
-/// review item 6 — one truthy parser, not a third copy).
+/// (`1`/`true`/`yes`/`on`), through the #3200 shared grammar
+/// ([`crate::env_flag`]).
 #[must_use]
 pub fn require_immutable_authorship_enabled() -> bool {
-    crate::governance::audit::env_flag_enabled(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV)
+    crate::env_flag::knobs::REQUIRE_IMMUTABLE_AUTHORSHIP.enabled()
 }
 
 /// #2060 — TRACT covenant clause 2 authorship-immutability gate,
@@ -988,22 +985,13 @@ pub(crate) const UNDECRYPTABLE_ROW_SKIPPED_MSG: &str = "at-rest envelope did not
      ciphertext is untouched on disk — re-key or restore the agent keypair to \
      recover it. Set AI_MEMORY_STRICT_DECRYPT_READS=1 to fail the read instead.";
 
-/// `true` when [`ENV_STRICT_DECRYPT_READS`] is set to a truthy value. Mirrors
-/// the truthy-set spelling of the other require-mode gates
-/// (`hnsw::strict_dim_enabled`, `identity::lineage::require_identity_lineage_enabled`).
-/// NOT cached: this is consulted only when a decrypt has already failed, so a
-/// process-env read here is off every hot path.
+/// `true` when [`ENV_STRICT_DECRYPT_READS`] is set to a truthy value, through
+/// the #3200 shared grammar ([`crate::env_flag`]). NOT cached: this is
+/// consulted only when a decrypt has already failed, so a process-env read
+/// here is off every hot path.
 #[must_use]
 pub fn strict_decrypt_reads_enabled() -> bool {
-    std::env::var(ENV_STRICT_DECRYPT_READS)
-        .map(|v| {
-            let v = v.trim();
-            v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-        })
-        .unwrap_or(false)
+    crate::env_flag::knobs::STRICT_DECRYPT_READS.enabled()
 }
 
 /// v1.0.0 #2383 (N1) — disposition for a row whose `encrypted_envelope` will

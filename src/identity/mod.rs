@@ -327,13 +327,7 @@ pub const ENV_ANONYMIZE: &str = "AI_MEMORY_ANONYMIZE";
 
 /// Returns true when the hostname-revealing default should be suppressed.
 fn anonymize_default_enabled() -> bool {
-    let Ok(v) = std::env::var(ENV_ANONYMIZE) else {
-        return false;
-    };
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::neutral_enabled(ENV_ANONYMIZE)
 }
 
 /// Returns a stable-for-this-process discriminator of the form
@@ -751,13 +745,7 @@ pub const ENV_REQUIRE_OWNED_ROWS: &str = "AI_MEMORY_REQUIRE_OWNED_ROWS";
 /// Returns true when [`ENV_REQUIRE_OWNED_ROWS`] is truthy.
 #[must_use]
 pub fn require_owned_rows_enabled() -> bool {
-    let Ok(v) = std::env::var(ENV_REQUIRE_OWNED_ROWS) else {
-        return false;
-    };
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::knobs::REQUIRE_OWNED_ROWS.enabled()
 }
 
 /// #1720 B3 — boot-time operator self-lockout guard.

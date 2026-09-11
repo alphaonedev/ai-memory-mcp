@@ -79,6 +79,8 @@
 //! | `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` | *(unset)* | PERMISSIVE-shaped: the fail-OPEN hatch is NOT in force — a rule-consultation error stays fail-CLOSED (#3168) |
 //! | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` | `1` | inbound federated push with a DETECTED-stale `policy_version` is refused (#3168; live name `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — the unprefixed `REQUIRE_POLICY_CURRENT` does not exist) |
 //! | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* | PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` is NOT in force (#3201) |
+//! | `AI_MEMORY_REQUIRE_API_KEY` | `1` | a keyless `serve` bind is refused on EVERY host, loopback included — a same-host proxy presents loopback while exposing the daemon (#1458, #3200) |
+//! | `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` | *(unset)* | PERMISSIVE-shaped: the plaintext acknowledgement hatch is NOT in force; a non-loopback plaintext bind is refused under `asi-hard` regardless (#3200) |
 //! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`. The documented `standard` unset default stays `warn` (#3201 / #3289) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
@@ -95,13 +97,19 @@
 //! `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`) likewise default ON;
 //! `asi-hard` pins them so the "no-disable" contract covers the outermost
 //! network access-control gates, not only the inner per-object attestation
-//! (#3033). Because these gates use the DEFAULT-ON grammar (enabled unless an
-//! explicit falsy token), their `meets_floor` predicates delegate to the same
-//! value-level readers the runtime resolves through
-//! ([`crate::federation::receive_auth::flag_value_default_on`] /
-//! [`crate::handlers::federation_signing_check::peer_enrollment_value_enabled`]),
-//! never a re-derived truthy grammar that would false-refuse a boot the live
-//! gate treats as compliant.
+//! (#3033). Since #3200 every BOOLEAN floor asks the knob's own
+//! [`crate::env_flag::BoolKnob`] registry entry, the same object the live
+//! reader resolves through, so a floor can neither accept a token the live
+//! gate ignores (#3618, #3619) nor refuse one it treats as compliant (NB1).
+//!
+//! ## Plaintext non-loopback binds (#3200 R3)
+//!
+//! `AI_MEMORY_REQUIRE_TLS` is deliberately NOT pinned: a pin would also refuse
+//! a LOOPBACK plaintext bind, which breaks the same-host TLS-terminating proxy
+//! topology. Instead `asi-hard` refuses a NON-loopback plaintext bind outright
+//! in `daemon_runtime::tls_bind_guard`, with no hatch, and keeps the loopback
+//! exemption. `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` is pinned closed so the
+//! acknowledgement cannot be set under the posture at all.
 //!
 //! ## Call site (#2386 — pre-runtime ONLY)
 //!
@@ -205,21 +213,35 @@ pub fn is_asi_hard() -> bool {
 struct KnobSpec {
     env: &'static str,
     hard_value: &'static str,
-    /// True iff `current` (the operator-set value) satisfies the hard floor.
-    meets_floor: fn(&str) -> bool,
+    /// Answers "does `current` (the operator-set value) satisfy the hard
+    /// floor?".
+    floor: Floor,
 }
 
-/// A truthy env token (the affirmative half of the substrate-wide
-/// `1`/`true`/`yes`/`on` convention).
+/// How a pinned knob's floor is decided.
 ///
-/// #3167 — exposed crate-wide so `config::skip_config` resolves
-/// `AI_MEMORY_NO_CONFIG` through the SAME grammar as every other
-/// `AI_MEMORY_*` boolean knob instead of a bare presence check.
-pub(crate) fn is_truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// #3200 — a BOOLEAN knob's floor is never a re-derived grammar: it asks the
+/// knob's own registry entry ([`crate::env_flag::BoolKnob`]), the same object
+/// the live reader resolves through, so a floor cannot accept a token the
+/// live reader ignores (#3618, #3619) and cannot refuse a token the live
+/// reader treats as compliant (the NB1 false-red).
+enum Floor {
+    /// A boolean MANDATE: met when the live reader reads the value as ON.
+    On(&'static crate::env_flag::BoolKnob),
+    /// A boolean HATCH: met when the live reader reads the value as OFF.
+    Off(&'static crate::env_flag::BoolKnob),
+    /// A non-boolean knob with its own value predicate.
+    Value(fn(&str) -> bool),
+}
+
+impl Floor {
+    fn met(&self, current: &str) -> bool {
+        match self {
+            Self::On(knob) => knob.value_enabled(current),
+            Self::Off(knob) => !knob.value_enabled(current),
+            Self::Value(f) => f(current),
+        }
+    }
 }
 
 /// `AI_MEMORY_SECRET_SCREEN_MODE` floor: only `refuse` clears it.
@@ -248,25 +270,6 @@ fn schema_ahead_hatch_meets_floor(v: &str) -> bool {
     v.trim().is_empty()
 }
 
-/// #2477 — floor for the plaintext-federation-peer hatch. The SECOND
-/// PERMISSIVE knob in this table (after the schema-ahead hatch), so "hard"
-/// again means the hatch is NOT in force. Any non-truthy value clears the
-/// floor, because [`crate::tls::plaintext_peers_allowed`] only opens on an
-/// explicit truthy token — so a knob left unset, empty, or set to `0` is
-/// already at the hard posture and must not refuse boot.
-///
-/// Without this entry an `asi-hard` deployment could still replicate
-/// memory CONTENT in the clear to a non-loopback peer, i.e. the hardened
-/// PROCUREMENT posture would be silently weaker than the no-disable
-/// contract advertises — the exact defect #2448 fixed for
-/// `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`, one door over.
-fn plaintext_peers_hatch_meets_floor(v: &str) -> bool {
-    !matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 /// #3168 — `AI_MEMORY_PERMISSIONS_MODE` floor: only a token the live
 /// reader ([`crate::config::AppConfig::permissions_mode_from_env_token`])
 /// resolves as [`crate::config::PermissionsMode::Enforce`]. The live env
@@ -277,21 +280,6 @@ fn permissions_mode_meets_floor(v: &str) -> bool {
         crate::config::AppConfig::permissions_mode_from_env_token(v),
         Some(crate::config::PermissionsMode::Enforce)
     )
-}
-
-/// #3168 — `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` floor: the hatch
-/// is NOT in force. Delegates to the live value-level reader so a token
-/// that would not arm fail-OPEN (`yes`/`on`/`false`/`0`) cannot refuse
-/// boot (NB1). Inverse of [`crate::daemon_runtime::governance_fail_open_value_enabled`].
-fn governance_fail_open_hatch_meets_floor(v: &str) -> bool {
-    !crate::daemon_runtime::governance_fail_open_value_enabled(v)
-}
-
-/// #3201 — `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` floor: the hatch is
-/// NOT in force. Inverse of the live receive-path reader
-/// ([`crate::handlers::federation_signing_check::allow_unenrolled_peers_value_enabled`]).
-fn unenrolled_peers_hatch_meets_floor(v: &str) -> bool {
-    !crate::handlers::federation_signing_check::allow_unenrolled_peers_value_enabled(v)
 }
 
 /// #3201 / #3289 — `AI_MEMORY_FED_CERT_PEER_BINDING` floor: only the
@@ -310,37 +298,37 @@ const KNOBS: &[KnobSpec] = &[
     KnobSpec {
         env: "AI_MEMORY_SECRET_SCREEN_MODE",
         hard_value: "refuse",
-        meets_floor: secret_screen_meets_floor,
+        floor: Floor::Value(secret_screen_meets_floor),
     },
     KnobSpec {
         env: crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD,
         hard_value: "",
-        meets_floor: schema_ahead_hatch_meets_floor,
+        floor: Floor::Value(schema_ahead_hatch_meets_floor),
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::REQUIRE_AGENT_ATTESTATION),
     },
     KnobSpec {
         env: "AI_MEMORY_FED_REQUIRE_WRITE_SIG",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_WRITE_SIG),
     },
     KnobSpec {
         env: "AI_MEMORY_FED_REQUIRE_SIGNAL_SIG",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_SIGNAL_SIG),
     },
     KnobSpec {
         env: "AI_MEMORY_FED_REQUIRE_TRANSITION_SIG",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_TRANSITION_SIG),
     },
     KnobSpec {
         env: "AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_CHECKPOINT_SIG),
     },
     // #3033 — the FOUR OUTER federation-TRANSPORT gates. The sig-lane rows
     // above pin the INNER per-object attestation (write/signal/transition/
@@ -353,85 +341,78 @@ const KNOBS: &[KnobSpec] = &[
     // #3033 defect where the "no-disable" contract silently excluded the
     // outermost network access-control gates.
     //
-    // Each `meets_floor` delegates to the SAME value-level grammar helper the
-    // live runtime reader uses (NOT `is_truthy`, which would false-RED a value
-    // the live default-ON gate treats as enabled — the NB1 lesson): the three
-    // `env_flag_default_on` gates share
-    // `receive_auth::flag_value_default_on` (case-sensitive), and the
-    // peer-enrollment gate shares
-    // `federation_signing_check::peer_enrollment_value_enabled`
-    // (case-insensitive) — the identical predicate
+    // Each floor is the knob's registry entry, the same object
     // `require_sig`/`require_nonce`/`require_push_namespace_scope_enabled`/
-    // `require_peer_enrollment_enabled` resolve through.
+    // `require_peer_enrollment_enabled` resolve through (NB1, #3200).
     KnobSpec {
         env: crate::federation::signing::REQUIRE_SIG_ENV,
         hard_value: "1",
-        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_SIG),
     },
     KnobSpec {
         env: crate::federation::signing::REQUIRE_NONCE_ENV,
         hard_value: "1",
-        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_NONCE),
     },
     KnobSpec {
         env: crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
         hard_value: "1",
-        meets_floor: crate::handlers::federation_signing_check::peer_enrollment_value_enabled,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_PEER_ENROLLMENT),
     },
     KnobSpec {
         env: crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
         hard_value: "1",
-        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_PUSH_NAMESPACE_SCOPE),
     },
     KnobSpec {
         env: "AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::FED_QUARANTINE_UNATTRIBUTED),
     },
     KnobSpec {
         env: "AI_MEMORY_CID_ENFORCE",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::CID_ENFORCE),
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_ROLLBACK_CHECK",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::REQUIRE_ROLLBACK_CHECK),
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_WITNESS",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::REQUIRE_WITNESS),
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_CAUSE_BINDING",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::REQUIRE_CAUSE_BINDING),
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_ROLE_SEPARATION",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::REQUIRE_ROLE_SEPARATION),
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_IDENTITY_LINEAGE",
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::REQUIRE_IDENTITY_LINEAGE),
     },
     KnobSpec {
         env: crate::tls::FED_REQUIRE_SERVER_VERIFY_ENV,
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_SERVER_VERIFY),
     },
     KnobSpec {
         env: crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
         hard_value: "",
-        meets_floor: plaintext_peers_hatch_meets_floor,
+        floor: Floor::Off(&crate::env_flag::knobs::FED_ALLOW_PLAINTEXT_PEERS),
     },
     KnobSpec {
         env: crate::storage::ENV_DB_SYNCHRONOUS,
         hard_value: "FULL",
-        meets_floor: synchronous_meets_floor,
+        floor: Floor::Value(synchronous_meets_floor),
     },
     // #3113 — the migration ladder's core-relation gate. The sqlite ladder's
     // existence-probe arms SKIP a relation that is absent and the tail stamps
@@ -450,7 +431,7 @@ const KNOBS: &[KnobSpec] = &[
     KnobSpec {
         env: crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
         hard_value: "1",
-        meets_floor: is_truthy,
+        floor: Floor::On(&crate::env_flag::knobs::MIGRATION_REQUIRE_CORE_TABLES),
     },
     // #3168 — three residual #3033 knobs that #3094 left un-pinned.
     // Certified deployments already refuse them via
@@ -459,22 +440,22 @@ const KNOBS: &[KnobSpec] = &[
     // `asi-hard` is the hole: `PERMISSIONS_MODE=off` boots with
     // `db::enforce_governance` OFF, `GOVERNANCE_FAIL_OPEN_ON_ERROR` can
     // arm fail-OPEN, and `FED_REQUIRE_POLICY_CURRENT` can be disabled.
-    // Each `meets_floor` delegates to the SAME grammar the live reader
-    // uses (NB1 / #3033 lesson — never a naive `is_truthy`).
+    // Each floor delegates to the SAME object the live reader uses (NB1 /
+    // #3033 / #3200).
     KnobSpec {
         env: crate::config::AppConfig::ENV_PERMISSIONS_MODE,
         hard_value: "enforce",
-        meets_floor: permissions_mode_meets_floor,
+        floor: Floor::Value(permissions_mode_meets_floor),
     },
     KnobSpec {
         env: crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
         hard_value: "",
-        meets_floor: governance_fail_open_hatch_meets_floor,
+        floor: Floor::Off(&crate::env_flag::knobs::GOVERNANCE_FAIL_OPEN_ON_ERROR),
     },
     KnobSpec {
         env: crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
         hard_value: "1",
-        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+        floor: Floor::On(&crate::env_flag::knobs::FED_REQUIRE_POLICY_CURRENT),
     },
     // #3201 — two federation escape hatches that the already-pinned
     // outer-transport gates do not cover. `REQUIRE_PEER_ENROLLMENT` is
@@ -490,12 +471,28 @@ const KNOBS: &[KnobSpec] = &[
     KnobSpec {
         env: crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
         hard_value: "",
-        meets_floor: unenrolled_peers_hatch_meets_floor,
+        floor: Floor::Off(&crate::env_flag::knobs::FED_ALLOW_UNENROLLED_PEERS),
     },
     KnobSpec {
         env: crate::tls::FED_CERT_PEER_BINDING_ENV,
         hard_value: "enforce",
-        meets_floor: cert_peer_binding_meets_floor,
+        floor: Floor::Value(cert_peer_binding_meets_floor),
+    },
+    // #3200 R3 — the daemon bind posture. `REQUIRE_API_KEY` refuses a keyless
+    // bind on every host, loopback included: a same-host proxy, socat forward
+    // or `--network=host` container presents loopback while exposing the
+    // daemon off-host (#1458). The plaintext acknowledgement hatch is pinned
+    // closed; `tls_bind_guard` refuses a non-loopback plaintext bind under
+    // `asi-hard` regardless. `REQUIRE_TLS` is NOT pinned (see module docs).
+    KnobSpec {
+        env: crate::env_flag::knobs::REQUIRE_API_KEY.env,
+        hard_value: "1",
+        floor: Floor::On(&crate::env_flag::knobs::REQUIRE_API_KEY),
+    },
+    KnobSpec {
+        env: crate::daemon_runtime::ENV_ALLOW_PLAINTEXT_NONLOOPBACK,
+        hard_value: "",
+        floor: Floor::Off(&crate::env_flag::knobs::ALLOW_PLAINTEXT_NONLOOPBACK),
     },
 ];
 
@@ -548,7 +545,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 27
+/// enterprise-federation`, which reuses this as ONE SSOT for the 29
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -557,7 +554,7 @@ pub fn asi_hard_below_floor() -> Vec<(&'static str, String, &'static str)> {
     KNOBS
         .iter()
         .filter_map(|k| match std::env::var(k.env) {
-            Ok(current) if !(k.meets_floor)(&current) => Some((k.env, current, k.hard_value)),
+            Ok(current) if !k.floor.met(&current) => Some((k.env, current, k.hard_value)),
             _ => None,
         })
         .collect()
@@ -584,7 +581,7 @@ pub fn enforce_at_boot() -> Result<(SecurityPosture, Vec<PinReport>)> {
     for knob in KNOBS {
         match std::env::var(knob.env) {
             Ok(current) => {
-                if (knob.meets_floor)(&current) {
+                if knob.floor.met(&current) {
                     reports.push(PinReport {
                         env: knob.env,
                         effective: knob.hard_value,
@@ -696,7 +693,7 @@ pub fn runtime_boot_report() -> Result<(SecurityPosture, Vec<PinReport>)> {
     let mut reports = Vec::with_capacity(KNOBS.len());
     for knob in KNOBS {
         match std::env::var(knob.env) {
-            Ok(current) if (knob.meets_floor)(&current) => reports.push(PinReport {
+            Ok(current) if knob.floor.met(&current) => reports.push(PinReport {
                 env: knob.env,
                 effective: knob.hard_value,
                 action: PinAction::AlreadyCompliant,
@@ -1247,6 +1244,25 @@ mod tests {
                 "asi-hard must pin the outer-transport gate {env} ON (#3033)"
             );
         }
+        // #3200 R3 — the daemon bind posture: keyless binds refused on every
+        // host, and the plaintext acknowledgement hatch pinned closed.
+        assert!(
+            pins.iter()
+                .any(|(e, v)| *e == crate::env_flag::knobs::REQUIRE_API_KEY.env && *v == "1"),
+            "asi-hard must pin AI_MEMORY_REQUIRE_API_KEY ON (#3200)"
+        );
+        assert!(
+            pins.iter().any(|(e, v)| {
+                *e == crate::daemon_runtime::ENV_ALLOW_PLAINTEXT_NONLOOPBACK && v.is_empty()
+            }),
+            "asi-hard must pin the plaintext acknowledgement hatch OFF (#3200)"
+        );
+        assert!(
+            !pins
+                .iter()
+                .any(|(e, _)| *e == crate::daemon_runtime::ENV_REQUIRE_TLS),
+            "AI_MEMORY_REQUIRE_TLS must NOT be pinned: it refuses loopback plaintext (#3200 R3)"
+        );
     }
 
     /// #3033 — `asi-hard` REFUSES to boot when an operator tries to DISABLE
@@ -1355,11 +1371,15 @@ mod tests {
         }
     }
 
-    /// #3168 — a value the LIVE reader would NOT treat as loosening must
-    /// still boot. `PERMISSIONS_MODE=ENFORCE` (case-insensitive live
-    /// match); `GOVERNANCE_FAIL_OPEN=yes` does NOT arm the live hatch
-    /// (exact `"1"` / case-insensitive `"true"` only); `FED_REQUIRE_POLICY_CURRENT=FALSE`
-    /// stays ON under the case-sensitive default-ON grammar.
+    /// #3168 — a value the LIVE reader treats as compliant must still boot.
+    ///
+    /// #3200 (rule (e)) — this pin read `GOVERNANCE_FAIL_OPEN=yes` as
+    /// compliant (the old reader ignored `yes`) and
+    /// `FED_REQUIRE_POLICY_CURRENT=FALSE` as compliant (the old default-ON
+    /// reader was case-sensitive). Under the shared grammar both tokens are
+    /// recognised, so both now LOOSEN and refuse boot
+    /// ([`asi_hard_refuses_tokens_that_changed_meaning_3200`]). The compliant
+    /// spellings the shared grammar accepts are pinned here instead.
     #[test]
     fn asi_hard_accepts_live_compliant_governance_values_3168() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -1375,35 +1395,102 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
             std::env::set_var(crate::config::AppConfig::ENV_PERMISSIONS_MODE, "ENFORCE");
-            std::env::set_var(crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "yes");
+            std::env::set_var(crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "No");
             std::env::set_var(
                 crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
-                "FALSE",
+                "ON",
             );
         }
         let (posture, reports) = enforce_at_boot().unwrap();
         assert_eq!(posture, SecurityPosture::AsiHard);
-        assert!(
-            reports.iter().any(|r| {
-                r.env == crate::config::AppConfig::ENV_PERMISSIONS_MODE
-                    && r.action == PinAction::AlreadyCompliant
-            }),
-            "ENFORCE must meet the permissions-mode floor"
-        );
-        assert!(
-            reports.iter().any(|r| {
-                r.env == crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN
-                    && r.action == PinAction::AlreadyCompliant
-            }),
-            "yes must NOT be treated as arming the fail-OPEN hatch (live grammar)"
-        );
-        assert!(
-            reports.iter().any(|r| {
-                r.env == crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV
-                    && r.action == PinAction::AlreadyCompliant
-            }),
-            "FALSE must keep the default-ON policy-current gate enabled (live grammar)"
-        );
+        for env in [
+            crate::config::AppConfig::ENV_PERMISSIONS_MODE,
+            crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
+            crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+        ] {
+            assert!(
+                reports
+                    .iter()
+                    .any(|r| r.env == env && r.action == PinAction::AlreadyCompliant),
+                "{env} must meet its floor with a compliant shared-grammar token"
+            );
+        }
+    }
+
+    /// #3200 / #3618 / #3619 — tokens whose meaning CHANGED under the shared
+    /// grammar now refuse `asi-hard` boot when they loosen, and tokens the
+    /// floor used to accept while the live reader ignored them now arm the
+    /// live control. Each pair is (knob, token, expected floor verdict).
+    #[test]
+    fn asi_hard_refuses_tokens_that_changed_meaning_3200() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_refuses_tokens_that_changed_meaning_3200",
+        ) {
+            return;
+        }
+        // Loosening tokens the old readers ignored or misread: must refuse.
+        let refused = [
+            (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "yes"),
+            (
+                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+                "FALSE",
+            ),
+            (crate::federation::signing::REQUIRE_SIG_ENV, "Off"),
+            (crate::daemon_runtime::ENV_ALLOW_PLAINTEXT_NONLOOPBACK, "on"),
+            (crate::env_flag::knobs::REQUIRE_API_KEY.env, "0"),
+        ];
+        for (env, value) in refused {
+            let _g = env_lock();
+            unsafe {
+                clear_all();
+            }
+            let _cleanup = KnobsGuard;
+            unsafe {
+                std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+                std::env::set_var(env, value);
+            }
+            let err = enforce_at_boot().unwrap_err();
+            assert!(
+                format!("{err}").contains(env),
+                "{env}={value:?} loosens the live control and must refuse boot: {err}"
+            );
+        }
+        // #3618 / #3619 — tokens the floor accepted while the live reader
+        // ignored them: after boot the LIVE reader must read them as ON.
+        let live_on: [(&str, &str, fn() -> bool); 2] = [
+            (
+                crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION,
+                "yes",
+                crate::identity::attest::global_strict_attestation_enabled,
+            ),
+            (
+                crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV,
+                "TRUE",
+                crate::federation::receive_auth::quarantine_unattributed_enabled,
+            ),
+        ];
+        for (env, value, live) in live_on {
+            let _g = env_lock();
+            unsafe {
+                clear_all();
+            }
+            let _cleanup = KnobsGuard;
+            unsafe {
+                std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+                std::env::set_var(env, value);
+            }
+            let (_posture, reports) = enforce_at_boot().unwrap();
+            assert!(
+                reports
+                    .iter()
+                    .any(|r| r.env == env && r.action == PinAction::AlreadyCompliant),
+                "{env}={value:?} meets the floor"
+            );
+            assert!(
+                live(),
+                "{env}={value:?} met the floor, so the LIVE reader must read it ON"
+            );
+        }
     }
 
     /// #3168 END-TO-END. Pinning the env is not the claim; the claim is
@@ -1529,7 +1616,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 27-knob asi-hard set
+        // reuses this accessor as the SSOT for the 29-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it
