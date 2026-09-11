@@ -422,9 +422,16 @@ pub fn validate_ruling_key_update(
 }
 
 /// Wire-independent typed write-once refusal.
-#[derive(Debug, thiserror::Error)]
-#[error("ruling_key is immutable after creation")]
+#[derive(Debug)]
 pub struct RulingKeyImmutable;
+
+impl std::fmt::Display for RulingKeyImmutable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ruling_key is immutable after creation")
+    }
+}
+
+impl std::error::Error for RulingKeyImmutable {}
 
 /// Exact keyed-store match. Missing, null, non-string and empty keys never match.
 #[must_use]
