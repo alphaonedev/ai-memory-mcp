@@ -916,3 +916,87 @@ async fn federated_decision_on_local_proposal_refused_even_with_gate_off_3587() 
         .status;
     assert_eq!(status_now, "pending", "never approved by a peer");
 }
+
+// ---------------------------------------------------------------------
+// #3587 — the LOCAL HTTP approve surface (`POST /api/v1/pending/{id}/approve`)
+// on a curator proposal: the old row's owner (X-Agent-Id, registered) archives
+// it; any other registered approver is refused 403 BEFORE the row is approved.
+// ---------------------------------------------------------------------
+
+async fn http_approve(router: &axum::Router, pid: &str, agent: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/pending/{pid}/approve"))
+        .header("x-agent-id", agent)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn queue_local_proposal(db: &ai_memory::handlers::Db, old: &str, new: &str) -> String {
+    let guard = db.lock().await;
+    let old_m = ai_memory::db::get(&guard.0, old).unwrap().unwrap();
+    let new_m = ai_memory::db::get(&guard.0, new).unwrap().unwrap();
+    let proposal =
+        ai_memory::identity::supersession::SupersessionProposal::from_pair(&old_m, &new_m).unwrap();
+    ai_memory::db::supersession_pending::queue_proposal(&guard.0, &proposal)
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn http_owner_approves_proposal_and_non_owner_is_refused_3587() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_posture(None, None);
+    let (router, db) = build_router_with_db();
+    register_approver(&db).await;
+    {
+        let guard = db.lock().await;
+        ai_memory::db::register_agent(&guard.0, "ai:victim", "service", &[]).unwrap();
+    }
+    let (old, new) = seed_supersession_pair(&router).await;
+    let pid = queue_local_proposal(&db, &old, &new).await;
+
+    // A registered, non-requester approver who does not own OLD: refused
+    // before approval — the row stays pending and nothing is archived.
+    let (status, body) = http_approve(&router, &pid, APPROVER).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(row_exists(&db, &old).await);
+    {
+        let guard = db.lock().await;
+        let pa = ai_memory::db::get_pending_action(&guard.0, &pid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pa.status, "pending",
+            "a refused approval never flips the row"
+        );
+    }
+
+    // The owner approves: OLD is archived as superseded, NEW gains the pointer.
+    let (status, body) = http_approve(&router, &pid, "ai:victim").await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(body["memory_id"], new.as_str(), "{body}");
+    assert!(!row_exists(&db, &old).await, "old left the live table");
+    let guard = db.lock().await;
+    let (reason, meta): (String, String) = guard
+        .0
+        .query_row(
+            "SELECT archive_reason, metadata FROM archived_memories WHERE id = ?1",
+            [&old],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(reason, "superseded");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(meta["superseded_by"], new.as_str());
+}
