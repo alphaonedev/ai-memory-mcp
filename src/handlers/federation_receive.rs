@@ -70,7 +70,8 @@ const CERT_BINDING_UNBOUND_NOTE: &str = crate::handlers::federation_wire_notes::
 
 /// Operator guidance for an `enforce`-mode refusal of a bound cert that
 /// asserted no `X-Peer-Id` header.
-const CERT_BINDING_NO_HEADER_NOTE: &str = crate::handlers::federation_wire_notes::wire::CERT_NO_HEADER;
+const CERT_BINDING_NO_HEADER_NOTE: &str =
+    crate::handlers::federation_wire_notes::wire::CERT_NO_HEADER;
 
 /// Render the `401 peer_id_cert_unbound` envelope for an `enforce`-mode
 /// refusal where the cross-check could not run at all (unbound cert /

@@ -137,7 +137,10 @@ async fn push_unenrolled(router: &axum::Router) -> (StatusCode, Value) {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .expect("body");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn assert_refusal_hides_knob_and_log_carries_it(backend: StorageBackend, label: &str) {
@@ -267,6 +270,9 @@ fn federation_handler_wire_notes_name_no_knob_3204() {
         assert!(!note.contains(ENV_PREFIX), "wire note leaks a knob: {note}");
     }
     for hint in remediation::ALL {
-        assert!(hint.contains(ENV_PREFIX), "remediation must name the knob: {hint}");
+        assert!(
+            hint.contains(ENV_PREFIX),
+            "remediation must name the knob: {hint}"
+        );
     }
 }

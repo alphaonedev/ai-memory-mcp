@@ -139,12 +139,18 @@ mod tests {
         assert_eq!(wire::ALL.len(), 13);
         for note in wire::ALL {
             assert!(!note.contains(ENV_PREFIX), "wire note leaks a knob: {note}");
-            assert!(!note.contains("=0") && !note.contains("=1"), "wire note leaks a toggle: {note}");
+            assert!(
+                !note.contains("=0") && !note.contains("=1"),
+                "wire note leaks a toggle: {note}"
+            );
             assert!(!note.trim().is_empty());
         }
         assert_eq!(remediation::ALL.len(), 7);
         for hint in remediation::ALL {
-            assert!(hint.contains(ENV_PREFIX), "remediation must name the knob: {hint}");
+            assert!(
+                hint.contains(ENV_PREFIX),
+                "remediation must name the knob: {hint}"
+            );
         }
     }
 }

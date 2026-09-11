@@ -1326,12 +1326,24 @@ mod tests {
         let signal_bytes = canonical_cbor_signal(&signal).expect("encode signal");
         let cp_bytes = canonical_cbor_checkpoint_resolution(&resolution).expect("encode cp");
         assert!(contains(&signal_bytes, domain_tags::SIGNAL.as_bytes()));
-        assert!(!contains(&signal_bytes, domain_tags::CHECKPOINT_RESOLUTION.as_bytes()));
-        assert!(contains(&cp_bytes, domain_tags::CHECKPOINT_RESOLUTION.as_bytes()));
+        assert!(!contains(
+            &signal_bytes,
+            domain_tags::CHECKPOINT_RESOLUTION.as_bytes()
+        ));
+        assert!(contains(
+            &cp_bytes,
+            domain_tags::CHECKPOINT_RESOLUTION.as_bytes()
+        ));
         assert!(!contains(&cp_bytes, domain_tags::SIGNAL.as_bytes()));
         for tag in [domain_tags::LINK, domain_tags::WRITE, domain_tags::PERSONA] {
-            assert!(!contains(&signal_bytes, tag.as_bytes()), "signal must not carry {tag}");
-            assert!(!contains(&cp_bytes, tag.as_bytes()), "resolution must not carry {tag}");
+            assert!(
+                !contains(&signal_bytes, tag.as_bytes()),
+                "signal must not carry {tag}"
+            );
+            assert!(
+                !contains(&cp_bytes, tag.as_bytes()),
+                "resolution must not carry {tag}"
+            );
         }
 
         let kp = keypair::generate("ai:curator").expect("generate");
@@ -1340,7 +1352,10 @@ mod tests {
 
         // ALLOWED — the tagged round trip.
         let sig = sign_signal(&kp, &signal).expect("sign signal");
-        assert!(verify_signal(&signal, &sig, &pk), "tagged signal must verify");
+        assert!(
+            verify_signal(&signal, &sig, &pk),
+            "tagged signal must verify"
+        );
         let sig = sign_checkpoint_resolution(&kp, &resolution).expect("sign resolution");
         assert!(
             verify_checkpoint_resolution(&resolution, &sig, &pk),
@@ -1351,14 +1366,29 @@ mod tests {
         // byte-for-byte, signed by the SAME genuine key.
         let legacy_signal = canonical_cbor_map(vec![
             ("id", ciborium::Value::Text(signal.id.to_string())),
-            ("namespace", ciborium::Value::Text(signal.namespace.to_string())),
-            ("from_agent", ciborium::Value::Text(signal.from_agent.to_string())),
+            (
+                "namespace",
+                ciborium::Value::Text(signal.namespace.to_string()),
+            ),
+            (
+                "from_agent",
+                ciborium::Value::Text(signal.from_agent.to_string()),
+            ),
             ("to_agent", text_or_null(signal.to_agent)),
             ("subject", ciborium::Value::Text(signal.subject.to_string())),
-            ("body_sha256", ciborium::Value::Bytes(signal.body_sha256.to_vec())),
-            ("signal_type", ciborium::Value::Text(signal.signal_type.to_string())),
+            (
+                "body_sha256",
+                ciborium::Value::Bytes(signal.body_sha256.to_vec()),
+            ),
+            (
+                "signal_type",
+                ciborium::Value::Text(signal.signal_type.to_string()),
+            ),
             ("in_reply_to", text_or_null(signal.in_reply_to)),
-            (field_names::CORRELATION_ID, text_or_null(signal.correlation_id)),
+            (
+                field_names::CORRELATION_ID,
+                text_or_null(signal.correlation_id),
+            ),
             (
                 field_names::CREATED_AT,
                 ciborium::Value::Integer(ciborium::value::Integer::from(signal.created_at)),
@@ -1366,7 +1396,10 @@ mod tests {
         ]);
         let mut legacy_signal_bytes = Vec::new();
         ciborium::ser::into_writer(&legacy_signal, &mut legacy_signal_bytes).expect("encode");
-        assert_ne!(legacy_signal_bytes, signal_bytes, "the tag must change the bytes");
+        assert_ne!(
+            legacy_signal_bytes, signal_bytes,
+            "the tag must change the bytes"
+        );
         let legacy_sig = ed25519_dalek::Signer::sign(signing, &legacy_signal_bytes).to_bytes();
         assert!(
             !verify_signal(&signal, &legacy_sig, &pk),
@@ -1374,10 +1407,19 @@ mod tests {
         );
 
         let legacy_cp = canonical_cbor_map(vec![
-            ("checkpoint_id", ciborium::Value::Text(resolution.checkpoint_id.to_string())),
-            ("namespace", ciborium::Value::Text(resolution.namespace.to_string())),
+            (
+                "checkpoint_id",
+                ciborium::Value::Text(resolution.checkpoint_id.to_string()),
+            ),
+            (
+                "namespace",
+                ciborium::Value::Text(resolution.namespace.to_string()),
+            ),
             ("state", ciborium::Value::Text(resolution.state.to_string())),
-            ("resolved_by", ciborium::Value::Text(resolution.resolved_by.to_string())),
+            (
+                "resolved_by",
+                ciborium::Value::Text(resolution.resolved_by.to_string()),
+            ),
             ("resolution", text_or_null(resolution.resolution)),
             (
                 "resolved_at",

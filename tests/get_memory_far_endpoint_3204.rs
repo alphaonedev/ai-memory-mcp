@@ -185,7 +185,10 @@ async fn get_as(router: &axum::Router, uri: &str, caller: &str) -> (StatusCode, 
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .expect("body");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn far_ids(body: &Value, anchor: &str) -> Vec<String> {
@@ -196,7 +199,11 @@ fn far_ids(body: &Value, anchor: &str) -> Vec<String> {
         .map(|l| {
             let src = l["source_id"].as_str().unwrap_or_default();
             let tgt = l["target_id"].as_str().unwrap_or_default();
-            if src == anchor { tgt.to_string() } else { src.to_string() }
+            if src == anchor {
+                tgt.to_string()
+            } else {
+                src.to_string()
+            }
         })
         .collect()
 }
@@ -207,7 +214,10 @@ async fn assert_far_endpoint_matrix(f: &Fixture, label: &str) {
     assert_eq!(body["memory"]["id"], f.anchor, "{label}: {body}");
     let far = far_ids(&body, &f.anchor);
     // ALLOWED — the caller's own row and the collective row still ride.
-    assert!(far.contains(&f.own), "{label}: own far endpoint must ride: {body}");
+    assert!(
+        far.contains(&f.own),
+        "{label}: own far endpoint must ride: {body}"
+    );
     assert!(
         far.contains(&f.collective),
         "{label}: collective far endpoint must ride: {body}"
@@ -223,13 +233,21 @@ async fn assert_far_endpoint_matrix(f: &Fixture, label: &str) {
         !rendered.contains(&f.other_inbox),
         "{label}: foreign inbox far endpoint disclosed: {body}"
     );
-    assert_eq!(far.len(), 2, "{label}: exactly the two readable edges: {body}");
+    assert_eq!(
+        far.len(),
+        2,
+        "{label}: exactly the two readable edges: {body}"
+    );
 
     // ALLOWED (control) — the OTHER agent reading its own collective row sees
     // the edge back to the anchor only when the anchor is readable to it; the
     // anchor is CALLER-private, so the far endpoint is dropped for OTHER too.
-    let (status, body) =
-        get_as(&f.router, &format!("/api/v1/memories/{}", f.collective), OTHER).await;
+    let (status, body) = get_as(
+        &f.router,
+        &format!("/api/v1/memories/{}", f.collective),
+        OTHER,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{label}: {body}");
     assert!(
         !body.to_string().contains(&f.anchor),
@@ -270,7 +288,13 @@ async fn live_pg_get_memory_hides_foreign_far_endpoints_3204() {
     let f = fixture_with_store(StorageBackend::Postgres, Some(Arc::clone(&store)));
     let conn = ai_memory::db::open(f.file.path()).expect("fixture rows");
     let ctx = CallerContext::for_admin("fixture-3204");
-    for id in [&f.anchor, &f.own, &f.collective, &f.other_private, &f.other_inbox] {
+    for id in [
+        &f.anchor,
+        &f.own,
+        &f.collective,
+        &f.other_private,
+        &f.other_inbox,
+    ] {
         let mem = ai_memory::db::get(&conn, id)
             .expect("fetch fixture")
             .expect("fixture exists");

@@ -2812,7 +2812,7 @@ pub(super) fn verify_get_signature_or_reject(
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
                         "error": fed_signing::VerifyError::Missing.tag(),
-                        "note": crate::handlers::federation_wire_notes::wire::SIG_INVALID,
+                        "note": crate::handlers::federation_wire_notes::wire::SIG_MISSING,
                     })),
                 )
                     .into_response(),
