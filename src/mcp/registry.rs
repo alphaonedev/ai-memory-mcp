@@ -1776,6 +1776,8 @@ mod d1_6_987_tests {
     const PROPERTY_ADDITIONS: &[(&str, &[&str])] = &[
         // #2258 — bitemporal validity on the write schema.
         // #3587 — `as_admin`: the handler honours it on keyed supersession.
+        // #3587 — `write_v2`: honoured since #1942 stage 3 and now accepted as
+        // keyed-supersession evidence; declared so the schema matches (#3171).
         (
             "memory_store",
             &[
@@ -1784,6 +1786,7 @@ mod d1_6_987_tests {
                 "citations",
                 "source_span",
                 "as_admin",
+                "write_v2",
             ],
         ),
         // #3011 — optional signal TTL, wiring `signals.expires_at`.

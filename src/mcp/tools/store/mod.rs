@@ -174,6 +174,19 @@ pub struct StoreRequest {
     )]
     pub created_at: Option<String>,
 
+    // #1942/#1941 crypto-core stage 3 — the v2 signed-write envelope
+    // (cert -> write -> suite chain). The handler has honoured it since
+    // stage 3 (`identity::attest_v2::parse_presented`) and #3587 keyed
+    // supersession accepts it as hardened-principal evidence, so the schema
+    // declares it (#3171 discipline). Takes precedence over `signature`; a
+    // presented-but-invalid envelope is always rejected. Plain `//` for the
+    // same schema-`title` reason documented on `signature` above.
+    #[serde(default)]
+    #[schemars(
+        description = "#1942 v2 signed-write envelope (cert/write/suite); overrides signature."
+    )]
+    pub write_v2: Option<serde_json::Map<String, Value>>,
+
     // v0.9.0 G10.1 (#1827) — optional macaroon capability token. Plain `//`
     // (not `///`) so schemars emits only the concise attribute description,
     // consistent with `signature` / `created_at` above.

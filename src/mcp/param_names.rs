@@ -212,6 +212,10 @@ pub const VALID_UNTIL: &str = crate::models::field_names::VALID_UNTIL;
 /// metadata key so the tool param and the gated metadata key can never
 /// drift.
 pub const WHY_TRACE: &str = crate::storage::META_KEY_WHY_TRACE;
+/// #1942 / #3587 — the `memory_store` v2 signed-write envelope param.
+/// SSOT-aliased to the attestation module's channel name so the tool param
+/// and the parser that reads it can never drift.
+pub const WRITE_V2: &str = crate::identity::attest_v2::WRITE_V2_PARAM;
 
 /// Every canonical MCP tool-call parameter name, surfaced as a single
 /// allowlist slice for the parity test in
@@ -361,6 +365,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     VALID_FROM,
     VALID_UNTIL,
     WHY_TRACE,
+    WRITE_V2,
 ];
 
 #[cfg(test)]
@@ -400,9 +405,12 @@ mod tests {
         //   likewise read as a bare literal).
         // v1.0.0 #3322 (2026-08-31) — 135 -> 136: FREEZE_ROUTINES (the
         //   memory_swarm_rewind operator-supplied routine-freeze set).
+        // v1.0.0 #3587 (2026-09-11) — 136 -> 137: WRITE_V2 (the memory_store
+        //   v2 signed-write envelope, honoured since #1942 and now read by the
+        //   MCP->HTTP store forwarder as keyed-supersession evidence).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            136,
+            137,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

@@ -123,7 +123,7 @@ pub(super) fn forward_store_to_http(
             && (params["signature"]
                 .as_str()
                 .is_some_and(|s| !s.trim().is_empty())
-                || params["write_v2"].is_object())
+                || params[crate::mcp::param_names::WRITE_V2].is_object())
         {
             // The HTTP edge MUST verify this presented envelope before the
             // header can authorize supersession; invalid signatures hard-refuse.
