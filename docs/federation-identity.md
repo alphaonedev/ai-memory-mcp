@@ -202,7 +202,7 @@ zero-touch additions:
 |---|---|---|---|
 | `AI_MEMORY_FED_IDENTITY` | `host:<hostname>` | P1 | Overrides the node's federation identity (`sender_agent_id`). Highest precedence. Blank/whitespace is ignored so an accidental empty value cannot collapse the identity. |
 | `AI_MEMORY_FED_TRUST_DOMAIN` | unset | P2 | The trust domain a receiver's bundle is scoped to. A credential minted in a different domain is rejected (`WrongTrustDomain`). |
-| `AI_MEMORY_FED_TRUST_BUNDLE_DIR` | unset → legacy `.pub` path | P2 | Directory of trusted **issuer** verifying keys. Presence of this dir + a credential header selects the credential verify path. |
+| `AI_MEMORY_FED_TRUST_BUNDLE_DIR` | unset → legacy `.pub` path | P2 | Directory of trusted **issuer** verifying keys. Presence of this dir + a credential header selects the credential verify path. **Read once per daemon process** (`cached_trust_bundle`, a `OnceLock`): an issuer added, rotated, or revoked on disk takes effect only after a restart — a revoked issuer keeps verifying on a long-running receiver until then (#3204, documented design; FED-P3 makes it reloadable). |
 | `AI_MEMORY_FED_CRED_PATH` | unset → boot-once keyfile | P2 | Path to this node's issued leaf credential (the outbound credential it presents). |
 | `AI_MEMORY_FED_CRED_CHAIN_PATH` | unset → direct (depth-1) | P4 | Path to the anchor-first intermediate chain this node attaches to outbound requests (hierarchical trust). |
 | `AI_MEMORY_FED_INVENTORY_PATH` | unset | P3 | Path to the declarative inventory YAML (GitOps source of truth, §6). |

@@ -268,13 +268,18 @@ async fn legacy_cert_without_binding_is_refused_under_enforce() {
         "peer_id_cert_unbound",
         "the refusal must carry the distinct unbound tag (not the mismatch tag); body={body}"
     );
-    // ACTIONABLE: the note names the map to fix and the warn rollback.
+    // #3204 item 6 — the map to fix and the warn rollback are operator
+    // remediation and ride the refusal-site WARN (`remediation` field), never
+    // the peer-facing body; the wire note is the closed-set const.
     let note = body["note"].as_str().unwrap_or("");
     assert!(
-        note.contains("AI_MEMORY_FED_CERT_PEER_BINDING_MAP"),
-        "{note}"
+        !note.contains(ai_memory::handlers::federation_wire_notes::ENV_PREFIX),
+        "wire note must not name the binding map or the warn rollback (#3204): {note}"
     );
-    assert!(note.contains("=warn"), "{note}");
+    assert_eq!(
+        note,
+        ai_memory::handlers::federation_wire_notes::wire::CERT_UNBOUND
+    );
 }
 
 /// The `warn` rollout posture is UNCHANGED for an unbound cert — the fix

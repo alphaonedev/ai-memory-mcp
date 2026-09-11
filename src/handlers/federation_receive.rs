@@ -66,18 +66,12 @@ pub(super) fn extract_peer_id(headers: &HeaderMap) -> Option<&str> {
 /// carries no operator binding. One const per note (pm-v3.1
 /// no-scattered-literals discipline); both are rendered by
 /// [`unbound_cert_refusal_response`].
-const CERT_BINDING_UNBOUND_NOTE: &str = "#2045: this client certificate's fingerprint has no entry in \
-     AI_MEMORY_FED_CERT_PEER_BINDING_MAP, so its peer identity cannot be \
-     cross-checked against the asserted x-peer-id. Add the fingerprint→peer-id \
-     binding, or set AI_MEMORY_FED_CERT_PEER_BINDING=warn to downgrade to a WARN \
-     during rollout.";
+const CERT_BINDING_UNBOUND_NOTE: &str = crate::handlers::federation_wire_notes::wire::CERT_UNBOUND;
 
 /// Operator guidance for an `enforce`-mode refusal of a bound cert that
 /// asserted no `X-Peer-Id` header.
-const CERT_BINDING_NO_HEADER_NOTE: &str = "#2045: this client certificate carries an operator binding but the request \
-     asserted no x-peer-id header, so the cross-check cannot run. Send x-peer-id, \
-     or set AI_MEMORY_FED_CERT_PEER_BINDING=warn to downgrade to a WARN during \
-     rollout.";
+const CERT_BINDING_NO_HEADER_NOTE: &str =
+    crate::handlers::federation_wire_notes::wire::CERT_NO_HEADER;
 
 /// Render the `401 peer_id_cert_unbound` envelope for an `enforce`-mode
 /// refusal where the cross-check could not run at all (unbound cert /
@@ -148,6 +142,7 @@ pub(super) fn enforce_cert_peer_binding(
             tracing::warn!(
                 target: ATTESTATION_TRACE_TARGET,
                 asserted_peer_id = asserted_peer_id.unwrap_or(""),
+                remediation = crate::handlers::federation_wire_notes::remediation::CERT_PEER_BINDING,
                 "cert↔x-peer-id: presenting client cert has NO operator binding \
                  (legacy) — refusing (AI_MEMORY_FED_CERT_PEER_BINDING=enforce)"
             );
@@ -169,6 +164,7 @@ pub(super) fn enforce_cert_peer_binding(
             tracing::warn!(
                 target: ATTESTATION_TRACE_TARGET,
                 bound_peer_id = %bound,
+                remediation = crate::handlers::federation_wire_notes::remediation::CERT_PEER_BINDING,
                 "cert↔x-peer-id: bound client cert presented WITHOUT an x-peer-id \
                  header — refusing (AI_MEMORY_FED_CERT_PEER_BINDING=enforce)"
             );
@@ -184,6 +180,7 @@ pub(super) fn enforce_cert_peer_binding(
             target: ATTESTATION_TRACE_TARGET,
             bound_peer_id = %bound,
             asserted_peer_id = %asserted,
+            remediation = crate::handlers::federation_wire_notes::remediation::CERT_PEER_BINDING,
             "cert↔x-peer-id mismatch — refusing (AI_MEMORY_FED_CERT_PEER_BINDING=enforce, #2045)"
         );
         return Some(
@@ -191,9 +188,7 @@ pub(super) fn enforce_cert_peer_binding(
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
                     "error": "peer_id_cert_mismatch",
-                    "note": "#2045: the asserted x-peer-id does not match the mTLS client cert's \
-                             operator-bound peer identity. Set AI_MEMORY_FED_CERT_PEER_BINDING=warn \
-                             to downgrade to a WARN during rollout.",
+                    "note": crate::handlers::federation_wire_notes::wire::CERT_MISMATCH,
                 })),
             )
                 .into_response(),
@@ -214,6 +209,11 @@ pub(super) fn enforce_cert_peer_binding(
 /// header. Surfaces both values so the operator can diff exactly
 /// what the peer claimed against what the substrate expected.
 fn attestation_refusal_response(err: &AttestError) -> Response {
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        remediation = crate::handlers::federation_wire_notes::remediation::TRUST_BODY_AGENT_ID,
+        "sync_push: body sender_agent_id does not attest to x-peer-id — refusing (#238)"
+    );
     let (claimed, peer_header) = match err {
         AttestError::HeaderMissing => (String::new(), String::new()),
         AttestError::Mismatch {
@@ -227,8 +227,7 @@ fn attestation_refusal_response(err: &AttestError) -> Response {
             "error": err.tag(),
             "claimed": claimed,
             "peer_header": peer_header,
-            "note": "set AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1 to opt out (legacy peers); \
-                     pre-v0.7.0 federation peers must be upgraded to send `x-peer-id`.",
+            "note": crate::handlers::federation_wire_notes::wire::SENDER_ATTESTATION,
         })),
     )
         .into_response()
@@ -257,6 +256,11 @@ const POLICY_READ_UNAVAILABLE_TAG: &str = "policy_read_unavailable";
 /// SHOULD retry, so a genuine fault degrades to a retry rather than a
 /// dropped write.
 fn policy_read_unavailable_response() -> Response {
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_POLICY_CURRENT,
+        "sync_push: local governance policy read failed after bounded retry — refusing (FED-RQ-03)"
+    );
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -265,12 +269,7 @@ fn policy_read_unavailable_response() -> Response {
             // federation PEER. The detail is already logged at
             // ATTESTATION_TRACE_TARGET at the call site; the wire carries
             // only the closed-set tag + the operator-facing retry note.
-            "note": "FED-RQ-03: the receiver could not read its own committed governance \
-                     policy_version after a bounded retry, so this push's staleness is \
-                     undeterminable and it is refused fail-closed. This is retryable — \
-                     re-send once the receiver's governance store recovers. Set \
-                     AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0 to disable the freshness gate \
-                     entirely during a heterogeneous-policy rollout window.",
+            "note": crate::handlers::federation_wire_notes::wire::POLICY_READ_UNAVAILABLE,
         })),
     )
         .into_response()
@@ -283,17 +282,18 @@ fn policy_read_unavailable_response() -> Response {
 /// can see exactly how far behind it is, plus the `=0` opt-out for a
 /// deliberate heterogeneous-policy rollout window.
 fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_POLICY_CURRENT,
+        "sync_push: stale governance policy_version — refusing (FED-RQ-03)"
+    );
     (
         StatusCode::CONFLICT,
         Json(json!({
             "error": crate::federation::receive_auth::STALE_POLICY_ERROR_TAG,
             (crate::models::field_names::SENDER_POLICY_SEQ): sender_seq,
             "local_policy_seq": local_seq,
-            "note": "FED-RQ-03 (#1947): this push is governed by a governance policy_version \
-                     behind the receiver's committed policy; advance the sender's governance \
-                     policy (ai-memory rules … --sign) to the current version and retry. Set \
-                     AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0 to accept stale-policy pushes during \
-                     a heterogeneous-policy rollout window.",
+            "note": crate::handlers::federation_wire_notes::wire::STALE_POLICY,
         })),
     )
         .into_response()
@@ -2249,14 +2249,14 @@ pub async fn sync_push(
             tracing::warn!(
                 target: ATTESTATION_TRACE_TARGET,
                 peer_id = %peer_id,
+                remediation = crate::handlers::federation_wire_notes::remediation::PEER_ATTESTATION,
                 "sync_push: x-peer-id is not in operator allowlist — refusing (#1056 TOFU guard)"
             );
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
                     "error": "x_peer_id_not_in_allowlist",
-                    "note": "#1056: x-peer-id is not in AI_MEMORY_FED_PEER_ATTESTATION; \
-                             enrol the peer or unset the env to restore zero-config posture.",
+                    "note": crate::handlers::federation_wire_notes::wire::PEER_NOT_IN_ALLOWLIST,
                 })),
             )
                 .into_response();

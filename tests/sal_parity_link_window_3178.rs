@@ -753,6 +753,33 @@ mod pg {
             .await
             .expect("link_signed");
 
+        // #3204 battery finding — the pin counted `memory_link.invalidated`
+        // leaves by `event_type` ALONE on the shared `sal-postgres` database,
+        // so `pg_invalidate_is_fenced_by_record_stop_3203` (same binary, also
+        // supersedes a signed edge) made the count 2 under
+        // `--test-threads=4`. `signed_events` carries no link ids, but the
+        // leaf's `signature` column is this edge's PRIOR Ed25519 signature
+        // (unique per link pre-image), so read it BEFORE the supersession
+        // clears it and scope every audit query by it. Isolation-proof at any
+        // thread count; the assertion itself is unchanged.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("pool");
+        let prior_signature: Vec<u8> = sqlx::query_scalar(
+            "SELECT signature FROM memory_links WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(&src)
+        .bind(&dst)
+        .fetch_one(&pool)
+        .await
+        .expect("prior signature");
+        assert!(
+            !prior_signature.is_empty(),
+            "link_signed must leave an Ed25519 signature to key the audit leaf on"
+        );
+
         let outcome = store
             .invalidate_link(
                 &src,
@@ -780,27 +807,27 @@ mod pg {
         assert!(!report.signature_present);
 
         // PRE-FIX: zero rows — the postgres audit chain had no record at all.
-        // Count by event_type only (same as the sqlite twin): after #3203
-        // `agent_id` is the ACTING principal (`system` here — `invalidate_link`
-        // was passed `None`), not the attester `kp.agent_id`.
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .expect("pool");
-        let events: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
-                .bind("memory_link.invalidated")
-                .fetch_one(&pool)
-                .await
-                .expect("count events");
+        // Count by event_type AND this edge's prior signature (the sqlite twin
+        // counts by event_type alone because it owns a per-test database):
+        // after #3203 `agent_id` is the ACTING principal (`system` here —
+        // `invalidate_link` was passed `None`), not the attester `kp.agent_id`.
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1 AND signature = $2",
+        )
+        .bind("memory_link.invalidated")
+        .bind(&prior_signature)
+        .fetch_one(&pool)
+        .await
+        .expect("count events");
         assert_eq!(events, 1, "supersession must leave exactly one audit leaf");
-        let actor: String =
-            sqlx::query_scalar("SELECT agent_id FROM signed_events WHERE event_type = $1")
-                .bind("memory_link.invalidated")
-                .fetch_one(&pool)
-                .await
-                .expect("actor");
+        let actor: String = sqlx::query_scalar(
+            "SELECT agent_id FROM signed_events WHERE event_type = $1 AND signature = $2",
+        )
+        .bind("memory_link.invalidated")
+        .bind(&prior_signature)
+        .fetch_one(&pool)
+        .await
+        .expect("actor");
         assert_eq!(
             actor,
             ai_memory::identity::sentinels::SYSTEM_PRINCIPAL,

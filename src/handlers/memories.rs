@@ -90,7 +90,26 @@ pub async fn get_memory(
                         Vec::new()
                     }
                 };
-                Json(json!({"memory": mem, "links": edges})).into_response()
+                // #3204 item 1 — the anchor passed the SAL `get` visibility
+                // filter, but every edge names a FAR endpoint that never did:
+                // a caller who owns one memory enumerated the ids (and
+                // relations) of every other tenant's private row linked to
+                // it. Same filter `GET /links/{id}` applies (FX-C2): keep an
+                // edge only when its far endpoint is itself readable by the
+                // caller; a hidden / absent / scope-denied endpoint surfaces
+                // as `Err` from `get` and drops the edge (fail closed).
+                let mut links = Vec::with_capacity(edges.len());
+                for link in edges {
+                    let far = far_endpoint(&link, &mem.id);
+                    let visible = match app.store.get(&ctx, far).await {
+                        Ok(m) => far_endpoint_readable(&m, &caller, &mem),
+                        Err(_) => false,
+                    };
+                    if visible {
+                        links.push(link);
+                    }
+                }
+                Json(json!({"memory": mem, "links": links})).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -116,6 +135,7 @@ pub async fn get_memory(
     // owned Memory so it stays outside the helper; only the SELECTs touch
     // a pool connection.
     let id_clone = id.clone();
+    let caller_for_edges = caller.clone();
     let lookup: Result<
         Option<(crate::models::Memory, Vec<crate::models::MemoryLink>)>,
         anyhow::Error,
@@ -128,7 +148,23 @@ pub async fn get_memory(
                     // body itself was retrieved cleanly. Empty `links`
                     // array degrades graph navigation rather than
                     // failing the GET.
-                    let links = db::get_links(conn, &mem.id).unwrap_or_default();
+                    //
+                    // #3204 item 1 — sqlite twin of the postgres far-endpoint
+                    // filter above: an edge rides the response only when its
+                    // far endpoint is readable by the caller. `db::get` yields
+                    // `Ok(None)` for a hidden (tombstoned / quarantined) row
+                    // and the edge is dropped with it (fail closed).
+                    let links = db::get_links(conn, &mem.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|link| {
+                            db::get(conn, far_endpoint(link, &mem.id))
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                .is_some_and(|m| far_endpoint_readable(m, &caller_for_edges, &mem))
+                        })
+                        .collect();
                     Ok(Some((mem, links)))
                 }
                 Ok(None) => Ok(None),
@@ -194,6 +230,34 @@ pub async fn get_memory(
             crate::handlers::errors::handler_error_500(&e)
         }
     }
+}
+
+/// #3204 item 1 — the endpoint of `link` that is NOT the GET anchor. A
+/// self-edge resolves to the anchor itself, which already passed the
+/// anchor's own visibility gate.
+fn far_endpoint<'a>(link: &'a crate::models::MemoryLink, anchor_id: &str) -> &'a str {
+    if link.source_id == anchor_id {
+        &link.target_id
+    } else {
+        &link.source_id
+    }
+}
+
+/// #3204 item 1 — whether a far endpoint may ride the anchor's `links` array.
+/// The canonical read predicate, with the requested-namespace hint carried
+/// ONLY for the anchor itself (mirrors `GET /links/{id}`): a far endpoint in
+/// another tenant's private scope, or in a substrate namespace the request
+/// did not name, is dropped.
+fn far_endpoint_readable(
+    mem: &crate::models::Memory,
+    caller: &str,
+    anchor: &crate::models::Memory,
+) -> bool {
+    crate::visibility::is_readable_on_query(
+        mem,
+        Some(caller),
+        (mem.id == anchor.id).then_some(anchor.namespace.as_str()),
+    )
 }
 
 /// #1628 — extract the stored `version` from the postgres

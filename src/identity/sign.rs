@@ -121,6 +121,13 @@ mod domain_tags {
     pub const WRITE: &str = "ai-memory/write/v1";
     /// Persona-provenance attestation.
     pub const PERSONA: &str = "ai-memory/persona/v1";
+    /// #3204 item 2 — signed inter-agent signal (`signals.signature`). Added
+    /// after #1931 shipped without it: the Pillar-1 signal lane signed a bare
+    /// map, so #1931's guarantee did not hold for that context.
+    pub const SIGNAL: &str = "ai-memory/signal/v1";
+    /// #3204 item 2 — attested checkpoint resolution (`checkpoints.signature`),
+    /// the separation-of-duties freeze anchor. Same gap as [`SIGNAL`].
+    pub const CHECKPOINT_RESOLUTION: &str = "ai-memory/checkpoint-resolution/v1";
 }
 
 /// #1931 — the map key carrying the [`domain_tags`] value. Distinct from every
@@ -526,6 +533,12 @@ pub struct SignableSignal<'a> {
 /// truncated payload.
 pub fn canonical_cbor_signal(s: &SignableSignal<'_>) -> Result<Vec<u8>> {
     let value = canonical_cbor_map(vec![
+        // #3204 item 2 — the #1931 domain tag this context was missing. A
+        // signal signature can no longer be reinterpreted as any other
+        // attestation, and NOTHING minted before this tag verifies here (the
+        // #1931 fail-closed posture: no untagged fallback, because the
+        // untagged bytes ARE the cross-context-ambiguous shape).
+        domain_separation_pair(domain_tags::SIGNAL),
         ("id", ciborium::Value::Text(s.id.to_string())),
         ("namespace", ciborium::Value::Text(s.namespace.to_string())),
         (
@@ -730,6 +743,11 @@ pub fn canonical_cbor_checkpoint_resolution(
     r: &SignableCheckpointResolution<'_>,
 ) -> Result<Vec<u8>> {
     let value = canonical_cbor_map(vec![
+        // #3204 item 2 — see `canonical_cbor_signal`: the freeze anchor
+        // commits its own domain tag; pre-tag resolutions do not re-verify
+        // (a transient K1 `Forged`/withheld window until the next anchor is
+        // emitted under the tagged encoding — the #1930 precedent).
+        domain_separation_pair(domain_tags::CHECKPOINT_RESOLUTION),
         (
             "checkpoint_id",
             ciborium::Value::Text(r.checkpoint_id.to_string()),
@@ -1290,6 +1308,134 @@ mod tests {
             .expect("genuine link signature must still verify (#1931 additive)");
     }
 
+    /// #3204 item 2 (CWE-347) — the two Pillar-1 contexts #1931 left untagged.
+    /// DENIED: a signature over the LEGACY untagged map (byte-identical to the
+    /// pre-#3204 encoding) does NOT verify under either verifier — there is no
+    /// fallback, because the untagged bytes are the cross-context-ambiguous
+    /// shape the tag exists to retire. ALLOWED: a freshly signed signal /
+    /// resolution verifies, and neither context's bytes carry the other's tag.
+    #[test]
+    fn issue_3204_signal_and_checkpoint_domain_tags_committed() {
+        use crate::identity::verify::{verify_checkpoint_resolution, verify_signal};
+        fn contains(hay: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+        }
+        let body = body_hash_fixture(0x3a);
+        let signal = signal_fixture(&body);
+        let resolution = resolution_fixture();
+        let signal_bytes = canonical_cbor_signal(&signal).expect("encode signal");
+        let cp_bytes = canonical_cbor_checkpoint_resolution(&resolution).expect("encode cp");
+        assert!(contains(&signal_bytes, domain_tags::SIGNAL.as_bytes()));
+        assert!(!contains(
+            &signal_bytes,
+            domain_tags::CHECKPOINT_RESOLUTION.as_bytes()
+        ));
+        assert!(contains(
+            &cp_bytes,
+            domain_tags::CHECKPOINT_RESOLUTION.as_bytes()
+        ));
+        assert!(!contains(&cp_bytes, domain_tags::SIGNAL.as_bytes()));
+        for tag in [domain_tags::LINK, domain_tags::WRITE, domain_tags::PERSONA] {
+            assert!(
+                !contains(&signal_bytes, tag.as_bytes()),
+                "signal must not carry {tag}"
+            );
+            assert!(
+                !contains(&cp_bytes, tag.as_bytes()),
+                "resolution must not carry {tag}"
+            );
+        }
+
+        let kp = keypair::generate("ai:curator").expect("generate");
+        let signing = kp.private.as_ref().expect("private key");
+        let pk = kp.public.to_bytes();
+
+        // ALLOWED — the tagged round trip.
+        let sig = sign_signal(&kp, &signal).expect("sign signal");
+        assert!(
+            verify_signal(&signal, &sig, &pk),
+            "tagged signal must verify"
+        );
+        let sig = sign_checkpoint_resolution(&kp, &resolution).expect("sign resolution");
+        assert!(
+            verify_checkpoint_resolution(&resolution, &sig, &pk),
+            "tagged resolution must verify"
+        );
+
+        // DENIED — the legacy (pre-#3204) untagged maps, re-derived here
+        // byte-for-byte, signed by the SAME genuine key.
+        let legacy_signal = canonical_cbor_map(vec![
+            ("id", ciborium::Value::Text(signal.id.to_string())),
+            (
+                "namespace",
+                ciborium::Value::Text(signal.namespace.to_string()),
+            ),
+            (
+                "from_agent",
+                ciborium::Value::Text(signal.from_agent.to_string()),
+            ),
+            ("to_agent", text_or_null(signal.to_agent)),
+            ("subject", ciborium::Value::Text(signal.subject.to_string())),
+            (
+                "body_sha256",
+                ciborium::Value::Bytes(signal.body_sha256.to_vec()),
+            ),
+            (
+                "signal_type",
+                ciborium::Value::Text(signal.signal_type.to_string()),
+            ),
+            ("in_reply_to", text_or_null(signal.in_reply_to)),
+            (
+                field_names::CORRELATION_ID,
+                text_or_null(signal.correlation_id),
+            ),
+            (
+                field_names::CREATED_AT,
+                ciborium::Value::Integer(ciborium::value::Integer::from(signal.created_at)),
+            ),
+        ]);
+        let mut legacy_signal_bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy_signal, &mut legacy_signal_bytes).expect("encode");
+        assert_ne!(
+            legacy_signal_bytes, signal_bytes,
+            "the tag must change the bytes"
+        );
+        let legacy_sig = ed25519_dalek::Signer::sign(signing, &legacy_signal_bytes).to_bytes();
+        assert!(
+            !verify_signal(&signal, &legacy_sig, &pk),
+            "a pre-#3204 untagged signal signature must NOT verify (no legacy fallback)"
+        );
+
+        let legacy_cp = canonical_cbor_map(vec![
+            (
+                "checkpoint_id",
+                ciborium::Value::Text(resolution.checkpoint_id.to_string()),
+            ),
+            (
+                "namespace",
+                ciborium::Value::Text(resolution.namespace.to_string()),
+            ),
+            ("state", ciborium::Value::Text(resolution.state.to_string())),
+            (
+                "resolved_by",
+                ciborium::Value::Text(resolution.resolved_by.to_string()),
+            ),
+            ("resolution", text_or_null(resolution.resolution)),
+            (
+                "resolved_at",
+                ciborium::Value::Integer(ciborium::value::Integer::from(resolution.resolved_at)),
+            ),
+        ]);
+        let mut legacy_cp_bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy_cp, &mut legacy_cp_bytes).expect("encode");
+        assert_ne!(legacy_cp_bytes, cp_bytes, "the tag must change the bytes");
+        let legacy_sig = ed25519_dalek::Signer::sign(signing, &legacy_cp_bytes).to_bytes();
+        assert!(
+            !verify_checkpoint_resolution(&resolution, &legacy_sig, &pk),
+            "a pre-#3204 untagged resolution signature must NOT verify (no legacy fallback)"
+        );
+    }
+
     #[test]
     fn canonical_cbor_is_deterministic() {
         // RFC 8949 §4.2.1 — encoding the same logical input three times
@@ -1511,16 +1657,18 @@ mod tests {
     fn canonical_cbor_signal_uses_rfc8949_key_order() {
         let body = [0x11u8; 32];
         let bytes = canonical_cbor_signal(&signal_fixture(&body)).expect("encode");
-        // 10 entries (0xAA), first key the 2-char `id` (0x62 'i' 'd').
+        // 11 entries (0xAB — 10 payload fields + the #3204 `_dst` tag), first
+        // key the 2-char `id` (0x62 'i' 'd'); the 4-char tag key sorts second.
         assert_eq!(
             &bytes[0..4],
-            &[0xAA, 0x62, b'i', b'd'],
-            "canonical map must open with 10 entries and the shortest key `id`"
+            &[0xAB, 0x62, b'i', b'd'],
+            "canonical map must open with 11 entries and the shortest key `id`"
         );
         assert_canonical_order(
             &bytes,
             &[
                 "id",
+                "_dst",
                 "subject",
                 "to_agent",
                 "namespace",
@@ -1584,15 +1732,17 @@ mod tests {
     #[test]
     fn canonical_cbor_checkpoint_resolution_uses_rfc8949_key_order() {
         let bytes = canonical_cbor_checkpoint_resolution(&resolution_fixture()).expect("encode");
-        // 6 entries (0xA6), first key the 5-char `state` (0x65 's' …).
+        // 7 entries (0xA7 — 6 payload fields + the #3204 `_dst` tag), first
+        // key the 4-char tag (0x64 '_' …), then the 5-char `state`.
         assert_eq!(
             &bytes[0..3],
-            &[0xA6, 0x65, b's'],
-            "canonical map must open with 6 entries and the shortest key `state`"
+            &[0xA7, 0x64, b'_'],
+            "canonical map must open with 7 entries and the shortest key `_dst`"
         );
         assert_canonical_order(
             &bytes,
             &[
+                "_dst",
                 "state",
                 "namespace",
                 "resolution",
