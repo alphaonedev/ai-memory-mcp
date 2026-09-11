@@ -357,8 +357,8 @@ pub fn evaluate_with_live(
 
     // ---- 4. AI_MEMORY_FED_REQUIRE_SIG ------------------------------
     // NB1 fix (Fable review, 2026-08-11): call the REAL reader
-    // (`crate::federation::signing::require_sig`, which delegates to the
-    // case-SENSITIVE `receive_auth::env_flag_default_on`) instead of
+    // (`crate::federation::signing::require_sig`, which reads the #3200
+    // shared-grammar registry entry) instead of
     // re-deriving falsy grammar with a lowercasing local helper. The
     // local `is_falsy` helper lowercased before matching, so e.g.
     // `AI_MEMORY_FED_REQUIRE_SIG=FALSE` read as non-compliant here while
@@ -695,8 +695,8 @@ pub fn evaluate_with_live(
     ));
 
     // ---- 18. AI_MEMORY_FED_REQUIRE_POLICY_CURRENT (#2911 item 2) ------
-    // FED-RQ-03 stale-governance-policy refusal. Default-ON via
-    // `env_flag_default_on`. #3168 now ALSO pins this into
+    // FED-RQ-03 stale-governance-policy refusal. Default-ON via the #3200
+    // shared grammar. #3168 now ALSO pins this into
     // `security_profile::KNOBS` (plain `asi-hard` refuses `=0` at boot);
     // this row remains so a certified doctor run still names the live
     // reader even when the operator is not on `asi-hard` (check #17

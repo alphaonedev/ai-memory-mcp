@@ -1267,10 +1267,9 @@ mod tests {
 
     /// #3033 — `asi-hard` REFUSES to boot when an operator tries to DISABLE
     /// any of the four outer federation-transport gates. Exercises the
-    /// default-ON grammar delegation directly: a case-sensitive falsy token
-    /// (`0`) loosens the `env_flag_default_on` gates, and a case-INSENSITIVE
-    /// falsy token (`FALSE`) loosens the peer-enrollment gate — each must be
-    /// caught as a below-floor override and refuse boot.
+    /// registry delegation directly (#3200 shared grammar): every falsy token,
+    /// in any case, loosens a default-ON gate and must be caught as a
+    /// below-floor override that refuses boot.
     #[test]
     fn asi_hard_refuses_disabling_outer_transport_gates() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -1288,9 +1287,8 @@ mod tests {
                 crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
                 "false",
             ),
-            // Case-INSENSITIVE for the peer-enrollment gate: `FALSE` disables
-            // the live reader, so it must refuse boot (a case-sensitive
-            // `flag_value_default_on` would MISS this — the grammars differ).
+            // `FALSE` disables the live reader, so it must refuse boot. Before
+            // #3200 only this gate was case-insensitive; now all of them are.
             (
                 crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
                 "FALSE",
@@ -1325,9 +1323,9 @@ mod tests {
     /// governance OFF (`PERMISSIONS_MODE=off`), arm the fail-OPEN hatch,
     /// or disable the stale-policy refusal. Exercises the live-reader
     /// grammars: `off` is the exact live Off token (not a truthy invert);
-    /// `"1"` arms fail-OPEN (the live `== "1"` arm); `"0"` disables the
-    /// default-ON policy-current gate (the live `flag_value_default_on`
-    /// falsy token).
+    /// `"1"`/`"TRUE"`/`"yes"` arm fail-OPEN and `"0"`/`"false"`/`"FALSE"`
+    /// disable the default-ON policy-current gate, all through the #3200
+    /// shared grammar the live readers use.
     #[test]
     fn asi_hard_refuses_governance_loosening_3168() {
         if crate::config::run_env_isolated_child_or_spawn(
