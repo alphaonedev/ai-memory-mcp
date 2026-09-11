@@ -159,7 +159,7 @@ doc = {
     "daemon_binary_sha256": addressed,
     "addressed_exe_sha256": addressed,
     "verdict": verdict,
-    "oracle_kind": "independent" if verdict == "PASS" else "independent",
+    "oracle_kind": "independent",
     "capacity": {"p99_method": "not-applicable"},
     "fail_count": int(fail),
 }

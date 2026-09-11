@@ -729,6 +729,11 @@ jobs:
         # workflow refuses, so the harness cannot pass vacuously.
         run: bash scripts/test/test-release-hardening.sh
 
+      - name: Self-test the evidence-bundle gate (#3547)
+        # Fixture-only: untracked producer refused, run→binary mismatch,
+        # prose verdict, self-report PASS and mean-of-p99 all refused.
+        run: bash scripts/check-evidence-bundle.sh --self-test
+
   git-dependency-source-gate:
     # Issues #2050 / #2512 — SUPPLY-CHAIN reproducibility. `Cargo.toml` pinned
     # `paste = { git = "https://github.com/alphaonedev/paste", rev = "6a30252" }`
