@@ -102,7 +102,7 @@ Human `--once` report fields (also on the JSON `WatchReport`):
 
 - `changes_detected`
 - `memories_captured`
-- `errors_total` (includes recover errors embedded in an otherwise-Ok tick)
+- `errors_total` in the human report; the JSON `WatchReport` field is `errors` (includes recover errors embedded in an otherwise-Ok tick)
 
 systemd user unit: `journalctl --user -u ai-memory-watch.service -f`
 
