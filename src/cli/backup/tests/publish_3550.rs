@@ -242,6 +242,9 @@ fn spawn_child_test(test: &str, env: &[(&str, &Path)]) -> std::process::Output {
         "--nocapture",
     ])
     .env_clear()
+    // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
+    // with a %p pid template) so the child's execution is measured, not lost.
+    .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
     .env("TMPDIR", std::env::temp_dir())
     .env("AI_MEMORY_NO_CONFIG", "1");
     for (key, value) in env {
