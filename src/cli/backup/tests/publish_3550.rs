@@ -989,7 +989,10 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
     std::fs::create_dir_all(&dir).expect("mkdir");
     let old = plant_snapshot(&mut env, &dir, "ai-memory-2026-01-01T000000Z", 3);
     plant_snapshot(&mut env, &dir, "ai-memory-2026-06-01T000000Z", 1);
-    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let future = std::time::SystemTime::now()
+        + std::time::Duration::from_secs(
+            u64::try_from(crate::SECS_PER_HOUR).expect("positive const"),
+        );
     std::fs::File::options()
         .write(true)
         .open(&old)
