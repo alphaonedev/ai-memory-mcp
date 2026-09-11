@@ -582,8 +582,8 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > **Evidence note (#3199, 2026-09-11):** the `cert-55/` captures and the
 > table below are **dated history at 20 checks**; they predate check #21
 > and are not re-measured here. On a bare host with no operator public key,
-> check #21 is an eleventh `[FAIL]` row. A 21-check recapture is required
-> before these legs are the evidence of record again.
+> check #21 is an eleventh `[FAIL]` row. The 21-check recapture is tracked
+> in [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607).
 
 | Environment | Exit | Result |
 |---|---|---|
