@@ -29,8 +29,8 @@ checks read the workflow itself:
       a step that runs assert-tag-unmoved.sh.
   R8  nothing is piped from curl into tar, and the nfpm download is checked
       with `sha256sum -c` against a pinned digest.
-  R9  every `cargo install` (release.yml and the republish workflow) pins
-      `--version`.
+  R9  every `cargo install` in release.yml pins `--version` (#3611 retired
+      the standalone iOS re-publisher, so release.yml is the only publisher).
   R10 every key line in release-tag-signers.txt appears verbatim in
       enrolled-commit-signers.txt, and the file is not empty.
   R11 a `dry_run` boolean input defaults to true, and every publish step
@@ -40,8 +40,7 @@ checks read the workflow itself:
   R12 preflight and every job that reads a repository secret other than
       GITHUB_TOKEN declare `environment: release`.
 
-Usage: check-release-workflow.py --workflow F [--republish F]
-                                 [--signers F --enrolled F]
+Usage: check-release-workflow.py --workflow F [--signers F --enrolled F]
 Exit codes: 0 clean · 1 violations · 2 usage.
 """
 
@@ -108,7 +107,7 @@ def step_text(step: list[str]) -> str:
     return "\n".join(step)
 
 
-def check(workflow: str, republish: str | None, signers: str | None, enrolled: str | None) -> list[str]:
+def check(workflow: str, signers: str | None, enrolled: str | None) -> list[str]:
     v: list[str] = []
     text = open(workflow, encoding="utf-8").read()
     jobs = split_jobs(text)
@@ -175,10 +174,9 @@ def check(workflow: str, republish: str | None, signers: str | None, enrolled: s
     if "nfpm" in code and not re.search(r"sha256sum -c", code):
         v.append("R8: the nfpm download is not checked with `sha256sum -c` against a pinned digest")
 
-    for path in [workflow] + ([republish] if republish else []):
-        for line in open(path, encoding="utf-8").read().split("\n"):
-            if re.search(r"\bcargo install\b", line) and "--version" not in line and not line.strip().startswith("#"):
-                v.append(f"R9: unpinned `cargo install` in {path}: `{line.strip()}`")
+    for line in text.split("\n"):
+        if re.search(r"\bcargo install\b", line) and "--version" not in line and not line.strip().startswith("#"):
+            v.append(f"R9: unpinned `cargo install` in {workflow}: `{line.strip()}`")
 
     # R11 — dry run by default; nothing publishes without dry_run == 'false'.
     gate = "github.event.inputs.dry_run == 'false'"
@@ -231,11 +229,10 @@ def check(workflow: str, republish: str | None, signers: str | None, enrolled: s
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workflow", required=True)
-    ap.add_argument("--republish")
     ap.add_argument("--signers")
     ap.add_argument("--enrolled")
     args = ap.parse_args()
-    violations = check(args.workflow, args.republish, args.signers, args.enrolled)
+    violations = check(args.workflow, args.signers, args.enrolled)
     for line in violations:
         print(f"VIOLATION {line}")
     if violations:

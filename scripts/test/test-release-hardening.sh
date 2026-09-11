@@ -94,7 +94,6 @@ echo "A  structure"
 out="$T/a.out"
 if python3 "$REPO_ROOT/scripts/release/check-release-workflow.py" \
   --workflow "$LIVE_YML" \
-  --republish "$REPO_ROOT/.github/workflows/mobile-ios-republish.yml" \
   --signers "$REPO_ROOT/scripts/qc-allowlists/release-tag-signers.txt" \
   --enrolled "$REPO_ROOT/scripts/qc-allowlists/enrolled-commit-signers.txt" >"$out" 2>&1; then
   pass "live release.yml satisfies R1-R12"
