@@ -180,6 +180,9 @@ pub mod equivocation;
 // makes an unproven bind unrepresentable at the storage funnel.
 pub mod pubkey_bind;
 
+/// #3587 — hardened supersession principal evidence and shared row policy.
+pub mod supersession;
+
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
 const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
@@ -1076,6 +1079,32 @@ pub fn preserve_update_provenance_keys(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn supersession_process_identity_has_no_claimed_fallback_3587() {
+        use super::supersession::{PrincipalSource, SupersessionPrincipal};
+        use super::test_agent_id::AgentIdOverride;
+        {
+            let _identity = AgentIdOverride::unset();
+            assert!(
+                SupersessionPrincipal::from_process_environment()
+                    .expect("unset")
+                    .is_none()
+            );
+        }
+        {
+            let _identity = AgentIdOverride::set("ai:supersession-3587");
+            let principal = SupersessionPrincipal::from_process_environment()
+                .expect("configured")
+                .expect("present");
+            assert_eq!(principal.agent_id(), "ai:supersession-3587");
+            assert_eq!(principal.source(), PrincipalSource::ProcessEnvironment);
+        }
+        for invalid in ["", "not an agent", "anonymous:req-3587"] {
+            let _identity = AgentIdOverride::set(invalid);
+            assert!(SupersessionPrincipal::from_process_environment().is_err());
+        }
+    }
 
     /// v1.0.0 #3383 — the admin predicate is PURE and fail-closed. These pin
     /// the three refusal arms that make `as_admin` un-forgeable on a surface
