@@ -45,48 +45,73 @@ impl SupersessionResult {
         if self.superseded.is_none() && self.refusal.is_none() {
             return;
         }
-        let actor = request.principal.map_or(
-            crate::identity::sentinels::ANONYMOUS_INVALID,
-            SupersessionPrincipal::agent_id,
-        );
-        let denied = self.refusal.is_some();
-        crate::governance::audit::record_decision(
-            actor,
-            if denied { "Deny" } else { "Allow" },
-            "supersession",
-            "3587",
-            serde_json::json!({
-                "new_id": self.id,
-                (field_names::SUPERSEDED): self.superseded,
-                "reason": self.refusal.map(|r| format!("{r:?}")),
-            }),
-        );
-        crate::audit::emit(
-            crate::audit::EventBuilder::new(
-                crate::audit::AuditAction::Update,
-                crate::audit::AuditActor {
-                    agent_id: actor.to_owned(),
-                    scope: None,
-                    synthesis_source: request.principal.map_or_else(
-                        || crate::audit::synthesis_sources::DEFAULT_FALLBACK.to_owned(),
-                        |p| format!("{:?}", p.source()),
-                    ),
-                },
-                crate::audit::AuditTarget {
-                    memory_id: self.id.clone(),
-                    namespace: memory.namespace.clone(),
-                    title: None,
-                    tier: None,
-                    scope: None,
-                },
-            )
-            .outcome(if denied {
-                crate::audit::AuditOutcome::Deny
-            } else {
-                crate::audit::AuditOutcome::Allow
-            }),
+        let reason = self.refusal.map(|r| format!("{r:?}"));
+        audit_decision(
+            request,
+            &self.id,
+            &memory.namespace,
+            self.superseded.as_deref(),
+            reason.as_deref(),
         );
     }
+}
+
+/// Audit a final operation error without exposing backend diagnostics or an
+/// unreadable predecessor. Resolve has no trusted namespace if its row read
+/// failed, so it supplies an empty namespace rather than performing another read.
+/// Called outside the transaction/retry boundary; never emits an Allow.
+pub(crate) fn audit_failure(request: SupersessionRequest<'_>, new_id: &str, namespace: &str) {
+    audit_decision(request, new_id, namespace, None, Some("operation_failed"));
+}
+
+fn audit_decision(
+    request: SupersessionRequest<'_>,
+    new_id: &str,
+    namespace: &str,
+    superseded: Option<&str>,
+    reason: Option<&str>,
+) {
+    let actor = request.principal.map_or(
+        crate::identity::sentinels::ANONYMOUS_INVALID,
+        SupersessionPrincipal::agent_id,
+    );
+    let denied = reason.is_some();
+    crate::governance::audit::record_decision(
+        actor,
+        if denied { "Deny" } else { "Allow" },
+        "supersession",
+        "3587",
+        serde_json::json!({
+            "new_id": new_id,
+            (field_names::SUPERSEDED): superseded,
+            "reason": reason,
+        }),
+    );
+    crate::audit::emit(
+        crate::audit::EventBuilder::new(
+            crate::audit::AuditAction::Update,
+            crate::audit::AuditActor {
+                agent_id: actor.to_owned(),
+                scope: None,
+                synthesis_source: request.principal.map_or_else(
+                    || crate::audit::synthesis_sources::DEFAULT_FALLBACK.to_owned(),
+                    |p| format!("{:?}", p.source()),
+                ),
+            },
+            crate::audit::AuditTarget {
+                memory_id: new_id.to_owned(),
+                namespace: namespace.to_owned(),
+                title: None,
+                tier: None,
+                scope: None,
+            },
+        )
+        .outcome(if denied {
+            crate::audit::AuditOutcome::Deny
+        } else {
+            crate::audit::AuditOutcome::Allow
+        }),
+    );
 }
 
 /// Bulk cannot decide ordered supersession safely; clients use single creates.
@@ -166,6 +191,17 @@ pub fn store(
     request: SupersessionRequest<'_>,
     embedding: Option<(&[f32], &str)>,
 ) -> Result<SupersessionResult> {
+    store_transaction(conn, memory, request, embedding)
+        .inspect_err(|_| audit_failure(request, &memory.id, &memory.namespace))
+}
+
+// The transaction guard unwinds here before the outer final-error audit.
+fn store_transaction(
+    conn: &Connection,
+    memory: &Memory,
+    request: SupersessionRequest<'_>,
+    embedding: Option<(&[f32], &str)>,
+) -> Result<SupersessionResult> {
     super::record_stop::gate_storage_conn(conn)?;
     let key = ruling_key(&memory.metadata)?
         .ok_or_else(|| anyhow::anyhow!("supersession store requires ruling_key"))?;
@@ -213,6 +249,17 @@ pub fn store(
 /// Missing rows, record-stop, database and archive failures propagate. Refusals
 /// are audited and returned without mutating either row.
 pub fn resolve(
+    conn: &Connection,
+    old_id: &str,
+    new_id: &str,
+    request: SupersessionRequest<'_>,
+) -> Result<SupersessionResult> {
+    resolve_transaction(conn, old_id, new_id, request)
+        .inspect_err(|_| audit_failure(request, new_id, ""))
+}
+
+// The transaction guard unwinds here before the outer final-error audit.
+fn resolve_transaction(
     conn: &Connection,
     old_id: &str,
     new_id: &str,

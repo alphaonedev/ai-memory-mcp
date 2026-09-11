@@ -7,7 +7,9 @@ use super::{CallerContext, Memory, PostgresStore, StoreError, StoreResult, to_st
 use crate::identity::supersession::{
     SupersessionDecision, SupersessionRefusal, authorize_supersession,
 };
-use crate::storage::supersession::{SupersessionRequest, SupersessionResult, ruling_key};
+use crate::storage::supersession::{
+    SupersessionRequest, SupersessionResult, audit_failure, ruling_key,
+};
 use crate::store::record_stop::gate_flag as gate_record_stop_cached;
 
 impl PostgresStore {
@@ -44,34 +46,38 @@ impl PostgresStore {
         space: Option<&str>,
         request: SupersessionRequest<'_>,
     ) -> StoreResult<SupersessionResult> {
-        self.gate_record_stop().await?;
-        let key = ruling_key(&memory.metadata)
-            .map_err(|e| StoreError::InvalidInput {
-                detail: e.to_string(),
-            })?
-            .ok_or_else(|| StoreError::InvalidInput {
-                detail: "supersession store requires ruling_key".into(),
-            })?;
-        // A namespace+key lock also serializes creators when NO predecessor
-        // exists. JSON tuple encoding is injective; hash collisions only serialize
-        // unrelated writers. Acquire it before any memory row locks.
-        let lock_key = serde_json::to_string(&("supersession-3587", &memory.namespace, key))
-            .map_err(|e| StoreError::InvalidInput {
-                detail: e.to_string(),
-            })?;
-        let mut retry = super::tx_retry::TxRetry::new("store supersession");
-        let result = loop {
-            match self
-                .store_supersession_attempt(ctx, memory, embedding, space, request, &lock_key)
-                .await
-            {
-                Ok(result) => break result,
-                Err(error) => retry.consider(error).await?,
-            }
-        };
-        crate::cost::postgres::record_write_pg(&self.pool, memory, &result.id).await;
-        result.audit(request, memory);
-        Ok(result)
+        async {
+            self.gate_record_stop().await?;
+            let key = ruling_key(&memory.metadata)
+                .map_err(|e| StoreError::InvalidInput {
+                    detail: e.to_string(),
+                })?
+                .ok_or_else(|| StoreError::InvalidInput {
+                    detail: "supersession store requires ruling_key".into(),
+                })?;
+            // A namespace+key lock also serializes creators when NO predecessor
+            // exists. JSON tuple encoding is injective; hash collisions only serialize
+            // unrelated writers. Acquire it before any memory row locks.
+            let lock_key = serde_json::to_string(&("supersession-3587", &memory.namespace, key))
+                .map_err(|e| StoreError::InvalidInput {
+                    detail: e.to_string(),
+                })?;
+            let mut retry = super::tx_retry::TxRetry::new("store supersession");
+            let result = loop {
+                match self
+                    .store_supersession_attempt(ctx, memory, embedding, space, request, &lock_key)
+                    .await
+                {
+                    Ok(result) => break result,
+                    Err(error) => retry.consider(error).await?,
+                }
+            };
+            crate::cost::postgres::record_write_pg(&self.pool, memory, &result.id).await;
+            result.audit(request, memory);
+            Ok(result)
+        }
+        .await
+        .inspect_err(|_| audit_failure(request, &memory.id, &memory.namespace))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -162,19 +168,23 @@ impl PostgresStore {
         new_id: &str,
         request: SupersessionRequest<'_>,
     ) -> StoreResult<SupersessionResult> {
-        self.gate_record_stop().await?;
-        let mut retry = super::tx_retry::TxRetry::new("resolve supersession");
-        let (result, new) = loop {
-            match self
-                .resolve_supersession_attempt(old_id, new_id, request)
-                .await
-            {
-                Ok(result) => break result,
-                Err(error) => retry.consider(error).await?,
-            }
-        };
-        result.audit(request, &new);
-        Ok(result)
+        async {
+            self.gate_record_stop().await?;
+            let mut retry = super::tx_retry::TxRetry::new("resolve supersession");
+            let (result, new) = loop {
+                match self
+                    .resolve_supersession_attempt(old_id, new_id, request)
+                    .await
+                {
+                    Ok(result) => break result,
+                    Err(error) => retry.consider(error).await?,
+                }
+            };
+            result.audit(request, &new);
+            Ok(result)
+        }
+        .await
+        .inspect_err(|_| audit_failure(request, new_id, ""))
     }
 
     async fn resolve_supersession_attempt(

@@ -526,7 +526,9 @@ impl MemoryStore for SqliteStore {
         new_id: &str,
         request: crate::storage::supersession::SupersessionRequest<'_>,
     ) -> StoreResult<crate::storage::supersession::SupersessionResult> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().inspect_err(|_| {
+            crate::storage::supersession::audit_failure(request, new_id, "");
+        })?;
         let conn = self.state.lock().await;
         crate::storage::supersession::resolve(&conn, old_id, new_id, request).map_err(box_err)
     }
@@ -539,7 +541,9 @@ impl MemoryStore for SqliteStore {
         space: Option<&str>,
         request: crate::storage::supersession::SupersessionRequest<'_>,
     ) -> StoreResult<crate::storage::supersession::SupersessionResult> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().inspect_err(|_| {
+            crate::storage::supersession::audit_failure(request, &memory.id, &memory.namespace);
+        })?;
         let stamped;
         let memory = if ctx.bypass_visibility {
             let mut value = memory.clone();
@@ -556,6 +560,13 @@ impl MemoryStore for SqliteStore {
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| StoreError::InvalidInput {
                         detail: "supersession embedding requires a space stamp".into(),
+                    })
+                    .inspect_err(|_| {
+                        crate::storage::supersession::audit_failure(
+                            request,
+                            &memory.id,
+                            &memory.namespace,
+                        );
                     })?,
             )),
             _ => None,
