@@ -94,6 +94,9 @@ use std::collections::HashMap;
 /// #3553 — the `PRAGMA synchronous` posture row (check #21) and its test.
 mod synchronous;
 
+/// #3199 — the backup-manifest-signing posture row (check #22) and its test.
+mod backup_signing;
+
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
 /// name here — deliberately not a free-form string so a typo in
@@ -792,15 +795,7 @@ pub fn evaluate_with_live(
     out.push(synchronous::check_synchronous(live_synchronous));
 
     // ---- 22. backup manifest signing (#3199; N/A on postgres) ----------
-    let (backup_pass, backup_actual) = crate::cli::backup::signing_posture(backend_is_postgres);
-    out.push(check(
-        "backup manifest signing",
-        "operator public key resolves AND any local operator signing key matches it",
-        backup_actual,
-        backup_pass,
-        "provision the operator public key (AI_MEMORY_OPERATOR_PUBKEY or operator.key.pub in \
-         the key directory); a local operator.key must be its private half",
-    ));
+    out.push(backup_signing::check_backup_signing(backend_is_postgres));
 
     debug_assert_eq!(
         out.len(),
@@ -1015,7 +1010,7 @@ mod tests {
                 approver_pubkey_b64_for_test(),
             );
         }
-        // #3199 check #21 — the operator public key restore verifies backups
+        // #3199 check #22 — the operator public key restore verifies backups
         // against, in the per-process test key sandbox (no env write).
         let (keys, pk) = (
             crate::identity::keypair::default_key_dir(),
@@ -1763,27 +1758,6 @@ mod tests {
             "actual must name the keyless state: {:?}",
             c.actual
         );
-        assert!(!all_pass(&checks));
-    }
-
-    /// #3199 check #21 — no operator public key: restore could not verify a
-    /// signed backup, so the row FAILs.
-    #[test]
-    fn no_operator_pubkey_fails_backup_signing_check_21() {
-        if crate::config::run_env_isolated_child_or_spawn(
-            "enterprise_federation_posture::tests::no_operator_pubkey_fails_backup_signing_check_21",
-        ) {
-            return;
-        }
-        let _g = env_lock();
-        unsafe { clear_all() };
-        let _cleanup = EnvGuard;
-        let _fp_file = set_fully_hardened_env();
-        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
-        let checks = evaluate(&AppConfig::default());
-        let c = find(&checks, "backup manifest signing");
-        assert!(!c.pass, "{c:?}");
-        assert!(c.actual.contains("no operator public key"), "{c:?}");
         assert!(!all_pass(&checks));
     }
 

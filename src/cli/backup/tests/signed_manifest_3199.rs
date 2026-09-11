@@ -796,7 +796,7 @@ fn rotation_reports_a_removal_it_could_not_make_3604() {
     );
 }
 
-/// The `doctor --posture` check #21 predicate: the anchor must resolve, and a
+/// The `doctor --posture` check #22 predicate: the anchor must resolve, and a
 /// local signing key must be its private half. A node with no usable key
 /// passes (it restores signed backups; it does not need to take them).
 #[test]

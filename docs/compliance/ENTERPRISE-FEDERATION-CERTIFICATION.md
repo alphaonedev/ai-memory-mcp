@@ -551,7 +551,7 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:739`) returns **0 iff all 22 checks pass, else 2** (20 at the certified tip; #3553 appended check #21, the `PRAGMA synchronous` durability posture, and #3199 check #22, backup manifest signing)
+(`src/cli/doctor.rs:739`) returns **0 iff all 22 checks pass, else 2**
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
 boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
 landed check #19 append-only-audit-spine-armed** — append-only spine ON
@@ -560,7 +560,8 @@ supersede leaf is SIGNED, not unsigned theater — then **19 → 20 when #2991
 landed check #20 R40-escalate-producer-armable** — approver keys enrolled so
 the wired L1-6 escalate producer routes to a SATISFIABLE signed-approval gate
 rather than parking a forever-un-approvable pending — then **20 → 21 when
-#3199 landed check #21 backup-manifest-signing**: the operator public key
+#3553 landed check #21**, the `PRAGMA synchronous` durability posture, and
+**21 → 22 when #3199 landed check #22 backup-manifest-signing**: the operator public key
 `restore` verifies backup manifests against resolves, and any local operator
 signing key matches it; `N/A` PASS on a postgres backend, where `ai-memory
 backup` is SQLite-only). The four-leg capture
@@ -580,9 +581,9 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > `e22bc93c` (this recapture does not re-mint).
 >
 > **Evidence note (#3199, 2026-09-11):** the `cert-55/` captures and the
-> table below are **dated history at 20 checks**; they predate check #21
-> and are not re-measured here. On a bare host with no operator public key,
-> check #21 is an eleventh `[FAIL]` row. The 21-check recapture is tracked
+> table below are **dated history at 20 checks**; they predate checks #21
+> (#3553) and #22 (#3199) and are not re-measured here. On a bare host with
+> no operator public key, check #22 adds a `[FAIL]` row. The 22-check recapture is tracked
 > in [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607).
 
 | Environment | Exit | Result |

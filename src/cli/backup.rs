@@ -1245,7 +1245,7 @@ fn local_signing_key() -> std::result::Result<ed25519_dalek::SigningKey, String>
 }
 
 /// v1.0.0 #3199 — the backup-signing row of `doctor --posture
-/// enterprise-federation` (check #21): `(pass, observed state)`.
+/// enterprise-federation` (check #22): `(pass, observed state)`.
 ///
 /// PASS when the operator public key `restore` verifies against resolves and
 /// any local operator signing key is its private half. A node that only
