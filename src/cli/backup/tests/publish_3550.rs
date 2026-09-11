@@ -965,7 +965,7 @@ fn asi_hard_enforces_a_durable_publish_3550() {
 /// v1.0.0 #3199 — a signed manifest names its snapshot, so the moved pair is
 /// RE-SIGNED under its new name with the test operator key, and its signed
 /// `created_at` is the timestamp in `id` (what `--latest` orders by).
-fn plant_snapshot(env: &mut TestEnv, dir: &Path, id: &str, rows: usize) -> PathBuf {
+pub(super) fn plant_snapshot(env: &mut TestEnv, dir: &Path, id: &str, rows: usize) -> PathBuf {
     let scratch = TestEnv::fresh();
     let db = scratch.db_path.clone();
     for i in 0..rows {

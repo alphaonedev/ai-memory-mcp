@@ -3899,6 +3899,10 @@ mod tests {
     // `src/cli/backup/tests/publish_3550.rs`.
     mod publish_3550;
 
+    // v1.0.0 #3199 — the signed-manifest cert battery lives in
+    // `src/cli/backup/tests/signed_manifest_3199.rs`.
+    mod signed_manifest_3199;
+
     /// `stage_and_verify` never touches the target: that is the whole point
     /// of staging. Pinned directly so a future refactor cannot quietly move
     /// the verification after the swap.
