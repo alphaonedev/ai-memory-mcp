@@ -225,9 +225,10 @@ pub(crate) fn is_truthy(v: &str) -> bool {
 
 /// #3124 — `AI_MEMORY_UNSTAMPED_MUTATION` floor: whatever the LIVE resolver
 /// ([`crate::identity::owner_stamp::UnstampedMutationMode::parse`]) resolves to
-/// `refuse` clears it — `refuse` itself, and an unrecognised token (which the
-/// resolver fails closed to `refuse`). `warn` and a blank value (resolved as
-/// unset → `warn`) are below it. Delegating to the live grammar is the NB1
+/// `refuse` clears it. `warn` and a blank value (resolved as unset → `warn`)
+/// are below it. An unrecognised token is refused at boot by
+/// [`crate::identity::owner_stamp::validate_boot_token`] in EVERY posture, so
+/// this floor never has to judge one. Delegating to the live grammar is the NB1
 /// lesson: a re-derived grammar can false-refuse a boot the gate honours.
 fn unstamped_mutation_meets_floor(v: &str) -> bool {
     crate::identity::owner_stamp::UnstampedMutationMode::parse(Some(v)).refuses()

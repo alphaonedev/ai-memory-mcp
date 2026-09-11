@@ -709,3 +709,51 @@ fn doctor_census_counts_unstamped_malformed_and_archived() {
     assert_eq!(census.malformed, 1, "{census:?}");
     assert_eq!(census.archived_unstamped, 1, "{census:?}");
 }
+
+// ---------------------------------------------------------------------------
+// boot grammar (Conductor ruling condition 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn boot_refuses_an_unrecognised_token_but_doctor_reports_it() {
+    let (dir, path) = fresh_db_path();
+    drop(db::open(&path).expect("init"));
+    let run = |args: &[&str], value: &str| {
+        Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env(ENV_UNSTAMPED_MUTATION, value)
+            .env("AI_MEMORY_AUDIT_DIR", dir.path().join("audit"))
+            .env("AI_MEMORY_LOG_DIR", dir.path().join("logs"))
+            .env("HOME", dir.path())
+            .arg("--db")
+            .arg(&path)
+            .args(args)
+            .output()
+            .expect("spawn")
+    };
+    // DENIED: a token outside the grammar refuses boot, naming knob + token.
+    let out = run(&["list"], "allow");
+    assert!(
+        !out.status.success(),
+        "boot must refuse an unrecognised token"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(ENV_UNSTAMPED_MUTATION) && stderr.contains("\"allow\""),
+        "{stderr}"
+    );
+    // ALLOWED: both grammar tokens (any case) and blank boot normally.
+    for ok in [MODE_WARN, "REFUSE", ""] {
+        let out = run(&["list"], ok);
+        assert!(
+            out.status.success(),
+            "{ok:?} must boot: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // doctor stays runnable and names the bad value.
+    let out = run(&["doctor"], "allow");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Unstamped owners (#3124)"), "{stdout}");
+    assert!(stdout.contains("allow"), "{stdout}");
+}
