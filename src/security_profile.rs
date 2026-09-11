@@ -114,6 +114,7 @@
 //! (`daemon_runtime::run`) consumes the READ-ONLY [`runtime_boot_report`]
 //! to log the posture; it never mutates the environment.
 
+use crate::storage::SynchronousLevel;
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
@@ -226,9 +227,13 @@ fn secret_screen_meets_floor(v: &str) -> bool {
     v.trim().eq_ignore_ascii_case("refuse")
 }
 
-/// `AI_MEMORY_DB_SYNCHRONOUS` floor: `FULL` or the stronger `EXTRA`.
+/// `AI_MEMORY_DB_SYNCHRONOUS` floor: `FULL` or the stronger `EXTRA`. Delegates
+/// to the ONE token grammar + floor definition
+/// ([`crate::storage::SynchronousLevel`], #3553) so this pin, the open
+/// funnels and the `doctor` surfaces cannot disagree about what `FULL` means;
+/// an unrecognised token is below the floor.
 fn synchronous_meets_floor(v: &str) -> bool {
-    matches!(v.trim().to_ascii_uppercase().as_str(), "FULL" | "EXTRA")
+    crate::storage::SynchronousLevel::parse(v).is_some_and(SynchronousLevel::meets_certified_floor)
 }
 
 /// v1.0.0 #2445 — `AI_MEMORY_ALLOW_SCHEMA_AHEAD` floor: it must be UNSET (or

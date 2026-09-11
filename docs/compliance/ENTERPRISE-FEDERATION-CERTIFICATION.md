@@ -471,9 +471,12 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
    > branch and `bootstrap-node` fail-closes on the wrong store. Under
    > systemd, run both with the daemon's exact `EnvironmentFile`.
 
-   `ai-memory doctor --posture` **never opens the database**; a doctor
-   PASS does not prove the passphrase is present or that a row would
-   decrypt. Boot-gate self-attestation and the FED-RQ-03 posture pin
+   `ai-memory doctor --posture` **never migrates or writes the database**
+   (`evaluate` itself is database-free; since #3553 the verb reads exactly
+   ONE thing on a read-only connection it opens itself — the live
+   `PRAGMA synchronous`, per-connection and this-process only — to
+   corroborate check #21); a doctor PASS does not prove the passphrase is
+   present or that a row would decrypt. Boot-gate self-attestation and the FED-RQ-03 posture pin
    landed 2026-08-13 (#2911 items 1-2, PR #2918 — checks #17/#18);
    the remaining code-side follow-ups (pin-file parse; doctor attests
    its own process, not a running daemon) are #2911 items **3-4**,
@@ -548,7 +551,7 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:739`) returns **0 iff all 20 checks pass, else 2**
+(`src/cli/doctor.rs:739`) returns **0 iff all 21 checks pass, else 2** (20 at the certified tip; #3553 appended check #21, the `PRAGMA synchronous` durability posture)
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
 boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
 landed check #19 append-only-audit-spine-armed** — append-only spine ON

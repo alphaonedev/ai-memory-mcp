@@ -928,6 +928,13 @@ pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stam
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
 // out on (also consumed by the config-precedence tests).
 pub use connection::{DEFAULT_DB_MMAP_SIZE_BYTES, set_db_mmap_size};
+// v1.0.0 #3553 — the `PRAGMA synchronous` posture SSOT: the typed level, its
+// resolver (with provenance) and the live per-connection reader that the
+// `doctor` Storage section and the `doctor --posture` row consume.
+pub use connection::{
+    DURABILITY_CLASS_LOCAL_ONLY, ResolvedSynchronous, SynchronousLevel, SynchronousSource,
+    live_synchronous, resolved_synchronous,
+};
 // v1.0.0 #3213 — process-private SQLCipher passphrase (file channel).
 pub use connection::{
     ENV_DB_PASSPHRASE, passphrase_requested, refuse_at_rest_requested_without_sqlcipher,

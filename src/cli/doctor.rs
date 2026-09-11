@@ -68,6 +68,19 @@ const FACT_DIM_VIOLATIONS: &str = "dim_violations";
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
 /// (see [`crate::storage::schema_integrity`]).
 const FACT_CORE_RELATIONS: &str = "core_relations";
+/// v1.0.0 #3553 — the LIVE `PRAGMA synchronous` of the doctor's own
+/// connection (per-connection; every open funnel applies the resolved level,
+/// so this is the funnel's output, never a running daemon's connection).
+const FACT_SYNCHRONOUS: &str = "synchronous";
+/// v1.0.0 #3553 — the level `storage::resolved_synchronous` resolves for THIS
+/// process plus the ladder rung that produced it (env / compiled default).
+const FACT_SYNCHRONOUS_RESOLVED: &str = "synchronous_resolved";
+/// v1.0.0 #3553 — standard §0.2 durability class (always `local-only` for a
+/// single-node SQLite store) with the fsync cadence the level buys inside it.
+const FACT_DURABILITY_CLASS: &str = "durability_class";
+/// v1.0.0 #3553 — what an acknowledged write may lose on a POWER LOSS (not a
+/// process crash) at the live level.
+const FACT_RPO_ON_POWER_LOSS: &str = "rpo_on_power_loss";
 /// v1.0.0 #3385 — provenance of the reported `archive_on_gc` fact:
 /// `config` (`[storage].archive_on_gc`), `legacy` (the deprecated flat key),
 /// or `compiled-default`. The value alone cannot tell an operator whether a
@@ -752,7 +765,21 @@ pub fn run(db_path: &Path, args: &DoctorArgs, out: &mut CliOutput<'_>) -> Result
 ///
 /// # Errors
 /// Returns `Err` only when the report cannot be written to `out`.
-pub fn run_posture(name: &str, json: bool, out: &mut CliOutput<'_>) -> Result<i32> {
+///
+/// #3553 — `db_path` is the ONE store touch this verb makes: when given, the
+/// live `PRAGMA synchronous` is read on a read-only connection opened HERE
+/// (`db::open_existing_read_only`, never a create-and-migrate) and handed to
+/// [`crate::enterprise_federation_posture::evaluate_with_live`] so check #21
+/// corroborates the resolved level against a connection this binary opened.
+/// A store that cannot be opened is reported on stderr and the row renders
+/// "not observed" — never a green invented from the resolver alone being
+/// mistaken for a live read. `evaluate` itself stays database-free.
+pub fn run_posture(
+    name: &str,
+    json: bool,
+    db_path: Option<&Path>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     if name != crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION {
         writeln!(
             out.stderr,
@@ -762,8 +789,26 @@ pub fn run_posture(name: &str, json: bool, out: &mut CliOutput<'_>) -> Result<i3
         return Ok(2);
     }
 
+    let live_synchronous = match db_path {
+        None => None,
+        Some(path) => match db::open_existing_read_only(path)
+            .and_then(|conn| crate::storage::live_synchronous(&conn))
+        {
+            Ok(level) => Some(level),
+            Err(e) => {
+                writeln!(
+                    out.stderr,
+                    "ai-memory doctor --posture: live PRAGMA synchronous not observed on {}: {e:#}",
+                    path.display()
+                )?;
+                None
+            }
+        },
+    };
+
     let app_config = crate::config::AppConfig::load();
-    let checks = crate::enterprise_federation_posture::evaluate(&app_config);
+    let checks =
+        crate::enterprise_federation_posture::evaluate_with_live(&app_config, live_synchronous);
     let overall_pass = crate::enterprise_federation_posture::all_pass(&checks);
 
     if json {
@@ -1962,6 +2007,75 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
             // read failure read as a clean bill of health — but never downgrade
             // a Critical already raised above.
             facts.push((format!("{FACT_CORE_RELATIONS}_error"), e.to_string()));
+            if severity == Severity::Info {
+                severity = Severity::Warning;
+            }
+        }
+    }
+
+    // v1.0.0 #3553 — DURABILITY POSTURE. The compiled default is
+    // `synchronous=NORMAL` (#1579 B7): under WAL that fsyncs per CHECKPOINT,
+    // so a power loss can drop acknowledged commits — a `local-only` node
+    // whose RPO must be DECLARED, not assumed (standard §0.1 / §0.2). Nothing
+    // in the report named the level before this block, so a buyer running
+    // defaults could not tell whether they were inside the envelope. The
+    // live value is read on THIS connection: every open funnel (including
+    // the read-only one `doctor` uses) applies the resolved level, so it is
+    // the funnel's output and a disagreement is a funnel defect — never a
+    // statement about a running daemon's connection (`PRAGMA synchronous`
+    // is per-connection and not persisted). Severity: Info under `standard`
+    // (`NORMAL` IS inside the envelope as `local-only`); Critical when the
+    // hardened / certified posture is engaged and the level is below FULL.
+    let resolved = crate::storage::resolved_synchronous();
+    facts.push((
+        FACT_SYNCHRONOUS_RESOLVED.into(),
+        format!("{} ({})", resolved.level, resolved.source.as_str()),
+    ));
+    let certified_posture = crate::security_profile::is_asi_hard()
+        || crate::enterprise_federation_posture::enterprise_federation_posture_required();
+    match crate::storage::live_synchronous(conn) {
+        Ok(live) => {
+            facts.push((FACT_SYNCHRONOUS.into(), live.as_str().into()));
+            facts.push((
+                FACT_DURABILITY_CLASS.into(),
+                format!(
+                    "{} (fsync {})",
+                    live.durability_class(),
+                    live.fsync_cadence()
+                ),
+            ));
+            facts.push((
+                FACT_RPO_ON_POWER_LOSS.into(),
+                live.rpo_on_power_loss().into(),
+            ));
+            if live != resolved.level {
+                severity = Severity::Critical;
+                append_note(
+                    &mut note,
+                    &format!(
+                        "live PRAGMA synchronous={live} DISAGREES with the resolved level \
+                         {} — the open funnel did not apply it (defect; report it)",
+                        resolved.level
+                    ),
+                );
+            } else if certified_posture && !live.meets_certified_floor() {
+                severity = Severity::Critical;
+                append_note(
+                    &mut note,
+                    &format!(
+                        "hardened / certified posture engaged but synchronous={live} is below \
+                         the certified floor (FULL): acknowledged commits are durable only \
+                         to the last WAL checkpoint on power loss. Set {}=FULL (asi-hard \
+                         pins it); see PERFORMANCE.md, Power-loss durability",
+                        crate::storage::ENV_DB_SYNCHRONOUS
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            // Unobserved is NOT verified-good: surface it, but never
+            // downgrade a Critical already raised above.
+            facts.push((format!("{FACT_SYNCHRONOUS}_error"), e.to_string()));
             if severity == Severity::Info {
                 severity = Severity::Warning;
             }
@@ -3995,6 +4109,73 @@ mod tests {
         );
         assert_eq!(storage.severity, Severity::Info);
         crate::encryption::set_config_at_rest(false);
+    }
+
+    /// v1.0.0 #3553 — plain `doctor` NAMES the durability posture. The test
+    /// process never sets `AI_MEMORY_DB_SYNCHRONOUS`, so the live pragma on
+    /// the read-only doctor connection must be the compiled `NORMAL`
+    /// (proving the read-only funnel mirrors the resolver — before #3553 it
+    /// answered SQLite's compiled `FULL`), the class is `local-only` with
+    /// per-checkpoint fsync, and under `standard` the section does NOT
+    /// escalate for it (NORMAL is inside the envelope as local-only).
+    #[test]
+    fn storage_section_names_synchronous_and_durability_class_3553() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        let storage = find(&report, "Storage");
+        assert_eq!(fact(storage, FACT_SYNCHRONOUS), "NORMAL");
+        let resolved = fact(storage, FACT_SYNCHRONOUS_RESOLVED);
+        assert!(resolved.starts_with("NORMAL ("), "{resolved}");
+        assert!(resolved.contains("compiled default"), "{resolved}");
+        assert_eq!(
+            fact(storage, FACT_DURABILITY_CLASS),
+            format!(
+                "{} (fsync per-checkpoint)",
+                crate::storage::DURABILITY_CLASS_LOCAL_ONLY
+            )
+        );
+        assert!(
+            fact(storage, FACT_RPO_ON_POWER_LOSS).contains("last WAL checkpoint"),
+            "{}",
+            fact(storage, FACT_RPO_ON_POWER_LOSS)
+        );
+        assert_ne!(
+            storage.severity,
+            Severity::Critical,
+            "NORMAL under `standard` is inside the envelope: {:?}",
+            storage.facts
+        );
+    }
+
+    /// v1.0.0 #3553 — the hardened profile engaged while the live level is
+    /// below the certified floor is CRITICAL and the note names the knob.
+    /// Exercised at the section level (a booted `asi-hard` daemon cannot
+    /// occupy this state because `enforce_at_boot` pins FULL, but `doctor`
+    /// is an observer and must report a drifted process honestly).
+    #[test]
+    fn storage_section_is_critical_below_floor_under_asi_hard_3553() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::storage_section_is_critical_below_floor_under_asi_hard_3553",
+        ) {
+            return;
+        }
+        let _lock = crate::test_support::env_lock();
+        let profile =
+            crate::test_support::EnvGuard::capture(crate::security_profile::ENV_SECURITY_PROFILE);
+        let sync = crate::test_support::EnvGuard::capture(crate::storage::ENV_DB_SYNCHRONOUS);
+        sync.unset();
+        profile.set("asi-hard");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doctor-3553.db");
+        drop(crate::db::open(&path).expect("create"));
+        let conn = crate::db::open_existing_read_only(&path).expect("read-only reopen");
+
+        let section = section_storage(&conn, &path);
+        assert_eq!(fact(&section, FACT_SYNCHRONOUS), "NORMAL");
+        assert_eq!(section.severity, Severity::Critical, "{:?}", section.facts);
+        let note = section.note.clone().unwrap_or_default();
+        assert!(note.contains("below"), "{note}");
+        assert!(note.contains(crate::storage::ENV_DB_SYNCHRONOUS), "{note}");
     }
 
     #[test]
@@ -6177,11 +6358,79 @@ enabled = true
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let exit = run_posture("not-a-real-posture", false, &mut out).unwrap();
+        let exit = run_posture("not-a-real-posture", false, None, &mut out).unwrap();
         assert_eq!(exit, 2);
         let stderr_str = String::from_utf8(stderr).unwrap();
         assert!(stderr_str.contains("not-a-real-posture"));
         assert!(stderr_str.contains("enterprise-federation"));
+    }
+
+    /// v1.0.0 #3553 — `doctor --posture` with a store path reads the live
+    /// `PRAGMA synchronous` on its OWN read-only connection and the row
+    /// reports that the live value AGREES with the resolved level; a missing
+    /// store is reported on stderr and the row says "not observed" instead
+    /// of inventing a green. Env-only otherwise (bare env → still exit 2).
+    #[test]
+    fn run_posture_reports_live_synchronous_from_the_store_3553() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::run_posture_reports_live_synchronous_from_the_store_3553",
+        ) {
+            return;
+        }
+        let _g = posture_env_lock();
+        clear_posture_env();
+        let _cleanup = PostureEnvGuard;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("posture-3553.db");
+        drop(crate::db::open(&path).expect("create"));
+
+        let row_for = |db: Option<&Path>| -> (serde_json::Value, String) {
+            let mut stdout = Vec::<u8>::new();
+            let mut stderr = Vec::<u8>::new();
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let exit = run_posture(
+                crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
+                true,
+                db,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(exit, 2, "a bare env must still exit non-zero");
+            let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            let row = v["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| {
+                    c["control"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("PRAGMA synchronous")
+                })
+                .cloned()
+                .expect("synchronous row present");
+            (row, String::from_utf8(stderr).unwrap())
+        };
+
+        let (row, stderr) = row_for(Some(&path));
+        assert_eq!(row["pass"], false, "bare env resolves NORMAL: {row}");
+        let actual = row["actual"].as_str().unwrap();
+        assert!(actual.starts_with("NORMAL"), "{actual}");
+        assert!(
+            actual.contains("agrees"),
+            "live read must corroborate: {actual}"
+        );
+        assert!(!stderr.contains("not observed"), "{stderr}");
+
+        let missing = tmp.path().join("no-such.db");
+        let (row, stderr) = row_for(Some(&missing));
+        assert!(
+            row["actual"].as_str().unwrap().contains("not observed"),
+            "{row}"
+        );
+        assert!(stderr.contains("not observed"), "{stderr}");
+        assert!(!missing.exists(), "must not create the missing store");
     }
 
     /// A near-empty environment (no `AI_MEMORY_SECURITY_PROFILE`, no
@@ -6209,6 +6458,7 @@ enabled = true
         let exit = run_posture(
             crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
             true,
+            None,
             &mut out,
         )
         .unwrap();
@@ -6280,6 +6530,7 @@ enabled = true
         let exit = run_posture(
             crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
             false,
+            None,
             &mut out,
         )
         .unwrap();
@@ -6371,6 +6622,7 @@ enabled = true
         let exit = run_posture(
             crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
             true,
+            None,
             &mut out,
         )
         .unwrap();

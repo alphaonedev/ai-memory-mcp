@@ -125,8 +125,12 @@ pub const ENV_PG_AT_REST_ATTESTED: &str = "AI_MEMORY_PG_AT_REST_ATTESTED";
 /// append-only-audit-spine-armed pairing, check #19) — a DELIBERATE, ratified
 /// re-cert, not a silent drift. #2991 raised it 19 → 20 (check #20: the R40
 /// escalate producer is armable — approver keys enrolled — so the wired L1-6
-/// producer routes to a SATISFIABLE signed-approval gate).
-pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 20;
+/// producer routes to a SATISFIABLE signed-approval gate). #3553 raised it
+/// 20 → 21 (check #21: the SQLite `PRAGMA synchronous` durability posture —
+/// standard §0.1 / §5 make the attached `doctor --posture` output the
+/// `synchronous=FULL` attestation, and until this row nothing in the report
+/// NAMED the level or the durability class it buys).
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 21;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -235,8 +239,27 @@ fn resolved_security_profile_label() -> &'static str {
 /// enterprise-federation posture. Pure / read-only: mutates no env var,
 /// touches no database. Safe to call from any live process (the
 /// `doctor` CLI, a running daemon's boot gate, or a test).
+///
+/// #3553 — the `PRAGMA synchronous` row (check #21) is rendered from the
+/// resolver alone here; a caller that HAS a connection (the `doctor` CLI)
+/// hands its own live observation to [`evaluate_with_live`] instead, so the
+/// row can corroborate the resolved level against what a connection this
+/// binary opened actually answers.
 #[must_use]
 pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
+    evaluate_with_live(app_config, None)
+}
+
+/// [`evaluate`] with an optional LIVE `PRAGMA synchronous` observation
+/// (#3553) taken by the caller on a connection THIS binary opened. `None`
+/// means "not observed" (the boot gate has no connection; `doctor --posture`
+/// could not open the store) and the row says so rather than inventing a
+/// green. Still touches no database itself.
+#[must_use]
+pub fn evaluate_with_live(
+    app_config: &AppConfig,
+    live_synchronous: Option<crate::storage::SynchronousLevel>,
+) -> Vec<PostureCheck> {
     let mut out = Vec::with_capacity(ENTERPRISE_FEDERATION_CHECK_COUNT);
 
     // ---- 1. asi-hard engaged --------------------------------------
@@ -759,6 +782,56 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
          can be approved rather than blocked by the keyless fail-closed guardrail",
     ));
 
+    // ---- 21. PRAGMA synchronous durability posture (#3553) ------------
+    // Standard §0.1: the certified SQLite envelope is `synchronous=FULL` —
+    // NOT the compiled `NORMAL` default — "or the asi-hard profile", and
+    // `doctor --posture` attests it; §5 makes the attached output showing
+    // `synchronous=FULL` a precondition of issuance. The asi-hard pin
+    // (check #2) already refuses a `NORMAL` OVERRIDE, but nothing NAMED
+    // the level, its provenance, or the durability class it buys — and a
+    // `NORMAL` ack presented as durable is a silently upgraded class
+    // (§0.4). Same real-reader discipline as checks #3-#6: the row renders
+    // `storage::resolved_synchronous()`, the exact resolver every open
+    // funnel applies, never a re-derived grammar. `PRAGMA synchronous` is
+    // per-connection and never persisted, so the live half (when the
+    // caller supplied one) is an observation of a connection THIS process
+    // opened, and is worded that way — it is corroboration of the funnel,
+    // never a claim about a running daemon's connection.
+    let resolved = crate::storage::resolved_synchronous();
+    let live_note = match live_synchronous {
+        Some(live) if live == resolved.level => {
+            "; live PRAGMA synchronous on this process's own read-only connection agrees"
+        }
+        Some(_) => {
+            "; live PRAGMA synchronous on this process's own read-only connection DISAGREES \
+             (open-funnel defect — the resolved level was not applied)"
+        }
+        None => "; live pragma not observed (no database connection in this evaluation)",
+    };
+    let live_agrees = live_synchronous.is_none_or(|live| live == resolved.level);
+    out.push(check(
+        &format!(
+            "PRAGMA synchronous ({})",
+            crate::storage::ENV_DB_SYNCHRONOUS
+        ),
+        "FULL or EXTRA (per-commit fsync; the certified SQLite envelope, standard §0.1/§5; \
+         asi-hard pins FULL) — per-connection, resolved for THIS process",
+        format!(
+            "{level} (resolved from {source}; applied to every connection this binary \
+             opens{live_note}) — durability_class={class}, fsync {cadence}, RPO on power \
+             loss: {rpo}",
+            level = resolved.level,
+            source = resolved.source.as_str(),
+            class = resolved.level.durability_class(),
+            cadence = resolved.level.fsync_cadence(),
+            rpo = resolved.level.rpo_on_power_loss(),
+        ),
+        resolved.level.meets_certified_floor() && live_agrees,
+        "set AI_MEMORY_DB_SYNCHRONOUS=FULL (the asi-hard profile pins it); see \
+         PERFORMANCE.md §\"Power-loss durability\" — a NORMAL node is inside the envelope \
+         only as durability_class=local-only with its RPO declared (standard §0.1)",
+    ));
+
     debug_assert_eq!(
         out.len(),
         ENTERPRISE_FEDERATION_CHECK_COUNT,
@@ -1004,6 +1077,105 @@ mod tests {
     // that would collide with the module's own `TRUST_DOMAIN_ENV`
     // re-export ambiguity across `crate::federation::identity::trust_bundle`.
     use crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV as TRUST_DOMAIN_ENV_FOR_TEST;
+
+    /// #3553 — with every other control satisfied, a `NORMAL` synchronous
+    /// level is the ONE failing row, it NAMES `synchronous`, and `all_pass`
+    /// is false (so `doctor --posture` exits 2). Set AFTER `enforce_at_boot`
+    /// pinned `FULL`: `evaluate` is pure, so this models a process whose
+    /// environment drifted below the floor after the pins were laid.
+    #[test]
+    fn synchronous_normal_is_the_named_failing_row_3553() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::synchronous_normal_is_the_named_failing_row_3553",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+        unsafe {
+            std::env::set_var(crate::storage::ENV_DB_SYNCHRONOUS, "normal");
+        }
+
+        let checks = evaluate(&AppConfig::default());
+        let row = find(&checks, "PRAGMA synchronous");
+        assert!(!row.pass, "NORMAL must fail the certified floor: {row:?}");
+        assert!(row.control.contains("synchronous"));
+        assert!(row.actual.starts_with("NORMAL"), "actual: {}", row.actual);
+        assert!(
+            row.actual.contains("env AI_MEMORY_DB_SYNCHRONOUS"),
+            "actual: {}",
+            row.actual
+        );
+        assert!(row.actual.contains("local-only"), "actual: {}", row.actual);
+        assert!(
+            row.actual.contains("per-checkpoint"),
+            "actual: {}",
+            row.actual
+        );
+        assert!(
+            row.actual.contains("not observed"),
+            "actual: {}",
+            row.actual
+        );
+        assert!(row.remediation.contains("AI_MEMORY_DB_SYNCHRONOUS=FULL"));
+        assert!(!all_pass(&checks));
+        assert_eq!(checks.len(), ENTERPRISE_FEDERATION_CHECK_COUNT);
+    }
+
+    /// #3553 — under the pinned `FULL` the row PASSES, and a live
+    /// observation that AGREES keeps it passing while one that DISAGREES
+    /// fails it (an open funnel that did not apply the resolved level is a
+    /// defect, never a green).
+    #[test]
+    fn synchronous_full_passes_and_live_disagreement_fails_3553() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::synchronous_full_passes_and_live_disagreement_fails_3553",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+        assert_eq!(
+            crate::storage::resolved_synchronous().level,
+            crate::storage::SynchronousLevel::Full,
+            "asi-hard must have pinned FULL"
+        );
+
+        let row_none = find(&evaluate(&AppConfig::default()), "PRAGMA synchronous").clone();
+        assert!(row_none.pass, "{row_none:?}");
+        assert!(row_none.actual.starts_with("FULL"));
+        assert!(row_none.actual.contains("per-commit"));
+        assert!(row_none.remediation.is_empty());
+
+        let agree = evaluate_with_live(
+            &AppConfig::default(),
+            Some(crate::storage::SynchronousLevel::Full),
+        );
+        let row_agree = find(&agree, "PRAGMA synchronous");
+        assert!(row_agree.pass, "{row_agree:?}");
+        assert!(row_agree.actual.contains("agrees"), "{}", row_agree.actual);
+
+        let disagree = evaluate_with_live(
+            &AppConfig::default(),
+            Some(crate::storage::SynchronousLevel::Normal),
+        );
+        let row_disagree = find(&disagree, "PRAGMA synchronous");
+        assert!(!row_disagree.pass, "{row_disagree:?}");
+        assert!(
+            row_disagree.actual.contains("DISAGREES"),
+            "{}",
+            row_disagree.actual
+        );
+        assert!(!all_pass(&disagree));
+    }
 
     #[test]
     fn fully_hardened_env_passes_every_check_except_possibly_sqlcipher_build() {
