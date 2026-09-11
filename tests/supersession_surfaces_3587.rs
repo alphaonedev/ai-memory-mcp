@@ -75,8 +75,12 @@ fn predecessor(namespace: &str, owner: Option<&str>, created_at: &str) -> Memory
     if let Some(owner) = owner {
         metadata["agent_id"] = json!(owner);
     }
+    // Long tier: a ruling is permanent. A mid-tier seed dated PAST would be
+    // TTL-expired, and the CLI's pre-store `gc_if_needed` would archive it as
+    // `ttl_expired` before the supersession lookup ever ran.
     Memory {
         id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Long,
         namespace: namespace.to_string(),
         title: uniq("old-ruling"),
         content: "the release freeze starts monday".into(),
@@ -156,6 +160,12 @@ trait Surface {
     /// `(metadata, archive_reason)` of an archived snapshot.
     async fn archived(&self, id: &str) -> Option<(Value, String)>;
     async fn live_ids_titled(&self, namespace: &str, title: &str) -> Vec<String>;
+    /// HTTP refuses a self-asserted identity that disagrees with the
+    /// authenticated caller before any write (#907 `AGENT_ID_MISMATCH`);
+    /// the other surfaces store the row and skip supersession.
+    fn refuses_forged_identity_at_edge(&self) -> bool {
+        false
+    }
 }
 
 fn new_id(surface: &str, envelope: &Value) -> String {
@@ -240,6 +250,37 @@ async fn assert_kept<S: Surface>(
     new
 }
 
+/// Edge refusal: the forged claim is a typed 403, nothing is stored, and OLD
+/// stays byte-identical and live.
+async fn assert_forged_identity_refused<S: Surface>(
+    s: &S,
+    namespace: &str,
+    title: &str,
+    old: &str,
+    before: &Value,
+    outcome: Result<Value, String>,
+) {
+    let name = s.name();
+    let err = outcome.expect_err("a forged identity must be refused at the edge");
+    assert!(
+        err.starts_with("403") && err.contains("AGENT_ID_MISMATCH"),
+        "{name}: {err}"
+    );
+    assert!(
+        s.live_ids_titled(namespace, title).await.is_empty(),
+        "{name}: a refused write stores nothing"
+    );
+    assert_eq!(
+        s.live_meta(old).await.as_ref(),
+        Some(before),
+        "{name}: OLD untouched"
+    );
+    assert!(
+        s.archived(old).await.is_none(),
+        "{name}: OLD never archived"
+    );
+}
+
 async fn seeded<S: Surface>(s: &S, memory: &Memory) -> Value {
     s.seed(memory).await;
     s.live_meta(&memory.id).await.expect("seeded row is live")
@@ -262,11 +303,14 @@ async fn family_matrix<S: Surface>(s: &S) {
     let o = owner();
     let old = predecessor(&ns, Some(&o), PAST);
     let before = seeded(s, &old).await;
-    let env = s
-        .store(Spec::new(&ns, &uniq("t")).claimed(&o))
-        .await
-        .expect("F2 store");
-    assert_kept(s, &old.id, &before, &env, true).await;
+    let title = uniq("t");
+    let outcome = s.store(Spec::new(&ns, &title).claimed(&o)).await;
+    if s.refuses_forged_identity_at_edge() {
+        assert_forged_identity_refused(s, &ns, &title, &old.id, &before, outcome).await;
+    } else {
+        let env = outcome.expect("F2 store");
+        assert_kept(s, &old.id, &before, &env, true).await;
+    }
 
     // F2b — a hardened principal that is not the owner.
     let ns = uniq("f2b");
@@ -744,7 +788,7 @@ impl Http {
             // The sqlite router writes through `app.db`; the SAL handle only
             // has to exist. Its scratch dir outlives the router on purpose.
             let dir = scratch_dir("surface-http-sal-3587-");
-            let store = ai_memory::store::sqlite::SqliteStore::open(&dir.path().join("sal.db"))
+            let store = ai_memory::store::sqlite::SqliteStore::open(dir.path().join("sal.db"))
                 .expect("open sal store");
             std::mem::forget(dir);
             app_state(
@@ -910,6 +954,9 @@ impl Surface for Http {
     async fn store(&self, spec: Spec<'_>) -> Result<Value, String> {
         self.post_create(spec.principal, &spec.body()).await
     }
+    fn refuses_forged_identity_at_edge(&self) -> bool {
+        true
+    }
     async fn live_meta(&self, id: &str) -> Option<Value> {
         match &self.backend {
             Backend::Sqlite(db) => sqlite_live_meta(&db.lock().await.0, id),
@@ -971,6 +1018,33 @@ async fn http_extras(http: &Http) {
         .await
         .expect("verified signer store");
     assert_superseded(http, &old.id, &env).await;
+
+    // F2 per channel — the body and the metadata claim are each refused alone.
+    for (body_channel, refusal) in [
+        (true, ai_memory::errors::msg::AGENT_ID_BODY_MISMATCH),
+        (
+            false,
+            "metadata.agent_id does not match authenticated caller",
+        ),
+    ] {
+        let ns = uniq("http-forge");
+        let o = owner();
+        let old = predecessor(&ns, Some(&o), PAST);
+        let before = seeded(http, &old).await;
+        let title = uniq("t");
+        let mut body = Spec::new(&ns, &title).body();
+        if body_channel {
+            body["agent_id"] = json!(o);
+        } else {
+            body["metadata"]["agent_id"] = json!(o);
+        }
+        let outcome = http.post_create(None, &body).await;
+        assert!(
+            outcome.as_ref().is_err_and(|e| e.contains(refusal)),
+            "{name}: {refusal}: {outcome:?}"
+        );
+        assert_forged_identity_refused(http, &ns, &title, &old.id, &before, outcome).await;
+    }
 
     // F14 — a keyed bulk row is typed-refused; the unkeyed sibling lands.
     let ns = uniq("http-bulk");
