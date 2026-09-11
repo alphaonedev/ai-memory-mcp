@@ -113,6 +113,15 @@ pub const STALE_RULING_NOTIFY_FLOOR_SECS: u64 = 86_400;
 /// row stays bounded (#3345 bloat class).
 pub const STALE_RULING_REPORT_TOP_N: usize = 20;
 
+/// #3587 U3 — one bounded SELECT is issued per sweep, capped here at
+/// `TOP_N * 64` (1 280 rows) so a very large stale corpus cannot turn the
+/// pass into an unbounded scan. [`CuratorReport::stale_rulings_found`] is
+/// therefore itself capped at this value: a corpus with MORE than
+/// `STALE_RULING_FETCH_CAP` stale rulings reports the cap, not the true
+/// count. Raising the cap is a deliberate future change (a cheap `COUNT(*)`
+/// plus a capped id fetch) rather than an operator knob.
+pub const STALE_RULING_FETCH_CAP: usize = STALE_RULING_REPORT_TOP_N * 64;
+
 /// #3587 U3 — namespace for the pass's own notify-dedup state row. The
 /// curator skips `_`-prefixed namespaces when collecting candidates, so this
 /// bookkeeping row is never itself curated.
@@ -362,6 +371,10 @@ pub struct CuratorReport {
     /// (tag `ruling` or `metadata.ruling_key`, older than
     /// `[curator].stale_ruling_days`, with no supersede / verify marker).
     /// The pass is read-only w.r.t. those rows.
+    ///
+    /// NOTE: this is the fetch-capped count ([`STALE_RULING_FETCH_CAP`],
+    /// 1 280) — a corpus with more stale rulings than the cap reports the cap,
+    /// because the pass issues one bounded SELECT and never a `COUNT(*)`.
     #[serde(default)]
     pub stale_rulings_found: usize,
     /// #3587 U3 — 1 when this cycle actually emitted a stale-ruling digest to
@@ -790,23 +803,17 @@ fn run_stale_ruling_pass(
         return;
     };
     let cutoff = (now - chrono::Duration::days(days_i64)).to_rfc3339();
-    // Over-fetch beyond the report cap so `stale_rulings_found` stays truthful
-    // while the persisted id list is capped (`--json` prints the full list).
-    let fetch_cap = STALE_RULING_REPORT_TOP_N.saturating_mul(64).max(256);
-    let stale = match crate::storage::list_stale_rulings(conn, &cutoff, fetch_cap) {
+    // One bounded SELECT, over-fetching beyond the report cap so
+    // `stale_rulings_found` is the true count up to `STALE_RULING_FETCH_CAP`
+    // while the persisted id list stays capped (`--json` prints the full list).
+    let stale = match crate::storage::list_stale_rulings(conn, &cutoff, STALE_RULING_FETCH_CAP) {
         Ok(rows) => rows,
         Err(e) => {
             report.errors.push(format!("stale-ruling scan failed: {e}"));
             return;
         }
     };
-    report.stale_rulings_found = stale.len();
-    report.stale_ruling_ids_all = stale.iter().map(|r| r.id.clone()).collect();
-    report.stale_ruling_ids = stale
-        .iter()
-        .take(STALE_RULING_REPORT_TOP_N)
-        .map(|r| r.id.clone())
-        .collect();
+    record_stale_findings(report, &stale);
 
     if stale.is_empty() || cfg.dry_run {
         return;
@@ -824,8 +831,25 @@ fn run_stale_ruling_pass(
     };
 
     let set_hash = stale_set_hash(&stale);
-    if stale_digest_within_floor(conn, now, &set_hash) {
-        return;
+    let last = match read_stale_ruling_state(conn) {
+        Ok(v) => v,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("stale-ruling state read failed: {e}"));
+            None
+        }
+    };
+    match stale_digest_floor_decision(
+        last.as_ref().map(|(h, a)| (h.as_str(), a.as_str())),
+        now,
+        &set_hash,
+    ) {
+        StaleDigestFloor::Suppressed => return,
+        StaleDigestFloor::CorruptTimestamp => report
+            .errors
+            .push("stale-ruling digest state timestamp is unparsable; re-notifying".to_string()),
+        StaleDigestFloor::Emit => {}
     }
 
     let ttl = crate::config::ResolvedTtl::default();
@@ -873,25 +897,64 @@ fn stale_set_hash(stale: &[crate::storage::StaleRuling]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// #3587 U3 — true when the SAME stale-id set was digested less than
-/// [`STALE_RULING_NOTIFY_FLOOR_SECS`] ago. A changed set always re-notifies;
-/// an unchanged set is suppressed until the floor elapses.
-fn stale_digest_within_floor(
-    conn: &Connection,
+/// #3587 U3 — copy a scan result into the report: the fetch-capped count and
+/// the capped persisted id list, with the full list kept in memory for the
+/// CLI's `--json` stdout only. Shared by the sqlite and store-backed passes.
+fn record_stale_findings(report: &mut CuratorReport, stale: &[crate::storage::StaleRuling]) {
+    report.stale_rulings_found = stale.len();
+    report.stale_ruling_ids_all = stale.iter().map(|r| r.id.clone()).collect();
+    report.stale_ruling_ids = stale
+        .iter()
+        .take(STALE_RULING_REPORT_TOP_N)
+        .map(|r| r.id.clone())
+        .collect();
+}
+
+/// #3587 U3 R2 — outcome of the stale-ruling digest anti-storm gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleDigestFloor {
+    /// Emit a digest for the current stale-id set.
+    Emit,
+    /// Suppress: inside the hard floor (regardless of whether the set changed)
+    /// or an unchanged set after the floor.
+    Suppressed,
+    /// The persisted state timestamp is unparsable. Emit (the emit rewrites the
+    /// state row, so the corruption self-heals) and let the caller surface it.
+    CorruptTimestamp,
+}
+
+/// #3587 U3 R2 — the digest anti-storm decision, shared by the sqlite and
+/// store-backed passes so the two backends cannot drift.
+///
+/// The 86 400 s floor is UNCONDITIONAL: any digest younger than the floor
+/// suppresses the next one EVEN WHEN the stale-id set changed. Without that,
+/// a corpus whose rulings cross the stale line one at a time produces a new
+/// set — and a new digest — every `interval_secs` (60 s) sweep, which is the
+/// F13 storm. Only once the floor has elapsed does the set-hash rule apply:
+/// an unchanged set is still suppressed (the previous digest already carried
+/// it), and a changed set emits exactly one digest carrying the CURRENT set.
+fn stale_digest_floor_decision(
+    last: Option<(&str, &str)>,
     now: chrono::DateTime<chrono::Utc>,
     set_hash: &str,
-) -> bool {
-    let Ok(Some((last_hash, last_at))) = read_stale_ruling_state(conn) else {
-        return false;
+) -> StaleDigestFloor {
+    let Some((last_hash, last_at)) = last else {
+        return StaleDigestFloor::Emit;
     };
-    if last_hash != set_hash {
-        return false;
-    }
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&last_at) else {
-        return false;
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(last_at) else {
+        return StaleDigestFloor::CorruptTimestamp;
     };
+    let floor = i64::try_from(STALE_RULING_NOTIFY_FLOOR_SECS).unwrap_or(i64::MAX);
     let elapsed = (now - parsed.with_timezone(&chrono::Utc)).num_seconds();
-    elapsed >= 0 && elapsed < i64::try_from(STALE_RULING_NOTIFY_FLOOR_SECS).unwrap_or(i64::MAX)
+    // A negative elapsed (clock skew / a future stamp) is treated as INSIDE
+    // the floor too, so a skewed clock cannot storm the recipient.
+    if elapsed < floor {
+        return StaleDigestFloor::Suppressed;
+    }
+    if last_hash == set_hash {
+        return StaleDigestFloor::Suppressed;
+    }
+    StaleDigestFloor::Emit
 }
 
 /// #3587 U3 — read the single notify-dedup state row, if any.
@@ -915,15 +978,12 @@ fn read_stale_ruling_state(conn: &Connection) -> rusqlite::Result<Option<(String
     }
 }
 
-/// #3587 U3 — upsert the single notify-dedup state row. Uses the substrate
-/// `db::insert` `(title, namespace)` upsert so there is never more than one.
-fn write_stale_ruling_state(
-    conn: &Connection,
-    set_hash: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> anyhow::Result<()> {
+/// #3587 U3 — the single notify-dedup state row body, shared by the sqlite and
+/// store-backed writers so their `(title, namespace)` upsert target and shape
+/// cannot drift.
+fn stale_ruling_state_memory(set_hash: &str, now: chrono::DateTime<chrono::Utc>) -> Memory {
     let ts = now.to_rfc3339();
-    let mem = Memory {
+    Memory {
         cid: None,
         valid_from: None,
         valid_until: None,
@@ -958,9 +1018,198 @@ fn write_stale_ruling_state(
         confidence_decayed_at: None,
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
-    };
-    crate::db::insert(conn, &mem)?;
+    }
+}
+
+/// #3587 U3 — upsert the single notify-dedup state row through `db::insert`
+/// (the `(title, namespace)` upsert) so there is never more than one.
+fn write_stale_ruling_state(
+    conn: &Connection,
+    set_hash: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    crate::db::insert(conn, &stale_ruling_state_memory(set_hash, now))?;
     Ok(())
+}
+
+/// #3587 U3 R1 — store-backed (`--store-url` / postgres) twin of
+/// [`run_stale_ruling_pass`].
+///
+/// The predicate is [`crate::store::MemoryStore::list_stale_rulings`], the
+/// digest goes through [`crate::store::MemoryStore::notify`] under a
+/// [`crate::store::CallerContext`] whose `agent_id` is the curator's OWN
+/// resolved `sender` (the same sender rule as the sqlite/MCP funnel — the
+/// configured `[curator].notify_agent_id` is only ever the recipient), and the
+/// notify-dedup state row is read/written through the store, so a postgres
+/// hive runs the same sweep the sqlite `run_once` does. The floor + set-hash
+/// decision is shared with the sqlite pass
+/// ([`stale_digest_floor_decision`]), so the two backends cannot drift.
+///
+/// Read-only w.r.t. the ruling rows; `cfg.dry_run` suppresses the digest but
+/// still reports.
+#[cfg(feature = "sal")]
+pub async fn run_store_backed_stale_ruling_pass(
+    store: &dyn crate::store::MemoryStore,
+    cfg: &CuratorConfig,
+    sender: &str,
+) -> CuratorReport {
+    let started = Instant::now();
+    let mut report = CuratorReport::new(cfg.dry_run);
+    store_backed_stale_ruling_body(store, cfg, sender, &mut report).await;
+    report.completed_at = chrono::Utc::now().to_rfc3339();
+    report.cycle_duration_ms = started.elapsed().as_millis();
+    report
+}
+
+/// #3587 U3 R1 — body of [`run_store_backed_stale_ruling_pass`]; early returns
+/// leave the report's `completed_at` / `cycle_duration_ms` to the caller.
+#[cfg(feature = "sal")]
+async fn store_backed_stale_ruling_body(
+    store: &dyn crate::store::MemoryStore,
+    cfg: &CuratorConfig,
+    sender: &str,
+    report: &mut CuratorReport,
+) {
+    let now = chrono::Utc::now();
+    let days = if cfg.stale_ruling_days == 0 {
+        DEFAULT_STALE_RULING_DAYS
+    } else {
+        cfg.stale_ruling_days
+    };
+    let Ok(days_i64) = i64::try_from(days) else {
+        report
+            .errors
+            .push("stale-ruling sweep: stale_ruling_days out of range".to_string());
+        return;
+    };
+    let cutoff = (now - chrono::Duration::days(days_i64)).to_rfc3339();
+    let stale = match store
+        .list_stale_rulings(&cutoff, STALE_RULING_FETCH_CAP)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            report.errors.push(format!("stale-ruling scan failed: {e}"));
+            return;
+        }
+    };
+    record_stale_findings(report, &stale);
+
+    if stale.is_empty() || cfg.dry_run {
+        return;
+    }
+    let Some(recipient) = cfg
+        .notify_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+
+    // The state row is substrate bookkeeping owned by the curator principal, so
+    // it is read/written under the same admin context the curator's other store
+    // writes use. The DIGEST is stamped with the caller's own resolved id.
+    let state_ctx = crate::store::CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
+    let set_hash = stale_set_hash(&stale);
+    let last = match read_store_stale_ruling_state(store, &state_ctx).await {
+        Ok(v) => v,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("stale-ruling state read failed: {e}"));
+            None
+        }
+    };
+    // Both `Emit` and `CorruptTimestamp` (which logs and then self-heals by
+    // re-notifying) reach the send; only `Suppressed` stops here. This mirrors
+    // the sqlite pass, where the send follows the match.
+    let emit = match stale_digest_floor_decision(
+        last.as_ref().map(|(h, a)| (h.as_str(), a.as_str())),
+        now,
+        &set_hash,
+    ) {
+        StaleDigestFloor::Suppressed => false,
+        StaleDigestFloor::CorruptTimestamp => {
+            report.errors.push(
+                "stale-ruling digest state timestamp is unparsable; re-notifying".to_string(),
+            );
+            true
+        }
+        StaleDigestFloor::Emit => true,
+    };
+    if emit {
+        let payload = format!(
+            "{} live ruling(s) older than {} day(s) with no supersede/verify marker: {}",
+            stale.len(),
+            days,
+            report.stale_ruling_ids.join(", "),
+        );
+        let title = format!("stale rulings: {} (>{days}d)", stale.len());
+        let notify_ctx = crate::store::CallerContext::for_agent(sender);
+        let tier = crate::models::Tier::Short;
+        match store
+            .notify(
+                &notify_ctx,
+                recipient,
+                &title,
+                &payload,
+                Some(5),
+                Some(&tier),
+                Some("curator stale-ruling sweep (#3587 U3)"),
+            )
+            .await
+        {
+            Ok(_) => {
+                report.stale_rulings_notified = 1;
+                if let Err(e) =
+                    write_store_stale_ruling_state(store, &state_ctx, &set_hash, now).await
+                {
+                    report
+                        .errors
+                        .push(format!("stale-ruling state write failed: {e}"));
+                }
+            }
+            Err(e) => report
+                .errors
+                .push(format!("stale-ruling digest failed: {e}")),
+        }
+    }
+}
+
+/// #3587 U3 — read the single notify-dedup state row through the store, if any.
+#[cfg(feature = "sal")]
+async fn read_store_stale_ruling_state(
+    store: &dyn crate::store::MemoryStore,
+    ctx: &crate::store::CallerContext,
+) -> crate::store::StoreResult<Option<(String, String)>> {
+    let Some(id) = store
+        .find_by_title_namespace(STALE_RULING_STATE_TITLE, STALE_RULING_STATE_NAMESPACE)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mem = store.get(ctx, &id).await?;
+    let hash = mem
+        .metadata
+        .get("stale_set_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Ok(hash.map(|h| (h, mem.updated_at)))
+}
+
+/// #3587 U3 — upsert the single notify-dedup state row through the store.
+/// Shares [`stale_ruling_state_memory`] with the sqlite writer so the
+/// `(title, namespace)` upsert target and the row shape cannot drift.
+#[cfg(feature = "sal")]
+async fn write_store_stale_ruling_state(
+    store: &dyn crate::store::MemoryStore,
+    ctx: &crate::store::CallerContext,
+    set_hash: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::store::StoreResult<()> {
+    let mem = stale_ruling_state_memory(set_hash, now);
+    store.store(ctx, &mem).await.map(|_| ())
 }
 
 /// v0.8.0 Pillar-2.5 (#1746 cutover) — SAL `ConsolidationPass` live driver.

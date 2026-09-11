@@ -10,7 +10,10 @@
 //! or the cycle is a dry run. The sender is always the curator's own resolved
 //! id, never the configured recipient (audit-A F8/F12/F13/F14).
 
-use ai_memory::curator::{CuratorConfig, STALE_RULING_REPORT_TOP_N, run_stale_ruling_sweep};
+use ai_memory::curator::{
+    CuratorConfig, STALE_RULING_NOTIFY_FLOOR_SECS, STALE_RULING_REPORT_TOP_N,
+    STALE_RULING_STATE_NAMESPACE, STALE_RULING_STATE_TITLE, run_stale_ruling_sweep,
+};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use serde_json::json;
 
@@ -100,6 +103,40 @@ fn snapshot(conn: &rusqlite::Connection, id: &str) -> (i64, String) {
 fn archived_count(conn: &rusqlite::Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM archived_memories", [], |r| r.get(0))
         .expect("count archived")
+}
+
+/// Move the persisted notify-dedup state row `secs` into the past so the
+/// anti-storm floor is treated as elapsed.
+fn backdate_state_row(conn: &rusqlite::Connection, secs: i64) {
+    let ts = (chrono::Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339();
+    conn.execute(
+        "UPDATE memories SET updated_at = ?1 WHERE namespace = ?2 AND title = ?3",
+        rusqlite::params![ts, STALE_RULING_STATE_NAMESPACE, STALE_RULING_STATE_TITLE],
+    )
+    .expect("backdate state row");
+}
+
+/// Corrupt the persisted notify-dedup timestamp (R2 recommended: visible, not
+/// a silent re-notify).
+fn corrupt_state_timestamp(conn: &rusqlite::Connection) {
+    conn.execute(
+        "UPDATE memories SET updated_at = 'not-a-timestamp' \
+         WHERE namespace = ?1 AND title = ?2",
+        rusqlite::params![STALE_RULING_STATE_NAMESPACE, STALE_RULING_STATE_TITLE],
+    )
+    .expect("corrupt state row");
+}
+
+/// Body of the most recent digest row, so a test can assert WHAT was notified.
+fn latest_inbox_content(conn: &rusqlite::Connection) -> String {
+    let ns = ai_memory::inbox_namespace(RECIPIENT);
+    conn.query_row(
+        "SELECT content FROM memories WHERE namespace = ?1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+        [&ns],
+        |r| r.get(0),
+    )
+    .expect("latest inbox content")
 }
 
 #[test]
@@ -201,6 +238,91 @@ fn stale_ruling_digest_sent_once_per_sweep_3587() {
         1,
         "exactly one digest row for N rulings"
     );
+
+    // #3587 U3 R2 — a CHANGED set inside the floor is STILL suppressed: the
+    // floor is unconditional, so rulings crossing the stale line one at a time
+    // cannot produce a digest on every 60 s sweep (the F13 storm).
+    seed(&conn, &["ruling"], Some("k-once-new"), json!({}), 30);
+    let r4 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep 4");
+    assert!(
+        r4.stale_rulings_found >= 5,
+        "the new ruling is part of the stale set"
+    );
+    assert_eq!(
+        r4.stale_rulings_notified, 0,
+        "changed set inside the floor must be suppressed"
+    );
+    assert_eq!(inbox_count(&conn), 1, "still exactly one digest row");
+}
+
+/// #3587 U3 R2 — the unconditional floor, end to end: a changed set inside the
+/// floor is suppressed; after the floor elapses the next digest carries the
+/// CURRENT set (the newly-stale ruling included).
+#[test]
+fn stale_ruling_floor_is_unconditional_3587() {
+    let (_dir, conn) = open_db();
+    let first = seed(&conn, &["ruling"], Some("k-floor-a"), json!({}), 30);
+
+    let r1 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep 1");
+    assert_eq!(r1.stale_rulings_notified, 1);
+    assert_eq!(inbox_count(&conn), 1);
+
+    // A newly-stale ruling changes the set, but the floor is still in force.
+    let second = seed(&conn, &["ruling"], Some("k-floor-b"), json!({}), 30);
+    let r2 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep 2");
+    assert_eq!(
+        r2.stale_rulings_notified, 0,
+        "changed set inside the floor is suppressed"
+    );
+    assert_eq!(inbox_count(&conn), 1);
+
+    // Once the floor has elapsed, ONE digest carries the current set.
+    backdate_state_row(
+        &conn,
+        i64::try_from(STALE_RULING_NOTIFY_FLOOR_SECS).unwrap() + 60,
+    );
+    let r3 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep 3");
+    assert_eq!(
+        r3.stale_rulings_notified, 1,
+        "after the floor the changed set re-notifies once: {:?}",
+        r3.errors
+    );
+    assert_eq!(inbox_count(&conn), 2, "exactly one fresh digest");
+    let body = latest_inbox_content(&conn);
+    assert!(
+        body.contains(&first),
+        "current set carries the first ruling"
+    );
+    assert!(body.contains(&second), "current set carries the new ruling");
+}
+
+/// #3587 U3 R2 (recommended) — an unparsable state timestamp is surfaced in
+/// `report.errors` and self-heals: the pass re-notifies once and rewrites the
+/// state row with a fresh, parseable timestamp.
+#[test]
+fn stale_ruling_corrupt_floor_timestamp_is_reported_3587() {
+    let (_dir, conn) = open_db();
+    seed(&conn, &["ruling"], Some("k-corrupt"), json!({}), 30);
+
+    let r1 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep 1");
+    assert_eq!(r1.stale_rulings_notified, 1);
+
+    corrupt_state_timestamp(&conn);
+    let r2 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep 2");
+    assert_eq!(
+        r2.stale_rulings_notified, 1,
+        "a corrupt timestamp must not silently swallow the digest"
+    );
+    assert!(
+        r2.errors.iter().any(|e| e.contains("unparsable")),
+        "the corruption is reported: {:?}",
+        r2.errors
+    );
+
+    // Self-healed: the re-notify rewrote a valid timestamp, so the next sweep
+    // is suppressed by the floor again.
+    let r3 = run_stale_ruling_sweep(&conn, &cfg(Some(RECIPIENT), false), None).expect("sweep 3");
+    assert_eq!(r3.stale_rulings_notified, 0, "state row self-healed");
 }
 
 #[test]

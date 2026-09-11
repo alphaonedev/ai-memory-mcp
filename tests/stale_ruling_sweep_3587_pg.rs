@@ -184,3 +184,141 @@ async fn stale_ruling_markers_and_latest_only_3587_pg() {
 
     cleanup(&store, &marker).await;
 }
+
+/// Count the rows in one inbox namespace.
+async fn inbox_count_pg(store: &PostgresStore, ns: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE namespace = $1")
+        .bind(ns)
+        .fetch_one(store.pool())
+        .await
+        .expect("count inbox")
+}
+
+/// #3587 U3 R1 — drives the STORE-BACKED sweep ENTRY (not the raw trait
+/// method) against a live cluster: scan via `list_stale_rulings`, digest via
+/// the store-backed notify funnel with the curator's own sender, and dedup
+/// state read/written through the store. Also pins the R2 unconditional floor
+/// (a changed set inside the floor is suppressed; after the floor one digest
+/// carries the current set) and the read-only guarantee on the ruling rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn store_backed_stale_ruling_sweep_notifies_and_dedups_3587_pg() {
+    let Some(store) = connect().await else {
+        panic!("AI_MEMORY_TEST_POSTGRES_URL must be set for the #3587 live-pg suite");
+    };
+    let marker = format!("m3587-{}", uuid::Uuid::new_v4());
+    let ns = format!("proj/{marker}");
+    let recipient = format!("deputy-{marker}");
+    let inbox_ns = ai_memory::inbox_namespace(&recipient);
+    let now = chrono::Utc::now();
+    let sender = "ai:curator";
+
+    // The shared dedup row must start absent so the first sweep actually emits.
+    sqlx::query("DELETE FROM memories WHERE namespace = $1 AND title = $2")
+        .bind(ai_memory::curator::STALE_RULING_STATE_NAMESPACE)
+        .bind(ai_memory::curator::STALE_RULING_STATE_TITLE)
+        .execute(store.pool())
+        .await
+        .expect("clear state row");
+
+    let first = raw_ruling(
+        &store,
+        &ns,
+        &["ruling"],
+        serde_json::json!({"agent_id": "ai:fable", "ruling_key": "k-store"}),
+        now - chrono::Duration::days(30),
+    )
+    .await;
+    let before = snapshot(&store, &first).await;
+    let archived_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories")
+        .fetch_one(store.pool())
+        .await
+        .expect("archived count");
+
+    let cfg = ai_memory::curator::CuratorConfig {
+        stale_ruling_days: 14,
+        notify_agent_id: Some(recipient.clone()),
+        ..ai_memory::curator::CuratorConfig::default()
+    };
+
+    let r1 = ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender).await;
+    assert!(
+        r1.errors.is_empty(),
+        "first store-backed sweep must be clean: {:?}",
+        r1.errors
+    );
+    assert!(
+        r1.stale_ruling_ids.contains(&first),
+        "the seeded ruling is reported: {:?}",
+        r1.stale_ruling_ids
+    );
+    assert_eq!(r1.stale_rulings_notified, 1, "first sweep emits one digest");
+    assert_eq!(inbox_count_pg(&store, &inbox_ns).await, 1);
+
+    // Read-only guarantee: the ruling row and the archive count are unchanged.
+    assert_eq!(snapshot(&store, &first).await, before, "ruling drifted");
+    let archived_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories")
+        .fetch_one(store.pool())
+        .await
+        .expect("archived count");
+    assert_eq!(archived_after, archived_before, "sweep must not archive");
+
+    // R2 — a CHANGED set inside the floor is suppressed.
+    let second = raw_ruling(
+        &store,
+        &ns,
+        &["ruling"],
+        serde_json::json!({"agent_id": "ai:fable", "ruling_key": "k-store-2"}),
+        now - chrono::Duration::days(30),
+    )
+    .await;
+    let r2 = ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender).await;
+    assert!(
+        r2.stale_ruling_ids.contains(&second),
+        "the new ruling is in the current set"
+    );
+    assert_eq!(
+        r2.stale_rulings_notified, 0,
+        "changed set inside the floor is suppressed: {:?}",
+        r2.errors
+    );
+    assert_eq!(inbox_count_pg(&store, &inbox_ns).await, 1);
+
+    // After the floor, ONE digest carrying the CURRENT set.
+    sqlx::query(
+        "UPDATE memories SET updated_at = now() - interval '2 days' \
+         WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::curator::STALE_RULING_STATE_NAMESPACE)
+    .bind(ai_memory::curator::STALE_RULING_STATE_TITLE)
+    .execute(store.pool())
+    .await
+    .expect("backdate state row");
+
+    let r3 = ai_memory::curator::run_store_backed_stale_ruling_pass(&store, &cfg, sender).await;
+    assert!(
+        r3.errors.is_empty(),
+        "post-floor sweep must be clean: {:?}",
+        r3.errors
+    );
+    assert_eq!(
+        r3.stale_rulings_notified, 1,
+        "after the floor the changed set re-notifies once"
+    );
+    assert_eq!(inbox_count_pg(&store, &inbox_ns).await, 2);
+    let body: String = sqlx::query_scalar(
+        "SELECT content FROM memories WHERE namespace = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&inbox_ns)
+    .fetch_one(store.pool())
+    .await
+    .expect("latest digest body");
+    assert!(body.contains(&second), "current set is carried: {body}");
+
+    cleanup(&store, &marker).await;
+    let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1 AND title = $2")
+        .bind(ai_memory::curator::STALE_RULING_STATE_NAMESPACE)
+        .bind(ai_memory::curator::STALE_RULING_STATE_TITLE)
+        .execute(store.pool())
+        .await;
+}

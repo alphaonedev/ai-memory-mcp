@@ -364,8 +364,9 @@ pub async fn run(
     if args.stale_rulings {
         // #3587 U3 — CLI-only one-shot stale-ruling sweep. Read-only w.r.t. the
         // ruling rows; the digest (if any) goes through the same pass the
-        // `--once` sweep uses.
-        return run_stale_rulings(db_path, args, app_config, out);
+        // `--once` sweep uses. `run_stale_rulings` itself dispatches to the SAL
+        // path when `--store-url` selects a postgres store (R1).
+        return run_stale_rulings(db_path, args, app_config, out).await;
     }
 
     if !args.once && !args.daemon {
@@ -478,7 +479,11 @@ pub async fn run(
 /// once and print its report. A configured (`[curator].notify_agent_id`) and
 /// non-dry-run invocation sends at most one `Tier::Short` digest through the
 /// curator's own notify funnel.
-fn run_stale_rulings(
+///
+/// #3587 U3 R1 — with `--store-url` the one-shot drives the SAME pass through
+/// the SAL trait the store-backed `--once` / `--daemon` sweep uses, so a
+/// postgres hive sees the same stale set on both surfaces.
+async fn run_stale_rulings(
     db_path: &Path,
     args: &CuratorArgs,
     app_config: &config::AppConfig,
@@ -494,13 +499,40 @@ fn run_stale_rulings(
         stale_ruling_days: app_config.resolve_stale_ruling_days(),
         notify_agent_id: app_config.resolve_curator_notify_agent_id(),
     };
+    #[cfg(feature = "sal")]
+    if curator_store_url(args).is_some() {
+        let store = crate::daemon_runtime::build_curator_store(
+            curator_store_url(args),
+            db_path,
+            app_config,
+        )
+        .await?;
+        let keypair = load_curator_keypair_best_effort();
+        let sender = keypair.as_ref().map_or_else(
+            || crate::identity::sentinels::AI_CURATOR.to_string(),
+            |k| k.agent_id.clone(),
+        );
+        let report =
+            curator::run_store_backed_stale_ruling_pass(store.as_ref(), &cfg, &sender).await;
+        return print_stale_ruling_report(&report, args, out);
+    }
     let conn = db::open(db_path)?;
     let keypair = load_curator_keypair_best_effort();
     let report = curator::run_stale_ruling_sweep(&conn, &cfg, keypair.as_ref())?;
+    print_stale_ruling_report(&report, args, out)
+}
+
+/// #3587 U3 — print a [`curator::CuratorReport`] as `--json` or human lines.
+/// Shared by the sqlite and store-backed `--stale-rulings` one-shots.
+fn print_stale_ruling_report(
+    report: &curator::CuratorReport,
+    args: &CuratorArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
     if args.json {
-        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(report)?)?;
     } else {
-        print_curator_report(&report, out)?;
+        print_curator_report(report, out)?;
     }
     Ok(())
 }
@@ -593,6 +625,14 @@ async fn run_store_backed_sweep(
             .await?;
 
     let keypair = load_curator_keypair_best_effort();
+    // #3587 U3 R1 — the store-backed stale-ruling pass stamps its digest with
+    // the curator's OWN resolved id (keypair agent id, else `ai:curator`),
+    // exactly like the sqlite funnel; `[curator].notify_agent_id` is only ever
+    // the recipient.
+    let sender = keypair.as_ref().map_or_else(
+        || crate::identity::sentinels::AI_CURATOR.to_string(),
+        |k| k.agent_id.clone(),
+    );
     let feature_tier = app_config.effective_tier(None);
     let llm = build_curator_llm(feature_tier, db_path);
 
@@ -626,10 +666,44 @@ async fn run_store_backed_sweep(
             args,
         )
         .await;
+        // #3587 U3 R1 — run the store-backed stale-ruling pass on every
+        // store-backed cycle: read-only w.r.t. the ruling rows and LLM-free,
+        // so a postgres hive detects and digests stale rulings the same way
+        // the sqlite `run_once` does.
+        let stale =
+            curator::run_store_backed_stale_ruling_pass(store.as_ref(), &curator_cfg, &sender)
+                .await;
+        log_store_backed_stale_rulings(&stale);
         if args.json {
-            writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+            // Additive keys on the reflection report; consumers that ignore
+            // them see the unchanged wire shape.
+            let mut value = serde_json::to_value(&report)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "stale_rulings_found".to_string(),
+                    serde_json::json!(stale.stale_rulings_found),
+                );
+                obj.insert(
+                    "stale_rulings_notified".to_string(),
+                    serde_json::json!(stale.stale_rulings_notified),
+                );
+                obj.insert(
+                    "stale_ruling_ids".to_string(),
+                    serde_json::json!(&stale.stale_ruling_ids),
+                );
+                obj.insert(
+                    "stale_ruling_ids_all".to_string(),
+                    serde_json::json!(&stale.stale_ruling_ids_all),
+                );
+                obj.insert(
+                    "stale_ruling_errors".to_string(),
+                    serde_json::json!(&stale.errors),
+                );
+            }
+            writeln!(out.stdout, "{}", serde_json::to_string_pretty(&value)?)?;
         } else {
             print_reflection_report(&report, out)?;
+            print_stale_ruling_summary(&stale, out)?;
         }
         return Ok(());
     }
@@ -676,6 +750,11 @@ async fn run_store_backed_sweep(
             args,
         )
         .await;
+        // #3587 U3 R1 — same pass on every daemon cycle.
+        let stale =
+            curator::run_store_backed_stale_ruling_pass(store.as_ref(), &curator_cfg, &sender)
+                .await;
+        log_store_backed_stale_rulings(&stale);
         tracing::info!(
             "curator SAL cycle: namespaces={} observations={} clusters_eligible={} \
              reflections_persisted={} depth_refusals={} errors={} (dry_run={})",
@@ -852,6 +931,49 @@ fn log_store_backed_consolidation(report: &curator::compaction::ConsolidationRun
         report.rolled_back,
         report.errors.len(),
     );
+}
+
+/// #3587 U3 R1 — emit a `tracing` line summarising a store-backed stale-ruling
+/// sweep. Quiet when there is nothing to say; every pass error is logged at
+/// WARN so a digest that never delivers is visible without reading the report.
+#[cfg(feature = "sal")]
+fn log_store_backed_stale_rulings(report: &curator::CuratorReport) {
+    if report.stale_rulings_found > 0 || report.stale_rulings_notified > 0 {
+        tracing::info!(
+            "curator SAL stale-ruling pass: found={} notified={} errors={}",
+            report.stale_rulings_found,
+            report.stale_rulings_notified,
+            report.errors.len(),
+        );
+    }
+    for e in &report.errors {
+        tracing::warn!("curator SAL stale-ruling pass: {e}");
+    }
+}
+
+/// #3587 U3 R1 — print the store-backed `--once` stale-ruling summary below the
+/// reflection report (human output). Quiet when the pass found nothing and
+/// reported no error.
+#[cfg(feature = "sal")]
+fn print_stale_ruling_summary(
+    report: &curator::CuratorReport,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    if report.stale_rulings_found == 0 && report.errors.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out.stdout,
+        "  stale_rulings:     {} found, digest_sent={}",
+        report.stale_rulings_found, report.stale_rulings_notified
+    )?;
+    for id in &report.stale_ruling_ids {
+        writeln!(out.stdout, "    - {id}")?;
+    }
+    for e in &report.errors {
+        writeln!(out.stdout, "    - {e}")?;
+    }
+    Ok(())
 }
 
 /// v0.7.0 #1548 — run the reflection pass over a SAL store with an
