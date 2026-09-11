@@ -373,6 +373,19 @@ pub async fn approval_decide(
     if let Err(msg) = crate::approvals::honourable_remember(body.remember) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     }
+    // #3587 propose mode — the hardened principal for a curator supersession
+    // proposal is the request's single X-Agent-Id (the #3587 ruling), read
+    // through the SAME header the approver id above comes from. An unusable
+    // header is "no hardened principal" (`None`), which refuses a proposal
+    // and changes nothing for any other pending row.
+    let supersede_principal =
+        crate::identity::supersession::SupersessionPrincipal::from_http_headers(&headers)
+            .ok()
+            .flatten();
+    let supersede_request = crate::storage::supersession::SupersessionRequest {
+        principal: supersede_principal.as_ref(),
+        as_admin: false,
+    };
 
     // #913 + #2634 / CB-24 — admin governance audit. Pre-fix, this
     // surface recorded the CALLER'S REQUESTED decision UNCONDITIONALLY
@@ -400,7 +413,7 @@ pub async fn approval_decide(
     // deny routes through `reject_with_approver_type` (#3448).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return approval_decide_postgres(&app, &id, &agent_id, &body).await;
+        return approval_decide_postgres(&app, &id, &agent_id, &body, supersede_request).await;
     }
 
     let lock = app.db.lock().await;
@@ -432,6 +445,20 @@ pub async fn approval_decide(
                 Ok(g) => g,
                 Err(resp) => return resp,
             };
+            // #3587 — a supersession proposal is refused BEFORE approval
+            // unless the hardened principal owns the old row.
+            match db::supersession_pending::gate_before_approve(
+                &lock.0,
+                &id,
+                &agent_id,
+                supersede_request,
+            ) {
+                Ok(db::supersession_pending::ProposalGate::Refused(reason)) => {
+                    return supersession_refused(&agent_id, &id, body.decision, reason);
+                }
+                Ok(_) => {}
+                Err(e) => return crate::handlers::errors::handler_error_500(&e),
+            }
             // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
             // Human-arm self-approval gate UNCONDITIONALLY regardless of backend
             // (multi-tenant; no process AI_MEMORY_AGENT_ID to key the opt-in on).
@@ -440,7 +467,8 @@ pub async fn approval_decide(
                 Ok(crate::db::ApproveOutcome::Approved) => {
                     // #2634 — record "allow" BEFORE the execute write below.
                     audit_decide_verdict(&agent_id, &id, body.decision, "allow");
-                    let executed = db::execute_pending_action(&lock.0, &id);
+                    let executed =
+                        db::supersession_pending::execute_with(&lock.0, &id, supersede_request);
                     match executed {
                         Ok(memory_id) => json!({
                             "approved": true,
@@ -567,6 +595,7 @@ async fn approval_decide_postgres(
     id: &str,
     agent_id: &str,
     body: &ApprovalRequestBody,
+    supersede_request: crate::storage::supersession::SupersessionRequest<'_>,
 ) -> axum::response::Response {
     let ctx = crate::store::CallerContext::for_agent(agent_id.to_string());
     // Snapshot the pending row before deciding so we can synthesise a
@@ -591,6 +620,18 @@ async fn approval_decide_postgres(
                     Ok(g) => g,
                     Err(resp) => return resp,
                 };
+            // #3587 — supersession proposal gate, BEFORE approval (pg twin).
+            match app
+                .store
+                .supersession_gate_before_approve(&ctx, id, agent_id, supersede_request)
+                .await
+            {
+                Ok(crate::storage::supersession_pending::ProposalGate::Refused(reason)) => {
+                    return supersession_refused(agent_id, id, body.decision, reason);
+                }
+                Ok(_) => {}
+                Err(e) => return store_err_to_response(e),
+            }
             match app
                 .store
                 .governance_approve_with_consensus(&ctx, id, agent_id)
@@ -599,7 +640,11 @@ async fn approval_decide_postgres(
                 Ok(crate::store::ApproveOutcome::Approved) => {
                     // #2634 — record "allow" BEFORE the execute write below.
                     audit_decide_verdict(agent_id, id, body.decision, "allow");
-                    match app.store.execute_pending_action(&ctx, id).await {
+                    match app
+                        .store
+                        .execute_pending_action_with(&ctx, id, supersede_request)
+                        .await
+                    {
                         Ok(memory_id) => json!({
                             "approved": true,
                             "id": id,
@@ -687,6 +732,23 @@ async fn approval_decide_postgres(
     };
     publish_decision_event(id, agent_id, body.decision, body.remember, pending_snapshot);
     Json(outcome).into_response()
+}
+
+/// #3587 propose mode — a refused supersession proposal approval: audited
+/// "refuse" and answered 403 exactly like a refused approver, with the pending
+/// row left untouched (it was never approved).
+fn supersession_refused(
+    agent_id: &str,
+    id: &str,
+    decision: crate::approvals::Decision,
+    reason: crate::identity::supersession::SupersessionRefusal,
+) -> axum::response::Response {
+    audit_decide_verdict(agent_id, id, decision, "refuse");
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
+    )
+        .into_response()
 }
 
 /// Shared post-decision fan-out for both storage-backend branches of

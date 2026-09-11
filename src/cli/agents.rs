@@ -847,6 +847,22 @@ pub fn run_pending(
                 }
             }
 
+            // #3587 propose mode — a curator supersession proposal is approved
+            // only by the owner's HARDENED principal (AI_MEMORY_AGENT_ID),
+            // checked BEFORE the row flips to approved (vote 4d3ea1c5).
+            let principal = db::supersession_pending::local_principal_for(snapshot.as_ref())?;
+            let request = db::supersession::SupersessionRequest {
+                principal: principal.as_ref(),
+                as_admin: false,
+            };
+            if let db::supersession_pending::ProposalGate::Refused(reason) =
+                db::supersession_pending::gate_before_approve(&conn, &id, &agent, request)?
+            {
+                return Err(anyhow::anyhow!(crate::errors::msg::approve_rejected(
+                    reason
+                )));
+            }
+
             // #1796 (5-agent vote 4d3ea1c5) — CLI is operator-as-actor (single
             // operator); keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in.
             match db::approve_with_approver_type(
@@ -856,7 +872,7 @@ pub fn run_pending(
                 db::ApproveSurface::LocalOperator,
             )? {
                 ApproveOutcome::Approved => {
-                    let executed = db::execute_pending_action(&conn, &id)?;
+                    let executed = db::supersession_pending::execute_with(&conn, &id, request)?;
                     if json_out {
                         writeln!(
                             out.stdout,

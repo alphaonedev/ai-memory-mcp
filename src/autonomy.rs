@@ -909,9 +909,8 @@ fn propose_supersession(conn: &Connection, entry: &RollbackEntry, report: &mut A
     else {
         return;
     };
-    let pair = db::get_any(conn, loser_id).and_then(|loser| {
-        Ok(loser.zip(db::get_any(conn, winner_id)?))
-    });
+    let pair =
+        db::get_any(conn, loser_id).and_then(|loser| Ok(loser.zip(db::get_any(conn, winner_id)?)));
     let proposal = match pair {
         Ok(Some((loser, winner))) => {
             crate::identity::supersession::SupersessionProposal::from_pair(&loser, &winner)
@@ -3413,5 +3412,131 @@ mod tests {
             5,
             "the halted cycle must leave the Pass-3 candidate untouched"
         );
+    }
+
+    // ---- #3587 U1 `[autonomy] supersede_on_contradiction` ----------------
+
+    /// A conserved same-author contradiction: the newer row carries the
+    /// confirmed marker and is strictly newer by `created_at`.
+    fn conserved_pair(conn: &Connection, owner_new: &str) -> Vec<Memory> {
+        let mut older = sample_mem(
+            "p-old",
+            "facts",
+            "claim v1",
+            "the build is green",
+            Tier::Long,
+        );
+        let then = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        older.created_at.clone_from(&then);
+        older.updated_at = then;
+        let mut newer = sample_mem("p-new", "facts", "claim v2", "the build is red", Tier::Long);
+        newer.metadata = serde_json::json!({
+            "agent_id": owner_new,
+            (field_names::CONFIRMED_CONTRADICTIONS): ["p-old"],
+        });
+        db::insert(conn, &older).unwrap();
+        db::insert(conn, &newer).unwrap();
+        vec![older, newer]
+    }
+
+    fn pass_with(
+        conn: &Connection,
+        candidates: &[Memory],
+        dry_run: bool,
+        mode: SupersedeOnContradiction,
+    ) -> AutonomyPassReport {
+        let llm = StubLlm::new("unused");
+        run_autonomy_passes_with(
+            conn,
+            &llm,
+            candidates,
+            AutonomyPassOptions {
+                dry_run,
+                skip_consolidation: true,
+                llm_op_budget: usize::MAX,
+                supersede_on_contradiction: mode,
+            },
+            None,
+        )
+    }
+
+    fn supersede_rows(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pending_actions WHERE action_type = ?1",
+            [crate::identity::supersession::PENDING_ACTION_SUPERSEDE],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Propose mode queues exactly ONE curator proposal for the conserved
+    /// pair; G7 still conserves (both rows live) and nothing is archived.
+    #[test]
+    fn propose_mode_queues_one_pending_supersession_3587() {
+        let (_tmp, conn) = setup_conn();
+        let candidates = conserved_pair(&conn, "ai:test");
+        let report = pass_with(&conn, &candidates, false, SupersedeOnContradiction::Propose);
+        assert_eq!(
+            report.supersessions_proposed, 1,
+            "errors={:?}",
+            report.errors
+        );
+        assert_eq!(supersede_rows(&conn), 1);
+        assert!(
+            db::get(&conn, "p-old").unwrap().is_some(),
+            "G7: loser stays live"
+        );
+        assert!(db::get(&conn, "p-new").unwrap().is_some());
+        // A second cycle is idempotent: the pair is already conserved.
+        let again = pass_with(&conn, &candidates, false, SupersedeOnContradiction::Propose);
+        assert_eq!(again.supersessions_proposed, 0);
+        assert_eq!(supersede_rows(&conn), 1);
+    }
+
+    /// Off (the default), dry-run and a cross-author pair queue nothing.
+    #[test]
+    fn off_dry_run_and_cross_author_queue_nothing_3587() {
+        let (_tmp, conn) = setup_conn();
+        let candidates = conserved_pair(&conn, "ai:test");
+        let off = pass_with(&conn, &candidates, false, SupersedeOnContradiction::Off);
+        assert_eq!(off.supersessions_proposed, 0);
+        assert_eq!(supersede_rows(&conn), 0);
+
+        let (_tmp2, conn2) = setup_conn();
+        let candidates2 = conserved_pair(&conn2, "ai:test");
+        let dry = pass_with(
+            &conn2,
+            &candidates2,
+            true,
+            SupersedeOnContradiction::Propose,
+        );
+        assert_eq!(dry.supersessions_proposed, 0);
+        assert_eq!(supersede_rows(&conn2), 0);
+
+        let (_tmp3, conn3) = setup_conn();
+        let candidates3 = conserved_pair(&conn3, "ai:someone-else");
+        let cross = pass_with(
+            &conn3,
+            &candidates3,
+            false,
+            SupersedeOnContradiction::Propose,
+        );
+        assert_eq!(cross.supersessions_proposed, 0, "errors={:?}", cross.errors);
+        assert_eq!(supersede_rows(&conn3), 0, "never propose across authors");
+    }
+
+    #[test]
+    fn supersede_mode_parse_is_strict_3587() {
+        assert_eq!(
+            SupersedeOnContradiction::parse(" Propose "),
+            Some(SupersedeOnContradiction::Propose)
+        );
+        assert_eq!(
+            SupersedeOnContradiction::parse("OFF"),
+            Some(SupersedeOnContradiction::Off)
+        );
+        for bad in ["true", "synchronous", "", "on", "1"] {
+            assert_eq!(SupersedeOnContradiction::parse(bad), None, "{bad}");
+        }
     }
 }

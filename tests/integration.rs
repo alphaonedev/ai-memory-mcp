@@ -13719,7 +13719,7 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
                 ..ai_memory::curator::CuratorConfig::default()
             },
             true, // archive_on_gc (#3345) — the curator daemon is the reaper
-            None,  // llm — keyword-only path, no LLM (#1440)
+            None, // llm — keyword-only path, no LLM (#1440)
             shutdown_for_daemon,
         )
         .await

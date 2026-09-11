@@ -12437,6 +12437,33 @@ legacy_scoring = false
     // daemon. The fix warns on every unknown top-level key while still
     // loading the config gracefully.
 
+    /// #3587 U1 — `[autonomy] supersede_on_contradiction` accepts only
+    /// `off` / `propose`; the cut boolean `true` or any other value cannot
+    /// break the parse of the whole file and resolves to `off` (fail closed).
+    #[test]
+    fn autonomy_supersede_on_contradiction_resolves_fail_closed_3587() {
+        use crate::autonomy::SupersedeOnContradiction as Mode;
+        let parse = |src: &str| -> AppConfig { toml::from_str(src).expect("config parses") };
+        assert_eq!(parse("").resolve_supersede_on_contradiction(), Mode::Off);
+        assert_eq!(
+            parse("[autonomy]\nsupersede_on_contradiction = \"propose\"\n")
+                .resolve_supersede_on_contradiction(),
+            Mode::Propose
+        );
+        assert_eq!(
+            parse("[autonomy]\nsupersede_on_contradiction = \"off\"\n")
+                .resolve_supersede_on_contradiction(),
+            Mode::Off
+        );
+        for bad in ["true", "\"synchronous\"", "1", "\"\""] {
+            let cfg = parse(&format!(
+                "tier = \"autonomous\"\n[autonomy]\nsupersede_on_contradiction = {bad}\n"
+            ));
+            assert_eq!(cfg.resolve_supersede_on_contradiction(), Mode::Off, "{bad}");
+            assert_eq!(cfg.tier.as_deref(), Some("autonomous"), "rest of file kept");
+        }
+    }
+
     /// Top-level key not in `AppConfig` is reported via `tracing::warn!`
     /// AND the config still loads with recognised fields intact.
     #[test]

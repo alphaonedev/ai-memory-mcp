@@ -9030,7 +9030,6 @@ pub async fn run_curator_daemon_with_primitives(
     llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
-
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_for_signal = shutdown_flag.clone();
     tokio::spawn(async move {

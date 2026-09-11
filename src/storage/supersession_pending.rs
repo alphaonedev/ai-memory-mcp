@@ -41,18 +41,41 @@ pub fn is_supersession(pa: &PendingAction) -> bool {
     pa.action_type == PENDING_ACTION_SUPERSEDE
 }
 
+/// The hardened principal a LOCAL (MCP / CLI) approve surface uses for `pa`:
+/// the operator-configured process identity for a supersession row, `None`
+/// for every other row (so an ordinary approval never depends on it).
+///
+/// # Errors
+/// A present but malformed `AI_MEMORY_AGENT_ID` fails closed.
+pub fn local_principal_for(
+    pa: Option<&PendingAction>,
+) -> Result<Option<crate::identity::supersession::SupersessionPrincipal>> {
+    if pa.is_some_and(is_supersession) {
+        crate::identity::supersession::SupersessionPrincipal::from_process_environment()
+    } else {
+        Ok(None)
+    }
+}
+
 /// Queue one proposal unless an identical one is still pending. Returns the
 /// new pending id, or `None` for the idempotent duplicate.
 ///
 /// # Errors
 /// Record-stop and SQL failures propagate.
-pub fn queue_proposal(conn: &Connection, proposal: &SupersessionProposal) -> Result<Option<String>> {
+pub fn queue_proposal(
+    conn: &Connection,
+    proposal: &SupersessionProposal,
+) -> Result<Option<String>> {
     super::record_stop::gate_storage_conn(conn)?;
     let duplicate: Option<String> = conn
         .query_row(
             "SELECT id FROM pending_actions WHERE action_type = ?1 AND status = 'pending' \
              AND memory_id = ?2 AND json_extract(payload, '$.new_id') = ?3 LIMIT 1",
-            params![PENDING_ACTION_SUPERSEDE, proposal.old_id(), proposal.new_id()],
+            params![
+                PENDING_ACTION_SUPERSEDE,
+                proposal.old_id(),
+                proposal.new_id()
+            ],
             |row| row.get(0),
         )
         .optional()?;

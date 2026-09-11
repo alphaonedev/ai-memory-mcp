@@ -640,6 +640,18 @@ pub(super) fn inbound_claim_is_write_attested(
     )
 }
 
+/// #3587 — shared WARN for a refused supersession row/decision on either
+/// federation governance lane (both backends).
+pub(super) fn warn_supersession_lane_refused(lane: &str, pending_id: &str) {
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        lane,
+        pending_id,
+        "sync_push: refusing a federated supersession proposal entry — proposals are \
+         node-local and execute only with a hardened local principal (#3587)"
+    );
+}
+
 /// #2720 F-12 (CWE-346) — bind the DECIDER of an inbound federated pending
 /// REJECT to the attested peer, never the self-asserted wire `decider`.
 ///
@@ -3492,6 +3504,16 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #3587 propose mode — a curator supersession proposal is NODE-LOCAL:
+        // approving it archives a row and requires a hardened LOCAL principal,
+        // so a peer can neither inject one nor replicate one. Refused
+        // regardless of the namespace gate, which the Standard opt-out
+        // disables (5-agent vote 4d3ea1c5).
+        if db::supersession_pending::is_supersession(pa) {
+            warn_supersession_lane_refused(crate::federation::receive_auth::LANE_PENDINGS, &pa.id);
+            skipped += 1;
+            continue;
+        }
         // #2529 (CWE-284) — `pendings[]` is the injection lane for UNDECIDED
         // governance rows. Decisions converge through `pending_decisions[]`.
         // Refuse wire rows that already claim a terminal status, so a peer
@@ -3629,6 +3651,19 @@ pub async fn sync_push(
         }
         if body.dry_run {
             noop += 1;
+            continue;
+        }
+        // #3587 — a decision on a local supersession proposal is refused
+        // before any approve/reject: proposals never leave the node.
+        if matches!(
+            db::get_pending_action(&lock.0, &dec.id),
+            Ok(Some(ref local)) if db::supersession_pending::is_supersession(local)
+        ) {
+            warn_supersession_lane_refused(
+                crate::federation::receive_auth::LANE_PENDING_DECISIONS,
+                &dec.id,
+            );
+            skipped += 1;
             continue;
         }
         // #1920 (CWE-862) — an APPROVAL is authority-granting (it triggers

@@ -477,6 +477,38 @@ failing `validate_agent_id` are logged at `warn` and dropped so a typo
 cannot lock the operator out. The role gate runs **after**
 `api_key_auth` — set `api_key` too for sensitive corpora.
 
+### `[autonomy]` — contradiction-driven supersession proposals (#3587 U1)
+
+```toml
+[autonomy]
+supersede_on_contradiction = "propose"   # "off" (default) | "propose"
+```
+
+**Config-file only — there is no env twin.** `off` (the default, and the
+value when the block is absent) keeps the v0.9.0 G7 behaviour: when the
+SQLite curator confirms a contradiction it CONSERVES both memories (one
+`contradicts` edge, a soft down-weight on the loser) and nothing else.
+`propose` additionally queues a PENDING `supersede` action
+(`action_type = "supersede"`, `requested_by = ai:curator`) when the
+conserved pair has **one author, one namespace, and a strictly newer
+winner**. The proposal archives nothing on its own: only an approval by
+the old memory's **hardened owner** — `AI_MEMORY_AGENT_ID` on MCP / CLI,
+the request's single `X-Agent-Id` on HTTP — replays it, through the same
+transaction as `ai-memory resolve` (the loser moves to
+`archived_memories` with `archive_reason = 'superseded'` and
+`superseded_by`, the winner gains `superseded_id`). Every approve surface
+checks that authority **before** it approves, so a refusal never leaves
+an approved-but-unexecuted row. In the single-operator trust-all default
+(no `AI_MEMORY_AGENT_ID`) no MCP / CLI principal exists and proposals
+cannot be approved — set `AI_MEMORY_AGENT_ID` (or use
+`ai-memory resolve --as-admin`). Proposals are node-local: peers refuse
+them on both `/sync/push` governance lanes and their decisions are never
+fanned out. The store-backed (PostgreSQL) curator performs no
+contradiction detection, so `propose` there only logs a WARN.
+Any other value — including `true`; synchronous supersession is not
+supported — WARNs and resolves to `off`; it cannot fail the parse of the
+rest of the file. Resolver: `AppConfig::resolve_supersede_on_contradiction`.
+
 ## Canonical resolver
 
 Every LLM / embedder / reranker / storage decision in the binary
@@ -963,7 +995,7 @@ bumped three QUAL-10 **test** ceilings so later swarm anti-drift units
 can land without fighting
 `tests/qual_10_module_size_ceiling.rs`. That commit added **no**
 `config.toml` keys, no `[qual]` / `[autonomy]` / extra `[curator]`
-fields, and no env knobs. Do not look for these numbers in this schema
+fields, and no env knobs (U1 later added `[autonomy]`, documented above). Do not look for these numbers in this schema
 file's TOML examples — they are lockstep rows in the QUAL-10 table:
 
 | Module | Ceiling after U5a |

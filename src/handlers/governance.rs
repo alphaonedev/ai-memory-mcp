@@ -248,6 +248,17 @@ pub async fn approve_pending(
             .ok()
             .and_then(|v| v.get("approvals").cloned())
             .unwrap_or(serde_json::Value::Null);
+    // #3587 propose mode — hardened principal for a curator supersession
+    // proposal: the request's single X-Agent-Id (the #3587 ruling). An
+    // unusable header is `None` (refuses a proposal, affects nothing else).
+    let supersede_principal =
+        crate::identity::supersession::SupersessionPrincipal::from_http_headers(&headers)
+            .ok()
+            .flatten();
+    let supersede_request = crate::storage::supersession::SupersessionRequest {
+        principal: supersede_principal.as_ref(),
+        as_admin: false,
+    };
 
     // #913 + #2634 / CB-24 — admin governance audit. Pre-fix a
     // `record_decision("allow")` fired UNCONDITIONALLY here, BEFORE the
@@ -297,6 +308,23 @@ pub async fn approve_pending(
             Ok(g) => g,
             Err(resp) => return resp,
         };
+        // #3587 — supersession proposal gate BEFORE approval (pg twin).
+        match app
+            .store
+            .supersession_gate_before_approve(&ctx, &id, &agent_id, supersede_request)
+            .await
+        {
+            Ok(crate::storage::supersession_pending::ProposalGate::Refused(reason)) => {
+                audit_pending_verdict(&agent_id, &id, "refuse");
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => return store_err_to_response(e),
+        }
         return match app
             .store
             .governance_approve_with_consensus(&ctx, &id, &agent_id)
@@ -321,16 +349,19 @@ pub async fn approve_pending(
                 // namespace where the cert oracle expects it. Mirrors
                 // sqlite's `db::execute_pending_action` for the
                 // `store` / `delete` / `promote` action types.
-                let executed_id: Option<String> =
-                    match app.store.execute_pending_action(&ctx, &id).await {
-                        Ok(eid) => eid,
-                        Err(e) => {
-                            tracing::warn!(
-                                "approve_pending: execute_pending_action failed for {id}: {e}"
-                            );
-                            None
-                        }
-                    };
+                let executed_id: Option<String> = match app
+                    .store
+                    .execute_pending_action_with(&ctx, &id, supersede_request)
+                    .await
+                {
+                    Ok(eid) => eid,
+                    Err(e) => {
+                        tracing::warn!(
+                            "approve_pending: execute_pending_action failed for {id}: {e}"
+                        );
+                        None
+                    }
+                };
                 Json(json!({
                     "approved": true,
                     "id": id,
@@ -400,11 +431,30 @@ pub async fn approve_pending(
     // self-approval reject + registered-approver requirement UNCONDITIONALLY
     // (it is multi-tenant via per-request X-Agent-Id and sets no process
     // AI_MEMORY_AGENT_ID, so the storage-layer env opt-in would never fire).
+    // #3587 — supersession proposal gate BEFORE approval; a proposal is also
+    // node-local (peers refuse it at the federation lanes), so its decision is
+    // never fanned out.
+    let is_supersession = pending_snapshot
+        .as_ref()
+        .is_some_and(db::supersession_pending::is_supersession);
+    match db::supersession_pending::gate_before_approve(&lock.0, &id, &agent_id, supersede_request)
+    {
+        Ok(db::supersession_pending::ProposalGate::Refused(reason)) => {
+            audit_pending_verdict(&agent_id, &id, "refuse");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return crate::handlers::errors::handler_error_500(&e),
+    }
     match db::approve_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
         Ok(ApproveOutcome::Approved) => {
             // #2634 — record "allow" BEFORE the execute write below.
             audit_pending_verdict(&agent_id, &id, "allow");
-            match db::execute_pending_action(&lock.0, &id) {
+            match db::supersession_pending::execute_with(&lock.0, &id, supersede_request) {
                 Ok(memory_id) => {
                     // v0.6.2 (S34): fan out the decision AND the resulting
                     // memory so approve on one node makes the governed write
@@ -414,7 +464,7 @@ pub async fn approve_pending(
                         .as_deref()
                         .and_then(|mid| db::get(&lock.0, mid).ok().flatten());
                     drop(lock);
-                    if let Some(fed) = app.federation.as_ref() {
+                    if !is_supersession && let Some(fed) = app.federation.as_ref() {
                         let decision = PendingDecision {
                             id: id.clone(),
                             approved: true,
@@ -617,11 +667,16 @@ pub async fn reject_pending(
     // this surface is multi-tenant via per-request X-Agent-Id and sets no
     // process AI_MEMORY_AGENT_ID, so the storage-layer env opt-in would never
     // fire here.
+    // #3587 — a supersession proposal is node-local: never fan its decision out.
+    let is_supersession = db::get_pending_action(&lock.0, &id)
+        .ok()
+        .flatten()
+        .is_some_and(|pa| db::supersession_pending::is_supersession(&pa));
     match db::reject_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
         Ok(db::RejectOutcome::Rejected) => {
             drop(lock);
             // v0.6.2 (S34): fan out the reject so peers converge.
-            if let Some(fed) = app.federation.as_ref() {
+            if !is_supersession && let Some(fed) = app.federation.as_ref() {
                 let decision = PendingDecision {
                     id: id.clone(),
                     approved: false,

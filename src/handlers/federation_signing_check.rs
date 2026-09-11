@@ -1352,6 +1352,15 @@ pub(super) async fn sync_push_via_store(
             noop += 1;
             continue;
         }
+        // #3587 — supersession proposals are node-local (sqlite twin).
+        if crate::storage::supersession_pending::is_supersession(pa) {
+            crate::handlers::federation_receive::warn_supersession_lane_refused(
+                crate::federation::receive_auth::LANE_PENDINGS,
+                &pa.id,
+            );
+            skipped += 1;
+            continue;
+        }
         if pa.status != crate::handlers::federation_receive::PENDING_STATUS_PENDING {
             tracing::warn!(
                 target: ATTESTATION_TRACE_TARGET,
@@ -1491,6 +1500,16 @@ pub(super) async fn sync_push_via_store(
                 continue;
             }
         };
+        // #3587 — a decision on a local supersession proposal is refused
+        // before any approve/reject (sqlite twin).
+        if crate::storage::supersession_pending::is_supersession(&pa) {
+            crate::handlers::federation_receive::warn_supersession_lane_refused(
+                crate::federation::receive_auth::LANE_PENDING_DECISIONS,
+                &dec.id,
+            );
+            skipped += 1;
+            continue;
+        }
         // Both arms pass the SAME base lane: the destructive
         // `pending_decisions (delete)` variant is selected INSIDE the shared
         // verdict, from the pending action's own effect, not from the wire.

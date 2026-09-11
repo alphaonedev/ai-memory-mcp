@@ -315,11 +315,12 @@ impl PostgresStore {
                     .transpose()
             }
         };
-        let new = fetch("memories", proposal.new_id())
-            .await?
-            .ok_or_else(|| StoreError::NotFound {
-                id: proposal.new_id().into(),
-            })?;
+        let new =
+            fetch("memories", proposal.new_id())
+                .await?
+                .ok_or_else(|| StoreError::NotFound {
+                    id: proposal.new_id().into(),
+                })?;
         if let Some(old) = fetch("memories", proposal.old_id()).await? {
             return Ok((old, new, false));
         }

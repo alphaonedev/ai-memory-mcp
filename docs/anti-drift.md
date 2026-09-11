@@ -123,6 +123,18 @@ store. This page documents that boundary. U6 PREP copy-and-substitute
 templates are [`docs/ops/watch-wiring.md`](ops/watch-wiring.html);
 activation stays with the Conductor.
 
+## Contradiction proposals (U1, `[autonomy]`)
+
+With `[autonomy] supersede_on_contradiction = "propose"` (config file
+only; default `off`), the SQLite curator turns a conserved same-author
+contradiction into a PENDING `supersede` approval request instead of
+leaving it only down-weighted. The old memory's hardened owner approves
+it with `memory_pending_approve` / `ai-memory pending approve` /
+`POST /api/v1/pending/{id}/approve` / `POST /api/v1/approvals/{pending_id}`; the approved replay archives the old
+memory exactly as `ai-memory resolve` would. Nothing is archived without
+that approval, and proposals never leave the node. Details:
+[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) §`[autonomy]`.
+
 ## QUAL-10 ceilings (U5a)
 
 U5a bumped three test-gate module-size ceilings so later anti-drift

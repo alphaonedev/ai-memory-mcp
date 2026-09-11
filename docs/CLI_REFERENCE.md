@@ -520,6 +520,14 @@ ai-memory pending approve pending-id
 ai-memory pending reject pending-id
 ```
 
+A `supersede` pending row is a curator supersession proposal
+(`[autonomy] supersede_on_contradiction = "propose"`, #3587). `pending
+approve` executes it only when `AI_MEMORY_AGENT_ID` is set, equals the
+approver (`--agent-id`, when given) and owns the older memory; otherwise it
+refuses before approving, and the row stays pending. The approved replay is
+the same archive `ai-memory resolve` performs. `pending reject` needs no
+special authority beyond the usual approver rules.
+
 `--agent-type` accepts: `human`, `system`, `ai:claude-opus-4.6`,
 `ai:claude-opus-4.7`, `ai:codex-5.4`, `ai:grok-4.2`, or any
 `ai:<name>` form (e.g., `ai:gpt-5`, `ai:gemini-2.5`).

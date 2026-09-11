@@ -489,6 +489,24 @@ pub fn handle_pending_approve(
         }
     }
 
+    // #3587 propose mode — a curator supersession proposal archives the old
+    // row, so it is approved only by the row owner's HARDENED principal (the
+    // operator-configured AI_MEMORY_AGENT_ID, never clientInfo/wire), checked
+    // BEFORE the row flips to approved (5-agent vote 4d3ea1c5).
+    let principal = db::supersession_pending::local_principal_for(signed_snapshot.as_ref())
+        .map_err(|e| e.to_string())?;
+    let request = db::supersession::SupersessionRequest {
+        principal: principal.as_ref(),
+        as_admin: false,
+    };
+    if let db::supersession_pending::ProposalGate::Refused(reason) =
+        db::supersession_pending::gate_before_approve(conn, id, &agent_id, request)
+            .map_err(|e| e.to_string())?
+    {
+        audit_pending_verdict(&agent_id, id, "refuse");
+        return Err(crate::errors::msg::approve_rejected(reason));
+    }
+
     // #1796 (5-agent vote 4d3ea1c5) — MCP/stdio is the single-operator surface;
     // keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in (an unconditional
     // reject-self would self-lock the lone operator approving their own action).
@@ -498,8 +516,10 @@ pub fn handle_pending_approve(
         ApproveOutcome::Approved => {
             // #2634 — record "allow" BEFORE the execute write below.
             audit_pending_verdict(&agent_id, id, "allow");
-            // Task 1.10: auto-execute the queued action on final approval.
-            let executed = db::execute_pending_action(conn, id).map_err(|e| e.to_string())?;
+            // Task 1.10: auto-execute the queued action on final approval
+            // (#3587: with the hardened principal for a supersession row).
+            let executed = db::supersession_pending::execute_with(conn, id, request)
+                .map_err(|e| e.to_string())?;
             record_mcp_decision(conn, id, &agent_id, "approve", remember);
             Ok(json!({
                 "approved": true,

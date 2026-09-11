@@ -31783,8 +31783,9 @@ impl MemoryStore for PostgresStore {
                 return Err(StoreError::PermissionDenied {
                     action: crate::store::EXECUTE_PENDING_ACTION.to_string(),
                     target: pending_id.to_string(),
-                    reason: crate::identity::supersession::SupersessionRefusal::UnauthenticatedPrincipal
-                        .to_string(),
+                    reason:
+                        crate::identity::supersession::SupersessionRefusal::UnauthenticatedPrincipal
+                            .to_string(),
                 });
             }
             other => {
