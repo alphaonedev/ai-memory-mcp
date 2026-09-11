@@ -65,6 +65,10 @@ authoritative for its topic; this page is just the map.
 - **[anti-drift.md](anti-drift.html)** — swarm line-file capture
   (`ai-memory watch --host file:<path>`): path safety, per-file dedup,
   untrusted `observed_actor`, `SWARM_LINE_TAGS`. [#3587](https://github.com/alphaonedev/ai-memory-mcp/issues/3587) U2.
+- **[ops/watch-wiring.md](ops/watch-wiring.html)** — U6 PREP systemd
+  user unit + launchd agent templates for `watch --daemon` on inbox and
+  outbox line files. Placeholders only; activation stays with the
+  Conductor. [#3587](https://github.com/alphaonedev/ai-memory-mcp/issues/3587).
 - **[wake-hub.md](wake-hub.html)** — the agent wake plane: the
   `agent_notified` bus, the `ai-memory wake-hub` switch, the bus sink
   between them, and the `ai-memory wake-listen` / `inbox --wait` client.

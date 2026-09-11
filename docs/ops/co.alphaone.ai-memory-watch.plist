@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  co.alphaone.ai-memory-watch.plist — macOS launchd agent template
+  (#3587 U6 PREP). Swarm line-file capture daemon for the macOS host (f1).
+
+  Copy-and-substitute artifact. XML-escaped angle-bracket tokens decode
+  to the same <placeholder> names as the systemd unit. Never commit real
+  host paths, principal ids, or store URLs into a tracked copy.
+  Activation (bootstrap) stays with the Conductor.
+
+  Substitute before install:
+    <binary>     absolute path to the ai-memory binary
+    <principal>  hardened agent id (same value as AI_MEMORY_AGENT_ID)
+    <db-path>    sqlite file this process opens
+    <inbox>      absolute regular file (inbox)
+    <outbox>     absolute regular file (outbox)
+    <home>       the launching user's home (logs only)
+    <store-url-file>  optional 0600 store-url file for a postgres hive
+                      (set AI_MEMORY_STORE_URL_FILE; never a DSN on argv)
+
+  Install (after substitution):
+    ~/Library/LaunchAgents/co.alphaone.ai-memory-watch.plist
+  Runbook: docs/ops/watch-wiring.md
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>co.alphaone.ai-memory-watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>&lt;binary&gt;</string>
+        <string>--agent-id</string>
+        <string>&lt;principal&gt;</string>
+        <string>--db</string>
+        <string>&lt;db-path&gt;</string>
+        <string>watch</string>
+        <string>--daemon</string>
+        <string>--host</string>
+        <string>file:&lt;inbox&gt;</string>
+        <string>--host</string>
+        <string>file:&lt;outbox&gt;</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AI_MEMORY_AGENT_ID</key>
+        <string>&lt;principal&gt;</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>&lt;home&gt;/Library/Logs/ai-memory-watch.out</string>
+    <key>StandardErrorPath</key>
+    <string>&lt;home&gt;/Library/Logs/ai-memory-watch.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>

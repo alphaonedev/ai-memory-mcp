@@ -9,7 +9,9 @@ layout: doc
 > the operator-facing contract for capturing swarm inbox/outbox
 > **line files** into ai-memory. It does **not** claim the later
 > units (store supersession, curator stale-ruling digest, capture-turn
-> hook, systemd/launchd watch wiring) have shipped.
+> hook) have shipped. U6 PREP templates live under
+> [`docs/ops/watch-wiring.md`](ops/watch-wiring.html); activation stays
+> with the Conductor.
 
 A multi-model swarm stays coherent only while every ruling and status
 line is captured as substrate truth. Host transcripts (`claude-code` /
@@ -117,8 +119,9 @@ not tag `ready`).
 Capture is per database. Conductor rulings on f2 and deputy lines on
 the f1 hive are **not** one corpus: a line captured here does not
 supersede a ruling over there. Supersession, when it lands, is per
-store. This page documents that boundary; it does not wire the
-daemons (that is unit U6).
+store. This page documents that boundary. U6 PREP copy-and-substitute
+templates are [`docs/ops/watch-wiring.md`](ops/watch-wiring.html);
+activation stays with the Conductor.
 
 ## QUAL-10 ceilings (U5a)
 
