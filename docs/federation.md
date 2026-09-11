@@ -82,7 +82,7 @@ catchup acceptance, by-id operations, pending decisions and namespace metadata.
 | Explicit peers configured; allowlist absent | Boot WARN; default namespace requirement refuses writes | Boot refused |
 | Invalid allowlist, even without peers | Boot WARN; inbound replication refused | Boot refused |
 | Valid empty allowlist `{}` | Boot accepted; inbound replication refused | Same |
-| Shared identity key enrollment present or unreadable | Boot WARN only | Boot WARN only |
+| Shared identity key enrollment present or unreadable, with no allowlist configured | Boot WARN only | Boot WARN only |
 | Valid, nonempty allowlist | Boot accepted; every operation still needs its peer scope and other checks | Same scope checks; hard floors enforced |
 | Allowlist absent; explicit `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` | Legacy namespace opt-out; configured peers still produce the WARN | Refused: the hard profile forbids this override |
 

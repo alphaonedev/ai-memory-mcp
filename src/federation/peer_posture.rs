@@ -106,7 +106,7 @@ pub fn evaluate(
         } else {
             Verdict::Warning
         }
-    } else if inbound_enrollment != Observation::Absent {
+    } else if peer_allowlist == Allowlist::Absent && inbound_enrollment != Observation::Absent {
         // Shared identity keys may belong entirely to local agents. Neither
         // their presence nor a read error establishes federation configuration.
         Verdict::Warning
@@ -387,7 +387,12 @@ mod tests {
                         Observation::Absent,
                         allowlist,
                     );
-                    assert_eq!(report.verdict, Verdict::Warning);
+                    let expected = if allowlist == Allowlist::Absent {
+                        Verdict::Warning
+                    } else {
+                        Verdict::Allowed
+                    };
+                    assert_eq!(report.verdict, expected);
                     assert!(enforce_report(&report).is_ok());
                 }
             }
