@@ -132,8 +132,9 @@ pub const ENV_PG_AT_REST_ATTESTED: &str = "AI_MEMORY_PG_AT_REST_ATTESTED";
 /// 20 → 21 (check #21: the SQLite `PRAGMA synchronous` durability posture —
 /// standard §0.1 / §5 make the attached `doctor --posture` output the
 /// `synchronous=FULL` attestation, and until this row nothing in the report
-/// NAMED the level or the durability class it buys).
-pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 21;
+/// NAMED the level or the durability class it buys). #3199 raised it
+/// 21 → 22 (check #22: backup manifests verify against the operator key).
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 22;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -790,6 +791,23 @@ pub fn evaluate_with_live(
     // rationale and the wording contract are documented there.
     out.push(synchronous::check_synchronous(live_synchronous));
 
+    // ---- 22. backup manifest signing (#3199) ------------------------
+    // `restore` verifies operator-signed manifests; `backup` is SQLite-only,
+    // so a postgres node has nothing to check.
+    let (backup_pass, backup_actual) = if backend_is_postgres {
+        (true, "N/A (postgres: `ai-memory backup` is SQLite-only)".to_string())
+    } else {
+        crate::cli::backup::signing_posture()
+    };
+    out.push(check(
+        "backup manifest signing",
+        "operator public key resolves AND any local operator signing key matches it",
+        backup_actual,
+        backup_pass,
+        "provision the operator public key (AI_MEMORY_OPERATOR_PUBKEY or operator.key.pub in \
+         the key directory); a local operator.key must be its private half",
+    ));
+
     debug_assert_eq!(
         out.len(),
         ENTERPRISE_FEDERATION_CHECK_COUNT,
@@ -1003,6 +1021,12 @@ mod tests {
                 approver_pubkey_b64_for_test(),
             );
         }
+        // #3199 check #21 — the operator public key restore verifies backups
+        // against, in the per-process test key sandbox (no env write).
+        let keys = crate::identity::keypair::default_key_dir().expect("sandbox key dir");
+        std::fs::create_dir_all(&keys).expect("create sandbox key dir");
+        std::fs::write(keys.join("operator.key.pub"), approver_pubkey_b64_for_test())
+            .expect("write operator.key.pub");
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED. Process-global `OnceLock`
         // install, isolated per env-isolated child
@@ -1744,6 +1768,26 @@ mod tests {
             "actual must name the keyless state: {:?}",
             c.actual
         );
+        assert!(!all_pass(&checks));
+    }
+
+    /// #3199 check #21 — no operator public key: restore could not verify a
+    /// signed backup, so the row FAILs.
+    #[test]
+    fn no_operator_pubkey_fails_backup_signing_check_21() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::no_operator_pubkey_fails_backup_signing_check_21",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe { clear_all() };
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, "backup manifest signing");
+        assert!(!c.pass && c.actual.contains("no operator public key"), "{c:?}");
         assert!(!all_pass(&checks));
     }
 

@@ -850,8 +850,11 @@ pub struct BackupArgs {
     /// missing.
     #[arg(long, default_value = "./backups")]
     pub to: PathBuf,
-    /// Retention: after writing a new snapshot, delete the oldest
-    /// snapshots so that at most this many remain. 0 disables rotation.
+    /// Retention: after writing a new snapshot, delete the oldest backups
+    /// so that at most this many remain. 0 disables rotation. Only backups
+    /// whose signed manifest verifies are counted, ordered by their SIGNED
+    /// creation time; a file that cannot be verified is never deleted
+    /// (#3604). A backup that is not durable rotates nothing (#3605).
     #[arg(long, default_value_t = 48)]
     pub keep: usize,
     /// Store URL this deployment serves, in the same grammar `serve` /
@@ -1223,17 +1226,71 @@ pub fn run_backup(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let signer = crate::identity::keypair::default_key_dir()
-        .and_then(|dir| crate::cli::rules::load_operator_signing_key_from_dir(&dir))
-        .map_err(|e| format!("{e:#}"));
     let policy = BackupPolicy {
         asi_hard: crate::security_profile::is_asi_hard(),
-        signer,
+        signer: local_signing_key(),
         anchor: crate::governance::rules_store::resolve_operator_pubkey(),
         sync_dir,
         remove_file: |path| std::fs::remove_file(path),
     };
     run_backup_with(db_path, args, json_out, out, &policy)
+}
+
+/// The operator signing key in this host's key directory, or why there is
+/// none usable.
+fn local_signing_key() -> std::result::Result<ed25519_dalek::SigningKey, String> {
+    crate::identity::keypair::default_key_dir()
+        .and_then(|dir| crate::cli::rules::load_operator_signing_key_from_dir(&dir))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// v1.0.0 #3199 — the backup-signing row of `doctor --posture
+/// enterprise-federation` for a SQLite node: `(pass, observed state)`.
+///
+/// PASS when the operator public key `restore` verifies against resolves and
+/// any local operator signing key is its private half. A node that only
+/// restores never needs the private key, so its absence passes; a key that
+/// does not match would sign backups this node's `restore` refuses.
+#[must_use]
+pub fn signing_posture() -> (bool, String) {
+    signing_posture_of(
+        crate::governance::rules_store::resolve_operator_pubkey().as_ref(),
+        local_signing_key().as_ref(),
+    )
+}
+
+fn signing_posture_of(
+    anchor: Option<&ed25519_dalek::VerifyingKey>,
+    signer: std::result::Result<&ed25519_dalek::SigningKey, &String>,
+) -> (bool, String) {
+    let Some(anchor) = anchor else {
+        return (
+            false,
+            "no operator public key resolves, so restore cannot verify a signed backup".into(),
+        );
+    };
+    let anchor_fp = manifest::fingerprint(anchor);
+    match signer {
+        Ok(key) if key.verifying_key() == *anchor => (
+            true,
+            format!("operator public key {anchor_fp}; the local signing key matches it"),
+        ),
+        Ok(key) => (
+            false,
+            format!(
+                "operator public key {anchor_fp}; the local signing key {} does NOT match it, \
+                 so backups taken here would be refused by restore",
+                manifest::fingerprint(&key.verifying_key())
+            ),
+        ),
+        Err(_) => (
+            true,
+            format!(
+                "operator public key {anchor_fp}; no usable local signing key (this node \
+                 restores signed backups but cannot take them)"
+            ),
+        ),
+    }
 }
 
 /// v1.0.0 #3199 — the key `backup` signs with.

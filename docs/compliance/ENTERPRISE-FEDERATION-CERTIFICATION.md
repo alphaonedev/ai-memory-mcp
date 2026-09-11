@@ -551,7 +551,7 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:739`) returns **0 iff all 21 checks pass, else 2** (20 at the certified tip; #3553 appended check #21, the `PRAGMA synchronous` durability posture)
+(`src/cli/doctor.rs:739`) returns **0 iff all 22 checks pass, else 2** (20 at the certified tip; #3553 appended check #21, the `PRAGMA synchronous` durability posture, and #3199 check #22, backup manifest signing)
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
 boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
 landed check #19 append-only-audit-spine-armed** — append-only spine ON
@@ -559,7 +559,11 @@ AND the daemon audit signing key armed, so a federation newer-wins
 supersede leaf is SIGNED, not unsigned theater — then **19 → 20 when #2991
 landed check #20 R40-escalate-producer-armable** — approver keys enrolled so
 the wired L1-6 escalate producer routes to a SATISFIABLE signed-approval gate
-rather than parking a forever-un-approvable pending). The four-leg capture
+rather than parking a forever-un-approvable pending — then **20 → 21 when
+#3199 landed check #21 backup-manifest-signing**: the operator public key
+`restore` verifies backup manifests against resolves, and any local operator
+signing key matches it; `N/A` PASS on a postgres backend, where `ai-memory
+backup` is SQLite-only). The four-leg capture
 below was taken 2026-08-13 on the release-built binary at the
 post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
 #2929); raw output in `docs/compliance/evidence/cert-54/` (see that
@@ -574,6 +578,12 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > remain the removal-proof evidence of record; they are **not** the
 > posture-leg evidence of record after this recapture. Bind stays
 > `e22bc93c` (this recapture does not re-mint).
+>
+> **Evidence note (#3199, 2026-09-11):** the `cert-55/` captures and the
+> table below are **dated history at 20 checks**; they predate check #21
+> and are not re-measured here. On a bare host with no operator public key,
+> check #21 is an eleventh `[FAIL]` row. A 21-check recapture is required
+> before these legs are the evidence of record again.
 
 | Environment | Exit | Result |
 |---|---|---|

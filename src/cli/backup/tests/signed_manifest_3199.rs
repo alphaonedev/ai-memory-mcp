@@ -729,3 +729,23 @@ fn rotation_reports_a_removal_it_could_not_make_3604() {
     assert!(january.exists(), "the file it could not remove is still there");
     assert!(env.stderr_str().contains("could not remove"), "{}", env.stderr_str());
 }
+
+/// The `doctor --posture` check #21 predicate: the anchor must resolve, and a
+/// local signing key must be its private half. A node with no usable key
+/// passes (it restores signed backups; it does not need to take them).
+#[test]
+fn backup_signing_posture_row_3199() {
+    let operator = test_operator_key();
+    let anchor = operator.verifying_key();
+    let foreign = foreign_key();
+    let missing = "governance.no_operator_key: none".to_string();
+
+    let (pass, actual) = signing_posture_of(None, Ok(&operator));
+    assert!(!pass && actual.contains("no operator public key"), "{actual}");
+    let (pass, actual) = signing_posture_of(Some(&anchor), Ok(&operator));
+    assert!(pass && actual.contains("matches"), "{actual}");
+    let (pass, actual) = signing_posture_of(Some(&anchor), Ok(&foreign));
+    assert!(!pass && actual.contains("does NOT match"), "{actual}");
+    let (pass, actual) = signing_posture_of(Some(&anchor), Err(&missing));
+    assert!(pass && actual.contains("no usable local signing key"), "{actual}");
+}
