@@ -904,6 +904,11 @@ never silently ignored:
 | only `~/Library/Application Support/ai-memory/config.toml` exists | It is HONOURED (a config is never dropped) with a one-shot WARN asking you to move it to `~/.config`. |
 | neither exists | `~/.config/ai-memory/config.toml` — new installs and `write_default_if_missing` land here. |
 
+With a truthy `AI_MEMORY_NO_CONFIG` no config file is read, so none of the
+config-path WARNs in either table (legacy `~/.config`, shadowed Library file,
+Library-only file) is printed [#3603]. The path resolution itself is
+unchanged.
+
 > **macOS upgrade note (#3329).** Before this fix the macOS binary preferred the
 > `~/Library/Application Support` path, so an operator who followed the docs and
 > wrote `~/.config/ai-memory/config.toml` had it silently ignored whenever a
