@@ -201,9 +201,11 @@ pub struct TargetArgs {
     pub force: bool,
 }
 
-/// Harness-side hook variant selectable via `--hook <kind>`. Today
-/// only `Pretool` is wired; future variants (e.g. `PostToolUse`,
-/// `Stop`) plug into the same dispatch shape.
+/// Harness-side hook variant selectable via `--hook <kind>`.
+/// `Pretool` is the Claude Code policy-engine gate; `Capture` is the
+/// v1.0.0 #3587 U4 Claude Code `Stop` hook that volunteers each
+/// finished assistant turn to `ai-memory capture-turn` (the L4
+/// layered-capture plane).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookKind {
     /// Claude Code's `PreToolUse` hook. Routes every Bash / Edit /
@@ -211,6 +213,11 @@ pub enum HookKind {
     /// substrate-rules engine can refuse or warn before the action
     /// dispatches.
     Pretool,
+    /// Claude Code's `Stop` hook. Pipes the `Stop` payload (which
+    /// carries `last_assistant_message` on stdin) into
+    /// `ai-memory capture-turn --quiet`, capturing each finished
+    /// assistant turn at the protocol layer.
+    Capture,
 }
 
 /// Concrete target enum used internally. `TargetCmd` carries clap
@@ -289,19 +296,52 @@ impl TargetCmd {
 /// resolved config path can't be determined (and `--config` was not
 /// passed), or when an `--apply` write fails (permission denied,
 /// disk full, etc.).
-pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
+pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'_>) -> Result<()> {
     let target = args.target.target();
     let t_args = args.target.args();
 
-    // --hook is meaningful for claude-code only today; reject loudly on
-    // other targets so operators don't silently lose the flag.
-    if t_args.hook.is_some() && target != Target::ClaudeCode {
+    // --hook is meaningful for claude-code only; reject loudly on other
+    // targets so operators don't silently lose the flag.
+    if let Some(kind) = t_args.hook
+        && target != Target::ClaudeCode
+    {
+        // v1.0.0 #3587 U4 / operator ruling — verified Codex leg. The
+        // current Codex CLI (0.153.3, 2026-09; docs
+        // https://learn.chatgpt.com/docs/hooks) DOES deliver the finished
+        // turn text on stdin via its `Stop` event
+        // (`codex-rs/hooks/src/events/stop.rs::StopRequest.last_assistant_message`),
+        // BUT every non-managed command hook is trust-gated: discovery
+        // registers a handler only when `trust_status` is Managed/Trusted,
+        // and an installer-written user hook is `HookTrustStatus::Untrusted`
+        // unless the operator trusts it in `/hooks` or launches Codex with
+        // `--dangerously-bypass-hook-trust`. Writing that hook would install
+        // a dead entry (and pointing the operator at a "DANGEROUS" bypass
+        // flag is not an acceptable installer default), so Codex turns are
+        // captured through the already-shipped, trust-free transcript
+        // source over Codex's session log instead.
+        if kind == HookKind::Capture && target == Target::Codex {
+            bail!(
+                "--hook capture is not supported for `codex`: Codex trust-gates user command \
+                 hooks (an installer-written hook stays untrusted and never runs), so capture \
+                 Codex turns from its session log with the documented transcript source: \
+                 `ai-memory watch --host codex`."
+            );
+        }
         bail!(
             "--hook {kind:?} is only supported for `claude-code` today; \
              other harnesses do not expose a PreToolUse-equivalent hook surface.",
-            kind = t_args.hook.unwrap(),
+            kind = kind,
         );
     }
+
+    // A capture hook embeds the resolved agent id in the generated
+    // command (the hook process inherits no shell environment).
+    let hook_agent_id = match t_args.hook {
+        Some(HookKind::Capture) => Some(
+            crate::identity::resolve_agent_id(cli_agent_id, None).map_err(|e| anyhow!("{e}"))?,
+        ),
+        _ => None,
+    };
 
     let config_path = resolve_config_path(target, t_args)?;
     let binary = resolve_binary(t_args.binary.as_deref());
@@ -328,6 +368,7 @@ pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
                 hook_kind,
                 before_value.clone(),
                 &binary,
+                hook_agent_id.as_deref().unwrap_or(""),
                 t_args.force,
                 out,
             )?
@@ -458,6 +499,13 @@ pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
                 writeln!(
                     out.stdout,
                     "installed PreToolUse hook -> {}",
+                    config_path.display(),
+                )?;
+            }
+            HookKind::Capture => {
+                writeln!(
+                    out.stdout,
+                    "installed Stop capture hook -> {}",
                     config_path.display(),
                 )?;
             }
@@ -1234,14 +1282,108 @@ fn remove_claude_code_pretool(obj: &mut Map<String, Value>) {
     }
 }
 
-/// Apply the requested hook variant. Today only `--hook pretool` for
-/// claude-code is wired; the dispatch is split out so future hook
-/// kinds (PostToolUse, Stop) plug in without touching `run`.
+// --- Claude Code Stop capture hook (v1.0.0 #3587 U4) ----------------------
+
+/// `ai-memory` subcommand the Stop hook shells into.
+const CAPTURE_HOOK_SUBCOMMAND: &str = "capture-turn";
+
+/// Claude Code `Stop` event key, single-sourced from the CLI mapper so
+/// the installer and the payload reader cannot drift.
+const HOOK_EVENT_STOP: &str = crate::cli::commands::capture_turn::HOOK_EVENT_STOP;
+
+/// Shell command stored in claude-code's `Stop` `type:command` hook.
+///
+/// Reads the Stop payload off stdin (which carries
+/// `last_assistant_message`), maps it in `ai-memory capture-turn`, and
+/// exits 0 on every path (`--quiet`) so the hook can never block the
+/// operator's turn. `--agent-id` is embedded explicitly because the
+/// spawned hook process does not inherit the installing shell's
+/// environment.
+fn claude_code_capture_command(binary: &str, agent_id: &str) -> String {
+    format!(
+        "{binary} {CAPTURE_HOOK_SUBCOMMAND} --host-kind {AGENT_TARGET_CLAUDE_CODE} \
+         --quiet --agent-id {agent_id}"
+    )
+}
+
+/// Build the `Stop` entry the installer writes. `async: true` keeps the
+/// capture off the host's critical path (audit-3587 F11): the hook must
+/// never stall the turn, and a capture error is a stderr line + exit 0.
+fn claude_code_capture_entry(binary: &str, agent_id: &str) -> Value {
+    serde_json::json!({
+        MARKER_START_KEY: MARKER_PAYLOAD,
+        MANAGED_KEYS_PROPERTY: ["hooks"],
+        "hooks": [
+            {
+                "type": "command",
+                "command": claude_code_capture_command(binary, agent_id),
+                "async": true,
+            }
+        ],
+        MARKER_END_KEY: MARKER_PAYLOAD,
+    })
+}
+
+/// Apply the Claude Code `Stop` capture managed block. APPENDS to an
+/// existing `hooks.Stop` array so operator-authored Stop hooks survive;
+/// an idempotent re-run replaces only our own managed entry.
+fn apply_claude_code_capture(
+    obj: &mut Map<String, Value>,
+    binary: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let entry = claude_code_capture_entry(binary, agent_id);
+
+    let hooks = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let hooks_obj = hooks.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
+    let stop = hooks_obj
+        .entry(HOOK_EVENT_STOP.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !stop.is_array() {
+        *stop = Value::Array(Vec::new());
+    }
+    let arr = stop.as_array_mut().expect(EXPECT_JUST_INSERTED_ARRAY);
+
+    arr.retain(|v| !is_managed_value(v));
+    arr.push(entry);
+    Ok(())
+}
+
+/// Remove the Claude Code `Stop` capture managed block (the inverse of
+/// [`apply_claude_code_capture`]). Idempotent on a clean config and
+/// NEVER touches operator-authored Stop entries.
+fn remove_claude_code_capture(obj: &mut Map<String, Value>) {
+    if let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut())
+        && let Some(arr) = hooks
+            .get_mut(HOOK_EVENT_STOP)
+            .and_then(|s| s.as_array_mut())
+    {
+        arr.retain(|v| !is_managed_value(v));
+        if arr.is_empty() {
+            hooks.remove(HOOK_EVENT_STOP);
+        }
+    }
+    if let Some(hooks) = obj.get("hooks").and_then(|h| h.as_object())
+        && hooks.is_empty()
+    {
+        obj.remove("hooks");
+    }
+}
+
+/// Apply the requested hook variant. `--hook pretool` and
+/// `--hook capture` for claude-code are wired; unsupported
+/// (target, kind) pairs are rejected upstream in `run`.
 fn apply_hook_block(
     target: Target,
     kind: HookKind,
     mut cfg: Value,
     binary: &str,
+    agent_id: &str,
     force: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<Value> {
@@ -1249,6 +1391,9 @@ fn apply_hook_block(
     match (target, kind) {
         (Target::ClaudeCode, HookKind::Pretool) => {
             apply_claude_code_pretool(obj, binary, force, out)?;
+        }
+        (Target::ClaudeCode, HookKind::Capture) => {
+            apply_claude_code_capture(obj, binary, agent_id)?;
         }
         // Other (target, kind) pairs are rejected upstream in `run` so
         // this match is exhaustive in practice. Keep the explicit
@@ -1272,6 +1417,9 @@ fn remove_hook_block(target: Target, kind: HookKind, mut cfg: Value) -> Result<V
     match (target, kind) {
         (Target::ClaudeCode, HookKind::Pretool) => {
             remove_claude_code_pretool(obj);
+        }
+        (Target::ClaudeCode, HookKind::Capture) => {
+            remove_claude_code_capture(obj);
         }
         _ => {
             // Same rationale as `apply_hook_block` — surface internal
@@ -1496,6 +1644,15 @@ mod tests {
     use super::*;
     use crate::cli::test_utils::TestEnv;
     use std::fs;
+
+    /// #3587 U4 — the shipped `run` gained a `cli_agent_id` argument (the
+    /// capture hook embeds `--agent-id`). The in-file tests exercise
+    /// non-agent surfaces, so they call through this 2-arg shim; a LOCAL
+    /// `run` shadows the `use super::*` glob, leaving every existing call
+    /// site unchanged (and `run`'s shipped 3-arg arity intact).
+    fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
+        super::run(args, None, out)
+    }
 
     fn args_for(target: Target, config: PathBuf) -> InstallArgs {
         let t = TargetArgs {

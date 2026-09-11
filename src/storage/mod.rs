@@ -2506,6 +2506,22 @@ fn tx_commit_failed(err: impl std::fmt::Display) -> String {
     format!("TX_COMMIT_FAILED: {err}")
 }
 
+/// v1.0.0 #3587 U4 — the `<CODE>: <source>` shape shared by the L4 capture
+/// and L2 recovery idempotent writers. The code strings are `const`s below
+/// and the separator lives here ONCE (pm-v3.1 hardcoded-literal gate: no
+/// `"<CODE>: {e}"` literal repeats across the three write funnels).
+fn idempotent_err(code: &str, err: impl std::fmt::Display) -> String {
+    format!("{code}: {err}")
+}
+
+/// String-stable idempotent-writer error codes (see the `# Errors` section
+/// of [`capture_turn_idempotent`]).
+const ERR_TX_BEGIN: &str = "TX_BEGIN_FAILED";
+const ERR_DEDUP_QUERY: &str = "DEDUP_QUERY_FAILED";
+const ERR_MEMORY_INSERT: &str = "MEMORY_INSERT_FAILED";
+const ERR_DEDUP_INSERT: &str = "DEDUP_INSERT_FAILED";
+const ERR_DEDUP_BUILD: &str = "DEDUP_BUILD_FAILED";
+
 /// v0.7.0 #1416 / RFC-0001 — sqlite SSOT for the L4 layered-capture
 /// idempotent write. Both the MCP `memory_capture_turn` handler (which
 /// holds a raw `&rusqlite::Connection`) and `SqliteStore::
@@ -2564,7 +2580,7 @@ pub fn capture_turn_idempotent(
             )
             .optional()
         })
-        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
 
     if let Some(memory_id) = existing {
         return Ok(crate::models::CaptureTurnResult {
@@ -2574,7 +2590,7 @@ pub fn capture_turn_idempotent(
     }
 
     let write_txn =
-        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+        connection::WriteTxn::begin(conn).map_err(|e| idempotent_err(ERR_TX_BEGIN, e))?;
 
     // #3231 — in-tx re-probe. BEGIN IMMEDIATE serializes writers, so a
     // racing first-capture that committed while we waited is now visible.
@@ -2595,7 +2611,7 @@ pub fn capture_turn_idempotent(
             )
             .optional()
         })
-        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
     if let Some(memory_id) = existing_in_tx {
         write_txn.commit().map_err(tx_commit_failed)?;
         return Ok(crate::models::CaptureTurnResult {
@@ -2617,7 +2633,7 @@ pub fn capture_turn_idempotent(
             stamp_substrate_why_trace(&mut captured.metadata);
         }
         let inserted_id =
-            insert(conn, &captured).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &captured).map_err(|e| idempotent_err(ERR_MEMORY_INSERT, e))?;
 
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
@@ -2635,7 +2651,153 @@ pub fn capture_turn_idempotent(
                 write.recovered_at_ms,
             ])
         })
-        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
+
+        crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
+            .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
+
+        Ok(inserted_id)
+    })();
+
+    match tx_result {
+        Ok(memory_id) => {
+            write_txn.commit().map_err(tx_commit_failed)?;
+            Ok(crate::models::CaptureTurnResult {
+                memory_id,
+                dedup_hit: false,
+            })
+        }
+        Err(e) => {
+            write_txn.rollback();
+            Err(e)
+        }
+    }
+}
+
+/// v1.0.0 #3587 U4 — auto-index L4 capture for the CLI `capture-turn`
+/// twin and the Claude Code `Stop` hook.
+///
+/// The Claude Code `Stop` payload carries `last_assistant_message` but
+/// no turn index (audit-3587 F8), so the CLI passes
+/// `--host-turn-index auto`. This entry point derives the next index
+/// for `host_session_id` INSIDE the same `BEGIN IMMEDIATE` transaction
+/// that writes the rows, so two Stop hooks racing on one session get
+/// distinct indices instead of one turn being swallowed by a
+/// same-index dedup hit.
+///
+/// Two in-transaction dedup guards:
+/// 1. **content guard** — the session's LATEST stored turn
+///    (`ORDER BY host_turn_index DESC LIMIT 1`) is compared against the
+///    incoming content in its STORAGE form: a host re-delivery of the
+///    same turn is a `dedup_hit` iff the stored `memories.content`
+///    equals the raw incoming text OR its redacted twin
+///    ([`crate::secret_screen::redact_for_storage`], which `insert`
+///    applies under `AI_MEMORY_SECRET_SCREEN_MODE=redact`). Comparing
+///    only the raw text would never match a redacted turn, and scanning
+///    every historical row (rather than just the latest) would swallow a
+///    legitimate A,B,A turn sequence as two memories;
+/// 2. the derived index is `MAX(host_turn_index) + 1` for the session,
+///    so it cannot collide with an existing row.
+///
+/// `build` receives the derived index and returns the fully-prepared
+/// write (signature verification + canonical hashing already done by
+/// the caller), keeping the verification single-sourced in
+/// `prepare_capture_turn`.
+///
+/// # Errors
+///
+/// Same string-stable codes as [`capture_turn_idempotent`], plus
+/// `DEDUP_BUILD_FAILED` when `build` refuses.
+pub fn capture_turn_idempotent_auto<F>(
+    conn: &Connection,
+    host_session_id: &str,
+    content: &str,
+    substrate_authored: bool,
+    build: F,
+) -> std::result::Result<crate::models::CaptureTurnResult, String>
+where
+    F: FnOnce(i64) -> std::result::Result<crate::models::CaptureTurnWrite, String>,
+{
+    use rusqlite::OptionalExtension;
+
+    let write_txn =
+        connection::WriteTxn::begin(conn).map_err(|e| idempotent_err(ERR_TX_BEGIN, e))?;
+
+    // Guard 1 — the session's LATEST turn (MAX host_turn_index) is the
+    // one a host re-delivery repeats. Compare its STORED content against
+    // the incoming text both raw and in the storage form `insert` applies
+    // (`redact_memory_for_storage` ⇒ `redact_for_storage` under any
+    // non-`Off` screen mode): a redacted turn never equals its raw input,
+    // so a raw-only compare would re-capture it on every re-delivery.
+    // Limiting to the latest row (not every historical row) keeps a
+    // legitimate A,B,A sequence as three distinct turns.
+    let latest: Option<(String, String)> = conn
+        .prepare_cached(
+            "SELECT d.memory_id, m.content FROM transcript_line_dedup d \
+             JOIN memories m ON m.id = d.memory_id \
+             WHERE d.host_session_id IS NOT NULL \
+               AND d.host_session_id = ?1 \
+             ORDER BY d.host_turn_index DESC \
+             LIMIT 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(params![host_session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+        })
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
+    if let Some((memory_id, stored)) = latest {
+        // `stored == raw || stored == redacted(raw)`: the raw compare runs
+        // first so a clean re-delivery never pays for the screen pass.
+        let matches = stored == content
+            || crate::secret_screen::redact_for_storage(content)
+                .is_some_and(|redacted| redacted == stored);
+        if matches {
+            write_txn.commit().map_err(tx_commit_failed)?;
+            return Ok(crate::models::CaptureTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
+    }
+
+    // Guard 2 — derive the next per-session index in-tx (race-free).
+    let next_index: i64 = conn
+        .prepare_cached(
+            "SELECT COALESCE(MAX(host_turn_index), -1) + 1 FROM transcript_line_dedup \
+             WHERE host_session_id IS NOT NULL AND host_session_id = ?1",
+        )
+        .and_then(|mut stmt| stmt.query_row(params![host_session_id], |row| row.get(0)))
+        .map_err(|e| idempotent_err(ERR_DEDUP_QUERY, e))?;
+
+    let write = build(next_index).map_err(|e| idempotent_err(ERR_DEDUP_BUILD, e))?;
+
+    let tx_result = (|| -> std::result::Result<String, String> {
+        let mut captured = write.memory.clone();
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut captured.metadata);
+        }
+        let inserted_id =
+            insert(conn, &captured).map_err(|e| idempotent_err(ERR_MEMORY_INSERT, e))?;
+
+        conn.prepare_cached(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                write.sha256,
+                inserted_id,
+                write.host_kind,
+                write.host_session_id,
+                write.host_turn_index,
+                write.recovered_at_ms,
+            ])
+        })
+        .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
 
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
@@ -2732,7 +2894,7 @@ pub fn recover_turn_idempotent(
     }
 
     let write_txn =
-        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+        connection::WriteTxn::begin(conn).map_err(|e| idempotent_err(ERR_TX_BEGIN, e))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — stamp the
@@ -2743,7 +2905,7 @@ pub fn recover_turn_idempotent(
             stamp_substrate_why_trace(&mut recovered.metadata);
         }
         let inserted_id =
-            insert(conn, &recovered).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &recovered).map_err(|e| idempotent_err(ERR_MEMORY_INSERT, e))?;
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
              (sha256, memory_id, host_kind, transcript_path, \
@@ -2761,7 +2923,7 @@ pub fn recover_turn_idempotent(
                 write.recovered_at_ms,
             ])
         })
-        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+        .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
         Ok(inserted_id)
     })();
 

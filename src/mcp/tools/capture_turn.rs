@@ -311,9 +311,42 @@ pub fn handle_capture_turn(
     params: &Value,
     caller_agent_id: Option<&str>,
 ) -> Result<Value, String> {
+    // #3587 U4 — the shared implementation is `anyhow`-typed so the new
+    // auto-index surface adds NO legacy String-typed handler signature
+    // (QUAL-6 ratchet: new handlers must use `anyhow`/`MemoryError`). The
+    // legacy MCP envelope keeps its `String` error via `Display`.
+    handle_capture_turn_inner(conn, params, caller_agent_id, false).map_err(|e| e.to_string())
+}
+
+/// v1.0.0 #3587 U4 — auto-index twin of [`handle_capture_turn`] for the
+/// `ai-memory capture-turn` CLI surface when the host Stop payload
+/// carries no turn index.
+///
+/// Identical gates and envelope; the only difference is that the
+/// per-session `host_turn_index` is derived inside the write
+/// transaction (`crate::storage::capture_turn_idempotent_auto`) so two
+/// concurrent Stop hooks on one session cannot collide.
+///
+/// # Errors
+///
+/// Same contract as [`handle_capture_turn`].
+pub fn handle_capture_turn_auto(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller_agent_id: Option<&str>,
+) -> anyhow::Result<Value> {
+    handle_capture_turn_inner(conn, params, caller_agent_id, true)
+}
+
+fn handle_capture_turn_inner(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller_agent_id: Option<&str>,
+    auto_index: bool,
+) -> anyhow::Result<Value> {
     let start = Instant::now();
-    let req: MemoryCaptureTurnRequest =
-        serde_json::from_value(params.clone()).map_err(|e| format!("INVALID_INPUT: {e}"))?;
+    let req: MemoryCaptureTurnRequest = serde_json::from_value(params.clone())
+        .map_err(|e| anyhow::anyhow!("INVALID_INPUT: {e}"))?;
 
     // v0.7.0 #1413 — resolve effective caller for the agent_id agreement
     // check + signed_events row attribution. MCP stdio captures the host
@@ -328,7 +361,7 @@ pub fn handle_capture_turn(
     // dedup-lookup + atomic three-row transaction is the sqlite SSOT
     // `crate::storage::capture_turn_idempotent` (also reached by
     // `SqliteStore::capture_turn_idempotent` through the SAL trait).
-    let write = prepare_capture_turn(&req, caller)?;
+    let write = prepare_capture_turn(&req, caller).map_err(anyhow::Error::msg)?;
     let attest_level = write.signed_event.attest_level.clone();
 
     // v0.7.0 H1 (HIGH) — write-gate parity for the mutating
@@ -360,11 +393,11 @@ pub fn handle_capture_turn(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(crate::governance::deny_message(
+                return Err(anyhow::Error::msg(crate::governance::deny_message(
                     ACTION_CAPTURE_TURN,
                     crate::governance::DenyGate::PermissionRule,
                     &reason,
-                ));
+                )));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({
@@ -381,7 +414,9 @@ pub fn handle_capture_turn(
         // param ONCE; inert unless `[capabilities].enabled`.
         let capability =
             crate::governance::capability::parse_presented_token(req.capability.as_deref(), caller)
-                .map_err(|rej| crate::governance::capability::edge_reject_message(&rej))?;
+                .map_err(|rej| {
+                    anyhow::Error::msg(crate::governance::capability::edge_reject_message(&rej))
+                })?;
         // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
         // consult BEFORE the governance decision dispatches.
         crate::mcp::consult_pre_governance_decision_gate(
@@ -389,7 +424,8 @@ pub fn handle_capture_turn(
             "store",
             caller,
             Some(&write.memory.id),
-        )?;
+        )
+        .map_err(anyhow::Error::msg)?;
         match crate::db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -400,18 +436,18 @@ pub fn handle_capture_turn(
             &gate_payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| anyhow::anyhow!("{e}"))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
                 // #3292 M7 — unowned-standard remedy: Owner + no resolvable
                 // ns owner must not lock capture_turn for every caller.
                 if !refusal.is_unowned_owner_lock() {
-                    return Err(crate::governance::deny_message(
+                    return Err(anyhow::Error::msg(crate::governance::deny_message(
                         ACTION_CAPTURE_TURN,
                         crate::governance::DenyGate::Governance,
                         &refusal.reason,
-                    ));
+                    )));
                 }
             }
             GovernanceDecision::Pending(pending_id) => {
@@ -431,7 +467,28 @@ pub fn handle_capture_turn(
     // why_trace exemption (`substrate_authored = false`); under
     // AI_MEMORY_REQUIRE_WHY_TRACE=1 the caller supplies
     // `metadata.why_trace` or the write is refused at the insert gate.
-    let result = crate::storage::capture_turn_idempotent(conn, &write, false)?;
+    //
+    // v1.0.0 #3587 U4 — the auto path derives the per-session index inside
+    // the transaction; every gate above ran on the placeholder-index
+    // `write`, which is identical in namespace + content (the only fields
+    // the gates read), so gating stays uniform across both paths.
+    let result = if auto_index {
+        let req_for_build = req.clone();
+        crate::storage::capture_turn_idempotent_auto(
+            conn,
+            &req.host_session_id,
+            &req.content,
+            false,
+            |derived_index| {
+                let mut indexed = req_for_build.clone();
+                indexed.host_turn_index = derived_index;
+                prepare_capture_turn(&indexed, caller)
+            },
+        )
+        .map_err(anyhow::Error::msg)?
+    } else {
+        crate::storage::capture_turn_idempotent(conn, &write, false).map_err(anyhow::Error::msg)?
+    };
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if result.dedup_hit {

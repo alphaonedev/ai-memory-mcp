@@ -683,7 +683,7 @@ pub use pending::{handle_pending_approve, handle_pending_reject};
 // #1416 — `prepare_capture_turn` + the request type are re-exported so
 // the HTTP `POST /api/v1/capture_turn` route reuses the exact same
 // validation + Memory/SignedEvent construction as the MCP tool.
-pub use capture_turn::{MemoryCaptureTurnRequest, handle_capture_turn};
+pub use capture_turn::{MemoryCaptureTurnRequest, handle_capture_turn, handle_capture_turn_auto};
 // `prepare_capture_turn` is `pub(crate)` — re-export at crate visibility so
 // the HTTP handler (`crate::handlers::capture_turn`) can reach it without
 // widening the MCP tool's surface to the public API.

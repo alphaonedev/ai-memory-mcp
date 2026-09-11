@@ -24,6 +24,12 @@ src/storage/mod.rs	set_lifecycle_state
 src/storage/mod.rs	reverse_conserve_contradiction
 src/storage/mod.rs	reconcile_envelope_owner
 src/storage/mod.rs	capture_turn_idempotent
+# #3587 U4 — auto-index twin of capture_turn_idempotent: the same three-row
+# L4 write funnel (memory INSERT + transcript_line_dedup INSERT + signed
+# event), reached only via handle_capture_turn_inner which applies the K9
+# permission gate + the governance gate BEFORE the transaction, exactly like
+# the sibling above. The index derivation is the only difference.
+src/storage/mod.rs	capture_turn_idempotent_auto
 src/storage/mod.rs	recover_turn_idempotent
 src/storage/mod.rs	stamp_embedding_space_attested
 src/storage/mod.rs	adopt_legacy_embedding_space

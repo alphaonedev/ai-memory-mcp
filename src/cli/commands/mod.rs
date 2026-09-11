@@ -79,3 +79,6 @@ pub mod unsubscribe;
 // There is no MCP-tool counterpart (no `memory_recover_previous_session`
 // tool was ever implemented/registered; corrected per Grok W1A4-01).
 pub mod recover_previous_session;
+// v1.0.0 #3587 U4 — `ai-memory capture-turn`: CLI twin of the
+// `memory_capture_turn` MCP tool + the Claude Code `Stop` hook sink.
+pub mod capture_turn;
