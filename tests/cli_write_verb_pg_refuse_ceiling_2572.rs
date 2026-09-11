@@ -49,8 +49,8 @@ const GUARDED: &[(&str, usize, &str)] = &[
     ("src/cli/store.rs", 1, "`store` write."),
     (
         "src/cli/link.rs",
-        2,
-        "`link` + `resolve` (supersede) writes.",
+        1,
+        "`link` write; #3587 resolve routes PostgreSQL through the SAL twin.",
     ),
     ("src/cli/update.rs", 1, "`update` write."),
     ("src/cli/promote.rs", 1, "`promote` write."),

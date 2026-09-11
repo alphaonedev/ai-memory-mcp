@@ -289,6 +289,14 @@ pub enum SupersessionRefusal {
     NotStrictlyNewer,
 }
 
+impl std::fmt::Display for SupersessionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "supersession refused: {self:?}")
+    }
+}
+
+impl std::error::Error for SupersessionRefusal {}
+
 /// A checked pair; private fields and borrowed rows prevent unchecked creation
 /// and mutation of the snapshots while the authorization is being consumed.
 #[derive(Debug)]

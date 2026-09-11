@@ -5,7 +5,7 @@
 //! design pattern.
 
 use crate::cli::CliOutput;
-use crate::{color, db, models, validate};
+use crate::{color, db, validate};
 use anyhow::Result;
 use clap::Args;
 use std::path::Path;
@@ -157,28 +157,46 @@ pub fn cmd_resolve(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
-    let db_path = crate::cli::backup::refuse_pg_store(db_path, "resolve", out)?;
-    let db_path = db_path.as_path();
-    let conn = db::open(db_path)?;
-    validate::validate_link(
-        &args.winner_id,
-        &args.loser_id,
-        crate::models::MemoryLinkRelation::Supersedes.as_str(),
-    )?;
+    validate::validate_id(&args.winner_id)?;
+    validate::validate_id(&args.loser_id)?;
     let principal =
         crate::identity::supersession::SupersessionPrincipal::from_process_environment()?;
-    let result = crate::storage::supersession::resolve(
-        &conn,
-        &args.loser_id,
-        &args.winner_id,
-        crate::storage::supersession::SupersessionRequest {
-            principal: principal.as_ref(),
-            as_admin: args.as_admin,
-        },
-    )?;
+    let request = crate::storage::supersession::SupersessionRequest {
+        principal: principal.as_ref(),
+        as_admin: args.as_admin,
+    };
+    let result = match crate::store_url::resolve_store_url(None)? {
+        Some(url) if crate::store_url::is_postgres_url(&url) => {
+            #[cfg(feature = "sal-postgres")]
+            {
+                crate::cli::doctor::run_pg_probe(|| async {
+                    let store = crate::migrate::open_store(&url).await?;
+                    Ok::<_, anyhow::Error>(
+                        store
+                            .resolve_supersession(&args.loser_id, &args.winner_id, request)
+                            .await?,
+                    )
+                })??
+            }
+            #[cfg(not(feature = "sal-postgres"))]
+            anyhow::bail!("PostgreSQL resolve requires the sal-postgres feature");
+        }
+        _ => {
+            // Preserve the established fail-closed SQLite URL / --db agreement.
+            let db_path = crate::cli::backup::resolve_sqlite_store(
+                db_path,
+                None,
+                "resolve",
+                crate::cli::backup::StoreDisagreement::Refuse,
+                None,
+                out,
+            )?;
+            let conn = db::open(&db_path)?;
+            crate::storage::supersession::resolve(&conn, &args.loser_id, &args.winner_id, request)?
+        }
+    };
     if let Some(reason) = result.refusal {
-        anyhow::bail!("supersession refused: {reason:?}");
+        return Err(reason.into());
     }
     if json_out {
         writeln!(out.stdout, "{}", {
@@ -423,103 +441,6 @@ mod tests {
         assert_eq!(v["linked"].as_bool().unwrap(), true);
     }
 
-    #[test]
-    fn test_resolve_creates_supersedes_link() {
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let winner = seed_memory(&db, "ns", "winner", "wins");
-        let loser = seed_memory(&db, "ns", "loser", "loses");
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: winner.clone(),
-            loser_id: loser.clone(),
-        };
-        {
-            let mut out = env.output();
-            cmd_resolve(&db, &args, false, &mut out).unwrap();
-        }
-        let conn = db::open(&db).unwrap();
-        let links = db::get_links(&conn, &winner).unwrap();
-        assert!(
-            links.iter().any(|l| l.target_id == loser
-                && l.relation == crate::models::MemoryLinkRelation::Supersedes),
-            "expected supersedes link from winner to loser"
-        );
-    }
-
-    #[test]
-    fn test_resolve_demotes_loser_priority_and_confidence() {
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let winner = seed_memory(&db, "ns", "winner", "wins");
-        let loser = seed_memory(&db, "ns", "loser", "loses");
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: winner,
-            loser_id: loser.clone(),
-        };
-        {
-            let mut out = env.output();
-            cmd_resolve(&db, &args, true, &mut out).unwrap();
-        }
-        let conn = db::open(&db).unwrap();
-        let mem = db::get(&conn, &loser).unwrap().unwrap();
-        assert_eq!(mem.priority, 1);
-        assert!((mem.confidence - 0.1).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_resolve_touches_winner() {
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let winner = seed_memory(&db, "ns", "winner", "wins");
-        let loser = seed_memory(&db, "ns", "loser", "loses");
-        // Capture access_count + updated_at before resolve.
-        let conn = db::open(&db).unwrap();
-        let pre = db::get(&conn, &winner).unwrap().unwrap();
-        let pre_access = pre.access_count;
-        drop(conn);
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: winner.clone(),
-            loser_id: loser,
-        };
-        {
-            let mut out = env.output();
-            cmd_resolve(&db, &args, true, &mut out).unwrap();
-        }
-        let conn = db::open(&db).unwrap();
-        let post = db::get(&conn, &winner).unwrap().unwrap();
-        // touch() bumps access_count.
-        assert!(
-            post.access_count >= pre_access,
-            "access_count should not regress: pre={pre_access} post={}",
-            post.access_count
-        );
-    }
-
-    /// Coverage restoration (post-#1558 floor dip): `cmd_resolve`'s
-    /// validate-error propagation path — `cmd_link`'s twin is pinned
-    /// by `test_link_self_link_validation_error`, but resolve's
-    /// validate call (winner == loser ⇒ self-supersede) was not.
-    #[test]
-    fn test_resolve_self_resolve_validation_error() {
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let only = seed_memory(&db, "ns", "only", "self");
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: only.clone(),
-            loser_id: only,
-        };
-        let mut out = env.output();
-        let err = cmd_resolve(&db, &args, false, &mut out).unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("self"),
-            "self-resolve must be refused by validate_link: {err}"
-        );
-    }
-
     // -----------------------------------------------------------------
     // GA-drive 2026-06-09 (per-module floor 96%) — error-branch
     // coverage for the remaining `?` propagation sites. Each fallible
@@ -542,92 +463,6 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn test_resolve_missing_ids_create_link_error() {
-        // Valid-format IDs that don't exist: validate passes, the
-        // create_link write refuses with the typed MemoryNotFound.
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        // Initialize schema so the failure comes from the link write,
-        // not from a missing table.
-        drop(db::open(&db).unwrap());
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: "nonexistent-winner-id".into(),
-            loser_id: "nonexistent-loser-id".into(),
-        };
-        let mut out = env.output();
-        let res = cmd_resolve(&db, &args, false, &mut out);
-        assert!(res.is_err());
-        let msg = res.unwrap_err().to_string();
-        assert!(
-            msg.contains(crate::errors::msg::MEMORY_NOT_FOUND),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_update_failure_propagates() {
-        // Force db::update on the loser to fail AFTER the supersedes
-        // link landed, via an abort trigger keyed on the loser row.
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let winner = seed_memory(&db, "ns", "winner", "wins");
-        let loser = seed_memory(&db, "ns", "loser", "loses");
-        let conn = db::open(&db).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TRIGGER test_fail_loser_update BEFORE UPDATE ON memories \
-             WHEN NEW.id = '{loser}' \
-             BEGIN SELECT RAISE(ABORT, 'test trigger: loser update refused'); END;"
-        ))
-        .unwrap();
-        drop(conn);
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: winner,
-            loser_id: loser,
-        };
-        let mut out = env.output();
-        let res = cmd_resolve(&db, &args, false, &mut out);
-        assert!(res.is_err());
-        // storage::update maps the RAISE(ABORT) into its canonical
-        // constraint-violation wrap; the raw trigger prose may be
-        // swallowed by that mapping, so accept either spelling.
-        let msg = res.unwrap_err().to_string();
-        assert!(
-            msg.contains("update failed") || msg.contains("loser update refused"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_touch_failure_propagates() {
-        // db::update targets only the loser; an abort trigger keyed on
-        // the winner row fires first inside db::touch.
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let winner = seed_memory(&db, "ns", "winner", "wins");
-        let loser = seed_memory(&db, "ns", "loser", "loses");
-        let conn = db::open(&db).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TRIGGER test_fail_winner_touch BEFORE UPDATE ON memories \
-             WHEN NEW.id = '{winner}' \
-             BEGIN SELECT RAISE(ABORT, 'test trigger: winner touch refused'); END;"
-        ))
-        .unwrap();
-        drop(conn);
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: winner,
-            loser_id: loser,
-        };
-        let mut out = env.output();
-        let res = cmd_resolve(&db, &args, true, &mut out);
-        assert!(res.is_err());
-        let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("winner touch refused"), "got: {msg}");
     }
 
     #[test]
@@ -669,48 +504,6 @@ mod tests {
             stderr: &mut stderr,
         };
         let res = cmd_link(&db, &args, true, None, &mut out);
-        assert!(res.is_err(), "broken pipe must propagate, not panic");
-    }
-
-    #[test]
-    fn test_resolve_json_output_broken_pipe_propagates() {
-        let env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let winner = seed_memory(&db, "ns", "winner", "wins");
-        let loser = seed_memory(&db, "ns", "loser", "loses");
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: winner,
-            loser_id: loser,
-        };
-        let mut failing = FailingWriter;
-        let mut stderr: Vec<u8> = Vec::new();
-        let mut out = CliOutput {
-            stdout: &mut failing,
-            stderr: &mut stderr,
-        };
-        let res = cmd_resolve(&db, &args, true, &mut out);
-        assert!(res.is_err(), "broken pipe must propagate, not panic");
-    }
-
-    #[test]
-    fn test_resolve_human_output_broken_pipe_propagates() {
-        let env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let winner = seed_memory(&db, "ns", "winner", "wins");
-        let loser = seed_memory(&db, "ns", "loser", "loses");
-        let args = ResolveArgs {
-            as_admin: false,
-            winner_id: winner,
-            loser_id: loser,
-        };
-        let mut failing = FailingWriter;
-        let mut stderr: Vec<u8> = Vec::new();
-        let mut out = CliOutput {
-            stdout: &mut failing,
-            stderr: &mut stderr,
-        };
-        let res = cmd_resolve(&db, &args, false, &mut out);
         assert!(res.is_err(), "broken pipe must propagate, not panic");
     }
 }

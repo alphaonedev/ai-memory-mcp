@@ -1745,7 +1745,13 @@ pub async fn run(
 
     let cli_agent_id: Option<String> = cli.agent_id.clone();
     // Track whether command writes to DB (for WAL checkpoint)
-    let needs_checkpoint = is_write_command(&cli.command);
+    // #3587: a successful PostgreSQL resolve must not create a phantom
+    // SQLite --db file in the generic write-command checkpoint epilogue.
+    let pg_resolve = matches!(&cli.command, Command::Resolve(_))
+        && crate::store_url::resolve_store_url(None)?
+            .as_deref()
+            .is_some_and(crate::store_url::is_postgres_url);
+    let needs_checkpoint = is_write_command(&cli.command) && !pg_resolve;
     let db_path_for_checkpoint = if needs_checkpoint {
         Some(db_path.clone())
     } else {
