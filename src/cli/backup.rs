@@ -3700,7 +3700,9 @@ mod tests {
         let args = RestoreArgs {
             from: bogus,
             snapshot: None,
+            latest: false,
             skip_verify: true,
+            allow_unsigned_manifest: false,
             store_url: None,
             yes: true,
         };
