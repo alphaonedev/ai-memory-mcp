@@ -326,6 +326,9 @@ pub const META_KEY_DERIVED_FROM: &str = "derived_from";
 /// caller's pre-read and its upsert cannot be clobbered, because the
 /// preserve is evaluated INSIDE the conflicting statement.
 ///
+/// #3587 also preserves `ruling_key`: an ordinary unkeyed re-store cannot
+/// erase the immutable key used to locate the next ruling predecessor.
+///
 /// Rotation and revocation are unaffected: `bind_agent_pubkey` and
 /// `revoke_agent_pubkey` write through their own explicit `UPDATE`
 /// (sqlite `json_set` / postgres `jsonb` set-and-strip), never through
@@ -333,12 +336,13 @@ pub const META_KEY_DERIVED_FROM: &str = "derived_from";
 ///
 /// [`field_names::AGENT_PUBKEY`]: crate::models::field_names::AGENT_PUBKEY
 /// [`field_names::PUBKEY_BOUND_AT`]: crate::models::field_names::PUBKEY_BOUND_AT
-pub const RESERVED_UPSERT_METADATA_KEYS: [&str; 5] = [
+pub const RESERVED_UPSERT_METADATA_KEYS: [&str; 6] = [
     META_KEY_AGENT_ID,
     META_KEY_DERIVED_FROM,
     META_KEY_CONSOLIDATED_FROM_AGENTS,
     crate::models::field_names::AGENT_PUBKEY,
     crate::models::field_names::PUBKEY_BOUND_AT,
+    crate::models::field_names::RULING_KEY,
 ];
 
 /// The [`RESERVED_UPSERT_METADATA_KEYS`] set rendered as a SQL quoted
@@ -359,7 +363,7 @@ pub const RESERVED_UPSERT_METADATA_KEYS: [&str; 5] = [
 #[macro_export]
 macro_rules! reserved_upsert_metadata_keys_sql {
     () => {
-        "'agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at'"
+        "'agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at', 'ruling_key'"
     };
 }
 

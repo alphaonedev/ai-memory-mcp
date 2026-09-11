@@ -1,0 +1,650 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! The same transaction assertions drive direct SQLite, SAL SQLite and live PG.
+//! No process environment writes or synthetic principal constructor are used.
+
+#[cfg(feature = "sal")]
+use ai_memory::store::{CallerContext, MemoryStore};
+use ai_memory::{
+    identity::supersession::{SupersessionPrincipal, SupersessionRefusal},
+    models::Memory,
+    storage::supersession::{SupersessionRequest, SupersessionResult},
+};
+use anyhow::Result;
+use rusqlite::OptionalExtension;
+use serde_json::{Value, json};
+
+const OWNER: &str = "ai:supersession-owner-3587";
+const ADMIN: &str = "ai:supersession-admin-3587";
+
+enum Backend {
+    Sqlite {
+        conn: rusqlite::Connection,
+        #[cfg(feature = "sal")]
+        adapter: Option<ai_memory::store::sqlite::SqliteStore>,
+        _dir: tempfile::TempDir,
+    },
+    #[cfg(feature = "sal-postgres")]
+    Postgres {
+        store: ai_memory::store::postgres::PostgresStore,
+        pool: sqlx::PgPool,
+    },
+}
+
+fn principal(actor: &str) -> SupersessionPrincipal {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-agent-id", actor.parse().unwrap());
+    SupersessionPrincipal::from_http_headers(&headers)
+        .unwrap()
+        .unwrap()
+}
+
+fn pair() -> (Memory, Memory) {
+    let old = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: format!("supersession-3587-{}", uuid::Uuid::new_v4()),
+        title: "old ruling".into(),
+        content: "old ruling bytes".into(),
+        created_at: "2026-09-09T00:00:00Z".into(),
+        updated_at: "2026-09-09T00:00:00Z".into(),
+        metadata: json!({"agent_id": OWNER, "scope": "collective", "ruling_key": "decision"}),
+        ..Memory::default()
+    };
+    let new = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: "new ruling".into(),
+        content: "new ruling bytes".into(),
+        created_at: "2026-09-10T00:00:00Z".into(),
+        updated_at: "2026-09-10T00:00:00Z".into(),
+        ..old.clone()
+    };
+    (old, new)
+}
+
+impl Backend {
+    fn sqlite() -> Self {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("supersession-tx-")
+            .tempdir_in(root)
+            .unwrap();
+        let conn = ai_memory::db::open(&dir.path().join("test.db")).unwrap();
+        Self::Sqlite {
+            conn,
+            #[cfg(feature = "sal")]
+            adapter: None,
+            _dir: dir,
+        }
+    }
+
+    async fn seed(&self, memory: &Memory) {
+        match self {
+            Self::Sqlite { conn, .. } => {
+                ai_memory::db::insert_no_overwrite(conn, memory).unwrap();
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { store, .. } => {
+                store
+                    .store(&CallerContext::for_agent(OWNER), memory)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn upsert(&self, memory: &Memory, embedded: bool) -> String {
+        match self {
+            #[cfg(feature = "sal")]
+            Self::Sqlite {
+                adapter: Some(store),
+                ..
+            } => {
+                let ctx = CallerContext::for_agent(OWNER);
+                if embedded {
+                    store
+                        .store_with_embedding(&ctx, memory, None, None)
+                        .await
+                        .unwrap()
+                } else {
+                    store.store(&ctx, memory).await.unwrap()
+                }
+            }
+            Self::Sqlite { conn, .. } => {
+                let _ = embedded; // Both direct SQLite arms share insert_inner.
+                ai_memory::db::insert(conn, memory).unwrap()
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { store, .. } => {
+                let ctx = CallerContext::for_agent(OWNER);
+                if embedded {
+                    store
+                        .store_with_embedding(&ctx, memory, None, None)
+                        .await
+                        .unwrap()
+                } else {
+                    store.store(&ctx, memory).await.unwrap()
+                }
+            }
+        }
+    }
+
+    async fn store(
+        &self,
+        memory: &Memory,
+        request: SupersessionRequest<'_>,
+    ) -> Result<SupersessionResult> {
+        match self {
+            #[cfg(feature = "sal")]
+            Self::Sqlite {
+                adapter: Some(store),
+                ..
+            } => Ok(store
+                .store_with_supersession(
+                    &CallerContext::for_agent(OWNER),
+                    memory,
+                    None,
+                    None,
+                    request,
+                )
+                .await?),
+            Self::Sqlite { conn, .. } => {
+                ai_memory::storage::supersession::store(conn, memory, request, None)
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { store, .. } => Ok(store
+                .store_with_supersession(
+                    &CallerContext::for_agent(OWNER),
+                    memory,
+                    None,
+                    None,
+                    request,
+                )
+                .await?),
+        }
+    }
+
+    async fn resolve(
+        &self,
+        old: &Memory,
+        new: &Memory,
+        request: SupersessionRequest<'_>,
+    ) -> Result<SupersessionResult> {
+        match self {
+            #[cfg(feature = "sal")]
+            Self::Sqlite {
+                adapter: Some(store),
+                ..
+            } => Ok(store
+                .resolve_supersession(&old.id, &new.id, request)
+                .await?),
+            Self::Sqlite { conn, .. } => {
+                ai_memory::storage::supersession::resolve(conn, &old.id, &new.id, request)
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { store, .. } => Ok(store
+                .resolve_supersession(&old.id, &new.id, request)
+                .await?),
+        }
+    }
+
+    /// Full durable row comparison within a backend, including versions and CID.
+    async fn snapshot(&self, id: &str, archived: bool) -> Option<Value> {
+        let table = if archived {
+            "archived_memories"
+        } else {
+            "memories"
+        };
+        match self {
+            Self::Sqlite { conn, .. } => {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {table} WHERE id = ?1"))
+                    .unwrap();
+                let names: Vec<String> = stmt
+                    .column_names()
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect();
+                stmt.query_row([id], |row| {
+                    let mut object = serde_json::Map::new();
+                    for (i, name) in names.iter().enumerate() {
+                        let value = match row.get_ref(i)? {
+                            rusqlite::types::ValueRef::Null => Value::Null,
+                            rusqlite::types::ValueRef::Integer(v) => json!(v),
+                            rusqlite::types::ValueRef::Real(v) => json!(v),
+                            rusqlite::types::ValueRef::Text(v) => {
+                                json!(std::str::from_utf8(v).unwrap())
+                            }
+                            rusqlite::types::ValueRef::Blob(v) => json!(v),
+                        };
+                        object.insert(name.clone(), value);
+                    }
+                    Ok(Value::Object(object))
+                })
+                .optional()
+                .unwrap()
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { pool, .. } => {
+                sqlx::query_scalar(&format!("SELECT to_jsonb(m) FROM {table} m WHERE id = $1"))
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap()
+            }
+        }
+    }
+
+    async fn metadata(&self, id: &str, archived: bool) -> Value {
+        let row = self.snapshot(id, archived).await.unwrap();
+        match &row["metadata"] {
+            Value::String(text) => serde_json::from_str(text).unwrap(),
+            value => value.clone(),
+        }
+    }
+
+    async fn set_metadata(&self, memory: &Memory, metadata: Value) {
+        match self {
+            Self::Sqlite { conn, .. } => {
+                conn.execute(
+                    "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+                    rusqlite::params![metadata.to_string(), memory.id],
+                )
+                .unwrap();
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { pool, .. } => {
+                sqlx::query("UPDATE memories SET metadata = $1 WHERE id = $2")
+                    .bind(metadata)
+                    .bind(&memory.id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn archive(&self, memory: &Memory) {
+        match self {
+            Self::Sqlite { conn, .. } => {
+                assert!(ai_memory::db::archive_memory(conn, &memory.id, Some("archive")).unwrap());
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { store, .. } => {
+                assert_eq!(
+                    store
+                        .archive_by_ids(
+                            &CallerContext::for_agent(OWNER),
+                            std::slice::from_ref(&memory.id),
+                            Some("archive")
+                        )
+                        .await
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    /// Fail after the loser archive, when the winner's pointer is stamped.
+    async fn pointer_fault(&self, new: &Memory, install: bool) {
+        match self {
+            Self::Sqlite { conn, .. } => {
+                if install {
+                    conn.execute_batch(&format!(
+                        "CREATE TRIGGER supersession_fault BEFORE UPDATE OF metadata ON memories \
+                         WHEN NEW.id = '{}' AND json_extract(NEW.metadata, '$.superseded_id') IS NOT NULL \
+                         BEGIN SELECT RAISE(ABORT, 'supersession injected pointer failure'); END", new.id
+                    )).unwrap();
+                } else {
+                    conn.execute_batch("DROP TRIGGER supersession_fault")
+                        .unwrap();
+                }
+            }
+            #[cfg(feature = "sal-postgres")]
+            Self::Postgres { pool, .. } => {
+                // Identifiers and the literal derive exclusively from a generated UUID.
+                let name = format!("supersession_fault_{}", new.id.replace('-', ""));
+                if install {
+                    sqlx::query(&format!(
+                        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                         IF NEW.id = '{}' AND NEW.metadata ? 'superseded_id' THEN \
+                         RAISE EXCEPTION 'supersession injected pointer failure'; END IF; RETURN NEW; END $$", new.id
+                    )).execute(pool).await.unwrap();
+                    sqlx::query(&format!(
+                        "CREATE TRIGGER {name} BEFORE UPDATE OF metadata ON memories \
+                        FOR EACH ROW EXECUTE FUNCTION {name}()"
+                    ))
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                } else {
+                    sqlx::query(&format!("DROP TRIGGER {name} ON memories"))
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    sqlx::query(&format!("DROP FUNCTION {name}()"))
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    }
+}
+
+async fn authority_matrix(backend: &Backend) {
+    use SupersessionRefusal as Refusal;
+    let owner = principal(OWNER);
+    let foreign = principal("ai:foreign-3587");
+    let admin = principal(ADMIN);
+    for (evidence, as_admin, expected) in [
+        (None, false, Some(Refusal::UnauthenticatedPrincipal)),
+        (Some(&foreign), false, Some(Refusal::OwnerMismatch)),
+        (Some(&owner), true, Some(Refusal::AdminNotAllowed)),
+        (Some(&admin), false, Some(Refusal::OwnerMismatch)),
+        (Some(&owner), false, Some(Refusal::UnownedPredecessor)),
+        (Some(&owner), false, Some(Refusal::NotStrictlyNewer)),
+        (Some(&owner), false, None),
+        (Some(&admin), true, None),
+    ] {
+        let (old, mut new) = pair();
+        if expected == Some(Refusal::NotStrictlyNewer) {
+            // Equal instants expressed in different time zones still refuse.
+            new.created_at = "2026-09-09T05:30:00+05:30".into();
+        }
+        backend.seed(&old).await;
+        if expected == Some(Refusal::UnownedPredecessor) {
+            let mut legacy = old.metadata.clone();
+            legacy["agent_id"] = json!("");
+            backend.set_metadata(&old, legacy).await;
+        }
+        let before = backend.snapshot(&old.id, false).await;
+        let result = backend
+            .store(
+                &new,
+                SupersessionRequest {
+                    principal: evidence,
+                    as_admin,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.id, new.id);
+        assert_eq!(result.refusal, expected);
+        let mut response = json!({"id": new.id});
+        result.add_response_fields(&mut response);
+        assert!(backend.snapshot(&new.id, false).await.is_some());
+        if expected.is_some() {
+            assert!(result.superseded.is_none());
+            assert_eq!(response["supersede_skipped"], "unauthenticated_principal");
+            assert!(response.get("superseded").is_none());
+            assert_eq!(backend.snapshot(&old.id, false).await, before);
+            assert!(backend.snapshot(&old.id, true).await.is_none());
+        } else {
+            assert_eq!(result.superseded.as_deref(), Some(old.id.as_str()));
+            assert_eq!(response["superseded"], old.id);
+            assert!(response.get("supersede_skipped").is_none());
+            assert!(backend.snapshot(&old.id, false).await.is_none());
+            let archive = backend.snapshot(&old.id, true).await.unwrap();
+            assert_eq!(archive["archive_reason"], "superseded");
+            assert_eq!(archive["content"], old.content);
+            assert_eq!(
+                backend.metadata(&old.id, true).await["superseded_by"],
+                new.id
+            );
+            assert_eq!(
+                backend.metadata(&new.id, false).await["superseded_id"],
+                old.id
+            );
+        }
+    }
+}
+
+async fn conflicts_and_namespaces(backend: &Backend) {
+    let owner = principal(OWNER);
+    let request = SupersessionRequest {
+        principal: Some(&owner),
+        as_admin: false,
+    };
+    for same_id in [false, true] {
+        let (old, mut new) = pair();
+        backend.seed(&old).await;
+        new.title.clone_from(&old.title);
+        if same_id {
+            new.id.clone_from(&old.id);
+        }
+        let before = backend.snapshot(&old.id, false).await;
+        let error = backend.store(&new, request).await.unwrap_err();
+        let typed = error
+            .downcast_ref::<ai_memory::storage::ConflictError>()
+            .is_some();
+        #[cfg(feature = "sal")]
+        let typed = typed
+            || matches!(
+                error.downcast_ref::<ai_memory::store::StoreError>(),
+                Some(ai_memory::store::StoreError::Conflict { .. })
+            );
+        assert!(typed, "expected typed conflict: {error:#}");
+        assert_eq!(backend.snapshot(&old.id, false).await, before);
+        assert!(backend.snapshot(&old.id, true).await.is_none());
+        if !same_id {
+            assert!(backend.snapshot(&new.id, false).await.is_none());
+        }
+    }
+    for change_key in [false, true] {
+        let (old, mut new) = pair();
+        backend.seed(&old).await;
+        if change_key {
+            new.metadata["ruling_key"] = json!("other-decision");
+        } else {
+            new.namespace.push_str("/child");
+        }
+        let before = backend.snapshot(&old.id, false).await;
+        let result = backend.store(&new, request).await.unwrap();
+        assert!(result.superseded.is_none() && result.refusal.is_none());
+        assert_eq!(backend.snapshot(&old.id, false).await, before);
+        assert!(backend.snapshot(&new.id, false).await.is_some());
+    }
+}
+
+async fn archive_replay(backend: &Backend) {
+    let owner = principal(OWNER);
+    let foreign = principal("ai:foreign-3587");
+    let request = SupersessionRequest {
+        principal: Some(&owner),
+        as_admin: false,
+    };
+    for already_superseded in [false, true] {
+        let (old, new) = pair();
+        backend.seed(&old).await;
+        backend.seed(&new).await;
+        if already_superseded {
+            let result = backend.resolve(&old, &new, request).await.unwrap();
+            assert_eq!(result.superseded.as_deref(), Some(old.id.as_str()));
+        } else {
+            backend.archive(&old).await;
+        }
+        let archive = backend.snapshot(&old.id, true).await;
+        let winner = backend.snapshot(&new.id, false).await;
+        for evidence in [None, Some(&foreign), Some(&owner)] {
+            let result = backend
+                .resolve(
+                    &old,
+                    &new,
+                    SupersessionRequest {
+                        principal: evidence,
+                        as_admin: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let expected = match evidence {
+                None => Some(SupersessionRefusal::UnauthenticatedPrincipal),
+                Some(p) if p.agent_id() != OWNER => Some(SupersessionRefusal::OwnerMismatch),
+                Some(_) if !already_superseded => Some(SupersessionRefusal::ArchivedPredecessor),
+                Some(_) => None,
+            };
+            assert_eq!(result.refusal, expected);
+            assert!(result.superseded.is_none());
+            assert_eq!(backend.snapshot(&old.id, true).await, archive);
+            assert_eq!(backend.snapshot(&new.id, false).await, winner);
+            assert!(backend.snapshot(&old.id, false).await.is_none());
+        }
+    }
+}
+
+async fn rollback(backend: &Backend) {
+    let owner = principal(OWNER);
+    let request = SupersessionRequest {
+        principal: Some(&owner),
+        as_admin: false,
+    };
+    for resolve in [false, true] {
+        let (old, new) = pair();
+        backend.seed(&old).await;
+        if resolve {
+            backend.seed(&new).await;
+        }
+        let old_before = backend.snapshot(&old.id, false).await;
+        let new_before = backend.snapshot(&new.id, false).await;
+        backend.pointer_fault(&new, true).await;
+        let result = if resolve {
+            backend.resolve(&old, &new, request).await
+        } else {
+            backend.store(&new, request).await
+        };
+        backend.pointer_fault(&new, false).await;
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("supersession injected pointer failure"),
+            "{error:#}"
+        );
+        assert_eq!(backend.snapshot(&old.id, false).await, old_before);
+        assert_eq!(backend.snapshot(&new.id, false).await, new_before);
+        assert!(backend.snapshot(&old.id, true).await.is_none());
+        // The identical request can commit after the injected failure is removed.
+        let result = if resolve {
+            backend.resolve(&old, &new, request).await
+        } else {
+            backend.store(&new, request).await
+        }
+        .unwrap();
+        assert_eq!(result.superseded.as_deref(), Some(old.id.as_str()));
+    }
+}
+
+async fn matrix(backend: &Backend) {
+    static ADMIN_INIT: std::sync::Once = std::sync::Once::new();
+    ADMIN_INIT.call_once(|| ai_memory::identity::set_admin_agent_ids(vec![ADMIN.into()]));
+    authority_matrix(backend).await;
+    conflicts_and_namespaces(backend).await;
+    archive_replay(backend).await;
+    rollback(backend).await;
+    upsert_preserves_ruling_key(backend).await;
+    concurrent_first_writes(backend).await;
+}
+
+async fn upsert_preserves_ruling_key(backend: &Backend) {
+    let owner = principal(OWNER);
+    for embedded in [false, true] {
+        let (old, mut incoming) = pair();
+        backend.seed(&old).await;
+        incoming.title.clone_from(&old.title);
+        incoming
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("ruling_key");
+        assert_eq!(backend.upsert(&incoming, embedded).await, old.id);
+        assert_eq!(
+            backend.metadata(&old.id, false).await["ruling_key"],
+            "decision"
+        );
+        let replacement = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "next keyed ruling".into(),
+            created_at: "2026-09-11T00:00:00Z".into(),
+            ..old.clone()
+        };
+        let result = backend
+            .store(
+                &replacement,
+                SupersessionRequest {
+                    principal: Some(&owner),
+                    as_admin: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.superseded.as_deref(), Some(old.id.as_str()));
+        assert!(backend.snapshot(&old.id, false).await.is_none());
+    }
+}
+
+async fn concurrent_first_writes(backend: &Backend) {
+    let owner = principal(OWNER);
+    let request = SupersessionRequest {
+        principal: Some(&owner),
+        as_admin: false,
+    };
+    let (first, mut second) = pair();
+    // Equal times make the assertion independent of which connection wins:
+    // exactly one sees an empty key; the other sees a predecessor and refuses.
+    second.created_at.clone_from(&first.created_at);
+    let (a, b) = tokio::join!(
+        backend.store(&first, request),
+        backend.store(&second, request)
+    );
+    let results = [a.unwrap(), b.unwrap()];
+    assert_eq!(results.iter().filter(|r| r.refusal.is_none()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r.refusal == Some(SupersessionRefusal::NotStrictlyNewer))
+            .count(),
+        1
+    );
+    assert!(results.iter().all(|r| r.superseded.is_none()));
+    assert!(backend.snapshot(&first.id, false).await.is_some());
+    assert!(backend.snapshot(&second.id, false).await.is_some());
+    assert!(backend.snapshot(&first.id, true).await.is_none());
+    assert!(backend.snapshot(&second.id, true).await.is_none());
+}
+
+#[tokio::test]
+async fn direct_sqlite_supersession_transactions_3587() {
+    matrix(&Backend::sqlite()).await;
+}
+
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn sal_sqlite_supersession_transactions_3587() {
+    let mut backend = Backend::sqlite();
+    match &mut backend {
+        Backend::Sqlite {
+            adapter, _dir: dir, ..
+        } => {
+            *adapter = Some(
+                ai_memory::store::sqlite::SqliteStore::open(dir.path().join("test.db")).unwrap(),
+            );
+        }
+        #[cfg(feature = "sal-postgres")]
+        Backend::Postgres { .. } => unreachable!("SQLite fixture"),
+    }
+    matrix(&backend).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn live_postgres_supersession_transactions_3587() {
+    let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
+        .expect("#3587 requires its isolated live PostgreSQL test database");
+    let store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let backend = Backend::Postgres { store, pool };
+    matrix(&backend).await;
+}

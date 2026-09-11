@@ -200,6 +200,7 @@ pub fn resolve(
             super::row_to_memory,
         )
         .optional()?;
+    let old_is_archived = old.is_none();
     let old = match old {
         Some(old) => old,
         None => conn
@@ -223,6 +224,9 @@ pub fn resolve(
         &old,
         &new,
     ) {
+        SupersessionDecision::Authorized(_) if old_is_archived => {
+            result.refusal = Some(SupersessionRefusal::ArchivedPredecessor);
+        }
         SupersessionDecision::Authorized(authorized) => {
             archive_as_superseded(conn, &authorized)?;
             result.superseded = Some(old.id);

@@ -2151,7 +2151,7 @@ fn insert_inner(
                     COALESCE(
                         (SELECT json_group_object(key, value)
                          FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at', 'ruling_key')),
                         '{}'
                     )
                 ),
@@ -4286,7 +4286,7 @@ pub fn update_with_expected_version(
                         -- must not silently unbind the agent's key either.
                         (SELECT json_group_object(key, value)
                          FROM json_each(metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at', 'ruling_key')),
                         '{}'
                     )
                 ),
@@ -17665,7 +17665,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                         -- merge must not unbind a locally-bound key.
                         (SELECT json_group_object(key, value)
                          FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at', 'ruling_key')),
                         '{}'
                     )
                 ),

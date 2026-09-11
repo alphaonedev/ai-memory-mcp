@@ -76,6 +76,10 @@ fn reserved_upsert_metadata_keys_sql_matches_the_typed_set() {
         typed.iter().any(|k| k == "agent_pubkey") && typed.iter().any(|k| k == "pubkey_bound_at"),
         "#2941 — the agent-registration pubkey PAIR must be preserved: {typed:?}"
     );
+    assert!(
+        typed.iter().any(|k| k == "ruling_key"),
+        "#3587 — an unkeyed upsert must not erase the predecessor's ruling_key"
+    );
 }
 
 /// Both backends must preserve the SAME set: a key preserved on sqlite but

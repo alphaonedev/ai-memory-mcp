@@ -287,6 +287,8 @@ pub enum SupersessionRefusal {
     NamespaceMismatch,
     /// A timestamp is malformed or the new instant is not strictly later.
     NotStrictlyNewer,
+    /// An archived row without a supersession pointer cannot be resolved again.
+    ArchivedPredecessor,
 }
 
 impl std::fmt::Display for SupersessionRefusal {
