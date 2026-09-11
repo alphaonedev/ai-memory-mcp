@@ -717,6 +717,17 @@ jobs:
         # own frozen-pre-fix-mirror regression leg at
         # scripts/test/fixtures/required-contexts-prefix-2494.txt.
         run: bash scripts/test/test-ci-workflow-invariants.sh
+      - name: Release workflow invariants (#3546)
+        # release.yml is workflow_dispatch-only and publishes, so its controls
+        # are proven here instead: check-release-workflow.py pins the
+        # structure (checkouts by verified SHA, `qualify` in every job's
+        # needs, the tag re-assert before each upload, pinned tool
+        # downloads), and the preflight / re-assert / packaging shell blocks
+        # are EXTRACTED VERBATIM from release.yml and driven over throwaway
+        # git repositories, canned check-runs and PATH shims. Every R-203 leg
+        # runs the frozen pre-#3546 copy and must see it ACCEPT what the live
+        # workflow refuses, so the harness cannot pass vacuously.
+        run: bash scripts/test/test-release-hardening.sh
 
   git-dependency-source-gate:
     # Issues #2050 / #2512 — SUPPLY-CHAIN reproducibility. `Cargo.toml` pinned

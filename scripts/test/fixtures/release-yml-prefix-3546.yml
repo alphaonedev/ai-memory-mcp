@@ -1,0 +1,1156 @@
+# FROZEN pre-#3546 copy of .github/workflows/release.yml (from 188369ae).
+# Used ONLY by scripts/test/test-release-hardening.sh as the R-203 leg: the
+# static and extracted-block checks must FAIL against this file, proving the
+# harness is not tautological. Never edit it to make a test pass.
+name: Release (workflow_dispatch — operator-gated publish)
+
+# Operator-gated publish pipeline. Lifted out of ci.yml (which now does
+# verification only) so that the act of releasing a tag is a separate,
+# intentional action — never an auto-fire side-effect of CI going green.
+#
+# Invoke from a maintainer shell:
+#
+#   gh workflow run release.yml --repo alphaonedev/ai-memory-mcp -f tag=v0.7.0
+#
+# The 5 jobs below mirror the historical release fanout: binary builds
+# (5 targets), GitHub Release page, crates.io, Homebrew tap, GHCR Docker
+# image, Fedora COPR. Pre-release tags (SemVer `-` suffix) auto-skip the
+# downstream stable channels (crates.io / Homebrew / Docker / COPR) so
+# `v0.7.0-rc.1` style operator dry-runs are safe.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (must already exist on remote, e.g. v0.7.0).'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  # One release at a time, per tag.
+  group: release-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # --------------------------------------------------------------------
+  # Verify the tag exists + is on a sane sha before any publish fires.
+  # Cheap belt-and-suspenders so an `gh workflow run` typo doesn't burn
+  # 20 minutes building artifacts against the wrong commit.
+  # --------------------------------------------------------------------
+  preflight:
+    name: Preflight (tag exists + is annotated)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      is_prerelease: ${{ steps.check.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Resolve tag + sha + prerelease flag
+        id: check
+        shell: bash
+        # #1851 (security review S7, CWE-94) — read the untrusted
+        # workflow_dispatch tag from an intermediate env var, NOT an inline
+        # `${{ inputs.tag }}` in `run:`. Inline template interpolation expands
+        # before the SemVer regex below runs and before the shell parses the
+        # line, so a crafted tag could inject shell ahead of validation.
+        # Mirrors the env-indirection pattern in yank.yml.
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Sanity check — refuse anything that doesn't start with `v`
+          # so a workflow_dispatch typo can't accidentally tag a branch.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.\-]+)?$ ]]; then
+            echo "::error::tag '$TAG' does not match SemVer v<MAJ>.<MIN>.<PATCH>(-pre)?"
+            exit 1
+          fi
+          SHA=$(git rev-parse "$TAG^{commit}")
+          echo "::notice::release tag $TAG -> $SHA"
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"   >> "$GITHUB_OUTPUT"
+          # SemVer pre-releases (e.g. v0.6.2-rc.0 / v0.7.0-alpha.1) skip
+          # the downstream stable channels.
+          if [[ "$TAG" == *-* ]]; then
+            echo "is_prerelease=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::pre-release detected — crates.io / Homebrew / Docker / COPR will skip"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --------------------------------------------------------------------
+  # #2895 (§3C release-pipeline supply-chain) — run the SAME supply-chain
+  # gates the PR-time CI runs, INSIDE the release pipeline, BEFORE any build
+  # or publish. A gate that only guards PRs does not guard the artifact a
+  # `workflow_dispatch` release mints: `release.yml` builds + publishes from a
+  # tag ref, and nothing forced that tag's tree through the gates. This job
+  # is a `needs:` of every build/publish job, so a git-sourced dependency
+  # (#2050 / #2512) or an un-ledgered custom build script (#2635) blocks the
+  # release rather than shipping to crates.io / GHCR / Homebrew / COPR.
+  # §6.6: treat current knowledge as a floor — extend this job as gates land.
+  # --------------------------------------------------------------------
+  supply-chain:
+    name: Supply-chain gates (before build + publish)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Git-dependency-source gate (#2050 / #2512)
+        # No cargo dependency may resolve from a git source (a deleted/rewritten
+        # git repo is an unfetchable, unpinnable supply-chain hole). Pure
+        # bash/grep over Cargo.toml + Cargo.lock; no toolchain needed.
+        run: bash scripts/check-git-dependency-sources.sh
+
+      - name: Git-dependency-source gate self-test (#2050 / #2512)
+        run: bash scripts/check-git-dependency-sources.sh --self-test
+
+      - name: Fetch the locked dependency graph (#2635)
+        # cargo metadata --offline resolves the complete cross-platform graph;
+        # fetch first so the verifier runs offline + content-pinned.
+        run: cargo fetch --locked
+
+      - name: Build-script custom-build ledger gate (#2635)
+        # Every custom-build package in the resolved graph must be ledgered in
+        # supply-chain/build-script-vetting.json — a build script executes with
+        # the builder's authority at compile time, and a release build runs
+        # every one of them.
+        run: python3 scripts/check-build-script-vetting.py
+
+      - name: Build-script ledger gate self-test (#2635)
+        run: python3 scripts/check-build-script-vetting.py --self-test
+
+  # --------------------------------------------------------------------
+  # Cross-platform binary builds + GitHub Release page.
+  # 4 targets: linux x86_64 + aarch64, macOS x86_64 + aarch64.
+  # --------------------------------------------------------------------
+  release:
+    name: Release (${{ matrix.target }})
+    needs: [preflight, supply-chain]
+    runs-on: ${{ matrix.os }}
+    # #2487 supply-chain: OIDC-bound Sigstore build provenance for the
+    # release binaries + deb/rpm, mirroring the OIDC pattern the SDK
+    # publish jobs already use (publish-sdks.yml `id-token: write` →
+    # PyPI Trusted Publishing / npm `--provenance`). `attest-build-provenance`
+    # is the GitHub-native application of that SAME OIDC → Sigstore/Rekor
+    # mechanism to raw binary artifacts (which have no package-registry
+    # trusted publisher). `contents: write` is retained for the GitHub
+    # Release upload; the top-level `packages: write` is dropped for this
+    # job because it publishes no package.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: ai-memory
+            nfpm_arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact: ai-memory
+            nfpm_arch: arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: ai-memory
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: ai-memory
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.98.0 + target std
+        # Pin to the rust-toolchain.toml channel (1.98.0). The build below
+        # resolves the toolchain from rust-toolchain.toml, so the cross
+        # target std must be installed onto THAT toolchain — installing it
+        # onto `stable` left non-host targets (e.g. x86_64-apple-darwin on
+        # the arm64 macOS runner) without `core`, failing with E0463.
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # #2676 packaging residual — release channel must not ship default-only
+      # binaries that omit `sal` (federation/SAL surface). Assert via the same
+      # pin Gate3 provision uses (`scripts/assert-compiled-features.sh`).
+      # Note: `sal-postgres` is NOT enabled here (sqlx/pgvector weight + native
+      # deps on every matrix OS); operators needing PG use an asserted
+      # sal-postgres build or the plan-c image. Agents never workflow_dispatch.
+      - name: Build release binary
+        # --locked (#2895): build against the COMMITTED Cargo.lock exactly.
+        # A release must never silently resolve a newer transitive dependency
+        # than the one that was reviewed/audited on the branch.
+        run: cargo build --locked --release --target ${{ matrix.target }} --features sal
+
+      - name: Assert compiled features (#2676, #2728)
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          target="${{ matrix.target }}"
+          # #2728 — the release matrix cross-builds x86_64-apple-darwin on an
+          # arm64 `macos-latest` runner. `ai-memory features` self-report is an
+          # EXECUTING assertion; running the x86_64 binary on arm64 needs
+          # Rosetta 2 (NOT guaranteed on GitHub arm64 macOS images), and a
+          # Rosetta miss would fail this job only during a real tag cut. So:
+          # execute the feature self-report ONLY when the target is natively
+          # runnable on this host; for a non-native target, verify the built
+          # artifact's ARCHITECTURE WITHOUT running it. The compiled feature
+          # set is identical across both darwin targets (same
+          # `cargo build --release --features sal` invocation above), so the
+          # native aarch64-apple-darwin job's feature assertion already covers
+          # the feature contract; the x86_64 job additionally confirms the
+          # cross-build actually emitted an x86_64 Mach-O, not a silent
+          # host-arch binary.
+          target_arch="${target%%-*}"
+          case "$target_arch" in
+            arm64) target_arch="aarch64" ;;
+          esac
+          host_arch="$(uname -m)"
+          case "$host_arch" in
+            arm64) host_arch="aarch64" ;;
+            amd64) host_arch="x86_64" ;;
+          esac
+          if [[ "$target_arch" == "$host_arch" ]]; then
+            # Native target — safe to execute; the script invokes the
+            # `features` subcommand via the path.
+            echo "native target ($target on $host_arch): executing feature self-report assertion"
+            bash scripts/assert-compiled-features.sh "$bin" \
+              --require sqlite-bundled --require sal
+          else
+            echo "non-native target ($target on $host_arch): verifying arch WITHOUT executing (#2728)"
+            # Expected Mach-O / `file` architecture token for the target CPU.
+            case "$target_arch" in
+              x86_64)  want="x86_64" ;;
+              aarch64) want="arm64" ;;   # lipo / Mach-O name aarch64 as arm64
+              *)       want="$target_arch" ;;
+            esac
+            if command -v lipo >/dev/null 2>&1; then
+              info="$(lipo -info "$bin")"
+            else
+              info="$(file "$bin")"
+            fi
+            echo "  artifact: $info"
+            if ! printf '%s' "$info" | grep -qiw "$want"; then
+              echo "assert: arch verification FAILED — expected '$want' in: $info" >&2
+              exit 1
+            fi
+            echo "assert: arch verification OK ($bin is $want; non-exec #2728)"
+          fi
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/
+          cd dist
+          tar czf ai-memory-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Build deb and rpm packages
+        if: matrix.nfpm_arch
+        run: |
+          NFPM_ARCH=$(uname -m | sed 's/aarch64/arm64/')
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_$(uname -s)_${NFPM_ARCH}.tar.gz | tar xz -C /usr/local/bin nfpm
+
+          VERSION="${TAG#v}"
+
+          ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p deb -f nfpm.yaml -t dist/
+          ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p rpm -f nfpm.yaml -t dist/
+
+          ls -la dist/*.deb dist/*.rpm
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+
+      # ------------------------------------------------------------------
+      # #2449 - publish a SHA-256 for every artifact an installer verifies.
+      #
+      # Before #2449 this job published the tarballs/zip/deb/rpm with NO
+      # .sha256 asset at all (only the SBOM, iOS and Android jobs emitted
+      # one), so install.sh's checksum fetch 404'd on every ordinary
+      # install and its verification step passed by doing nothing.
+      #
+      # This is a whole-directory SWEEP, not an enumerated list, and it
+      # lives in the same job that packages the artifacts - so a future
+      # artifact type added to this job is checksummed automatically
+      # rather than shipping unverified because someone forgot a line.
+      # The `files: dist/ai-memory*` glob below then publishes the
+      # checksums for free. Output shape is sha256sum's `<hash>  <name>`,
+      # matching the existing SBOM/iOS/Android assets and install.sh's
+      # `awk '{ print $1 }'` extraction.
+      #
+      # EXCLUDED: the bare `ai-memory` binary that the packaging step leaves
+      # in dist/. It is NOT architecture-qualified, so all four matrix legs
+      # publish an asset of that same name and overwrite each other. A
+      # checksum for it could be raced against a different leg's binary, and
+      # a WRONG checksum is worse than none. No installer path fetches it
+      # (install.sh fetches the arch-qualified archive). Tracked separately.
+      # ------------------------------------------------------------------
+      - name: Checksum every release artifact  # checksum-sweep (#2449)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          emitted=0
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.sha256)          continue ;;
+              ai-memory)         echo "::notice::skipping checksum for non-arch-qualified '$f' (collides across matrix legs)"; continue ;;
+            esac
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+            emitted=$((emitted + 1))
+          done
+          # Fail loudly rather than publishing a release with no checksums:
+          # a sweep that silently emitted nothing would be the exact
+          # "reports success when it did nothing" defect #2449 is about.
+          if [ "$emitted" -eq 0 ]; then
+            echo "::error::checksum sweep produced nothing - refusing to publish unverifiable artifacts"
+            exit 1
+          fi
+          echo "checksummed ${emitted} artifact(s)"
+          ls -la
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ai-memory-${{ matrix.target }}
+          path: dist/ai-memory*
+
+      - name: Attest build provenance (release binaries + packages)
+        # #2487 — additive to the existing sha256 checksums (never a
+        # replacement): a Rekor-logged, OIDC-bound attestation naming
+        # workflow + repo + commit SHA over every released artifact in
+        # dist/ (tarball/zip + deb + rpm). Consumers verify with
+        # `gh attestation verify <file> --repo alphaonedev/ai-memory-mcp`.
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: 'dist/ai-memory*'
+
+      - name: Resolve release-body file (per-tag override, optional)
+        id: release_body
+        shell: bash
+        run: |
+          # v0.6.4 introduced the per-tag release-body convention. The
+          # file lives at .github/release-body-<tag>.md and carries the
+          # polished GitHub release page copy.
+          path=".github/release-body-${TAG}.md"
+          if [[ -f "$path" ]]; then
+            echo "body_path=$path" >> "$GITHUB_OUTPUT"
+            echo "::notice::release body sourced from $path"
+          else
+            echo "body_path=" >> "$GITHUB_OUTPUT"
+            echo "::notice::no release-body file at $path — falling back to auto-generated notes"
+          fi
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: dist/ai-memory*
+          body_path: ${{ steps.release_body.outputs.body_path }}
+          generate_release_notes: ${{ steps.release_body.outputs.body_path == '' }}
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --------------------------------------------------------------------
+  # #1973 (v1.0 supply-chain, epic #1940) - CycloneDX SBOM per release.
+  #
+  # Emits a standalone CycloneDX JSON Software Bill of Materials via
+  # cargo-cyclonedx, a CI-installed release-workflow tool (NOT a
+  # Cargo.toml dependency; never linked into the shipped binary) per
+  # the 2x5 ruling fad215c5 / #1951 - the repo's operator-gated-
+  # dependency / no-external-code-injection rule permits a pinned,
+  # cargo-installed tool used only at release time.
+  #
+  # The SBOM enumerates every resolved dependency in Cargo.lock (name,
+  # version, purl, declared license); SHA-256 is present only for
+  # registry (crates.io) dependencies because Cargo.lock carries no
+  # hash for git/path deps. This is an inventory, not an assurance -
+  # it lists what is in the dependency graph and vouches for none of
+  # it. `cargo audit` (RustSec) remains the substrate's vulnerability
+  # gate; the SBOM is for compliance/procurement tooling to ingest.
+  #
+  # SOURCE_DATE_EPOCH is pinned to the tagged commit's own timestamp so
+  # the emitted metadata.timestamp (and any other clock-derived bytes)
+  # are byte-stable across re-runs of the same tag - this is the
+  # byte-stability lever this cargo-cyclonedx version exposes; the
+  # component list itself is already a deterministic function of the
+  # locked (and already-committed) dependency graph, so there is no
+  # separate sort step to run.
+  # --------------------------------------------------------------------
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: [preflight, supply-chain]
+    runs-on: ubuntu-latest
+    # #2487 — OIDC-bound Sigstore provenance for the CycloneDX SBOM
+    # artifact (same mechanism as the release-binary job above).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.98.0
+        # Pin to rust-toolchain.toml (1.98.0) so cargo-cyclonedx reads
+        # the same Cargo.lock / MSRV-compatible metadata every other
+        # release job builds against.
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: sbom-${{ needs.preflight.outputs.tag }}
+
+      - name: Install cargo-cyclonedx (pinned version, CI tool only)
+        # Pinned per #1973 (2x5 ruling fad215c5): a cargo-installed
+        # release-workflow tool is acceptable here; it is never added
+        # to Cargo.toml and never compiled into the shipped binary.
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Generate CycloneDX SBOM (JSON)
+        run: |
+          set -euo pipefail
+          # Pin the emitted timestamp to the tagged commit's own
+          # timestamp (HEAD is already checked out at the release tag)
+          # so the SBOM is byte-stable across re-runs of the same tag.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          cargo cyclonedx --format json
+          mkdir -p dist
+          cp ai-memory.cdx.json dist/
+          cd dist
+          sha256sum ai-memory.cdx.json > ai-memory.cdx.json.sha256
+          ls -la ai-memory.cdx.json*
+
+      - name: Attest build provenance (CycloneDX SBOM)
+        # #2487 — additive to the sha256 above.
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: 'dist/ai-memory.cdx.json'
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: |
+            dist/ai-memory.cdx.json
+            dist/ai-memory.cdx.json.sha256
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (for cross-job inspection)
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ai-memory-sbom
+          path: dist/ai-memory.cdx.json*
+
+  # --------------------------------------------------------------------
+  # v0.7.0 Posture-1a (issue #1068) — iOS xcframework artifact.
+  #
+  # Produces `ai-memory-ios.xcframework.tar.gz` containing a multi-arch
+  # `.xcframework` directory that an iOS app can drop into its Xcode
+  # project. The xcframework bundles three slices:
+  #
+  #   1. `aarch64-apple-ios`        → real iOS devices (iPhone, iPad)
+  #   2. `aarch64-apple-ios-sim`    → Simulator on Apple-silicon Macs
+  #   3. `x86_64-apple-ios`         → Simulator on Intel Macs
+  #
+  # Each slice is a `libai_memory.a` static library. They are combined
+  # via `xcodebuild -create-xcframework` (Apple's official tool for
+  # multi-arch FFI distribution; replaces the older "fat .a"
+  # convention that Xcode 13+ rejects).
+  #
+  # The C header is generated via `cbindgen` against `cbindgen.toml`
+  # at the repo root. Until `#[no_mangle] extern "C"` items land in
+  # `src/lib.rs` (Layer 2 v0.7.x follow-up), the header is a stub —
+  # the xcframework still produces correctly, and downstream
+  # consumers can declare the FFI surface by hand against the same
+  # name + crate-type pair.
+  #
+  # Skipped on pre-release tags (`is_prerelease=true`) so dry-run
+  # tag dispatches don't burn ~10 min of macOS runner time.
+  # --------------------------------------------------------------------
+  mobile-ios:
+    name: Mobile artifact (iOS xcframework)
+    needs: [preflight, supply-chain]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: macos-latest
+    # #2487 — OIDC-bound Sigstore provenance for the iOS xcframework
+    # tarball (same mechanism as the release-binary job above).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.98.0 + iOS targets
+        # Pin to rust-toolchain.toml (1.98.0) so the iOS cross-target std
+        # lands on the build toolchain (see release-matrix note above).
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: mobile-ios-${{ needs.preflight.outputs.tag }}
+
+      - name: Install cbindgen
+        run: cargo install --locked cbindgen
+
+      - name: Build static libraries (release, --features sqlite-bundled)
+        run: |
+          set -euo pipefail
+          for TARGET in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+            echo "::group::cargo build --target $TARGET"
+            cargo build \
+              --locked \
+              --release \
+              --target "$TARGET" \
+              --no-default-features \
+              --features sqlite-bundled \
+              --lib
+            echo "::endgroup::"
+            test -f "target/$TARGET/release/libai_memory.a" || {
+              echo "::error::libai_memory.a not produced for $TARGET"
+              ls -la "target/$TARGET/release/" || true
+              exit 1
+            }
+          done
+
+      - name: Generate C header (cbindgen)
+        run: |
+          set -euo pipefail
+          mkdir -p include
+          cbindgen --config cbindgen.toml --crate ai-memory --output include/ai_memory.h
+          echo "--- include/ai_memory.h ---"
+          head -50 include/ai_memory.h
+
+      - name: Assemble .xcframework
+        run: |
+          set -euo pipefail
+          mkdir -p dist/headers
+          cp include/ai_memory.h dist/headers/
+          # Apple requires a module map alongside the umbrella header
+          # so Swift can `import AiMemory` directly. Minimal map —
+          # one module, one header, no submodule mapping.
+          cat > dist/headers/module.modulemap <<'MODULEMAP'
+          framework module AiMemory {
+              umbrella header "ai_memory.h"
+              export *
+          }
+          MODULEMAP
+          # The two simulator slices (arm64-sim + x86_64-sim) are the same
+          # platform-variant; -create-xcframework rejects them as separate
+          # -library args ("equivalent library definitions"). lipo them into
+          # one fat simulator lib first, then pass device + fat-sim.
+          mkdir -p target/ios-sim-universal/release
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libai_memory.a \
+            target/x86_64-apple-ios/release/libai_memory.a \
+            -output target/ios-sim-universal/release/libai_memory.a
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers \
+            -library target/ios-sim-universal/release/libai_memory.a -headers dist/headers \
+            -output dist/AiMemory.xcframework
+          ls -la dist/AiMemory.xcframework/
+
+      - name: Tar + sha256 the xcframework
+        run: |
+          set -euo pipefail
+          cd dist
+          tar czf ai-memory-ios.xcframework.tar.gz AiMemory.xcframework
+          shasum -a 256 ai-memory-ios.xcframework.tar.gz > ai-memory-ios.xcframework.tar.gz.sha256
+          ls -la ai-memory-ios.xcframework.tar.gz*
+
+      - name: Attest build provenance (iOS xcframework)
+        # #2487 — additive to the sha256 above.
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: 'dist/ai-memory-ios.xcframework.tar.gz'
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: |
+            dist/ai-memory-ios.xcframework.tar.gz
+            dist/ai-memory-ios.xcframework.tar.gz.sha256
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (for cross-job inspection)
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ai-memory-ios-xcframework
+          path: dist/ai-memory-ios.xcframework.tar.gz*
+
+  # --------------------------------------------------------------------
+  # v0.7.0 Posture-1a (issue #1068) — Android AAR-compatible artifact.
+  #
+  # Produces `ai-memory-android.tar.gz` containing a `jniLibs/<abi>/`
+  # directory tree that maps 1:1 onto Android Gradle's AAR layout. An
+  # Android app can either:
+  #   - drop the unpacked directory into its `src/main/jniLibs/`, OR
+  #   - consume the `.aar` published in the follow-up Maven artifact.
+  #
+  # Four ABIs match the Android Architectures the v0.7.0 Posture-1a
+  # row supports:
+  #
+  #   * `aarch64-linux-android`        → arm64-v8a   (modern devices)
+  #   * `armv7-linux-androideabi`      → armeabi-v7a (older devices, ~5%)
+  #   * `x86_64-linux-android`         → x86_64      (emulator on x64)
+  #   * `i686-linux-android`           → x86         (legacy emulators)
+  #
+  # The Android NDK clang toolchain is pointed at via CC_*/AR_* env
+  # vars so the rusqlite bundled SQLite C blob links against the
+  # Android sysroot, not the host's glibc.
+  # --------------------------------------------------------------------
+  mobile-android:
+    name: Mobile artifact (Android AAR-compatible)
+    needs: [preflight, supply-chain]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    # #2487 — OIDC-bound Sigstore provenance for the Android JNI tarball
+    # (same mechanism as the release-binary job above).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.98.0 + Android targets
+        # Pin to rust-toolchain.toml (1.98.0) so the Android cross-target
+        # std lands on the build toolchain (see release-matrix note above).
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: mobile-android-${{ needs.preflight.outputs.tag }}
+
+      - name: Install Android NDK r26d
+        id: setup-ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Configure NDK toolchain envs (all 4 ABIs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # min-sdk 24 (Android 7.0+). Same floor as the cross-compile
+          # gate in ci.yml.
+          {
+            echo "CC_aarch64_linux_android=$TC/aarch64-linux-android24-clang"
+            echo "CXX_aarch64_linux_android=$TC/aarch64-linux-android24-clang++"
+            echo "AR_aarch64_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android24-clang"
+            echo "CC_armv7_linux_androideabi=$TC/armv7a-linux-androideabi24-clang"
+            echo "CXX_armv7_linux_androideabi=$TC/armv7a-linux-androideabi24-clang++"
+            echo "AR_armv7_linux_androideabi=$TC/llvm-ar"
+            echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$TC/armv7a-linux-androideabi24-clang"
+            echo "CC_x86_64_linux_android=$TC/x86_64-linux-android24-clang"
+            echo "CXX_x86_64_linux_android=$TC/x86_64-linux-android24-clang++"
+            echo "AR_x86_64_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$TC/x86_64-linux-android24-clang"
+            echo "CC_i686_linux_android=$TC/i686-linux-android24-clang"
+            echo "CXX_i686_linux_android=$TC/i686-linux-android24-clang++"
+            echo "AR_i686_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_I686_LINUX_ANDROID_LINKER=$TC/i686-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+
+      - name: Build .so for each ABI
+        run: |
+          set -euo pipefail
+          declare -A ABI_OF=(
+            [aarch64-linux-android]=arm64-v8a
+            [armv7-linux-androideabi]=armeabi-v7a
+            [x86_64-linux-android]=x86_64
+            [i686-linux-android]=x86
+          )
+          mkdir -p dist/aar/jniLibs
+          for TARGET in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
+            ABI="${ABI_OF[$TARGET]}"
+            echo "::group::cargo build --target $TARGET ($ABI)"
+            cargo build \
+              --locked \
+              --release \
+              --target "$TARGET" \
+              --no-default-features \
+              --features sqlite-bundled \
+              --lib
+            echo "::endgroup::"
+            mkdir -p "dist/aar/jniLibs/$ABI"
+            cp "target/$TARGET/release/libai_memory.so" "dist/aar/jniLibs/$ABI/"
+          done
+          ls -la dist/aar/jniLibs/*/
+
+      - name: Tar + sha256 the AAR-compatible bundle
+        run: |
+          set -euo pipefail
+          # Drop a minimal AndroidManifest.xml stub alongside the jniLibs
+          # tree so the archive maps 1:1 onto AGP's expected layout.
+          # The real manifest is supplied by the consuming app; this is
+          # informational so `tar tf` makes the layout self-describing.
+          cat > dist/aar/README.md <<'README'
+          # ai-memory Android JNI bundle (v0.7.0 Posture-1a, issue #1068)
+
+          Drop the `jniLibs/` directory into your Android app at:
+
+              src/main/jniLibs/
+
+          Or unpack into a Gradle module's `src/main/jniLibs/` (the
+          standard AGP layout). Four ABIs are bundled:
+
+          - `arm64-v8a/libai_memory.so`   — modern devices
+          - `armeabi-v7a/libai_memory.so` — older devices
+          - `x86_64/libai_memory.so`      — emulator on x64
+          - `x86/libai_memory.so`         — legacy emulators
+
+          The C-callable FFI surface itself lands in a v0.7.x follow-up
+          (#1068 Layer 2 wrap-up); v0.7.0 ships the BUILD pipeline +
+          artifact layout. Until the FFI surface is declared, link the
+          .so into a JNI wrapper that calls a stub `Java_*` entry point.
+          README
+          cd dist
+          tar czf ai-memory-android.tar.gz aar/
+          shasum -a 256 ai-memory-android.tar.gz > ai-memory-android.tar.gz.sha256
+          ls -la ai-memory-android.tar.gz*
+
+      - name: Attest build provenance (Android JNI bundle)
+        # #2487 — additive to the sha256 above.
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: 'dist/ai-memory-android.tar.gz'
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: |
+            dist/ai-memory-android.tar.gz
+            dist/ai-memory-android.tar.gz.sha256
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (for cross-job inspection)
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ai-memory-android-aar
+          path: dist/ai-memory-android.tar.gz*
+
+  # --------------------------------------------------------------------
+  # crates.io publish (stable releases only).
+  # --------------------------------------------------------------------
+  crates-io:
+    name: Publish to crates.io
+    needs: [preflight, release]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        # #2895 — pin the publish toolchain to the same 1.98.0 every other
+        # release + verification job uses (was bare `@stable`, an unpinned,
+        # moving compiler on the one job that mints the crates.io artifact).
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+
+      - name: Publish to crates.io (with retry)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # #2895 — `--locked` (build the crate against the COMMITTED Cargo.lock)
+          # and NO `--allow-dirty`. The checkout is at the release tag, so the
+          # tree is already clean; `--allow-dirty` only ever masked a tree that
+          # DIVERGED from the committed source, which is exactly what a
+          # supply-chain gate must not paper over on the publish path.
+          for attempt in 1 2 3; do
+            if output=$(cargo publish --locked 2>&1); then
+              echo "::notice::crates.io publish succeeded on attempt $attempt"
+              echo "$output" | tail -10
+              exit 0
+            fi
+            echo "$output" | tail -20
+            if echo "$output" | grep -q "already exists\|crate version .* is already uploaded"; then
+              echo "::notice::crates.io: version already published (idempotent no-op)"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::crates.io publish failed on attempt $attempt — retrying after 30s"
+              sleep 30
+            fi
+          done
+          echo "::error::crates.io publish failed on all 3 attempts"
+          exit 1
+
+  # --------------------------------------------------------------------
+  # Homebrew tap formula update (stable releases only).
+  # --------------------------------------------------------------------
+  homebrew:
+    name: Update Homebrew formula
+    needs: [preflight, release]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+
+      # #2449 - the hash pinned into the Homebrew formula is now CROSS-CHECKED
+      # against the published .sha256 rather than simply being whatever this
+      # job happened to download.
+      #
+      # Previously this step ran `curl -sL` (note: no `-f`, so an HTTP error
+      # body was saved as if it were the tarball), hashed the result, and
+      # pinned that hash into the formula. The formula therefore attested to
+      # the bytes THIS JOB received, not to the bytes the release publishes -
+      # so a corrupted or substituted download would have been faithfully
+      # pinned as authoritative, and every subsequent `brew install` would
+      # have verified against it successfully. Now that the release job
+      # publishes a .sha256 for every artifact, the two can be compared, and
+      # any disagreement fails the job instead of minting a formula.
+      - name: Download release assets, verify, and pin SHA256
+        id: sha
+        run: |
+          set -euo pipefail
+          VERSION=${{ steps.version.outputs.version }}
+          BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
+
+          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            ASSET="ai-memory-${TARGET}.tar.gz"
+            # -f so an HTTP error page can never be mistaken for the tarball.
+            curl -fsSL -o "$ASSET" "${BASE}/${ASSET}"
+            curl -fsSL -o "${ASSET}.sha256" "${BASE}/${ASSET}.sha256"
+
+            EXPECTED=$(awk 'NR == 1 { print $1 }' "${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
+            ACTUAL=$(sha256sum "$ASSET" | cut -d' ' -f1)
+
+            if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::${ASSET}.sha256 does not contain a valid SHA-256 digest"
+              exit 1
+            fi
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to mint a Homebrew formula"
+              exit 1
+            fi
+
+            SAFE=$(echo "$TARGET" | tr '-' '_')
+            echo "sha_${SAFE}=${ACTUAL}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: alphaonedev/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          cat > homebrew-tap/Formula/ai-memory.rb << 'FORMULA_EOF'
+          class AiMemory < Formula
+            desc "AI-agnostic persistent memory system — MCP server, HTTP API, and CLI"
+            homepage "https://alphaonedev.github.io/ai-memory-mcp/"
+            version "VERSION_PLACEHOLDER"
+            license "Apache-2.0"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_AARCH64_APPLE_DARWIN"
+              else
+                url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_X86_64_APPLE_DARWIN"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_AARCH64_UNKNOWN_LINUX_GNU"
+              else
+                url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_X86_64_UNKNOWN_LINUX_GNU"
+              end
+            end
+
+            def install
+              bin.install "ai-memory"
+            end
+
+            def caveats
+              <<~EOS
+                To use with an MCP-compatible AI (Claude Code, Codex CLI, Gemini CLI, OpenClaw, etc.),
+                add to your AI platform's MCP config:
+
+                  {
+                    "mcpServers": {
+                      "memory": {
+                        "command": "ai-memory",
+                        "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+                      }
+                    }
+                  }
+
+                Documentation: https://alphaonedev.github.io/ai-memory-mcp/
+              EOS
+            end
+
+            test do
+              system "#{bin}/ai-memory", "stats", "--json", "--db", testpath/"test.db"
+            end
+          end
+          FORMULA_EOF
+
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_x86_64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_aarch64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_X86_64_APPLE_DARWIN/${{ steps.sha.outputs.sha_x86_64_apple_darwin }}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${{ steps.sha.outputs.sha_aarch64_apple_darwin }}/" homebrew-tap/Formula/ai-memory.rb
+
+      - name: Push updated formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ai-memory.rb
+          git commit -m "Update ai-memory to ${{ steps.version.outputs.version }}"
+          git push
+
+  # --------------------------------------------------------------------
+  # Docker image push to GHCR (stable releases only).
+  # --------------------------------------------------------------------
+  docker:
+    name: Docker (GHCR)
+    needs: [preflight, supply-chain]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # #2487 — OIDC-bound Sigstore provenance for the GHCR image, the
+      # container-registry form of the same mechanism the SDK OIDC jobs use.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/ai-memory:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/ai-memory:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Attest build provenance (Docker image)
+        # #2487 — pins the attestation to the pushed image digest and
+        # attaches it to GHCR. Consumers verify with
+        # `gh attestation verify oci://ghcr.io/alphaonedev/ai-memory:<ver> \
+        #    --repo alphaonedev/ai-memory-mcp`.
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/ai-memory
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # --------------------------------------------------------------------
+  # Fedora COPR source-RPM upload (stable releases only).
+  # --------------------------------------------------------------------
+  copr:
+    name: Fedora COPR
+    needs: [preflight, release]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install copr-cli
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          # #3090/#2960 — bounded, retried, fail-LOUD apt install (mirrors the
+          # postgresql-client hardening #3091). The old bare
+          # `apt-get update && apt-get install -y pipx` could hang on a stalled
+          # apt mirror until the job timeout fired. No external Action added.
+          apt_ok=0
+          for attempt in 1 2; do
+            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y pipx; then
+              apt_ok=1; break
+            fi
+            echo "apt pipx attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${apt_ok}" = 1 ] || { echo "::error::pipx install failed"; exit 1; }
+          pipx ensurepath
+          pipx install copr-cli
+          pipx inject copr-cli rich
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure copr-cli
+        run: |
+          mkdir -p ~/.config
+          echo "${{ secrets.COPR_CONFIG }}" > ~/.config/copr
+
+      - name: Install RPM build tools
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # #3090/#2960 — bounded, retried, fail-LOUD apt install (mirrors the
+          # postgresql-client hardening #3091). No external Action added.
+          apt_ok=0
+          for attempt in 1 2; do
+            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y rpm; then
+              apt_ok=1; break
+            fi
+            echo "apt rpm attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${apt_ok}" = 1 ] || { echo "::error::rpm install failed"; exit 1; }
+          rpm --version
+
+      - name: Build source RPM
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p ~/rpmbuild/{SOURCES,SPECS,SRPMS}
+
+          # #2449 - verify each tarball against its published .sha256 before
+          # it is baked into the SRPM.
+          #
+          # These are the SAME two prebuilt tarballs install.sh downloads, and
+          # ai-memory.spec consumes them as Source0/Source1 with no %prep-stage
+          # verification of its own - so whatever bytes land here are what
+          # every `dnf install` from the COPR repo ultimately executes, with no
+          # chain of custody back to the GitHub release. The previous
+          # `curl -sL` also lacked `-f`, so an HTTP error body would have been
+          # packaged as if it were the binary.
+          BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
+          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            ASSET="ai-memory-${TARGET}.tar.gz"
+            curl -fsSL -o ~/rpmbuild/SOURCES/"$ASSET" "${BASE}/${ASSET}"
+            curl -fsSL -o ~/rpmbuild/SOURCES/"${ASSET}.sha256" "${BASE}/${ASSET}.sha256"
+
+            EXPECTED=$(awk 'NR == 1 { print $1 }' ~/rpmbuild/SOURCES/"${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
+            ACTUAL=$(sha256sum ~/rpmbuild/SOURCES/"$ASSET" | cut -d' ' -f1)
+
+            if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::${ASSET}.sha256 does not contain a valid SHA-256 digest"
+              exit 1
+            fi
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to build an SRPM"
+              exit 1
+            fi
+            # The .sha256 is not a spec Source, so keep SOURCES/ clean.
+            rm -f ~/rpmbuild/SOURCES/"${ASSET}.sha256"
+          done
+
+          if [[ "$VERSION" == *-* ]]; then
+            RPM_VERSION="${VERSION%%-*}"
+            PRE="${VERSION#*-}"
+            PRE_TAG="${PRE//./}"
+            RPM_RELEASE="0.1.${PRE_TAG}%{?dist}"
+          else
+            RPM_VERSION="$VERSION"
+            RPM_RELEASE="1%{?dist}"
+          fi
+          echo "RPM Version: $RPM_VERSION"
+          echo "RPM Release: $RPM_RELEASE"
+
+          sed -e "s/^Version:.*/Version:        ${RPM_VERSION}/" \
+              -e "s/^Release:.*/Release:        ${RPM_RELEASE}/" \
+              ai-memory.spec > ~/rpmbuild/SPECS/ai-memory.spec
+
+          rpmbuild -bs ~/rpmbuild/SPECS/ai-memory.spec \
+            --define "_sourcedir $HOME/rpmbuild/SOURCES" \
+            --define "_srcrpmdir $HOME/rpmbuild/SRPMS"
+
+          ls -la ~/rpmbuild/SRPMS/
+
+      - name: Upload to COPR
+        run: |
+          copr-cli build alpha-one-ai/ai-memory ~/rpmbuild/SRPMS/ai-memory-*.src.rpm

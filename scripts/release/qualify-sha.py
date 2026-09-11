@@ -104,7 +104,7 @@ def gh_pages(endpoint: str, key: str) -> list[dict]:
 
 
 def evaluate(contexts, check_runs, workflow_runs, carriers, sha):
-    """Return (ok, table_rows). table_rows: (context, verdict, detail)."""
+    """Return (ok, rows, ignored): rows are (context, verdict, detail)."""
     suite_to_run = {}
     for run in workflow_runs:
         if run.get("head_sha") and run["head_sha"] != sha:
@@ -113,7 +113,8 @@ def evaluate(contexts, check_runs, workflow_runs, carriers, sha):
         wf_file = path.rsplit("/", 1)[-1]
         suite_to_run[run.get("check_suite_id")] = (wf_file, run.get("event", ""), run.get("id"))
 
-    # context -> list of (run_key, attempt_order_key, conclusion)
+    # context -> {check_suite_id: (attempt order, conclusion, run)}; one entry
+    # per workflow run, holding that run's latest attempt only.
     per_context: dict[str, dict] = {c: {} for c in contexts}
     ignored = 0
     for cr in check_runs:
