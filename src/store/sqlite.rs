@@ -244,24 +244,21 @@ fn link_owner_of(m: &Memory) -> String {
 /// constructs a store — so a future reader does not mistake this arm
 /// for a whole-crate chokepoint.
 ///
-/// SEMANTICS — deliberately sqlite's OWN contract, not postgres's.
+/// SEMANTICS — the ONE cross-backend unstamped-row policy (#3124).
 /// This delegates to the canonical, shared
 /// [`crate::visibility::caller_owns_for_mutation`] predicate — the same
 /// one every MCP mutate tool uses (`mcp::tools::{update, delete, promote,
 /// link, kg_invalidate}`) and the twin of the HTTP
-/// `require_caller_owns_memory` carve-out set (src/handlers/parity.rs).
-/// So an UNSTAMPED row (no `metadata.agent_id`: legacy / pre-v0.6.3 /
-/// migrated) stays MUTABLE, which is what keeps the single-operator
-/// default — where rows may carry no stamp at all — working.
-///
-/// This is NOT the postgres #1628 posture, which REFUSES unstamped rows.
-/// Adopting that here would turn today-writable legacy rows into
-/// permanently inaccessible ones for every non-admin caller — a data-loss
-/// mode — and it would be a posture tightening, which a parity change must
-/// not ship silently. Sqlite therefore stays internally consistent
-/// (HTTP == MCP == SAL); unifying the two BACKENDS (stamp legacy rows via
-/// migration, then refuse everywhere) is the cross-backend policy decision
-/// tracked in #3124 — do NOT tighten this arm here ahead of that issue.
+/// `require_caller_owns_memory` gate (src/handlers/parity.rs). An
+/// UNSTAMPED row (no / null / `""` `metadata.agent_id`: legacy /
+/// pre-v0.6.3 / migrated) is decided by `AI_MEMORY_UNSTAMPED_MUTATION`:
+/// admitted with a WARN + counter under `warn` (the default, and this
+/// arm's pre-#3124 outcome — refusing outright would turn today-writable
+/// legacy rows into inaccessible ones, the data-loss mode the #3115 panel
+/// rejected), refused under `refuse`. A MALFORMED (non-string) owner is
+/// never matched. Postgres's own #1412/#1628 funnels keep refusing an
+/// unstamped row in both postures — `warn` never loosens a funnel that
+/// already refused; under `refuse` the two backends agree on every funnel.
 ///
 /// `allow_inbox` mirrors the established per-verb convention exactly:
 /// `false` for update/promote (an inbox recipient must not rewrite the
@@ -283,6 +280,7 @@ fn assert_caller_owns_for_mutation(
     id: &str,
     action: &str,
     allow_inbox: bool,
+    funnel: &'static str,
 ) -> StoreResult<()> {
     if ctx.bypass_visibility {
         return Ok(());
@@ -291,18 +289,27 @@ fn assert_caller_owns_for_mutation(
         return Err(StoreError::NotFound { id: id.to_string() });
     };
     let caller = ctx.effective_principal();
-    if crate::visibility::caller_owns_for_mutation(&target, caller, allow_inbox) {
+    if crate::visibility::caller_owns_for_mutation(
+        &target,
+        caller,
+        allow_inbox,
+        crate::identity::owner_stamp::MutationSite::sqlite(funnel),
+    ) {
         return Ok(());
     }
-    let owner = target
-        .metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let stamp = crate::identity::owner_stamp::OwnerStamp::of(&target.metadata);
+    let reason = if stamp.is_unstamped() {
+        // #3124 — `AI_MEMORY_UNSTAMPED_MUTATION=refuse`: the same stable
+        // reason the postgres twin carries for an unstamped row.
+        crate::identity::owner_stamp::REASON_UNSTAMPED_REFUSED.to_string()
+    } else {
+        let owner = stamp.owner_for_display();
+        format!("caller {caller:?} does not own memory (owner: {owner:?})")
+    };
     Err(StoreError::PermissionDenied {
         action: action.to_string(),
         target: id.to_string(),
-        reason: format!("caller {caller:?} does not own memory (owner: {owner:?})"),
+        reason,
     })
 }
 
@@ -720,7 +727,14 @@ impl MemoryStore for SqliteStore {
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity).
         // Inbox carve-out DISABLED for update, mirroring the HTTP
         // `update_memory` / MCP `memory_update` convention.
-        assert_caller_owns_for_mutation(&conn, ctx, id, "update", false)?;
+        assert_caller_owns_for_mutation(
+            &conn,
+            ctx,
+            id,
+            "update",
+            false,
+            crate::identity::owner_stamp::funnel::UPDATE,
+        )?;
         // v0.7.0 Provenance Gap 2 (#906) — thread the patch's
         // `source_uri` slot into `update_with_expected_version` so the
         // sqlite SAL adapter honors source_uri rewrites end-to-end.
@@ -810,7 +824,14 @@ impl MemoryStore for SqliteStore {
         // Inbox carve-out ENABLED for delete: the addressed recipient may
         // delete a message sent to it, mirroring HTTP `delete_memory` /
         // MCP `memory_delete`.
-        assert_caller_owns_for_mutation(&conn, ctx, id, "delete", true)?;
+        assert_caller_owns_for_mutation(
+            &conn,
+            ctx,
+            id,
+            "delete",
+            true,
+            crate::identity::owner_stamp::funnel::DELETE,
+        )?;
         let removed = db::delete(&conn, id).map_err(box_err)?;
         if removed {
             Ok(())
@@ -2864,8 +2885,9 @@ impl MemoryStore for SqliteStore {
         // disposition holds: the row stays live and the handler reports
         // `missing`. A 403 would be an existence oracle. Operator lanes
         // (`ctx.bypass_visibility`) skip the gate. The predicate is the
-        // same four-way SQL as `db::archive_memory_for_caller` (#940) so
-        // a nested `BEGIN` is never opened inside this outer tx.
+        // ONE #3124 owner predicate shared with `db::archive_memory_for_caller`
+        // (`db::caller_may_mutate_live_row`, a plain read) so a nested
+        // `BEGIN` is never opened inside this outer tx.
         let owns_tx = conn.is_autocommit();
         let write_txn = if owns_tx {
             Some(crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?)
@@ -2884,21 +2906,15 @@ impl MemoryStore for SqliteStore {
                     // live (the caller saw a smaller `moved` count with no
                     // error), while the postgres twin was hardened the
                     // opposite way in the same commit — the two adapters
-                    // disagreed on probe-error disposition. `COUNT(*) > 0`
-                    // always returns exactly one row, so the only `Err` here
-                    // is a genuine backend fault, which must roll the whole
-                    // batch back (the closure returns `anyhow::Result`).
-                    let owned: bool = conn.query_row(
-                        "SELECT COUNT(*) > 0 FROM memories \
-                         WHERE id = ?1 \
-                           AND ( \
-                             json_extract(metadata, '$.agent_id') = ?2 OR \
-                             json_extract(metadata, '$.target_agent_id') = ?2 OR \
-                             json_extract(metadata, '$.agent_id') IS NULL OR \
-                             json_extract(metadata, '$.agent_id') = '' \
-                           )",
-                        rusqlite::params![id, caller],
-                        |r| r.get(0),
+                    // disagreed on probe-error disposition. The probe maps a
+                    // missing row to `Ok(false)`, so the only `Err` here is a
+                    // genuine backend fault, which must roll the whole batch
+                    // back (the closure returns `anyhow::Result`).
+                    let owned = db::caller_may_mutate_live_row(
+                        &conn,
+                        id,
+                        &caller,
+                        crate::identity::owner_stamp::funnel::ARCHIVE,
                     )?;
                     if !owned {
                         continue;

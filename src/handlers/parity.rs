@@ -502,6 +502,11 @@ mod require_caller_owns_memory_tests {
     use crate::models::{ConfidenceSource, Memory, MemoryKind, Tier};
     use serde_json::json;
 
+    const SITE: crate::identity::owner_stamp::MutationSite =
+        crate::identity::owner_stamp::MutationSite::sqlite(
+            crate::identity::owner_stamp::funnel::UPDATE,
+        );
+
     fn mem_with(metadata: serde_json::Value) -> Memory {
         Memory {
             cid: None,
@@ -540,27 +545,60 @@ mod require_caller_owns_memory_tests {
     #[test]
     fn owner_passes() {
         let mem = mem_with(json!({"agent_id": "alice"}));
-        assert!(require_caller_owns_memory(&mem, "alice", false).is_none());
+        assert!(require_caller_owns_memory(&mem, "alice", false, SITE).is_none());
     }
 
     #[test]
     fn non_owner_blocked() {
         let mem = mem_with(json!({"agent_id": "alice"}));
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_some());
+        assert!(require_caller_owns_memory(&mem, "bob", false, SITE).is_some());
+    }
+
+    /// #3124 rule (e) census — the pre-#3124 pin: an unstamped row passes
+    /// the HTTP gate. It is the `warn` (default) posture; the `refuse` twin
+    /// below is the single cross-backend policy's other half.
+    #[test]
+    fn legacy_unowned_passes() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::Warn;
+        let mem = mem_with(json!({}));
+        assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
+        let mem = mem_with(json!({"agent_id": ""}));
+        assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
     }
 
     #[test]
-    fn legacy_unowned_passes() {
+    fn legacy_unowned_refused_under_refuse_3124() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::Refuse;
+        for meta in [
+            json!({}),
+            json!({"agent_id": ""}),
+            json!({"agent_id": null}),
+        ] {
+            let mem = mem_with(meta);
+            assert!(
+                require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Refuse).is_some()
+            );
+        }
+        // The daemon pass-through is pre-existing and posture-independent.
         let mem = mem_with(json!({}));
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_none());
-        let mem = mem_with(json!({"agent_id": ""}));
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_none());
+        assert!(
+            require_caller_owns_memory_with_mode(&mem, "daemon", false, SITE, Refuse).is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_owner_refused_in_both_postures_3124() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::{Refuse, Warn};
+        let mem = mem_with(json!({"agent_id": 42}));
+        for mode in [Warn, Refuse] {
+            assert!(require_caller_owns_memory_with_mode(&mem, "42", false, SITE, mode).is_some());
+        }
     }
 
     #[test]
     fn daemon_passes() {
         let mem = mem_with(json!({"agent_id": "alice"}));
-        assert!(require_caller_owns_memory(&mem, "daemon", false).is_none());
+        assert!(require_caller_owns_memory(&mem, "daemon", false, SITE).is_none());
     }
 
     #[test]
@@ -571,7 +609,7 @@ mod require_caller_owns_memory_tests {
         }));
         // allow_inbox = true (DELETE case): bob is the inbox target,
         // permitted to consume the message.
-        assert!(require_caller_owns_memory(&mem, "bob", true).is_none());
+        assert!(require_caller_owns_memory(&mem, "bob", true, SITE).is_none());
     }
 
     #[test]
@@ -582,7 +620,7 @@ mod require_caller_owns_memory_tests {
         }));
         // allow_inbox = false (UPDATE/PROMOTE case): bob may NOT
         // mutate alice's row even though he's the inbox target.
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_some());
+        assert!(require_caller_owns_memory(&mem, "bob", false, SITE).is_some());
     }
 
     #[test]
@@ -592,7 +630,7 @@ mod require_caller_owns_memory_tests {
             "target_agent_id": "carol",
         }));
         // bob is neither owner nor inbox target.
-        assert!(require_caller_owns_memory(&mem, "bob", true).is_some());
+        assert!(require_caller_owns_memory(&mem, "bob", true, SITE).is_some());
     }
 }
 
@@ -604,15 +642,18 @@ mod require_caller_owns_memory_tests {
 /// returns `Some(403 Forbidden response)` when ownership fails —
 /// caller short-circuits with `return` on the `Some` branch.
 ///
-/// **Carve-outs (preserved verbatim from the inline sites the helper
-/// replaces):**
-/// - `owner.is_empty()` → unowned/legacy row falls through to caller
-///   (legacy-unowned carve-out used across the codebase).
+/// The decision is the ONE mutation predicate
+/// ([`crate::identity::owner_stamp::metadata_admits_mutation`], #3124) plus
+/// the pre-existing sqlite `daemon` pass-through:
+/// - an UNSTAMPED row (missing / null / `""` `agent_id`) is admitted with a
+///   WARN + counter under `AI_MEMORY_UNSTAMPED_MUTATION=warn` (the default —
+///   the pre-#3124 legacy-unowned carve-out) and refused under `refuse`;
+/// - a MALFORMED (non-string) `agent_id` is never matched or admitted;
 /// - `caller == "daemon"` → daemon-origin path exempt; the audit
 ///   chain captures the daemon-origin write via signed_events.
-/// - `allow_inbox && metadata.target_agent_id == caller` → the
-///   sender-stamped inbox carve-out from the DELETE handler. Only
-///   the recipient of an inbox message may delete it; passing
+/// - `allow_inbox && metadata.target_agent_id == caller` on a row that is
+///   not unstamped → the sender-stamped inbox carve-out from the DELETE
+///   handler. Only the recipient of an inbox message may delete it; passing
 ///   `allow_inbox = false` disables this carve-out for handlers
 ///   (update / promote) where the inbox target should NOT be able
 ///   to mutate someone else's row.
@@ -620,46 +661,64 @@ mod require_caller_owns_memory_tests {
 /// **Wire shape on rejection.** `403 Forbidden` with body
 /// `{"error": "caller does not own this memory", "owner": "<owner>",
 /// "caller": "<caller>"}` — matches the inline-site shape so test
-/// expectations + audit grep patterns remain valid.
+/// expectations + audit grep patterns remain valid. An unstamped refusal
+/// additionally carries `"reason"` naming the `reown` remedy (additive).
 #[must_use]
 pub fn require_caller_owns_memory(
     mem: &Memory,
     caller: &str,
     allow_inbox: bool,
+    site: crate::identity::owner_stamp::MutationSite,
 ) -> Option<axum::response::Response> {
-    let owner = mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if owner.is_empty() || owner == caller || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+    require_caller_owns_memory_with_mode(
+        mem,
+        caller,
+        allow_inbox,
+        site,
+        crate::identity::owner_stamp::mode(),
+    )
+}
+
+/// [`require_caller_owns_memory`] under an explicit unstamped-row posture —
+/// the seam unit tests use to pin both postures without touching the
+/// process environment.
+#[must_use]
+pub(crate) fn require_caller_owns_memory_with_mode(
+    mem: &Memory,
+    caller: &str,
+    allow_inbox: bool,
+    site: crate::identity::owner_stamp::MutationSite,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> Option<axum::response::Response> {
+    use crate::identity::owner_stamp::{OwnerStamp, REASON_UNSTAMPED_REFUSED};
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+        || crate::identity::owner_stamp::metadata_admits_mutation_with_mode(
+            &mem.metadata,
+            &mem.id,
+            caller,
+            allow_inbox,
+            site,
+            mode,
+        )
     {
         return None;
     }
-    if allow_inbox {
-        let target = mem
-            .metadata
-            .get("target_agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !target.is_empty() && target == caller {
-            return None;
-        }
-    }
+    let stamp = OwnerStamp::of(&mem.metadata);
+    let owner = stamp.owner_for_display();
     tracing::warn!(
         target: super::AUTHZ_TRACE_TARGET,
         "ownership-gate 403: caller {caller} != owner {owner} (id={})",
         mem.id
     );
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "caller does not own this memory",
-                "owner": owner,
-                "caller": caller,
-            })),
-        )
-            .into_response(),
-    )
+    let mut body = json!({
+        "error": "caller does not own this memory",
+        "owner": owner,
+        "caller": caller,
+    });
+    if stamp.is_unstamped()
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert("reason".to_string(), json!(REASON_UNSTAMPED_REFUSED));
+    }
+    Some((StatusCode::FORBIDDEN, Json(body)).into_response())
 }

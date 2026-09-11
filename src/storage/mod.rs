@@ -5654,6 +5654,48 @@ pub fn undo_in_place_edit(
     })
 }
 
+/// v1.0.0 #3124 — the by-id caller-scoped mutation admission for the sqlite
+/// ARCHIVE funnels ([`archive_memory_for_caller`] and the SAL
+/// `archive_by_ids`). Reads the live row's `metadata` and applies the ONE
+/// predicate ([`crate::identity::owner_stamp::metadata_admits_mutation`],
+/// inbox carve-out enabled — the recipient may archive a message addressed to
+/// it), replacing the pre-#3124 four-way SQL arm whose unstamped disjunct
+/// ignored the posture knob. `Ok(false)` for a missing id or unparseable
+/// metadata (never admitted — a row whose owner cannot be read is not
+/// provably the caller's). A read fault propagates (ERRORS-19, #3296).
+///
+/// # Errors
+///
+/// Propagates the owner-probe query failure.
+pub(crate) fn caller_may_mutate_live_row(
+    conn: &Connection,
+    id: &str,
+    caller: &str,
+    funnel: &'static str,
+) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let metadata: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(metadata) = metadata else {
+        return Ok(false);
+    };
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata) else {
+        return Ok(false);
+    };
+    Ok(crate::identity::owner_stamp::metadata_admits_mutation(
+        &metadata,
+        id,
+        caller,
+        true,
+        crate::identity::owner_stamp::MutationSite::sqlite(funnel),
+    ))
+}
+
 /// #940 (security-high, 2026-05-20) — caller-scoped archive variant.
 /// Mirrors [`archive_memory`] but constrains the soft-move to rows
 /// in the live `memories` table whose `metadata->'agent_id'` JSON
@@ -5686,22 +5728,15 @@ pub fn archive_memory_for_caller(
     let reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
     let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<bool> {
-        // Owner gate: row must exist AND match the caller (or be an
-        // inbox-target row whose recipient is the caller).
-        let owned: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories \
-                 WHERE id = ?1 \
-                   AND ( \
-                     json_extract(metadata, '$.agent_id') = ?2 OR \
-                     json_extract(metadata, '$.target_agent_id') = ?2 OR \
-                     json_extract(metadata, '$.agent_id') IS NULL OR \
-                     json_extract(metadata, '$.agent_id') = '' \
-                   )",
-                params![id, caller],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
+        // Owner gate: row must exist AND be mutable by the caller under the
+        // ONE #3124 predicate (owner, or inbox recipient of a stamped row, or
+        // an unstamped row admitted by `AI_MEMORY_UNSTAMPED_MUTATION`).
+        let owned = caller_may_mutate_live_row(
+            conn,
+            id,
+            caller,
+            crate::identity::owner_stamp::funnel::ARCHIVE,
+        )?;
         if !owned {
             return Ok(false);
         }
@@ -5967,6 +6002,62 @@ pub fn forget_distinct_namespaces(
     Ok(rows)
 }
 
+/// v1.0.0 #3124 — the caller-scoped OWNER predicate for every forget-by-filter
+/// SQL arm: `(col.agent_id = ?{idx} [OR <unstamped>])`. The unstamped arm (a
+/// missing / JSON-null / `''` owner — the ONE definition,
+/// [`crate::identity::owner_stamp::sqlite_unstamped_predicate`]) is present
+/// only under `AI_MEMORY_UNSTAMPED_MUTATION=warn`, so under `refuse` the
+/// preview, the count, the purge/tombstone set, the archive copy and the
+/// DELETE all shrink to the caller's OWN rows together. A malformed
+/// (non-string) owner never equals the text caller parameter.
+fn sql_owner_predicate(
+    col: &str,
+    idx: usize,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> String {
+    format!(
+        "(json_extract({col},'$.agent_id') = ?{idx}{})",
+        crate::identity::owner_stamp::sqlite_unstamped_arm(col, mode)
+    )
+}
+
+/// v1.0.0 #3124 — count the UNSTAMPED rows a caller-scoped forget-by-filter
+/// is about to admit, so `warn` mode can report them (WARN + counter) before
+/// the DELETE. Same filter as the forget arms minus the owner clause (under
+/// `warn` every unstamped row matching the filter is in the victim set).
+fn forget_unstamped_victim_count(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+) -> Result<u64> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let count: i64 = if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat)?;
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memories_fts fts JOIN memories m ON m.rowid = fts.rowid \
+                 WHERE memories_fts MATCH ?1 AND (?2 IS NULL OR m.namespace = ?2) \
+                 AND (?3 IS NULL OR m.tier = ?3) AND {}",
+                crate::identity::owner_stamp::sqlite_unstamped_predicate("m.metadata")
+            ),
+            params![fts_query, namespace, tier_str],
+            |r| r.get(0),
+        )?
+    } else {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1) \
+                 AND (?2 IS NULL OR tier = ?2) AND {}",
+                crate::identity::owner_stamp::sqlite_unstamped_predicate("metadata")
+            ),
+            params![namespace, tier_str],
+            |r| r.get(0),
+        )?
+    };
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
 /// leaks (`federation_push_dlq` cleartext payload, `transcript_line_dedup`
 /// content-hash oracle) for the rows a forget is about to delete. MUST run
@@ -5991,6 +6082,7 @@ fn purge_and_tombstone_forget(
     tier: Option<&Tier>,
     caller: Option<&str>,
     now: &str,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
 ) -> Result<()> {
     let tier_str = tier.map(|t| t.as_str().to_string());
     let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -6005,11 +6097,10 @@ fn purge_and_tombstone_forget(
         );
         if let Some(c) = caller {
             bound.push(Box::new(c.to_string()));
-            q.push_str(
-                " AND (json_extract(m.metadata,'$.agent_id') = ?4 \
-                 OR json_extract(m.metadata,'$.agent_id') IS NULL \
-                 OR json_extract(m.metadata,'$.agent_id') = '')",
-            );
+            q.push_str(&format!(
+                " AND {}",
+                sql_owner_predicate("m.metadata", 4, mode)
+            ));
         }
         q
     } else {
@@ -6021,11 +6112,10 @@ fn purge_and_tombstone_forget(
         );
         if let Some(c) = caller {
             bound.push(Box::new(c.to_string()));
-            q.push_str(
-                " AND (json_extract(metadata,'$.agent_id') = ?3 \
-                 OR json_extract(metadata,'$.agent_id') IS NULL \
-                 OR json_extract(metadata,'$.agent_id') = '')",
-            );
+            q.push_str(&format!(
+                " AND {}",
+                sql_owner_predicate("metadata", 3, mode)
+            ));
         }
         q
     };
@@ -6841,6 +6931,8 @@ pub fn forget(
             tier,
             None,
             &Utc::now().to_rfc3339(),
+            // No caller → no owner clause; the posture is irrelevant.
+            crate::identity::owner_stamp::UnstampedMutationMode::Warn,
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
@@ -6974,6 +7066,7 @@ pub fn forget_count_for_caller(
     tier: Option<&Tier>,
     caller: &str,
 ) -> Result<usize> {
+    let mode = crate::identity::owner_stamp::mode();
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -6984,16 +7077,17 @@ pub fn forget_count_for_caller(
         let fts_query = forget_fts_query(pat)?;
         let tier_str = tier.map(|t| t.as_str().to_string());
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE rowid IN (
+            &format!(
+                "SELECT COUNT(*) FROM memories WHERE rowid IN (
                 SELECT m.rowid FROM memories_fts fts
                 JOIN memories m ON m.rowid = fts.rowid
                 WHERE memories_fts MATCH ?1
                   AND (?2 IS NULL OR m.namespace = ?2)
                   AND (?3 IS NULL OR m.tier = ?3)
-                  AND (json_extract(m.metadata,'$.agent_id') = ?4
-                       OR json_extract(m.metadata,'$.agent_id') IS NULL
-                       OR json_extract(m.metadata,'$.agent_id') = '')
+                  AND {}
             )",
+                sql_owner_predicate("m.metadata", 4, mode)
+            ),
             params![fts_query, namespace, tier_str, caller],
             |r| r.get(0),
         )?;
@@ -7001,11 +7095,12 @@ pub fn forget_count_for_caller(
     }
     let tier_str = tier.map(|t| t.as_str().to_string());
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+        &format!(
+            "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1)
            AND (?2 IS NULL OR tier = ?2)
-           AND (json_extract(metadata,'$.agent_id') = ?3
-                OR json_extract(metadata,'$.agent_id') IS NULL
-                OR json_extract(metadata,'$.agent_id') = '')",
+           AND {}",
+            sql_owner_predicate("metadata", 3, mode)
+        ),
         params![namespace, tier_str, caller],
         |r| r.get(0),
     )?;
@@ -7031,19 +7126,19 @@ pub fn forget_distinct_namespaces_for_caller(
     tier: Option<&Tier>,
     caller: &str,
 ) -> Result<Vec<String>> {
+    let mode = crate::identity::owner_stamp::mode();
     let tier_str = tier.map(|t| t.as_str().to_string());
     if let Some(pat) = pattern {
         let fts_query = forget_fts_query(pat)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT DISTINCT m.namespace
              FROM memories_fts fts
              JOIN memories m ON m.rowid = fts.rowid
              WHERE memories_fts MATCH ?1
                AND (?2 IS NULL OR m.tier = ?2)
-               AND (json_extract(m.metadata,'$.agent_id') = ?3
-                    OR json_extract(m.metadata,'$.agent_id') IS NULL
-                    OR json_extract(m.metadata,'$.agent_id') = '')",
-        )?;
+               AND {}",
+            sql_owner_predicate("m.metadata", 3, mode)
+        ))?;
         let rows = stmt
             .query_map(params![fts_query, tier_str, caller], |r| {
                 r.get::<_, String>(0)
@@ -7051,13 +7146,12 @@ pub fn forget_distinct_namespaces_for_caller(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         return Ok(rows);
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT namespace FROM memories
          WHERE (?1 IS NULL OR tier = ?1)
-           AND (json_extract(metadata,'$.agent_id') = ?2
-                OR json_extract(metadata,'$.agent_id') IS NULL
-                OR json_extract(metadata,'$.agent_id') = '')",
-    )?;
+           AND {}",
+        sql_owner_predicate("metadata", 2, mode)
+    ))?;
     let rows = stmt
         .query_map(params![tier_str, caller], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -7078,6 +7172,7 @@ pub fn forget_matches_for_caller(
     limit: usize,
     caller: &str,
 ) -> Result<Vec<ForgetMatch>> {
+    let mode = crate::identity::owner_stamp::mode();
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — same refusal as `forget` / `forget_count`.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -7096,19 +7191,18 @@ pub fn forget_matches_for_caller(
     };
     if let Some(pat) = pattern {
         let fts_query = forget_fts_query(pat)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT m.id, m.title, m.namespace, m.tier
              FROM memories_fts fts
              JOIN memories m ON m.rowid = fts.rowid
              WHERE memories_fts MATCH ?1
                AND (?2 IS NULL OR m.namespace = ?2)
                AND (?3 IS NULL OR m.tier = ?3)
-               AND (json_extract(m.metadata,'$.agent_id') = ?5
-                    OR json_extract(m.metadata,'$.agent_id') IS NULL
-                    OR json_extract(m.metadata,'$.agent_id') = '')
+               AND {}
              ORDER BY m.rowid
              LIMIT ?4",
-        )?;
+            sql_owner_predicate("m.metadata", 5, mode)
+        ))?;
         let rows = stmt
             .query_map(
                 params![fts_query, namespace, tier_str, limit_i64, caller],
@@ -7117,15 +7211,14 @@ pub fn forget_matches_for_caller(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         return Ok(rows);
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, title, namespace, tier FROM memories
          WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
-           AND (json_extract(metadata,'$.agent_id') = ?4
-                OR json_extract(metadata,'$.agent_id') IS NULL
-                OR json_extract(metadata,'$.agent_id') = '')
+           AND {}
          ORDER BY rowid
          LIMIT ?3",
-    )?;
+        sql_owner_predicate("metadata", 4, mode)
+    ))?;
     let rows = stmt
         .query_map(
             params![namespace, tier_str, limit_i64, caller],
@@ -7159,12 +7252,30 @@ pub fn forget_for_caller(
         }));
     }
 
+    // #3124 — ONE posture for the whole statement set (preview-equivalent
+    // archive copy, purge/tombstone set and DELETE all use the same `mode`).
+    let mode = crate::identity::owner_stamp::mode();
+
     // #1776 — archive + delete MUST be ONE atomic transaction (see [`forget`]
     // for the full rationale). The owner clause (#1772) is pinned to the
     // identical row set across the archive SELECT and the DELETE because the
     // `BEGIN IMMEDIATE` write lock is held for the whole transaction.
     let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<usize> {
+        // #3124 — under `warn` report the unstamped rows this forget admits
+        // (WARN + counter); under `refuse` the owner predicate excludes them.
+        if !mode.refuses() {
+            let unstamped = forget_unstamped_victim_count(conn, namespace, pattern, tier)?;
+            let _admitted = crate::identity::owner_stamp::admit_unstamped_rows(
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::FORGET,
+                ),
+                namespace.unwrap_or("*"),
+                caller,
+                unstamped,
+                mode,
+            );
+        }
         if archive {
             // Archive matching memories before deletion.
             let now = Utc::now().to_rfc3339();
@@ -7172,7 +7283,7 @@ pub fn forget_for_caller(
                 let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR REPLACE INTO archived_memories
+                    &format!("INSERT OR REPLACE INTO archived_memories
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
@@ -7200,16 +7311,14 @@ pub fn forget_for_caller(
                         WHERE memories_fts MATCH ?1
                           AND (?2 IS NULL OR m.namespace = ?2)
                           AND (?3 IS NULL OR m.tier = ?3)
-                          AND (json_extract(m.metadata,'$.agent_id') = ?5
-                               OR json_extract(m.metadata,'$.agent_id') IS NULL
-                               OR json_extract(m.metadata,'$.agent_id') = '')
-                     )",
+                          AND {}
+                     )", sql_owner_predicate("m.metadata", 5, mode)),
                     params![fts_query, namespace, tier_str, now, caller],
                 )?;
             } else {
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR REPLACE INTO archived_memories
+                    &format!("INSERT OR REPLACE INTO archived_memories
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
@@ -7233,9 +7342,7 @@ pub fn forget_for_caller(
                     cid, cid_genesis
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1)
                        AND (?2 IS NULL OR tier = ?2)
-                       AND (json_extract(metadata,'$.agent_id') = ?4
-                            OR json_extract(metadata,'$.agent_id') IS NULL
-                            OR json_extract(metadata,'$.agent_id') = '')",
+                       AND {}", sql_owner_predicate("metadata", 4, mode)),
                     params![namespace, tier_str, now, caller],
                 )?;
             }
@@ -7252,7 +7359,8 @@ pub fn forget_for_caller(
                 let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR IGNORE INTO archived_memory_links
+                    &format!(
+                        "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
                           observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
@@ -7265,9 +7373,7 @@ pub fn forget_for_caller(
                             WHERE memories_fts MATCH ?1
                               AND (?2 IS NULL OR m.namespace = ?2)
                               AND (?3 IS NULL OR m.tier = ?3)
-                              AND (json_extract(m.metadata,'$.agent_id') = ?5
-                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
-                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                              AND {}
                         )
                         OR ml.target_id IN (
                             SELECT m.id FROM memories_fts fts
@@ -7275,16 +7381,18 @@ pub fn forget_for_caller(
                             WHERE memories_fts MATCH ?1
                               AND (?2 IS NULL OR m.namespace = ?2)
                               AND (?3 IS NULL OR m.tier = ?3)
-                              AND (json_extract(m.metadata,'$.agent_id') = ?5
-                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
-                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                              AND {}
                         )",
+                        sql_owner_predicate("m.metadata", 5, mode),
+                        sql_owner_predicate("m.metadata", 5, mode)
+                    ),
                     params![fts_query, namespace, tier_str, now, caller],
                 )?;
             } else {
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR IGNORE INTO archived_memory_links
+                    &format!(
+                        "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
                           observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
@@ -7294,17 +7402,16 @@ pub fn forget_for_caller(
                      WHERE ml.source_id IN (
                             SELECT id FROM memories
                             WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
-                              AND (json_extract(metadata,'$.agent_id') = ?4
-                                   OR json_extract(metadata,'$.agent_id') IS NULL
-                                   OR json_extract(metadata,'$.agent_id') = '')
+                              AND {}
                         )
                         OR ml.target_id IN (
                             SELECT id FROM memories
                             WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
-                              AND (json_extract(metadata,'$.agent_id') = ?4
-                                   OR json_extract(metadata,'$.agent_id') IS NULL
-                                   OR json_extract(metadata,'$.agent_id') = '')
+                              AND {}
                         )",
+                        sql_owner_predicate("metadata", 4, mode),
+                        sql_owner_predicate("metadata", 4, mode)
+                    ),
                     params![namespace, tier_str, now, caller],
                 )?;
             }
@@ -7321,6 +7428,7 @@ pub fn forget_for_caller(
             tier,
             Some(caller),
             &Utc::now().to_rfc3339(),
+            mode,
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
@@ -7331,26 +7439,28 @@ pub fn forget_for_caller(
             let fts_query = forget_fts_query(pat)?;
             let tier_str = tier.map(|t| t.as_str().to_string());
             conn.execute(
-                "DELETE FROM memories WHERE rowid IN (
+                &format!(
+                    "DELETE FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
                     WHERE memories_fts MATCH ?1
                       AND (?2 IS NULL OR m.namespace = ?2)
                       AND (?3 IS NULL OR m.tier = ?3)
-                      AND (json_extract(m.metadata,'$.agent_id') = ?4
-                           OR json_extract(m.metadata,'$.agent_id') IS NULL
-                           OR json_extract(m.metadata,'$.agent_id') = '')
+                      AND {}
                 )",
+                    sql_owner_predicate("m.metadata", 4, mode)
+                ),
                 params![fts_query, namespace, tier_str, caller],
             )
         } else {
             let tier_str = tier.map(|t| t.as_str().to_string());
             conn.execute(
-                "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                &format!(
+                    "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1)
                    AND (?2 IS NULL OR tier = ?2)
-                   AND (json_extract(metadata,'$.agent_id') = ?3
-                        OR json_extract(metadata,'$.agent_id') IS NULL
-                        OR json_extract(metadata,'$.agent_id') = '')",
+                   AND {}",
+                    sql_owner_predicate("metadata", 3, mode)
+                ),
                 params![namespace, tier_str, caller],
             )
         }
@@ -16208,6 +16318,26 @@ const SQL_ARCHIVE_LIST_PROJECTION: &str = "SELECT id, tier, namespace, title, co
      atomised_into, atom_of, mentioned_entity_id \
      FROM archived_memories";
 
+/// v1.0.0 #3124 — the archive ownership prefilter for the RESTORE mutation.
+/// Under `AI_MEMORY_UNSTAMPED_MUTATION=warn` it is byte-identical to the
+/// read-side [`archive_owner_scope_clause`] (the pre-#3124 contract); under
+/// `refuse` it drops the unstamped arms and confines the inbox arm to a
+/// STAMPED row (an unstamped row is not an addressed inbox row), so the
+/// prefilter agrees with the ONE Rust predicate the restore re-checks.
+fn archive_owner_mutation_clause(
+    idx: usize,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> String {
+    if !mode.refuses() {
+        return archive_owner_scope_clause(idx);
+    }
+    let unstamped = crate::identity::owner_stamp::sqlite_unstamped_predicate("metadata");
+    format!(
+        "(json_extract(metadata, '$.agent_id') = ?{idx} OR \
+          (json_extract(metadata, '$.target_agent_id') = ?{idx} AND NOT {unstamped}))"
+    )
+}
+
 /// #3382 archive ownership SQL prefilter; the final read decision also
 /// applies canonical query visibility before pagination or aggregation.
 fn archive_owner_scope_clause(idx: usize) -> String {
@@ -16708,7 +16838,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // require query visibility; restoration keeps its recovery contract.
         let owned_sql = format!(
             "SELECT COUNT(*) > 0 FROM archived_memories WHERE id = ?1 AND {}",
-            archive_owner_scope_clause(2)
+            archive_owner_mutation_clause(2, crate::identity::owner_stamp::mode())
         );
         let owned: bool = conn
             .query_row(&owned_sql, params![id, caller], |r| r.get(0))
@@ -16775,7 +16905,14 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // caller context); ownership gating already happened on the
         // SELECT above.
         let candidate = load_archived_as_memory(conn, id)?;
-        if !crate::visibility::caller_owns_for_mutation(&candidate, caller, true) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &candidate,
+            caller,
+            true,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::RESTORE,
+            ),
+        ) {
             return Ok(false);
         }
         consult_governance_pre_write(&candidate)?;
@@ -17263,7 +17400,7 @@ fn archive_row_readable(
     };
     Ok(
         crate::visibility::is_readable_on_query(&memory, caller, namespace)
-            && caller.is_none_or(|c| crate::visibility::caller_owns_for_mutation(&memory, c, true)),
+            && caller.is_none_or(|c| crate::visibility::legacy_owner_admits_read(&memory, c, true)),
     )
 }
 

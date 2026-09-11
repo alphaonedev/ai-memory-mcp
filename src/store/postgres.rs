@@ -7931,8 +7931,8 @@ impl PostgresStore {
     /// cannot slip between probe and INSERT/DELETE (item 4). On the
     /// autocommit pool (update/delete) the lock releases at statement
     /// end — same TOCTOU those verbs already had.
-    const SQL_SELECT_OWNER_AGENT_ID_BY_ID: &'static str = "SELECT metadata->>'agent_id', metadata->>'target_agent_id' \
-         FROM memories WHERE id = $1 FOR UPDATE";
+    const SQL_SELECT_OWNER_AGENT_ID_BY_ID: &'static str = "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
+         metadata->>'target_agent_id' FROM memories WHERE id = $1 FOR UPDATE";
 
     /// #1412 caller-owns mutation gate shared by the tenant-facing
     /// write paths: the trait `update`, the trait `delete`, and the
@@ -7997,31 +7997,41 @@ impl PostgresStore {
         }
         // ERRORS-01: probe failure is Result, never unwrap. CONCURRENCY-20:
         // sqlx executor, no std Mutex held across await.
-        let row: Option<(Option<String>, Option<String>)> =
+        let row: Option<(Option<String>, Option<String>, Option<String>)> =
             sqlx::query_as(Self::SQL_SELECT_OWNER_AGENT_ID_BY_ID)
                 .bind(id)
                 .fetch_optional(executor)
                 .await
                 .map_err(|e| to_store_err(&format!("{action}: pre-fetch owner"), e))?;
-        let Some((owner, inbox)) = row else {
+        let Some((owner_type, owner, inbox)) = row else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
-        let existing_owner = owner.unwrap_or_default();
+        // #3124 — the ONE definition: `jsonb_typeof` separates an unstamped
+        // row from a malformed (non-string) stamp, which `->>` would render
+        // as text and let a caller of the same spelling match.
+        let stamp = crate::identity::owner_stamp::OwnerStamp::of_pg(
+            owner_type.as_deref(),
+            owner.as_deref(),
+        );
         let inbox_target = inbox.unwrap_or_default();
         let caller = ctx.effective_principal();
-        if existing_owner.is_empty() {
-            // Unstamped: pg #3124 REFUSE (row stays live). Inbox-target
-            // does not override — a missing owner stamp is not an
-            // addressed inbox row.
+        if stamp.is_unstamped() {
+            // Unstamped: REFUSED on these #1412/#1628 funnels in BOTH
+            // `AI_MEMORY_UNSTAMPED_MUTATION` postures — `warn` never loosens a
+            // funnel that already refused (#3124 R1). Inbox-target does not
+            // override — a missing owner stamp is not an addressed inbox row.
             return Err(StoreError::PermissionDenied {
                 action: action.to_string(),
                 target: id.to_string(),
                 reason: unstamped_reason.to_string(),
             });
         }
-        if existing_owner == caller || (allow_inbox && inbox_target == caller) {
+        if stamp.is_owned_by(caller)
+            || (allow_inbox && !inbox_target.is_empty() && inbox_target == caller)
+        {
             return Ok(());
         }
+        let existing_owner = stamp.owner_for_display();
         Err(StoreError::PermissionDenied {
             action: action.to_string(),
             target: id.to_string(),
@@ -13100,25 +13110,41 @@ impl PostgresStore {
         // so the later FK pre-flight still names the missing memory
         // (an owner-gate 403 on a missing id would be an existence
         // oracle).
-        let source_row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT namespace, metadata->>'agent_id', metadata->>'target_agent_id' \
-             FROM memories WHERE id = $1 FOR UPDATE",
-        )
-        .bind(&link.source_id)
-        .fetch_optional(owner_exec)
-        .await
-        .map_err(|e| to_store_err("resolve link source namespace", e))?;
+        // #3124 — the owner stamp is classified by the ONE definition
+        // (`jsonb_typeof` tells an unstamped row from a malformed one).
+        let source_row: Option<(String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT namespace, jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
+                 metadata->>'target_agent_id' \
+                 FROM memories WHERE id = $1 FOR UPDATE",
+            )
+            .bind(&link.source_id)
+            .fetch_optional(owner_exec)
+            .await
+            .map_err(|e| to_store_err("resolve link source namespace", e))?;
         if !ctx.bypass_visibility
-            && let Some((_, ref owner, ref inbox)) = source_row
+            && let Some((_, ref owner_type, ref owner, ref inbox)) = source_row
         {
-            let source_owner = owner.as_deref().unwrap_or("");
+            let stamp = crate::identity::owner_stamp::OwnerStamp::of_pg(
+                owner_type.as_deref(),
+                owner.as_deref(),
+            );
+            let source_owner = stamp.owner_for_display();
             let source_inbox = inbox.as_deref().unwrap_or("");
-            let is_unowned_legacy = source_owner.is_empty();
-            if !is_unowned_legacy
-                && source_owner != caller_principal
-                && source_inbox != caller_principal
-                && caller_principal != crate::identity::sentinels::DAEMON_PRINCIPAL
-            {
+            let admitted = caller_principal == crate::identity::sentinels::DAEMON_PRINCIPAL
+                || stamp.is_owned_by(caller_principal)
+                || (!stamp.is_unstamped()
+                    && !source_inbox.is_empty()
+                    && source_inbox == caller_principal)
+                || (stamp.is_unstamped()
+                    && crate::identity::owner_stamp::admit_unstamped(
+                        crate::identity::owner_stamp::MutationSite::postgres(
+                            crate::identity::owner_stamp::funnel::LINK,
+                        ),
+                        &link.source_id,
+                        caller_principal,
+                    ));
+            if !admitted {
                 tracing::warn!(
                     target: crate::handlers::AUTHZ_TRACE_TARGET,
                     "postgres link 403: caller {caller_principal} != source owner \
@@ -13134,7 +13160,7 @@ impl PostgresStore {
         }
         let link_ns = source_row
             .as_ref()
-            .map(|(ns, _, _)| ns.clone())
+            .map(|(ns, _, _, _)| ns.clone())
             .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
         // Pass 0: v0.9.0 G13-mem (#1859) — lineage-DAG acyclicity guard
@@ -30592,34 +30618,64 @@ impl MemoryStore for PostgresStore {
                 // 404 `NOT_FOUND_IN_ARCHIVE`, no oracle. Admin/operator lanes
                 // (`ctx.bypass_visibility`) round-trip regardless of ownership, exactly
                 // as they do on update / delete / archive.
-                let exists: Option<(String,)> = if ctx.bypass_visibility {
-                    sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
+                //
+                // #3124 — the ownership verdict is the ONE cross-backend predicate:
+                // the probe reads the row's owner stamp (typed by `jsonb_typeof`, so a
+                // malformed owner is never mistaken for a stamp OR for unstamped) and
+                // decides in Rust — owner, inbox recipient of a STAMPED row, or an
+                // UNSTAMPED row admitted by `AI_MEMORY_UNSTAMPED_MUTATION` (`warn`, the
+                // pre-#3124 outcome, WARNs + counts; `refuse` refuses). A refusal is
+                // the same `Ok(false)` an absent id gives — still no oracle.
+                // `admit_unstamped_row` feeds the INSERT's defense-in-depth arm so the
+                // write predicate and this verdict cannot disagree.
+                let mut admit_unstamped_row = false;
+                if ctx.bypass_visibility {
+                    let exists: Option<(String,)> =
+                        sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
+                            .bind(id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| to_store_err("archive_restore lookup", e))?;
+                    if exists.is_none() {
+                        return Ok(false);
+                    }
+                } else {
+                    let probe: Option<(Option<String>, Option<String>, Option<String>)> =
+                        sqlx::query_as(
+                            "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
+                             metadata->>'target_agent_id' \
+                             FROM archived_memories WHERE id = $1",
+                        )
                         .bind(id)
                         .fetch_optional(&mut *tx)
                         .await
-                        .map_err(|e| to_store_err("archive_restore lookup", e))?
-                } else {
-                    sqlx::query_as(
-                        // Owner OR inbox-target OR the legacy-unowned carve-out
-                        // (unstamped rows are restorable by anyone — the
-                        // single-operator default; exact parity with the sqlite
-                        // `db::restore_archived_for_caller` #940/#3124 predicate). Only
-                        // a row owned by a DIFFERENT, NAMED agent is refused.
-                        "SELECT id FROM archived_memories \
-                         WHERE id = $1 \
-                           AND (metadata->>'agent_id' = $2 \
-                                OR metadata->>'target_agent_id' = $2 \
-                                OR metadata->>'agent_id' IS NULL \
-                                OR metadata->>'agent_id' = '')",
-                    )
-                    .bind(id)
-                    .bind(ctx.effective_principal())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore owner lookup", e))?
-                };
-                if exists.is_none() {
-                    return Ok(false);
+                        .map_err(|e| to_store_err("archive_restore owner lookup", e))?;
+                    let Some((owner_type, owner, inbox)) = probe else {
+                        return Ok(false);
+                    };
+                    let caller = ctx.effective_principal();
+                    let stamp = crate::identity::owner_stamp::OwnerStamp::of_pg(
+                        owner_type.as_deref(),
+                        owner.as_deref(),
+                    );
+                    let admitted = if stamp.is_unstamped() {
+                        admit_unstamped_row = crate::identity::owner_stamp::admit_unstamped(
+                            crate::identity::owner_stamp::MutationSite::postgres(
+                                crate::identity::owner_stamp::funnel::RESTORE,
+                            ),
+                            id,
+                            caller,
+                        );
+                        admit_unstamped_row
+                    } else {
+                        stamp.is_owned_by(caller)
+                            || inbox
+                                .as_deref()
+                                .is_some_and(|t| !t.is_empty() && t == caller)
+                    };
+                    if !admitted {
+                        return Ok(false);
+                    }
                 }
 
                 // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
@@ -30790,14 +30846,21 @@ impl MemoryStore for PostgresStore {
                       -- v1.0.0 #3271 — owner-predicated write (defense-in-depth with
                       -- the owner probe above; same predicate). $6 bypass
                       -- short-circuits the owner/inbox/legacy arms so operator lanes
-                      -- still round-trip any row. The legacy-unowned carve-out
-                      -- (agent_id NULL / '') keeps unstamped rows restorable, matching
-                      -- the sqlite `db::restore_archived_for_caller` predicate.
+                      -- still round-trip any row. #3124: owner equality is typed
+                      -- (a malformed non-string owner never matches), the inbox arm
+                      -- needs a STAMPED row, and the unstamped arm is live only when
+                      -- the probe's `AI_MEMORY_UNSTAMPED_MUTATION` verdict admitted
+                      -- it ($8) — the same ONE predicate as the sqlite
+                      -- `db::restore_archived_for_caller`.
                       AND ($6::bool
-                           OR metadata->>'agent_id' = $7
-                           OR metadata->>'target_agent_id' = $7
-                           OR metadata->>'agent_id' IS NULL
-                           OR metadata->>'agent_id' = '')",
+                           OR (jsonb_typeof(metadata->'agent_id') = 'string'
+                               AND metadata->>'agent_id' = $7)
+                           OR (metadata->>'target_agent_id' = $7
+                               AND metadata->>'agent_id' IS NOT NULL
+                               AND metadata->>'agent_id' <> '')
+                           OR ($8::bool
+                               AND (metadata->>'agent_id' IS NULL
+                                    OR metadata->>'agent_id' = '')))",
                 )
                 .bind(now)
                 .bind(id)
@@ -30808,6 +30871,8 @@ impl MemoryStore for PostgresStore {
                 .bind(crate::embeddings::active_embedding_space())
                 .bind(ctx.bypass_visibility)
                 .bind(ctx.effective_principal())
+                // #3124 — $8: the probe's unstamped-row verdict.
+                .bind(admit_unstamped_row)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("archive_restore insert", e))?;

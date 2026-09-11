@@ -180,6 +180,11 @@ pub mod equivocation;
 // makes an unproven bind unrepresentable at the storage funnel.
 pub mod pubkey_bind;
 
+// v1.0.0 #3124 — the ONE cross-backend definition of an unstamped
+// (legacy-unowned) row and the `AI_MEMORY_UNSTAMPED_MUTATION` posture knob
+// governing caller-scoped mutations of such rows.
+pub mod owner_stamp;
+
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
 const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
@@ -1035,6 +1040,17 @@ pub const UPDATE_PRESERVED_ATTESTATION_KEYS: [&str; 4] = [
 /// [`UPDATE_PRESERVED_ATTESTATION_KEYS`] from `existing` through a metadata
 /// overwrite (existing-wins), so an attested row keeps its attestation across
 /// `memory_update` / `PUT /memories/{id}` (#3015).
+///
+/// v1.0.0 #3124 (R3) — an update can never WRITE an owner onto a row that has
+/// none. `agent_id` is provenance (immutable after first write), and the
+/// existing-wins copy above only protects a row that already carries the key:
+/// on a row with NO `agent_id` key the caller's `metadata.agent_id` used to
+/// win, so any caller that could mutate an unstamped row (the legacy
+/// carve-out) could silently CLAIM it. The incoming `agent_id` is now dropped
+/// (with a WARN) and the row stays unstamped; claiming is the operator-run
+/// `ai-memory reown` path only. This holds in both
+/// `AI_MEMORY_UNSTAMPED_MUTATION` postures — it closes the claim without
+/// refusing the legacy writer's update.
 #[must_use]
 pub fn preserve_update_provenance_keys(
     existing: &serde_json::Value,
@@ -1046,6 +1062,16 @@ pub fn preserve_update_provenance_keys(
             if let Some(existing_val) = existing.get(key).cloned() {
                 obj.insert(key.to_string(), existing_val);
             }
+        }
+        if existing.get(crate::META_KEY_AGENT_ID).is_none()
+            && let Some(claimed) = obj.remove(crate::META_KEY_AGENT_ID)
+        {
+            tracing::warn!(
+                target: owner_stamp::TRACE_TARGET,
+                claimed = %claimed,
+                "update tried to stamp an owner onto an UNSTAMPED row; the caller-supplied \
+                 metadata.agent_id was dropped (claiming an unowned row is `ai-memory reown` only)"
+            );
         }
     }
     merged
@@ -1586,6 +1612,27 @@ mod tests {
         let merged = preserve_agent_id(&existing, &incoming);
         assert!(merged.is_object());
         assert_eq!(merged["agent_id"], "alice");
+    }
+
+    #[test]
+    fn preserve_update_provenance_keys_never_claims_an_unstamped_row_3124() {
+        // F3: pre-#3124 the caller's agent_id won on a row with no key.
+        let merged = preserve_update_provenance_keys(
+            &serde_json::json!({"note": "legacy"}),
+            &serde_json::json!({"agent_id": "ai:mallory", "note": "edited"}),
+        );
+        assert!(merged.get("agent_id").is_none(), "{merged}");
+        assert_eq!(merged["note"], "edited");
+        // A stamped row keeps its owner (existing-wins, unchanged).
+        let merged = preserve_update_provenance_keys(
+            &serde_json::json!({"agent_id": "ai:alice"}),
+            &serde_json::json!({"agent_id": "ai:mallory"}),
+        );
+        assert_eq!(merged["agent_id"], "ai:alice");
+        // An update that does not name an owner is untouched.
+        let merged =
+            preserve_update_provenance_keys(&serde_json::json!({}), &serde_json::json!({"x": 1}));
+        assert!(merged.get("agent_id").is_none());
     }
 
     #[test]

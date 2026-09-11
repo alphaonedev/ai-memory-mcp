@@ -285,7 +285,14 @@ pub(super) fn handle_update(
         let target = db::get(conn, &resolved_id)
             .map_err(|e| e.to_string())?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
-        if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &target,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::UPDATE,
+            ),
+        ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
     }

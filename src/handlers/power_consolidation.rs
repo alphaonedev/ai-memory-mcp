@@ -179,7 +179,15 @@ async fn gate_consolidate_sources(
         ) {
             return Err(not_found(&mem.id));
         }
-        if !crate::visibility::caller_owns_for_mutation(mem, caller_principal, false) {
+        if !crate::visibility::caller_owns_for_mutation(
+            mem,
+            caller_principal,
+            false,
+            crate::identity::owner_stamp::MutationSite::new(
+                app.storage_backend.as_str(),
+                crate::identity::owner_stamp::funnel::CONSOLIDATE,
+            ),
+        ) {
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY})),
