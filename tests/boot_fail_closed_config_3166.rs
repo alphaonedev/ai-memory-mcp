@@ -545,3 +545,86 @@ fn legacy_home_config_survives_the_xdg_move_3002() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #3603 — AI_MEMORY_NO_CONFIG=1 must not emit the config-path WARNs
+// ---------------------------------------------------------------------------
+
+/// Stderr markers of the three config-path WARNs (`src/config.rs`
+/// `warn_legacy_config_root_once` / `warn_macos_library_config_shadowed_once`
+/// / `warn_macos_library_config_only_once`). Mirrored, not imported, for the
+/// same reason as [`EX_CONFIG`].
+const CONFIG_PATH_WARN_MARKERS: [&str; 3] = [
+    "LEGACY config path",
+    "a second config exists at the platform path",
+    "loading config from the macOS platform path",
+];
+
+/// #3603 — a host carrying the WARN-bearing config-path shape must stay
+/// quiet under `AI_MEMORY_NO_CONFIG=1`: no config is consulted, so there is
+/// nothing to report as shadowed or legacy. Pre-fix, `main` resolved the path
+/// for `write_default_if_missing` regardless of the escape hatch, so every
+/// `NO_CONFIG` child on such a host (f1: both `~/.config` and the Library
+/// file) wrote the WARN to stderr and broke quiet-success contracts
+/// (`capture_turn_cli_3587`).
+///
+/// macOS reproduces the reported shape (documented `~/.config` file PLUS the
+/// Library file); elsewhere the WARN-bearing shape is the #3002 legacy
+/// fallback. The unflagged control run proves the sandbox really triggers
+/// the WARN, so the quiet assertion is not vacuous.
+#[test]
+fn no_config_boot_emits_no_config_path_warn_3603() {
+    let mut sb = Sandbox::new();
+    sb.write_config(&format!(
+        "db = \"{}\"\ntier = \"keyword\"\n",
+        sb.cwd.join("configured.db").display()
+    ));
+    let expected_marker = if cfg!(target_os = "macos") {
+        let library = sb
+            .home
+            .join("Library")
+            .join("Application Support")
+            .join("ai-memory");
+        std::fs::create_dir_all(&library).expect("mkdir Library config dir");
+        std::fs::write(library.join("config.toml"), "tier = \"keyword\"\n")
+            .expect("write Library config");
+        CONFIG_PATH_WARN_MARKERS[1]
+    } else {
+        // An XDG root that exists but carries NO ai-memory config.
+        let xdg = sb.home.parent().expect("sandbox root").join("xdg");
+        std::fs::create_dir_all(&xdg).expect("mkdir xdg root");
+        sb.xdg_root = Some(xdg);
+        CONFIG_PATH_WARN_MARKERS[0]
+    };
+
+    let control = sb.run(&["stats", "--json"], None);
+    assert!(
+        control.status.success(),
+        "control exit={:?} stderr={}",
+        control.status.code(),
+        stderr_of(&control)
+    );
+    assert!(
+        stderr_of(&control).contains(expected_marker),
+        "control: without AI_MEMORY_NO_CONFIG the sandbox must trigger the \
+         config-path WARN, or the quiet assertion below proves nothing; \
+         stderr={}",
+        stderr_of(&control)
+    );
+
+    let quiet = sb.run(&["stats", "--json"], Some("1"));
+    assert!(
+        quiet.status.success(),
+        "exit={:?} stderr={}",
+        quiet.status.code(),
+        stderr_of(&quiet)
+    );
+    let stderr = stderr_of(&quiet);
+    for marker in CONFIG_PATH_WARN_MARKERS {
+        assert!(
+            !stderr.contains(marker),
+            "#3603: AI_MEMORY_NO_CONFIG=1 consults no config, so it must not \
+             emit a config-path WARN ({marker:?}); stderr={stderr}"
+        );
+    }
+}

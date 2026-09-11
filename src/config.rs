@@ -3005,6 +3005,47 @@ struct ConfigPathChoice {
     warning: ConfigPathWarning,
 }
 
+/// #3603 — drop the config-path WARN when `AI_MEMORY_NO_CONFIG` is truthy.
+///
+/// The WARNs report which on-disk config is being LOADED and which is being
+/// ignored. Under the escape hatch no config is loaded at all, so reporting a
+/// shadowed or legacy file is false and, worse, breaks the quiet-success
+/// contract of every child spawned with `AI_MEMORY_NO_CONFIG=1` on a host
+/// that happens to carry two config files. The PATH is unchanged: callers
+/// that name the file still get the same answer.
+fn gate_config_path_warning(choice: ConfigPathChoice, skip_config: bool) -> ConfigPathChoice {
+    if skip_config {
+        ConfigPathChoice {
+            warning: ConfigPathWarning::None,
+            ..choice
+        }
+    } else {
+        choice
+    }
+}
+
+/// #3603 — [`AppConfig::config_path`] minus the side effects: resolve from
+/// the given platform config dir (`dirs::config_dir()` in production) and
+/// `$HOME`, then apply the `AI_MEMORY_NO_CONFIG` gate. The returned
+/// `warning` is exactly what `config_path` emits. Takes its inputs as
+/// parameters so the gate is testable against a real temp tree without
+/// mutating the process environment.
+fn config_path_choice(
+    config_dir: Option<PathBuf>,
+    home: Option<std::ffi::OsString>,
+    skip_config: bool,
+) -> Option<ConfigPathChoice> {
+    let platform = config_dir.map(|base| base.join(CONFIG_APP_DIR).join(CONFIG_FILE));
+    let dotconfig = home.map(|home| Path::new(&home).join(LEGACY_CONFIG_DIR).join(CONFIG_FILE));
+    // #3329 sibling — the platform-parameterised core is unit-tested for
+    // BOTH `is_macos` values (macOS resolution can thus be verified on a
+    // Linux CI host). See [`resolve_config_path_choice`].
+    let choice = resolve_config_path_choice(platform, dotconfig, cfg!(target_os = "macos"), |p| {
+        p.exists()
+    })?;
+    Some(gate_config_path_warning(choice, skip_config))
+}
+
 /// Pure, platform-parameterised core of [`AppConfig::config_path`] (extracted
 /// so the macOS branch is unit-testable ON any host).
 ///
@@ -8102,17 +8143,18 @@ impl AppConfig {
     /// keep honouring the legacy file and WARN once telling the operator to
     /// move it. New installs land at the XDG path (it is what is returned
     /// when neither exists, so `write_default_if_missing` creates it there).
+    ///
+    /// # `AI_MEMORY_NO_CONFIG` (#3603)
+    ///
+    /// Under a truthy [`skip_config`] no config file is consulted, so the
+    /// config-path WARNs (legacy root, shadowed / Library-only macOS config)
+    /// describe a choice nobody is making and are NOT emitted. The path is
+    /// still resolved and returned for the callers that name it (doctor's
+    /// `config_path` fact, `ai-memory config check|migrate`,
+    /// `write_default_if_missing`).
     pub fn config_path() -> Option<PathBuf> {
-        let platform = dirs::config_dir().map(|base| base.join(CONFIG_APP_DIR).join(CONFIG_FILE));
-        let dotconfig = std::env::var_os("HOME")
-            .map(|home| Path::new(&home).join(LEGACY_CONFIG_DIR).join(CONFIG_FILE));
-        // #3329 sibling — the platform-parameterised core is unit-tested for
-        // BOTH `is_macos` values (macOS resolution can thus be verified on a
-        // Linux CI host). See [`resolve_config_path_choice`].
         let choice =
-            resolve_config_path_choice(platform, dotconfig, cfg!(target_os = "macos"), |p| {
-                p.exists()
-            })?;
+            config_path_choice(dirs::config_dir(), std::env::var_os("HOME"), skip_config())?;
         match &choice.warning {
             ConfigPathWarning::None => {}
             ConfigPathWarning::LegacyXdg { legacy, xdg } => {
@@ -11892,6 +11934,132 @@ legacy_scoring = false
     fn no_home_no_platform_resolves_to_none() {
         assert!(resolve_config_path_choice(None, None, true, present(&[])).is_none());
         assert!(resolve_config_path_choice(None, None, false, present(&[])).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #3603 — `AI_MEMORY_NO_CONFIG` silences the config-path WARNs.
+    // -----------------------------------------------------------------------
+
+    /// Every WARN-bearing choice loses its WARN under the gate, and keeps it
+    /// (byte-identical) without the gate. The PATH never changes. Host
+    /// independent: covers the macOS shapes on a Linux leg and vice versa.
+    #[test]
+    fn gate_drops_every_config_path_warning_under_no_config_3603() {
+        let xdg = "/nonstd/xdg/ai-memory/config.toml";
+        let legacy = "/home/x/.config/ai-memory/config.toml";
+        let warned = [
+            resolve_config_path_choice(Some(pb(xdg)), Some(pb(legacy)), false, present(&[legacy])),
+            resolve_config_path_choice(
+                Some(pb(MAC_LIB)),
+                Some(pb(MAC_DOC)),
+                true,
+                present(&[MAC_DOC, MAC_LIB]),
+            ),
+            resolve_config_path_choice(
+                Some(pb(MAC_LIB)),
+                Some(pb(MAC_DOC)),
+                true,
+                present(&[MAC_LIB]),
+            ),
+        ];
+        for choice in warned {
+            let choice = choice.expect("resolves");
+            assert_ne!(
+                choice.warning,
+                ConfigPathWarning::None,
+                "fixture must carry a WARN, or the gate assertion below is vacuous"
+            );
+            let gated = gate_config_path_warning(choice.clone(), true);
+            assert_eq!(gated.warning, ConfigPathWarning::None, "{choice:?}");
+            assert_eq!(gated.path, choice.path, "the gate must not move the path");
+            assert_eq!(gate_config_path_warning(choice.clone(), false), choice);
+        }
+    }
+
+    /// macOS: a temp `$HOME` carrying BOTH the documented `~/.config` file and
+    /// the Library file (the f1 host shape that reddened
+    /// `capture_turn_cli_3587`). With the escape hatch on, the resolver still
+    /// names the documented file but reports no shadow WARN; with it off the
+    /// same tree does report it, so the fixture is proven to reproduce.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_config_silences_shadowed_library_warn_on_real_tree_3603() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let config_dir = home.join("Library").join("Application Support");
+        let documented = home.join(".config").join("ai-memory").join("config.toml");
+        let library = config_dir.join("ai-memory").join("config.toml");
+        for f in [&documented, &library] {
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("mkdir");
+            std::fs::write(f, "tier = \"keyword\"\n").expect("write");
+        }
+
+        let quiet = config_path_choice(
+            Some(config_dir.clone()),
+            Some(home.clone().into_os_string()),
+            true,
+        )
+        .expect("resolves");
+        assert_eq!(quiet.path, documented);
+        assert_eq!(
+            quiet.warning,
+            ConfigPathWarning::None,
+            "#3603: AI_MEMORY_NO_CONFIG consults no config, so no shadow WARN"
+        );
+
+        let loud = config_path_choice(Some(config_dir), Some(home.into_os_string()), false)
+            .expect("resolves");
+        assert_eq!(loud.path, documented);
+        assert_eq!(
+            loud.warning,
+            ConfigPathWarning::MacosLibraryShadowed {
+                documented,
+                library,
+            },
+            "control: without the escape hatch the shadow WARN still fires"
+        );
+    }
+
+    /// Linux/Windows twin: the one WARN-bearing shape off macOS is the #3002
+    /// legacy fallback (`XDG_CONFIG_HOME` root empty, legacy `~/.config` file
+    /// present). When BOTH files exist the XDG file wins with no WARN at all
+    /// (`config_path_prefers_xdg_when_both_exist_3002`), so that shape cannot
+    /// witness the gate.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn no_config_silences_legacy_root_warn_on_real_tree_3603() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg_root = tmp.path().join("xdg");
+        let legacy = home.join(".config").join("ai-memory").join("config.toml");
+        std::fs::create_dir_all(legacy.parent().expect("parent")).expect("mkdir legacy");
+        std::fs::create_dir_all(&xdg_root).expect("mkdir xdg");
+        std::fs::write(&legacy, "tier = \"keyword\"\n").expect("write legacy");
+
+        let quiet = config_path_choice(
+            Some(xdg_root.clone()),
+            Some(home.clone().into_os_string()),
+            true,
+        )
+        .expect("resolves");
+        assert_eq!(quiet.path, legacy);
+        assert_eq!(
+            quiet.warning,
+            ConfigPathWarning::None,
+            "#3603: AI_MEMORY_NO_CONFIG consults no config, so no legacy-root WARN"
+        );
+
+        let loud = config_path_choice(Some(xdg_root.clone()), Some(home.into_os_string()), false)
+            .expect("resolves");
+        assert_eq!(loud.path, legacy);
+        assert_eq!(
+            loud.warning,
+            ConfigPathWarning::LegacyXdg {
+                legacy,
+                xdg: xdg_root.join("ai-memory").join("config.toml"),
+            },
+            "control: without the escape hatch the legacy-root WARN still fires"
+        );
     }
 
     // -----------------------------------------------------------------------
