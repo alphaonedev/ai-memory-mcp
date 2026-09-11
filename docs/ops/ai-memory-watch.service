@@ -1,0 +1,58 @@
+# ai-memory-watch.service — systemd *user* unit template (#3587 U6 PREP)
+#
+# Swarm line-file capture daemon for the Linux host (f2). This file is a
+# copy-and-substitute artifact. Angle-bracket tokens are placeholders;
+# never commit real host paths, principal ids, or store URLs into a
+# tracked copy. Activation (install + enable) stays with the Conductor.
+#
+# Substitute before install:
+#   <binary>     absolute path to the ai-memory binary
+#   <principal>  hardened agent id (same value as AI_MEMORY_AGENT_ID)
+#   <db-path>    sqlite file this process opens (unused when a postgres
+#                store-url file is set; still required by the CLI)
+#   <db-dir>     directory of that sqlite file — the ONLY ReadWritePaths
+#                entry under ProtectSystem=strict
+#   <inbox>      absolute regular file (MASTER inbox / deputy inbox)
+#   <outbox>     absolute regular file (the matching outbox)
+#
+# Install (after substitution): ~/.config/systemd/user/ai-memory-watch.service
+# Runbook: docs/ops/watch-wiring.md
+
+[Unit]
+Description=ai-memory watch — swarm line-file capture daemon
+Documentation=https://github.com/alphaonedev/ai-memory-mcp/issues/3587
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=<binary> --agent-id <principal> --db <db-path> watch --daemon --host file:<inbox> --host file:<outbox>
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=90
+UMask=0077
+Nice=5
+
+# Alternative to --agent-id on argv (same principal; Conductor MCP uses this
+# env on its server entry — keep the two in lockstep):
+# Environment=AI_MEMORY_AGENT_ID=<principal>
+#
+# f1 hive / postgres: point at a 0600 store-url *file*, never a DSN on argv.
+# Requires a binary built with --features sal (sal-postgres for postgres).
+# Environment=AI_MEMORY_STORE_URL_FILE=<store-url-file>
+
+StandardOutput=journal
+StandardError=journal
+
+# --- hardening (U6 PREP contract) ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+# ProtectHome is deliberately unset: inbox/outbox live in the user's tree.
+# ProtectSystem=strict makes /usr /boot /etc read-only; ReadWritePaths is
+# the single write carve-out (the sqlite db directory). Inbox and outbox
+# stay readable because they are not under those read-only prefixes.
+ReadWritePaths=<db-dir>
+
+[Install]
+WantedBy=default.target
