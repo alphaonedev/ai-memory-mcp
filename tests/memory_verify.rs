@@ -166,6 +166,7 @@ fn unsigned_link_reports_unsigned_and_not_verified() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok");
 
@@ -206,6 +207,7 @@ fn self_signed_link_verifies_and_reports_self_signed() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok");
 
@@ -276,6 +278,7 @@ fn tampered_signature_byte_does_not_verify() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok (tampered → false, not Err)");
 
@@ -365,6 +368,7 @@ fn peer_attested_link_verifies_and_reports_peer_attested() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok");
 
@@ -390,8 +394,8 @@ fn link_id_composite_form_resolves_same_link() {
         .expect("create_link_signed");
 
     let composite = format!("{}--related_to-->{}", f.src_id, f.dst_id);
-    let body =
-        mcp::handle_verify(&f.conn, &json!({ "link_id": composite })).expect("handle_verify Ok");
+    let body = mcp::handle_verify(&f.conn, &json!({ "link_id": composite }), None)
+        .expect("handle_verify Ok");
 
     assert_eq!(body["signature_verified"], json!(false));
     assert_eq!(body["attest_level"], json!("unsigned"));
@@ -417,6 +421,7 @@ fn missing_link_returns_err() {
             "target_id": f.dst_id,
             "relation": "supersedes",
         }),
+        None,
     )
     .unwrap_err();
     assert!(

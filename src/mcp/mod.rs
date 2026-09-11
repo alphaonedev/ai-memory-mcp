@@ -840,8 +840,9 @@ pub fn dispatch_handle_link_for_test(
 pub fn dispatch_handle_dependents_for_test(
     conn: &rusqlite::Connection,
     params: &serde_json::Value,
+    caller: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    dependents_of_invalidated::handle_dependents_of_invalidated(conn, params)
+    dependents_of_invalidated::handle_dependents_of_invalidated(conn, params, caller)
 }
 
 /// v0.7.0 (issue #691) — accessor for the stable
@@ -2325,7 +2326,9 @@ fn dispatch_memory_get_taxonomy(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 }
 
 fn dispatch_memory_check_duplicate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_check_duplicate(ctx.conn, ctx.arguments, ctx.embedder)
+    // v1.0.0 #3597 — caller visibility gate on the nearest row (the #947 MCP twin).
+    let caller = ctx.authority.read_caller();
+    handle_check_duplicate(ctx.conn, ctx.arguments, ctx.embedder, caller)
 }
 
 fn dispatch_memory_entity_register(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2333,7 +2336,9 @@ fn dispatch_memory_entity_register(ctx: &ToolDispatchCtx<'_>) -> Result<Value, S
 }
 
 fn dispatch_memory_entity_get_by_alias(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_entity_get_by_alias(ctx.conn, ctx.arguments)
+    // v1.0.0 #3598 — caller visibility gate on the backing entity memory.
+    let caller = ctx.authority.read_caller();
+    handle_entity_get_by_alias(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_kg_timeline(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2461,7 +2466,9 @@ fn dispatch_memory_get_links(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String>
 }
 
 fn dispatch_memory_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_verify(ctx.conn, ctx.arguments)
+    // v1.0.0 #3601 — both link endpoints must be readable by the caller.
+    let caller = ctx.authority.read_caller();
+    handle_verify(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_replay(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2832,7 +2839,9 @@ fn dispatch_memory_rule_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String>
 }
 
 fn dispatch_memory_reflection_origin(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_reflection_origin(ctx.conn, ctx.arguments)
+    // v1.0.0 #3600 — caller visibility gate on the reflection row.
+    let caller = ctx.authority.read_caller();
+    handle_reflection_origin(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_export_reflection(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2840,7 +2849,9 @@ fn dispatch_memory_export_reflection(ctx: &ToolDispatchCtx<'_>) -> Result<Value,
 }
 
 fn dispatch_memory_persona(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_persona(ctx.conn, ctx.arguments)
+    // v1.0.0 #3596 — caller visibility gate on the backing Persona row.
+    let caller = ctx.authority.read_caller();
+    handle_persona(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_persona_generate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2889,7 +2900,9 @@ fn dispatch_memory_calibrate_confidence(ctx: &ToolDispatchCtx<'_>) -> Result<Val
 }
 
 fn dispatch_memory_dependents_of_invalidated(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_dependents_of_invalidated(ctx.conn, ctx.arguments)
+    // v1.0.0 #3599 — every rendered dependent must be readable by the caller.
+    let caller = ctx.authority.read_caller();
+    handle_dependents_of_invalidated(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_skill_register(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

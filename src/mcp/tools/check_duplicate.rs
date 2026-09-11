@@ -16,6 +16,7 @@ pub fn handle_check_duplicate(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let title = params["title"]
         .as_str()
@@ -50,8 +51,31 @@ pub fn handle_check_duplicate(
     // falling through to embedding cosine similarity. Catches byte-
     // identical duplicates that the embedding pipeline would otherwise
     // cap at ~0.92 due to nomic prefix normalisation.
-    let check = db::check_duplicate_with_text(conn, &query_embedding, &text, namespace, threshold)
-        .map_err(|e| e.to_string())?;
+    let mut check =
+        db::check_duplicate_with_text(conn, &query_embedding, &text, namespace, threshold)
+            .map_err(|e| e.to_string())?;
+
+    // v1.0.0 #3597 — mirror the #947 HTTP mask (`handlers::power`): when the
+    // nearest row is one the caller cannot read (`scope=private`, another
+    // owner), drop it AND clear `is_duplicate`, so the duplicate-detection
+    // surface cannot leak the existence, title or similarity of another
+    // tenant's private rows. The predicate names the row's OWN namespace
+    // (the #3549 read-funnel contract); a row that cannot be re-fetched is
+    // HIDDEN (fail closed, the #3232 disposition).
+    if let Some(near) = check.nearest.as_ref() {
+        let visible = match db::get(conn, &near.id) {
+            Ok(Some(full)) => crate::visibility::is_readable_on_query(
+                &full,
+                caller,
+                Some(full.namespace.as_str()),
+            ),
+            Ok(None) | Err(_) => false,
+        };
+        if !visible {
+            check.nearest = None;
+            check.is_duplicate = false;
+        }
+    }
 
     // Round similarity to 3 decimals at the response edge — keeps the
     // JSON readable without leaking the f32's full quantisation noise.
@@ -210,8 +234,13 @@ mod tests {
     #[test]
     fn missing_embedder_refuses() {
         let conn = fresh_conn();
-        let err = handle_check_duplicate(&conn, &json!({"title": "hi", "content": "world"}), None)
-            .unwrap_err();
+        let err = handle_check_duplicate(
+            &conn,
+            &json!({"title": "hi", "content": "world"}),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("requires the embedder"), "got: {err}");
     }
 
@@ -220,7 +249,8 @@ mod tests {
     fn missing_title_errors() {
         let conn = fresh_conn();
         let emb = MockEmbedder::new_local().unwrap();
-        let err = handle_check_duplicate(&conn, &json!({"content": "x"}), Some(&emb)).unwrap_err();
+        let err =
+            handle_check_duplicate(&conn, &json!({"content": "x"}), Some(&emb), None).unwrap_err();
         assert!(err.contains("title"), "got: {err}");
     }
 
@@ -229,7 +259,8 @@ mod tests {
     fn missing_content_errors() {
         let conn = fresh_conn();
         let emb = MockEmbedder::new_local().unwrap();
-        let err = handle_check_duplicate(&conn, &json!({"title": "t"}), Some(&emb)).unwrap_err();
+        let err =
+            handle_check_duplicate(&conn, &json!({"title": "t"}), Some(&emb), None).unwrap_err();
         assert!(err.contains("content"), "got: {err}");
     }
 
@@ -242,6 +273,7 @@ mod tests {
             &conn,
             &json!({"title": "t", "content": "c", "namespace": "has spaces"}),
             Some(&emb),
+            None,
         )
         .unwrap_err();
         assert!(!err.is_empty(), "expected non-empty error");
@@ -256,6 +288,7 @@ mod tests {
             &conn,
             &json!({"title": "first", "content": "the very first memory"}),
             Some(&emb),
+            None,
         )
         .expect("ok");
         assert_eq!(resp["is_duplicate"], false);
@@ -290,6 +323,7 @@ mod tests {
             &conn,
             &json!({"title": title, "content": content}),
             Some(&emb),
+            None,
         )
         .expect("ok");
         assert_eq!(resp["is_duplicate"], true);
@@ -331,6 +365,7 @@ mod tests {
                 "namespace": "test-other",
             }),
             Some(&emb),
+            None,
         )
         .expect("ok");
         // Scoped to a different namespace — must NOT be a duplicate.
@@ -346,6 +381,7 @@ mod tests {
             &conn,
             &json!({"title": "t", "content": "c", "namespace": "   "}),
             Some(&emb),
+            None,
         )
         .expect("ok");
         // Should not error; namespace stripped to None.
@@ -361,11 +397,117 @@ mod tests {
             &conn,
             &json!({"title": "x", "content": "y", "threshold": 0.99}),
             Some(&emb),
+            None,
         )
         .expect("ok");
         let threshold = resp["threshold"].as_f64().unwrap();
         // The hard floor is enforced inside `db::check_duplicate_with_text`,
         // but 0.99 is above the floor so it must survive unchanged.
         assert!((threshold - 0.99).abs() < 0.01, "got {threshold}");
+    }
+}
+
+#[cfg(test)]
+mod authority_gate_3597_tests {
+    //! v1.0.0 #3597 — DENIED / ALLOWED matrix for the `memory_check_duplicate`
+    //! read gate, the MCP twin of the #947 HTTP mask.
+    use super::*;
+    use crate::embeddings::test_support::MockEmbedder;
+    use crate::models::{Memory, Tier};
+    use crate::storage as db;
+
+    const TITLE: &str = "dup-title-3597";
+    const CONTENT: &str = "dup-content-3597";
+
+    fn seed_private_embedded(
+        conn: &rusqlite::Connection,
+        emb: &MockEmbedder,
+        owner: &str,
+    ) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "test".to_string(),
+            title: TITLE.to_string(),
+            content: CONTENT.to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": owner, "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let text = format!("{TITLE} {CONTENT}");
+        let embedding = emb.embed(&text).unwrap();
+        let id = db::insert(conn, &mem).unwrap();
+        db::set_embedding(
+            conn,
+            &id,
+            &embedding,
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        id
+    }
+
+    fn fresh_conn() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    #[test]
+    fn foreign_owner_private_nearest_is_masked_and_not_a_duplicate_3597() {
+        let conn = fresh_conn();
+        let emb = MockEmbedder::new_local().unwrap();
+        seed_private_embedded(&conn, &emb, "ai:alice");
+        let resp = handle_check_duplicate(
+            &conn,
+            &json!({"title": TITLE, "content": CONTENT}),
+            Some(&emb),
+            Some("ai:bob"),
+        )
+        .expect("ok");
+        assert_eq!(resp["is_duplicate"], false, "{resp}");
+        assert!(
+            resp["nearest"].is_null(),
+            "title/id/similarity masked: {resp}"
+        );
+        assert!(resp["suggested_merge"].is_null(), "{resp}");
+    }
+
+    #[test]
+    fn owner_still_sees_their_own_duplicate_3597() {
+        let conn = fresh_conn();
+        let emb = MockEmbedder::new_local().unwrap();
+        let id = seed_private_embedded(&conn, &emb, "ai:alice");
+        let resp = handle_check_duplicate(
+            &conn,
+            &json!({"title": TITLE, "content": CONTENT}),
+            Some(&emb),
+            Some("ai:alice"),
+        )
+        .expect("ok");
+        assert_eq!(resp["is_duplicate"], true, "{resp}");
+        assert_eq!(resp["nearest"]["id"].as_str(), Some(id.as_str()));
+        assert_eq!(resp["suggested_merge"].as_str(), Some(id.as_str()));
     }
 }

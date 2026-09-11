@@ -54,7 +54,11 @@ pub fn cmd_entity_get_by_alias(
         params["namespace"] = json!(ns);
     }
 
-    let envelope = crate::mcp::handle_entity_get_by_alias(&conn, &params)
+    // v1.0.0 #3596–#3601 — the CLI read-visibility caller (the `recall` /
+    // `boot` precedent): `AI_MEMORY_AGENT_ID` when set, else the local
+    // operator's trust-all `None`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    let envelope = crate::mcp::handle_entity_get_by_alias(&conn, &params, caller.as_deref())
         .map_err(|e| anyhow::anyhow!("entity-get-by-alias: {e}"))?;
 
     if args.json {

@@ -55,10 +55,6 @@ read	memory_archive_stats	owner-scoped aggregate over archived_memories (#3382)
 read	memory_inbox	own-inbox only: handle_inbox_with_policy binds the inbox to the resolved caller (#1557/#3356)
 read	memory_pending_list	pending_actions rows bound to the resolved subject (#3363); not memory rows
 read	memory_namespace_get_standard	the bound standard row is gated by is_readable_on_query in mcp::lookup_namespace_standard (src/mcp/mod.rs, #2537), outside the handler file
-# (d) UNGATED memory-row reads surfaced BY this inventory — each tracked to closure
-read	memory_persona	UNGATED: returns Persona-kind content by entity_id with no caller gate — tracked #3596
-read	memory_check_duplicate	UNGATED: emits the nearest row's title with no caller gate (HTTP twin masks per #947) — tracked #3597
-read	memory_entity_get_by_alias	UNGATED: entity registry lookup with no caller gate (HTTP twin gates on the backing memory) — tracked #3598
-read	memory_dependents_of_invalidated	UNGATED: dependent ids + namespaces with no caller gate — tracked #3599
-read	memory_reflection_origin	UNGATED: provenance + existence disclosure by memory id with no caller gate — tracked #3600
-read	memory_verify	UNGATED: link existence oracle over any triple with no caller gate — tracked #3601
+# (d) UNGATED memory-row reads surfaced BY this inventory — ALL CLOSED (#3596–#3601):
+#     every read-only tool that reads memory rows now calls is_readable_on_query; a
+#     future ungated tool fails the structural guard and must be tracked here to closure.

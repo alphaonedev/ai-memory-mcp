@@ -57,7 +57,11 @@ pub fn cmd_dependents_of_invalidated(
     // terminal (parity with HTTP `transitive:true` + the MCP tool param).
     let params = json!({"memory_id": args.memory_id, "transitive": args.transitive});
 
-    let envelope = crate::mcp::handle_dependents_of_invalidated(&conn, &params)
+    // v1.0.0 #3596–#3601 — the CLI read-visibility caller (the `recall` /
+    // `boot` precedent): `AI_MEMORY_AGENT_ID` when set, else the local
+    // operator's trust-all `None`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    let envelope = crate::mcp::handle_dependents_of_invalidated(&conn, &params, caller.as_deref())
         .map_err(|e| anyhow::anyhow!("dependents-of-invalidated: {e}"))?;
 
     if args.json {

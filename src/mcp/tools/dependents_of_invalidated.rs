@@ -38,6 +38,7 @@ use serde_json::{Value, json};
 pub fn handle_dependents_of_invalidated(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
@@ -48,8 +49,23 @@ pub fn handle_dependents_of_invalidated(
     let dependents =
         crate::notification::invalidation::list_dependents_of_invalidated(conn, memory_id)
             .map_err(|e| format!("dependents_of_invalidated substrate error: {e}"))?;
+    // v1.0.0 #3599 — the dependent list (and the transitive suspect set
+    // below) is an existence + namespace oracle over rows the caller may not
+    // read. Filter every rendered row through the per-row scope predicate,
+    // naming the row's OWN namespace (the #3549 read-funnel contract); `count`
+    // / `transitive_count` reflect the VISIBLE set. An unfetchable row is
+    // HIDDEN (fail closed, the #3232 disposition).
+    let row_readable = |id: &str| -> bool {
+        match crate::db::get(conn, id) {
+            Ok(Some(mem)) => {
+                crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
+            }
+            Ok(None) | Err(_) => false,
+        }
+    };
     let rendered: Vec<Value> = dependents
         .iter()
+        .filter(|d| row_readable(&d.id))
         .map(|d| {
             json!({
                 "id": d.id,
@@ -76,6 +92,7 @@ pub fn handle_dependents_of_invalidated(
                 .map_err(|e| format!("transitive_suspects substrate error: {e}"))?;
         let rendered_suspects: Vec<Value> = suspects
             .iter()
+            .filter(|n| row_readable(&n.id))
             .map(|n| {
                 json!({
                     "id": n.id,
@@ -224,22 +241,23 @@ mod tests {
     #[test]
     fn missing_memory_id_returns_error() {
         let conn = fresh_conn();
-        let err = handle_dependents_of_invalidated(&conn, &json!({})).unwrap_err();
+        let err = handle_dependents_of_invalidated(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("memory_id"));
     }
 
     #[test]
     fn empty_memory_id_returns_error() {
         let conn = fresh_conn();
-        let err = handle_dependents_of_invalidated(&conn, &json!({"memory_id": ""})).unwrap_err();
+        let err =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": ""}), None).unwrap_err();
         assert!(err.contains("empty"));
     }
 
     #[test]
     fn unknown_id_returns_empty_envelope() {
         let conn = fresh_conn();
-        let out =
-            handle_dependents_of_invalidated(&conn, &json!({"memory_id": "nope-id"})).unwrap();
+        let out = handle_dependents_of_invalidated(&conn, &json!({"memory_id": "nope-id"}), None)
+            .unwrap();
         assert_eq!(out["count"].as_u64(), Some(0));
         assert_eq!(out["dependents"].as_array().unwrap().len(), 0);
     }
@@ -260,12 +278,121 @@ mod tests {
         db::create_link(&conn, &m2_id, &r1_id, "reflects_on").unwrap();
         db::create_link(&conn, &m3_id, &r1_id, "related_to").unwrap();
 
-        let out = handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id})).unwrap();
+        let out =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id}), None).unwrap();
         assert_eq!(out["count"].as_u64(), Some(2));
         let deps = out["dependents"].as_array().unwrap();
         let ids: Vec<&str> = deps.iter().filter_map(|d| d["id"].as_str()).collect();
         assert!(ids.contains(&m1_id.as_str()));
         assert!(ids.contains(&m2_id.as_str()));
         assert!(!ids.contains(&m3_id.as_str()), "related_to leaked");
+    }
+}
+
+#[cfg(test)]
+mod authority_gate_3599_tests {
+    //! v1.0.0 #3599 — DENIED / ALLOWED matrix for the
+    //! `memory_dependents_of_invalidated` read gate: another owner's private
+    //! dependents are dropped (and not counted); the owner sees them.
+    use super::*;
+    use crate::models::{Memory, MemoryKind, Tier};
+    use crate::storage as db;
+
+    fn fresh_conn() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    fn mem(title: &str, kind: MemoryKind, owner: &str) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "ns-a".to_string(),
+            title: title.to_string(),
+            content: format!("body {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": owner, "scope": "private"}),
+            reflection_depth: i32::from(matches!(kind, MemoryKind::Reflection)),
+            memory_kind: kind,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        }
+    }
+
+    /// Anchor R1 with two `reflects_on` dependents: alice's private M1 and
+    /// bob's private M2. Returns `(r1_id, m1_id, m2_id)`.
+    fn seed(conn: &rusqlite::Connection) -> (String, String, String) {
+        let r1_id = db::insert(conn, &mem("R1", MemoryKind::Reflection, "ai:tester")).unwrap();
+        let m1_id = db::insert(conn, &mem("M1", MemoryKind::Observation, "ai:alice")).unwrap();
+        let m2_id = db::insert(conn, &mem("M2", MemoryKind::Observation, "ai:bob")).unwrap();
+        db::create_link(conn, &m1_id, &r1_id, "reflects_on").unwrap();
+        db::create_link(conn, &m2_id, &r1_id, "reflects_on").unwrap();
+        (r1_id, m1_id, m2_id)
+    }
+
+    fn ids(out: &Value) -> Vec<String> {
+        out["dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn foreign_owner_private_dependents_are_dropped_and_not_counted_3599() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
+        let conn = fresh_conn();
+        let (r1_id, _m1_id, m2_id) = seed(&conn);
+        let out =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id}), Some("ai:bob"))
+                .unwrap();
+        assert_eq!(
+            out["count"].as_u64(),
+            Some(1),
+            "only bob's own row counts: {out}"
+        );
+        assert_eq!(
+            ids(&out),
+            vec![m2_id],
+            "alice's private M1 must not be listed"
+        );
+    }
+
+    #[test]
+    fn owner_sees_their_dependent_and_local_operator_sees_all_3599() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
+        let conn = fresh_conn();
+        let (r1_id, m1_id, _m2_id) = seed(&conn);
+        let own =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id}), Some("ai:alice"))
+                .unwrap();
+        assert_eq!(ids(&own), vec![m1_id]);
+        let all =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id}), None).unwrap();
+        assert_eq!(
+            all["count"].as_u64(),
+            Some(2),
+            "None caller is trust-all: {all}"
+        );
     }
 }

@@ -197,9 +197,12 @@ fn r1_sourced_by_m1_m2_m3_r2_supersedes_r1_notifies_three_dependents() {
     // Acceptance gate 4: `memory_dependents_of_invalidated` returns
     // the correct dependent list — used by curator / operator
     // tooling to drive the review queue.
-    let dependents_resp =
-        ai_memory::mcp::dispatch_handle_dependents_for_test(&conn, &json!({"memory_id": r1_id}))
-            .expect("dependents handler");
+    let dependents_resp = ai_memory::mcp::dispatch_handle_dependents_for_test(
+        &conn,
+        &json!({"memory_id": r1_id}),
+        None,
+    )
+    .expect("dependents handler");
     assert_eq!(dependents_resp["count"].as_u64(), Some(3));
     let deps = dependents_resp["dependents"].as_array().unwrap();
     let dep_ids: Vec<&str> = deps.iter().filter_map(|d| d["id"].as_str()).collect();
@@ -357,15 +360,19 @@ fn dependents_of_invalidated_handles_unknown_and_zero_dependent_cases() {
     let r1 = make_mem("R1-alone", "ns", MemoryKind::Reflection);
     let r1_id = db::insert(&conn, &r1).unwrap();
 
-    let zero =
-        ai_memory::mcp::dispatch_handle_dependents_for_test(&conn, &json!({"memory_id": r1_id}))
-            .expect("zero deps");
+    let zero = ai_memory::mcp::dispatch_handle_dependents_for_test(
+        &conn,
+        &json!({"memory_id": r1_id}),
+        None,
+    )
+    .expect("zero deps");
     assert_eq!(zero["count"].as_u64(), Some(0));
     assert!(zero["dependents"].as_array().unwrap().is_empty());
 
     let unknown = ai_memory::mcp::dispatch_handle_dependents_for_test(
         &conn,
         &json!({"memory_id": "definitely-not-an-id"}),
+        None,
     )
     .expect("unknown id returns empty envelope");
     assert_eq!(unknown["count"].as_u64(), Some(0));

@@ -117,7 +117,11 @@ pub fn run_with_embedder(
         params["threshold"] = json!(t);
     }
 
-    let envelope = crate::mcp::handle_check_duplicate(conn, &params, embedder)
+    // v1.0.0 #3596–#3601 — the CLI read-visibility caller (the `recall` /
+    // `boot` precedent): `AI_MEMORY_AGENT_ID` when set, else the local
+    // operator's trust-all `None`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    let envelope = crate::mcp::handle_check_duplicate(conn, &params, embedder, caller.as_deref())
         .map_err(|e| anyhow::anyhow!("check-duplicate: {e}"))?;
 
     if args.json {
