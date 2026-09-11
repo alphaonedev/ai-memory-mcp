@@ -12,16 +12,21 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `ad60beadf602823c4451ff82067f62091aba9a04` (`origin/chain/next`
-at the 2026-09-11 re-issue; Merge #3593 on Merge #3582). The original
+**Binds to:** `b048311595caa94db435c3dd9b59b02ea4b765f2` (`origin/release/v1.0.0`,
+published 2026-09-11T19:58Z — the tip carrying #3549, #3553 and #3199; re-issued
+by [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)). The
+2026-09-11 #3595 re-issue at `ad60bead` and the The original
 2026-08-12 mint remains `e22bc93c` as a historical record. Any change to the
 federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-11** (re-issued after #3582)
+> ## STATUS — **LIVE as of 2026-09-11** (re-issued after #3549 / #3553 / #3199 at 22 checks)
 >
-> Re-validated and re-issued against `ad60beadf602823c4451ff82067f62091aba9a04`
-> by [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595).
+> Re-validated and re-issued against `b048311595caa94db435c3dd9b59b02ea4b765f2`
+> by [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)
+> (posture legs re-measured at 22 checks, §7 battery on both backends);
+> the earlier same-day re-issue by [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595)
+> at `ad60bead` is superseded and kept as history in §7.
 > [#3582](https://github.com/alphaonedev/ai-memory-mcp/issues/3582) changed
 > the federation wire contract (absent allowlist ⇒ inbound namespace
 > writes and catchup pulls refused by default) and **voided** the prior
@@ -580,21 +585,27 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > posture-leg evidence of record after this recapture. Bind stays
 > `e22bc93c` (this recapture does not re-mint).
 >
-> **Evidence note (#3199, 2026-09-11):** the `cert-55/` captures and the
-> table below are **dated history at 20 checks**; they predate checks #21
-> (#3553) and #22 (#3199) and are not re-measured here. On a bare host with
-> no operator public key, check #22 adds a `[FAIL]` row. The 22-check recapture is tracked
-> in [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607).
+> **Evidence note (#3607, 2026-09-11):** the four-leg captures were
+> **re-measured at 22 checks** on release-built binaries of the published tip
+> `b0483115` (`docs/compliance/evidence/cert-3607/`, `SANITIZATION.md` +
+> `MANIFEST.sha256`): bare 12 PASS / 10 FAIL (exit 2); hardened
+> non-sqlcipher 20 / 2 (exit 2, the same two remaining); boot gate armed →
+> refuses to boot (exit 1); sqlcipher + `ENCRYPT_AT_REST=1` + boot gate →
+> **22 PASS / 0 FAIL (exit 0)**, with check #21's live `PRAGMA synchronous`
+> observed on an encrypted fixture store and check #22's operator key pair
+> present in the key directory. `cert-3607/` is the posture-leg evidence of
+> record; the `cert-55/` 20-check captures are dated history. The table
+> below reads at 22 checks.
 
 | Environment | Exit | Result |
 |---|---|---|
-| Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 10 `[FAIL]` rows of 20** (named below) |
+| Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 10 `[FAIL]` rows of 22** (named below; `cert-3607/posture-bare-env.out`) |
 | Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor. |
 | Same hardened non-sqlcipher env **with the boot gate ARMED** | **1** | the binary **refuses to boot**, naming the below-floor control (`posture-hardened-boot-refusal.out`) — #2911 item 1's enforcement demonstrated, not merely reported |
-| Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`posture-sqlcipher-pass.out`; 20 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
+| Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`cert-3607/posture-sqlcipher-pass.out`; 22 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
 
 (The four exit statuses **2 / 2 / 1 / 0** are recorded in
-`docs/compliance/evidence/cert-55/posture-legs-exit-codes.txt`; the
+`docs/compliance/evidence/cert-3607/posture-legs-exit-codes.txt`; the
 rendered `.out` files show the PASS/FAIL rows but not the process exit
 code.)
 
@@ -1448,13 +1459,65 @@ signature over this document is future mint hardening, not a present
 claim. **Merge/tag authority remains the operator (`alphaonedev`)** —
 this document does not self-authorize a tag cut.
 
+**Re-cert trigger — FIRED by #3549 (identity resolver + postgres visibility
+funnel inside the standard §5 watch set) and DISCHARGED by re-issue (#3607,
+2026-09-11).** After the #3595 re-issue, #3549 (`src/identity/authority.rs`,
+`src/identity/mod.rs`, `src/store/postgres.rs`), #3553 (posture check #21,
+`PRAGMA synchronous`) and #3199 (posture check #22, backup-manifest signing)
+landed inside the watched surface; the cert-expiry ancestor check (#3556)
+correctly reports the `ad60bead` bind as drifted. [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)
+re-ran the §7 acceptance on **both** backends at the published tip
+`b048311595caa94db435c3dd9b59b02ea4b765f2` (`origin/release/v1.0.0`), re-measured the
+§5.4(2) four-leg posture bundle at **22 checks** (`cert-3607/`, see the §2
+evidence note), and re-issues this document against that SHA. The top
+STATUS banner is **LIVE**; the #3502, #3582 and #3595 records above stay as
+the firing ledger.
+
+*Evidence (exact `test result:` lines; zero `skip:`; zero `FAILED`).*
+Captured 2026-09-11T20:00Z–20:45Z on the Linux gate host; throwaway live pg
+database created for the run; raw named-test listing and the posture
+captures in `docs/compliance/evidence/cert-3607/`. Cargo `--no-fail-fast`.
+
+| Invocation | Exact `test result:` line |
+|---|---|
+| default `--test boot_fail_closed_config_3166` | `ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.22s` |
+| default `--test doctor_posture_exit_code_3003` | `ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s` |
+| default `--test doctor_synchronous_posture_3553` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s` |
+| default `--test federation_catchup_posture_3582` | `ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.81s` |
+| default `--test federation_namespace_gate_3582` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s` |
+| default `--test federation_peer_posture_3582` | `ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s` |
+| default `--test federation_write_ns_scope_2447` | `ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s` |
+| default `--test posture_control15_pg_resolution_3106` | `ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s` |
+| default `--lib enterprise_federation_posture federation::peer_posture cli::backup::tests` | `ok. 124 passed; 0 failed; 0 ignored; 0 measured; 8259 filtered out; finished in 42.68s` |
+| sal,sal-postgres (live pg) — the same eight suites | `15 / 2 / 3 / 2 / 3 / 10 / 6 / 4 passed; 0 failed` (catchup 2 = sqlite + postgres) |
+| sal,sal-postgres `--lib` slices | `ok. 124 passed; 0 failed; 0 ignored; 0 measured; 8872 filtered out; finished in 39.09s` |
+
+*Posture legs (22 checks, release builds of `b0483115`).* Bare: exit 2,
+12 PASS / 10 FAIL. Hardened non-sqlcipher: exit 2, 20 / 2. Boot gate armed:
+exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
+boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
+22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
+reproducible with `scripts/recapture-cert-3607-posture.sh`.
+
 ---
 
 ## 8. Current determination
 
+**Status at `b048311595caa94db435c3dd9b59b02ea4b765f2` (2026-09-11
+re-issue, [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607);
+#3549 authority resolver, #3553 check #21 and #3199 check #22 now certified).**
+The seven §5.4 falsifiability requirements hold on this SHA — §5.4(1)
+canonical doc = this document (LIVE banner); §5.4(2) machine-checked posture =
+CLOSED at **22 checks** (`cert-3607/`, four legs re-measured on release
+builds of this tip); §5.4(7) disconfirmation = §7, discharged for the
+#3549/#3553/#3199 watched-path changes by this re-issue's both-backend
+acceptance battery (`docs/compliance/evidence/cert-3607/`). The earlier
+same-day #3595 re-issue at `ad60bead` and the 2026-08-12 mint at `e22bc93c`
+remain historical ratification records (next paragraphs).
+
 **Status at `ad60beadf602823c4451ff82067f62091aba9a04` (2026-09-11
 re-issue, [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595);
-#3582 wire contract now certified).** The seven §5.4 falsifiability
+#3582 wire contract certified; superseded by the #3607 re-issue above).** The seven §5.4 falsifiability
 requirements hold on this SHA as follows — §5.4(1) canonical doc = this
 document (LIVE banner); §5.4(2) machine-checked posture = CLOSED at 20
 checks (`cert-55/`, unchanged count; #3582 added no posture row);

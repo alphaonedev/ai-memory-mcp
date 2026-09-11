@@ -1,0 +1,46 @@
+# cert-3607 exact `test result:` lines
+# HEAD=b048311595caa94db435c3dd9b59b02ea4b765f2 (origin/release/v1.0.0, published 2026-09-11T19:58Z)
+# BATTERY 2026-09-11T20:58:19Z — cargo test --no-fail-fast; zero skip:; zero ignored>0 in the named suites
+
+## default
+# --test tests/boot_fail_closed_config_3166
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.22s
+# --test tests/doctor_posture_exit_code_3003
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+# --test tests/doctor_synchronous_posture_3553
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+# --test tests/federation_catchup_posture_3582
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.81s
+# --test tests/federation_namespace_gate_3582
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+# --test tests/federation_peer_posture_3582
+# --test tests/federation_write_ns_scope_2447
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s
+# --test tests/posture_control15_pg_resolution_3106
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+## lib-default
+# --lib (enterprise_federation_posture, federation::peer_posture, cli::backup::tests)
+test result: ok. 124 passed; 0 failed; 0 ignored; 0 measured; 8259 filtered out; finished in 42.68s
+
+## salpg
+# --test tests/boot_fail_closed_config_3166
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.88s
+# --test tests/doctor_posture_exit_code_3003
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+# --test tests/doctor_synchronous_posture_3553
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+# --test tests/federation_catchup_posture_3582
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 43.78s
+# --test tests/federation_namespace_gate_3582
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+# --test tests/federation_peer_posture_3582
+# --test tests/federation_write_ns_scope_2447
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.21s
+# --test tests/posture_control15_pg_resolution_3106
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+## lib-salpg
+# --lib (enterprise_federation_posture, federation::peer_posture, cli::backup::tests)
+test result: ok. 124 passed; 0 failed; 0 ignored; 0 measured; 8872 filtered out; finished in 39.09s
+
