@@ -8781,9 +8781,8 @@ impl PostgresStore {
         // version counts the transition's bump too.
         #[cfg(test)]
         crate::recover::durability::in_tx_fault::patched_before_lifecycle(id);
-        let transitioned = self
-            .apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target)
-            .await?;
+        let transitioned =
+            lifecycle_tx_3152::apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit update tx", e))?;
@@ -24174,8 +24173,7 @@ impl MemoryStore for PostgresStore {
         // `lifecycle_target` was captured before the binds moved `patch`.
         #[cfg(test)]
         crate::recover::durability::in_tx_fault::patched_before_lifecycle(id);
-        self.apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target)
-            .await?;
+        lifecycle_tx_3152::apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("update commit tx", e))?;
