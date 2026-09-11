@@ -1513,7 +1513,7 @@ async fn create_memory_postgres(
             embedding_space.as_deref(),
         ))
     };
-    let (id, mut quorum_outcome) = match app.federation.as_ref().filter(|_| !keyed_store) {
+    let (id, mut quorum_outcome) = match app.federation.as_ref().as_ref().filter(|_| !keyed_store) {
         Some(fed) => {
             tracing::debug!(
                 target: crate::federation::SYNC_TRACE_TARGET,
