@@ -6002,6 +6002,11 @@ pub fn forget_distinct_namespaces(
     Ok(rows)
 }
 
+/// v1.0.0 #3124 — the `metadata` column as qualified by the `m` alias the
+/// FTS-joined forget statements use (one spelling for every owner-predicate
+/// call site).
+const SQL_COL_M_METADATA: &str = "m.metadata";
+
 /// v1.0.0 #3124 — the caller-scoped OWNER predicate for every forget-by-filter
 /// SQL arm: `(col.agent_id = ?{idx} [OR <unstamped>])`. The unstamped arm (a
 /// missing / JSON-null / `''` owner — the ONE definition,
@@ -6039,7 +6044,7 @@ fn forget_unstamped_victim_count(
                 "SELECT COUNT(*) FROM memories_fts fts JOIN memories m ON m.rowid = fts.rowid \
                  WHERE memories_fts MATCH ?1 AND (?2 IS NULL OR m.namespace = ?2) \
                  AND (?3 IS NULL OR m.tier = ?3) AND {}",
-                crate::identity::owner_stamp::sqlite_unstamped_predicate("m.metadata")
+                crate::identity::owner_stamp::sqlite_unstamped_predicate(SQL_COL_M_METADATA)
             ),
             params![fts_query, namespace, tier_str],
             |r| r.get(0),
@@ -6099,7 +6104,7 @@ fn purge_and_tombstone_forget(
             bound.push(Box::new(c.to_string()));
             q.push_str(&format!(
                 " AND {}",
-                sql_owner_predicate("m.metadata", 4, mode)
+                sql_owner_predicate(SQL_COL_M_METADATA, 4, mode)
             ));
         }
         q
@@ -7086,7 +7091,7 @@ pub fn forget_count_for_caller(
                   AND (?3 IS NULL OR m.tier = ?3)
                   AND {}
             )",
-                sql_owner_predicate("m.metadata", 4, mode)
+                sql_owner_predicate(SQL_COL_M_METADATA, 4, mode)
             ),
             params![fts_query, namespace, tier_str, caller],
             |r| r.get(0),
@@ -7137,7 +7142,7 @@ pub fn forget_distinct_namespaces_for_caller(
              WHERE memories_fts MATCH ?1
                AND (?2 IS NULL OR m.tier = ?2)
                AND {}",
-            sql_owner_predicate("m.metadata", 3, mode)
+            sql_owner_predicate(SQL_COL_M_METADATA, 3, mode)
         ))?;
         let rows = stmt
             .query_map(params![fts_query, tier_str, caller], |r| {
@@ -7201,7 +7206,7 @@ pub fn forget_matches_for_caller(
                AND {}
              ORDER BY m.rowid
              LIMIT ?4",
-            sql_owner_predicate("m.metadata", 5, mode)
+            sql_owner_predicate(SQL_COL_M_METADATA, 5, mode)
         ))?;
         let rows = stmt
             .query_map(
@@ -7312,7 +7317,7 @@ pub fn forget_for_caller(
                           AND (?2 IS NULL OR m.namespace = ?2)
                           AND (?3 IS NULL OR m.tier = ?3)
                           AND {}
-                     )", sql_owner_predicate("m.metadata", 5, mode)),
+                     )", sql_owner_predicate(SQL_COL_M_METADATA, 5, mode)),
                     params![fts_query, namespace, tier_str, now, caller],
                 )?;
             } else {
@@ -7383,8 +7388,8 @@ pub fn forget_for_caller(
                               AND (?3 IS NULL OR m.tier = ?3)
                               AND {}
                         )",
-                        sql_owner_predicate("m.metadata", 5, mode),
-                        sql_owner_predicate("m.metadata", 5, mode)
+                        sql_owner_predicate(SQL_COL_M_METADATA, 5, mode),
+                        sql_owner_predicate(SQL_COL_M_METADATA, 5, mode)
                     ),
                     params![fts_query, namespace, tier_str, now, caller],
                 )?;
@@ -7448,7 +7453,7 @@ pub fn forget_for_caller(
                       AND (?3 IS NULL OR m.tier = ?3)
                       AND {}
                 )",
-                    sql_owner_predicate("m.metadata", 4, mode)
+                    sql_owner_predicate(SQL_COL_M_METADATA, 4, mode)
                 ),
                 params![fts_query, namespace, tier_str, caller],
             )
