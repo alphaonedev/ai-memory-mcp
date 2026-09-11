@@ -71,7 +71,7 @@ impl McpTool for ListTool {
 /// MCP dispatch resolved a stable `AI_MEMORY_AGENT_ID` identity via
 /// [`crate::identity::resolve_read_visibility_caller`]) we drop every row
 /// the caller does not own per the canonical
-/// [`crate::visibility::is_visible_to_caller`] predicate. `None`
+/// `crate::visibility::is_visible_to_caller` predicate. `None`
 /// (single-tenant / no env identity) preserves the trust-all behavior.
 pub(super) fn handle_list(
     conn: &rusqlite::Connection,

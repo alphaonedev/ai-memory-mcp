@@ -21,7 +21,7 @@ pub(crate) const SESSION_START_MODE: &str = "session_start";
 /// `resolve_http_agent_id(body.agent_id, header_agent_id)`; MCP: via
 /// `ctx.mcp_client` captured from `initialize.clientInfo.name`). When
 /// `Some`, the post-list result set is filtered through
-/// [`crate::visibility::is_visible_to_caller`] so `scope=private` rows owned by
+/// `crate::visibility::is_visible_to_caller` so `scope=private` rows owned by
 /// OTHER agents are dropped before the caller sees them — closing the
 /// v0.7.0 #1420 cross-agent visibility leak (6-agent review
 /// reviewer 3 finding F3.3, memory `cd28329a`).

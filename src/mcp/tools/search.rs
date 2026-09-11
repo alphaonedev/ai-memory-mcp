@@ -79,7 +79,7 @@ impl McpTool for SearchTool {
 /// `caller` is `Some` (MCP dispatch resolved a stable `AI_MEMORY_AGENT_ID`
 /// identity via [`crate::identity::resolve_read_visibility_caller`]) we
 /// additionally drop rows the caller does not own per
-/// [`crate::visibility::is_visible_to_caller`]. `None` keeps the
+/// `crate::visibility::is_visible_to_caller`. `None` keeps the
 /// single-tenant trust-all behavior only when `as_agent` is also absent.
 pub(super) fn handle_search(
     conn: &rusqlite::Connection,

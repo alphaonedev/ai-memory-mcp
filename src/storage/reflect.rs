@@ -342,7 +342,7 @@ pub fn reflect_with_hooks(
 ///
 /// `caller`:
 /// * `Some(principal)` — a TENANT read. Each source is checked with
-///   [`crate::visibility::is_visible_to_caller`] and an invisible source is
+///   `crate::visibility::is_visible_to_caller` and an invisible source is
 ///   folded to [`ReflectError::SourceNotFound`], byte-identical to a genuinely
 ///   missing id (the postgres twin's `StoreError::NotFound` fold), so the gate
 ///   leaks no existence signal.
@@ -406,7 +406,7 @@ pub fn reflect_with_hooks_for_caller(
             // #3176 — a TENANT caller only sees what it may read; an invisible
             // source folds to the SAME `SourceNotFound` a missing id produces
             // (no existence leak). `None` caller = substrate/admin read.
-            Some(m) if caller.is_none_or(|c| crate::visibility::is_visible_to_caller(&m, c)) => {
+            Some(m) if caller.is_none_or(|c| crate::visibility::is_readable_on_query(&m, Some(c), Some(&m.namespace))) => {
                 sources.push(m);
             }
             Some(_) | None => return Err(ReflectError::SourceNotFound(id.clone())),

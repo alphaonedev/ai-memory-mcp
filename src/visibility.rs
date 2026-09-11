@@ -107,12 +107,20 @@ pub fn is_legacy_broad_scope(scope: &str) -> bool {
 /// pre-#951 inline copy in `handlers/memories_query.rs` was missing
 /// the inbox carve-out, which would have surfaced the day a private
 /// inbox row hit a list+filter path).
+///
+/// v1.0.0 #3549 (ruling 2 of the #3581 3×3 vote) — RETIRED as a public
+/// predicate: every read/list funnel calls [`is_readable_on_query`], which
+/// composes this owner/scope predicate with the #3348 substrate-namespace
+/// ambient gate. The structural pin in
+/// `tests/authority_boundary_structural_3549.rs` asserts no production call
+/// site outside this module. Private on purpose — not `pub(crate)` — so the
+/// day someone needs the bare predicate they land here and read why.
 #[must_use]
-pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
+fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
     is_visible_by_fields(&mem.id, &mem.namespace, &mem.metadata, caller)
 }
 
-/// #2633 — the field-level form of [`is_visible_to_caller`], for the one call
+/// #2633 — the field-level form of `is_visible_to_caller`, for the one call
 /// site that holds a row's `(id, namespace, metadata)` but not a full
 /// [`Memory`]: the postgres `find_paths` path-traversal filter, which reads
 /// `SELECT id, namespace, metadata` per graph node.
@@ -258,7 +266,7 @@ fn classify_scope(id: &str, namespace: &str, metadata: &serde_json::Value) -> Sc
 ///
 /// Keying the private arm on `as_agent` instead would let a self-asserted wire
 /// value unlock another principal's private rows on any surface whose baseline
-/// is fail-closed. Callers combine this with [`is_visible_to_caller`] for the
+/// is fail-closed. Callers combine this with `is_visible_to_caller` for the
 /// enforced caller, so the result can only ever be NARROWER than either gate
 /// alone.
 #[must_use]
@@ -366,7 +374,7 @@ pub fn namespace_read_scope_prefixes(caller: &str) -> Vec<String> {
 /// may `caller` read `namespace` AS A NAMESPACE?
 ///
 /// This is the namespace-LEVEL question, distinct from the row-level
-/// [`is_visible_to_caller`]: it answers "does this caller hold a read scope
+/// `is_visible_to_caller`: it answers "does this caller hold a read scope
 /// over this namespace", never "may this caller read this row". It is what the
 /// wake hub's topic derivation needs, because a wake topic addresses a
 /// namespace rather than a row.
@@ -668,7 +676,7 @@ pub fn substrate_listing_requested(prefix: Option<&str>) -> bool {
 
 /// v1.0.0 #3348 — the canonical read-surface predicate. Every ambient read
 /// funnel (`recall`, `search`, `list`, `boot`/`session_start`, on BOTH backends)
-/// routes through this instead of applying [`is_visible_to_caller`] only when a
+/// routes through this instead of applying `is_visible_to_caller` only when a
 /// caller happens to be resolvable.
 ///
 /// ## The defect this closes
@@ -687,7 +695,7 @@ pub fn substrate_listing_requested(prefix: Option<&str>) -> bool {
 ///   This is what closes the `_agents` half: those rows can legitimately carry a
 ///   broad scope, so the scope predicate alone would still return them.
 /// - Once the request names the substrate namespace explicitly, the row is
-///   subject to the ordinary [`is_visible_to_caller`] gate, so a caller still
+///   subject to the ordinary `is_visible_to_caller` gate, so a caller still
 ///   only sees their own mail.
 /// - Past the ambient gate the historical contract is BYTE-IDENTICAL: `None`
 ///   still trusts all, `Some(c)` still applies the canonical predicate. Only
@@ -697,7 +705,7 @@ pub fn substrate_listing_requested(prefix: Option<&str>) -> bool {
 /// The opt-in the issue asks for is satisfied by NAMING the namespace, which
 /// needs no new knob (and therefore no MCP-schema / param-census / docs SSOT
 /// churn). An operator-wide `--include-system` override would lift exactly the
-/// first check below and nothing else — the per-row [`is_visible_to_caller`]
+/// first check below and nothing else — the per-row `is_visible_to_caller`
 /// gate is never lifted, by anyone.
 #[must_use]
 pub fn is_readable_on_query(

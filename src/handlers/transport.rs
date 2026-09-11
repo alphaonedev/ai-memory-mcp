@@ -1033,7 +1033,7 @@ pub async fn api_key_auth(
     // The axum peer-cert-in-extensions plumbing this comment once said was
     // "unlanded" is what the acceptor now provides.
     let path = req.uri().path();
-    if auth.mtls_enforced && path.starts_with("/api/v1/sync/") {
+    if auth.mtls_enforced && path.starts_with(super::authority::SYNC_PREFIX) {
         return next.run(req).await.into_response();
     }
 

@@ -362,7 +362,12 @@ fn effective_principal_prefers_as_agent_over_agent_id() {
 
 #[test]
 fn is_visible_to_caller_predicate_truth_table() {
-    use ai_memory::store::is_visible_to_caller;
+    // #3549 — the bare predicate is retired; the truth table is asserted
+    // through the ONE public read funnel with the row's own namespace named
+    // (which lifts the #3348 ambient gate — byte-identical to the old call).
+    let is_visible_to_caller = |row: &ai_memory::models::Memory, caller: &str| {
+        ai_memory::visibility::is_readable_on_query(row, Some(caller), Some(&row.namespace))
+    };
 
     let private_alice = make_memory("t-1", "c", "alice", "private");
     let collective = make_memory("t-2", "c", "alice", "collective");

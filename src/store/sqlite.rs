@@ -21,7 +21,7 @@ use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 use super::{
     BoxBackendError, CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter,
     MemoryStore, ReplayTranscriptEntry, StoreError, StoreResult, UpdatePatch, VerifyFilter,
-    VerifyLinkReport, VerifyReport, is_visible_to_caller,
+    VerifyLinkReport, VerifyReport,
 };
 use crate::quotas::{self, QuotaStatus};
 
@@ -693,7 +693,7 @@ impl MemoryStore for SqliteStore {
                 // existence to callers that lack read permission.
                 // Admin/migrate paths set `bypass_visibility` and read
                 // every row regardless of metadata.scope.
-                if ctx.bypass_visibility || is_visible_to_caller(&mem, ctx.effective_principal()) {
+                if ctx.bypass_visibility || crate::visibility::is_readable_on_query(&mem, Some(ctx.effective_principal()), Some(&mem.namespace)) {
                     Ok(mem)
                 } else {
                     Err(StoreError::NotFound { id: id.to_string() })
@@ -881,7 +881,7 @@ impl MemoryStore for SqliteStore {
         let caller = ctx.effective_principal();
         Ok(rows
             .into_iter()
-            .filter(|m| is_visible_to_caller(m, caller))
+            .filter(|m| crate::visibility::is_readable_on_query(m, Some(caller), Some(&m.namespace)))
             .collect())
     }
 
@@ -911,7 +911,7 @@ impl MemoryStore for SqliteStore {
                 if !m.namespace.starts_with(prefix) {
                     continue;
                 }
-                if !ctx.bypass_visibility && !is_visible_to_caller(&m, &caller) {
+                if !ctx.bypass_visibility && !crate::visibility::is_readable_on_query(&m, Some(&caller), Some(&m.namespace)) {
                     continue;
                 }
                 out.push(m);
@@ -994,7 +994,7 @@ impl MemoryStore for SqliteStore {
         let caller = ctx.effective_principal();
         Ok(rows
             .into_iter()
-            .filter(|m| is_visible_to_caller(m, caller))
+            .filter(|m| crate::visibility::is_readable_on_query(m, Some(caller), Some(&m.namespace)))
             .collect())
     }
 
@@ -1012,7 +1012,7 @@ impl MemoryStore for SqliteStore {
         // `NotFound` here too so the two adapters leak identically (i.e. not
         // at all). Admin/migrate contexts (`bypass_visibility`) verify every
         // row, exactly as they read every row.
-        if !ctx.bypass_visibility && !is_visible_to_caller(&mem, ctx.effective_principal()) {
+        if !ctx.bypass_visibility && !crate::visibility::is_readable_on_query(&mem, Some(ctx.effective_principal()), Some(&mem.namespace)) {
             return Err(StoreError::NotFound { id: id.to_string() });
         }
         // #1624 — shared finding-checks (see `store::integrity_findings`)
@@ -1797,7 +1797,7 @@ impl MemoryStore for SqliteStore {
             let caller = ctx.effective_principal();
             results
                 .into_iter()
-                .filter(|(m, _)| is_visible_to_caller(m, caller))
+                .filter(|(m, _)| crate::visibility::is_readable_on_query(m, Some(caller), Some(&m.namespace)))
                 .collect()
         };
         // v0.9.0 P0-1 (#1869) — close the SAL-sqlite ledger gap: with

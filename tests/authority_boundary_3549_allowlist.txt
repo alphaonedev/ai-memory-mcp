@@ -1,0 +1,64 @@
+# #3549 caller-authority boundary — the checked-in allowlist WITH REASONS.
+# Consumed by tests/authority_boundary_structural_3549.rs. Format (tab-separated):
+#   <surface>\t<key>\t<reason>          surface ∈ http | mcp | read ; reason >= 20 chars
+# This file IS the boundary spec (ruling 3 of the #3581 3x3 vote): every path the HTTP
+# authority layer does not gate, every MCP table entry that does not pass the chokepoint
+# (none today), and every read-only MCP tool whose handler does not call
+# visibility::is_readable_on_query must be named here with the reason. A STALE entry
+# (a path the layer now gates, a tool that now calls the funnel) FAILS the guard.
+
+# ---- http: exact paths / prefixes the authority layer deliberately does not gate ----
+http	/api/v1/health	liveness probe; carries no identity; an orchestrator must never lose liveness on a header quirk
+http	/metrics	Prometheus scrape; carries no identity; exempt like /health (admission control exempts it too, #79)
+http	/api/v1/metrics	Prometheus scrape (REST alias); carries no identity; exempt like /health
+http	/api/v1/sync/push	federation receive boundary: peer authenticated by X-Peer-Id + Ed25519 sig + nonce + enrollment (receive_auth / signing_check), its own guard — ruling 4
+http	/api/v1/sync/since	federation catch-up boundary: same peer authentication as /sync/push; not an X-Agent-Id surface — ruling 4
+
+# ---- mcp: TOOL_DISPATCH_TABLE entries not passing the chokepoint (must stay empty) ----
+
+# ---- read: read-only MCP tools whose handler does not call is_readable_on_query ----
+# (a) no memory rows are read at all
+read	memory_capabilities	tool/family bootstrap envelope rendered from the registry; reads no memory rows
+read	memory_stats	corpus counters only (db::stats); no row content is emitted
+read	memory_get_taxonomy	namespace/tag aggregate counts only; no row content is emitted
+read	memory_expand_query	LLM query expansion over the caller-supplied text; reads no rows
+read	memory_check_agent_action	governance evaluation over the caller-bound subject (#3363); reads no memory rows
+read	memory_rule_list	governance rules are operator artefacts, not memory rows
+read	memory_agent_list	agent registry (_agents) is collective by design; no memory content
+read	memory_quota_status	quota ledger for the caller-bound subject (#3171); not memory rows
+read	memory_list_subscriptions	webhook subscription registry bound to the mcp client; not memory rows
+read	memory_subscription_dlq_list	webhook DLQ rows bound to the mcp client; not memory rows
+read	memory_recall_observations	recall ledger (ids + scores) keyed by recall_id and identity-bound per #1705; no row content
+# (b) coordination / skill substrates with their own actor binding, not memory rows
+read	memory_action_get	coordination action substrate, actor-bound (#3363/#3364); not memory rows
+read	memory_action_list	coordination action substrate, actor-bound (#3363/#3364); not memory rows
+read	memory_action_edges	coordination action DAG edges, actor-bound (#3363/#3364); not memory rows
+read	memory_action_frontier	coordination frontier view, actor-bound (#3363/#3364); not memory rows
+read	memory_action_next	coordination next-action view, actor-bound (#3363/#3364); not memory rows
+read	memory_lease_get	coordination lease substrate, holder-bound (#3364); not memory rows
+read	memory_routine_list	routine substrate, creator-bound (#3363); not memory rows
+read	memory_routine_status	routine substrate, creator-bound (#3363); not memory rows
+read	memory_checkpoint_query	checkpoint substrate (attested coordination gates); not memory rows
+read	memory_checkpoint_verify	checkpoint signature verification; not memory rows
+read	memory_signal_inbox	signal substrate, recipient-bound (#3365); not memory rows
+read	memory_signal_read	signal substrate, recipient-bound (#3365); not memory rows
+read	memory_signal_thread	signal substrate, participant-bound (#3365); not memory rows
+read	memory_skill_get	skills substrate (collective artefacts, not memory rows); forensic actor caller-bound (#3363)
+read	memory_skill_list	skills substrate listing (collective artefacts); not memory rows
+read	memory_skill_resource	skill resource blob (bounded zstd, #1933); skills are collective artefacts, not memory rows
+read	memory_skill_compositional_context	skill composition view over skill artefacts; not memory rows
+read	memory_skill_export	writes a skill bundle into the export jail (#3357); skill artefact, not memory rows
+read	memory_deref	offload blob keyed by ref_id and bound to the resolved agent_id (offload.rs); not a memory-row read
+# (c) memory rows gated by a sibling predicate the inventory cannot see in the handler file
+read	memory_archive_list	owner-scoped *_for_caller twin over archived_memories (#3382) — the gate is the SAL query, not the row predicate
+read	memory_archive_stats	owner-scoped aggregate over archived_memories (#3382)
+read	memory_inbox	own-inbox only: handle_inbox_with_policy binds the inbox to the resolved caller (#1557/#3356)
+read	memory_pending_list	pending_actions rows bound to the resolved subject (#3363); not memory rows
+read	memory_namespace_get_standard	the bound standard row is gated by is_readable_on_query in mcp::lookup_namespace_standard (src/mcp/mod.rs, #2537), outside the handler file
+# (d) UNGATED memory-row reads surfaced BY this inventory — each tracked to closure
+read	memory_persona	UNGATED: returns Persona-kind content by entity_id with no caller gate — tracked #3596
+read	memory_check_duplicate	UNGATED: emits the nearest row's title with no caller gate (HTTP twin masks per #947) — tracked #3597
+read	memory_entity_get_by_alias	UNGATED: entity registry lookup with no caller gate (HTTP twin gates on the backing memory) — tracked #3598
+read	memory_dependents_of_invalidated	UNGATED: dependent ids + namespaces with no caller gate — tracked #3599
+read	memory_reflection_origin	UNGATED: provenance + existence disclosure by memory id with no caller gate — tracked #3600
+read	memory_verify	UNGATED: link existence oracle over any triple with no caller gate — tracked #3601

@@ -664,6 +664,15 @@ impl Permissions {
 /// else too); Advisory and Off both default to Allow. The unified
 /// surface mirrors the v0.6.x semantics: namespaces without an
 /// explicit policy are unaffected.
+///
+/// #3549 ruling 5 (the #3125 Standard-posture statement, recorded in
+/// `SECURITY.md`): the EFFECTIVE unconfigured mode is `Enforce`
+/// (`resolve_v07_default_mode(None)`), and with no rules this function
+/// makes the default decision `Allow` — a default install denies nothing
+/// BY DESIGN, not by downgrade. Ungoverned namespaces stay allow-on-silence
+/// (cutline-protected, `tests/ship_gate_governance_inheritance.rs`); the
+/// fail-closed posture for a GOVERNED tier is the posture-gated knob
+/// `AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE` (#3125 3x7 ruling).
 fn mode_default_for(_mode: PermissionsMode, _ctx: &PermissionContext) -> Decision {
     Decision::Allow
 }

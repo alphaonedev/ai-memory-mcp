@@ -259,7 +259,7 @@ pub async fn sync_since(
         if opt_in {
             return true;
         }
-        crate::visibility::is_visible_to_caller(mem, federation_caller)
+        crate::visibility::is_readable_on_query(mem, Some(federation_caller), Some(&mem.namespace))
     }
 
     // Pre-resolved scope row: `Some(&PeerScope)` means filter by its

@@ -974,7 +974,7 @@ pub async fn get_namespace_standard_qs(
                     // content / governance bytes enter the response.
                     match app.store.get(&bind_ctx, &standard_id).await {
                         Ok(m)
-                            if crate::visibility::is_visible_to_caller(&m, &visibility_caller) =>
+                            if crate::visibility::is_readable_on_query(&m, Some(&visibility_caller), Some(&m.namespace)) =>
                         {
                             standards.push(json!({
                                 "namespace": candidate,
@@ -1040,7 +1040,7 @@ pub async fn get_namespace_standard_qs(
                 // #2543 — if the bound memory exists and is not visible,
                 // do not leak its id (MCP honesty shape).
                 match app.store.get(&bind_ctx, &standard_id).await {
-                    Ok(m) if !crate::visibility::is_visible_to_caller(&m, &visibility_caller) => {
+                    Ok(m) if !crate::visibility::is_readable_on_query(&m, Some(&visibility_caller), Some(&m.namespace)) => {
                         return (
                             StatusCode::OK,
                             Json(json!({

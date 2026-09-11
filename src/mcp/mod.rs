@@ -1217,7 +1217,7 @@ enum StandardLookup {
 /// verbatim by recalling in namespace `A`.
 ///
 /// The fix is the SAME canonical predicate every other read path already
-/// applies to the `memories` array — [`crate::visibility::is_visible_to_caller`]
+/// applies to the `memories` array — `crate::visibility::is_visible_to_caller`
 /// (#951 single-implementation rule; #1468 / #1720 / #1420 precedent) — NOT
 /// a bespoke namespace-chain carve-out. The 5-agent adversarial vote
 /// (`4d3ea1c5`) ranked the carve-out LAST 4-of-5: `"*"` is a link in EVERY
@@ -1352,7 +1352,7 @@ fn inject_namespace_standard(
 /// `caller == None` preserves the documented single-tenant trust-all read
 /// posture byte-for-byte (see [`crate::identity::resolve_read_visibility_caller`]);
 /// `Some(c)` applies the canonical
-/// [`crate::visibility::is_visible_to_caller`] predicate to the bound
+/// `crate::visibility::is_visible_to_caller` predicate to the bound
 /// memory before ANY of its bytes reach the response.
 fn lookup_namespace_standard(
     conn: &rusqlite::Connection,
@@ -1388,7 +1388,7 @@ fn lookup_namespace_standard(
     }
     // #2537 — run the predicate on the typed `Memory` BEFORE serialization,
     // so a withheld standard's bytes are never materialised at all.
-    if caller.is_some_and(|c| !crate::visibility::is_visible_to_caller(&mem, c)) {
+    if caller.is_some_and(|c| !crate::visibility::is_readable_on_query(&mem, Some(c), Some(&mem.namespace))) {
         tracing::debug!(
             target: "namespace.standard.withheld",
             namespace = %namespace,
@@ -1474,6 +1474,14 @@ pub(crate) struct ToolDispatchCtx<'a> {
     /// `skipped_queue_full`, never a blocking inline curator call).
     pub atomise_queue: Option<&'a crate::background::atomise_worker::AtomiseQueue>,
     pub ingest_multistep_handler: Option<&'a ingest_multistep::IngestMultistepHandler>,
+    /// v1.0.0 #3549 — the caller authority resolved ONCE at the `tools/call`
+    /// chokepoint ([`crate::identity::authority::Authority::resolve_mcp`])
+    /// BEFORE the table lookup. Every dispatch wrapper reads the principal /
+    /// binding / admin facts from here instead of re-deriving them from the
+    /// environment; the constructor is private, so the only way this field
+    /// is ever populated is through that resolver — a wrapper cannot mint a
+    /// wider authority than the chokepoint resolved.
+    pub authority: &'a crate::identity::authority::Authority,
 }
 
 /// Uniform signature for every entry in [`TOOL_DISPATCH_TABLE`]. Each
@@ -1545,7 +1553,7 @@ fn dispatch_memory_recall(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1468 — resolve the read-path visibility caller from the
     // stable `AI_MEMORY_AGENT_ID` env (or None) so cross-agent
     // `scope=private` rows are dropped before serialization.
-    let caller = crate::identity::resolve_read_visibility_caller();
+    let caller = ctx.authority.read_caller();
     handle_recall_caller(
         ctx.conn,
         ctx.arguments,
@@ -1556,7 +1564,7 @@ fn dispatch_memory_recall(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
         ctx.resolved_ttl,
         ctx.resolved_scoring,
         ctx.recall_scope,
-        caller.as_deref(),
+        caller,
     )
 }
 
@@ -2281,26 +2289,26 @@ fn dispatch_memory_routine_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1468 — see `dispatch_memory_recall`.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_search(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_search(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1468 — see `dispatch_memory_recall`.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_list(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_list(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_load_family(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1555 — scope=private visibility gate, parity with recall/list/search.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_load_family(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_load_family(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_smart_load(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1555 — the always-on intent loader forwards to load_family; gate it too.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_smart_load(ctx.conn, ctx.arguments, ctx.embedder, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_smart_load(ctx.conn, ctx.arguments, ctx.embedder, caller)
 }
 
 fn dispatch_memory_get_taxonomy(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2322,8 +2330,8 @@ fn dispatch_memory_entity_get_by_alias(ctx: &ToolDispatchCtx<'_>) -> Result<Valu
 fn dispatch_memory_kg_timeline(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #1800 — mirror the #944 HTTP caller-vs-source-owner gate; see
     // `dispatch_memory_search`.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_kg_timeline(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_kg_timeline(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_kg_invalidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2341,14 +2349,14 @@ fn dispatch_memory_kg_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> 
 fn dispatch_memory_find_paths(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #1800 — mirror the #944 HTTP caller-vs-source-owner gate; see
     // `dispatch_memory_search`.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_find_paths(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_find_paths(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_lineage(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.9.0 G13-mem (#1859) — same #1800 visibility gate as find_paths.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_lineage(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_lineage(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2414,8 +2422,8 @@ fn dispatch_memory_update(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 
 fn dispatch_memory_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1553 — scope=private visibility gate, parity with recall/list/search.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_get(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_get(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2439,8 +2447,8 @@ fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 fn dispatch_memory_get_links(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1553 — visibility gate so neighbor-id enumeration / existence
     // oracling of another tenant's scope=private row is blocked.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_get_links(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_get_links(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2451,8 +2459,8 @@ fn dispatch_memory_replay(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1571 — bind the replay visibility/permission identity to the
     // resolved caller so a spoofed `agent_id` param cannot widen visibility
     // (same class as #1553 get/get_links and #1557 inbox).
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_replay(ctx.conn, ctx.arguments, ctx.mcp_client, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_replay(ctx.conn, ctx.arguments, ctx.mcp_client, caller)
 }
 
 fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2470,7 +2478,7 @@ fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
     // caller-owns-source gate inside `handle_consolidate` has a subject.
     // Mirrors `dispatch_memory_get`; `None` (no `AI_MEMORY_AGENT_ID`) is the
     // single-operator trust-all posture.
-    let caller = crate::identity::resolve_read_visibility_caller();
+    let caller = ctx.authority.read_caller();
     handle_consolidate(
         ctx.conn,
         ctx.db_path,
@@ -2479,7 +2487,7 @@ fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
         ctx.embedder,
         ctx.vector_index,
         ctx.mcp_client,
-        caller.as_deref(),
+        caller,
     )
 }
 
@@ -2640,13 +2648,12 @@ fn dispatch_memory_expand_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 }
 
 fn dispatch_memory_auto_tag(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    let caller =
-        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
+    let caller = ctx.authority.read_caller();
     handle_auto_tag(
         ctx.conn,
         ctx.llm,
         ctx.arguments,
-        caller.as_deref(),
+        caller,
         ctx.mcp_client,
     )
 }
@@ -2657,25 +2664,23 @@ fn dispatch_memory_detect_contradiction(ctx: &ToolDispatchCtx<'_>) -> Result<Val
     // rows by id, returns both titles and ships both bodies to an external
     // LLM, so it must resolve the same read-visibility principal those tools
     // do and refuse before the model call.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_detect_contradiction(ctx.conn, ctx.llm, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_detect_contradiction(ctx.conn, ctx.llm, ctx.arguments, caller)
 }
 
 fn dispatch_memory_archive_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v1.0.0 #3382 — resolve the read-visibility principal so the archive
     // listing is owner-scoped, parity with the `require_admin`-gated HTTP twin.
     // Invalid identities fail closed; an absent identity keeps ordinary reads.
-    let caller =
-        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
-    handle_archive_list(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_archive_list(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_archive_restore(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #3382 — route through the gated `restore_archived_for_caller` twin the
     // HTTP route has used since #940 instead of the owner-blind primitive.
-    let caller =
-        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
-    handle_archive_restore(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_archive_restore(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_archive_purge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2684,9 +2689,8 @@ fn dispatch_memory_archive_purge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
 
 fn dispatch_memory_archive_stats(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #3382 — owner-scoped aggregate, parity with `memory_archive_list`.
-    let caller =
-        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
-    handle_archive_stats(ctx.conn, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_archive_stats(ctx.conn, caller)
 }
 
 fn dispatch_memory_gc(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2706,8 +2710,8 @@ fn dispatch_memory_session_start(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
     // `clientInfo.name` made an agent invisible to its OWN private WIP
     // rows on resume. Resolving env > None makes resume see exactly the
     // rows the same env identity wrote, and keeps single-tenant trust-all.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_session_start(ctx.conn, ctx.arguments, ctx.llm, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_session_start(ctx.conn, ctx.arguments, ctx.llm, caller)
 }
 
 fn dispatch_memory_namespace_set_standard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2720,8 +2724,8 @@ fn dispatch_memory_namespace_get_standard(ctx: &ToolDispatchCtx<'_>) -> Result<V
     // body `memory_recall` / `memory_session_start` inject. Mirrors
     // `dispatch_memory_recall` (#1468); `None` (no `AI_MEMORY_AGENT_ID`)
     // keeps the single-tenant trust-all posture.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_namespace_get_standard(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    handle_namespace_get_standard(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_namespace_clear_standard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2755,16 +2759,14 @@ fn dispatch_memory_share(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #3379 — validate the configured principal before reading the source.
     // Absent identity retains the single-operator posture; malformed identity
     // must never silently downgrade to it (#3523).
-    let caller =
-        crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| e.to_string())?;
-    crate::mcp::share::handle_share(ctx.conn, ctx.arguments, caller.as_deref())
+    let caller = ctx.authority.read_caller();
+    crate::mcp::share::handle_share(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1557 — bind the inbox owner to the resolved caller so a
     // multi-tenant caller cannot read another agent's private inbox.
-    let caller =
-        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
+    let caller = ctx.authority.read_caller();
     let single_tenant_trust_all = ctx
         .mcp_config
         .is_some_and(|config| config.single_tenant_trust_all);
@@ -2778,7 +2780,7 @@ fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
         ctx.conn,
         ctx.arguments,
         ctx.mcp_client,
-        caller.as_deref(),
+        caller,
         single_tenant_trust_all,
     )
 }
@@ -2871,13 +2873,10 @@ fn dispatch_memory_persona_generate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, 
 fn calibrate_audience_for_mcp(
     ctx: &ToolDispatchCtx<'_>,
 ) -> Result<crate::confidence::calibrate::CalibrationAudience, String> {
-    let principal = match crate::identity::resolve_mcp_read_visibility_caller()
-        .map_err(|error| error.to_string())?
-    {
-        Some(caller) => caller,
-        None => crate::identity::resolve_agent_id(None, ctx.mcp_client)
-            .map_err(|error| error.to_string())?,
-    };
+    // #3549 — the dispatch-resolved principal: the configured identity when
+    // set, else the durable owner stamp (the same two arms this site used to
+    // re-derive inline).
+    let principal = ctx.authority.principal().to_string();
     crate::confidence::calibrate::CalibrationAudience::for_caller(&principal)
 }
 
@@ -3668,6 +3667,29 @@ fn handle_request(
                 mcp_client,
             );
 
+            // v1.0.0 #3549 — THE caller-authority chokepoint. Resolve the
+            // launcher's principal / binding / admin ONCE, before the table
+            // lookup, and refuse EVERY tool call — read or write, on every
+            // profile — when the configured identity is unusable. The #3356
+            // boot gate already refuses to SERVE on that condition; this is
+            // the dispatch-level twin that makes the boundary structural
+            // (a handler cannot run without an `Authority`, and an
+            // `Authority` cannot exist unless this resolved). Protocol-level
+            // `-32603`: the server cannot act on behalf of anyone until the
+            // operator fixes `AI_MEMORY_AGENT_ID`.
+            let authority = match crate::identity::authority::Authority::resolve_mcp(mcp_client)
+            {
+                Ok(authority) => authority,
+                Err(e) => {
+                    tracing::error!(
+                        target: "ai_memory::authz",
+                        tool = tool_name,
+                        error = %e,
+                        "#3549: tools/call refused — caller authority unresolvable"
+                    );
+                    return err_response(id, jsonrpc::INTERNAL_ERROR, e.to_string());
+                }
+            };
             // #867 — registry-driven dispatch. The legacy per-tool match
             // is gone; every tool now resolves through
             // [`TOOL_DISPATCH_TABLE`] which keys on `tool_name` and
@@ -3700,6 +3722,7 @@ fn handle_request(
                 atomise_handler,
                 atomise_queue,
                 ingest_multistep_handler,
+                authority: &authority,
             };
             // Wave-2 B6 — MCP dispatch-layer record-stop fence
             // (defense-in-depth). Read-only tools stay live; everything

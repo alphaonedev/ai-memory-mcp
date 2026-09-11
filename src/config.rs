@@ -6135,8 +6135,16 @@ pub enum PermissionsMode {
     /// to the caller as-is. The strict, audit-ready posture.
     Enforce,
     /// Log a warning and allow the action. Governance metadata is
-    /// recorded but does not block writes. Default for v0.7.0 to
-    /// preserve the v0.6.x posture for upgrading operators.
+    /// recorded but does not block writes.
+    ///
+    /// #3549 ruling 5 (reconciling this comment with `evaluate_with`):
+    /// `Advisory` is the SERDE default only, and that default is PRE-BOOT.
+    /// The EFFECTIVE unconfigured mode is [`PermissionsMode::Enforce`]
+    /// ([`AppConfig::effective_permissions_mode`] →
+    /// `governance::resolve_v07_default_mode(None)`). Under `Enforce` with
+    /// NO matching rule the decision is `Allow` (`governance::mode_default_for`
+    /// — rules opt in to deny), which is why a fresh install denies nothing;
+    /// an explicit rule `Deny` is never downgraded by `Advisory`.
     Advisory,
     /// Skip the gate entirely. No policy resolution, no log, no
     /// `pending_actions` row. Useful for benchmarking and temporary

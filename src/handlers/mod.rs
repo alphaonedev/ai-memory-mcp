@@ -120,6 +120,9 @@ pub mod governance;
 pub mod hook_subscribers;
 pub mod http;
 pub mod identity_binding;
+/// v1.0.0 #3549 — the HTTP caller-authority chokepoint (one middleware beneath
+/// `api_key_auth`; every route registration sits under it).
+pub mod authority;
 /// v1.0.0 #3465 — `GET /api/v1/inbox/stream`, the agent-facing SSE
 /// wake stream for `memory_notify` (identity-bound to the caller's own
 /// inbox, fed from the in-process wake bus, never the webhook lane).

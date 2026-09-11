@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3549 — one caller-authority resolver beneath every handler)
+
+- **#3549 (SECURITY, ga-blocker) — `identity::authority::Authority { principal,
+  binding, admin }` is resolved ONCE per request at the two dispatch
+  chokepoints and attached to the request context; the constructor is
+  private.** MCP: the `tools/call` arm resolves BEFORE the `TOOL_DISPATCH_TABLE`
+  lookup and every dispatch wrapper reads `ctx.authority` instead of re-reading
+  `AI_MEMORY_AGENT_ID`; an unusable configured identity refuses every tool call
+  (`-32603`). HTTP: the new `handlers::authority::authority_layer` (composed
+  tower-inside `api_key_auth`) refuses a present but malformed / reserved
+  `X-Agent-Id` with a typed `400` on EVERY route before any handler runs
+  (probes + `/api/v1/sync/*` are the checked-in exemptions with reasons) and
+  attaches the resolved authority as a request extension. No `decision` field
+  (object predicates stay per handler); `visibility::is_visible_to_caller` is
+  retired as a public predicate and every former call site goes through
+  `is_readable_on_query`. `tests/authority_boundary_structural_3549.rs` is a
+  positive inventory over every table entry and every `.route()` registration
+  with `tests/authority_boundary_3549_allowlist.txt` as the frozen boundary
+  spec; its read-funnel leg surfaced six ungated MCP reads (#3596–#3601).
+  Rulings recorded in `SECURITY.md`: #3125 Standard posture (`enforce`,
+  `Allow` absent rules, strict knob posture-gated) and F13 (stdio is one trust
+  domain). Conductor ruling from the 3×3 vote on #3581.
+
 ### Fixed (#3519 — PostgreSQL bootstrap/migration advisory-lock wait no longer deadlocks concurrent boots)
 
 - **#3519 (SECURITY — data-tier availability at upgrade time) — the migration

@@ -482,7 +482,7 @@ pub const STANDARD_ID: &str = "standard_id";
 /// `standards_withheld` — wire field name (#2537). Count-only disclosure of
 /// namespace standards that resolved for the recalled namespace chain but
 /// were NOT injected because the caller fails
-/// [`crate::visibility::is_visible_to_caller`]. Deliberately a bare integer:
+/// `crate::visibility::is_visible_to_caller`. Deliberately a bare integer:
 /// emitting the withheld standard's id / owner / namespace would turn the
 /// honesty marker into a cross-tenant existence oracle. Mirrors the
 /// count-only shape of the `confidence_filtered_out` recall-meta disclosure.

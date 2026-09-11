@@ -199,7 +199,7 @@ pub fn mark_request_authn_configured(configured: bool) {
     REQUEST_AUTHN_CONFIGURED.store(configured, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn request_authn_configured() -> bool {
+pub(crate) fn request_authn_configured() -> bool {
     REQUEST_AUTHN_CONFIGURED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -271,7 +271,7 @@ pub fn is_admin_caller(state: &AppState, caller: &str) -> bool {
 /// [`ENV_ADMIN_HEADER_TRUST`]. Default = deny (fail closed).
 ///
 /// Read handlers that OR an admin flag past the per-row
-/// [`crate::visibility::is_visible_to_caller`] scope=private filter
+/// `crate::visibility::is_visible_to_caller` scope=private filter
 /// MUST use this predicate, not the bare [`is_admin_caller`] — else a
 /// self-asserted `X-Agent-Id` on a keyless deployment bypasses
 /// cross-tenant private-row visibility (the #1582 finding).
