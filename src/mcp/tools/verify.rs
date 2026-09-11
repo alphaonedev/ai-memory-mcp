@@ -148,9 +148,13 @@ pub fn handle_verify(
     // answers the SAME not-found text a missing link does (no existence
     // oracle). The predicate names the row's OWN namespace (the #3549
     // read-funnel contract); an unfetchable row is HIDDEN (fail closed).
+    // The endpoints are read UNFILTERED (`get_any`, the #3270 authz-read
+    // rule): a link whose endpoint is tombstoned / contaminated was
+    // verifiable before #3601 and stays verifiable for a caller who may read
+    // the row — the gate decides scope, never lifecycle disclosure.
     let link_not_found = || format!("link not found: ({source_id}, {relation}, {target_id})");
     for id in [source_id.as_str(), target_id.as_str()] {
-        let readable = match db::get(conn, id) {
+        let readable = match db::get_any(conn, id) {
             Ok(Some(mem)) => {
                 crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
             }

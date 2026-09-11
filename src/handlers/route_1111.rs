@@ -579,6 +579,30 @@ async fn pg_row_readable(app: &AppState, caller: Option<&str>, id: &str) -> bool
     let Some(c) = caller else {
         return true;
     };
+    // The gate reads the row UNFILTERED (the #3270 authz-read rule) so it is
+    // lifecycle-NEUTRAL: the trait `get` folds tombstoned / contaminated rows
+    // into `NotFound`, and a gate built on it hid exactly the `contaminated`
+    // dependents the #3324 `supersedes` path stamps before the curator lists
+    // them. `PostgresStore::get_any` is reached through the concrete store
+    // (the #2587 downcast hatch); a store that is not postgres keeps the
+    // trait read (this arm only runs under `StorageBackend::Postgres`).
+    #[cfg(feature = "sal-postgres")]
+    {
+        if let Some(pg) = app
+            .store
+            .as_any()
+            .downcast_ref::<crate::store::postgres::PostgresStore>()
+        {
+            return match pg.get_any(id).await {
+                Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                    &mem,
+                    caller,
+                    Some(mem.namespace.as_str()),
+                ),
+                Ok(None) | Err(_) => false,
+            };
+        }
+    }
     let ctx = crate::store::CallerContext::for_agent(c);
     match app.store.get(&ctx, id).await {
         Ok(mem) => {

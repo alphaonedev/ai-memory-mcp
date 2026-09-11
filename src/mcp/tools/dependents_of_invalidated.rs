@@ -55,8 +55,18 @@ pub fn handle_dependents_of_invalidated(
     // naming the row's OWN namespace (the #3549 read-funnel contract); `count`
     // / `transitive_count` reflect the VISIBLE set. An unfetchable row is
     // HIDDEN (fail closed, the #3232 disposition).
+    //
+    // The gate reads the row UNFILTERED (`get_any`, the #3270 authz-read
+    // rule) and is therefore lifecycle-NEUTRAL: it decides ownership/scope
+    // over the row that exists and never changes WHICH lifecycle states this
+    // tool discloses. That matters here more than anywhere — the `supersedes`
+    // path (#3324) auto-stamps every downstream dependent `contaminated`
+    // BEFORE the curator asks this tool for the review queue, and
+    // `contaminated` is outside the recall-visible set, so a gate built on
+    // the filtered `get` hid exactly the rows the tool exists to list
+    // (`tests/notification/invalidation_test.rs` caught it).
     let row_readable = |id: &str| -> bool {
-        match crate::db::get(conn, id) {
+        match crate::db::get_any(conn, id) {
             Ok(Some(mem)) => {
                 crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
             }
@@ -394,5 +404,40 @@ mod authority_gate_3599_tests {
             Some(2),
             "None caller is trust-all: {all}"
         );
+    }
+
+    /// The #3324 `supersedes` path stamps dependents `contaminated` before the
+    /// curator lists them. The gate is lifecycle-NEUTRAL: a contaminated
+    /// dependent stays listed for its owner and the local operator (the
+    /// pre-#3599 disclosure), and is still dropped for a foreign caller.
+    #[test]
+    fn contaminated_dependent_stays_listed_for_owner_and_operator_3599() {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
+        let conn = fresh_conn();
+        let (r1_id, m1_id, m2_id) = seed(&conn);
+        conn.execute(
+            "UPDATE memories SET lifecycle_state = 'contaminated' WHERE id = ?1",
+            rusqlite::params![m1_id],
+        )
+        .unwrap();
+        assert!(
+            db::get(&conn, &m1_id).unwrap().is_none(),
+            "precondition: the filtered read hides a contaminated row"
+        );
+        let all =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id}), None).unwrap();
+        assert_eq!(
+            all["count"].as_u64(),
+            Some(2),
+            "operator still sees the contaminated dependent: {all}"
+        );
+        let own =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id}), Some("ai:alice"))
+                .unwrap();
+        assert_eq!(ids(&own), vec![m1_id], "owner keeps their contaminated row");
+        let bob =
+            handle_dependents_of_invalidated(&conn, &json!({"memory_id": r1_id}), Some("ai:bob"))
+                .unwrap();
+        assert_eq!(ids(&bob), vec![m2_id], "foreign private row still dropped");
     }
 }

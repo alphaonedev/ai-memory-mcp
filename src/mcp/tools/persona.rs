@@ -87,7 +87,8 @@ pub(super) fn handle_persona(
 /// undecryptable at-rest envelope) is HIDDEN — fail closed, the #3232
 /// disposition.
 fn persona_row_readable(conn: &rusqlite::Connection, id: &str, caller: Option<&str>) -> bool {
-    match crate::storage::get(conn, id) {
+    // Unfiltered read (`get_any`, #3270): the gate is lifecycle-neutral.
+    match crate::storage::get_any(conn, id) {
         Ok(Some(mem)) => {
             crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
         }

@@ -68,7 +68,8 @@ pub fn handle_entity_get_by_alias(
     // predicate names the row's OWN namespace (the #3549 read-funnel
     // contract); an unfetchable row is HIDDEN (fail closed).
     let backing_row_readable = |id: &str| -> bool {
-        match db::get(conn, id) {
+        // Unfiltered read (`get_any`, #3270): the gate is lifecycle-neutral.
+        match db::get_any(conn, id) {
             Ok(Some(mem)) => {
                 crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
             }

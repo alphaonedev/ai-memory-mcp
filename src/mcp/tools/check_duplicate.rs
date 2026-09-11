@@ -63,7 +63,8 @@ pub fn handle_check_duplicate(
     // (the #3549 read-funnel contract); a row that cannot be re-fetched is
     // HIDDEN (fail closed, the #3232 disposition).
     if let Some(near) = check.nearest.as_ref() {
-        let visible = match db::get(conn, &near.id) {
+        // Unfiltered read (`get_any`, #3270): the gate is lifecycle-neutral.
+        let visible = match db::get_any(conn, &near.id) {
             Ok(Some(full)) => crate::visibility::is_readable_on_query(
                 &full,
                 caller,

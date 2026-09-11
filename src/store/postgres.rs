@@ -8029,6 +8029,37 @@ impl PostgresStore {
         })
     }
 
+    /// v1.0.0 #3599/#3601 — UNFILTERED single-row read for AUTHZ decisions:
+    /// the postgres twin of [`crate::storage::get_any`] (#3270).
+    ///
+    /// Identical to the trait [`MemoryStore::get`] SELECT but applies NEITHER
+    /// the lifecycle fold (`Quarantined` / `Tombstoned` / `Contaminated` →
+    /// `NotFound`) NOR the caller visibility fold: it returns the raw row
+    /// whatever its state, or `Ok(None)` only when the id has no row. A
+    /// read gate (`handlers::route_1111::pg_row_readable`) runs its own
+    /// scope predicate over the row that exists, so the gate is
+    /// lifecycle-NEUTRAL — it never changes which lifecycle states the
+    /// surface it guards discloses (the `supersedes` path, #3324, stamps
+    /// dependents `contaminated` before the curator lists them).
+    ///
+    /// This is an authz-precondition read ONLY — never a caller-facing
+    /// content read (the #3270 rule); it is reached through the concrete
+    /// `PostgresStore` (the `as_any().downcast_ref` hatch, #2587 precedent),
+    /// not the `MemoryStore` trait.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::BackendUnavailable` on SQL failure; a row that fails the
+    /// mapper surfaces as the mapper's error.
+    pub async fn get_any(&self, id: &str) -> StoreResult<Option<Memory>> {
+        let row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("select by id (unfiltered)", e))?;
+        row.as_ref().map(Self::row_to_memory).transpose()
+    }
+
     /// v0.7.0 Provenance Gap 1 (issue #884) — optimistic-concurrency
     /// aware update. Postgres twin of
     /// [`crate::storage::update_with_expected_version`].
