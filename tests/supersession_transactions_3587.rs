@@ -79,6 +79,14 @@ impl Backend {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn seed(&self, memory: &Memory) {
         match self {
             Self::Sqlite { conn, .. } => {
@@ -94,6 +102,14 @@ impl Backend {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "sal"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn upsert(&self, memory: &Memory, embedded: bool) -> String {
         match self {
             #[cfg(feature = "sal")]
@@ -130,6 +146,14 @@ impl Backend {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "sal"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn store(
         &self,
         memory: &Memory,
@@ -165,6 +189,14 @@ impl Backend {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "sal"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn resolve(
         &self,
         old: &Memory,
@@ -190,6 +222,14 @@ impl Backend {
     }
 
     /// Full durable row comparison within a backend, including versions and CID.
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn snapshot(&self, id: &str, archived: bool) -> Option<Value> {
         let table = if archived {
             "archived_memories"
@@ -244,6 +284,14 @@ impl Backend {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn set_metadata(&self, memory: &Memory, metadata: Value) {
         match self {
             Self::Sqlite { conn, .. } => {
@@ -265,6 +313,14 @@ impl Backend {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn archive(&self, memory: &Memory) {
         match self {
             Self::Sqlite { conn, .. } => {
@@ -288,6 +344,14 @@ impl Backend {
     }
 
     /// Fail after the loser archive, when the winner's pointer is stamped.
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "shared backend matrix awaits the feature-gated store implementation"
+        )
+    )]
     async fn pointer_fault(&self, new: &Memory, install: bool) {
         match self {
             Self::Sqlite { conn, .. } => {
