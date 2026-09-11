@@ -114,7 +114,11 @@ const GUARDED: &[(&str, usize, &str)] = &[
     // #3587 U2 — `watch` writes captured turns/lines (refuses postgres in the default build; the SAL twin writes through the store).
     ("src/cli/watch.rs", 1, "`watch` write."),
     // #3587 U4 — `capture-turn` CLI twin of memory_capture_turn (refuses postgres on the CLI).
-    ("src/cli/commands/capture_turn.rs", 1, "`capture-turn` write."),
+    (
+        "src/cli/commands/capture_turn.rs",
+        1,
+        "`capture-turn` write.",
+    ),
     ("src/cli/commands/atomise.rs", 1, "`atomise` write."),
     (
         "src/cli/commands/reembed.rs",
