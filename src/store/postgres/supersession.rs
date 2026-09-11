@@ -270,7 +270,7 @@ impl PostgresStore {
                 tx,
                 &archive_ctx,
                 std::slice::from_ref(&old.id),
-                "superseded",
+                crate::models::field_names::ARCHIVE_REASON_SUPERSEDED,
                 chrono::Utc::now(),
             )
             .await?;

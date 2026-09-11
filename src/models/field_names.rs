@@ -75,6 +75,9 @@ pub const ARCHIVE_REASON_IN_PLACE_EDIT: &str = "in_place_edit";
 /// backends. `"archive"` is the value the sqlite unit test
 /// `archive_memory_default_reason_is_archive` has pinned since v0.6.
 pub const ARCHIVE_REASON_DEFAULT: &str = "archive";
+
+/// Reason for archival by deterministic store supersession or explicit resolve.
+pub const ARCHIVE_REASON_SUPERSEDED: &str = SUPERSEDED;
 /// v1.0.0 #3012 — the `archive_reason` VALUE stamped when the targeted CLI
 /// `delete <id>` archives-then-deletes (its recoverable default). Distinct
 /// from the bulk `forget` reason so an operator can tell WHICH destructive
@@ -499,6 +502,8 @@ pub const SUGGESTED_MERGE: &str = "suggested_merge";
 /// bulk `deduped_rows[]`/`updated_rows[]` disclosure arrays (#2551, #2725) and
 /// the skill supersession response.
 pub const SUPERSEDED_BY: &str = "superseded_by";
+/// Optional store/resolve response field naming the archived predecessor.
+pub const SUPERSEDED: &str = "superseded";
 /// `superseded_id` — wire/row field name.
 pub const SUPERSEDED_ID: &str = "superseded_id";
 /// `synthesized` — wire/row field name.
