@@ -17410,3 +17410,190 @@ mod read_gate_parity_1730 {
         );
     }
 }
+
+/// v1.0.0 #3549 — the dispatch-level authority chokepoint, driven through
+/// the REAL `handle_request` with the caller principal steered by the
+/// thread-local test seam (#3523), so no process env is mutated.
+#[cfg(test)]
+mod authority_dispatch_3549_tests {
+    use super::*;
+    use crate::identity::test_agent_id::AgentIdOverride;
+
+    fn dispatch(req: &RpcRequest) -> RpcResponse {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = db::open(tmp.path()).expect("open db");
+        let tier_config = crate::config::FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let profile = crate::profile::Profile::full();
+        handle_request(
+            &conn,
+            tmp.path(),
+            req,
+            None,
+            None,
+            None,
+            &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            None,
+            &profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "authority-3549",
+        )
+    }
+
+    fn call(tool: &str, args: Value) -> RpcRequest {
+        RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({"name": tool, "arguments": args}),
+        }
+    }
+
+    /// DENIED — an unusable configured identity refuses a READ tool at
+    /// dispatch with the protocol-level `-32603`, before the table lookup.
+    #[test]
+    fn unusable_configured_identity_refuses_a_read_tool_at_dispatch_3549() {
+        let _seam = AgentIdOverride::set("bad id with spaces");
+        let resp = dispatch(&call(
+            crate::mcp::registry::tool_names::MEMORY_LIST,
+            json!({}),
+        ));
+        let err = resp.error.expect("must refuse");
+        assert_eq!(err.code, jsonrpc::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("caller authority unresolvable"),
+            "{}",
+            err.message
+        );
+        assert!(resp.result.is_none());
+    }
+
+    /// DENIED — the same refusal for a WRITE tool: the #3356 boot gate never
+    /// covered writes at dispatch; this does, and the row is never written.
+    #[test]
+    fn unusable_configured_identity_refuses_a_write_tool_at_dispatch_3549() {
+        let _seam = AgentIdOverride::set("");
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = db::open(tmp.path()).expect("open db");
+        let tier_config = crate::config::FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let profile = crate::profile::Profile::full();
+        let req = call(
+            crate::mcp::registry::tool_names::MEMORY_STORE,
+            json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
+        );
+        let resp = handle_request(
+            &conn,
+            tmp.path(),
+            &req,
+            None,
+            None,
+            None,
+            &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            None,
+            &profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "authority-3549",
+        );
+        assert_eq!(resp.error.expect("must refuse").code, jsonrpc::INTERNAL_ERROR);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 0, "the refusal precedes the write");
+    }
+
+    /// ALLOWED — a valid configured identity dispatches, and the resolved
+    /// principal is the one the write is attributed to.
+    #[test]
+    fn valid_configured_identity_dispatches_and_attributes_the_write_3549() {
+        let _seam = AgentIdOverride::set("ai:alice");
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = db::open(tmp.path()).expect("open db");
+        let tier_config = crate::config::FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let profile = crate::profile::Profile::full();
+        let req = call(
+            crate::mcp::registry::tool_names::MEMORY_STORE,
+            json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
+        );
+        let resp = handle_request(
+            &conn,
+            tmp.path(),
+            &req,
+            None,
+            None,
+            None,
+            &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            None,
+            &profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "authority-3549",
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let owner: String = conn
+            .query_row(
+                "SELECT json_extract(metadata, '$.agent_id') FROM memories LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("owner");
+        assert_eq!(owner, "ai:alice");
+    }
+
+    /// ALLOWED — the unset identity is the local-operator trust domain:
+    /// dispatch proceeds with trust-all reads.
+    #[test]
+    fn unset_identity_dispatches_as_the_local_operator_3549() {
+        let _seam = AgentIdOverride::unset();
+        let resp = dispatch(&call(
+            crate::mcp::registry::tool_names::MEMORY_LIST,
+            json!({}),
+        ));
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+    }
+}
