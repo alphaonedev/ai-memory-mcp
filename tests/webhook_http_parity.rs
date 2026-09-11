@@ -64,10 +64,12 @@ use ai_memory::subscriptions::{self, NewSubscription};
 /// the `Connection::open` reopen and first-call cold root-cert TLS init
 /// can take several seconds — still observes the POST within it. A
 /// genuine dispatch-drop never reaches the sink and still trips this
-/// deadline, so detection power is preserved. Mirrors the #1477
-/// `SINK_POLL_DEADLINE` / #1475 `DRAIN_DEADLINE` convention (the prior
-/// inline 5s budget was too tight and flaked under full-suite
-/// saturation; the stale "within 2s" panic strings predated even that).
+/// deadline, so detection power is preserved. Mirrors the #1475
+/// `DRAIN_DEADLINE` convention (the prior inline 5s budget was too
+/// tight and flaked under full-suite saturation; the stale "within 2s"
+/// panic strings predated even that). #3589 retired the sibling
+/// `SINK_POLL_DEADLINE` 30 s receipt window on
+/// `postgres_subscription_dispatch` in favour of `wait_dispatch_idle`.
 const WEBHOOK_RECEIPT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// #1478 — poll cadence while waiting for the dispatched POST to arrive.

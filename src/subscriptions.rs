@@ -30,13 +30,19 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 /// Tracing target for the subscription fan-out / DLQ surface
 /// (#1558 tracing-target SSOT).
 const SUBSCRIPTIONS_TRACE_TARGET: &str = "ai_memory::subscriptions";
 
 static DISPATCH_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Woken when the last admitted webhook worker drops. Subscribe-first
+/// (see [`wait_dispatch_idle`]) so a drop between the in-flight load and
+/// the wait cannot lose the wake. `notify_waiters` with no subscribers
+/// is a no-op — production fire-and-forget is unchanged.
+static DISPATCH_IDLE: Notify = Notify::const_new();
 
 struct DispatchInFlightGuard;
 
@@ -49,7 +55,13 @@ impl DispatchInFlightGuard {
 
 impl Drop for DispatchInFlightGuard {
     fn drop(&mut self) {
-        DISPATCH_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        // `fetch_sub` returns the previous count. prev == 1 means we
+        // were the last admitted worker (CONCURRENCY-08: SeqCst pairs
+        // with the load in `wait_dispatch_idle`).
+        let prev = DISPATCH_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            DISPATCH_IDLE.notify_waiters();
+        }
     }
 }
 
@@ -60,10 +72,26 @@ pub(crate) fn dispatch_in_flight() -> usize {
     DISPATCH_IN_FLIGHT.load(Ordering::SeqCst)
 }
 
-/// Poll interval for [`drain_dispatches`]. Short enough that a one-shot
-/// CLI with nothing in flight adds no measurable latency, long enough not
-/// to spin.
-const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// Await every ADMITTED webhook delivery finishing.
+///
+/// Subscribe-first [`Notify`] so a worker that drops between the
+/// in-flight load and the wait cannot lose the wake (CONCURRENCY-17).
+/// A dispatch that never admitted a worker is already idle and
+/// returns immediately — the caller then fail-closes on the sink
+/// assertion, not on a wall-clock receipt window (#3589).
+///
+/// Production shutdown wraps this in [`drain_dispatches`]'s timeout;
+/// tests await it directly so a loaded host is not a 30 s flake.
+#[doc(hidden)]
+pub async fn wait_dispatch_idle() {
+    loop {
+        let notified = DISPATCH_IDLE.notified();
+        if dispatch_in_flight() == 0 {
+            return;
+        }
+        notified.await;
+    }
+}
 
 /// Wait for every ADMITTED webhook delivery to finish, up to `timeout`.
 ///
@@ -80,15 +108,13 @@ const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// is fire-and-forget by design, so a surface that dispatches and then
 /// exits without draining would emit events that reliably die with the
 /// process.
+///
+/// #3589 — the wait itself is the dispatcher idle [`Notify`], not a
+/// poll of the clock. `timeout` is only a hang detector.
 pub async fn drain_dispatches(timeout: std::time::Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while dispatch_in_flight() != 0 {
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-    }
-    true
+    tokio::time::timeout(timeout, wait_dispatch_idle())
+        .await
+        .is_ok()
 }
 
 /// The graceful-shutdown budget [`drain_dispatches`] callers use. See

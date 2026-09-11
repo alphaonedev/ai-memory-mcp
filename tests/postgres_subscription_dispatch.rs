@@ -36,25 +36,11 @@ use std::time::Duration;
 use ai_memory::handlers::{AppState, StorageBackend, dispatch_event_postgres};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::store::{CallerContext, MemoryStore, sqlite::SqliteStore};
+use ai_memory::subscriptions::wait_dispatch_idle;
 use chrono::Utc;
 use tokio::sync::{Mutex, RwLock};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// #1477 — upper bound on how long the positive-path test waits for the
-/// dispatched POST to land at the wiremock sink. Generous so a slow host
-/// under full-suite `--features sal` HTTP contention — where the dispatch
-/// fan-out (`Handle::spawn` → `spawn_blocking(reqwest::blocking::send)`
-/// plus the first-call `prewarm_dispatch_tls` cold root-cert init) can
-/// take several seconds — still observes the POST within it. A genuine
-/// dispatch-drop never reaches the sink and still trips this deadline, so
-/// detection power is preserved. Mirrors the #1475 `DRAIN_DEADLINE`
-/// convention (the prior inline 5s / 50×100ms budget was too tight and
-/// flaked under full-suite saturation).
-const SINK_POLL_DEADLINE: Duration = Duration::from_secs(30);
-
-/// #1477 — poll cadence while waiting for the dispatched POST to arrive.
-const SINK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// #1201 — bind a fresh `127.0.0.1:0` `TcpListener` for use with
 /// `MockServer::builder().listener(...)`. Bypasses wiremock's internal
@@ -292,28 +278,25 @@ async fn dispatch_event_postgres_fires_hmac_signed_post() {
     )
     .await;
 
-    // Poll until the wiremock observes the dispatched POST on OUR
-    // per-test path (#1201), bounded by SINK_POLL_DEADLINE (#1477).
-    let deadline = std::time::Instant::now() + SINK_POLL_DEADLINE;
-    while std::time::Instant::now() < deadline {
-        let received = server.received_requests().await.unwrap_or_default();
-        if let Some(req) = received.iter().find(|r| r.url.path() == path_str) {
-            let sig = req
-                .headers
-                .get("x-ai-memory-signature")
-                .expect("HMAC signature header MUST be present on postgres dispatch");
-            let sig_str = sig.to_str().expect("signature header is ASCII");
-            assert!(
-                sig_str.starts_with("sha256="),
-                "signature header MUST carry sha256= prefix; got {sig_str:?}"
-            );
-            return;
-        }
-        tokio::time::sleep(SINK_POLL_INTERVAL).await;
-    }
-    panic!(
-        "post-#932 dispatch path never reached the sink within {SINK_POLL_DEADLINE:?} — \
-         regression: dispatch_event_postgres dropped the event"
+    // Deterministic: `DispatchInFlightGuard` notifies when the admitted
+    // worker drops (#3589). A dropped dispatch never increments
+    // in-flight, so this returns immediately and the HMAC assertion
+    // below fails closed — not a wall-clock receipt window.
+    wait_dispatch_idle().await;
+
+    let received = server.received_requests().await.unwrap_or_default();
+    let req = received.iter().find(|r| r.url.path() == path_str).expect(
+        "post-#932 dispatch path never reached the sink after the dispatcher \
+         went idle — regression: dispatch_event_postgres dropped the event",
+    );
+    let sig = req
+        .headers
+        .get("x-ai-memory-signature")
+        .expect("HMAC signature header MUST be present on postgres dispatch");
+    let sig_str = sig.to_str().expect("signature header is ASCII");
+    assert!(
+        sig_str.starts_with("sha256="),
+        "signature header MUST carry sha256= prefix; got {sig_str:?}"
     );
 }
 
@@ -360,8 +343,10 @@ async fn dispatch_event_postgres_respects_namespace_filter() {
     )
     .await;
 
-    // Wait briefly to confirm no dispatch fires.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Filter miss admits no worker (idle immediately). A broken filter
+    // admits a worker; waiting for idle then asserting empty fails
+    // closed instead of racing a 300 ms sleep (#3589).
+    wait_dispatch_idle().await;
     // #1201 — filter to OUR per-test path to be straggler-resilient.
     let received: Vec<_> = server
         .received_requests()
