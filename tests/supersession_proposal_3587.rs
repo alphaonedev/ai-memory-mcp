@@ -106,7 +106,11 @@ impl Backend {
     /// to `$N` for PostgreSQL; values bind as text).
     #[cfg_attr(
         not(feature = "sal-postgres"),
-        allow(clippy::unused_async, reason = "awaits the feature-gated pg arm")
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "awaits the feature-gated pg arm"
+        )
     )]
     async fn exec(&self, sql: &str, args: &[&str]) {
         match self {
@@ -131,7 +135,11 @@ impl Backend {
 
     #[cfg_attr(
         not(feature = "sal-postgres"),
-        allow(clippy::unused_async, reason = "awaits the feature-gated pg arm")
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "awaits the feature-gated pg arm"
+        )
     )]
     async fn seed(&self, memory: &Memory) {
         match self {
@@ -203,7 +211,11 @@ impl Backend {
 
     #[cfg_attr(
         not(feature = "sal"),
-        allow(clippy::unused_async, reason = "awaits the feature-gated SAL arms")
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "awaits the feature-gated SAL arms"
+        )
     )]
     async fn gate(
         &self,
@@ -247,7 +259,11 @@ impl Backend {
 
     #[cfg_attr(
         not(feature = "sal"),
-        allow(clippy::unused_async, reason = "awaits the feature-gated SAL arms")
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "awaits the feature-gated SAL arms"
+        )
     )]
     async fn execute_with(
         &self,
@@ -286,7 +302,11 @@ impl Backend {
     /// A federation newer-wins receive of `memory` (a peer re-pushing it).
     #[cfg_attr(
         not(feature = "sal"),
-        allow(clippy::unused_async, reason = "awaits the feature-gated SAL arms")
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "awaits the feature-gated SAL arms"
+        )
     )]
     async fn receive(&self, memory: &Memory) {
         match self {
@@ -316,7 +336,11 @@ impl Backend {
     /// The PRINCIPAL-LESS executor every federation lane and legacy caller uses.
     #[cfg_attr(
         not(feature = "sal"),
-        allow(clippy::unused_async, reason = "awaits the feature-gated SAL arms")
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "awaits the feature-gated SAL arms"
+        )
     )]
     async fn execute_plain(&self, pending_id: &str) -> Result<Option<String>, String> {
         match self {
@@ -343,7 +367,11 @@ impl Backend {
     /// or archived row; `None` when absent. Also reads a pending row's status.
     #[cfg_attr(
         not(feature = "sal-postgres"),
-        allow(clippy::unused_async, reason = "awaits the feature-gated pg arm")
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "awaits the feature-gated pg arm"
+        )
     )]
     async fn text(&self, sql: &str, id: &str) -> Option<String> {
         match self {
@@ -541,6 +569,13 @@ async fn direct_sqlite_supersession_proposal_3587() {
 }
 
 #[cfg(feature = "sal")]
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    allow(
+        irrefutable_let_patterns,
+        reason = "only the SQLite variant exists without sal-postgres"
+    )
+)]
 #[tokio::test]
 async fn sal_sqlite_supersession_proposal_3587() {
     let mut backend = Backend::sqlite();

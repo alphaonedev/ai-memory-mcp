@@ -695,8 +695,8 @@ async fn rollback(backend: &Backend) {
 }
 
 async fn matrix(backend: &Backend) {
-    audit_path();
     static ADMIN_INIT: std::sync::Once = std::sync::Once::new();
+    audit_path();
     ADMIN_INIT.call_once(|| ai_memory::identity::set_admin_agent_ids(vec![ADMIN.into()]));
     authority_matrix(backend).await;
     conflicts_and_namespaces(backend).await;
