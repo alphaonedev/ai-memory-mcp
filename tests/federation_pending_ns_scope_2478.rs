@@ -818,3 +818,101 @@ async fn refused_pending_decision_is_reported_as_skipped_2478() {
          demotes the peer's 2xx to a non-ack (#2341). Report: {report}"
     );
 }
+
+// ---------------------------------------------------------------------
+// #3587 U1 propose mode — a curator supersession proposal is NODE-LOCAL.
+// Both governance lanes refuse it REGARDLESS of the namespace gate, so these
+// cells run under the Standard opt-out (`=0`, no allowlist) where #2478's
+// gate is OFF — the posture in which only the #3587 check can stop them.
+// ---------------------------------------------------------------------
+
+/// Two rows by the same author (`ai:victim`), the second strictly newer.
+async fn seed_supersession_pair(router: &axum::Router) -> (String, String) {
+    let old = seed_row(router, IN_SCOPE_NS, "proposal-old-3587").await;
+    let new = seed_row(router, IN_SCOPE_NS, "proposal-new-3587").await;
+    (old, new)
+}
+
+async fn proposal_for(db: &ai_memory::handlers::Db, old: &str, new: &str) -> Value {
+    let guard = db.lock().await;
+    let old = ai_memory::db::get(&guard.0, old).unwrap().unwrap();
+    let new = ai_memory::db::get(&guard.0, new).unwrap().unwrap();
+    ai_memory::identity::supersession::SupersessionProposal::from_pair(&old, &new)
+        .expect("same-author strictly-newer pair")
+        .to_payload()
+}
+
+async fn pending_exists(db: &ai_memory::handlers::Db, id: &str) -> bool {
+    let guard = db.lock().await;
+    ai_memory::db::get_pending_action(&guard.0, id)
+        .unwrap()
+        .is_some()
+}
+
+#[tokio::test]
+async fn federated_supersession_proposal_row_refused_even_with_gate_off_3587() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_posture(None, Some("0"));
+    let (router, db) = build_router_with_db();
+    let (old, new) = seed_supersession_pair(&router).await;
+    let payload = proposal_for(&db, &old, &new).await;
+    let pid = uuid::Uuid::new_v4().to_string();
+    let entry = pending_entry(
+        &pid,
+        ai_memory::identity::supersession::PENDING_ACTION_SUPERSEDE,
+        IN_SCOPE_NS,
+        Some(&old),
+        &payload,
+    );
+    let (status, report) = push_governance(&router, vec![entry], vec![]).await;
+    assert!(status.is_success(), "report: {report}");
+    assert!(
+        !pending_exists(&db, &pid).await,
+        "proposal must not land: {report}"
+    );
+    assert_eq!(counter(&report, "pendings_applied"), 0, "report: {report}");
+    assert!(
+        counter(&report, "skipped") >= 1,
+        "refusal visible: {report}"
+    );
+}
+
+#[tokio::test]
+async fn federated_decision_on_local_proposal_refused_even_with_gate_off_3587() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_posture(None, Some("0"));
+    let (router, db) = build_router_with_db();
+    register_approver(&db).await;
+    let (old, new) = seed_supersession_pair(&router).await;
+    let pid = {
+        let guard = db.lock().await;
+        let old_m = ai_memory::db::get(&guard.0, &old).unwrap().unwrap();
+        let new_m = ai_memory::db::get(&guard.0, &new).unwrap().unwrap();
+        let proposal =
+            ai_memory::identity::supersession::SupersessionProposal::from_pair(&old_m, &new_m)
+                .unwrap();
+        ai_memory::db::supersession_pending::queue_proposal(&guard.0, &proposal)
+            .unwrap()
+            .unwrap()
+    };
+    let (status, report) = push_governance(&router, vec![], vec![approve(&pid)]).await;
+    assert!(status.is_success(), "report: {report}");
+    assert_eq!(
+        counter(&report, "pending_decisions_applied"),
+        0,
+        "report: {report}"
+    );
+    assert!(
+        counter(&report, "skipped") >= 1,
+        "refusal visible: {report}"
+    );
+    assert!(row_exists(&db, &old).await, "old row must stay live");
+    let guard = db.lock().await;
+    let status_now = ai_memory::db::get_pending_action(&guard.0, &pid)
+        .unwrap()
+        .unwrap()
+        .status;
+    assert_eq!(status_now, "pending", "never approved by a peer");
+}

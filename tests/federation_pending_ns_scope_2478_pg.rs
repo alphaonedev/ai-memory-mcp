@@ -837,3 +837,129 @@ async fn required_scope_local_pending_decision_postures_on_postgres_3582() {
     }
     pool.close().await;
 }
+
+// ---------------------------------------------------------------------
+// #3587 U1 propose mode — postgres twins of the sqlite cells: a curator
+// supersession proposal is NODE-LOCAL, refused on both governance lanes
+// REGARDLESS of the namespace gate (run with the gate OFF: no allowlist +
+// the Standard `=0` opt-out).
+// ---------------------------------------------------------------------
+
+/// Two rows by one author, the second strictly newer; returns the proposal payload.
+async fn seed_supersession_pair_pg(
+    store: &Arc<dyn MemoryStore>,
+    namespace: &str,
+) -> (String, String, Value) {
+    let old = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: namespace.to_string(),
+        title: uniq("proposal-old-3587"),
+        content: "the release freeze starts monday".to_string(),
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+        metadata: json!({"agent_id": "ai:victim-3587"}),
+        ..Default::default()
+    };
+    let new = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: uniq("proposal-new-3587"),
+        content: "the release freeze starts friday".to_string(),
+        created_at: "2026-01-02T00:00:00+00:00".to_string(),
+        updated_at: "2026-01-02T00:00:00+00:00".to_string(),
+        ..old.clone()
+    };
+    store.store(&admin_ctx(), &old).await.expect("seed old");
+    store.store(&admin_ctx(), &new).await.expect("seed new");
+    let payload = ai_memory::identity::supersession::SupersessionProposal::from_pair(&old, &new)
+        .expect("proposable pair")
+        .to_payload();
+    (old.id, new.id, payload)
+}
+
+fn set_gate_off_posture() {
+    // SAFETY: callers hold FED_ENV_LOCK; this binary serializes env users.
+    unsafe {
+        std::env::set_var(REQUIRE_ATTEST_ENV, "0");
+        std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
+        std::env::remove_var(SYNC_TRUST_PEER_ENV);
+        std::env::remove_var(TRUST_BODY_AGENT_ID_ENV);
+        std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
+}
+
+#[tokio::test]
+async fn federated_supersession_proposal_row_refused_on_postgres_3587() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_gate_off_posture();
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+    let ns = uniq("proposal-3587");
+    let (old, _new, payload) = seed_supersession_pair_pg(&store, &ns).await;
+    let pid = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = json!({
+        "id": pid, "action_type": ai_memory::identity::supersession::PENDING_ACTION_SUPERSEDE,
+        "memory_id": old, "namespace": ns, "payload": payload,
+        "requested_by": PEER_ID, "requested_at": now, "status": "pending",
+        "decided_by": null, "decided_at": null, "approvals": []
+    });
+    let (status, report) = push_governance(&router, vec![entry], vec![]).await;
+    assert!(status.is_success(), "report: {report}");
+    assert!(
+        pending_snapshot_3582(&pool, &pid).await.is_none(),
+        "proposal must not land: {report}"
+    );
+    assert!(
+        counter(&report, "skipped") >= 1,
+        "refusal visible: {report}"
+    );
+}
+
+#[tokio::test]
+async fn federated_decision_on_local_proposal_refused_on_postgres_3587() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_gate_off_posture();
+    let (router, store) = pg_router(&url).await;
+    register_approver(&store, "ai:approver-3587").await;
+    let pool = raw_pool(&url).await;
+    let ns = uniq("proposal-3587");
+    let (old, _new, payload) = seed_supersession_pair_pg(&store, &ns).await;
+    let pid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO pending_actions (id, action_type, memory_id, namespace, payload, \
+         requested_by, requested_at, status) VALUES ($1, $2, $3, $4, $5, $6, NOW(), 'pending')",
+    )
+    .bind(&pid)
+    .bind(ai_memory::identity::supersession::PENDING_ACTION_SUPERSEDE)
+    .bind(&old)
+    .bind(&ns)
+    .bind(&payload)
+    .bind(ai_memory::identity::sentinels::AI_CURATOR)
+    .execute(&pool)
+    .await
+    .expect("queue local proposal");
+    let decision = json!({"id": pid, "approved": true, "decider": "ai:approver-3587"});
+    let (status, report) = push_governance(&router, vec![], vec![decision]).await;
+    assert!(status.is_success(), "report: {report}");
+    assert!(
+        counter(&report, "skipped") >= 1,
+        "refusal visible: {report}"
+    );
+    assert!(row_exists(&pool, &old).await, "old row must stay live");
+    let snapshot = pending_snapshot_3582(&pool, &pid).await.expect("row");
+    assert_eq!(snapshot["status"], "pending", "never approved by a peer");
+}
