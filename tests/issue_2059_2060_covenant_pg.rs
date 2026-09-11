@@ -11,16 +11,23 @@
 //! tests drive REAL postgres writes through each funnel under the enforce env
 //! knobs so a future re-bypass fails RED.
 //!
-//! # Live-postgres gated + serial
+//! # Live-postgres gated + isolation-safe under `--test-threads=4`
 //!
 //! Skip-if-`AI_MEMORY_TEST_POSTGRES_URL`-unset (the shipped-postgres-suite
 //! convention, e.g. `tests/entity_alias_1654.rs`). Env mutation happens ONLY
 //! AFTER the skip check, so a local run without a PG URL never touches the
-//! process env; when a URL IS present the sal-postgres suite already runs
-//! serial (`-- --test-threads=1`, per CLAUDE.md — the shared `ai_memory_test`
-//! DB has no per-test schema isolation), so the env-knob mutations do not race.
-//! This is a distinct test BINARY from the sqlite covenant file, so the two
-//! never share a process.
+//! process env. Tests WITHIN this binary still run on multiple threads by
+//! default (`--test-threads=4` is the cargo default, and CI may run this
+//! binary in parallel with siblings that share a live PG URL). Every env
+//! mutator therefore takes [`covenant_env_lock`] (a `tokio::sync::Mutex`,
+//! held across `.await` — CONCURRENCY-20) and mutates through
+//! [`CovenantEnvGuard`] so Drop restores the prior value on panic
+//! (OWNERSHIP-24). Unique per-test namespaces isolate the *rows*; the lock
+//! isolates the *process-global knobs*. All 18 tests in this binary take
+//! the lock (16 mutators + 2 readers of the same knobs) so a `set_var`
+//! cannot race a concurrent env read (rust-1.98 contract). This is a
+//! distinct test BINARY from the sqlite covenant file, so the two never
+//! share a process.
 
 #![cfg(feature = "sal-postgres")]
 
@@ -87,18 +94,54 @@ fn is_permission_denied(err: &StoreError) -> bool {
 /// `tokio::sync::Mutex` because this file's tests are async and the guard is
 /// held across `.await` points (a std `MutexGuard` there trips
 /// `clippy::await_holding_lock` and risks a deadlock under a multi-thread
-/// runtime). The pg-gated tests skip (return) BEFORE touching the env when no
-/// PG url is set, so the only env-mutators that RUN under a default (no-PG)
-/// `cargo test` are the two unconditional in-memory sqlite tests below;
-/// guarding them keeps the default parallel invocation deterministic (the
-/// live-PG suite additionally runs serial via `-- --test-threads=1`, per the
-/// module header).
+/// runtime — CONCURRENCY-20). Every env-mutating test in this binary takes
+/// the lock, including the live-PG cases: unique namespaces isolate rows,
+/// not the process-global knobs (#3593). The pg-gated tests skip (return)
+/// BEFORE touching the env when no PG url is set, so a default (no-PG)
+/// `cargo test` only runs the in-memory sqlite mutators.
 async fn covenant_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
     use std::sync::OnceLock;
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await
+}
+
+/// Snapshot+restore one covenant env var. The caller MUST hold
+/// [`covenant_env_lock`] for the whole test body while this guard is live
+/// (CONCURRENCY-02). Drop restores the prior value even on panic
+/// (OWNERSHIP-24), so an assertion failure cannot leak `=1` into a sibling.
+#[must_use = "the guard restores the env var on drop"]
+struct CovenantEnvGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl CovenantEnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var_os(key);
+        // SAFETY: caller holds `covenant_env_lock()` for the whole test body,
+        // so no other thread in this binary reads or writes the environment
+        // concurrently (UNSAFE-01/03; rust-1.98 `set_var` contract).
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, prev }
+    }
+}
+
+impl Drop for CovenantEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: same as `set` — serialised by `covenant_env_lock`. Runs
+        // during unwinding, so a panic cannot leak enforce into a sibling.
+        unsafe {
+            if let Some(v) = &self.prev {
+                std::env::set_var(self.key, v);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 // ── Clause 1 — why_trace on the postgres store funnels (#2102) ────────────
@@ -109,12 +152,13 @@ async fn pg_store_refuses_missing_why_trace_under_enforce() {
         eprintln!("skip pg_store_refuses_missing_why_trace_under_enforce: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let ctx = CallerContext::for_agent("cov-2102-owner");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let ns = format!("cov2102-store-{run}");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // store — no why_trace → refused.
     let no_wt = pg_mem(&format!("s-{run}"), &ns, "no wt", "alice", None);
     let err = store
@@ -151,8 +195,6 @@ async fn pg_store_refuses_missing_why_trace_under_enforce() {
         .store(&ctx, &wt)
         .await
         .expect("store must allow a why_trace-bearing write under enforce");
-
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 #[tokio::test]
@@ -161,19 +203,19 @@ async fn pg_federation_apply_never_refuses_missing_why_trace_under_enforce() {
         eprintln!("skip pg_federation_apply_never_refuses: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let ctx = CallerContext::for_agent("cov-2102-fed");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let ns = format!("cov2102-fed-{run}");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // apply_remote_memory — federation receive must NEVER refuse (CRDT).
     let inbound = pg_mem(&format!("ar-{run}"), &ns, "inbound no wt", "peer", None);
     store
         .apply_remote_memory(&ctx, &inbound)
         .await
         .expect("apply_remote_memory must accept a why_trace-less inbound write under enforce");
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 // ── Clause 2 — authorship on the postgres update funnels (#2103) ──────────
@@ -184,6 +226,7 @@ async fn pg_update_no_if_match_refuses_authorship_rewrite_under_enforce() {
         eprintln!("skip pg_update_no_if_match_refuses_authorship_rewrite: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     // The acting caller must OWN the seeded row: the pg SAL `update`/`get`
     // enforce the scope=private owner-write gate, so a caller != author
@@ -215,7 +258,7 @@ async fn pg_update_no_if_match_refuses_authorship_rewrite_under_enforce() {
 
     // Enforce: the SAME rewrite via the default (no-If-Match) update path is
     // now REFUSED (pre-#2103 it was a silent, unlogged, non-refusing no-op).
-    unsafe { std::env::set_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, "1") };
+    let _auth = CovenantEnvGuard::set(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, "1");
     let err = store
         .update(&ctx, &id, rewrite)
         .await
@@ -226,7 +269,6 @@ async fn pg_update_no_if_match_refuses_authorship_rewrite_under_enforce() {
         still.metadata.get("agent_id").and_then(|v| v.as_str()),
         Some("alice")
     );
-    unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
 }
 
 #[tokio::test]
@@ -235,6 +277,7 @@ async fn pg_supersede_refuses_authorship_rewrite_under_enforce() {
         eprintln!("skip pg_supersede_refuses_authorship_rewrite: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     // Caller must OWN the seeded row (see pg_update fixture note above):
     // the post-refusal `get(&ctx, ..)` visibility-hides a scope=private row
@@ -246,7 +289,7 @@ async fn pg_supersede_refuses_authorship_rewrite_under_enforce() {
     let mem = pg_mem(&id, &ns, "owned by alice sup", "alice", Some("seed"));
     store.store(&ctx, &mem).await.expect("store");
 
-    unsafe { std::env::set_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, "1") };
+    let _auth = CovenantEnvGuard::set(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, "1");
     let patch = UpdatePatch {
         title: Some("superseding title".to_string()),
         content: Some("superseding body".to_string()),
@@ -264,7 +307,6 @@ async fn pg_supersede_refuses_authorship_rewrite_under_enforce() {
         still.metadata.get("agent_id").and_then(|v| v.as_str()),
         Some("alice")
     );
-    unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
 }
 
 // ── #2110 — authenticated-origin exemption (system principal exempt, tenant
@@ -274,8 +316,8 @@ async fn pg_supersede_refuses_authorship_rewrite_under_enforce() {
 #[tokio::test]
 async fn sqlite_system_principal_exempt_tenant_gated_under_enforce_2110() {
     use ai_memory::store::sqlite::SqliteStore;
-    let _env = covenant_env_lock().await;
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _lock = covenant_env_lock().await;
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     let store = SqliteStore::open(":memory:").expect("open in-memory store");
 
     // Tenant principal forging kind:"reflection" → still REFUSED (no origin
@@ -315,7 +357,6 @@ async fn sqlite_system_principal_exempt_tenant_gated_under_enforce_2110() {
         got.metadata.get("why_trace").and_then(|v| v.as_str()),
         Some("substrate:system-authored")
     );
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 #[tokio::test]
@@ -324,11 +365,12 @@ async fn pg_system_principal_exempt_tenant_gated_under_enforce_2110() {
         eprintln!("skip pg_system_principal_exempt_2110: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let ns = format!("cov2110-{run}");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // Tenant forging kind → REFUSED.
     let tenant = CallerContext::for_agent("ai:tenant-2110");
     let mut forged = pg_mem(
@@ -366,7 +408,6 @@ async fn pg_system_principal_exempt_tenant_gated_under_enforce_2110() {
         Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
         "#2124 — pg store must stamp the substrate why_trace for the internal principal"
     );
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 // ── #2113 — the pg reflect funnel (POST /api/v1/reflect) was ungated ──
@@ -408,7 +449,7 @@ fn is_reflect_why_trace_refusal(err: &ai_memory::db::ReflectError) -> bool {
 #[tokio::test]
 async fn sqlite_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
     use ai_memory::store::sqlite::SqliteStore;
-    let _env = covenant_env_lock().await;
+    let _lock = covenant_env_lock().await;
     let store = SqliteStore::open(":memory:").expect("open in-memory store");
     let system = CallerContext::for_admin("ai:curator-2113");
     let tenant = CallerContext::for_agent("ai:tenant-2113");
@@ -421,7 +462,7 @@ async fn sqlite_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
     let src = pg_mem("sq-src-2113", ns, "source", "ai:tenant-2113", None);
     store.store(&tenant, &src).await.expect("seed source");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // Tenant reflect with NO why_trace → REFUSED (pre-#2113 this was ungated).
     let err = store
         .reflect(
@@ -457,7 +498,6 @@ async fn sqlite_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
         )
         .await
         .expect("a why_trace-bearing tenant reflect is allowed under enforce");
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 #[tokio::test]
@@ -466,6 +506,7 @@ async fn pg_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
         eprintln!("skip pg_reflect_refuses_tenant_2113: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let system = CallerContext::for_admin("ai:curator-2113");
     let tenant = CallerContext::for_agent("ai:tenant-2113");
@@ -481,7 +522,7 @@ async fn pg_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
     let src = pg_mem(&src_id, &ns, "source", "ai:tenant-2113", None);
     store.store(&tenant, &src).await.expect("seed source");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // Tenant reflect with NO why_trace → REFUSED (the #2113 fix; POST /reflect
     // on a postgres daemon got ZERO why_trace enforcement pre-fix).
     let err = store
@@ -501,7 +542,6 @@ async fn pg_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
         )
         .await
         .expect("authenticated system principal pg reflect is exempt");
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 /// #2113 audit — the pg `update_with_archive_on_supersede` inline INSERT was
@@ -513,6 +553,7 @@ async fn pg_supersede_refuses_missing_why_trace_under_enforce_2113() {
         eprintln!("skip pg_supersede_refuses_missing_why_trace_2113: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let system = CallerContext::for_admin("ai:curator-sup-2113");
     let run = uuid::Uuid::new_v4().simple().to_string();
@@ -523,7 +564,7 @@ async fn pg_supersede_refuses_missing_why_trace_under_enforce_2113() {
     let src = pg_mem(&id, &ns, "sup source", "alice", None);
     store.store(&system, &src).await.expect("seed source");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // Supersede with a patch carrying NO why_trace → the composed candidate
     // lacks why_trace (preserve_provenance_keys copies agent_id, not why_trace)
     // → REFUSED by the newly-gated inline INSERT.
@@ -560,7 +601,6 @@ async fn pg_supersede_refuses_missing_why_trace_under_enforce_2113() {
         .update_with_archive_on_supersede(&id, patch_wt, None, ai_memory::models::EditSource::Llm)
         .await
         .expect("a why_trace-bearing supersede is allowed under enforce");
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 // ── #2121 — capture_turn / recover_turn / consolidate key the substrate
@@ -643,13 +683,14 @@ async fn pg_capture_turn_tenant_refused_system_exempt_under_enforce_2121() {
         eprintln!("skip pg_capture_turn_tenant_refused_2121: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let tenant = CallerContext::for_agent("ai:tenant-2121");
     let system = CallerContext::for_admin("ai:system-2121");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let ns = format!("cov2121cap-{run}");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // Tenant + no why_trace → REFUSED (pre-fix: unconditionally stamped =
     // the #2110 bypass re-committed on the L4 funnel).
     let w1 = pg_capture_write(
@@ -703,7 +744,6 @@ async fn pg_capture_turn_tenant_refused_system_exempt_under_enforce_2121() {
         why_trace_of(&got3).as_deref(),
         Some("substrate:system-authored")
     );
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 /// #2121 — the L2 recovery twin of the capture test above.
@@ -713,13 +753,14 @@ async fn pg_recover_turn_tenant_refused_system_exempt_under_enforce_2121() {
         eprintln!("skip pg_recover_turn_tenant_refused_2121: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let tenant = CallerContext::for_agent("ai:tenant-rec-2121");
     let system = CallerContext::for_admin("ai:system-rec-2121");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let ns = format!("cov2121rec-{run}");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     let w1 = pg_recover_write(&format!("rec-t-{run}"), &ns, "tenant recover", 11, None);
     let err = store
         .recover_turn_idempotent(&tenant, &w1)
@@ -739,7 +780,6 @@ async fn pg_recover_turn_tenant_refused_system_exempt_under_enforce_2121() {
         why_trace_of(&got).as_deref(),
         Some("substrate:system-authored")
     );
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 /// #2121 — `memory_consolidate`'s summary is verbatim caller content: a
@@ -752,6 +792,7 @@ async fn pg_consolidate_tenant_refused_system_exempt_under_enforce_2121() {
         eprintln!("skip pg_consolidate_tenant_refused_2121: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let tenant = CallerContext::for_agent("ai:tenant-cons-2121");
     let system = CallerContext::for_admin("ai:curator-cons-2121");
@@ -772,54 +813,55 @@ async fn pg_consolidate_tenant_refused_system_exempt_under_enforce_2121() {
         .await
         .expect("seed b");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
-    // Tenant consolidate → REFUSED; sources survive (tx dropped).
-    let err = store
-        .consolidate(
-            &tenant,
-            &[id_a.clone(), id_b.clone()],
-            "tenant merged",
-            "verbatim tenant summary",
-            &ns,
-            &Tier::Long,
-            "consolidation",
-            "ai:tenant-cons-2121",
-        )
-        .await
-        .expect_err("tenant consolidate without why_trace must be refused under enforce");
-    assert!(is_permission_denied(&err), "got {err:?}");
-    store
-        .get(&system, &id_a)
-        .await
-        .expect("source a survives the refused consolidate");
-    store
-        .get(&system, &id_b)
-        .await
-        .expect("source b survives the refused consolidate");
+    {
+        let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
+        // Tenant consolidate → REFUSED; sources survive (tx dropped).
+        let err = store
+            .consolidate(
+                &tenant,
+                &[id_a.clone(), id_b.clone()],
+                "tenant merged",
+                "verbatim tenant summary",
+                &ns,
+                &Tier::Long,
+                "consolidation",
+                "ai:tenant-cons-2121",
+            )
+            .await
+            .expect_err("tenant consolidate without why_trace must be refused under enforce");
+        assert!(is_permission_denied(&err), "got {err:?}");
+        store
+            .get(&system, &id_a)
+            .await
+            .expect("source a survives the refused consolidate");
+        store
+            .get(&system, &id_b)
+            .await
+            .expect("source b survives the refused consolidate");
 
-    // Curator principal → exempt + result stamped.
-    let new_id = store
-        .consolidate(
-            &system,
-            &[id_a, id_b],
-            "curator merged",
-            "curator summary",
-            &ns,
-            &Tier::Long,
-            "consolidation",
-            "ai:curator-cons-2121",
-        )
-        .await
-        .expect("internal curator consolidate is exempt");
-    let got = store.get(&system, &new_id).await.expect("get");
-    assert_eq!(
-        why_trace_of(&got).as_deref(),
-        Some("substrate:system-authored")
-    );
+        // Curator principal → exempt + result stamped.
+        let new_id = store
+            .consolidate(
+                &system,
+                &[id_a, id_b],
+                "curator merged",
+                "curator summary",
+                &ns,
+                &Tier::Long,
+                "consolidation",
+                "ai:curator-cons-2121",
+            )
+            .await
+            .expect("internal curator consolidate is exempt");
+        let got = store.get(&system, &new_id).await.expect("get");
+        assert_eq!(
+            why_trace_of(&got).as_deref(),
+            Some("substrate:system-authored")
+        );
+    } // Drop restores advisory so the inheritance seed below is not refused.
 
     // Inheritance: a tenant consolidate over a why_trace-bearing source
     // clears the gate with the inherited rationale.
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
     let ns2 = format!("cov2121consin-{run}");
     let id_c = format!("cons-c-{run}");
     store
@@ -829,7 +871,7 @@ async fn pg_consolidate_tenant_refused_system_exempt_under_enforce_2121() {
         )
         .await
         .expect("seed c");
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     let inherited = store
         .consolidate(
             &tenant,
@@ -845,7 +887,6 @@ async fn pg_consolidate_tenant_refused_system_exempt_under_enforce_2121() {
         .expect("inherited why_trace clears the gate for a tenant consolidate");
     let got2 = store.get(&system, &inherited).await.expect("get");
     assert_eq!(why_trace_of(&got2).as_deref(), Some("caller rationale"));
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 /// #2122 — the SAL `notify` `why_trace` path on postgres: a why_trace-less
@@ -857,12 +898,13 @@ async fn pg_notify_why_trace_param_path_under_enforce_2122() {
         eprintln!("skip pg_notify_why_trace_param_2122: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let tenant = CallerContext::for_agent("ai:notifier-2122");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let target = format!("ai:recipient-{run}");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     let err = store
         .notify(
             &tenant,
@@ -891,7 +933,6 @@ async fn pg_notify_why_trace_param_path_under_enforce_2122() {
         .expect("why_trace param clears the gate");
     let got = store.get(&tenant, &id).await.expect("get");
     assert_eq!(why_trace_of(&got).as_deref(), Some("coordinating handoff"));
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 // ── #2124 (LOW) — cross-backend provenance parity: the pg store FAMILY
@@ -915,6 +956,10 @@ async fn pg_notify_why_trace_param_path_under_enforce_2122() {
 #[tokio::test]
 async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
     use ai_memory::store::sqlite::SqliteStore;
+    // Reader of `REQUIRE_WHY_TRACE_ENV` (store funnels consult it). Take the
+    // lock so a sibling mutator cannot `set_var` while this thread reads
+    // the process env (rust-1.98 set_var contract; #3593).
+    let _lock = covenant_env_lock().await;
     let store = SqliteStore::open(":memory:").expect("open in-memory store");
     let system = CallerContext::for_admin("ai:curator-2124");
 
@@ -991,12 +1036,13 @@ async fn pg_store_family_stamps_substrate_why_trace_for_system_2124() {
         eprintln!("skip pg_store_family_stamps_substrate_why_trace_2124: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let ns = format!("cov2124-{run}");
     let system = CallerContext::for_admin("ai:curator-2124");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
 
     // store — internal principal → stamped.
     let id_s = store
@@ -1085,8 +1131,6 @@ async fn pg_store_family_stamps_substrate_why_trace_for_system_2124() {
             .is_err(),
         "tenant store_batch without why_trace must stay gated",
     );
-
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 // ── #2141 — GOVERNANCE_PRE_WRITE gate on the DEFAULT (no-If-Match) postgres
@@ -1129,6 +1173,10 @@ async fn pg_update_no_if_match_refuses_governance_refused_shape_2141() {
         eprintln!("skip pg_update_no_if_match_refuses_governance_refused_shape_2141: no PG url");
         return;
     };
+    // Reader of the covenant env knobs via `store`/`update`. Serialize with
+    // the mutators so a sibling cannot `set_var` while this thread reads
+    // (rust-1.98 set_var contract; #3593).
+    let _lock = covenant_env_lock().await;
     ensure_gov_marker_hook_2141();
     let store = PostgresStore::connect(&url).await.expect("connect");
     let ctx = CallerContext::for_agent("alice");
@@ -1190,6 +1238,7 @@ async fn pg_supersede_omitted_why_trace_not_laundered_via_inheritance_2123() {
         eprintln!("skip pg_supersede_omitted_why_trace_2123: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let ctx = CallerContext::for_agent("alice");
     let run = uuid::Uuid::new_v4().simple().to_string();
@@ -1209,7 +1258,7 @@ async fn pg_supersede_omitted_why_trace_not_laundered_via_inheritance_2123() {
         .await
         .expect("seed source with why_trace");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // Patch SUPPLIES a metadata object but OMITS why_trace → the composed
     // candidate lacks why_trace (agent_id is preserved, why_trace is not) →
     // REFUSED. If a future change added why_trace to the preserve set, this
@@ -1229,7 +1278,6 @@ async fn pg_supersede_omitted_why_trace_not_laundered_via_inheritance_2123() {
     let still = store.get(&ctx, &id).await.expect("get");
     assert_eq!(still.title, "sup source w/ trace");
     assert_eq!(why_trace_of(&still).as_deref(), Some("original rationale"));
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
 /// #2123 — the WHOLE-OBJECT inheritance path IS allowed: when the patch OMITS
@@ -1244,6 +1292,7 @@ async fn pg_supersede_whole_object_omission_inherits_why_trace_2123() {
         eprintln!("skip pg_supersede_whole_object_omission_2123: no PG url");
         return;
     };
+    let _lock = covenant_env_lock().await;
     let store = PostgresStore::connect(&url).await.expect("connect");
     let ctx = CallerContext::for_agent("alice");
     let run = uuid::Uuid::new_v4().simple().to_string();
@@ -1261,7 +1310,7 @@ async fn pg_supersede_whole_object_omission_inherits_why_trace_2123() {
         .await
         .expect("seed source with why_trace");
 
-    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let _why = CovenantEnvGuard::set(REQUIRE_WHY_TRACE_ENV, "1");
     // Patch OMITS metadata entirely → existing metadata (incl. why_trace) is
     // inherited whole → ALLOWED under enforce.
     let patch = UpdatePatch {
@@ -1273,5 +1322,4 @@ async fn pg_supersede_whole_object_omission_inherits_why_trace_2123() {
         .update_with_archive_on_supersede(&id, patch, None, ai_memory::models::EditSource::Llm)
         .await
         .expect("a whole-object supersede that omits metadata inherits why_trace and is allowed");
-    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }

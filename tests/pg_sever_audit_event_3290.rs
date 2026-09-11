@@ -31,6 +31,20 @@ use ai_memory::signed_events::event_types::SUBSTRATE_NAMESPACE_STANDARD_SEVERED;
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore};
 
+/// Serialize the setup / before-count / reap / after-count / newest-event /
+/// cleanup window. `severed_event_count` and `newest_severed_event` filter
+/// only `event_type`; unique namespaces isolate the *rows* they reap, not
+/// the database-global count those helpers read (#3593). A `tokio::sync::Mutex`
+/// is held across `.await` (CONCURRENCY-20 — a std guard would trip
+/// `clippy::await_holding_lock`).
+async fn sever_audit_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 fn pg_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .ok()
@@ -89,8 +103,10 @@ fn standard_memory(standard_ns: &str, owner: &str, policy: &GovernancePolicy) ->
 /// opaque hash (`standard_id \0 ns... \0 timestamp`) so we cannot filter by the
 /// standard id in SQL; each test instead pins the DELTA across its own reap to
 /// exactly +1 and asserts the daemon principal + chained sequence on the newest
-/// row. Tests use unique namespaces so concurrent runs do not perturb the count
-/// they measure (the assertion is a before/after delta, not an absolute).
+/// row. Unique namespaces isolate the bound `namespace_meta` rows, NOT this
+/// global count — callers must hold [`sever_audit_lock`] across the
+/// before-count / reap / after-count / newest-event window so a sibling cannot
+/// append a matching `event_type` between the two reads (#3593).
 async fn severed_event_count(store: &PostgresStore) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM signed_events WHERE event_type = $1")
         .bind(SUBSTRATE_NAMESPACE_STANDARD_SEVERED)
@@ -133,6 +149,7 @@ async fn pg_delete_sever_emits_signed_severed_event_3290() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let _lock = sever_audit_lock().await;
     let owner = uniq("ai:op-3290");
     let ctx = CallerContext::for_agent(owner.clone());
     let attacker_ns = uniq("public-3290");
@@ -184,6 +201,7 @@ async fn pg_archive_by_ids_sever_emits_signed_severed_event_3290() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let _lock = sever_audit_lock().await;
     let owner = uniq("ai:arch-3290");
     let ctx = CallerContext::for_agent(owner.clone());
     let attacker_ns = uniq("public-arch-3290");
@@ -228,6 +246,7 @@ async fn pg_delete_non_standard_emits_no_severed_event_3290() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let _lock = sever_audit_lock().await;
     let owner = uniq("ai:plain-3290");
     let ctx = CallerContext::for_agent(owner.clone());
     let ns = uniq("plain-3290");
