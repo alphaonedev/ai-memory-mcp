@@ -369,7 +369,7 @@ fn mcp_valid_configured_identity_serves_read_and_write_3549() {
         &call(
             1,
             "memory_store",
-            serde_json::json!({
+            &serde_json::json!({
                 "title": "t-3549", "content": "c-3549", "namespace": "ns-3549"
             }),
         ),
@@ -381,7 +381,7 @@ fn mcp_valid_configured_identity_serves_read_and_write_3549() {
         &call(
             2,
             "memory_list",
-            serde_json::json!({"namespace": "ns-3549"}),
+            &serde_json::json!({"namespace": "ns-3549"}),
         ),
     );
     assert!(listed["error"].is_null(), "{listed}");
