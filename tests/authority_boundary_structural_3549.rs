@@ -40,8 +40,8 @@
 //!    `src/identity/authority.rs`; no struct literal or `::new(` elsewhere.
 //! 5. **Read-funnel pin (ruling 2)** — `is_visible_to_caller` is no longer
 //!    `pub`, has NO production call site outside `src/visibility.rs`, and
-//!    every read-only MCP tool's handler calls `is_readable_on_query` or
-//!    is allowlisted with a reason.
+//!    every read-only MCP tool (the `src/mcp/read_only_tools.rs` table) has a
+//!    handler that calls `is_readable_on_query` or is allowlisted with a reason.
 //!
 //! The `detector_*` cases drive each parser over synthetic buffers so the
 //! guard is proven to CATCH the defect rather than pass vacuously on
@@ -69,7 +69,8 @@ const CTX_STRUCT_FIELD: &str = "pub authority: &'a crate::identity::authority::A
 const ROUTER_FN: &str = "pub fn build_router_with_timeout(";
 const AUTHORITY_LAYER: &str = "handlers::authority::authority_layer,";
 const API_KEY_LAYER: &str = "handlers::api_key_auth,";
-const READ_ONLY_FN: &str = "fn mcp_tool_is_read_only(name: &str) -> bool {";
+const READ_ONLY_TOOLS: &str = "src/mcp/read_only_tools.rs";
+const READ_ONLY_FN: &str = "pub(crate) fn mcp_tool_is_read_only(name: &str) -> bool {";
 
 /// The env-re-derivation tokens a dispatch WRAPPER may no longer call: the
 /// chokepoint resolved them once.
@@ -310,10 +311,13 @@ fn parse_route_consts(routes_src: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// Tool names from `mcp_tool_is_read_only`, lowercased (`memory_recall`).
-fn parse_read_only_tools(mcp_src: &str) -> BTreeSet<String> {
-    let start = mcp_src.find(READ_ONLY_FN).expect("mcp_tool_is_read_only");
-    let body = &mcp_src[start..];
+/// Tool names from `mcp_tool_is_read_only` (`src/mcp/read_only_tools.rs`),
+/// lowercased (`memory_recall`).
+fn parse_read_only_tools(read_only_src: &str) -> BTreeSet<String> {
+    let start = read_only_src
+        .find(READ_ONLY_FN)
+        .expect("mcp_tool_is_read_only");
+    let body = &read_only_src[start..];
     let end = body.find("\n}\n").expect("fn end");
     let body = &body[..end];
     let mut out = BTreeSet::new();
@@ -710,8 +714,7 @@ fn handler_file_for(tool: &str, tool_files: &[(String, String)]) -> Option<Strin
 
 #[test]
 fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
-    let mcp = read(MCP_MOD);
-    let tools = parse_read_only_tools(&mcp);
+    let tools = parse_read_only_tools(&read(READ_ONLY_TOOLS));
     assert!(
         tools.len() > 40,
         "read-only inventory unexpectedly small: {}",

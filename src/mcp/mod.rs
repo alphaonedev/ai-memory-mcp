@@ -80,6 +80,18 @@ pub mod jsonrpc;
 #[cfg(test)]
 mod param_numeric_3374_tests;
 
+// v1.0.0 #3549 (QUAL-10 split) — the Wave-2 B6 read-only tool table, a
+// sibling so `mod.rs` stays under its size ceiling. The #3549 structural
+// guard parses it from its own file.
+mod read_only_tools;
+
+// v1.0.0 #3549 — doc-hidden test entry into the REAL `tools/call` dispatch
+// arm, so `tests/` can drive the dispatch-level authority refusal with the
+// #3523 seam (which `src/` may never arm). Precedent:
+// `handle_archive_purge_for_test`.
+#[doc(hidden)]
+pub mod dispatch_test_hook;
+
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
 // `tool_definitions()` catalog. Each `d1_5_986_tests` mod under
@@ -1477,12 +1489,7 @@ pub(crate) struct ToolDispatchCtx<'a> {
     pub atomise_queue: Option<&'a crate::background::atomise_worker::AtomiseQueue>,
     pub ingest_multistep_handler: Option<&'a ingest_multistep::IngestMultistepHandler>,
     /// v1.0.0 #3549 — the caller authority resolved ONCE at the `tools/call`
-    /// chokepoint ([`crate::identity::authority::Authority::resolve_mcp`])
-    /// BEFORE the table lookup. Every dispatch wrapper reads the principal /
-    /// binding / admin facts from here instead of re-deriving them from the
-    /// environment; the constructor is private, so the only way this field
-    /// is ever populated is through that resolver — a wrapper cannot mint a
-    /// wider authority than the chokepoint resolved.
+    /// chokepoint (private constructor: no wrapper can mint a wider one).
     pub authority: &'a crate::identity::authority::Authority,
 }
 
@@ -2974,70 +2981,7 @@ fn dispatch_memory_deref(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     }
 }
 
-/// Wave-2 B6 — MCP tools that MUST stay live under record-stop (reads /
-/// status / capabilities). Everything else is a mutating write and is
-/// fenced at the dispatch layer. Fail-closed: a newly added tool that
-/// is not in this set is treated as a write.
-fn mcp_tool_is_read_only(name: &str) -> bool {
-    use crate::mcp::registry::tool_names as t;
-    matches!(
-        name,
-        t::MEMORY_RECALL
-            | t::MEMORY_RECALL_OBSERVATIONS
-            | t::MEMORY_SEARCH
-            | t::MEMORY_LIST
-            | t::MEMORY_GET
-            | t::MEMORY_GET_LINKS
-            | t::MEMORY_GET_TAXONOMY
-            | t::MEMORY_STATS
-            | t::MEMORY_CAPABILITIES
-            | t::MEMORY_CHECK_DUPLICATE
-            | t::MEMORY_CHECK_AGENT_ACTION
-            | t::MEMORY_ENTITY_GET_BY_ALIAS
-            | t::MEMORY_FIND_PATHS
-            | t::MEMORY_LINEAGE
-            | t::MEMORY_KG_QUERY
-            | t::MEMORY_KG_TIMELINE
-            | t::MEMORY_VERIFY
-            | t::MEMORY_REPLAY
-            | t::MEMORY_INBOX
-            | t::MEMORY_PENDING_LIST
-            | t::MEMORY_ACTION_GET
-            | t::MEMORY_ACTION_LIST
-            | t::MEMORY_ACTION_EDGES
-            | t::MEMORY_ACTION_FRONTIER
-            | t::MEMORY_ACTION_NEXT
-            | t::MEMORY_LEASE_GET
-            | t::MEMORY_ROUTINE_LIST
-            | t::MEMORY_ROUTINE_STATUS
-            | t::MEMORY_CHECKPOINT_QUERY
-            | t::MEMORY_CHECKPOINT_VERIFY
-            | t::MEMORY_SIGNAL_INBOX
-            | t::MEMORY_SIGNAL_READ
-            | t::MEMORY_SIGNAL_THREAD
-            | t::MEMORY_SKILL_GET
-            | t::MEMORY_SKILL_LIST
-            | t::MEMORY_SKILL_EXPORT
-            | t::MEMORY_SKILL_RESOURCE
-            | t::MEMORY_SKILL_COMPOSITIONAL_CONTEXT
-            | t::MEMORY_ARCHIVE_LIST
-            | t::MEMORY_ARCHIVE_STATS
-            | t::MEMORY_NAMESPACE_GET_STANDARD
-            | t::MEMORY_QUOTA_STATUS
-            | t::MEMORY_RULE_LIST
-            | t::MEMORY_AGENT_LIST
-            | t::MEMORY_LIST_SUBSCRIPTIONS
-            | t::MEMORY_SUBSCRIPTION_DLQ_LIST
-            | t::MEMORY_SMART_LOAD
-            | t::MEMORY_LOAD_FAMILY
-            | t::MEMORY_EXPAND_QUERY
-            | t::MEMORY_REFLECTION_ORIGIN
-            | t::MEMORY_EXPORT_REFLECTION
-            | t::MEMORY_DEPENDENTS_OF_INVALIDATED
-            | t::MEMORY_PERSONA
-            | t::MEMORY_DEREF
-    )
-}
+pub(crate) use read_only_tools::mcp_tool_is_read_only;
 
 /// The canonical `tools/call` dispatch table. Keyed by MCP tool name;
 /// each entry's `DispatchFn` un-bundles a [`ToolDispatchCtx`] back
@@ -3663,16 +3607,10 @@ fn handle_request(
                 mcp_client,
             );
 
-            // v1.0.0 #3549 — THE caller-authority chokepoint. Resolve the
-            // launcher's principal / binding / admin ONCE, before the table
-            // lookup, and refuse EVERY tool call — read or write, on every
-            // profile — when the configured identity is unusable. The #3356
-            // boot gate already refuses to SERVE on that condition; this is
-            // the dispatch-level twin that makes the boundary structural
-            // (a handler cannot run without an `Authority`, and an
-            // `Authority` cannot exist unless this resolved). Protocol-level
-            // `-32603`: the server cannot act on behalf of anyone until the
-            // operator fixes `AI_MEMORY_AGENT_ID`.
+            // v1.0.0 #3549 — THE caller-authority chokepoint: resolve ONCE,
+            // before the table lookup; an unusable configured identity refuses
+            // every tool call with a protocol-level `-32603` (see
+            // `crate::identity::authority`).
             let authority = match crate::identity::authority::Authority::resolve_mcp(mcp_client) {
                 Ok(authority) => authority,
                 Err(e) => {
@@ -17403,195 +17341,5 @@ mod read_gate_parity_1730 {
             super::search::handle_search(&conn, &json!({"query": "x"}), None).is_ok(),
             "search must pass the fast-path"
         );
-    }
-}
-
-/// v1.0.0 #3549 — the dispatch-level authority chokepoint, driven through
-/// the REAL `handle_request` with the caller principal steered by the
-/// thread-local test seam (#3523), so no process env is mutated.
-#[cfg(test)]
-mod authority_dispatch_3549_tests {
-    use super::*;
-    use crate::identity::test_agent_id::AgentIdOverride;
-
-    fn dispatch(req: &RpcRequest) -> RpcResponse {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let conn = db::open(tmp.path()).expect("open db");
-        let tier_config = crate::config::FeatureTier::Keyword.config();
-        let resolved_ttl = crate::config::ResolvedTtl::default();
-        let resolved_scoring = crate::config::ResolvedScoring::default();
-        let profile = crate::profile::Profile::full();
-        handle_request(
-            &conn,
-            tmp.path(),
-            req,
-            None,
-            None,
-            None,
-            &tier_config,
-            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
-            None,
-            &resolved_ttl,
-            &resolved_scoring,
-            true,
-            false,
-            None,
-            &profile,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "authority-3549",
-        )
-    }
-
-    fn call(tool: &str, args: Value) -> RpcRequest {
-        RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: Some(json!(1)),
-            method: "tools/call".into(),
-            params: json!({"name": tool, "arguments": args}),
-        }
-    }
-
-    /// DENIED — an unusable configured identity refuses a READ tool at
-    /// dispatch with the protocol-level `-32603`, before the table lookup.
-    #[test]
-    fn unusable_configured_identity_refuses_a_read_tool_at_dispatch_3549() {
-        let _seam = AgentIdOverride::set("bad id with spaces");
-        let resp = dispatch(&call(
-            crate::mcp::registry::tool_names::MEMORY_LIST,
-            json!({}),
-        ));
-        let err = resp.error.expect("must refuse");
-        assert_eq!(err.code, jsonrpc::INTERNAL_ERROR);
-        assert!(
-            err.message.contains("caller authority unresolvable"),
-            "{}",
-            err.message
-        );
-        assert!(resp.result.is_none());
-    }
-
-    /// DENIED — the same refusal for a WRITE tool: the #3356 boot gate never
-    /// covered writes at dispatch; this does, and the row is never written.
-    #[test]
-    fn unusable_configured_identity_refuses_a_write_tool_at_dispatch_3549() {
-        let _seam = AgentIdOverride::set("");
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let conn = db::open(tmp.path()).expect("open db");
-        let tier_config = crate::config::FeatureTier::Keyword.config();
-        let resolved_ttl = crate::config::ResolvedTtl::default();
-        let resolved_scoring = crate::config::ResolvedScoring::default();
-        let profile = crate::profile::Profile::full();
-        let req = call(
-            crate::mcp::registry::tool_names::MEMORY_STORE,
-            json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
-        );
-        let resp = handle_request(
-            &conn,
-            tmp.path(),
-            &req,
-            None,
-            None,
-            None,
-            &tier_config,
-            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
-            None,
-            &resolved_ttl,
-            &resolved_scoring,
-            true,
-            false,
-            None,
-            &profile,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "authority-3549",
-        );
-        assert_eq!(
-            resp.error.expect("must refuse").code,
-            jsonrpc::INTERNAL_ERROR
-        );
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .expect("count");
-        assert_eq!(n, 0, "the refusal precedes the write");
-    }
-
-    /// ALLOWED — a valid configured identity dispatches, and the resolved
-    /// principal is the one the write is attributed to.
-    #[test]
-    fn valid_configured_identity_dispatches_and_attributes_the_write_3549() {
-        let _seam = AgentIdOverride::set("ai:alice");
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let conn = db::open(tmp.path()).expect("open db");
-        let tier_config = crate::config::FeatureTier::Keyword.config();
-        let resolved_ttl = crate::config::ResolvedTtl::default();
-        let resolved_scoring = crate::config::ResolvedScoring::default();
-        let profile = crate::profile::Profile::full();
-        let req = call(
-            crate::mcp::registry::tool_names::MEMORY_STORE,
-            json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
-        );
-        let resp = handle_request(
-            &conn,
-            tmp.path(),
-            &req,
-            None,
-            None,
-            None,
-            &tier_config,
-            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
-            None,
-            &resolved_ttl,
-            &resolved_scoring,
-            true,
-            false,
-            None,
-            &profile,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "authority-3549",
-        );
-        assert!(resp.error.is_none(), "{:?}", resp.error);
-        let owner: String = conn
-            .query_row(
-                "SELECT json_extract(metadata, '$.agent_id') FROM memories LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("owner");
-        assert_eq!(owner, "ai:alice");
-    }
-
-    /// ALLOWED — the unset identity is the local-operator trust domain:
-    /// dispatch proceeds with trust-all reads.
-    #[test]
-    fn unset_identity_dispatches_as_the_local_operator_3549() {
-        let _seam = AgentIdOverride::unset();
-        let resp = dispatch(&call(
-            crate::mcp::registry::tool_names::MEMORY_LIST,
-            json!({}),
-        ));
-        assert!(resp.error.is_none(), "{:?}", resp.error);
     }
 }
