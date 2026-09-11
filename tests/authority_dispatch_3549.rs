@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 const INTERNAL_ERROR: i64 = -32603;
 
-fn call(tool: &str, args: Value) -> Value {
+fn call(tool: &str, args: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -41,7 +41,7 @@ fn row_count(conn: &rusqlite::Connection) -> i64 {
 fn unusable_configured_identity_refuses_a_read_tool_at_dispatch_3549() {
     let _seam = AgentIdOverride::set("bad id with spaces");
     let (tmp, conn) = open_db();
-    let resp = handle_request_for_test(&conn, tmp.path(), &call("memory_list", json!({})));
+    let resp = handle_request_for_test(&conn, tmp.path(), &call("memory_list", &json!({})));
     assert_eq!(resp["error"]["code"], INTERNAL_ERROR, "{resp}");
     assert!(
         resp["error"]["message"]
@@ -63,7 +63,7 @@ fn unusable_configured_identity_refuses_a_write_tool_at_dispatch_3549() {
         tmp.path(),
         &call(
             "memory_store",
-            json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
+            &json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
         ),
     );
     assert_eq!(resp["error"]["code"], INTERNAL_ERROR, "{resp}");
@@ -81,7 +81,7 @@ fn valid_configured_identity_dispatches_and_attributes_the_write_3549() {
         tmp.path(),
         &call(
             "memory_store",
-            json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
+            &json!({"title": "t", "content": "c", "namespace": "ns-3549"}),
         ),
     );
     assert!(resp.get("error").is_none(), "{resp}");
@@ -101,6 +101,6 @@ fn valid_configured_identity_dispatches_and_attributes_the_write_3549() {
 fn unset_identity_dispatches_as_the_local_operator_3549() {
     let _seam = AgentIdOverride::unset();
     let (tmp, conn) = open_db();
-    let resp = handle_request_for_test(&conn, tmp.path(), &call("memory_list", json!({})));
+    let resp = handle_request_for_test(&conn, tmp.path(), &call("memory_list", &json!({})));
     assert!(resp.get("error").is_none(), "{resp}");
 }
