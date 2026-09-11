@@ -451,7 +451,7 @@ contract). Under the default `standard` posture every knob keeps its
 own default (byte-identical legacy). SSOT: `src/security_profile.rs`.
 
 Pinned knobs (unset → pinned to the hard value; already-compliant →
-accepted; set-below-floor → boot REFUSED). All **27** of them, in `KNOBS`
+accepted; set-below-floor → boot REFUSED). All **29** of them, in `KNOBS`
 order — this table is mechanically pinned to the SSOT by SET equality in
 `src/security_profile.rs::tests::performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly`,
 so a knob can no longer be added to `KNOBS` without a row here, and a row
@@ -487,6 +487,8 @@ here cannot claim a hardening guarantee the binary does not enforce
 | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` | `1` (inbound federated push with a DETECTED-stale `policy_version` is refused — #3168; live name, not the unprefixed `REQUIRE_POLICY_CURRENT`) |
 | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* — PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` must be CLOSED; a truthy value REFUSES boot (#3201) |
 | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` (mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without a binding map. Documented `standard` unset default stays `warn` — #3201 / #3289) |
+| `AI_MEMORY_REQUIRE_API_KEY` | `1` (a keyless `serve` bind is refused on EVERY host, loopback included: a same-host proxy presents loopback while exposing the daemon — #1458 / #3200) |
+| `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` | *(unset)* — PERMISSIVE-shaped: the plaintext acknowledgement hatch must be CLOSED; a truthy value REFUSES boot. Under `asi-hard` a NON-loopback plaintext bind is refused outright regardless, and the loopback exemption stays for a same-host TLS-terminating proxy. `AI_MEMORY_REQUIRE_TLS` is deliberately NOT pinned: it would also refuse loopback plaintext (#3200) |
 
 In addition, `asi-hard` forces the config-backed governance knob
 `[governance].require_operator_pubkey` to `true` at the governance boot

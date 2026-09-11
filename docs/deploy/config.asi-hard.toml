@@ -25,6 +25,14 @@
 #   [governance].require_operator_pubkey = true
 #       Governance boot refuses to run without a resolvable operator key
 #       (also bridged automatically by the asi-hard posture).
+#   api_key (top-level) — REQUIRED under asi-hard (#3200): the posture pins
+#       AI_MEMORY_REQUIRE_API_KEY=1, so `serve` refuses a keyless bind on
+#       every host, loopback included. This template deliberately ships NO
+#       value (a shared placeholder key would be a known credential). Set
+#           api_key = "<a long random secret from your secret store>"
+#       above the first [section] before `serve`. A NON-loopback plaintext
+#       bind is also refused under asi-hard: pass --tls-cert / --tls-key,
+#       or bind to 127.0.0.1 behind a TLS-terminating proxy.
 #
 # NAMESPACE write != Any (PE-1): config.toml does NOT carry namespace
 # standards — they are attached at runtime via `memory_namespace_set_standard`

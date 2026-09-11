@@ -1408,8 +1408,14 @@ fn test_secret_screen_mode_precedence() {
 // #2032 M2 (class-a, DEFINE-ONLY, 5-agent vote `4d3ea1c5`) — the two TLS
 // escape-hatch env resolvers. Tranche 2 lands the resolvers + this census
 // case; the `tls_bind_guard` that consumes them lands in tranche 3, so
-// binding behaviour is unchanged. Each defaults `false` and mirrors the
-// truthy grammar of `require_api_key_strict` (`1` / `true`, case-insensitive).
+// binding behaviour is unchanged. Each defaults `false`.
+//
+// #3200 (rule (e)) — both now read through the ONE shared grammar
+// (`src/env_flag.rs`). This table pinned the old `1`/`true`-only grammar
+// (`yes` ignored) and `garbage -> false` for both. Now `yes`/`on` enable,
+// and an unrecognised token fails closed BY POLARITY: the REQUIRE_TLS
+// mandate reads ON, the plaintext hatch reads OFF (a normal boot refuses
+// the token outright in the pre-runtime sweep).
 // ---------------------------------------------------------------------------
 #[test]
 fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
@@ -1418,31 +1424,35 @@ fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
         require_tls_enabled,
     };
 
-    // Table of (env-value, expected-bool). `None` = unset (default false).
-    let cases: &[(Option<&str>, bool)] = &[
-        (None, false),
-        (Some("1"), true),
-        (Some("true"), true),
-        (Some("TRUE"), true),
-        (Some("0"), false),
-        (Some("false"), false),
-        (Some("garbage"), false),
+    // Table of (env-value, expected hatch, expected mandate). `None` = unset.
+    let cases: &[(Option<&str>, bool, bool)] = &[
+        (None, false, false),
+        (Some(""), false, false),
+        (Some("1"), true, true),
+        (Some("true"), true, true),
+        (Some("TRUE"), true, true),
+        (Some("yes"), true, true),
+        (Some(" on "), true, true),
+        (Some("0"), false, false),
+        (Some("false"), false, false),
+        (Some("OFF"), false, false),
+        (Some("garbage"), false, true),
     ];
 
-    for &(val, want) in cases {
+    for &(val, want_hatch, want_mandate) in cases {
         let _g = MultiEnvVarGuard::apply(&[
             (ENV_ALLOW_PLAINTEXT_NONLOOPBACK, val),
             (ENV_REQUIRE_TLS, val),
         ]);
         assert_eq!(
             allow_plaintext_nonloopback_enabled(),
-            want,
-            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK={val:?} must resolve to {want}"
+            want_hatch,
+            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK={val:?} must resolve to {want_hatch}"
         );
         assert_eq!(
             require_tls_enabled(),
-            want,
-            "AI_MEMORY_REQUIRE_TLS={val:?} must resolve to {want}"
+            want_mandate,
+            "AI_MEMORY_REQUIRE_TLS={val:?} must resolve to {want_mandate}"
         );
     }
 }
@@ -1452,7 +1462,7 @@ fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
 //      verification (#2448). Pure runtime env knob (no CLI flag, no
 //      config.toml binding), so the ladder collapses to `env > compiled
 //      default`. It is the INVERSE polarity of the #2032 pair above: this one
-//      defaults ON (fail-closed), the house `env_flag_default_on` grammar
+//      defaults ON (fail-closed), the #3200 shared grammar (`src/env_flag.rs`)
 //      shared with AI_MEMORY_FED_REQUIRE_{WRITE,SIGNAL,TRANSITION,CHECKPOINT}_SIG.
 // ---------------------------------------------------------------------------
 #[test]

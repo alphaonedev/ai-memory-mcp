@@ -1,0 +1,43 @@
+# #3200 truthy-grammar ledger: inline boolean-token comparisons allowed OUTSIDE
+# src/env_flag.rs. RATCHET: this file only shrinks. scripts/check-truthy-grammar.sh
+# fails on an inline grammar with no row here AND on a row whose function no
+# longer holds one (stale), so migrating a reader means deleting its row.
+#
+# Format: <src-path> <fn-name> <YYYY-MM-DD> #<issue> <CLASS> <reason...>
+#   NEUTRAL  boolean env reader not migrated yet; #3622 burns these down with a
+#            per-reader semantics review (a grammar change can alter data
+#            behaviour, e.g. CONSOLIDATE_TOMBSTONE_SOURCES=no -> hard delete).
+#   ENUM     multi-valued parser that shares a boolean token; not an env bool.
+#   PROMPT   interactive y/n confirmation; not an env knob.
+#   QUERY    HTTP query-parameter boolean; not an env knob.
+#
+# Security MANDATE/HATCH knobs may NEVER appear here: they are registered
+# BoolKnobs in src/env_flag.rs (boot-sweep refusal + asi-hard floor parity).
+
+# --- NEUTRAL env readers (#3622) -------------------------------------------
+src/confidence/decay.rs decay_enabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_CONFIDENCE_DECAY exact-1 reader (confidence decay sweep)
+src/confidence/mod.rs auto_confidence_enabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_AUTO_CONFIDENCE exact-1 reader
+src/confidence/shadow.rs from_env 2026-09-11 #3622 NEUTRAL AI_MEMORY_CONFIDENCE_SHADOW exact-1 reader
+src/config.rs effective_anonymize_default 2026-09-11 #3622 NEUTRAL AI_MEMORY_ANONYMIZE tri-state with config fall-through
+src/config.rs effective_autonomous_hooks 2026-09-11 #3622 NEUTRAL AI_MEMORY_AUTONOMOUS_HOOKS tri-state with config fall-through
+src/config.rs effective_enabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_BOOT_ENABLED tri-state (default ON)
+src/config.rs env_bool 2026-09-11 #3622 NEUTRAL AI_MEMORY_VECTOR_INDEX_HARD_FAIL 1|true / 0|false tri-state
+src/config.rs resolve_compaction_enabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_COMPACTION_ENABLED 1|true / 0|false; =yes would enable hard-delete merges, needs its own review
+src/config.rs resolve_storage 2026-09-11 #3622 NEUTRAL AI_MEMORY_LINEAGE_DAG + CONSOLIDATE_TOMBSTONE_SOURCES; =no would become hard delete, needs its own review
+src/config.rs resolve_transcript_classify_enabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED 1|true / 0|false tri-state
+src/daemon_runtime.rs bootstrap_serve 2026-09-11 #3622 NEUTRAL AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS exact-1 (boot warm-up)
+src/embeddings.rs remote_fetch_disabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_EMBED_OFFLINE + HF_HUB_OFFLINE (HF_HUB_OFFLINE is a third-party convention)
+src/governance/capability.rs parse_capabilities_toggle 2026-09-11 #3622 NEUTRAL AI_MEMORY_CAPABILITIES on/off toggle with config fall-through (additive-only layer)
+src/handlers/power.rs get_taxonomy 2026-09-11 #3622 NEUTRAL AI_MEMORY_TAXONOMY_LEGACY_PG debug A/B switch (sal-postgres build)
+src/hooks/post_reflect/auto_export.rs build_post_reflect_hook 2026-09-11 #3622 NEUTRAL AI_MEMORY_AUTO_EXPORT_INJECT_PANIC test-only fault injection (debug builds)
+src/mcp/registry.rs tools_verbose_env_enabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_TOOLS_VERBOSE tools/list render switch
+src/store/postgres.rs pg_heal_foreign_space_enabled 2026-09-11 #3622 NEUTRAL AI_MEMORY_PG_HEAL_FOREIGN_SPACE opt-in paced re-embed (house grammar already)
+
+# --- non-boolean parsers that share a token ---------------------------------
+src/cli/backup.rs confirm_restore 2026-09-11 #3200 PROMPT interactive y/yes restore confirmation
+src/cli/governance_install_defaults.rs confirm_proceed 2026-09-11 #3200 PROMPT interactive y/yes install confirmation
+src/config.rs parse 2026-09-11 #3200 ENUM mode parser whose Off arm accepts "off"
+src/egress.rs parse 2026-09-11 #3200 ENUM AI_MEMORY_INFERENCE_EGRESS allow/loopback-only/deny parser ("off" = allow)
+src/handlers/inventory.rs parse_summary_flag 2026-09-11 #3200 QUERY ?summary= query flag (unknown -> 400)
+src/mcp/tools/capabilities.rs parse 2026-09-11 #3200 ENUM capabilities schema version token ("1" = v1)
+src/reranker.rs parse 2026-09-11 #3200 ENUM AI_MEMORY_RERANK_SCORE_FLOOR off/absolute/relative parser
