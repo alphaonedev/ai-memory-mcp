@@ -228,11 +228,19 @@ sleep 60
     // Arc-wrap so we can share the executor with the spawned second
     // fire below. `DaemonExecutor: Send + Sync` (its only interior
     // mutability is the async `tokio::sync::Mutex<Option<…>>`).
-    let executor = Arc::new(DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 500)));
+    // #3460: the first fire is a REAL fork+exec+sh warm-up on the wall clock;
+    // 500 ms flaked on the macOS runner whenever the host was compiling. The
+    // budget is 5 s here because phase 2 trips it under a paused clock, so a
+    // larger budget costs nothing and removes the host-load dependence.
+    let executor = Arc::new(DaemonExecutor::new(cfg_for(
+        script,
+        HookMode::Daemon,
+        5_000,
+    )));
 
     // Phase 1 — first fire (real clock). Warms the daemon connection
     // via real fork/exec/read/write; the child responds in real ms
-    // and the 500ms timeout never trips.
+    // and the 5 s timeout never trips even on a loaded runner.
     let r1 = executor
         .fire(HookEvent::PostStore, json!({"first": true}))
         .await
@@ -257,10 +265,10 @@ sleep 60
     // the script is in `sleep 60`).
     tokio::task::yield_now().await;
 
-    // Advance the paused clock past the 500ms executor deadline.
+    // Advance the paused clock past the 5 s executor deadline.
     // The tokio timer wired inside `fire_inner` now trips and the
     // executor records `Timeout` with no wall-clock dependence.
-    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::time::advance(Duration::from_millis(5_100)).await;
 
     // The spawned fire should be resolved — Timeout surfaced
     // deterministically.
