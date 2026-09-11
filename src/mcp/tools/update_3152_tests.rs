@@ -114,7 +114,10 @@ fn mcp_patch_is_uncommitted_at_the_fault_point_3152() {
         .unwrap_or_else(PoisonError::into_inner)
         .take()
         .expect("the fault point must be reached between patch and transition");
-    assert_eq!(observed.content, ORIGINAL_CONTENT, "nothing is committed yet");
+    assert_eq!(
+        observed.content, ORIGINAL_CONTENT,
+        "nothing is committed yet"
+    );
     assert_eq!(observed.lifecycle_state, LifecycleState::Open);
     let row = db::get(&conn, &id).expect("read").expect("row");
     assert_eq!(row.content, "patched body");

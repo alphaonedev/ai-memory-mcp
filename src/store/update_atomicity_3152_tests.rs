@@ -90,7 +90,11 @@ fn owner_ctx() -> CallerContext {
 fn assert_unchanged(mem: &Memory, why: &str) {
     assert_eq!(mem.title, ORIGINAL_TITLE, "{why}: title");
     assert_eq!(mem.content, ORIGINAL_CONTENT, "{why}: content");
-    assert_eq!(mem.lifecycle_state, LifecycleState::Open, "{why}: lifecycle");
+    assert_eq!(
+        mem.lifecycle_state,
+        LifecycleState::Open,
+        "{why}: lifecycle"
+    );
     assert_eq!(mem.version, 1, "{why}: version");
 }
 
@@ -181,7 +185,11 @@ async fn sqlite_sal_illegal_edge_rolls_the_patch_back_3152() {
 
     // open -> done skips `active`: illegal.
     let err = store
-        .update(&owner_ctx(), &mem.id, content_and_lifecycle(LifecycleState::Done))
+        .update(
+            &owner_ctx(),
+            &mem.id,
+            content_and_lifecycle(LifecycleState::Done),
+        )
         .await
         .expect_err("an illegal edge must refuse the whole update");
     assert!(
@@ -207,7 +215,11 @@ async fn sqlite_sal_legal_edge_commits_patch_and_transition_together_3152() {
     store.store(&owner_ctx(), &mem).await.expect("seed");
 
     store
-        .update(&owner_ctx(), &mem.id, content_and_lifecycle(LifecycleState::Active))
+        .update(
+            &owner_ctx(),
+            &mem.id,
+            content_and_lifecycle(LifecycleState::Active),
+        )
         .await
         .expect("open -> active is legal");
     let row = sqlite_committed_row(&path, &mem.id);
@@ -237,7 +249,11 @@ async fn sqlite_sal_patch_is_uncommitted_at_the_fault_point_3152() {
         })),
     );
     let res = store
-        .update(&owner_ctx(), &mem.id, content_and_lifecycle(LifecycleState::Active))
+        .update(
+            &owner_ctx(),
+            &mem.id,
+            content_and_lifecycle(LifecycleState::Active),
+        )
         .await;
     in_tx_fault::disarm(&mem.id);
     res.expect("open -> active is legal");
@@ -272,7 +288,11 @@ async fn sqlite_sal_crash_child_3152() {
         },
     );
     let res = store
-        .update(&owner_ctx(), &id, content_and_lifecycle(LifecycleState::Active))
+        .update(
+            &owner_ctx(),
+            &id,
+            content_and_lifecycle(LifecycleState::Active),
+        )
         .await;
     panic!("the #3152 fault point was never reached; update returned {res:?}");
 }
@@ -308,7 +328,10 @@ async fn sqlite_sal_crash_between_patch_and_transition_leaves_row_unchanged_3152
     // Direct store read after the crash: the row is fully unchanged.
     let reopened = crate::store::sqlite::SqliteStore::open(path.clone()).expect("reopen");
     assert_unchanged(
-        &reopened.get(&owner_ctx(), &mem.id).await.expect("store read"),
+        &reopened
+            .get(&owner_ctx(), &mem.id)
+            .await
+            .expect("store read"),
         "a crash between the patch and the transition",
     );
     assert_eq!(sqlite_in_place_snapshots(&path, &mem.id), 0);
@@ -363,7 +386,11 @@ mod pg {
         };
         let (store, mem) = seeded(&url, "atomicity-3152-pg-trait-refuse").await;
         let err = store
-            .update(&owner_ctx(), &mem.id, content_and_lifecycle(LifecycleState::Done))
+            .update(
+                &owner_ctx(),
+                &mem.id,
+                content_and_lifecycle(LifecycleState::Done),
+            )
             .await
             .expect_err("an illegal edge must refuse the whole update");
         assert!(
@@ -426,7 +453,10 @@ mod pg {
         assert_eq!(row.content, PATCHED_CONTENT);
         assert_eq!(row.lifecycle_state, LifecycleState::Active);
         assert_eq!(row.version, 3, "one bump for the patch, one for the edge");
-        assert_eq!(reported, row.version, "the returned version is the stored one");
+        assert_eq!(
+            reported, row.version,
+            "the returned version is the stored one"
+        );
     }
 
     /// Child half of both pg crash tests: a no-op unless re-executed.
@@ -493,9 +523,6 @@ mod pg {
     #[cfg(unix)]
     #[test]
     fn pg_if_match_crash_between_patch_and_transition_leaves_row_unchanged_3152() {
-        pg_crash_between_patch_and_transition(
-            ROLE_PG_IF_MATCH,
-            "atomicity-3152-pg-if-match-crash",
-        );
+        pg_crash_between_patch_and_transition(ROLE_PG_IF_MATCH, "atomicity-3152-pg-if-match-crash");
     }
 }
