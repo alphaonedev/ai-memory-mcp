@@ -313,10 +313,17 @@ mod pg {
         url
     }
 
+    /// Seed one fixture row in a namespace unique to THIS run. The live
+    /// database outlives a run, and `store` upserts on `(title, namespace)`:
+    /// a fixed namespace would land on a previous run's row (under ITS id)
+    /// and the patched title could collide with a row an earlier run already
+    /// patched. The returned id must be the seeded one.
     async fn seeded(url: &str, namespace: &str) -> (PostgresStore, Memory) {
         let store = PostgresStore::connect(url).await.expect("connect");
-        let mem = fixture(namespace);
-        store.store(&owner_ctx(), &mem).await.expect("seed");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mem = fixture(&format!("{namespace}-{run}"));
+        let stored_id = store.store(&owner_ctx(), &mem).await.expect("seed");
+        assert_eq!(stored_id, mem.id, "the seed must insert, not upsert");
         (store, mem)
     }
 
