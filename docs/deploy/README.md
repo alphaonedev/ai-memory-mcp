@@ -88,10 +88,18 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
 - `AI_MEMORY_FED_CERT_PEER_BINDING=enforce` (#3201 — mTLS cert↔`X-Peer-Id`
   cross-check ENFORCES; `off`/`warn` refuse boot. The documented
   `standard` unset default stays `warn`)
+- `AI_MEMORY_REQUIRE_API_KEY=1` (#3200 — a keyless `serve` bind is refused
+  on every host, loopback included; set `api_key` in the config)
+- `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` **must be non-truthy** (#3200) —
+  the plaintext acknowledgement hatch is closed, and under `asi-hard` a
+  NON-loopback plaintext bind is refused outright; bind to loopback behind a
+  TLS-terminating proxy or pass `--tls-cert` / `--tls-key`.
+  `AI_MEMORY_REQUIRE_TLS` is deliberately not pinned (it would also refuse
+  loopback plaintext)
 - plus `[governance].require_operator_pubkey=true` (bridged at the
   governance boot check).
 
-(That list is all **27** `KNOBS` entries. It has drifted from its own
+(That list is all **29** `KNOBS` entries. It has drifted from its own
 declared SSOT twice: it enumerated only 15 of the then-17 through v1.0.0,
 silently omitting the two permissive-shaped pins above — the ones whose
 violation REFUSES BOOT — and it then sat at 17 after #3033 raised the table

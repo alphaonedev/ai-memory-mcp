@@ -1282,6 +1282,8 @@ mod tests {
         let cases = [
             (crate::federation::signing::REQUIRE_SIG_ENV, "0"),
             (crate::federation::signing::REQUIRE_NONCE_ENV, "off"),
+            // #3200: case-insensitive falsy tokens disable too.
+            (crate::federation::signing::REQUIRE_SIG_ENV, "Off"),
             (
                 crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
                 "false",
@@ -1338,6 +1340,9 @@ mod tests {
             (crate::config::AppConfig::ENV_PERMISSIONS_MODE, "advisory"),
             (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "1"),
             (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "TRUE"),
+            // #3200 (rule (e)): the shared grammar arms the hatch on `yes`
+            // (the old reader ignored it), so asi-hard now refuses it.
+            (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "yes"),
             (
                 crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
                 "0",
@@ -1345,6 +1350,12 @@ mod tests {
             (
                 crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
                 "false",
+            ),
+            // #3200 (rule (e)): `FALSE` disables the gate under the shared
+            // case-insensitive grammar (the old reader kept it ON).
+            (
+                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+                "FALSE",
             ),
         ];
         for (env, disabling_value) in cases {
@@ -1377,9 +1388,11 @@ mod tests {
     /// compliant (the old reader ignored `yes`) and
     /// `FED_REQUIRE_POLICY_CURRENT=FALSE` as compliant (the old default-ON
     /// reader was case-sensitive). Under the shared grammar both tokens are
-    /// recognised, so both now LOOSEN and refuse boot
-    /// ([`asi_hard_refuses_tokens_that_changed_meaning_3200`]). The compliant
-    /// spellings the shared grammar accepts are pinned here instead.
+    /// recognised, so both now LOOSEN and refuse boot (pinned in
+    /// `asi_hard_refuses_governance_loosening_3168`). The compliant
+    /// spellings the shared grammar accepts are pinned here instead, plus
+    /// the #3618 / #3619 end-to-end: a token that meets the floor arms the
+    /// live reader.
     #[test]
     fn asi_hard_accepts_live_compliant_governance_values_3168() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -1392,105 +1405,49 @@ mod tests {
             clear_all();
         }
         let _cleanup = KnobsGuard;
-        unsafe {
-            std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
-            std::env::set_var(crate::config::AppConfig::ENV_PERMISSIONS_MODE, "ENFORCE");
-            std::env::set_var(crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "No");
-            std::env::set_var(
-                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
-                "ON",
-            );
-        }
-        let (posture, reports) = enforce_at_boot().unwrap();
-        assert_eq!(posture, SecurityPosture::AsiHard);
-        for env in [
-            crate::config::AppConfig::ENV_PERMISSIONS_MODE,
-            crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
-            crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
-        ] {
-            assert!(
-                reports
-                    .iter()
-                    .any(|r| r.env == env && r.action == PinAction::AlreadyCompliant),
-                "{env} must meet its floor with a compliant shared-grammar token"
-            );
-        }
-    }
-
-    /// #3200 / #3618 / #3619 — tokens whose meaning CHANGED under the shared
-    /// grammar now refuse `asi-hard` boot when they loosen, and tokens the
-    /// floor used to accept while the live reader ignored them now arm the
-    /// live control. Each pair is (knob, token, expected floor verdict).
-    #[test]
-    fn asi_hard_refuses_tokens_that_changed_meaning_3200() {
-        if crate::config::run_env_isolated_child_or_spawn(
-            "security_profile::tests::asi_hard_refuses_tokens_that_changed_meaning_3200",
-        ) {
-            return;
-        }
-        // Loosening tokens the old readers ignored or misread: must refuse.
-        let refused = [
-            (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "yes"),
+        // (knob, a compliant shared-grammar token). The last two are the
+        // #3618 / #3619 tokens the floor always accepted while the old live
+        // readers ignored them; after boot the LIVE readers must read them ON.
+        let compliant = [
+            (crate::config::AppConfig::ENV_PERMISSIONS_MODE, "ENFORCE"),
+            (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "No"),
             (
                 crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
-                "FALSE",
+                "ON",
             ),
-            (crate::federation::signing::REQUIRE_SIG_ENV, "Off"),
-            (crate::daemon_runtime::ENV_ALLOW_PLAINTEXT_NONLOOPBACK, "on"),
-            (crate::env_flag::knobs::REQUIRE_API_KEY.env, "0"),
-        ];
-        for (env, value) in refused {
-            let _g = env_lock();
-            unsafe {
-                clear_all();
-            }
-            let _cleanup = KnobsGuard;
-            unsafe {
-                std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
-                std::env::set_var(env, value);
-            }
-            let err = enforce_at_boot().unwrap_err();
-            assert!(
-                format!("{err}").contains(env),
-                "{env}={value:?} loosens the live control and must refuse boot: {err}"
-            );
-        }
-        // #3618 / #3619 — tokens the floor accepted while the live reader
-        // ignored them: after boot the LIVE reader must read them as ON.
-        let live_on: [(&str, &str, fn() -> bool); 2] = [
             (
                 crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION,
                 "yes",
-                crate::identity::attest::global_strict_attestation_enabled,
             ),
             (
                 crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV,
                 "TRUE",
-                crate::federation::receive_auth::quarantine_unattributed_enabled,
             ),
         ];
-        for (env, value, live) in live_on {
-            let _g = env_lock();
-            unsafe {
-                clear_all();
-            }
-            let _cleanup = KnobsGuard;
-            unsafe {
-                std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
-                std::env::set_var(env, value);
-            }
-            let (_posture, reports) = enforce_at_boot().unwrap();
+        unsafe {
+            std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+        }
+        for (env, value) in compliant {
+            unsafe { std::env::set_var(env, value) };
+        }
+        let (posture, reports) = enforce_at_boot().unwrap();
+        assert_eq!(posture, SecurityPosture::AsiHard);
+        for (env, value) in compliant {
             assert!(
                 reports
                     .iter()
                     .any(|r| r.env == env && r.action == PinAction::AlreadyCompliant),
-                "{env}={value:?} meets the floor"
-            );
-            assert!(
-                live(),
-                "{env}={value:?} met the floor, so the LIVE reader must read it ON"
+                "{env}={value:?} must meet its floor with a compliant shared-grammar token"
             );
         }
+        assert!(
+            crate::identity::attest::global_strict_attestation_enabled(),
+            "#3618: `yes` met the floor, so the LIVE attestation gate must read it ON"
+        );
+        assert!(
+            crate::federation::receive_auth::quarantine_unattributed_enabled(),
+            "#3619: `TRUE` met the floor, so the LIVE quarantine gate must read it ON"
+        );
     }
 
     /// #3168 END-TO-END. Pinning the env is not the claim; the claim is
@@ -1553,6 +1510,9 @@ mod tests {
             (crate::tls::FED_CERT_PEER_BINDING_ENV, "off"),
             (crate::tls::FED_CERT_PEER_BINDING_ENV, "warn"),
             (crate::tls::FED_CERT_PEER_BINDING_ENV, "enforc"),
+            // #3200 R3 — the daemon bind posture pins.
+            (crate::daemon_runtime::ENV_ALLOW_PLAINTEXT_NONLOOPBACK, "on"),
+            (crate::env_flag::knobs::REQUIRE_API_KEY.env, "0"),
         ];
         for (env, disabling_value) in cases {
             let _g = env_lock();
