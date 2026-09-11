@@ -721,6 +721,51 @@ mod tests {
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }
 
+    /// #3587 propose mode — in the single-operator trust-all default (no
+    /// `AI_MEMORY_AGENT_ID`) MCP has no hardened principal, so a curator
+    /// supersession proposal is refused BEFORE approval and stays pending.
+    #[test]
+    fn pending_approve_refuses_supersession_proposal_without_principal_3587() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        assert!(
+            std::env::var_os("AI_MEMORY_AGENT_ID").is_none(),
+            "every env mutator restores AI_MEMORY_AGENT_ID under this lock"
+        );
+        let conn = fresh_conn();
+        let mut old = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: "proposal-mcp-3587".into(),
+            title: "old claim".into(),
+            content: "old claim bytes".into(),
+            created_at: "2026-09-09T00:00:00Z".into(),
+            updated_at: "2026-09-09T00:00:00Z".into(),
+            metadata: json!({"agent_id": "ai:owner-3587", "scope": "collective"}),
+            ..crate::models::Memory::default()
+        };
+        db::insert_no_overwrite(&conn, &old).unwrap();
+        let new = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "new claim".into(),
+            created_at: "2026-09-10T00:00:00Z".into(),
+            updated_at: "2026-09-10T00:00:00Z".into(),
+            ..old.clone()
+        };
+        db::insert_no_overwrite(&conn, &new).unwrap();
+        old = db::get(&conn, &old.id).unwrap().unwrap();
+        let proposal =
+            crate::identity::supersession::SupersessionProposal::from_pair(&old, &new).unwrap();
+        let id = db::supersession_pending::queue_proposal(&conn, &proposal)
+            .unwrap()
+            .unwrap();
+
+        let err = handle_pending_approve(&conn, &json!({"id": id}), None)
+            .expect_err("no hardened principal in the trust-all default");
+        assert!(err.contains("UnauthenticatedPrincipal"), "got: {err}");
+        let row = db::get_pending_action(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert!(db::get(&conn, &old.id).unwrap().is_some(), "old stays live");
+    }
+
     // parse_remember_param: each of the four branches.
     #[test]
     fn parse_remember_param_returns_session() {
