@@ -647,6 +647,21 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run required-contexts gate
         run: bash scripts/check-required-contexts.sh
+      - name: Declared-vs-live required-context drift (#3554 / #2712)
+        # Compares the hand-authored declaration to live branch protection.
+        # NEVER writes the declaration from live (the #2473 laundering class).
+        # GitHub-hosted GITHUB_TOKEN cannot read the Administration API
+        # (401/403): the step then requires declaration == the committed
+        # live-pin (regenerated only by --pin-from-live). An admin token
+        # compares all three and also asserts enforce_admins=true / strict=true.
+        # Sibling of the soundness gate above — no new required context.
+        run: bash scripts/check-required-contexts-live.sh
+      - name: Self-test the declared-vs-live drift gate (#3554)
+        # Plants the exact #3554 38-vs-35 shape (MUST fail), extra live
+        # context, enforce_admins=false, strict=false, empty live, missing
+        # declaration/pin, stale pin; spares equal sets and an inline-#
+        # context name. Fixture-only — no network.
+        run: bash scripts/check-required-contexts-live.sh --self-test
       - name: One-declaration-source gate (#2534 — branch-protection.yml)
         # HARD-FAIL if .github/branch-protection.yml re-declares a bare
         # `required_checks` key. The required-status-check set has ONE
@@ -867,8 +882,10 @@ jobs:
     # merge ref, which cannot walk merge-base(base, head)).
     #
     # No `needs:`, no job-level `if:`, no `paths:` filter — always runs.
-    # Declared REQUIRED in required-contexts-release.txt (mirror-first;
-    # live branch-protection API is the operator-gated follow-up).
+    # Declared REQUIRED in required-contexts-release.txt and live-required
+    # as of #3554 (the companion protection call the original mirror-first
+    # window never made). Watch-set / VOID-banner hardening of the script
+    # itself is #3556.
     name: Enterprise-federation cert-expiry gate (cert §7 / F7)
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -88,6 +88,14 @@
 # runs STATICALLY at PR time against a hand-authored mirror of the required
 # set at `scripts/qc-allowlists/required-contexts-release.txt`.
 #
+# Live declared-vs-protection DRIFT is a different class (#2712 closed by
+# restoring live to 32, recurred as #3554 38-vs-35 because this gate never
+# compared live). That class is gated by the sibling
+# `scripts/check-required-contexts-live.sh`, wired as extra steps of the
+# same required-contexts job. This file stays the soundness gate
+# (declaration vs workflows). Do not merge the two: regenerating the
+# declaration from live is the #2473 laundering class.
+#
 #   *** THE MIRROR IS HAND-AUTHORED FROM INTENT. NEVER GENERATE IT FROM LIVE
 #   *** API STATE. The canonical demonstration is #2473: one required context
 #   *** WAS

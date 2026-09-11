@@ -1,0 +1,55 @@
+# required-contexts-live-pin.txt — last-fetched LIVE required-status-check
+# set for `release/v1.0.0`. Regenerated ONLY by
+# `scripts/check-required-contexts-live.sh --pin-from-live`.
+#
+# ============================================================================ 
+# *** NEVER HAND-EDIT. NEVER COPY THIS FILE INTO THE DECLARATION.
+# *** The declaration is required-contexts-release.txt (intent).
+# *** This pin is the CI stand-in for live protection when the
+# *** Actions GITHUB_TOKEN cannot read the Administration API.
+# ============================================================================ 
+#
+# fetched-from: alphaonedev/ai-memory-mcp release/v1.0.0
+# fetched-at:   2026-09-11T05:26Z
+# count:        38
+# enforce_admins: true
+# strict:         true
+#
+Benchmark-claim canon gate (#2879)
+Build-script custom-build ledger gate (#2635)
+C8 caller-context allowlist check
+Capacity-claim ceiling gate (#2869)
+Check (linux-fed,enterprise-fed)
+Check (macos-fed,enterprise-fed)
+Check (macos-fed,sqlite)
+Check (ubuntu-latest,sqlite)
+Classify changes
+Cloud-init ASCII gate
+Coverage classify (docs-only short-circuit)
+Cross-compile (aarch64-apple-ios)
+Cross-compile (aarch64-linux-android)
+Doc surface completeness gate (#2839)
+Doc symbol/path anchor gate (#2629)
+Dockerfile build (no push)
+Docs vs SSOT drift gate
+Enterprise-federation cert-expiry gate (cert §7 / F7)
+External-PR operator-approval gate (author outside team => @alphaonedev review)
+Git-dependency-source supply-chain gate (#2050/#2512)
+Hardcoded-literal duplication ratchet (pm-v3.1)
+Installer checksum fail-closed gate (#2449)
+L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
+Lint (fmt + clippy)
+MSRV (Rust 1.98)
+Migration-ladder-uniqueness gate (guardrail-D)
+Named-CI-job existence + enforcement-truthfulness gate (#2629)
+Non-Rust conformance-reader proof gate (#2452)
+Per-Module Coverage Thresholds
+Postgres feature gate
+Required-context + classify-base soundness gate (#2494/#2496/#2508)
+SAL-only feature gate
+SDK-path vs routes.rs membership gate (#2629)
+Test-env $HOME-lock gate (#2146)
+Test-reachable stdin-read gate (#1989)
+Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
+actionlint (workflow-injection guard)
+vectorlite feature gate
