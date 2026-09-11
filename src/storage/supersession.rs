@@ -93,9 +93,16 @@ impl SupersessionResult {
 pub const KEYED_BULK_UNSUPPORTED: &str = "KEYED_BULK_UNSUPPORTED";
 
 /// Typed refusal shared by both bulk backends.
-#[derive(Debug, thiserror::Error)]
-#[error("ruling_key is unsupported in bulk; use single-memory store")]
+#[derive(Debug)]
 pub struct KeyedBulkUnsupported;
+
+impl std::fmt::Display for KeyedBulkUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ruling_key is unsupported in bulk; use single-memory store")
+    }
+}
+
+impl std::error::Error for KeyedBulkUnsupported {}
 
 /// Validate a keyed store before any merge/synthesis mutation.
 ///
