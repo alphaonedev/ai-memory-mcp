@@ -17,21 +17,32 @@
 # "reports success while doing nothing" shape applied to a certification
 # expiry trigger.
 #
-# THE RULE (TASK C, verbatim — no extra escape hatches). The change
-# under test is the standard PR diff
-# (`merge-base(PR-base, HEAD)..HEAD`), NEVER a diff against the cert's
-# pinned SHA (unrelated later PRs must not fail forever). The gate
-# FAILS when that diff touches ANY of:
+# THE RULE. Three checks, all fail-closed (#3556 / N30):
 #
-#   * src/federation/**  (the directory itself or any path under it)
-#   * src/handlers/federation_receive.rs
-#   * src/handlers/federation_signing_check.rs
-#   * added / removed / renamed `AI_MEMORY_FED_[A-Z0-9_]+` identifiers
-#     anywhere in src/  (set-diff of identifiers at merge-base vs HEAD)
+#   1. PR-range watch (TASK C, widened to standard §5): the standard PR
+#      diff (`merge-base(PR-base, HEAD)..HEAD`) FAILS when it touches
+#      ANY of:
+#        * src/federation/**  (the directory itself or any path under it)
+#        * src/handlers/federation_receive.rs
+#        * src/handlers/federation_signing_check.rs
+#        * src/identity/**
+#        * src/storage/migrations.rs
+#        * src/store/postgres.rs and src/store/postgres/** (B7 write
+#          funnels — the adapter file, not a hand-typed function list)
+#        * src/handlers/admin.rs
+#        * added / removed / renamed `AI_MEMORY_FED_[A-Z0-9_]+`
+#          identifiers anywhere in src/
+#      UNLESS the same change also modifies
+#      `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`.
 #
-# UNLESS the same change also modifies
-# `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` (a re-issue
-# or voiding record in the same change satisfies the gate).
+#   2. VOID/EXPIRED banner: HEAD's STATUS heading matching VOID or
+#      EXPIRED FAILS unless this change touches the cert doc (the
+#      re-issue / voiding record). A later PR against a still-VOID
+#      banner is the class this gate was green on.
+#
+#   3. Ancestor: `git diff --name-only <cert_bind_sha>..HEAD` over the
+#      watch set nonempty FAILS. Unrelated later PRs fail until the
+#      cert is re-issued; that is the point of a bind SHA.
 #
 # Failure message (required wording):
 #   federation-wire surface changed → the enterprise-federation
@@ -55,13 +66,12 @@
 #                      pull_request event is fail-closed.
 #
 # WHAT THIS DOES NOT CLAIM. A value-only edit of an *existing*
-# AI_MEMORY_FED_* identifier in a file outside the three path watches
+# AI_MEMORY_FED_* identifier in a file outside the path watches
 # does not trip the identifier check (TASK C is add/remove/rename of
 # the identifier surface, not every behavioural tweak). Path watches
-# still catch any edit under src/federation/** or the two handler
-# files, values included. This gate does not re-run §5.4(2)–(5); it
-# only forces the cert-doc to be touched so a human/re-issue cannot
-# be skipped.
+# still catch any edit under the §5 set, values included. This gate
+# does not re-run §5.4(2)–(5); it only forces the cert-doc to be
+# touched so a human/re-issue cannot be skipped.
 #
 # Usage:
 #   scripts/check-cert-expiry.sh              # against the resolved range
@@ -82,19 +92,68 @@ FED_ID_PATTERN='AI_MEMORY_FED_[A-Z0-9_]+'
 # Path / identifier classifiers
 # ---------------------------------------------------------------------------
 
-# is_watched_path PATH — 0 iff PATH is on the §7 federation-wire surface.
+# is_watched_path PATH — 0 iff PATH is on the §5/§7 watched surface.
 # Use [[ == ]] globs, not `case`. bash `case` `*` does not match `/`, so
 # `src/federation/*` would miss nested paths (e.g. src/federation/identity/*.rs
 # — 10 files at 580d8427). `[[ == ]]` `*` does match `/`.
+#
+# #3556 (N30) widens the set per the certification standard §5:
+#   src/identity/**, src/storage/migrations.rs, the postgres write
+#   funnels (the B7 write-SQL file, not a hand-typed function list),
+#   src/handlers/admin.rs. The postgres adapter split under
+#   src/store/postgres/ is the same write plane.
 is_watched_path() {
     [[ "$1" == src/federation || "$1" == src/federation/* ]] && return 0
     [[ "$1" == src/handlers/federation_receive.rs ]] && return 0
     [[ "$1" == src/handlers/federation_signing_check.rs ]] && return 0
+    [[ "$1" == src/identity || "$1" == src/identity/* ]] && return 0
+    [[ "$1" == src/storage/migrations.rs ]] && return 0
+    [[ "$1" == src/store/postgres.rs ]] && return 0
+    [[ "$1" == src/store/postgres || "$1" == src/store/postgres/* ]] && return 0
+    [[ "$1" == src/handlers/admin.rs ]] && return 0
     return 1
 }
 
 is_cert_doc_path() {
     [[ "$1" == "$CERT_DOC" ]]
+}
+
+# First STATUS heading in the cert doc (the live banner, not §7 history).
+extract_status_banner() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    awk '
+        /^> ## STATUS/ || /^## STATUS/ || /^\*\*STATUS/ {
+            print
+            exit
+        }
+    ' "$file"
+}
+
+banner_is_void_or_expired() {
+    local banner="$1"
+    printf '%s' "$banner" | grep -qiE 'VOID|EXPIRED'
+}
+
+# Bind SHA from the first "Binds to:" line (40-hex).
+extract_bind_sha() {
+    local file="$1" line
+    [ -f "$file" ] || return 1
+    line="$(awk '/Binds to/{print; exit}' "$file")"
+    [ -n "$line" ] || return 1
+    printf '%s' "$line" | grep -oE '[0-9a-f]{40}' | head -1
+}
+
+range_touches_cert_doc() {
+    local repo="$1" base="$2" head="$3"
+    local p
+    while IFS= read -r -d '' p; do
+        [[ -z "$p" ]] && continue
+        if is_cert_doc_path "$p"; then
+            return 0
+        fi
+    done < <(git -C "$repo" -c core.quotePath=false diff --name-only -z --no-renames "$base" "$head")
+    return 1
 }
 
 # extract_fed_ids REPO TREE — unique AI_MEMORY_FED_* identifiers in src/
@@ -295,6 +354,68 @@ check_change() {
     return 1
 }
 
+# #3556 — VOID/EXPIRED banner is fail unless this change re-issues/voids
+# the cert doc. A later PR against a still-VOID banner is the class
+# "green with a VOID certificate".
+check_void_banner() {
+    local repo="$1" base="$2" head="$3"
+    local doc="$repo/$CERT_DOC"
+    local banner
+    banner="$(extract_status_banner "$doc" || true)"
+    if [ -z "$banner" ]; then
+        echo "check-cert-expiry: ERROR — no STATUS banner in $CERT_DOC (fail-closed)"
+        return 1
+    fi
+    if ! banner_is_void_or_expired "$banner"; then
+        echo "check-cert-expiry: PASS — STATUS banner is not VOID/EXPIRED"
+        return 0
+    fi
+    if range_touches_cert_doc "$repo" "$base" "$head"; then
+        echo "check-cert-expiry: PASS — STATUS banner is VOID/EXPIRED AND this change re-issues or records the void ($CERT_DOC touched in ${base}..${head})"
+        return 0
+    fi
+    echo "check-cert-expiry: FAIL — STATUS banner is VOID/EXPIRED and this change does not re-issue the cert doc."
+    echo "Banner: $banner"
+    echo "Remedy: re-issue or record the void in ${CERT_DOC} in this same change (#3556)."
+    return 1
+}
+
+# #3556 — HEAD must not have watched-path changes after the cert's bind SHA.
+# Unrelated later PRs fail until the cert is re-issued (that is the point).
+check_ancestor() {
+    local repo="$1"
+    local doc="$repo/$CERT_DOC"
+    local bind
+    bind="$(extract_bind_sha "$doc" || true)"
+    if [ -z "$bind" ]; then
+        echo "check-cert-expiry: ERROR — no 40-hex bind SHA on a Binds to: line in $CERT_DOC (fail-closed)"
+        return 1
+    fi
+    if ! git -C "$repo" rev-parse --verify --quiet "${bind}^{commit}" >/dev/null; then
+        echo "check-cert-expiry: ERROR — bind SHA $bind is not a local commit (fail-closed)"
+        return 1
+    fi
+    local watched=() p
+    while IFS= read -r -d '' p; do
+        [[ -z "$p" ]] && continue
+        if is_watched_path "$p"; then
+            watched+=("$p")
+        fi
+    done < <(git -C "$repo" -c core.quotePath=false diff --name-only -z --no-renames "$bind" HEAD)
+    if ((${#watched[@]} == 0)); then
+        echo "check-cert-expiry: PASS — no watched-path drift since bind SHA ${bind}"
+        return 0
+    fi
+    echo "check-cert-expiry: FAIL — watched surface changed after the cert bind SHA ${bind} and the cert was not re-issued."
+    echo "Watched paths in ${bind}..HEAD:"
+    local w
+    for w in "${watched[@]}"; do
+        echo "  $w"
+    done
+    echo "Remedy: re-issue ${CERT_DOC} against HEAD (update Binds to: and STATUS)."
+    return 1
+}
+
 run_gate() {
     local repo="${1:-$REPO_ROOT}"
     local pair rc
@@ -310,12 +431,26 @@ run_gate() {
     fi
     local base head
     read -r base head <<<"$pair"
+    local fail=0 out
     if ! out="$(check_change "$repo" "$base" "$head")"; then
         printf '%s\n' "$out" >&2
-        return 1
+        fail=1
+    else
+        printf '%s\n' "$out"
     fi
-    printf '%s\n' "$out"
-    return 0
+    if ! out="$(check_void_banner "$repo" "$base" "$head")"; then
+        printf '%s\n' "$out" >&2
+        fail=1
+    else
+        printf '%s\n' "$out"
+    fi
+    if ! out="$(check_ancestor "$repo")"; then
+        printf '%s\n' "$out" >&2
+        fail=1
+    else
+        printf '%s\n' "$out"
+    fi
+    return "$fail"
 }
 
 # ---------------------------------------------------------------------------
@@ -330,7 +465,8 @@ self_test() {
     trap "rm -rf '$tmp'" EXIT
 
     local repo="$tmp/repo"
-    mkdir -p "$repo/src/federation" "$repo/src/handlers" "$repo/docs/compliance"
+    mkdir -p "$repo/src/federation" "$repo/src/handlers" "$repo/src/identity" \
+        "$repo/src/storage" "$repo/src/store/postgres" "$repo/docs/compliance"
     git -C "$repo" init -q -b main
     git -C "$repo" config user.name "Cert Expiry Selftest"
     git -C "$repo" config user.email "selftest@invalid.example"
@@ -339,6 +475,11 @@ self_test() {
     printf 'fn federation_mod() {}\n' >"$repo/src/federation/mod.rs"
     printf 'fn receive() {}\n' >"$repo/src/handlers/federation_receive.rs"
     printf 'fn signing_check() {}\n' >"$repo/src/handlers/federation_signing_check.rs"
+    printf 'fn identity() {}\n' >"$repo/src/identity/mod.rs"
+    printf 'fn migrate() {}\n' >"$repo/src/storage/migrations.rs"
+    printf 'fn pg_write() {}\n' >"$repo/src/store/postgres.rs"
+    printf 'fn pg_split() {}\n' >"$repo/src/store/postgres/write.rs"
+    printf 'fn admin() {}\n' >"$repo/src/handlers/admin.rs"
     printf 'pub const X: &str = "AI_MEMORY_FED_REQUIRE_SIG";\n' >"$repo/src/config.rs"
     printf 'fn other() {}\n' >"$repo/src/unrelated.rs"
     printf '# cert\nbinds to e22bc93c\n' >"$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
@@ -634,13 +775,16 @@ self_test() {
     # (o) GREEN — this PR itself (scripts / workflow / allowlist / CHANGELOG
     #     only; must not trip the gate). Runs against the REAL worktree so a
     #     future edit that accidentally touches the watched surface turns
-    #     the self-test red before CI does.
+    #     the self-test red before CI does. Prefer @{upstream} (the lane
+    #     base, e.g. origin/chain/next) so a chain-based branch is not
+    #     compared against the published release tip (which would include
+    #     every unrelated merge).
     local own_base="" own_head
     own_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-    if git -C "$REPO_ROOT" rev-parse --verify --quiet origin/release/v1.0.0 >/dev/null 2>&1; then
-        own_base="$(git -C "$REPO_ROOT" rev-parse origin/release/v1.0.0)"
-    elif git -C "$REPO_ROOT" rev-parse --verify --quiet '@{upstream}' >/dev/null 2>&1; then
+    if git -C "$REPO_ROOT" rev-parse --verify --quiet '@{upstream}' >/dev/null 2>&1; then
         own_base="$(git -C "$REPO_ROOT" rev-parse '@{upstream}')"
+    elif git -C "$REPO_ROOT" rev-parse --verify --quiet origin/release/v1.0.0 >/dev/null 2>&1; then
+        own_base="$(git -C "$REPO_ROOT" rev-parse origin/release/v1.0.0)"
     fi
     if [[ -n "$own_base" ]]; then
         if ! out="$(check_change "$REPO_ROOT" "$own_base" "$own_head")"; then
@@ -652,11 +796,92 @@ self_test() {
         echo "self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 and no @{upstream})" >&2
     fi
 
+    git -C "$repo" reset -q --hard "$base_sha"
+
+    # (q) RED — #3556 §5 watch-set additions (identity, migrations, pg
+    #     write funnel, admin). One commit per path so a glob miss names
+    #     the exact file.
+    local q_path q_sha
+    for q_path in src/identity/mod.rs src/storage/migrations.rs src/store/postgres.rs src/store/postgres/write.rs src/handlers/admin.rs; do
+        echo "// mutate" >>"$repo/$q_path"
+        git -C "$repo" add "$q_path"
+        git -C "$repo" commit -q -m "violate: touch $q_path"
+        q_sha="$(git -C "$repo" rev-parse HEAD)"
+        if out="$(check_change "$repo" "$base_sha" "$q_sha" 2>&1)"; then
+            echo "self-test FAILED (q): $q_path was NOT rejected" >&2
+            echo "$out" >&2
+            failed=1
+        else
+            if ! printf '%s\n' "$out" | grep -q "$q_path"; then
+                echo "self-test FAILED (q): rejection did not name $q_path:" >&2
+                echo "$out" >&2
+                failed=1
+            fi
+        fi
+        git -C "$repo" reset -q --hard "$base_sha"
+    done
+
+    # (r) VOID banner: FAIL unless this change touches the cert doc.
+    printf '# cert\n**Binds to:** `%s`\n\n> ## STATUS — **VOID / EXPIRED as of 2026-09-05**\n' "$base_sha" \
+        >"$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    git -C "$repo" add "$CERT_DOC"
+    git -C "$repo" commit -q -m "void banner"
+    local void_sha
+    void_sha="$(git -C "$repo" rev-parse HEAD)"
+    echo "// unrelated" >>"$repo/src/unrelated.rs"
+    git -C "$repo" add src/unrelated.rs
+    git -C "$repo" commit -q -m "docs-unrelated against VOID banner"
+    local void_later
+    void_later="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_void_banner "$repo" "$void_sha" "$void_later" 2>&1)"; then
+        echo "self-test FAILED (r): VOID banner without cert-doc touch was NOT rejected" >&2
+        echo "$out" >&2
+        failed=1
+    fi
+    echo "// re-issue" >>"$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    git -C "$repo" add "$CERT_DOC"
+    git -C "$repo" commit -q -m "re-issue on VOID"
+    local void_reissue
+    void_reissue="$(git -C "$repo" rev-parse HEAD)"
+    if ! out="$(check_void_banner "$repo" "$void_later" "$void_reissue")"; then
+        echo "self-test FAILED (r): VOID banner + cert-doc touch was REJECTED:" >&2
+        echo "$out" >&2
+        failed=1
+    fi
+
+    git -C "$repo" reset -q --hard "$base_sha"
+
+    # (s) ancestor: bind SHA then a later watched-path commit FAILS;
+    #     re-pointing Binds to: HEAD PASSES.
+    printf '# cert\n**Binds to:** `%s`\n\n> ## STATUS — **LIVE as of 2026-09-11**\n' "$base_sha" \
+        >"$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    git -C "$repo" add "$CERT_DOC"
+    git -C "$repo" commit -q -m "bind live banner"
+    echo "// after bind" >>"$repo/src/identity/mod.rs"
+    git -C "$repo" add src/identity/mod.rs
+    git -C "$repo" commit -q -m "watched path after bind"
+    if out="$(check_ancestor "$repo" 2>&1)"; then
+        echo "self-test FAILED (s): ancestor watched-path drift was NOT rejected" >&2
+        echo "$out" >&2
+        failed=1
+    fi
+    local now_sha
+    now_sha="$(git -C "$repo" rev-parse HEAD)"
+    printf '# cert\n**Binds to:** `%s`\n\n> ## STATUS — **LIVE as of 2026-09-11**\n' "$now_sha" \
+        >"$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    git -C "$repo" add "$CERT_DOC"
+    git -C "$repo" commit -q -m "re-bind"
+    if ! out="$(check_ancestor "$repo")"; then
+        echo "self-test FAILED (s): re-bound ancestor was REJECTED:" >&2
+        echo "$out" >&2
+        failed=1
+    fi
+
     if ((failed != 0)); then
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed)."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs upstream GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) §5 watch-set paths RED; (r) VOID banner without cert-doc touch RED, with touch GREEN; (s) ancestor drift RED, re-bind GREEN."
 }
 
 case "${1:-}" in

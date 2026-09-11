@@ -897,25 +897,26 @@ jobs:
 
   cert-expiry-gate:
     # Cert §7 expiry trigger (F7 / 2026-08-12 ratification caveat). The
-    # enterprise-federation certification expires on any change to
-    # src/federation/**, the two federation handler files, or the
+    # enterprise-federation certification expires on any change to the
+    # §5 watch set (#3556): src/federation/**, the two federation
+    # handler files, src/identity/**, src/storage/migrations.rs, the
+    # postgres write plane (src/store/postgres.rs and
+    # src/store/postgres/**), src/handlers/admin.rs, or the
     # AI_MEMORY_FED_* identifier surface, unless the same change also
     # re-issues or voids docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md.
     # Until this job that sentence was prose-only — a federation-wire
     # change could merge through green CI while the cert kept being cited
     # (the #2444 "reports success while doing nothing" shape).
     #
-    # Diff range is the standard PR diff (merge-base-with-PR-base .. HEAD),
-    # NEVER a diff against the cert's pinned SHA, so unrelated later PRs
-    # do not fail forever. `fetch-depth: 0` is required (default
+    # Three fail-closed checks (#3556): PR-range watch, VOID/EXPIRED
+    # banner, ancestor (bind-SHA). `fetch-depth: 0` is required (default
     # actions/checkout@v4 is a shallow single-commit checkout of the PR
-    # merge ref, which cannot walk merge-base(base, head)).
+    # merge ref, which cannot walk merge-base(base, head) nor the cert
+    # bind SHA).
     #
     # No `needs:`, no job-level `if:`, no `paths:` filter — always runs.
     # Declared REQUIRED in required-contexts-release.txt and live-required
-    # as of #3554 (the companion protection call the original mirror-first
-    # window never made). Watch-set / VOID-banner hardening of the script
-    # itself is #3556.
+    # as of #3554. Watch-set / VOID-banner / ancestor hardening is #3556.
     name: Enterprise-federation cert-expiry gate (cert §7 / F7)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -938,7 +939,9 @@ jobs:
         # add/rename outside the path watches is RED; docs-only and
         # unrelated src edits are GREEN; pull_request-without-base
         # fail-closes; workflow_dispatch and a zero-SHA push skip;
-        # THIS checkout vs origin/release/v1.0.0 is GREEN.
+        # THIS checkout vs @{upstream} is GREEN; (q) §5 watch-set paths
+        # RED; (r) VOID banner without cert-doc touch RED; (s) ancestor
+        # drift RED, re-bind GREEN.
         run: bash scripts/check-cert-expiry.sh --self-test
 
   external-pr-operator-approval-gate:
