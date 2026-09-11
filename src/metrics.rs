@@ -211,6 +211,12 @@ pub struct Metrics {
     /// classifier maps the free-text `last_error` to one of the six
     /// values), never the raw string.
     pub federation_push_dlq_quarantined_by_cause: IntCounterVec,
+    /// v1.0.0 #3124 — caller-scoped mutations ADMITTED on an UNSTAMPED
+    /// (legacy-unowned) row under `AI_MEMORY_UNSTAMPED_MUTATION=warn`,
+    /// labeled by `backend` (`sqlite`|`postgres`) and `funnel` (the closed
+    /// `identity::owner_stamp::funnel` set). Non-zero means rows the
+    /// operator must re-own before flipping the knob to `refuse`.
+    pub unstamped_mutation_allowed_total: IntCounterVec,
     /// #2442 — push-DLQ rows skipped because their durable routing key is a
     /// pre-#2442 POSITIONAL peer id (`peer-0`, `peer-1`, …) that no longer
     /// resolves to any configured peer.
@@ -749,6 +755,20 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_quarantined_by_cause.clone()))?;
 
+        // v1.0.0 #3124 — unstamped-row mutation admissions (closed labels).
+        let unstamped_mutation_allowed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_unstamped_mutation_allowed_total",
+                "Caller-scoped mutations admitted on an UNSTAMPED \
+                 (legacy-unowned, no metadata.agent_id) memory row under \
+                 AI_MEMORY_UNSTAMPED_MUTATION=warn, labeled by backend and \
+                 funnel. Non-zero means rows to re-own (ai-memory reown) \
+                 before setting the knob to refuse.",
+            ),
+            &["backend", "funnel"],
+        )?;
+        registry.register(Box::new(unstamped_mutation_allowed_total.clone()))?;
+
         // #2442 — legacy positional peer-id skips. Kept OFF the `cause` label
         // set above on purpose: see the field doc on
         // `federation_push_dlq_legacy_positional`.
@@ -1095,6 +1115,7 @@ impl Metrics {
             deferred_audit_drainer_terminal_state,
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
+            unstamped_mutation_allowed_total,
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
@@ -1251,6 +1272,27 @@ pub fn record_auto_export_spawn_failed() {
 /// quarantine knob (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) is off.
 pub fn inc_fed_quarantined_unattributed() {
     registry().federation_quarantined_unattributed.inc();
+}
+
+/// v1.0.0 #3124 — record `rows` caller-scoped mutations admitted on
+/// UNSTAMPED rows (`AI_MEMORY_UNSTAMPED_MUTATION=warn`). Pairs with the
+/// `authz.unstamped` WARN at the call site
+/// ([`crate::identity::owner_stamp::admit_unstamped_rows`]).
+pub fn inc_unstamped_mutation_allowed(backend: &str, funnel: &str, rows: u64) {
+    registry()
+        .unstamped_mutation_allowed_total
+        .with_label_values(&[backend, funnel])
+        .inc_by(rows);
+}
+
+/// v1.0.0 #3124 — read the unstamped-admission counter for one label pair.
+/// Test-only accessor pinning the observability wiring.
+#[must_use]
+pub fn unstamped_mutation_allowed_count(backend: &str, funnel: &str) -> u64 {
+    registry()
+        .unstamped_mutation_allowed_total
+        .with_label_values(&[backend, funnel])
+        .get()
 }
 
 /// #2966 — read the current value of the route-IN quarantine counter.
