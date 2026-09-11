@@ -53,7 +53,11 @@ use crate::persona::{PersonaConfig, PersonaError, PersonaGenerator, get_latest_p
 /// Errors:
 /// * `entity_id is required` — caller omitted the parameter.
 /// * `entity_id cannot be empty`.
-pub(super) fn handle_persona(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+pub(super) fn handle_persona(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let entity_id = params["entity_id"]
         .as_str()
         .ok_or("entity_id is required")?;
@@ -66,7 +70,30 @@ pub(super) fn handle_persona(conn: &rusqlite::Connection, params: &Value) -> Res
 
     let persona = get_latest_persona(conn, entity_id, namespace)
         .map_err(|e| format!("memory_persona substrate error: {e}"))?;
+    // v1.0.0 #3596 — caller visibility gate on the BACKING Persona row.
+    // `get_latest_persona` selects by `(entity_id, namespace)` with no
+    // owner / scope predicate, so without this every tenant could read every
+    // other tenant's private persona. A hidden row folds into the SAME
+    // `null` envelope an unminted persona answers, so the tool cannot be
+    // used as an existence oracle (the #1553 / #3387 disposition).
+    let persona = persona.filter(|p| persona_row_readable(conn, &p.id, caller));
     Ok(json!({ "persona": persona }))
+}
+
+/// v1.0.0 #3596 — `true` iff the Persona-kind memory `id` is readable by
+/// `caller` under the per-row scope predicate, naming the row's OWN
+/// namespace as the requested one (the #3549 read-funnel contract). A row
+/// that cannot be re-fetched (gone between the two reads, or an
+/// undecryptable at-rest envelope) is HIDDEN — fail closed, the #3232
+/// disposition.
+fn persona_row_readable(conn: &rusqlite::Connection, id: &str, caller: Option<&str>) -> bool {
+    // Unfiltered read (`get_any`, #3270): the gate is lifecycle-neutral.
+    match crate::storage::get_any(conn, id) {
+        Ok(Some(mem)) => {
+            crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
+        }
+        Ok(None) | Err(_) => false,
+    }
 }
 
 /// Wire shape (write):
@@ -368,6 +395,7 @@ mod tests {
         let out = handle_persona(
             &conn,
             &json!({"entity_id": "alice", "namespace": "team/alpha"}),
+            None,
         )
         .unwrap();
         assert!(out["persona"].is_null());
@@ -376,7 +404,7 @@ mod tests {
     #[test]
     fn handle_persona_rejects_empty_entity_id() {
         let (conn, _dir) = fresh_db();
-        let err = handle_persona(&conn, &json!({"entity_id": ""})).unwrap_err();
+        let err = handle_persona(&conn, &json!({"entity_id": ""}), None).unwrap_err();
         assert!(err.contains("entity_id cannot be empty"));
     }
 
@@ -425,6 +453,7 @@ mod tests {
         let got = handle_persona(
             &conn,
             &json!({"entity_id": "alice", "namespace": "team/alpha"}),
+            None,
         )
         .unwrap();
         assert_eq!(got["persona"]["entity_id"], "alice");
@@ -539,6 +568,86 @@ mod tests {
         assert!(
             err.contains("<any namespace>"),
             "#848 — empty cross-namespace scan must reference the cross-namespace sentinel; got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod authority_gate_3596_tests {
+    //! v1.0.0 #3596 — DENIED / ALLOWED matrix for the `memory_persona` read
+    //! gate: a foreign owner's `scope=private` persona folds into the same
+    //! `null` envelope an unminted persona returns; the owner and the local
+    //! operator (`None`) read it.
+    use super::*;
+    use crate::models::{Memory, MemoryKind, Tier};
+    use crate::storage as db;
+
+    fn seed_private_persona(conn: &rusqlite::Connection, owner: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "team/alpha".to_string(),
+            title: "persona: alice".to_string(),
+            content: "alice is methodical".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": owner, "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Persona,
+            entity_id: Some("alice".to_string()),
+            persona_version: Some(1),
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert persona row")
+    }
+
+    fn fresh_conn() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    const PARAMS: &str = r#"{"entity_id": "alice", "namespace": "team/alpha"}"#;
+
+    #[test]
+    fn foreign_owner_private_persona_is_null_for_another_caller_3596() {
+        let conn = fresh_conn();
+        seed_private_persona(&conn, "ai:alice");
+        let params: Value = serde_json::from_str(PARAMS).unwrap();
+        let out = handle_persona(&conn, &params, Some("ai:bob")).expect("ok envelope");
+        assert!(
+            out["persona"].is_null(),
+            "bob must see the SAME null envelope an unminted persona returns: {out}"
+        );
+    }
+
+    #[test]
+    fn owner_and_local_operator_read_the_persona_3596() {
+        let conn = fresh_conn();
+        let id = seed_private_persona(&conn, "ai:alice");
+        let params: Value = serde_json::from_str(PARAMS).unwrap();
+        let own = handle_persona(&conn, &params, Some("ai:alice")).expect("ok");
+        assert_eq!(own["persona"]["id"], id, "owner reads their persona: {own}");
+        let local = handle_persona(&conn, &params, None).expect("ok");
+        assert_eq!(
+            local["persona"]["id"], id,
+            "local operator (None) is trust-all"
         );
     }
 }

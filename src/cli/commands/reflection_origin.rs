@@ -46,7 +46,11 @@ pub fn cmd_reflection_origin(
     let conn = db::open(db_path)?;
     let params = json!({"memory_id": args.memory_id});
 
-    let envelope = crate::mcp::handle_reflection_origin(&conn, &params)
+    // v1.0.0 #3596–#3601 — the CLI read-visibility caller (the `recall` /
+    // `boot` precedent): `AI_MEMORY_AGENT_ID` when set, else the local
+    // operator's trust-all `None`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    let envelope = crate::mcp::handle_reflection_origin(&conn, &params, caller.as_deref())
         .map_err(|e| anyhow::anyhow!("reflection-origin: {e}"))?;
 
     if args.json {

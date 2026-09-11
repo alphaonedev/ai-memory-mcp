@@ -410,6 +410,7 @@ fn memory_verify_self_signed_happy_path() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok");
 
@@ -457,6 +458,7 @@ fn memory_verify_tampered_content_returns_false() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("pre-tamper handle_verify Ok");
     assert_eq!(pre["signature_verified"], json!(true));
@@ -480,6 +482,7 @@ fn memory_verify_tampered_content_returns_false() {
             "target_id": f.dst_id,
             "relation": "supersedes",
         }),
+        None,
     )
     .expect("post-tamper handle_verify Ok (rejection is data, not Err)");
 
@@ -577,6 +580,7 @@ fn peer_attested_inbound_link_verifies() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok");
 
@@ -650,6 +654,7 @@ fn inbound_link_with_no_enrolled_pubkey_lands_unsigned() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok");
 
@@ -710,6 +715,7 @@ fn tampered_signature_byte_does_not_verify() {
             "target_id": f.dst_id,
             "relation": "related_to",
         }),
+        None,
     )
     .expect("handle_verify Ok (tampered → false, not Err)");
 

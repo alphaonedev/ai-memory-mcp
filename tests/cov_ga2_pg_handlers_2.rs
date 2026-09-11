@@ -158,6 +158,24 @@ async fn post_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode
     decode(router, req).await
 }
 
+/// #3599 — `post_json` as an explicit NON-admin principal, so the read gates
+/// that short-circuit for the router's admin `CALLER` actually run.
+async fn post_json_as(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    agent: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    decode(router, req).await
+}
+
 async fn delete_req(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("DELETE")
@@ -869,6 +887,82 @@ pg_test!(pg_memory_dependents_not_501_3064, url, {
     assert_eq!(deps.len(), 1, "body={body}");
     assert_eq!(deps[0]["id"], json!(child), "body={body}");
 });
+
+// #3599 — the pg HTTP arm's read gate is lifecycle-NEUTRAL: a dependent the
+// #3324 `supersedes` path stamped `contaminated` stays listed for its OWNER
+// (a non-admin caller, so the gate actually runs) and is still hidden from a
+// stranger. Pre-fix the gate read through the trait `get`, whose lifecycle
+// fold turned every contaminated dependent into `NotFound` → count 0.
+pg_test!(
+    pg_memory_dependents_contaminated_listed_for_owner_3599,
+    url,
+    {
+        let r = pg_router(&url).await;
+        let ns = uniq_ns();
+        let owner = "ai:dep-owner-3599";
+        let stranger = "ai:dep-stranger-3599";
+        let seed = |title: &str| json!({"title": title, "content": "body", "namespace": ns, "agent_id": owner});
+        let (status, body) =
+            post_json_as(&r, "/api/v1/memories", seed("dep-origin-3599"), owner).await;
+        assert!(
+            status.is_success(),
+            "seed origin status={status} body={body}"
+        );
+        let origin = body["id"].as_str().expect("origin id").to_string();
+        let (status, body) =
+            post_json_as(&r, "/api/v1/memories", seed("dep-child-3599"), owner).await;
+        assert!(
+            status.is_success(),
+            "seed child status={status} body={body}"
+        );
+        let child = body["id"].as_str().expect("child id").to_string();
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/links",
+            json!({"source_id": child, "target_id": origin, "relation": "reflects_on"}),
+            owner,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "seed reflects_on status={status} body={body}"
+        );
+        // Stamp the dependent the way #3324 does after a `supersedes`.
+        let pool = sqlx::PgPool::connect(&url).await.expect("pg pool");
+        sqlx::query("UPDATE memories SET lifecycle_state = 'contaminated' WHERE id = $1")
+            .bind(&child)
+            .execute(&pool)
+            .await
+            .expect("stamp contaminated");
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/memory_dependents_of_invalidated",
+            json!({"memory_id": origin}),
+            owner,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body.get("count"),
+            Some(&json!(1)),
+            "owner keeps the contaminated dependent; body={body}"
+        );
+        assert_eq!(body["dependents"][0]["id"], json!(child), "body={body}");
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/memory_dependents_of_invalidated",
+            json!({"memory_id": origin}),
+            stranger,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body.get("count"),
+            Some(&json!(0)),
+            "stranger sees no private dependent; body={body}"
+        );
+    }
+);
 
 pg_test!(pg_memory_export_reflection_not_501_3064, url, {
     // #3064 batch C — pre-fix 501. Seed an observation, reflect, export.

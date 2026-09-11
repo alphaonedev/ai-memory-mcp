@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 pub fn handle_reflection_origin(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
@@ -47,8 +48,17 @@ pub fn handle_reflection_origin(
     if memory_id.is_empty() {
         return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
     }
-    let origin = crate::federation::reflection_bookkeeping::reflection_origin(conn, memory_id)
+    // v1.0.0 #3600 — fetch the row ONCE, gate it through the per-row scope
+    // predicate naming its OWN namespace (the #3549 read-funnel contract),
+    // and derive the origin record from the fetched row. A row the caller
+    // cannot read answers the SAME `memory not found` text an unknown id
+    // does, so peer / signing provenance is not an existence oracle over
+    // another tenant's private reflections (the #3426 leak-resistant shape).
+    let mem = crate::storage::get(conn, memory_id)
         .map_err(|e| format!("reflection_origin substrate error: {e}"))?;
+    let origin = mem
+        .filter(|m| crate::visibility::is_readable_on_query(m, caller, Some(m.namespace.as_str())))
+        .map(|m| crate::federation::reflection_bookkeeping::reflection_origin_from_memory(&m));
     match origin {
         Some(record) => Ok(json!({
             "memory_id": record.memory_id,
@@ -134,14 +144,15 @@ mod tests {
     #[test]
     fn handle_unknown_id_returns_not_found() {
         let conn = fresh_db();
-        let err = handle_reflection_origin(&conn, &json!({"memory_id": "nope-id"})).unwrap_err();
+        let err =
+            handle_reflection_origin(&conn, &json!({"memory_id": "nope-id"}), None).unwrap_err();
         assert!(err.contains("not found"), "expected not-found error: {err}");
     }
 
     #[test]
     fn handle_missing_param_returns_error() {
         let conn = fresh_db();
-        let err = handle_reflection_origin(&conn, &json!({})).unwrap_err();
+        let err = handle_reflection_origin(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("memory_id"), "expected param error: {err}");
     }
 
@@ -183,8 +194,79 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).expect("insert");
-        let out = handle_reflection_origin(&conn, &json!({"memory_id": id})).unwrap();
+        let out = handle_reflection_origin(&conn, &json!({"memory_id": id}), None).unwrap();
         assert_eq!(out["is_reflection"].as_bool(), Some(false));
         assert_eq!(out["original_depth"].as_i64(), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod authority_gate_3600_tests {
+    //! v1.0.0 #3600 — DENIED / ALLOWED matrix for the `memory_reflection_origin`
+    //! read gate: another owner's private reflection answers the SAME
+    //! not-found text an unknown id does; the owner reads its provenance.
+    use super::*;
+    use crate::storage as db;
+
+    fn seed_private_reflection(conn: &rusqlite::Connection, owner: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = crate::models::Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: crate::models::Tier::Mid,
+            namespace: "test".to_string(),
+            title: "reflection".to_string(),
+            content: "body".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": owner, "scope": "private"}),
+            reflection_depth: 1,
+            memory_kind: crate::models::MemoryKind::Reflection,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert")
+    }
+
+    #[test]
+    fn foreign_owner_private_reflection_is_not_found_for_another_caller_3600() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = db::open(tmp.path()).expect("db::open");
+        let id = seed_private_reflection(&conn, "ai:alice");
+        let err =
+            handle_reflection_origin(&conn, &json!({"memory_id": id}), Some("ai:bob")).unwrap_err();
+        assert_eq!(
+            err,
+            crate::errors::msg::memory_not_found(&id),
+            "must be byte-identical to the unknown-id text (no existence oracle)"
+        );
+    }
+
+    #[test]
+    fn owner_reads_their_reflection_provenance_3600() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = db::open(tmp.path()).expect("db::open");
+        let id = seed_private_reflection(&conn, "ai:alice");
+        let out = handle_reflection_origin(&conn, &json!({"memory_id": id}), Some("ai:alice"))
+            .expect("owner reads");
+        assert_eq!(out["is_reflection"].as_bool(), Some(true));
+        assert_eq!(out["signing_agent"].as_str(), Some("ai:alice"));
     }
 }

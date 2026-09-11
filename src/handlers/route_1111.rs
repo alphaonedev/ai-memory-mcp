@@ -549,14 +549,80 @@ pub async fn handle_recall_observations_http(
     }
 }
 
+/// v1.0.0 #3599 / #3600 / #3601 — the read-visibility caller for the read
+/// routes in this module that forward to a gated MCP handler: the #947 /
+/// #3232 HTTP disposition (the header-asserted id, anonymous when absent —
+/// the #3549 authority layer has already refused a malformed assertion
+/// before this runs), with an enrolled admin reading trust-all (`None`).
+fn http_read_caller(app: &AppState, headers: &HeaderMap) -> Option<String> {
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+    if crate::handlers::admin_role::is_admin_caller_trusted(app, headers, &caller) {
+        None
+    } else {
+        Some(caller)
+    }
+}
+
+/// v1.0.0 #3599 / #3600 / #3601 — postgres twin of the sqlite handlers'
+/// per-row gate: `true` iff `id` is readable by `caller`. `None` (an admin /
+/// trust-all caller) reads everything; otherwise the row is fetched under
+/// the caller's OWN context and re-checked through the shared predicate
+/// naming its own namespace. An unfetchable row is HIDDEN (fail closed —
+/// `MemoryStore::get` under a non-admin ctx already maps an invisible row to
+/// `NotFound`, the #3232 disposition).
+#[cfg(feature = "sal")]
+async fn pg_row_readable(app: &AppState, caller: Option<&str>, id: &str) -> bool {
+    let Some(c) = caller else {
+        return true;
+    };
+    // The gate reads the row UNFILTERED (the #3270 authz-read rule) so it is
+    // lifecycle-NEUTRAL: the trait `get` folds tombstoned / contaminated rows
+    // into `NotFound`, and a gate built on it hid exactly the `contaminated`
+    // dependents the #3324 `supersedes` path stamps before the curator lists
+    // them. `PostgresStore::get_any` is reached through the concrete store
+    // (the #2587 downcast hatch); a store that is not postgres keeps the
+    // trait read (this arm only runs under `StorageBackend::Postgres`).
+    #[cfg(feature = "sal-postgres")]
+    {
+        if let Some(pg) = app
+            .store
+            .as_any()
+            .downcast_ref::<crate::store::postgres::PostgresStore>()
+        {
+            return match pg.get_any(id).await {
+                Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                    &mem,
+                    caller,
+                    Some(mem.namespace.as_str()),
+                ),
+                Ok(None) | Err(_) => false,
+            };
+        }
+    }
+    let ctx = crate::store::CallerContext::for_agent(c);
+    match app.store.get(&ctx, id).await {
+        Ok(mem) => {
+            crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
+        }
+        Err(_) => false,
+    }
+}
+
 /// `POST /api/v1/memory_reflection_origin` — walk a reflection
 /// memory backward along `reflects_on` edges to surface the original
 /// observation set. Read-only.
 pub async fn handle_reflection_origin_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3600 — the same caller gate the MCP handler applies (sqlite arm) /
+    // its postgres twin below.
+    let caller = http_read_caller(&app, &headers);
     // Postgres SAL path (#1549): walk reflection origin metadata through
     // `MemoryStore::get_reflection_origin`. Mirrors the sqlite MCP path's
     // `memory_id` validation + response shape + "memory not found" 4xx.
@@ -567,6 +633,9 @@ pub async fn handle_reflection_origin_http(
             Some(_) => return err_response(crate::errors::msg::MEMORY_ID_EMPTY.to_string()),
             None => return err_response(crate::errors::msg::MEMORY_ID_REQUIRED.to_string()),
         };
+        if !pg_row_readable(&app, caller.as_deref(), memory_id).await {
+            return err_response(crate::errors::msg::memory_not_found(memory_id));
+        }
         return match app.store.get_reflection_origin(memory_id).await {
             Ok(Some(record)) => (
                 StatusCode::OK,
@@ -585,7 +654,7 @@ pub async fn handle_reflection_origin_http(
         };
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_reflection_origin(&lock.0, &body);
+    let result = crate::mcp::handle_reflection_origin(&lock.0, &body, caller.as_deref());
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -598,19 +667,21 @@ pub async fn handle_reflection_origin_http(
 /// L2-3 / #668 substrate. Read-only.
 pub async fn handle_dependents_of_invalidated_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3599 — the same caller gate the MCP handler applies.
+    let caller = http_read_caller(&app, &headers);
     // #3064 batch B — postgres SAL dispatch. Direct list is
     // `MemoryStore::list_dependents_of_invalidated`; opt-in
     // `transitive` reuses `lineage_descendants` (sqlite
     // `db::transitive_suspects` is an alias of that).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return dependents_http_via_store(&app, &body).await;
+        return dependents_http_via_store(&app, &body, caller.as_deref()).await;
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_dependents_of_invalidated(&lock.0, &body);
+    let result = crate::mcp::handle_dependents_of_invalidated(&lock.0, &body, caller.as_deref());
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -621,7 +692,11 @@ pub async fn handle_dependents_of_invalidated_http(
 /// #3064 batch B — postgres arm of [`handle_dependents_of_invalidated_http`].
 /// ERRORS-01: store faults go through [`super::store_err_to_response`].
 #[cfg(feature = "sal")]
-async fn dependents_http_via_store(app: &AppState, params: &Value) -> axum::response::Response {
+async fn dependents_http_via_store(
+    app: &AppState,
+    params: &Value,
+    caller: Option<&str>,
+) -> axum::response::Response {
     use crate::mcp::param_names;
     use crate::store::StoreError;
 
@@ -637,15 +712,17 @@ async fn dependents_http_via_store(app: &AppState, params: &Value) -> axum::resp
         Ok(v) => v,
         Err(e) => return super::store_err_to_response(e),
     };
-    let rendered: Vec<Value> = dependents
-        .iter()
-        .map(|d| {
-            json!({
+    // #3599 — render only the dependents the caller can read (postgres twin
+    // of the sqlite handler's filter); `count` is the VISIBLE set.
+    let mut rendered: Vec<Value> = Vec::with_capacity(dependents.len());
+    for d in &dependents {
+        if pg_row_readable(app, caller, &d.id).await {
+            rendered.push(json!({
                 "id": d.id,
                 "namespace": d.namespace,
-            })
-        })
-        .collect();
+            }));
+        }
+    }
     let mut out = json!({
         "memory_id": memory_id,
         "count": rendered.len(),
@@ -662,17 +739,17 @@ async fn dependents_http_via_store(app: &AppState, params: &Value) -> axum::resp
             .await
         {
             Ok(suspects) => {
-                let rendered_suspects: Vec<Value> = suspects
-                    .iter()
-                    .map(|n| {
-                        json!({
+                let mut rendered_suspects: Vec<Value> = Vec::with_capacity(suspects.len());
+                for n in &suspects {
+                    if pg_row_readable(app, caller, &n.id).await {
+                        rendered_suspects.push(json!({
                             "id": n.id,
                             "cid": n.cid,
                             "relation": n.relation,
                             "depth": n.depth,
-                        })
-                    })
-                    .collect();
+                        }));
+                    }
+                }
                 if let Value::Object(map) = &mut out {
                     map.insert(
                         field_names::TRANSITIVE_COUNT.to_string(),
@@ -1063,18 +1140,21 @@ async fn calibrate_confidence_http_via_store(
 /// Read-only.
 pub async fn handle_verify_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3601 — both endpoints must be readable by the caller (the MCP
+    // handler's gate on the sqlite arm; its postgres twin below).
+    let caller = http_read_caller(&app, &headers);
     // #3064 — postgres SAL dispatch. `PostgresStore::verify_link` already
     // exists; the gate used to 501 this route so the sqlite MCP handler
     // never ran against the empty scratch db.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return verify_http_via_store(&app, &body).await;
+        return verify_http_via_store(&app, &body, caller.as_deref()).await;
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_verify(&lock.0, &body);
+    let result = crate::mcp::handle_verify(&lock.0, &body, caller.as_deref());
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -1088,7 +1168,11 @@ pub async fn handle_verify_http(
 /// onto the MCP `memory_verify` envelope. ERRORS-01: store faults go
 /// through [`super::store_err_to_response`].
 #[cfg(feature = "sal")]
-async fn verify_http_via_store(app: &AppState, params: &Value) -> axum::response::Response {
+async fn verify_http_via_store(
+    app: &AppState,
+    params: &Value,
+    caller: Option<&str>,
+) -> axum::response::Response {
     use crate::mcp::param_names;
     use crate::store::{StoreError, VerifyFilter};
 
@@ -1133,10 +1217,19 @@ async fn verify_http_via_store(app: &AppState, params: &Value) -> axum::response
     {
         return err_response(e.to_string());
     }
+    // #3601 — a hidden endpoint answers the SAME not-found text the store's
+    // missing-link arm below renders, so the route is not an existence
+    // oracle over edges between rows the caller cannot read.
+    let sal_link_id = format!("{source_id}|{target_id}|{relation}");
+    for id in [source_id.as_str(), target_id.as_str()] {
+        if !pg_row_readable(app, caller, id).await {
+            return err_response(format!("link not found: {sal_link_id}"));
+        }
+    }
     let filter = VerifyFilter {
         source_id: None,
         target_id: None,
-        link_id: Some(format!("{source_id}|{target_id}|{relation}")),
+        link_id: Some(sal_link_id),
     };
     match app.store.verify_link(filter).await {
         Ok(report) => {

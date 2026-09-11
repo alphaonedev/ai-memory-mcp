@@ -103,7 +103,11 @@ impl McpTool for VerifyTool {
 /// - `link_id` shape doesn't match the composite form
 /// - link tuple does not exist in `memory_links`
 
-pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+pub fn handle_verify(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     // Two callable shapes:
     //   1. link_id="<src>--<rel>-->\<dst>"
     //   2. source_id=… target_id=… [relation="related_to"]
@@ -137,9 +141,33 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
     validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
         .map_err(|e| e.to_string())?;
 
+    // v1.0.0 #3601 — BOTH endpoints must be readable by the caller BEFORE the
+    // link is looked up: otherwise `link not found` vs a verdict confirms the
+    // existence of an edge between rows the caller cannot read, and the
+    // verdict discloses `observed_by` / attest facts. A hidden endpoint
+    // answers the SAME not-found text a missing link does (no existence
+    // oracle). The predicate names the row's OWN namespace (the #3549
+    // read-funnel contract); an unfetchable row is HIDDEN (fail closed).
+    // The endpoints are read UNFILTERED (`get_any`, the #3270 authz-read
+    // rule): a link whose endpoint is tombstoned / contaminated was
+    // verifiable before #3601 and stays verifiable for a caller who may read
+    // the row — the gate decides scope, never lifecycle disclosure.
+    let link_not_found = || format!("link not found: ({source_id}, {relation}, {target_id})");
+    for id in [source_id.as_str(), target_id.as_str()] {
+        let readable = match db::get_any(conn, id) {
+            Ok(Some(mem)) => {
+                crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
+            }
+            Ok(None) | Err(_) => false,
+        };
+        if !readable {
+            return Err(link_not_found());
+        }
+    }
+
     let record = db::get_link_for_verify(conn, &source_id, &target_id, &relation)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("link not found: ({source_id}, {relation}, {target_id})"))?;
+        .ok_or_else(link_not_found)?;
 
     // Decision matrix mirrors `decide_attest_level` from the H3 tests:
     //   - signature is None → unsigned, signature_verified=false
@@ -268,5 +296,93 @@ mod d1_4_985_tests {
     fn memory_verify_tool_metadata_985() {
         assert_eq!(VerifyTool::name(), "memory_verify");
         assert_eq!(VerifyTool::family(), "graph");
+    }
+}
+
+#[cfg(test)]
+mod authority_gate_3601_tests {
+    //! v1.0.0 #3601 — DENIED / ALLOWED matrix for the `memory_verify` read
+    //! gate: a triple between another owner's private rows answers the SAME
+    //! `link not found` text a missing link does; the owner gets a verdict.
+    use super::*;
+    use crate::models::{Memory, Tier};
+    use crate::storage as db;
+
+    fn fresh_conn() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    fn private_mem(title: &str, owner: &str) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "test".to_string(),
+            title: title.to_string(),
+            content: format!("body {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": owner, "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        }
+    }
+
+    fn seed_linked_pair(conn: &rusqlite::Connection, owner: &str) -> (String, String) {
+        let src = db::insert(conn, &private_mem("src", owner)).unwrap();
+        let dst = db::insert(conn, &private_mem("dst", owner)).unwrap();
+        db::create_link(conn, &src, &dst, "related_to").unwrap();
+        (src, dst)
+    }
+
+    #[test]
+    fn foreign_owner_private_triple_is_link_not_found_for_another_caller_3601() {
+        let conn = fresh_conn();
+        let (src, dst) = seed_linked_pair(&conn, "ai:alice");
+        let err = handle_verify(
+            &conn,
+            &json!({"source_id": src, "target_id": dst}),
+            Some("ai:bob"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("link not found: ({src}, related_to, {dst})"),
+            "byte-identical to the missing-link text (no existence oracle)"
+        );
+    }
+
+    #[test]
+    fn owner_gets_a_verdict_on_their_own_link_3601() {
+        let conn = fresh_conn();
+        let (src, dst) = seed_linked_pair(&conn, "ai:alice");
+        let out = handle_verify(
+            &conn,
+            &json!({"source_id": src, "target_id": dst}),
+            Some("ai:alice"),
+        )
+        .expect("owner reads the verdict");
+        assert_eq!(out["signature_verified"], false, "unsigned link: {out}");
+        assert_eq!(out["attest_level"], "unsigned");
     }
 }

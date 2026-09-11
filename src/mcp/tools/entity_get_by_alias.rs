@@ -49,6 +49,7 @@ impl McpTool for EntityGetByAliasTool {
 pub fn handle_entity_get_by_alias(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let alias = params["alias"].as_str().ok_or("alias is required")?;
     let namespace = params["namespace"]
@@ -59,15 +60,31 @@ pub fn handle_entity_get_by_alias(
         validate::validate_namespace(ns).map_err(|e| e.to_string())?;
     }
 
+    // v1.0.0 #3598 — mirror the #3232 HTTP disposition (`handlers::kg`):
+    // an alias resolves ONLY when the caller can read the BACKING entity
+    // memory (`rec.entity_id` IS that row's id — `entity_aliases` joins on
+    // it). A hidden backing row answers the SAME `found: false` envelope an
+    // unknown alias does, so the registry is not an existence oracle. The
+    // predicate names the row's OWN namespace (the #3549 read-funnel
+    // contract); an unfetchable row is HIDDEN (fail closed).
+    let backing_row_readable = |id: &str| -> bool {
+        // Unfiltered read (`get_any`, #3270): the gate is lifecycle-neutral.
+        match db::get_any(conn, id) {
+            Ok(Some(mem)) => {
+                crate::visibility::is_readable_on_query(&mem, caller, Some(mem.namespace.as_str()))
+            }
+            Ok(None) | Err(_) => false,
+        }
+    };
     match db::entity_get_by_alias(conn, alias, namespace).map_err(|e| e.to_string())? {
-        Some(rec) => Ok(json!({
+        Some(rec) if backing_row_readable(&rec.entity_id) => Ok(json!({
             "found": true,
             "entity_id": rec.entity_id,
             (field_names::CANONICAL_NAME): rec.canonical_name,
             "namespace": rec.namespace,
             "aliases": rec.aliases,
         })),
-        None => Ok(json!({
+        Some(_) | None => Ok(json!({
             "found": false,
             "entity_id": null,
             (field_names::CANONICAL_NAME): null,
@@ -96,5 +113,60 @@ mod d1_4_985_tests {
     fn memory_entity_get_by_alias_tool_metadata_985() {
         assert_eq!(EntityGetByAliasTool::name(), "memory_entity_get_by_alias");
         assert_eq!(EntityGetByAliasTool::family(), "graph");
+    }
+}
+
+#[cfg(test)]
+mod authority_gate_3598_tests {
+    //! v1.0.0 #3598 — DENIED / ALLOWED matrix for the
+    //! `memory_entity_get_by_alias` read gate: a foreign owner's private
+    //! entity answers the same `found: false` envelope an unknown alias does.
+    use super::*;
+    use crate::storage as db;
+
+    fn fresh_conn() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    fn register_private_entity(conn: &rusqlite::Connection, owner: &str) -> String {
+        db::entity_register(
+            conn,
+            "Alice Smith",
+            "team/alpha",
+            &["ally".to_string()],
+            &json!({"scope": "private"}),
+            Some(owner),
+        )
+        .expect("entity_register")
+        .entity_id
+    }
+
+    #[test]
+    fn foreign_owner_private_entity_is_not_found_for_another_caller_3598() {
+        let conn = fresh_conn();
+        register_private_entity(&conn, "ai:alice");
+        let out = handle_entity_get_by_alias(
+            &conn,
+            &json!({"alias": "ally", "namespace": "team/alpha"}),
+            Some("ai:bob"),
+        )
+        .expect("ok");
+        assert_eq!(out["found"], false, "{out}");
+        assert!(out["entity_id"].is_null(), "entity id must not leak: {out}");
+        assert!(out["namespace"].is_null(), "namespace must not leak: {out}");
+    }
+
+    #[test]
+    fn owner_resolves_their_own_entity_3598() {
+        let conn = fresh_conn();
+        let id = register_private_entity(&conn, "ai:alice");
+        let out = handle_entity_get_by_alias(
+            &conn,
+            &json!({"alias": "ally", "namespace": "team/alpha"}),
+            Some("ai:alice"),
+        )
+        .expect("ok");
+        assert_eq!(out["found"], true, "{out}");
+        assert_eq!(out["entity_id"], id);
     }
 }
