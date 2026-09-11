@@ -92,7 +92,7 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 /// embeddings) to strict (rank the pair LAST / reject the insert,
 /// with a typed [`EmbeddingDimMismatch`] in the log). Truthy set
 /// (`1`/`true`/`yes`/`on`) mirrors the `AI_MEMORY_REQUIRE_*` gates
-/// (`governance::audit::env_flag_enabled`). Default: unset ⇒
+/// (the #3200 shared grammar, [`crate::env_flag`]). Default: unset ⇒
 /// tolerant, byte-identical legacy.
 pub const ENV_REQUIRE_DIM_MATCH: &str = "AI_MEMORY_REQUIRE_DIM_MATCH";
 
@@ -106,28 +106,12 @@ pub const ENV_REQUIRE_DIM_MATCH: &str = "AI_MEMORY_REQUIRE_DIM_MATCH";
 /// Default: unset ⇒ legacy unfiltered search, byte-identical.
 pub const ENV_VECTOR_NS_ALLOWLIST: &str = "AI_MEMORY_VECTOR_NAMESPACE_ALLOWLIST";
 
-/// Shared truthy-set parse for the #1005 flags. Clone of the
-/// `governance::audit::env_flag_enabled` truthy set (the K2-gate
-/// precedent — see `identity::lineage::require_identity_lineage_enabled`)
-/// so opt-in spelling stays uniform across the require-mode surfaces.
-fn env_flag_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            let v = v.trim();
-            v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-        })
-        .unwrap_or(false)
-}
-
 /// `true` when the §5.2 namespace-allowlist recall path is enabled
 /// ([`ENV_VECTOR_NS_ALLOWLIST`]). Read per recall (cold path — one
 /// env read per request, the lineage/require-gate precedent).
 #[must_use]
 pub fn vector_ns_allowlist_enabled() -> bool {
-    env_flag_truthy(ENV_VECTOR_NS_ALLOWLIST)
+    crate::env_flag::neutral_enabled(ENV_VECTOR_NS_ALLOWLIST)
 }
 
 /// G4 strict-dim mode cache. [`cosine_distance`] sits on the graph
@@ -145,7 +129,7 @@ pub fn strict_dim_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = env_flag_truthy(ENV_REQUIRE_DIM_MATCH);
+            let on = crate::env_flag::knobs::REQUIRE_DIM_MATCH.enabled();
             STRICT_DIM_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
@@ -193,7 +177,7 @@ pub fn strict_embed_model_match_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = env_flag_truthy(ENV_REQUIRE_EMBED_MODEL_MATCH);
+            let on = crate::env_flag::knobs::REQUIRE_EMBED_MODEL_MATCH.enabled();
             STRICT_EMBED_MODEL_MATCH_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }

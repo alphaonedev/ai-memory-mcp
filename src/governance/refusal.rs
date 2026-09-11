@@ -173,12 +173,12 @@ pub const ENV_REQUIRE_GOVERNED_NAMESPACE: &str = "AI_MEMORY_PERMISSIONS_REQUIRE_
 
 /// Is the OPT-IN strict admission posture engaged? See
 /// [`ENV_REQUIRE_GOVERNED_NAMESPACE`]. Grammar is the shared house truthy
-/// set (`1` / `true` / `yes` / `on`, case-insensitive) via
-/// [`crate::governance::audit::env_flag_enabled`] — a `=yes` must never
-/// silently stay FAIL-OPEN (Fable HIGH #3133). Default UNSET = legacy Allow.
+/// set via the #3200 shared grammar ([`crate::env_flag`]) — a `=yes` must
+/// never silently stay FAIL-OPEN (Fable HIGH #3133). Default UNSET = legacy
+/// Allow.
 #[must_use]
 pub fn require_governed_namespace() -> bool {
-    crate::governance::audit::env_flag_enabled(ENV_REQUIRE_GOVERNED_NAMESPACE)
+    crate::env_flag::knobs::PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE.enabled()
 }
 
 /// The operator-facing reason carried by an ungoverned-namespace refusal.

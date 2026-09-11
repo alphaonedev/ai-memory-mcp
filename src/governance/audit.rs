@@ -1466,39 +1466,18 @@ pub const REQUIRE_CAUSE_BINDING_ENV: &str = "AI_MEMORY_REQUIRE_CAUSE_BINDING";
 /// independent of [`LAST_WATERMARKED_SEQ`].
 static LAST_WITNESSED_SEQ: AtomicI64 = AtomicI64::new(0);
 
-/// Truthy-env helper for the K2 require-mode knobs. Keeps the plain
-/// opt-in shape (default `false`), distinct from the surface-scoped
-/// [`crate::identity::attest::require_agent_attestation_for`] resolver
-/// (#1985) — these audit knobs stay permissive/withhold by default.
-///
-/// `pub(crate)` since #2106 review item 6 so the #2059/#2060 covenant
-/// gate resolvers (`crate::storage::{require_why_trace_enabled,
-/// require_immutable_authorship_enabled}`) reuse the SAME truthy grammar
-/// instead of re-implementing a third copy.
-pub(crate) fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            let v = v.trim();
-            v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-        })
-        .unwrap_or(false)
-}
-
 /// K2 — `true` when `AI_MEMORY_REQUIRE_WITNESS` is set truthy (fail-closed on
 /// a missing / unpinnable witness anchor). Default `false` (withhold posture).
 #[must_use]
 pub fn require_witness_enabled() -> bool {
-    env_flag_enabled(REQUIRE_WITNESS_ENV)
+    crate::env_flag::knobs::REQUIRE_WITNESS.enabled()
 }
 
 /// K2 — `true` when `AI_MEMORY_REQUIRE_CAUSE_BINDING` is set truthy
 /// (fail-closed on any unbound-cause row). Default `false` (withhold posture).
 #[must_use]
 pub fn require_cause_binding_enabled() -> bool {
-    env_flag_enabled(REQUIRE_CAUSE_BINDING_ENV)
+    crate::env_flag::knobs::REQUIRE_CAUSE_BINDING.enabled()
 }
 
 /// Resolve the audit-witness PRIVATE-key custody directory: the
@@ -1794,7 +1773,7 @@ static RECORDER_KEY: OnceLock<SigningKey> = OnceLock::new();
 /// K2 — `true` when `AI_MEMORY_REQUIRE_ROLE_SEPARATION` is set truthy.
 #[must_use]
 pub fn require_role_separation_enabled() -> bool {
-    env_flag_enabled(REQUIRE_ROLE_SEPARATION_ENV)
+    crate::env_flag::knobs::REQUIRE_ROLE_SEPARATION.enabled()
 }
 
 /// Resolve a role custody directory: the `dir_env` override when set +
@@ -2703,7 +2682,7 @@ const AUDIT_ROLLBACK_EVIDENCE_DECISION: &str = "rollback_evidence";
 /// Default `false` (emit-evidence-and-continue).
 #[must_use]
 pub fn require_rollback_check_enabled() -> bool {
-    env_flag_enabled(REQUIRE_ROLLBACK_CHECK_ENV)
+    crate::env_flag::knobs::REQUIRE_ROLLBACK_CHECK.enabled()
 }
 
 /// v1.0.0 #1946 A — the OSS rollback-counter binding for a witness emission at

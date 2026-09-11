@@ -96,27 +96,16 @@ pub const DEFAULT_ERASURE_DATA_SHARDS: usize = 4;
 /// Compiled default `m`.
 pub const DEFAULT_ERASURE_PARITY_SHARDS: usize = 2;
 
-/// Truthy-grammar check (`1`/`true`/`yes`/`on`, case-insensitive, trimmed) —
-/// the secure-opt-in shape shared by every erasure boolean env knob.
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
 /// Whether the erasure cold tier is enabled (default OFF — opt-in).
 #[must_use]
 pub fn erasure_cold_tier_enabled() -> bool {
-    env_truthy(ENV_ERASURE_COLD_TIER)
+    crate::env_flag::neutral_enabled(ENV_ERASURE_COLD_TIER)
 }
 
 /// Whether the DR quarantine-recovery mode is engaged (default OFF).
 #[must_use]
 pub fn recover_quarantine_enabled() -> bool {
-    env_truthy(ENV_ERASURE_RECOVER_QUARANTINE)
+    crate::env_flag::knobs::ERASURE_RECOVER_QUARANTINE.enabled()
 }
 
 /// Parse one shard-count knob: a positive integer within the codec cap

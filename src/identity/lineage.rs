@@ -81,21 +81,11 @@ pub const ZERO_PREV_HASH: [u8; 32] = [0u8; 32];
 /// `AI_MEMORY_REQUIRE_ROLE_SEPARATION` / `AI_MEMORY_REQUIRE_WITNESS`.
 pub const REQUIRE_IDENTITY_LINEAGE_ENV: &str = "AI_MEMORY_REQUIRE_IDENTITY_LINEAGE";
 
-/// `true` when [`REQUIRE_IDENTITY_LINEAGE_ENV`] is set truthy
-/// (`1`/`true`/`yes`/`on`). Clone of the
-/// `governance::audit::env_flag_enabled` truthy set so require-mode
-/// spelling is uniform across the K2-style gates.
+/// `true` when [`REQUIRE_IDENTITY_LINEAGE_ENV`] is set truthy, through the
+/// #3200 shared grammar ([`crate::env_flag`]).
 #[must_use]
 pub fn require_identity_lineage_enabled() -> bool {
-    std::env::var(REQUIRE_IDENTITY_LINEAGE_ENV)
-        .map(|v| {
-            let v = v.trim();
-            v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-        })
-        .unwrap_or(false)
+    crate::env_flag::knobs::REQUIRE_IDENTITY_LINEAGE.enabled()
 }
 
 /// Why a lineage record exists. Wire slugs are the lowercase names

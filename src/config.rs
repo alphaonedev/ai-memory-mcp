@@ -2871,7 +2871,7 @@ pub fn skip_config() -> bool {
         return false;
     };
     let as_str = raw.to_str();
-    if as_str.is_some_and(crate::security_profile::is_truthy) {
+    if as_str.is_some_and(crate::env_flag::is_truthy) {
         return true;
     }
     static WARNED: std::sync::Once = std::sync::Once::new();
@@ -5011,13 +5011,7 @@ pub const ENV_CID_ENFORCE: &str = "AI_MEMORY_CID_ENFORCE";
 /// AND-LOG only; NEVER refuses a write regardless of this flag.
 #[must_use]
 pub fn cid_enforce_enabled() -> bool {
-    std::env::var(ENV_CID_ENFORCE)
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    crate::env_flag::knobs::CID_ENFORCE.enabled()
 }
 
 /// v1.0.0 (#3113) — env knob turning the migration core-relation report
@@ -5049,15 +5043,12 @@ pub const ENV_MIGRATION_REQUIRE_CORE_TABLES: &str = "AI_MEMORY_MIGRATION_REQUIRE
 
 /// v1.0.0 (#3113) — whether a missing core relation REFUSES the schema stamp
 /// (see [`ENV_MIGRATION_REQUIRE_CORE_TABLES`]). Reads the env var directly
-/// through the shared [`crate::governance::audit::env_flag_enabled`] truthy
-/// grammar (`1` / `true` / `yes` / `on`, case-insensitive for the words):
-/// the migration ladder runs before the boot-seeded config globals exist, so
-/// a boot-seeded atomic would always read its compile-time default here.
-/// Issue #3246: this used to re-implement the same grammar inline; the SSOT
-/// does not change the documented tokens.
+/// through the #3200 shared grammar ([`crate::env_flag`]): the migration
+/// ladder runs before the boot-seeded config globals exist, so a boot-seeded
+/// atomic would always read its compile-time default here.
 #[must_use]
 pub fn migration_require_core_tables() -> bool {
-    crate::governance::audit::env_flag_enabled(ENV_MIGRATION_REQUIRE_CORE_TABLES)
+    crate::env_flag::knobs::MIGRATION_REQUIRE_CORE_TABLES.enabled()
 }
 
 /// v1.0.0 (#3172) — operator ACKNOWLEDGEMENT for a detected append-only
@@ -5079,15 +5070,14 @@ pub const ENV_ALLOW_LINEAGE_REGRESSION: &str = "AI_MEMORY_ALLOW_LINEAGE_REGRESSI
 /// v1.0.0 (#3172) — whether the operator has acknowledged an append-only
 /// lineage regression and authorised the open to proceed (resetting the mark).
 ///
-/// Read directly through the shared
-/// [`crate::governance::audit::env_flag_enabled`] truthy grammar rather than a
-/// boot-seeded global for the same reason as
+/// Read directly through the #3200 shared grammar ([`crate::env_flag`])
+/// rather than a boot-seeded global for the same reason as
 /// [`migration_require_core_tables`]: the migration ladder and the postgres
 /// connect bootstrap both run BEFORE the boot-seeded config globals exist, so a
 /// seeded atomic would always read its compile-time default at the gate.
 #[must_use]
 pub fn allow_lineage_regression() -> bool {
-    crate::governance::audit::env_flag_enabled(ENV_ALLOW_LINEAGE_REGRESSION)
+    crate::env_flag::knobs::ALLOW_LINEAGE_REGRESSION.enabled()
 }
 
 /// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.
@@ -6002,18 +5992,10 @@ impl AppConfig {
     /// 3. Compiled default (`false` — loopback rejected).
     #[must_use]
     pub fn effective_allow_loopback_webhooks(&self) -> bool {
-        if let Ok(raw) = std::env::var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS") {
-            match raw.to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => return true,
-                "0" | "false" | "no" | "off" | "" => return false,
-                other => {
-                    eprintln!(
-                        "ai-memory: AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS={other:?} is not a valid \
-                         boolean (expected 1/true/yes/on or 0/false/no/off); falling back to \
-                         config.toml"
-                    );
-                }
-            }
+        // #3200 — the shared grammar. An unrecognised token refuses boot in
+        // the pre-runtime sweep; a lazy read of one keeps the hatch CLOSED.
+        if let Some(explicit) = crate::env_flag::knobs::ALLOW_LOOPBACK_WEBHOOKS.explicit() {
+            return explicit;
         }
         self.subscriptions
             .as_ref()
@@ -8066,12 +8048,7 @@ fn enforce_api_key_file_perms(
         if mode & 0o077 != 0 {
             // Allow lax perms only when the operator explicitly opts in
             // (mirroring #1055 for AI_MEMORY_DB_PASSPHRASE_FILE).
-            let opt_in = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
-                .ok()
-                .is_some_and(|s| {
-                    let t = s.trim().to_ascii_lowercase();
-                    matches!(t.as_str(), "1" | "true" | "yes" | "on")
-                });
+            let opt_in = crate::env_flag::knobs::PASSPHRASE_FILE_ALLOW_LAX_PERMS.enabled();
             if !opt_in {
                 return Err(format!(
                     "{field} = {:?} has lax permissions \
@@ -9990,23 +9967,13 @@ impl AppConfig {
 
         // v0.9.0 G6 (#1823) — append-only spine flag, uniform ladder:
         // env (truthy/falsy wins) > `[storage].append_only` > compiled
-        // default `false` (OFF). Any non-boolean env string falls through
-        // to the config field then the default. Mirrors
-        // `resolve_compaction_enabled`.
-        let append_only = {
-            let env = std::env::var(ENV_APPEND_ONLY).ok().and_then(|v| {
-                let t = v.trim();
-                if t == "1" || t.eq_ignore_ascii_case("true") {
-                    Some(true)
-                } else if t == "0" || t.eq_ignore_ascii_case("false") {
-                    Some(false)
-                } else {
-                    None
-                }
-            });
-            env.or_else(|| cfg.and_then(|s| s.append_only))
-                .unwrap_or(false)
-        };
+        // default `false` (OFF). #3200: the env reads through the shared
+        // grammar; an unrecognised token refuses boot in the pre-runtime
+        // sweep, and a lazy read of one keeps the mandate ON.
+        let append_only = crate::env_flag::knobs::APPEND_ONLY
+            .explicit()
+            .or_else(|| cfg.and_then(|s| s.append_only))
+            .unwrap_or(false);
 
         // v0.9.0 G13-mem (#1859) — lineage-DAG flags, same truthy/falsy env
         // ladder. The master flag's compiled default is ON ("master default
