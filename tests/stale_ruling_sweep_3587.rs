@@ -209,7 +209,8 @@ fn stale_ruling_report_list_is_capped_3587() {
     let n = STALE_RULING_REPORT_TOP_N + 5;
     for i in 0..n {
         // Tag-only rulings (no key) so none is collapsed as a same-key loser.
-        seed(&conn, &["ruling"], None, json!({}), 30 + i as i64);
+        let age = 30_i64 + i64::try_from(i).unwrap_or(0);
+        seed(&conn, &["ruling"], None, json!({}), age);
     }
 
     let report = run_stale_ruling_sweep(&conn, &cfg(None, false), None).expect("sweep");
@@ -302,4 +303,56 @@ fn stale_rulings_flag_is_exclusive_and_parses_3587() {
             "--stale-rulings must conflict with {conflicting}"
         );
     }
+}
+
+/// End-to-end: the `curator --stale-rulings` one-shot drives the SAME pass
+/// through the real binary and prints the counts (the `--json` full id list
+/// included).
+#[test]
+fn stale_rulings_cli_oneshot_reports_3587() {
+    use std::io::Write as _;
+    use std::process::{Command as StdCommand, Stdio};
+
+    let dir = tempfile::Builder::new()
+        .prefix("ai-memory-3587-cli-")
+        .tempdir()
+        .expect("tempdir");
+    let db = dir.path().join("m.db");
+
+    // Seed one stale, un-superseded ruling through the library connection.
+    {
+        let conn = ai_memory::db::open(&db).expect("init");
+        seed(&conn, &["ruling"], Some("k-cli"), json!({}), 30);
+    }
+
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .arg("--db")
+        .arg(&db)
+        .arg("--agent-id")
+        .arg("test-agent-3587")
+        .args(["curator", "--stale-rulings", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ai-memory");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"")
+        .expect("close stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "curator --stale-rulings failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("--json report is JSON");
+    assert!(
+        report["stale_rulings_found"].as_u64().unwrap_or(0) >= 1,
+        "the seeded ruling must be reported: {report}"
+    );
 }

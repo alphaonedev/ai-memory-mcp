@@ -2774,7 +2774,8 @@ impl MemoryStore for SqliteStore {
         cutoff_rfc3339: &str,
         cap: usize,
     ) -> StoreResult<Vec<crate::storage::StaleRuling>> {
-        self.gate_record_stop()?;
+        // READ-ONLY: unlike `size_gc`, this is a pure SELECT, so it must NOT
+        // consult the #3175 record-stop write gate (a read is never a write).
         let conn = self.state.lock().await;
         db::list_stale_rulings(&conn, cutoff_rfc3339, cap).map_err(box_err)
     }
