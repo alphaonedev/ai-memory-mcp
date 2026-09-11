@@ -220,9 +220,9 @@ section.
 
 | Module | Was | Now | Why (U5a comment) |
 |---|---|---|---|
-| `src/storage/mod.rs` | 34_000 | **35_200** | Room for U1 `archive_as_superseded` + U2 consumers. Measured 33_848 at the bump (152 headroom under 34_000 — audit-C F12). |
-| `src/config.rs` | 15_120 | **15_500** | Room for U3 `[curator]` stale-ruling keys + U1 `[autonomy]` propose. Measured 15_028 (92 headroom under 15_120). |
-| `src/cli/install.rs` | 3_600 | **3_900** | Room for U4 `--hook capture` + Codex capture leg. Measured 3_558 (42 headroom under 3_600). |
+| `src/storage/mod.rs` | 34_000 | **35_200** | Room for U1 `archive_as_superseded` + U2 consumers. Measured 33_848 at the bump (152 headroom under 34_000 — audit-C F12). #3297 re-MEASURED **34_014** on 1880b1cc (`wc -l`; ceiling unchanged). |
+| `src/config.rs` | 15_120 | **15_500** | Room for U3 `[curator]` stale-ruling keys + U1 `[autonomy]` propose. Measured 15_028 (92 headroom under 15_120). #3297 re-MEASURED **15_213** on 1880b1cc (`wc -l`; ceiling unchanged). |
+| `src/cli/install.rs` | 3_600 | **3_900** | Room for U4 `--hook capture` + Codex capture leg. Measured 3_558 (42 headroom under 3_600). #3297 re-MEASURED **3_715** on 1880b1cc (`wc -l`; ceiling unchanged). |
 
 QUAL-6 stays **132** (`tests/qual_6_7_legacy_error_type_ceiling.rs`).
 U5a also landed `crate::models::field_names::RULING_KEY` (`"ruling_key"`)

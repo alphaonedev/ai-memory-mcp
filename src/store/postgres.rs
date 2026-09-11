@@ -12813,27 +12813,22 @@ impl PostgresStore {
         //
         // ## This changes zero answers
         //
-        // `build_find_paths_current_view_cypher` emits an `ALL(e IN
-        // relationships(p) WHERE …)` guard, and AGE 1.7.0 — the
-        // SSOT-pinned version — REJECTS that at parse time:
-        //
-        //   ERROR:  syntax error at or near "("
-        //   LINE 1: … AND ALL(e IN relationships(p) WHERE e.valid_until …
-        //
-        // Reproduced against both a scratch graph and the LIVE
-        // `memory_graph`. `ALL`/`ANY`/`NONE` are grammar keywords there,
-        // not callable functions (AGE's lexer is case-insensitive, so
-        // lowercase fails identically), and AGE 1.7 implements no list
-        // predicates, no list comprehensions and no `filter()` — the same
-        // grammar narrowing already documented on the builder. So on every
-        // AGE deployment this call ALREADY fell through: it paid BEGIN +
-        // `LOAD 'age'` + `SET LOCAL search_path` + a failing parse +
-        // rollback, logged a `warn_age_fallback_pair`, and then ran
-        // `find_paths_cte` anyway. 100% of production AGE `find_paths`
-        // results already came from the CTE; this deletes the wasted round
-        // trips and a WARN that fired on every single call (which is log
-        // noise carrying zero discriminating information — it buries the
-        // real `age_substrate_unreachable` warnings it looks like).
+        // `build_find_paths_current_view_cypher` (DELETED, #2613) emitted
+        // an `ALL(e IN relationships(p) WHERE …)` guard. On AGE **1.7.0**
+        // that was a PARSE rejection (`syntax error at or near "("`).
+        // The certified pin is now AGE **1.8.0** (`EXPECTED_AGE_VERSION`;
+        // `deploy/docker-1461/provision/lib.sh`). Re-verified #3297 on a
+        // live 1.8.0 extversion: `ALL(x IN [1,2,3] WHERE …)` and
+        // `ANY(…)` now PARSE and return; `filter(…)` still parse-rejects;
+        // the find_paths `ALL(e IN relationships(p) WHERE e.valid_until
+        // IS NULL)` still does NOT succeed — it fails at RUNTIME
+        // (`ERROR: no relation entry for relid 2`) on a seeded
+        // two-vertex graph. Capture: `docs/kg-find-paths-engine.md`.
+        // Restoring an AGE `find_paths` reader is follow-up #3609, not
+        // this path: the dispatcher stays the relational CTE on BOTH
+        // `KgBackend` values because even a PARSEABLE AGE walk is a
+        // `Seq Scan` over vertices (below). 100% of production
+        // `find_paths` answers already came from the CTE.
         //
         // ## And fixing the Cypher would be the wrong repair anyway
         //

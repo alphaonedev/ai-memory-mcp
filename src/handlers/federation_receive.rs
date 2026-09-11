@@ -3929,7 +3929,8 @@ pub async fn sync_push(
         // The caller-origin arm (#2994) screens `subject` / `body` before a
         // LOCAL signal is signed + inserted, but the RECEIVE arm had none, so a
         // credential shipped by an `off`-mode (or hostile) peer landed verbatim
-        // in this node's `signals` table and re-egressed on the next push.
+        // in this node's `signals` table (queryable here; not re-egressed
+        // on the next push — #3297).
         // REDACT-only — a refusal here would diverge replicas (#1821) — and it
         // runs AFTER the forged-signature / authorship / namespace gates above
         // so those still see exactly the bytes the peer signed. The helper

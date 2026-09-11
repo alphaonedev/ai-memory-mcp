@@ -71,8 +71,10 @@ pub struct SignableLink<'a> {
     /// RFC3339 instant the edge was recorded. Caller-supplied after
     /// #3178; attested as of #3291 so a forged timestamp fails verify.
     pub created_at: Option<&'a str>,
-    /// RFC3339 instant the link became true. Always present on writes
-    /// produced by `db::create_link` (set to "now" at insert time).
+    /// RFC3339 instant the link became true. Caller-supplied after
+    /// #3178 (the insert funnel persists the presented value; it is
+    /// NOT overwritten with "now"). `None` is a legitimate unbounded
+    /// start.
     pub valid_from: Option<&'a str>,
     /// RFC3339 instant the link was invalidated, or `None` if still
     /// valid. Almost always `None` at insert time; set later by

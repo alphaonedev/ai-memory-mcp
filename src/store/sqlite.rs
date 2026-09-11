@@ -231,13 +231,18 @@ fn link_owner_of(m: &Memory) -> String {
 /// a bare `rusqlite::Connection` never reach it, and their posture is
 /// whatever their own call site applies. `mcp::tools::delete` re-applies
 /// this very same lenient [`crate::visibility::caller_owns_for_mutation`]
-/// predicate before `db::delete`, so it matches this arm exactly; the
-/// `mcp::tools::store::synthesis` merge (`db::update` / `db::delete` over
-/// `db::find_synthesis_candidates`) applies no per-row owner check at all
-/// and is scoped by NAMESPACE alone. That split is recorded here
-/// deliberately — a SAL gate cannot cover a caller that never constructs a
-/// store — so a future reader does not mistake this arm for a whole-crate
-/// chokepoint.
+/// predicate before `db::delete`, so it matches this arm exactly. The
+/// `mcp::tools::store::synthesis` merge still bypasses this SAL arm
+/// (bare `rusqlite::Connection`, never a `SqliteStore`) — but #3173
+/// closed the owner-check gap **on that MCP path**: it filters
+/// `db::find_synthesis_candidates` to rows the caller may mutate
+/// before the curator sees them, and re-checks ownership at every
+/// `update`/`delete` verdict (refuse, never silent skip). The
+/// candidate probe itself stays NAMESPACE-scoped; the gate is the
+/// MCP caller, not this adapter. That split is recorded here
+/// deliberately — a SAL gate cannot cover a caller that never
+/// constructs a store — so a future reader does not mistake this arm
+/// for a whole-crate chokepoint.
 ///
 /// SEMANTICS — deliberately sqlite's OWN contract, not postgres's.
 /// This delegates to the canonical, shared

@@ -40,11 +40,13 @@ choice. Switch to postgres+AGE when one or more of these is true:
 - **Larger than RAM.** sqlite + HNSW keeps the full vector index in
   memory. pgvector's HNSW lives on disk and pages on demand —
   practical for 10M+ memory corpora.
-- **AGE Cypher KG.** ai-memory's KG operations (`kg_query`,
-  `kg_timeline`, `kg_invalidate`, `find_paths`) compile to native
-  Cypher on AGE, which beats the sqlite recursive-CTE fallback by
-  ≥30% at depth=5 on the canonical 1k-entity / 5k-edge corpus
-  (S76 perf gate). The deeper the graph, the wider the gap.
+- **AGE Cypher KG.** ai-memory's KG operations `kg_query`,
+  `kg_timeline`, and `kg_invalidate` compile to native Cypher on AGE
+  (with recursive-CTE fallback when the extension is absent).
+  `find_paths` is **not** AGE Cypher: it is the relational recursive-CTE
+  (bounded BFS) on both backends (#2582 / #3297), even when
+  `KgBackend::Age` is engaged. The AGE-vs-CTE ≥30% depth=5 comparison
+  (S76) applies to `kg_query`, not to `find_paths`.
 - **Multi-daemon A2A.** Two or more `ai-memory serve` processes
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
@@ -709,7 +711,7 @@ and sqlite-backed daemons project byte-identical wire shapes.
 | HTTP method | Path | SAL dispatch |
 |---|---|---|
 | `POST` | `/api/v1/quota/status` | `MemoryStore::quota_status(agent_id)` (single-agent) or `MemoryStore::quota_status_list()` (operator-facing list). Postgres reads from the `agent_quotas` table directly — no fallthrough to the empty scratch sqlite. Auto-inserts the default row on first call. Body `{agent_id?, namespace?}`; returns the canonical `QuotaStatus` projection (`max_memories_per_day`, `max_storage_bytes`, `max_links_per_day`, `current_*`, `day_started_at`, ...). |
-| `POST` | `/api/v1/kg/find_paths` | `MemoryStore::find_paths(source, target, max_depth?, max_results?)`. SQLite uses the recursive CTE in `db::find_paths`; Postgres dispatches AGE Cypher when the extension is installed and falls back to a SQL recursive CTE otherwise. Body `{source_id, target_id, max_depth?, max_results?}`; returns `{paths: [[id, ...], ...], count, source_id, target_id}`. 422 when `max_depth` exceeds the supported ceiling. |
+| `POST` | `/api/v1/kg/find_paths` | `MemoryStore::find_paths(source, target, max_depth?, max_results?)`. Relational recursive-CTE (bounded BFS) on **both** SQLite (`db::find_paths`) and Postgres (`find_paths_cte`) — including when Apache AGE is installed. Not an AGE Cypher walk (#2582 / #3297). Body `{source_id, target_id, max_depth?, max_results?}`; returns `{paths: [[id, ...], ...], count, source_id, target_id}`. 422 when `max_depth` exceeds the supported ceiling. |
 | `POST` | `/api/v1/links/verify` | `MemoryStore::verify_link(VerifyFilter)`. Resolves the `(source, target?, relation?)` triple from the body and re-verifies the canonical-CBOR signature against the enrolled peer key when one is present. Body `{source_id?, target_id?, link_id?}` — at least one of `source_id` or `link_id` is required (`link_id` format is `source_id|target_id|relation`). Returns `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
 
 #### Phase 20 — full governance pipeline
@@ -1183,12 +1185,12 @@ recommendation; the v0.7.0 release does not yet expose these as
 The four KG operations dispatch on the `KgBackend` tag the postgres
 adapter probes at connect time:
 
-| Op | AGE 1.8.0 (Cypher) | CTE fallback | Speedup at depth=5 |
+| Op | AGE 1.8.0 (executed engine) | CTE / other | Speedup at depth=5 |
 |---|---|---|---|
-| `kg_query` | `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join | ≥30% (S76 gate) |
-| `kg_timeline` | `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join | ≥30% |
-| `kg_invalidate` | `MATCH ... SET valid_until = $1` | `UPDATE memory_links` | parity |
-| `find_paths` | `MATCH p = shortestPath((a)-[*1..d]->(b))` | recursive CTE with cycle detection | 2-5× at depth=5+ |
+| `kg_query` | AGE Cypher `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join (fallback) | ≥30% (S76 gate) |
+| `kg_timeline` | AGE Cypher `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join (fallback) | ≥30% |
+| `kg_invalidate` | AGE Cypher `MATCH ... SET valid_until = $1` | `UPDATE memory_links` (fallback) | parity |
+| `find_paths` | **relational recursive-CTE (bounded BFS) on both `KgBackend` values** — not AGE Cypher (#2582 / #3297) | (this **is** the production engine) | n/a (no AGE walk) |
 
 The S76 perf gate fires if AGE is reported as engaged but the AGE p95
 is **not** at least 30% faster than CTE p95 on the canonical 1k-entity
@@ -1420,7 +1422,8 @@ parity test is the gate that prevents it.
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |
-| `kg_query` / `kg_timeline` / `kg_invalidate` / `find_paths` | CTE | AGE Cypher (CTE fallback) — sqlite-bound HTTP handlers in v0.7.0; trait routing in v0.7.x |
+| `kg_query` / `kg_timeline` / `kg_invalidate` | CTE | AGE Cypher (CTE fallback) — sqlite-bound HTTP handlers in v0.7.0; trait routing in v0.7.x |
+| `find_paths` | CTE (bounded BFS) | **relational CTE on both backends** (not AGE Cypher — #2582 / #3297) |
 | HTTP CRUD on SAL trait (Wave-3 subset) | ✓ | ✓ (8 endpoints — see table above) |
 | HTTP read paths (agents/stats/namespaces/taxonomy/archive/entities/inbox/subs) | ✓ | ✓ (Wave-3 Continuation — Phase 4 + 5) |
 | HTTP KG handlers (kg_query/kg_timeline/kg_invalidate) | ✓ | ✓ (Wave-3 Continuation — Phase 5) |

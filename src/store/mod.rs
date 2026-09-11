@@ -1427,10 +1427,12 @@ pub trait MemoryStore: Send + Sync {
     /// non-overriding adapter would have reported a batch outcome that did
     /// not describe what durably landed (the #2551/#2588 write-truthfulness
     /// class, one layer down). An adapter that cannot honour the atomicity
-    /// contract must say so, not approximate it. `SqliteStore` deliberately
-    /// does NOT implement it: sqlite's bulk ingest is
-    /// `handlers::bulk::bulk_create_sqlite` over the transactional
-    /// `crate::storage` funnel, which never routes through the SAL batch.
+    /// contract must say so, not approximate it. Both production adapters
+    /// override this (`SqliteStore` since #3181 via a `WriteTxn` around
+    /// the same `db::insert` funnel per row; `PostgresStore` inline).
+    /// HTTP sqlite bulk ingest (`handlers::bulk::bulk_create_sqlite`)
+    /// still uses the transactional `crate::storage` funnel and does
+    /// not route through this SAL method.
     async fn store_batch(
         &self,
         _ctx: &CallerContext,
