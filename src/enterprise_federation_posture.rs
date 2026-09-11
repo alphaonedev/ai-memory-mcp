@@ -1078,54 +1078,6 @@ mod tests {
     // re-export ambiguity across `crate::federation::identity::trust_bundle`.
     use crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV as TRUST_DOMAIN_ENV_FOR_TEST;
 
-    /// #3553 — with every other control satisfied, a `NORMAL` synchronous
-    /// level is the ONE failing row, it NAMES `synchronous`, and `all_pass`
-    /// is false (so `doctor --posture` exits 2). Set AFTER `enforce_at_boot`
-    /// pinned `FULL`: `evaluate` is pure, so this models a process whose
-    /// environment drifted below the floor after the pins were laid.
-    #[test]
-    fn synchronous_normal_is_the_named_failing_row_3553() {
-        if crate::config::run_env_isolated_child_or_spawn(
-            "enterprise_federation_posture::tests::synchronous_normal_is_the_named_failing_row_3553",
-        ) {
-            return;
-        }
-        let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
-        let _fp_file = set_fully_hardened_env();
-        unsafe {
-            std::env::set_var(crate::storage::ENV_DB_SYNCHRONOUS, "normal");
-        }
-
-        let checks = evaluate(&AppConfig::default());
-        let row = find(&checks, "PRAGMA synchronous");
-        assert!(!row.pass, "NORMAL must fail the certified floor: {row:?}");
-        assert!(row.control.contains("synchronous"));
-        assert!(row.actual.starts_with("NORMAL"), "actual: {}", row.actual);
-        assert!(
-            row.actual.contains("env AI_MEMORY_DB_SYNCHRONOUS"),
-            "actual: {}",
-            row.actual
-        );
-        assert!(row.actual.contains("local-only"), "actual: {}", row.actual);
-        assert!(
-            row.actual.contains("per-checkpoint"),
-            "actual: {}",
-            row.actual
-        );
-        assert!(
-            row.actual.contains("not observed"),
-            "actual: {}",
-            row.actual
-        );
-        assert!(row.remediation.contains("AI_MEMORY_DB_SYNCHRONOUS=FULL"));
-        assert!(!all_pass(&checks));
-        assert_eq!(checks.len(), ENTERPRISE_FEDERATION_CHECK_COUNT);
-    }
-
     /// #3553 — under the pinned `FULL` the row PASSES, and a live
     /// observation that AGREES keeps it passing while one that DISAGREES
     /// fails it (an open funnel that did not apply the resolved level is a

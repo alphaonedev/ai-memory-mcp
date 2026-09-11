@@ -1920,6 +1920,37 @@ fn section_identity_3147(
     }
 }
 
+/// v1.0.0 #3553 — the Storage section's durability escalation, as a PURE
+/// decision so it is testable without touching the process environment
+/// (the #3475 / #3523 env-mutation ratchets). `Some(note)` means CRITICAL:
+/// either the live pragma disagrees with the level the open funnel was
+/// meant to apply (a funnel defect regardless of posture), or a hardened /
+/// certified posture is engaged while the level sits below the certified
+/// `FULL` floor. `None` under `standard` — `NORMAL` IS inside the envelope
+/// as `local-only` with its RPO declared (standard §0.1).
+fn synchronous_escalation(
+    live: crate::storage::SynchronousLevel,
+    resolved: crate::storage::SynchronousLevel,
+    certified_posture: bool,
+) -> Option<String> {
+    if live != resolved {
+        return Some(format!(
+            "live PRAGMA synchronous={live} DISAGREES with the resolved level {resolved} — the \
+             open funnel did not apply it (defect; report it)"
+        ));
+    }
+    if certified_posture && !live.meets_certified_floor() {
+        return Some(format!(
+            "hardened / certified posture engaged but synchronous={live} is below the \
+             certified floor (FULL): acknowledged commits are durable only to the last WAL \
+             checkpoint on power loss. Set {}=FULL (asi-hard pins it); see PERFORMANCE.md, \
+             Power-loss durability",
+            crate::storage::ENV_DB_SYNCHRONOUS
+        ));
+    }
+    None
+}
+
 fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection {
     let mut facts = Vec::new();
     let mut severity = Severity::Info;
@@ -2048,28 +2079,11 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
                 FACT_RPO_ON_POWER_LOSS.into(),
                 live.rpo_on_power_loss().into(),
             ));
-            if live != resolved.level {
+            if let Some(escalation) =
+                synchronous_escalation(live, resolved.level, certified_posture)
+            {
                 severity = Severity::Critical;
-                append_note(
-                    &mut note,
-                    &format!(
-                        "live PRAGMA synchronous={live} DISAGREES with the resolved level \
-                         {} — the open funnel did not apply it (defect; report it)",
-                        resolved.level
-                    ),
-                );
-            } else if certified_posture && !live.meets_certified_floor() {
-                severity = Severity::Critical;
-                append_note(
-                    &mut note,
-                    &format!(
-                        "hardened / certified posture engaged but synchronous={live} is below \
-                         the certified floor (FULL): acknowledged commits are durable only \
-                         to the last WAL checkpoint on power loss. Set {}=FULL (asi-hard \
-                         pins it); see PERFORMANCE.md, Power-loss durability",
-                        crate::storage::ENV_DB_SYNCHRONOUS
-                    ),
-                );
+                append_note(&mut note, &escalation);
             }
         }
         Err(e) => {
@@ -4147,35 +4161,29 @@ mod tests {
         );
     }
 
-    /// v1.0.0 #3553 — the hardened profile engaged while the live level is
-    /// below the certified floor is CRITICAL and the note names the knob.
-    /// Exercised at the section level (a booted `asi-hard` daemon cannot
-    /// occupy this state because `enforce_at_boot` pins FULL, but `doctor`
-    /// is an observer and must report a drifted process honestly).
+    /// v1.0.0 #3553 — the escalation decision, exercised as a pure function
+    /// (no env mutation): a funnel disagreement is CRITICAL under any
+    /// posture; below-floor is CRITICAL only when a hardened / certified
+    /// posture is engaged and names the knob; NORMAL under `standard` is not
+    /// escalated. (A BOOTED asi-hard daemon cannot occupy the below-floor
+    /// state — `enforce_at_boot` pins FULL — but `doctor` is an observer and
+    /// must report a drifted process honestly.)
     #[test]
-    fn storage_section_is_critical_below_floor_under_asi_hard_3553() {
-        if crate::config::run_env_isolated_child_or_spawn(
-            "cli::doctor::tests::storage_section_is_critical_below_floor_under_asi_hard_3553",
-        ) {
-            return;
-        }
-        let _lock = crate::test_support::env_lock();
-        let profile =
-            crate::test_support::EnvGuard::capture(crate::security_profile::ENV_SECURITY_PROFILE);
-        let sync = crate::test_support::EnvGuard::capture(crate::storage::ENV_DB_SYNCHRONOUS);
-        sync.unset();
-        profile.set("asi-hard");
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("doctor-3553.db");
-        drop(crate::db::open(&path).expect("create"));
-        let conn = crate::db::open_existing_read_only(&path).expect("read-only reopen");
-
-        let section = section_storage(&conn, &path);
-        assert_eq!(fact(&section, FACT_SYNCHRONOUS), "NORMAL");
-        assert_eq!(section.severity, Severity::Critical, "{:?}", section.facts);
-        let note = section.note.clone().unwrap_or_default();
-        assert!(note.contains("below"), "{note}");
-        assert!(note.contains(crate::storage::ENV_DB_SYNCHRONOUS), "{note}");
+    fn synchronous_escalation_matrix_3553() {
+        use crate::storage::SynchronousLevel as L;
+        assert_eq!(synchronous_escalation(L::Normal, L::Normal, false), None);
+        assert_eq!(synchronous_escalation(L::Full, L::Full, true), None);
+        assert_eq!(synchronous_escalation(L::Extra, L::Extra, true), None);
+        let below = synchronous_escalation(L::Normal, L::Normal, true).expect("critical");
+        assert!(below.contains("below"), "{below}");
+        assert!(
+            below.contains(crate::storage::ENV_DB_SYNCHRONOUS),
+            "{below}"
+        );
+        let drift = synchronous_escalation(L::Full, L::Normal, false).expect("critical");
+        assert!(drift.contains("DISAGREES"), "{drift}");
+        let drift_hard = synchronous_escalation(L::Normal, L::Full, true).expect("critical");
+        assert!(drift_hard.contains("DISAGREES"), "{drift_hard}");
     }
 
     #[test]
