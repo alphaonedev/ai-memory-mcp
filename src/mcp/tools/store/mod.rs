@@ -57,6 +57,8 @@ pub use self::validation::OnConflict as OnConflictMode;
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct StoreRequest {
+    /// Keyed supersession (#3587): `true` lets an admin-allowlisted hardened
+    /// principal supersede a predecessor owned by another agent. Default `false`.
     #[serde(default)]
     pub as_admin: Option<bool>,
     /// Short title

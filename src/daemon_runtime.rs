@@ -12016,7 +12016,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_dispatch_resolve_command() {
-        // Seed two memories, then resolve one as superseding the other.
+        // #3587: dispatch reaches cmd_resolve, which refuses a caller without a
+        // hardened principal and leaves both rows live (success paths:
+        // tests/cli_resolve_unit_3587.rs + tests/supersession_surfaces_3587.rs).
         let _g = no_config_env();
         let env = TestEnv::fresh();
         let id_a = crate::cli::test_utils::seed_memory(&env.db_path, "ns", "old", "old fact");
@@ -12031,7 +12033,18 @@ mod tests {
             &id_b,
         ])
         .unwrap();
-        run(cli, &cfg, None).await.unwrap();
+        let err = run(cli, &cfg, None).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("supersession refused"),
+            "{err:#}"
+        );
+        let conn = crate::db::open(&env.db_path).unwrap();
+        for id in [&id_a, &id_b] {
+            assert!(
+                crate::db::get(&conn, id).unwrap().is_some(),
+                "{id} archived"
+            );
+        }
     }
 
     #[tokio::test]

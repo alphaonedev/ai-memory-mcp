@@ -1775,9 +1775,16 @@ mod d1_6_987_tests {
     /// `tests/snapshots/tools_list_*.json` profiles.
     const PROPERTY_ADDITIONS: &[(&str, &[&str])] = &[
         // #2258 — bitemporal validity on the write schema.
+        // #3587 — `as_admin`: the handler honours it on keyed supersession.
         (
             "memory_store",
-            &["valid_from", "valid_until", "citations", "source_span"],
+            &[
+                "valid_from",
+                "valid_until",
+                "citations",
+                "source_span",
+                "as_admin",
+            ],
         ),
         // #3011 — optional signal TTL, wiring `signals.expires_at`.
         ("memory_signal_send", &["ttl_secs"]),
