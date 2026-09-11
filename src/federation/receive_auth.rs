@@ -857,22 +857,11 @@ pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_N
 /// ruling `9e9c3cf2` condition 7). An explicit falsy token
 /// (`0`/`false`/`no`/`off`) is the staged-rollout opt-out.
 ///
-/// **This knob CANNOT brick zero-config federation**, because the gate that
-/// reads it is itself gated on [`PeerAttestationConfig::has_allowlist`]: with
-/// no `AI_MEMORY_FED_PEER_ATTESTATION` configured the check never runs. Its
-/// entire blast radius is ONE config shape — the operator wrote the peer JSON,
-/// enrolled this peer, and left `allowed_namespaces` empty/absent (it is
-/// `#[serde(default)]`, so an omitted field silently yields `[]`).
-///
-/// **That claim is STRUCTURALLY ENFORCED, not merely asserted (#2497).**
-/// [`layer2_unscoped_peer_authorized`] refuses the header-absent and
-/// not-in-a-non-empty-allowlist shapes UNCONDITIONALLY, before it consults this
-/// knob at all — see [`peer_enrolled_in_allowlist`] for the shape table and the
-/// regression that skipping that split caused (a falsy knob plus
-/// `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1` briefly granted an ANONYMOUS peer
-/// unbounded federated delete-by-id). An operator who wants an unlisted peer
-/// admitted removes the allowlist (zero-config, which short-circuits earlier) or
-/// enrolls the peer; this knob is never that lever.
+/// #3582: absent allowlists also refuse under this default-on requirement.
+/// With a configured allowlist, anonymous and unknown peers remain refused
+/// unconditionally; the opt-out only relaxes an enrolled peer's empty scope.
+/// With no allowlist, an explicit Standard-posture opt-out preserves legacy
+/// replication. `asi-hard` pins this requirement on.
 ///
 /// ## AVAILABILITY NOTE — a falsy value is NOT a general rollout hatch (#2497)
 ///
@@ -887,7 +876,8 @@ pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_N
 ///
 /// The remedy is to make the peer IDENTIFIABLE (enroll it, `["**"]` for a
 /// deliberate per-peer allow-all) or to remove the allowlist entirely for the
-/// zero-config posture. Note that for a header-LESS push "enroll the peer" is
+/// zero-config posture AND explicitly opt out of the scope requirement. For a
+/// header-LESS push, "enroll the peer" is
 /// not an actionable remedy at all: a per-peer scope cannot be applied to a peer
 /// that cannot be identified.
 ///
@@ -935,7 +925,8 @@ pub fn peer_declares_namespace_scope(
 ///
 /// The sibling of [`peer_declares_namespace_scope`], and the predicate that
 /// separates the ONE peer shape [`require_push_namespace_scope_enabled`]
-/// governs from the two it must NEVER govern.
+/// governs WITHIN a configured allowlist from the two it must NEVER govern.
+/// The absent-allowlist decision is separate (#3582).
 ///
 /// # Why this exists (the #2497 regression it closes)
 ///
@@ -961,8 +952,8 @@ pub fn peer_declares_namespace_scope(
 /// to that gate and neither is caught there.
 ///
 /// An operator who genuinely wants an unlisted peer admitted removes the
-/// allowlist (the zero-config posture, which short-circuits before Layer 2) or
-/// enrolls the peer — never a knob whose documented scope is a different shape.
+/// allowlist AND explicitly opts out of the scope requirement in Standard
+/// posture, or enrolls the peer. A configured allowlist always remains binding.
 #[must_use]
 pub fn peer_enrolled_in_allowlist(
     peer_id: Option<&str>,
@@ -990,9 +981,8 @@ pub fn peer_enrolled_in_allowlist(
 /// #2488 — makes the gate UNREACHABLE for exactly the peer shapes Layer 2 was
 /// written to refuse (enrolled-unscoped, header-absent), because those are the
 /// shapes for which it returns `false`. The correct structure is
-/// `if attest_cfg.has_allowlist() { let stored = if needs { probe()? } else { None };
-/// verdict(stored) }` — the enrolled posture gates, this predicate only elides
-/// the read whose answer cannot change the verdict.
+/// to call [`inbound_namespace_gate_enabled`] before the verdict; this predicate
+/// only elides the read whose answer cannot change the verdict.
 #[must_use]
 pub fn inbound_write_needs_existing_namespace(
     peer_id: Option<&str>,
@@ -1138,6 +1128,32 @@ pub fn peer_scope_is_allow_all(
 /// following the [`CAUSE_UNENROLLED_AUTHOR_STRICT`] precedent.
 pub const CAUSE_NAMESPACE_PROBE_UNRESOLVABLE: &str = "namespace_probe_unresolvable";
 
+/// Whether a namespace mutation must reach the shared authorization helpers.
+/// The read-elision predicate remains separate: no allowlist needs no row probe,
+/// but still requires a refusal when namespace scope is required (#3582).
+#[must_use]
+pub fn inbound_namespace_gate_enabled(
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    require_push_namespace_scope: bool,
+) -> bool {
+    attest_cfg.has_allowlist() || require_push_namespace_scope
+}
+
+/// One absent-allowlist decision for memory, by-id, and governance mutations.
+fn unconfigured_namespace_authorized(lane: &str, require_push_namespace_scope: bool) -> bool {
+    if !require_push_namespace_scope {
+        return true;
+    }
+    tracing::warn!(
+        target: crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET,
+        "sync_push: refusing federated {lane} entry — namespace scope is required \
+         but AI_MEMORY_FED_PEER_ATTESTATION has no allowlist (#3582). Configure \
+         the peer's allowed_namespaces; legacy replication requires the explicit \
+         Standard-posture AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 opt-out."
+    );
+    false
+}
+
 /// #2447 (CWE-284, security-high) — namespace confinement for an inbound
 /// relayed MEMORY write, shared verbatim by the sqlite (`sync_push`) and
 /// postgres (`sync_push_via_store`) receive loops so both backends behave
@@ -1174,16 +1190,11 @@ pub const CAUSE_NAMESPACE_PROBE_UNRESOLVABLE: &str = "namespace_probe_unresolvab
 ///
 /// ## Two composed layers (the #1843 shape)
 ///
-/// **Both layers are gated on [`PeerAttestationConfig::has_allowlist`] first**,
-/// exactly like [`resolve_inbound_attribution`]'s and
-/// [`signal_author_authorized`]'s Layer 1: with no
-/// `AI_MEMORY_FED_PEER_ATTESTATION` configured, the ZERO-CONFIG posture, this
-/// function is a no-op and replication is byte-identical to pre-#2447. Calling
-/// [`crate::federation::peer_attestation::namespace_allowed`] verbatim (as the
-/// #1934 delete lane does) would instead have returned `false` for every
-/// zero-config push — a silent, total federation outage — because its
-/// `scope_for(peer) == None` arm falls through to `sync_trust_peer_bypass()`,
-/// which is `false` unless the operator opted out of #239 entirely.
+/// #3582: no allowlist is a refusal while the default-on namespace-scope
+/// requirement is enabled. Legacy replication requires an explicit Standard
+/// posture opt-out (`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0`).
+/// A configured-but-broken allowlist still fails closed independently of that
+/// opt-out, through the existing enrollment checks below.
 ///
 /// - **Layer 1 (always-on, no knob)** — the peer DECLARED a non-empty
 ///   `allowed_namespaces` ([`peer_declares_namespace_scope`]). Both the claimed
@@ -1223,9 +1234,9 @@ pub fn inbound_write_namespace_authorized(
     use crate::federation::peer_attestation::namespace_allowed;
     use crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET;
 
-    // Zero-config: byte-identical faith-based replication (see the doc above).
+    // #3582: absent authorization config must not bypass the scope requirement.
     if !attest_cfg.has_allowlist() {
-        return true;
+        return unconfigured_namespace_authorized(lane, require_push_namespace_scope);
     }
 
     // Layer 1 — enforce the scope the operator actually declared.
@@ -1314,8 +1325,9 @@ fn layer2_unscoped_peer_authorized(
              AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE governs only an ENROLLED peer \
              that declared no allowed_namespaces, never an anonymous or unenrolled \
              one. Enroll the peer in AI_MEMORY_FED_PEER_ATTESTATION (with a real \
-             scope, or [\"**\"] for a deliberate per-peer allow-all), or remove the \
-             allowlist entirely for the zero-config posture."
+             scope, or [\"**\"] for a deliberate per-peer allow-all). A Standard-posture \
+             legacy rollout requires removing the allowlist AND explicitly setting \
+             AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0."
         );
         return false;
     }
@@ -1392,10 +1404,9 @@ pub fn inbound_by_id_namespace_authorized(
     peer_id: Option<&str>,
     require_push_namespace_scope: bool,
 ) -> bool {
-    // Zero-config: byte-identical faith-based replication (see the doc on
-    // `inbound_write_namespace_authorized`).
+    // Same absent-allowlist decision as every other namespace mutation lane.
     if !attest_cfg.has_allowlist() {
-        return true;
+        return unconfigured_namespace_authorized(lane, require_push_namespace_scope);
     }
     match stored_namespace {
         // Layer 1 is (or may be) armed and the caller resolved the row — the
@@ -1503,11 +1514,10 @@ pub fn inbound_by_id_namespace_authorized(
 ///
 /// ## Zero-config
 ///
-/// Short-circuits on [`PeerAttestationConfig::has_allowlist`] exactly like every
-/// sibling lane, so a node with no `AI_MEMORY_FED_PEER_ATTESTATION` replicates
-/// governance standards byte-identically to pre-#2479. Callers MUST ALSO wrap the
-/// call in that same predicate (the #2491 lesson is that a gate which runs
-/// unconditionally is how a lane goes silently dark).
+/// Without an allowlist, the default-on scope requirement refuses mutation.
+/// Only the explicit Standard-posture opt-out preserves legacy replication.
+/// Callers must run this gate when either an allowlist exists OR the scope
+/// requirement is enabled, using [`inbound_namespace_gate_enabled`].
 ///
 /// [`PeerAttestationConfig::has_allowlist`]: crate::federation::peer_attestation::PeerAttestationConfig::has_allowlist
 ///
@@ -1525,9 +1535,9 @@ pub fn inbound_namespace_meta_authorized(
 ) -> bool {
     use crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET;
 
-    // Zero-config: byte-identical faith-based replication.
+    // Same absent-allowlist decision, including the global standard.
     if !attest_cfg.has_allowlist() {
-        return true;
+        return unconfigured_namespace_authorized(lane, require_push_namespace_scope);
     }
 
     // Amendment E — before, and independent of, the layered verdict.
@@ -1811,17 +1821,15 @@ mod tests {
         unsafe { std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV) };
     }
 
-    /// #2447 — the pure verdict, exercised without any HTTP/DB plumbing. The
-    /// zero-config arm is the load-bearing one: a verbatim `namespace_allowed`
-    /// call would return `false` here and silently black-hole every inbound
-    /// memory on an unconfigured deployment.
+    /// #2447/#3582 — absent allowlists refuse required scope; configured
+    /// scopes still enforce both claimed and stored namespaces.
     #[test]
     fn inbound_write_namespace_verdict_layers() {
         use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
 
         let zero_config = PeerAttestationConfig::default();
         assert!(
-            inbound_write_namespace_authorized(
+            !inbound_write_namespace_authorized(
                 "memories",
                 "id-1",
                 "secure/ops",
@@ -1830,7 +1838,7 @@ mod tests {
                 Some("peer-1"),
                 true,
             ),
-            "zero-config must be byte-identical to pre-#2447 even under the knob"
+            "#3582: required namespace scope refuses without an allowlist"
         );
 
         let mut scoped = PeerAttestationConfig::default();
@@ -1991,15 +1999,12 @@ mod tests {
     fn inbound_by_id_verdict_option_contract_2488() {
         use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
 
-        // ZERO-CONFIG — #2491. A verbatim `namespace_allowed` call returns false
-        // here (its `scope_for == None` arm falls through to the default-off
-        // `sync_trust_peer_bypass`), which is exactly the silent
-        // delete-replication outage. The verdict must short-circuit to `true`
-        // regardless of whether the caller resolved a namespace.
+        // #3582: required scope refuses absent configuration whether or not
+        // the caller resolved a stored namespace.
         let zero_config = PeerAttestationConfig::default();
         for stored in [None, Some("secure/ops")] {
             assert!(
-                inbound_by_id_namespace_authorized(
+                !inbound_by_id_namespace_authorized(
                     LANE_DELETIONS,
                     "id-1",
                     stored,
@@ -2007,7 +2012,7 @@ mod tests {
                     Some("peer-1"),
                     true,
                 ),
-                "zero-config must replicate the deletion (#2491), stored={stored:?}"
+                "#3582: required namespace scope refuses without an allowlist"
             );
         }
 
@@ -2139,12 +2144,11 @@ mod tests {
             }
         }
 
-        // And the ZERO-CONFIG posture is untouched by all of that: with no
-        // allowlist configured, a header-absent push still replicates (that is
-        // #2491, and it must not be re-broken by the #2497 tightening).
+        // #3582: removing the allowlist cannot bypass required scope,
+        // regardless of the header shape.
         for peer in [None, Some("peer-not-enrolled")] {
             assert!(
-                inbound_by_id_namespace_authorized(
+                !inbound_by_id_namespace_authorized(
                     LANE_DELETIONS,
                     "id-1",
                     None,
@@ -2152,8 +2156,7 @@ mod tests {
                     peer,
                     true,
                 ),
-                "#2491: zero-config replicates regardless of the peer header — the \
-                 #2497 tightening applies ONLY under an enrolled posture. peer={peer:?}"
+                "#3582: required namespace scope refuses without an allowlist"
             );
         }
     }

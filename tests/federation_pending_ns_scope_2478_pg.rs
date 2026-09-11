@@ -643,3 +643,197 @@ async fn federated_pending_cannot_clobber_decided_row_on_postgres_2529() {
         "the local decision must survive the replay: {report}"
     );
 }
+
+/// #3582: the same four postures as the SQLite twin, under this binary's async
+/// env lock. The trust-peer bypass remains absent in every case.
+fn set_required_scope_posture(root: &str, scoped: bool, require: Option<&str>) {
+    set_scoped_posture(root);
+    // SAFETY: all callers hold FED_ENV_LOCK; this binary serializes env users.
+    unsafe {
+        if !scoped {
+            std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+        }
+        match require {
+            Some(value) => std::env::set_var(
+                ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                value,
+            ),
+            None => std::env::remove_var(
+                ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            ),
+        }
+    }
+}
+
+fn pending_store_entry_3582(id: &str, namespace: &str) -> Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    json!({
+        "id": id,
+        "action_type": "store",
+        "memory_id": null,
+        "namespace": namespace,
+        "payload": {
+            "id": uuid::Uuid::new_v4().to_string(),
+            "tier": "long",
+            "namespace": namespace,
+            "title": uniq("3582-pending-store"),
+            "content": "namespace authorization persistence control",
+            "tags": [], "priority": 5, "confidence": 1.0, "source": "api",
+            "access_count": 0, "created_at": now, "updated_at": now,
+            "metadata": {"agent_id": PEER_ID},
+            "reflection_depth": 0, "memory_kind": "observation"
+        },
+        "requested_by": PEER_ID, "requested_at": now, "status": "pending",
+        "decided_by": null, "decided_at": null, "approvals": []
+    })
+}
+
+/// Full persisted row snapshot, including votes and decision attribution.
+async fn pending_snapshot_3582(pool: &sqlx::PgPool, id: &str) -> Option<Value> {
+    sqlx::query_scalar("SELECT to_jsonb(p) FROM pending_actions p WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read full pending row")
+}
+
+#[tokio::test]
+async fn required_scope_pending_pair_postures_on_postgres_3582() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+    let approver = uniq("ai:approver-3582-pair");
+    register_approver(&store, &approver).await;
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        let root = uniq("pending-3582-pair");
+        let namespace = format!("{root}/ok");
+        set_required_scope_posture(&root, scoped, require);
+        let pid = uuid::Uuid::new_v4().to_string();
+        let entry = pending_store_entry_3582(&pid, &namespace);
+        let decision = json!({"id": pid, "approved": true, "decider": approver});
+        let (status, report) = push_governance(&router, vec![entry], vec![decision]).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(
+            count_ns(&pool, &namespace).await,
+            i64::from(allowed),
+            "{report}"
+        );
+        let pending = pending_snapshot_3582(&pool, &pid).await;
+        assert_eq!(pending.is_some(), allowed, "pending persistence: {report}");
+        if let Some(pending) = pending {
+            assert_eq!(pending["namespace"], namespace);
+            assert_eq!(pending["status"], "approved", "{report}");
+            assert_eq!(pending["decided_by"], approver);
+        }
+        assert_eq!(
+            counter(&report, "pendings_applied"),
+            i64::from(allowed),
+            "{report}"
+        );
+        assert_eq!(
+            counter(&report, "pending_decisions_applied"),
+            i64::from(allowed),
+            "{report}"
+        );
+        assert_eq!(counter(&report, "skipped"), i64::from(!allowed), "{report}");
+        assert_eq!(counter(&report, "unsupported_on_postgres"), 0, "{report}");
+    }
+    pool.close().await;
+}
+
+/// Seed locally through the store, then send decisions without any pendings[].
+/// A missing insertion alone cannot satisfy these refusal assertions.
+#[tokio::test]
+async fn required_scope_local_pending_decision_postures_on_postgres_3582() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+    let approver = uniq("ai:approver-3582-decision");
+    register_approver(&store, &approver).await;
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        for approved in [true, false] {
+            let root = uniq("pending-3582-decision");
+            let namespace = format!("{root}/ok");
+            set_required_scope_posture(&root, scoped, require);
+            let victim_id = uuid::Uuid::new_v4().to_string();
+            seed_row(&store, &victim_id, &namespace, &uniq("3582-delete-target")).await;
+            let pid = uuid::Uuid::new_v4().to_string();
+            let pending = ai_memory::models::PendingAction {
+                id: pid.clone(),
+                action_type: "delete".to_string(),
+                memory_id: Some(victim_id.clone()),
+                namespace,
+                payload: json!({}),
+                requested_by: PEER_ID.to_string(),
+                requested_at: chrono::Utc::now().to_rfc3339(),
+                status: "pending".to_string(),
+                decided_by: None,
+                decided_at: None,
+                approvals: vec![],
+            };
+            store
+                .apply_remote_pending_action(&admin_ctx(), &pending)
+                .await
+                .expect("seed local pending");
+            let before = pending_snapshot_3582(&pool, &pid)
+                .await
+                .expect("seeded pending exists");
+            let decider = if approved { approver.as_str() } else { PEER_ID };
+            let decision = json!({"id": pid, "approved": approved, "decider": decider});
+            let (status, report) = push_governance(&router, vec![], vec![decision]).await;
+            assert_eq!(status, StatusCode::OK, "{report}");
+            assert_eq!(
+                row_exists(&pool, &victim_id).await,
+                !(allowed && approved),
+                "{report}"
+            );
+            let after = pending_snapshot_3582(&pool, &pid)
+                .await
+                .expect("local pending survives");
+            if allowed {
+                assert_eq!(
+                    after["status"],
+                    if approved { "approved" } else { "rejected" },
+                    "{report}"
+                );
+                assert_eq!(after["decided_by"], decider);
+                assert!(!after["decided_at"].is_null());
+            } else {
+                assert_eq!(after, before, "no vote/status/payload mutation: {report}");
+            }
+            assert_eq!(
+                counter(&report, "pending_decisions_applied"),
+                i64::from(allowed),
+                "{report}"
+            );
+            assert_eq!(
+                counter(&report, "deleted"),
+                i64::from(allowed && approved),
+                "{report}"
+            );
+            assert_eq!(counter(&report, "skipped"), i64::from(!allowed), "{report}");
+            assert_eq!(counter(&report, "unsupported_on_postgres"), 0, "{report}");
+        }
+    }
+    pool.close().await;
+}

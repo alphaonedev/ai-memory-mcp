@@ -47,6 +47,50 @@ use ai_memory::identity::keypair as kp_mod;
 /// Process-global async mutex — the funnel reads env vars this test mutates.
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// #3582: authorize only this fixture's peer and namespace. The caller holds
+/// ENV_LOCK until after this guard drops, including during panic unwinding.
+struct NamespaceScopeGuard([(&'static str, Option<std::ffi::OsString>); 2]);
+
+impl NamespaceScopeGuard {
+    fn new(peer: &str, namespace: &str) -> Self {
+        use ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV;
+        use ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+        let guard = Self([
+            (PEER_ATTESTATION_ENV, std::env::var_os(PEER_ATTESTATION_ENV)),
+            (
+                REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                std::env::var_os(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV),
+            ),
+        ]);
+        let allowlist = json!({peer: {
+            "allowed_sender_agent_ids": [peer],
+            "allowed_namespaces": [namespace],
+        }});
+        // SAFETY: every caller holds ENV_LOCK; Drop restores both variables
+        // before that async mutex guard is released.
+        unsafe {
+            std::env::set_var(PEER_ATTESTATION_ENV, allowlist.to_string());
+            std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        }
+        guard
+    }
+}
+
+impl Drop for NamespaceScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: the enclosing test still holds ENV_LOCK.
+        for (key, previous) in &self.0 {
+            unsafe {
+                if let Some(value) = previous {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+}
+
 const RESOLVER_ENROLLED: &str = "ai:epoch-operator-1936";
 const RESOLVER_GHOST: &str = "ai:ghost-resolver-1936";
 const CHECKPOINT_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG";
@@ -77,7 +121,8 @@ fn enrolled_key_dir() -> (&'static std::path::Path, kp_mod::AgentKeypair) {
 /// v0.8 strict peer-enrollment default would 401 an unenrolled push before the
 /// funnel; opt to the permissive posture like `tests/g_issue_238`). Held under
 /// `ENV_LOCK` by every caller.
-fn reset_env(require_checkpoint_sig: Option<&str>) {
+fn reset_env(require_checkpoint_sig: Option<&str>) -> NamespaceScopeGuard {
+    let scope = NamespaceScopeGuard::new("peer-1936", "_epoch");
     let (dir, _) = enrolled_key_dir();
     unsafe {
         std::env::set_var(kp_mod::KEY_DIR_ENV, dir);
@@ -88,6 +133,7 @@ fn reset_env(require_checkpoint_sig: Option<&str>) {
             None => std::env::remove_var(CHECKPOINT_SIG_ENV),
         }
     }
+    scope
 }
 
 fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
@@ -229,7 +275,7 @@ async fn count_resolved(db: &ai_memory::handlers::Db, id: &str) -> Option<String
 #[tokio::test]
 async fn epoch_advance_resolution_round_trips_strict() {
     let _guard = ENV_LOCK.lock().await;
-    reset_env(None); // knob unset → default fail-closed
+    let _scope = reset_env(None); // knob unset → default fail-closed
     let (_dir, resolver_kp) = enrolled_key_dir();
     let (router, db) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-epoch-rt", RESOLVER_ENROLLED, "deadbeef", &resolver_kp);
@@ -261,7 +307,7 @@ async fn epoch_advance_resolution_round_trips_strict() {
 #[tokio::test]
 async fn strict_refuses_unenrolled_resolver() {
     let _guard = ENV_LOCK.lock().await;
-    reset_env(Some("1")); // explicit fail-closed
+    let _scope = reset_env(Some("1")); // explicit fail-closed
     // A resolver with NO enrolled key on the receiver, signed by its own key.
     let ghost_kp = kp_mod::generate(RESOLVER_GHOST).unwrap();
     let (router, db) = build_router_with_db();
@@ -276,7 +322,7 @@ async fn strict_refuses_unenrolled_resolver() {
 #[tokio::test]
 async fn escape_hatch_permissive_applies_unenrolled() {
     let _guard = ENV_LOCK.lock().await;
-    reset_env(Some("0")); // operator opt-out
+    let _scope = reset_env(Some("0")); // operator opt-out
     let ghost_kp = kp_mod::generate(RESOLVER_GHOST).unwrap();
     let (router, db) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-permissive", RESOLVER_GHOST, "allowed", &ghost_kp);
@@ -297,7 +343,7 @@ async fn escape_hatch_permissive_applies_unenrolled() {
 #[tokio::test]
 async fn forged_signature_rejected_even_permissive() {
     let _guard = ENV_LOCK.lock().await;
-    reset_env(Some("0")); // permissive — forged still refused
+    let _scope = reset_env(Some("0")); // permissive — forged still refused
     // Sign with mallory's key but attribute to the ENROLLED resolver: the
     // signature will not verify against the resolver's enrolled key.
     let mallory = kp_mod::generate("ai:mallory-1936").unwrap();
@@ -321,7 +367,7 @@ async fn forged_signature_rejected_even_permissive() {
 #[tokio::test]
 async fn idempotent_replay_is_noop() {
     let _guard = ENV_LOCK.lock().await;
-    reset_env(None);
+    let _scope = reset_env(None);
     let (_dir, resolver_kp) = enrolled_key_dir();
     let (router1, db) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-replay", RESOLVER_ENROLLED, "once", &resolver_kp);
@@ -352,7 +398,7 @@ async fn idempotent_replay_is_noop() {
 #[tokio::test]
 async fn divergent_resolution_conflicts_first_wins() {
     let _guard = ENV_LOCK.lock().await;
-    reset_env(None);
+    let _scope = reset_env(None);
     let (_dir, resolver_kp) = enrolled_key_dir();
     let (router, db) = build_router_with_db();
 

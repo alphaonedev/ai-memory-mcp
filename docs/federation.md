@@ -66,6 +66,63 @@ the local store.
   [#318](https://github.com/alphaonedev/ai-memory-mcp/issues/318),
   v0.7.0 security-hardening sweep.
 
+## Current defaults and boot posture (#3582)
+
+Peer **key enrollment**, per-message Ed25519 signatures and nonce freshness
+are required by default. Enrollment establishes identity; it does not grant
+namespace authority. `AI_MEMORY_FED_PEER_ATTESTATION` is the separate JSON
+map of peer authorship and namespace permissions. Although unset by default,
+that map is needed for scoped replication: the default-on
+`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` refuses inbound writes when
+no allowlist exists. This applies to SQLite and PostgreSQL, including
+catchup acceptance, by-id operations, pending decisions and namespace metadata.
+
+| Configuration | Standard | `asi-hard` |
+|---|---|---|
+| Peers configured; allowlist absent, empty or invalid | Boot WARN; default namespace requirement refuses writes | Boot refused |
+| Valid, nonempty allowlist | Boot accepted; every operation still needs its peer scope and other checks | Same scope checks; hard floors enforced |
+| Allowlist absent; explicit `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` | Legacy namespace opt-out; configured peers still produce the WARN | Refused: the hard profile forbids this override |
+
+The Standard opt-out changes the namespace requirement only. It does not
+remove identity, signature, nonce or other authorization checks. With a
+configured allowlist, anonymous or unlisted peers remain refused even at
+`=0`, and a declared nonempty namespace scope remains enforced. Empty or
+malformed configured maps never become the absent-map opt-out.
+
+“Peers configured” includes a nonempty `serve --quorum-peers` or
+`sync-daemon --peers` list, regardless of `quorum_writes`, plus inbound peer
+fingerprints, certificate bindings, trusted credential issuers and enrolled
+public peer keys (including slashed peer IDs). An explicit listener
+`--mtls-allowlist` also counts as configured intent; the existing TLS loader
+still validates the file. The boot observer reads public configuration only.
+An incomplete inbound enrollment observation warns under Standard and
+refuses `asi-hard` boot; it is never evidence of a peerless deployment.
+
+Ordinary `ai-memory doctor` remains runnable under this peer-allowlist boot
+refusal in either posture, with a **Federation peer authorization** section.
+Local doctor observes inbound configuration directly and marks outbound peer
+lists and listener mTLS argv **unobservable from this process**. Remote doctor
+uses the daemon's capabilities snapshot. The existing
+`doctor --posture enterprise-federation` report is unchanged.
+
+### Capabilities boot snapshot
+
+HTTP `/api/v1/capabilities` and MCP `memory_capabilities` v2/v3 expose the
+optional `federation_security` object, shared by SQLite and PostgreSQL. It
+contains `security_posture`, `outbound_peers`, `inbound_bindings`,
+`listener_mtls`, `peer_allowlist`, `verdict`, `key_enrollment_required`,
+`require_push_namespace_scope` and `observation_errors`. Observations are
+`present`, `absent` or `unobservable`; allowlist status is `absent`,
+`empty_or_invalid` or `configured`. Verdicts are `no_peers_observed`,
+`allowed`, `warning`, `refused` or `unobservable`.
+
+This is the last completed **in-process boot evaluation**, not a live rescan
+of enrolled keys and not a grant for any particular operation. Observation
+errors remain relevant even with an `allowed` verdict: `asi-hard` refuses
+boot on incomplete observation. The report contains no peer IDs, paths or
+key material. It is omitted when no boot evaluation exists, and v1 remains
+unchanged; an absent field is not evidence of an allowed or peerless posture.
+
 ## The three auth layers
 
 ### Layer 1 — mTLS allowlist (transport)
@@ -183,8 +240,8 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   namespaces whose GOVERNANCE you intend it to set, not merely the ones
   whose rows you intend it to write.
 
-  The literal global standard `*` is a special case: it is the
-  substrate-wide default that `build_namespace_chain` prepends to EVERY
+  With a configured allowlist, the literal global standard `*` is a special
+  case: it is the substrate-wide default that `build_namespace_chain` prepends to EVERY
   namespace's chain, so a `namespace_meta` row on it is refused unless the
   peer declared `**`. Note this is NOT the same as a scope of `["*"]` —
   that pattern means "any TOP-LEVEL namespace" (#1902), and it would
@@ -196,15 +253,13 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   match, because `merge_memory` resolves `namespace` by last-writer-wins
   — without the second check a peer could relocate a row out of a
   namespace it was denied by pushing that row's id under an in-scope
-  namespace. Enforcement engages only under an ENROLLED posture
-  (`AI_MEMORY_FED_PEER_ATTESTATION` configured); zero-config federation
-  is unchanged. See env row 147
-  (`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`) for the disposition of
-  an enrolled peer that declares no namespaces at all.
+  namespace. A declared nonempty scope is always enforced. The default-on
+  `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` also refuses an absent
+  allowlist or an enrolled peer with no namespaces. See env row 147 in
+  `CLAUDE.md` and the Standard opt-out contract above.
 
 > ✅ **Inbound write lanes are namespace-confined.**
-> Under an ENROLLED posture (`AI_MEMORY_FED_PEER_ATTESTATION`
-> configured), every inbound write lane routes through the shared
+> Every inbound write lane routes through the shared
 > by-id / by-namespace choke in `federation::receive_auth`:
 > `/sync/push` `memories[]`, `links[]` (source AND target stored
 > namespace, [#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489)),
@@ -214,8 +269,9 @@ the `x-peer-id` HTTP header) to a `PeerScope`
 > (`src/federation/receive.rs::catchup_memory_namespace_authorized`,
 > [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)).
 > An endpoint whose namespace cannot be resolved is REFUSED, not
-> admitted. Zero-config (no allowlist) is unchanged, byte-identical
-> faith replication. `CallerContext::for_admin(FEDERATION_CATCHUP)`
+> admitted under a scoped posture. With no allowlist, the default namespace
+> requirement refuses writes; only the explicit Standard `=0` opt-out
+> retains legacy namespace acceptance. `CallerContext::for_admin(FEDERATION_CATCHUP)`
 > still bypasses SAL *visibility* so a peer snapshot can round-trip —
 > the scope gate runs before it.
 
@@ -243,7 +299,7 @@ Pinned by [`tests/federation_b2_hardening.rs`](../tests/federation_b2_hardening.
 
 | Var | Default | Effect |
 |---|---|---|
-| `AI_MEMORY_FED_PEER_ATTESTATION` | unset → empty allowlist | When set to JSON, populates the per-peer `PeerScope` allowlist. Unset = empty config (default-deny on `/sync/since`, header-must-equal-body on `/sync/push`). |
+| `AI_MEMORY_FED_PEER_ATTESTATION` | unset → empty allowlist | When set to JSON, populates the per-peer `PeerScope` allowlist. Unset = absent authorization: default-deny on `/sync/since` and default-required inbound writes. With configured peers, Standard warns and `asi-hard` refuses boot. Key enrollment is separate. |
 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (deny) | When set to `"1"`, widens "no scope row" cases on `/sync/since` to legacy full-dump behavior. Once a scope row exists for a peer, its namespace list is the authoritative gate and the bypass is ignored. |
 | `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` | unset (deny) | When set to `"1"`, the substrate trusts the wire body's `agent_id` claim instead of the authenticated peer-id. Default: header wins. |
 
@@ -259,11 +315,10 @@ the two `TRUST_*` flags. Bypass detection:
 [`src/federation/peer_attestation.rs`](../src/federation/peer_attestation.rs).
 
 A malformed `AI_MEMORY_FED_PEER_ATTESTATION` JSON value is treated as
-an empty allowlist (default-deny) plus a `tracing::warn!` so the
-operator sees the typo immediately
+configured-but-empty (default-deny), with a `tracing::warn!`
 ([`peer_attestation::PeerAttestationConfig::from_env`](../src/federation/peer_attestation.rs)).
-Refusing to start on a malformed allowlist would be a self-DOS hazard
-during config rollouts.
+It cannot activate the absent-map opt-out. With peers configured, Standard
+warns at boot and `asi-hard` refuses boot, as for an empty map.
 
 ## v0.8.0 hardening additions
 

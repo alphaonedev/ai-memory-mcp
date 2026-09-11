@@ -398,33 +398,55 @@ async fn enrolled_unscoped_federated_deletion_applies_under_knob_off_2488_pg() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn zero_config_federated_deletion_still_applies_2488_pg() {
+async fn no_allowlist_deletion_posture_matrix_3582_pg() {
     let Some(url) = pg_url() else {
         eprintln!(
-            "SKIP zero_config_federated_deletion_still_applies_2488_pg: no AI_MEMORY_TEST_POSTGRES_URL"
+            "SKIP no_allowlist_deletion_posture_matrix_3582_pg: no AI_MEMORY_TEST_POSTGRES_URL"
         );
         return;
     };
     let _g = FED_ENV_LOCK.lock().await;
     let _posture = PostureGuard;
-    let peer = uniq("ai:zeroconf");
-    let ns = uniq("secure/ops");
-    set_zero_config_posture();
-    let (router, store) = pg_router(&url).await;
-    let pool = raw_pool(&url).await;
+    // #3582: identical mutations under default/explicit denial, rollout opt-out,
+    // and an explicit peer scope. All environment access holds the binary lock.
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        let peer = uniq("ai:zeroconf");
+        let ns = uniq("secure/ops");
+        set_zero_config_posture();
+        // SAFETY: every test in this binary holds FED_ENV_LOCK.
+        unsafe {
+            if scoped {
+                std::env::set_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                json!({peer.clone(): {"allowed_namespaces": [ns.clone()], "allowed_sender_agent_ids": [peer.clone()]}}).to_string());
+            }
+            if let Some(value) = require {
+                std::env::set_var(
+                    ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                    value,
+                );
+            }
+        }
 
-    let id = uuid::Uuid::new_v4().to_string();
-    seed_row(&store, &id, &ns, &uniq("zero-config-victim")).await;
+        let (router, store) = pg_router(&url).await;
+        let pool = raw_pool(&url).await;
 
-    let (status, report) = push_deletions(&router, &peer, &peer, &[&id]).await;
-    assert!(status.is_success());
-    assert!(
-        !row_exists(&pool, &id).await,
-        "#2488: widening the gate to the ENROLLED posture must NOT black-hole \
-         zero-config deletions — that would trade the #2488 confidentiality hole \
-         for the #2491 permanent-divergence outage on the other backend"
-    );
-    assert_eq!(counter(&report, "deleted"), 1);
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_row(&store, &id, &ns, &uniq("zero-config-victim")).await;
+
+        let (status, report) = push_deletions(&router, &peer, &peer, &[&id]).await;
+        assert!(status.is_success());
+        assert_eq!(
+            row_exists(&pool, &id).await,
+            !allowed,
+            "#3582: deletion persisted state scoped={scoped} require={require:?}"
+        );
+        assert_eq!(counter(&report, "deleted"), i64::from(allowed));
+    }
 }
 
 // ---------------------------------------------------------------------

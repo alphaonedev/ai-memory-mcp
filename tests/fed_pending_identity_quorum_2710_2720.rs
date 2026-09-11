@@ -47,14 +47,19 @@ impl Drop for PostureGuard {
     }
 }
 
-fn clear_and_zero_config() {
+fn set_standard_scope_opt_out() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         std::env::set_var(REQUIRE_ATTEST_ENV, "0");
         std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
         std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
         std::env::remove_var(ai_memory::federation::peer_attestation::SYNC_TRUST_PEER_ENV);
-        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        // #3582: explicit Standard opt-out keeps this identity/status control
+        // independent of the default-on namespace admission requirement.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
     }
 }
 
@@ -231,7 +236,7 @@ fn upsert_fresh_insert_drops_wire_approvals_2710() {
 async fn federated_fresh_pending_drops_stuffed_approvals_2710() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
-    clear_and_zero_config();
+    set_standard_scope_opt_out();
     let (router, db) = build_router_with_db();
 
     let wire = json!({
@@ -413,12 +418,11 @@ async fn federated_reject_rebinds_forged_decider_2720() {
 }
 
 #[tokio::test]
-async fn federated_reject_converges_zero_config_2720() {
-    // Control: zero-config (faith-based) reject still converges — no regression
-    // to legitimate reject propagation on an unenrolled mesh.
+async fn federated_reject_converges_explicit_scope_opt_out_2720() {
+    // Control: explicit Standard scope opt-out preserves reject propagation.
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
-    clear_and_zero_config();
+    set_standard_scope_opt_out();
     let (router, db) = build_router_with_db();
 
     {
@@ -448,6 +452,6 @@ async fn federated_reject_converges_zero_config_2720() {
         .expect("row survives");
     assert_eq!(
         row.status, "rejected",
-        "zero-config reject converges: {report}"
+        "explicit scope opt-out reject converges: {report}"
     );
 }

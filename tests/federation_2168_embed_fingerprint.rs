@@ -268,6 +268,14 @@ fn unit_norm_fill(dim: usize) -> Vec<f32> {
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_model_shipped_vector_not_stored_verbatim_deferred_2168() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     // SAFETY: env mutation under env_lock for the test's duration.
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
@@ -350,6 +358,14 @@ async fn foreign_model_shipped_vector_not_stored_verbatim_deferred_2168() {
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_model_string_shipped_vector_not_stored_verbatim_deferred_2176() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     // SAFETY: env mutation under env_lock for the test's duration.
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
@@ -419,6 +435,14 @@ async fn empty_model_string_shipped_vector_not_stored_verbatim_deferred_2176() {
 #[tokio::test(flavor = "multi_thread")]
 async fn matching_model_shipped_vector_stored_verbatim_2168() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }
@@ -470,6 +494,14 @@ async fn matching_model_shipped_vector_stored_verbatim_2168() {
 #[tokio::test(flavor = "multi_thread")]
 async fn same_model_bare_id_accepted_2168() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }
@@ -515,6 +547,14 @@ async fn same_model_bare_id_accepted_2168() {
 #[tokio::test(flavor = "multi_thread")]
 async fn matching_fingerprint_non_normalized_still_normalized_1584_2168() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }

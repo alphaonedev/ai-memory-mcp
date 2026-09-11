@@ -344,9 +344,15 @@ and `AI_MEMORY_FED_REQUIRE_NONCE=1` (#922 secure default) refuses
 byte-for-byte replays via per-peer nonce freshness
 (`X-Memory-Nonce`; nonces persist across restarts in the
 `federation_nonce_cache` table, schema v51 / #1255). Peer
-attestation (`AI_MEMORY_FED_PEER_ATTESTATION`) further scopes what
-an authenticated peer may claim and pull. Never run the sync
-endpoint on a public network without mTLS.
+key enrollment is also required by default. The separate peer attestation
+map (`AI_MEMORY_FED_PEER_ATTESTATION`) scopes authorship and namespaces.
+Default-required namespace checks refuse inbound writes without that map
+(#3582). With peers configured, Standard warns and `asi-hard` refuses boot
+if the map is absent, empty or invalid. Standard retains the explicit
+require-scope `0` opt-out; it does not disable other checks. Ordinary doctor
+and capabilities expose the posture as described in
+[federation hardening](federation.html#current-defaults-and-boot-posture-3582).
+Never run the sync endpoint on a public network without mTLS.
 
 ## Governance
 

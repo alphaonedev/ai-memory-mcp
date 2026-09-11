@@ -77,6 +77,9 @@ impl Drop for PostureGuard {
         // SAFETY: the holder owns FED_ENV_LOCK for the guard's lifetime.
         unsafe {
             std::env::remove_var(CHECKPOINT_SIG_ENV);
+            std::env::remove_var(
+                ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            );
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         }
     }
@@ -136,6 +139,11 @@ fn reset_env(require_checkpoint_sig: Option<&str>) {
     unsafe {
         std::env::set_var(kp_mod::KEY_DIR_ENV, dir);
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+        // #3582: these signature/L5/CRDT controls explicitly opt out of namespace scope.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
         std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         match require_checkpoint_sig {
             Some(v) => std::env::set_var(CHECKPOINT_SIG_ENV, v),
@@ -575,7 +583,7 @@ async fn checkpoint_namespace_scope_gated_on_postgres_3075_2708() {
     let _allow = AllowlistGuard;
 
     let (_dir, resolver_kp) = enrolled_key_dir();
-    let (router, _store) = pg_router(&url).await;
+    let (router, store) = pg_router(&url).await;
     let pool = raw_pool(&url).await;
 
     let in_id = uniq("cp3075n");
@@ -614,4 +622,165 @@ async fn checkpoint_namespace_scope_gated_on_postgres_3075_2708() {
         0,
         "{report}"
     );
+    // The wire namespace cannot authorize a locally pending anchor in a
+    // different, out-of-scope namespace (the literal SQLite #2708 exploit).
+    let local_id = uniq("cp3582stored");
+    let mut pending = resolved_checkpoint(
+        &local_id,
+        &victim_ns,
+        ai_memory::models::ConditionType::Approval,
+        RESOLVER_ENROLLED,
+        "approve",
+        &resolver_kp,
+    );
+    pending.state = ai_memory::models::CheckpointState::Pending;
+    pending.resolution = None;
+    pending.resolved_by = None;
+    pending.resolved_at = None;
+    pending.signature.clear();
+    pending.resolver_pubkey.clear();
+    let ctx = ai_memory::store::CallerContext::for_agent(RESOLVER_ENROLLED);
+    store
+        .checkpoint_create(&ctx, &pending)
+        .await
+        .expect("seed foreign stored anchor");
+    let before =
+        sqlx::query_scalar::<_, Value>("SELECT to_jsonb(c) FROM checkpoints c WHERE id = $1")
+            .bind(&local_id)
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot stored anchor");
+    let spoofed = resolved_checkpoint(
+        &local_id,
+        &in_scope_ns,
+        ai_memory::models::ConditionType::Approval,
+        RESOLVER_ENROLLED,
+        "approve",
+        &resolver_kp,
+    );
+    let (status, report) = push_checkpoint(&router, &spoofed).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let after =
+        sqlx::query_scalar::<_, Value>("SELECT to_jsonb(c) FROM checkpoints c WHERE id = $1")
+            .bind(&local_id)
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot after spoof");
+    assert_eq!(after, before, "stored namespace must govern: {report}");
+    assert_eq!(report["checkpoints_applied"], json!(0), "{report}");
+}
+
+/// #3582 — default/explicit denial and explicit opt-out/scope, for both first
+/// landing and resolution of a locally pending checkpoint. Signatures stay strict.
+#[tokio::test]
+async fn no_allowlist_checkpoint_posture_matrix_on_postgres_3582() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _lock = FED_ENV_LOCK.lock().await;
+    let _guard = PostureGuard;
+    let _allow = AllowlistGuard;
+    let (_, resolver_kp) = enrolled_key_dir();
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        reset_env(None);
+        let namespace = uniq("checkpoint3582");
+        // SAFETY: every test in this binary holds FED_ENV_LOCK, including awaits.
+        unsafe {
+            std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+            if scoped {
+                std::env::set_var(
+                    ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                    json!({PEER_ID: {"allowed_namespaces": [&namespace],
+                        "allowed_sender_agent_ids": [PEER_ID]}})
+                    .to_string(),
+                );
+            }
+            match require {
+                Some(value) => std::env::set_var(
+                    ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                    value,
+                ),
+                None => std::env::remove_var(
+                    ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                ),
+            }
+        }
+        let (router, store) = pg_router(&url).await;
+        let pool = raw_pool(&url).await;
+        for locally_pending in [false, true] {
+            let id = uniq("cp3582");
+            let cp = resolved_checkpoint(
+                &id,
+                &namespace,
+                ai_memory::models::ConditionType::Approval,
+                RESOLVER_ENROLLED,
+                "approve",
+                &resolver_kp,
+            );
+            if locally_pending {
+                let mut pending = cp.clone();
+                pending.state = ai_memory::models::CheckpointState::Pending;
+                pending.resolution = None;
+                pending.resolved_by = None;
+                pending.resolved_at = None;
+                pending.signature.clear();
+                pending.resolver_pubkey.clear();
+                let ctx = ai_memory::store::CallerContext::for_agent(RESOLVER_ENROLLED);
+                store
+                    .checkpoint_create(&ctx, &pending)
+                    .await
+                    .expect("seed local anchor");
+            }
+            let before = sqlx::query_scalar::<_, Value>(
+                "SELECT to_jsonb(c) FROM checkpoints c WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await
+            .expect("snapshot checkpoint");
+            assert_eq!(before.is_some(), locally_pending);
+            let (status, report) = push_checkpoint(&router, &cp).await;
+            assert_eq!(status, StatusCode::OK, "{report}");
+            let after = sqlx::query_scalar::<_, Value>(
+                "SELECT to_jsonb(c) FROM checkpoints c WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await
+            .expect("snapshot checkpoint after push");
+            if allowed {
+                let ctx = ai_memory::store::CallerContext::for_agent(RESOLVER_ENROLLED);
+                let stored = store
+                    .checkpoint_get(&ctx, &id)
+                    .await
+                    .expect("get anchor")
+                    .expect("landed anchor");
+                assert_eq!(stored.state, ai_memory::models::CheckpointState::Resolved);
+                assert_eq!(stored.namespace, namespace);
+                assert_eq!(stored.resolution.as_deref(), Some("approve"));
+                assert_eq!(stored.resolved_by, cp.resolved_by);
+                assert_eq!(stored.signature, cp.signature);
+                assert_eq!(stored.resolver_pubkey, cp.resolver_pubkey);
+            } else {
+                assert_eq!(
+                    after, before,
+                    "full row unchanged: scoped={scoped} require={require:?} local={locally_pending}: {report}"
+                );
+            }
+            assert_eq!(
+                report["checkpoints_applied"],
+                json!(u64::from(allowed)),
+                "{report}"
+            );
+            assert_eq!(report["checkpoints_conflicted"], json!(0), "{report}");
+            assert_eq!(report["unsupported_on_postgres"], json!(0), "{report}");
+        }
+        pool.close().await;
+    }
 }

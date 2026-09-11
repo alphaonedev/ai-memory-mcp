@@ -325,6 +325,14 @@ fn sync_push_body_decodes_with_and_without_embeddings_field() {
 #[tokio::test(flavor = "multi_thread")]
 async fn push_without_embeddings_field_is_accepted_old_peer_shape() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     // SAFETY: env mutation under env_lock; restored semantics by every
     // test in this file setting the vars it needs explicitly.
     unsafe {
@@ -349,6 +357,14 @@ async fn push_without_embeddings_field_is_accepted_old_peer_shape() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shipped_vector_stored_directly_without_receiver_embed() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }
@@ -408,6 +424,14 @@ async fn shipped_vector_stored_directly_without_receiver_embed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn dim_mismatch_falls_back_to_deferred_local_embed() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }
@@ -451,6 +475,14 @@ async fn dim_mismatch_falls_back_to_deferred_local_embed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_embedder_does_not_delay_sync_push_ack() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }
@@ -491,6 +523,14 @@ async fn slow_embedder_does_not_delay_sync_push_ack() {
 #[tokio::test(flavor = "multi_thread")]
 async fn signature_covers_shipped_vector_tamper_yields_401() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     let key_tmp = TempDir::new().expect("key tempdir");
     // SAFETY: env mutation under env_lock for the test's duration.
     unsafe {
@@ -584,6 +624,14 @@ async fn nan_shipped_vector_rejected_at_json_wire_boundary_1584() {
     // direct-call ingest) that could carry a non-finite component past
     // serde.
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }
@@ -617,6 +665,14 @@ async fn nan_shipped_vector_rejected_at_json_wire_boundary_1584() {
 #[tokio::test(flavor = "multi_thread")]
 async fn non_normalized_shipped_vector_is_stored_normalized_1584() {
     let _g = env_lock();
+    // #3582: isolate vector transport from required namespace authorization.
+    // SAFETY: this binary serializes federation env readers with env_lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+    }
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }

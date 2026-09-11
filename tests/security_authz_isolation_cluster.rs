@@ -373,6 +373,12 @@ async fn federated_forged_approval_does_not_execute_1920() {
     // Zero-config federation posture (no allowlist) so the request passes
     // the TOFU / signature gates; the APPROVAL gate must still fire.
     unsafe {
+        // #3582: explicit Standard namespace opt-out lets this downstream
+        // control run; the required-scope refusal is pinned in its own suite.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
         std::env::set_var(REQUIRE_ATTEST_ENV, "0");
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
@@ -466,6 +472,7 @@ async fn federated_forged_approval_does_not_execute_1920() {
     );
 
     unsafe {
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
         std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         std::env::remove_var(REQUIRE_ATTEST_ENV);
     }

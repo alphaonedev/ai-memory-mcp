@@ -28,7 +28,7 @@
 //! (a) forged signature → skipped; (b) enrolled peer + allowlist, `from_agent`
 //! OUTSIDE the allowlist → skipped while a co-resident memory in the SAME push
 //! still applies (batch survival); (c) self-relay + allowlisted third-party →
-//! accepted; (d) zero-config (no allowlist) → accepted (faith-based); (e) strict
+//! accepted; (d) explicit namespace/signal opt-outs → accepted; (e) strict
 //! mode → enrolled+valid accepted, unenrolled skipped.
 
 #![allow(clippy::too_many_lines)]
@@ -125,9 +125,15 @@ fn setup_router() -> (axum::Router, Db) {
 
 /// Disable the orthogonal federation gates so each test isolates the #1843
 /// signal-authorship behavior: body-signature requirement (#791) and
-/// peer-enrollment requirement (#1789).
+/// peer-enrollment requirement (#1789), and namespace scope (#3582).
 fn relax_orthogonal_gates() {
     unsafe {
+        // #3582: explicit Standard namespace opt-out lets this downstream
+        // control run; the required-scope refusal is pinned in its own suite.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
         std::env::set_var(REQUIRE_SIG_ENV, "0");
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
     }
@@ -135,6 +141,7 @@ fn relax_orthogonal_gates() {
 
 fn clear_all_env() {
     unsafe {
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
         std::env::remove_var(PEER_ATTESTATION_ENV);
         std::env::remove_var(REQUIRE_SIG_ENV);
         std::env::remove_var(REQUIRE_SIGNAL_SIG_ENV);
@@ -339,10 +346,10 @@ async fn self_relay_and_allowlisted_author_accepted_1843() {
     );
 }
 
-// ---- (d) zero-config (no allowlist) → accepted (faith-based, byte-unchanged) --
+// ---- (d) explicit namespace + signal opt-outs → accepted, byte-unchanged ----
 
 #[tokio::test(flavor = "current_thread")]
-async fn zero_config_accepts_any_author_1843() {
+async fn explicit_namespace_and_signal_opt_out_accepts_any_author_1843() {
     let _g = env_lock();
     clear_all_env();
     relax_orthogonal_gates(); // no PEER_ATTESTATION_ENV → has_allowlist()==false
@@ -369,7 +376,7 @@ async fn zero_config_accepts_any_author_1843() {
     assert_eq!(
         i(&resp, "signals_applied"),
         1,
-        "zero-config MUST keep the faith-based posture (accept signed signal): {resp}"
+        "explicit namespace and signal opt-outs must accept the signed signal: {resp}"
     );
 }
 

@@ -1539,11 +1539,10 @@ pub(super) fn pending_action_effect(
 /// is byte-identical to theirs and the empty-scope case honours
 /// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` instead of hard-coding a verdict.
 ///
-/// Callers MUST wrap this in the ENROLLED posture (`attest_cfg.has_allowlist()`)
-/// exactly as the sibling lanes do — with no allowlist configured the shared
-/// helpers already return `true`, but the wrap is what keeps the zero-config
-/// posture free of the probes below (the #2491 outage was a gate that ran
-/// unconditionally).
+/// Callers must use `inbound_namespace_gate_enabled` (allowlist OR required scope)
+/// exactly as the sibling lanes do. With no allowlist, the shared helpers
+/// refuse default-required scope; the explicit Standard opt-out skips the
+/// gate. Probe elision remains separate from authorization (#3582).
 ///
 /// `stored_pending_namespace` is the namespace of the pending row ALREADY at
 /// `pa.id`, or `None` when there provably is none. It is load-bearing, not
@@ -2613,10 +2612,12 @@ pub async fn sync_push(
             peer_header_owned.as_deref(),
             &attest_cfg,
         );
-    // The by-id sibling lanes (`archives[]` / `restores[]`) probe under the
-    // whole ENROLLED posture, not just a declared scope, so Layer 2's
-    // disposition of an unscoped enrolled peer is IDENTICAL on every lane.
-    let ns_gate_enrolled = attest_cfg.has_allowlist();
+    // #3582: every mutation reaches authorization when scope is required,
+    // including when no allowlist is configured. Probe elision is independent.
+    let ns_gate_enabled = crate::federation::receive_auth::inbound_namespace_gate_enabled(
+        &attest_cfg,
+        require_push_ns_scope,
+    );
     for mem in &body.memories {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
@@ -3112,7 +3113,7 @@ pub async fn sync_push(
         // through `row_to_memory`'s fail-closed at-rest decrypt, which made a
         // row with an unopenable envelope permanently un-erasable (see the
         // `namespace_by_id` doc). Fable 5 1×7 vote (4d3ea1c5).
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             let needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
                 peer_header_owned.as_deref(),
                 &attest_cfg,
@@ -3185,7 +3186,7 @@ pub async fn sync_push(
         // an ARCHIVED row is the input `restores[]` below resurrects. Confine
         // it to the peer's scope with the same resolve-then-refuse shape. A
         // missing row stays a no-op; an unresolvable one fails closed.
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             match db::namespace_by_id(&lock.0, arch_id) {
                 Ok(Some(namespace)) => {
                     if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
@@ -3253,7 +3254,7 @@ pub async fn sync_push(
         // would have left behind). The row lives in `archived_memories` at this
         // point, hence the archive-table twin of the namespace probe. The G30
         // tombstone gate below is orthogonal and still runs.
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             match db::archived_namespace_by_id(&lock.0, res_id) {
                 Ok(Some(namespace)) => {
                     if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
@@ -3338,8 +3339,8 @@ pub async fn sync_push(
         // Gate 1 / #2489 — namespace confinement for links[] via the shared
         // by-id choke (source AND target stored namespaces). Structural
         // lane token: receive_auth::LANE_LINKS / push_lanes::Links.
-        // Zero-config (`!ns_gate_enrolled`) stays byte-identical faith replication.
-        if ns_gate_enrolled {
+        // Only an explicit no-allowlist scope opt-out bypasses this gate (#3582).
+        if ns_gate_enabled {
             use crate::federation::receive_auth::{
                 LANE_LINKS, inbound_by_id_namespace_authorized, peer_declares_namespace_scope,
             };
@@ -3566,13 +3567,9 @@ pub async fn sync_push(
         // approval (by the `pending_decisions[]` loop below, or by a LOCAL
         // operator through an approve surface that has no peer scope to consult).
         //
-        // ZERO-CONFIG RESIDUAL, stated rather than implied: like every sibling
-        // lane this whole gate short-circuits on `has_allowlist()`, so a
-        // deployment with no `AI_MEMORY_FED_PEER_ATTESTATION` keeps the
-        // arbitrary-namespace primitive. That is parity with #2447/#2488, not an
-        // oversight — but this lane's sink is strictly more destructive than
-        // `memories[]`, so it is named here and in the PR body.
-        if ns_gate_enrolled {
+        // #3582: the scope requirement also arms this gate with no allowlist.
+        // An absent allowlist may bypass it only under the explicit opt-out.
+        if ns_gate_enabled {
             let stored_pending_ns = local_pending.as_ref().map(|row| row.namespace.clone());
             if !pending_namespaces_authorized(
                 &lock.0,
@@ -3690,7 +3687,7 @@ pub async fn sync_push(
                     continue;
                 }
             };
-            if ns_gate_enrolled
+            if ns_gate_enabled
                 && !pending_namespaces_authorized(
                     &lock.0,
                     crate::federation::receive_auth::LANE_PENDING_DECISIONS,
@@ -3809,7 +3806,7 @@ pub async fn sync_push(
                     continue;
                 }
             };
-            if ns_gate_enrolled
+            if ns_gate_enabled
                 && !pending_namespaces_authorized(
                     &lock.0,
                     crate::federation::receive_auth::LANE_PENDING_DECISIONS,
@@ -3993,7 +3990,7 @@ pub async fn sync_push(
         // (authorize_remote_transition) answers "who signed"; this choke answers
         // "may this peer touch the stored action namespace". Subject is the
         // **stored** namespace already loaded for the signable — no extra read.
-        // Zero-config (`!has_allowlist`) short-circuits inside the helper.
+        // No allowlist refuses unless namespace scope was explicitly opted out.
         if !crate::federation::receive_auth::inbound_write_namespace_authorized(
             crate::federation::receive_auth::LANE_ACTION_TRANSITIONS,
             &op.action_id,
@@ -4296,7 +4293,7 @@ pub async fn sync_push(
         // splices above it; see `inbound_namespace_meta_authorized` for the
         // reach this does NOT close (descendants by inheritance; the namespace
         // the `standard_id` memory itself lives in).
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
                 crate::federation::receive_auth::LANE_NAMESPACE_META,
                 &entry.namespace,
@@ -4359,7 +4356,7 @@ pub async fn sync_push(
         // DISARMS a namespace (and, by inheritance, its descendants) rather than
         // merely rewriting it. There is no `standard_id` on this lane, hence no
         // parent to gate: the namespace is the whole subject.
-        if ns_gate_enrolled {
+        if ns_gate_enabled {
             if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
                 crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
                 ns,

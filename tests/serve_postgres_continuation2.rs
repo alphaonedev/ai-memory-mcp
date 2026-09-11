@@ -160,192 +160,242 @@ async fn spawn_daemon(
     (format!("http://{addr}"), shutdown, handle)
 }
 
+/// #3582: keep the original SAL push controls in single-test child processes
+/// with the explicit Standard namespace opt-out. No new process environment
+/// mutation in the parallel parent (UNSAFE-01, CONCURRENCY-20).
+fn with_legacy_push_env(name: &str, test: impl std::future::Future<Output = ()>) {
+    const REQUIRE_SCOPE: &str =
+        ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+    let args: Vec<String> = std::env::args().collect();
+    let isolated = args.iter().any(|arg| arg == "--exact")
+        && args.iter().any(|arg| arg == name)
+        && args.iter().any(|arg| arg == "--test-threads=1")
+        && std::env::var(REQUIRE_SCOPE).as_deref() == Ok("0");
+    if isolated {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("legacy SAL push test runtime")
+            .block_on(test);
+        return;
+    }
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping {name}: no PostgreSQL test URL");
+        return;
+    };
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name, "--test-threads=1", "--nocapture"])
+        .env_clear()
+        .env("TMPDIR", std::env::temp_dir())
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_TEST_POSTGRES_URL", url)
+        .env(REQUIRE_SCOPE, "0")
+        .output()
+        .expect("isolated legacy SAL push child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success()
+            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+            && !stdout.contains("skipping")
+            && !String::from_utf8_lossy(&output.stderr).contains("skipping"),
+        "{name}: isolated child must run exactly one passing test\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 // ===================================================================
 // Phase 8 — federation push/pull
 // ===================================================================
 
 /// Two postgres-backed daemons round-trip a memory via `sync/push`
-/// + `sync/since`. The pushed memory becomes visible on the
+/// and `sync/since`. The pushed memory becomes visible on the
 /// receiver's GET /memories list.
-#[tokio::test(flavor = "multi_thread")]
-async fn federation_sync_push_round_trip_via_sal() {
-    let Some(url) = postgres_url() else {
-        eprintln!("skipping federation_sync_push_round_trip_via_sal");
-        return;
-    };
-    let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = pg_test_client("ai:cont2-test");
+#[test]
+fn federation_sync_push_round_trip_via_sal() {
+    with_legacy_push_env("federation_sync_push_round_trip_via_sal", async {
+        let Some(url) = postgres_url() else {
+            eprintln!("skipping federation_sync_push_round_trip_via_sal");
+            return;
+        };
+        let (base, shutdown, handle) = spawn_daemon(&url).await;
+        let client = pg_test_client("ai:cont2-test");
 
-    let unique_ns = format!("fed-{}", uuid::Uuid::new_v4());
-    let mem_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let body = json!({
-        "sender_agent_id": "fed-test-sender",
-        "sender_clock": { "entries": {} },
-        "memories": [{
-            "id": mem_id,
-            "tier": "long",
-            "namespace": unique_ns,
-            "title": format!("fed-pushed-{mem_id}"),
-            "content": "federated payload via SAL trait",
-            "tags": ["fed"],
-            "priority": 5,
-            "confidence": 1.0,
-            "source": "import",
-            "access_count": 0,
-            "created_at": now,
-            "updated_at": now,
-            "metadata": {"agent_id": "fed-test-sender"}
-        }],
-        "dry_run": false,
+        let unique_ns = format!("fed-{}", uuid::Uuid::new_v4());
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let body = json!({
+            "sender_agent_id": "fed-test-sender",
+            "sender_clock": { "entries": {} },
+            "memories": [{
+                "id": mem_id,
+                "tier": "long",
+                "namespace": unique_ns,
+                "title": format!("fed-pushed-{mem_id}"),
+                "content": "federated payload via SAL trait",
+                "tags": ["fed"],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "import",
+                "access_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "metadata": {"agent_id": "fed-test-sender"}
+            }],
+            "dry_run": false,
+        });
+        let resp = client
+            .post(format!("{base}/api/v1/sync/push"))
+            .header("x-agent-id", "fed-test-sender")
+            .json(&body)
+            .send()
+            .await
+            .expect("sync push");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let resp_body: Value = resp.json().await.expect("body");
+        assert_eq!(resp_body["applied"], 1);
+        assert_eq!(resp_body["storage_backend"], "postgres");
+
+        // Read back via GET /sync/since.
+        let since_resp = client
+            .get(format!("{base}/api/v1/sync/since?limit=10"))
+            .send()
+            .await
+            .expect("sync since")
+            .json::<Value>()
+            .await
+            .expect("body");
+        assert!(
+            since_resp["count"].as_u64().unwrap_or(0) >= 1,
+            "sync_since must surface at least the pushed memory"
+        );
+        assert_eq!(since_resp["storage_backend"], "postgres");
+
+        shutdown.notify_one();
+        let _ = handle.await;
     });
-    let resp = client
-        .post(format!("{base}/api/v1/sync/push"))
-        .header("x-agent-id", "fed-test-sender")
-        .json(&body)
-        .send()
-        .await
-        .expect("sync push");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let resp_body: Value = resp.json().await.expect("body");
-    assert_eq!(resp_body["applied"], 1);
-    assert_eq!(resp_body["storage_backend"], "postgres");
-
-    // Read back via GET /sync/since.
-    let since_resp = client
-        .get(format!("{base}/api/v1/sync/since?limit=10"))
-        .send()
-        .await
-        .expect("sync since")
-        .json::<Value>()
-        .await
-        .expect("body");
-    assert!(
-        since_resp["count"].as_u64().unwrap_or(0) >= 1,
-        "sync_since must surface at least the pushed memory"
-    );
-    assert_eq!(since_resp["storage_backend"], "postgres");
-
-    shutdown.notify_one();
-    let _ = handle.await;
 }
 
 /// `sync_push` with `dry_run=true` reports applied=0 / noop=N and
 /// does not actually persist the memory.
-#[tokio::test(flavor = "multi_thread")]
-async fn federation_sync_push_dry_run_via_sal() {
-    let Some(url) = postgres_url() else {
-        eprintln!("skipping federation_sync_push_dry_run_via_sal");
-        return;
-    };
-    let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = pg_test_client("ai:cont2-test");
-    let unique_ns = format!("fed-dryrun-{}", uuid::Uuid::new_v4());
-    let mem_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let body = json!({
-        "sender_agent_id": "fed-test-dryrun",
-        "memories": [{
-            "id": mem_id,
-            "tier": "mid",
-            "namespace": unique_ns,
-            "title": format!("dryrun-{mem_id}"),
-            "content": "should not persist",
-            "tags": [],
-            "priority": 5,
-            "confidence": 1.0,
-            "source": "import",
-            "access_count": 0,
-            "created_at": now,
-            "updated_at": now,
-            "metadata": {"agent_id": "fed-test-dryrun"}
-        }],
-        "dry_run": true,
-    });
-    let resp = client
-        .post(format!("{base}/api/v1/sync/push"))
-        .header("x-agent-id", "fed-test-dryrun")
-        .json(&body)
-        .send()
-        .await
-        .expect("sync push dry-run");
-    let resp_body: Value = resp.json().await.expect("body");
-    assert_eq!(resp_body["applied"], 0);
-    assert_eq!(resp_body["noop"], 1);
-    assert_eq!(resp_body["dry_run"], true);
+#[test]
+fn federation_sync_push_dry_run_via_sal() {
+    with_legacy_push_env("federation_sync_push_dry_run_via_sal", async {
+        let Some(url) = postgres_url() else {
+            eprintln!("skipping federation_sync_push_dry_run_via_sal");
+            return;
+        };
+        let (base, shutdown, handle) = spawn_daemon(&url).await;
+        let client = pg_test_client("ai:cont2-test");
+        let unique_ns = format!("fed-dryrun-{}", uuid::Uuid::new_v4());
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let body = json!({
+            "sender_agent_id": "fed-test-dryrun",
+            "memories": [{
+                "id": mem_id,
+                "tier": "mid",
+                "namespace": unique_ns,
+                "title": format!("dryrun-{mem_id}"),
+                "content": "should not persist",
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "import",
+                "access_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "metadata": {"agent_id": "fed-test-dryrun"}
+            }],
+            "dry_run": true,
+        });
+        let resp = client
+            .post(format!("{base}/api/v1/sync/push"))
+            .header("x-agent-id", "fed-test-dryrun")
+            .json(&body)
+            .send()
+            .await
+            .expect("sync push dry-run");
+        let resp_body: Value = resp.json().await.expect("body");
+        assert_eq!(resp_body["applied"], 0);
+        assert_eq!(resp_body["noop"], 1);
+        assert_eq!(resp_body["dry_run"], true);
 
-    shutdown.notify_one();
-    let _ = handle.await;
+        shutdown.notify_one();
+        let _ = handle.await;
+    });
 }
 
 /// `sync_push` is idempotent on duplicate memory ids — second push
 /// of the same id with the same updated_at lands as a noop (matches
 /// sqlite's `db::insert_if_newer` contract).
-#[tokio::test(flavor = "multi_thread")]
-async fn federation_sync_push_idempotent_on_duplicate() {
-    let Some(url) = postgres_url() else {
-        eprintln!("skipping federation_sync_push_idempotent_on_duplicate");
-        return;
-    };
-    let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = pg_test_client("ai:cont2-test");
-    let unique_ns = format!("fed-dup-{}", uuid::Uuid::new_v4());
-    let mem_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let payload = json!({
-        "sender_agent_id": "fed-test-dup",
-        "memories": [{
-            "id": mem_id.clone(),
-            "tier": "long",
-            "namespace": unique_ns,
-            "title": format!("dup-{mem_id}"),
-            "content": "duplicate-test",
-            "tags": [],
-            "priority": 5,
-            "confidence": 1.0,
-            "source": "import",
-            "access_count": 0,
-            "created_at": now.clone(),
-            "updated_at": now.clone(),
-            "metadata": {"agent_id": "fed-test-dup"}
-        }],
-        "dry_run": false,
+#[test]
+fn federation_sync_push_idempotent_on_duplicate() {
+    with_legacy_push_env("federation_sync_push_idempotent_on_duplicate", async {
+        let Some(url) = postgres_url() else {
+            eprintln!("skipping federation_sync_push_idempotent_on_duplicate");
+            return;
+        };
+        let (base, shutdown, handle) = spawn_daemon(&url).await;
+        let client = pg_test_client("ai:cont2-test");
+        let unique_ns = format!("fed-dup-{}", uuid::Uuid::new_v4());
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let payload = json!({
+            "sender_agent_id": "fed-test-dup",
+            "memories": [{
+                "id": mem_id.clone(),
+                "tier": "long",
+                "namespace": unique_ns,
+                "title": format!("dup-{mem_id}"),
+                "content": "duplicate-test",
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "import",
+                "access_count": 0,
+                "created_at": now.clone(),
+                "updated_at": now.clone(),
+                "metadata": {"agent_id": "fed-test-dup"}
+            }],
+            "dry_run": false,
+        });
+
+        let r1 = client
+            .post(format!("{base}/api/v1/sync/push"))
+            .header("x-agent-id", "fed-test-dup")
+            .json(&payload)
+            .send()
+            .await
+            .expect("first push")
+            .json::<Value>()
+            .await
+            .expect("body");
+        assert_eq!(r1["applied"], 1);
+
+        // Second push of the same row — apply_remote_memory's
+        // ON CONFLICT path keeps the row as-is.
+        let r2 = client
+            .post(format!("{base}/api/v1/sync/push"))
+            .header("x-agent-id", "fed-test-dup")
+            .json(&payload)
+            .send()
+            .await
+            .expect("second push")
+            .json::<Value>()
+            .await
+            .expect("body");
+        // The row resolved to "applied" again (UPSERT) but content
+        // remained byte-identical — both 1's are acceptable; what we
+        // really test is no error / no skip / no exception.
+        assert!(
+            r2["applied"].as_u64().unwrap_or(0) + r2["noop"].as_u64().unwrap_or(0) >= 1,
+            "duplicate sync_push must not error"
+        );
+
+        shutdown.notify_one();
+        let _ = handle.await;
     });
-
-    let r1 = client
-        .post(format!("{base}/api/v1/sync/push"))
-        .header("x-agent-id", "fed-test-dup")
-        .json(&payload)
-        .send()
-        .await
-        .expect("first push")
-        .json::<Value>()
-        .await
-        .expect("body");
-    assert_eq!(r1["applied"], 1);
-
-    // Second push of the same row — apply_remote_memory's
-    // ON CONFLICT path keeps the row as-is.
-    let r2 = client
-        .post(format!("{base}/api/v1/sync/push"))
-        .header("x-agent-id", "fed-test-dup")
-        .json(&payload)
-        .send()
-        .await
-        .expect("second push")
-        .json::<Value>()
-        .await
-        .expect("body");
-    // The row resolved to "applied" again (UPSERT) but content
-    // remained byte-identical — both 1's are acceptable; what we
-    // really test is no error / no skip / no exception.
-    assert!(
-        r2["applied"].as_u64().unwrap_or(0) + r2["noop"].as_u64().unwrap_or(0) >= 1,
-        "duplicate sync_push must not error"
-    );
-
-    shutdown.notify_one();
-    let _ = handle.await;
 }
 
 // ===================================================================

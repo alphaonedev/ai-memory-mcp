@@ -60,6 +60,7 @@ pub mod erasure_outbox;
 pub mod identity;
 pub mod peer;
 pub mod peer_attestation;
+pub mod peer_posture;
 // v0.7.0 Track D #933 — federation push DLQ + replay worker.
 // #2678: the module is ungated on the default (sqlite-only) build so
 // failed fanouts land in `federation_push_dlq` rather than being
@@ -1891,6 +1892,51 @@ mod tests {
         )))
     }
 
+    /// #3582: authorize the fixture namespace in an isolated child test process.
+    /// Command env applies only at child launch; no lib-test process env mutation
+    /// or blocking lock crosses an await (UNSAFE-01, CONCURRENCY-20).
+    fn with_scoped_catchup_env(
+        name: &str,
+        start_paused: bool,
+        test: impl std::future::Future<Output = ()>,
+    ) {
+        const SCOPE: &str = r#"{"peer-0":{"allowed_namespaces":["catchup"]}}"#;
+        let full_name = format!("federation::tests::{name}");
+        let args: Vec<String> = std::env::args().collect();
+        let isolated = args.iter().any(|arg| arg == "--exact")
+            && args.iter().any(|arg| arg == &full_name)
+            && args.iter().any(|arg| arg == "--test-threads=1")
+            && std::env::var(super::peer_attestation::PEER_ATTESTATION_ENV).as_deref() == Ok(SCOPE);
+        if isolated {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(start_paused)
+                .build()
+                .expect("catchup test runtime")
+                .block_on(test);
+            return;
+        }
+        // Avoid inheriting another parallel test's temporary security posture.
+        // Only the short scratch root and explicit fixture authorization cross
+        // into the child; no operator config, keys or database are needed.
+        let output = std::process::Command::new(std::env::current_exe().expect("lib test binary"))
+            .args(["--exact", &full_name, "--test-threads=1", "--nocapture"])
+            .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env(super::peer_attestation::PEER_ATTESTATION_ENV, SCOPE)
+            .env(super::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "1")
+            .output()
+            .expect("isolated catchup test child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "{full_name}: isolated child must run exactly one passing test\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     /// Build a `FederationConfig` whose peer's `id` matches the segment we
     /// pull from sync_state — `peer-0`. This mirrors the production
     /// invariant: the catchup loop keys vector-clock entries by peer.id.
@@ -1978,272 +2024,312 @@ mod tests {
 
     // ---- catchup_once: pulls `since`, advances state ----
 
-    #[tokio::test]
-    async fn test_catchup_once_pulls_since_cursor_advances_state() {
-        // First-time catchup with empty sync_state: we expect the request
-        // to land WITHOUT a `since` query param, and after the call
-        // sync_state should be advanced to the latest memory's timestamp.
-        let mems = vec![
-            catchup_memory("a", "2026-04-26T10:00:00Z"),
-            catchup_memory("b", "2026-04-26T10:00:01Z"),
-            catchup_memory("c", "2026-04-26T10:00:02Z"),
-            catchup_memory("d", "2026-04-26T10:00:03Z"),
-            catchup_memory("e", "2026-04-26T10:00:04Z"),
-        ];
-        let latest_ts = mems.last().unwrap().updated_at.clone();
-        let (url, hits, last_since, last_peer) =
-            spawn_since_peer(SinceMockBehaviour::ReturnMemories(mems.clone())).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
+    #[test]
+    fn test_catchup_once_pulls_since_cursor_advances_state() {
+        with_scoped_catchup_env(
+            "test_catchup_once_pulls_since_cursor_advances_state",
+            false,
+            async {
+                // First-time catchup with empty sync_state: we expect the request
+                // to land WITHOUT a `since` query param, and after the call
+                // sync_state should be advanced to the latest memory's timestamp.
+                let mems = vec![
+                    catchup_memory("a", "2026-04-26T10:00:00Z"),
+                    catchup_memory("b", "2026-04-26T10:00:01Z"),
+                    catchup_memory("c", "2026-04-26T10:00:02Z"),
+                    catchup_memory("d", "2026-04-26T10:00:03Z"),
+                    catchup_memory("e", "2026-04-26T10:00:04Z"),
+                ];
+                let latest_ts = mems.last().unwrap().updated_at.clone();
+                let (url, hits, last_since, last_peer) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(mems.clone())).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
 
-        catchup_once(&cfg, &db).await;
+                catchup_once(&cfg, &db).await;
 
-        assert_eq!(hits.load(Ordering::Relaxed), 1, "peer hit exactly once");
-        // First-time call → no `since` query param.
-        assert!(
-            last_since.lock().await.is_none(),
-            "first catchup must omit since"
+                assert_eq!(hits.load(Ordering::Relaxed), 1, "peer hit exactly once");
+                // First-time call → no `since` query param.
+                assert!(
+                    last_since.lock().await.is_none(),
+                    "first catchup must omit since"
+                );
+                // Local agent id is forwarded.
+                assert_eq!(last_peer.lock().await.as_deref(), Some("ai:catchup-test"));
+                // sync_state advanced to the latest memory's timestamp.
+                let lock = db.lock().await;
+                let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test")
+                    .expect("load sync state");
+                assert_eq!(
+                    clock.entries.get("peer-0").map(String::as_str),
+                    Some(latest_ts.as_str()),
+                    "sync state advanced to latest pulled memory's updated_at"
+                );
+                // All 5 memories landed.
+                let count: i64 = lock
+                    .0
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 5, "all five memories inserted");
+            },
         );
-        // Local agent id is forwarded.
-        assert_eq!(last_peer.lock().await.as_deref(), Some("ai:catchup-test"));
-        // sync_state advanced to the latest memory's timestamp.
-        let lock = db.lock().await;
-        let clock =
-            crate::db::sync_state_load(&lock.0, "ai:catchup-test").expect("load sync state");
-        assert_eq!(
-            clock.entries.get("peer-0").map(String::as_str),
-            Some(latest_ts.as_str()),
-            "sync state advanced to latest pulled memory's updated_at"
-        );
-        // All 5 memories landed.
-        let count: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 5, "all five memories inserted");
     }
 
     // ---- catchup_once: empty array no-op ----
 
-    #[tokio::test]
-    async fn test_catchup_once_no_new_memories_no_op() {
-        let (url, hits, _, _) = spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
+    #[test]
+    fn test_catchup_once_no_new_memories_no_op() {
+        with_scoped_catchup_env("test_catchup_once_no_new_memories_no_op", false, async {
+            let (url, hits, _, _) =
+                spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
+            let cfg = build_catchup_cfg(&url, 2000);
+            let db = build_test_db();
 
-        catchup_once(&cfg, &db).await;
+            catchup_once(&cfg, &db).await;
 
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        let lock = db.lock().await;
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert!(
-            clock.entries.get("peer-0").is_none(),
-            "empty response must not advance sync_state"
-        );
-        let count: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
+            assert_eq!(hits.load(Ordering::Relaxed), 1);
+            let lock = db.lock().await;
+            let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+            assert!(
+                clock.entries.get("peer-0").is_none(),
+                "empty response must not advance sync_state"
+            );
+            let count: i64 = lock
+                .0
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        });
     }
 
     // ---- catchup_once: 5xx error swallowed, state untouched ----
 
-    #[tokio::test]
-    async fn test_catchup_once_peer_500_error_logged_no_panic() {
-        let (url, hits, _, _) = spawn_since_peer(SinceMockBehaviour::Error500).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
+    #[test]
+    fn test_catchup_once_peer_500_error_logged_no_panic() {
+        with_scoped_catchup_env(
+            "test_catchup_once_peer_500_error_logged_no_panic",
+            false,
+            async {
+                let (url, hits, _, _) = spawn_since_peer(SinceMockBehaviour::Error500).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
 
-        // Must NOT panic. The function logs at debug! and continues.
-        catchup_once(&cfg, &db).await;
+                // Must NOT panic. The function logs at debug! and continues.
+                catchup_once(&cfg, &db).await;
 
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        let lock = db.lock().await;
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert!(
-            clock.entries.get("peer-0").is_none(),
-            "500 must not advance sync state"
+                assert_eq!(hits.load(Ordering::Relaxed), 1);
+                let lock = db.lock().await;
+                let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+                assert!(
+                    clock.entries.get("peer-0").is_none(),
+                    "500 must not advance sync state"
+                );
+            },
         );
     }
 
     // ---- catchup_once: timeout swallowed ----
 
-    #[tokio::test]
-    async fn test_catchup_once_peer_timeout_handled() {
-        // Mock hangs for 2s, client timeout is 200ms → reqwest returns Err,
-        // catchup logs at debug! and skips this peer.
-        let (url, hits, _, _) =
-            spawn_since_peer(SinceMockBehaviour::Hang(Duration::from_secs(2))).await;
-        let cfg = build_catchup_cfg(&url, 200);
-        let db = build_test_db();
+    #[test]
+    fn test_catchup_once_peer_timeout_handled() {
+        with_scoped_catchup_env("test_catchup_once_peer_timeout_handled", false, async {
+            // Mock hangs for 2s, client timeout is 200ms → reqwest returns Err,
+            // catchup logs at debug! and skips this peer.
+            let (url, hits, _, _) =
+                spawn_since_peer(SinceMockBehaviour::Hang(Duration::from_secs(2))).await;
+            let cfg = build_catchup_cfg(&url, 200);
+            let db = build_test_db();
 
-        let start = Instant::now();
-        catchup_once(&cfg, &db).await;
-        let elapsed = start.elapsed();
+            let start = Instant::now();
+            catchup_once(&cfg, &db).await;
+            let elapsed = start.elapsed();
 
-        // Must return promptly after the client-timeout fires, not after
-        // the full 2s mock-side hang.
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "catchup_once should honour the client timeout, took {elapsed:?}"
-        );
-        assert_eq!(hits.load(Ordering::Relaxed), 1, "request was sent");
-        let lock = db.lock().await;
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert!(clock.entries.get("peer-0").is_none());
+            // Must return promptly after the client-timeout fires, not after
+            // the full 2s mock-side hang.
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "catchup_once should honour the client timeout, took {elapsed:?}"
+            );
+            assert_eq!(hits.load(Ordering::Relaxed), 1, "request was sent");
+            let lock = db.lock().await;
+            let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+            assert!(clock.entries.get("peer-0").is_none());
+        });
     }
 
     // ---- catchup_once: malformed JSON body ----
 
-    #[tokio::test]
-    async fn test_catchup_once_malformed_response_handled() {
-        let (url, hits, _, _) = spawn_since_peer(SinceMockBehaviour::MalformedBody).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
+    #[test]
+    fn test_catchup_once_malformed_response_handled() {
+        with_scoped_catchup_env(
+            "test_catchup_once_malformed_response_handled",
+            false,
+            async {
+                let (url, hits, _, _) = spawn_since_peer(SinceMockBehaviour::MalformedBody).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
 
-        // No panic — the function `tracing::warn!`s and skips the peer.
-        catchup_once(&cfg, &db).await;
+                // No panic — the function `tracing::warn!`s and skips the peer.
+                catchup_once(&cfg, &db).await;
 
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        let lock = db.lock().await;
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert!(
-            clock.entries.get("peer-0").is_none(),
-            "malformed body must not advance sync state"
+                assert_eq!(hits.load(Ordering::Relaxed), 1);
+                let lock = db.lock().await;
+                let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+                assert!(
+                    clock.entries.get("peer-0").is_none(),
+                    "malformed body must not advance sync state"
+                );
+            },
         );
     }
 
     // ---- catchup_once: only newer memories overwrite local ----
 
-    #[tokio::test]
-    async fn test_catchup_once_inserts_only_newer_memories() {
-        // Pre-seed local DB with a memory titled "shared" at t=10:00:01.
-        // Mock peer returns:
-        //   - "shared" at t=10:00:00  (older — must NOT clobber local)
-        //   - "fresh"  at t=10:00:02  (new title — must insert)
-        let db = build_test_db();
-        {
-            let lock = db.lock().await;
-            let local = catchup_memory("shared", "2026-04-26T10:00:01Z");
-            // Insert via the test path — this is the "we already have it
-            // locally at a newer timestamp" precondition.
-            crate::db::insert_if_newer(&lock.0, &local).unwrap();
-            // Confirm pre-state.
-            let cnt: i64 = lock
+    #[test]
+    fn test_catchup_once_inserts_only_newer_memories() {
+        with_scoped_catchup_env(
+            "test_catchup_once_inserts_only_newer_memories",
+            false,
+            async {
+                // Pre-seed local DB with a memory titled "shared" at t=10:00:01.
+                // Mock peer returns:
+                //   - "shared" at t=10:00:00  (older — must NOT clobber local)
+                //   - "fresh"  at t=10:00:02  (new title — must insert)
+                let db = build_test_db();
+                {
+                    let lock = db.lock().await;
+                    let local = catchup_memory("shared", "2026-04-26T10:00:01Z");
+                    // Insert via the test path — this is the "we already have it
+                    // locally at a newer timestamp" precondition.
+                    crate::db::insert_if_newer(&lock.0, &local).unwrap();
+                    // Confirm pre-state.
+                    let cnt: i64 = lock
+                        .0
+                        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(cnt, 1, "pre-seeded shared row");
+                }
+
+                let mut stale_shared = catchup_memory("shared", "2026-04-26T10:00:00Z");
+                // Distinct content so the "did the older catchup body win?" assertion
+                // is meaningful — base catchup_memory derives content from title.
+                stale_shared.content = "stale-from-catchup-peer".to_string();
+                stale_shared.id = "cat-shared-OLD".to_string();
+                let stale_shared_content = stale_shared.content.clone();
+                let new_fresh = catchup_memory("fresh", "2026-04-26T10:00:02Z");
+                let (url, _, _, _) = spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![
+                    stale_shared,
+                    new_fresh,
+                ]))
+                .await;
+                let cfg = build_catchup_cfg(&url, 2000);
+
+                catchup_once(&cfg, &db).await;
+
+                let lock = db.lock().await;
+                // Both rows now exist.
+                let cnt: i64 = lock
+                    .0
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(cnt, 2, "fresh row inserted, shared kept");
+                // The "shared" row's content must still be the locally-seeded
+                // version (older catchup body did NOT win).
+                let shared_content: String = lock
                 .0
-                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .query_row(
+                    "SELECT content FROM memories WHERE title = 'shared' AND namespace = 'catchup'",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(cnt, 1, "pre-seeded shared row");
-        }
-
-        let mut stale_shared = catchup_memory("shared", "2026-04-26T10:00:00Z");
-        // Distinct content so the "did the older catchup body win?" assertion
-        // is meaningful — base catchup_memory derives content from title.
-        stale_shared.content = "stale-from-catchup-peer".to_string();
-        stale_shared.id = "cat-shared-OLD".to_string();
-        let stale_shared_content = stale_shared.content.clone();
-        let new_fresh = catchup_memory("fresh", "2026-04-26T10:00:02Z");
-        let (url, _, _, _) = spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![
-            stale_shared,
-            new_fresh,
-        ]))
-        .await;
-        let cfg = build_catchup_cfg(&url, 2000);
-
-        catchup_once(&cfg, &db).await;
-
-        let lock = db.lock().await;
-        // Both rows now exist.
-        let cnt: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(cnt, 2, "fresh row inserted, shared kept");
-        // The "shared" row's content must still be the locally-seeded
-        // version (older catchup body did NOT win).
-        let shared_content: String = lock
-            .0
-            .query_row(
-                "SELECT content FROM memories WHERE title = 'shared' AND namespace = 'catchup'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_ne!(
-            shared_content, stale_shared_content,
-            "older catchup memory must NOT overwrite newer local row"
-        );
-        // sync_state advanced to the LATEST timestamp seen, not to the
-        // one we actually applied — function tracks `latest_ts` over the
-        // whole batch.
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert_eq!(
-            clock.entries.get("peer-0").map(String::as_str),
-            Some("2026-04-26T10:00:02Z"),
+                assert_ne!(
+                    shared_content, stale_shared_content,
+                    "older catchup memory must NOT overwrite newer local row"
+                );
+                // sync_state advanced to the LATEST timestamp seen, not to the
+                // one we actually applied — function tracks `latest_ts` over the
+                // whole batch.
+                let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+                assert_eq!(
+                    clock.entries.get("peer-0").map(String::as_str),
+                    Some("2026-04-26T10:00:02Z"),
+                );
+            },
         );
     }
 
     // ---- spawn_catchup_loop: runs at interval (paused-time) ----
 
-    #[tokio::test(start_paused = true)]
-    async fn test_spawn_catchup_loop_runs_at_interval() {
-        // The loop sleeps 5s up-front then ticks every `interval`. With
-        // paused time, advance past the initial sleep and one full tick
-        // and assert the mock saw at least one hit.
-        let (url, hits, _, _) = spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
-        let cfg = build_catchup_cfg(&url, 5000);
-        let db = build_test_db();
+    #[test]
+    fn test_spawn_catchup_loop_runs_at_interval() {
+        with_scoped_catchup_env("test_spawn_catchup_loop_runs_at_interval", true, async {
+            // The loop sleeps 5s up-front then ticks every `interval`. With
+            // paused time, advance past the initial sleep and one full tick
+            // and assert the mock saw at least one hit.
+            let (url, hits, _, _) =
+                spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
+            let cfg = build_catchup_cfg(&url, 5000);
+            let db = build_test_db();
 
-        let handle = spawn_catchup_loop(cfg, db, Duration::from_secs(60));
+            let handle = spawn_catchup_loop(cfg, db, Duration::from_secs(60));
 
-        // Advance past the 5s startup delay + give the first catchup_once
-        // a slice of real wall-clock to actually execute the network call.
-        // Paused time still yields() between awaits; the network IO is
-        // not virtualized — so we step in chunks separated by yields.
-        for _ in 0..6 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-        }
-        // Allow the spawned reqwest::send to actually complete on the
-        // real runtime — a small real-time wait covers in-process axum
-        // round-trip latency without paused-time interference.
-        for _ in 0..50 {
-            if hits.load(Ordering::Relaxed) >= 1 {
-                break;
+            // Advance past the 5s startup delay + give the first catchup_once
+            // a slice of real wall-clock to actually execute the network call.
+            // Paused time still yields() between awaits; the network IO is
+            // not virtualized — so we step in chunks separated by yields.
+            for _ in 0..6 {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-            tokio::time::advance(Duration::from_millis(10)).await;
-        }
+            // Allow the spawned reqwest::send to actually complete on the
+            // real runtime — a small real-time wait covers in-process axum
+            // round-trip latency without paused-time interference.
+            for _ in 0..50 {
+                if hits.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(10)).await;
+            }
 
-        assert!(
-            hits.load(Ordering::Relaxed) >= 1,
-            "first catchup tick must hit the mock peer (got {})",
-            hits.load(Ordering::Relaxed),
-        );
+            assert!(
+                hits.load(Ordering::Relaxed) >= 1,
+                "first catchup tick must hit the mock peer (got {})",
+                hits.load(Ordering::Relaxed),
+            );
 
-        handle.abort();
+            handle.abort();
+        });
     }
 
     // ---- spawn_catchup_loop: aborts cleanly on handle drop ----
 
-    #[tokio::test]
-    async fn test_spawn_catchup_loop_aborts_cleanly_on_handle_drop() {
-        // Drop the JoinHandle (via abort) and confirm the task ends quickly
-        // — no lingering tasks, no panics from being killed mid-tick.
-        let (url, _, _, _) = spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
+    #[test]
+    fn test_spawn_catchup_loop_aborts_cleanly_on_handle_drop() {
+        with_scoped_catchup_env(
+            "test_spawn_catchup_loop_aborts_cleanly_on_handle_drop",
+            false,
+            async {
+                // Drop the JoinHandle (via abort) and confirm the task ends quickly
+                // — no lingering tasks, no panics from being killed mid-tick.
+                let (url, _, _, _) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
 
-        let handle = spawn_catchup_loop(cfg, db, Duration::from_secs(crate::SECS_PER_HOUR as u64));
-        // Don't let it run a full 5s startup-sleep. Abort and confirm
-        // the join future resolves promptly with a Cancelled error.
-        handle.abort();
-        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
-        let join = result.expect("aborted handle must resolve within 500ms");
-        assert!(
-            join.is_err() && join.unwrap_err().is_cancelled(),
-            "handle.abort() must surface as is_cancelled() == true"
+                let handle =
+                    spawn_catchup_loop(cfg, db, Duration::from_secs(crate::SECS_PER_HOUR as u64));
+                // Don't let it run a full 5s startup-sleep. Abort and confirm
+                // the join future resolves promptly with a Cancelled error.
+                handle.abort();
+                let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+                let join = result.expect("aborted handle must resolve within 500ms");
+                assert!(
+                    join.is_err() && join.unwrap_err().is_cancelled(),
+                    "handle.abort() must surface as is_cancelled() == true"
+                );
+            },
         );
     }
 
@@ -2803,40 +2889,51 @@ mod tests {
     /// the constructed `since` URL appends `/api/v1/sync/since` to the
     /// raw base. Exercises the trim-noop branch at the start of
     /// catchup_once.
-    #[tokio::test]
-    async fn catchup_once_peer_url_without_push_suffix_still_builds_since() {
-        let (url, hits, _, last_peer) =
-            spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
-        // Build a config whose peer.sync_push_url does NOT end in
-        // `/api/v1/sync/push`. The trim_end_matches in catchup_once is
-        // a no-op for this shape, so the base URL is the raw `url`.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(2000))
-            .build()
-            .unwrap();
-        let cfg = FederationConfig {
-            policy: QuorumPolicy::new(2, 1, Duration::from_millis(2000), Duration::from_secs(30))
-                .unwrap(),
-            peers: vec![PeerEndpoint {
-                id: "peer-0".to_string(),
-                // No /api/v1/sync/push suffix — verifies the trim is
-                // tolerant of unexpected shapes.
-                sync_push_url: url.clone(),
-            }],
-            client,
-            sender_agent_id: "ai:no-suffix".to_string(),
-            api_key: None,
-            signing_key: None,
-            dlq_sink: None,
-        };
-        let db = build_test_db();
-        catchup_once(&cfg, &db).await;
-        // The mock saw a hit at /api/v1/sync/since with the local agent id.
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            last_peer.lock().await.as_deref(),
-            Some("ai:no-suffix"),
-            "local agent id should be forwarded as ?peer="
+    #[test]
+    fn catchup_once_peer_url_without_push_suffix_still_builds_since() {
+        with_scoped_catchup_env(
+            "catchup_once_peer_url_without_push_suffix_still_builds_since",
+            false,
+            async {
+                let (url, hits, _, last_peer) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![])).await;
+                // Build a config whose peer.sync_push_url does NOT end in
+                // `/api/v1/sync/push`. The trim_end_matches in catchup_once is
+                // a no-op for this shape, so the base URL is the raw `url`.
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_millis(2000))
+                    .build()
+                    .unwrap();
+                let cfg = FederationConfig {
+                    policy: QuorumPolicy::new(
+                        2,
+                        1,
+                        Duration::from_millis(2000),
+                        Duration::from_secs(30),
+                    )
+                    .unwrap(),
+                    peers: vec![PeerEndpoint {
+                        id: "peer-0".to_string(),
+                        // No /api/v1/sync/push suffix — verifies the trim is
+                        // tolerant of unexpected shapes.
+                        sync_push_url: url.clone(),
+                    }],
+                    client,
+                    sender_agent_id: "ai:no-suffix".to_string(),
+                    api_key: None,
+                    signing_key: None,
+                    dlq_sink: None,
+                };
+                let db = build_test_db();
+                catchup_once(&cfg, &db).await;
+                // The mock saw a hit at /api/v1/sync/since with the local agent id.
+                assert_eq!(hits.load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    last_peer.lock().await.as_deref(),
+                    Some("ai:no-suffix"),
+                    "local agent id should be forwarded as ?peer="
+                );
+            },
         );
     }
 
@@ -2845,46 +2942,53 @@ mod tests {
     /// IS applied; sync_state advances to the latest TS seen. Exercises
     /// the `if crate::validate::validate_memory(&mem).is_err() { continue; }`
     /// branch which the F9 happy-path tests don't trigger.
-    #[tokio::test]
-    async fn catchup_once_skips_invalid_memory_but_applies_valid_neighbour() {
-        // valid memory uses source="system" (whitelisted by validate_memory).
-        let valid = catchup_memory("ok-mem", "2026-04-26T10:00:00Z");
-        // invalid memory has source not in the allowlist (validate fails).
-        let mut bad = catchup_memory("bad-source", "2026-04-26T10:00:01Z");
-        bad.source = "made-up-source-not-in-allowlist".to_string();
-        let mems = vec![valid.clone(), bad];
+    #[test]
+    fn catchup_once_skips_invalid_memory_but_applies_valid_neighbour() {
+        with_scoped_catchup_env(
+            "catchup_once_skips_invalid_memory_but_applies_valid_neighbour",
+            false,
+            async {
+                // valid memory uses source="system" (whitelisted by validate_memory).
+                let valid = catchup_memory("ok-mem", "2026-04-26T10:00:00Z");
+                // invalid memory has source not in the allowlist (validate fails).
+                let mut bad = catchup_memory("bad-source", "2026-04-26T10:00:01Z");
+                bad.source = "made-up-source-not-in-allowlist".to_string();
+                let mems = vec![valid.clone(), bad];
 
-        let (url, hits, _, _) = spawn_since_peer(SinceMockBehaviour::ReturnMemories(mems)).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
-        catchup_once(&cfg, &db).await;
+                let (url, hits, _, _) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(mems)).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
+                catchup_once(&cfg, &db).await;
 
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        let lock = db.lock().await;
-        // Only the valid memory was inserted.
-        let count: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1, "only the valid memory should land");
-        let title: String = lock
-            .0
-            .query_row(
-                "SELECT title FROM memories WHERE namespace='catchup' LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(title, "ok-mem");
-        // sync_state advanced to the latest TS of the APPLIED rows
-        // only — the validate-fail `continue` happens before the
-        // `latest_ts` bump, so the invalid 10:00:01 row does NOT
-        // contribute. Net: latest_ts == valid memory's timestamp.
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert_eq!(
-            clock.entries.get("peer-0").map(String::as_str),
-            Some("2026-04-26T10:00:00Z"),
-            "sync_state tracks latest_ts of validate-passing rows"
+                assert_eq!(hits.load(Ordering::Relaxed), 1);
+                let lock = db.lock().await;
+                // Only the valid memory was inserted.
+                let count: i64 = lock
+                    .0
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 1, "only the valid memory should land");
+                let title: String = lock
+                    .0
+                    .query_row(
+                        "SELECT title FROM memories WHERE namespace='catchup' LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(title, "ok-mem");
+                // sync_state advanced to the latest TS of the APPLIED rows
+                // only — the validate-fail `continue` happens before the
+                // `latest_ts` bump, so the invalid 10:00:01 row does NOT
+                // contribute. Net: latest_ts == valid memory's timestamp.
+                let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+                assert_eq!(
+                    clock.entries.get("peer-0").map(String::as_str),
+                    Some("2026-04-26T10:00:00Z"),
+                    "sync_state tracks latest_ts of validate-passing rows"
+                );
+            },
         );
     }
 
@@ -2909,53 +3013,60 @@ mod tests {
     /// the per-request anonymous fallback. This test pins the catchup path
     /// directly so future refactors of `insert_if_newer` can't silently
     /// regress the federation contract.
-    #[tokio::test]
-    async fn l11_catchup_preserves_original_agent_id_through_replication() {
-        // Build a peer-side memory carrying alice's claim.
-        let mut alice_mem = catchup_memory("alice-note", "2026-05-10T10:00:00Z");
-        alice_mem.metadata = serde_json::json!({
-            "agent_id": "ai:alice@plan-c",
-            "shared": "alice wrote this"
-        });
+    #[test]
+    fn l11_catchup_preserves_original_agent_id_through_replication() {
+        with_scoped_catchup_env(
+            "l11_catchup_preserves_original_agent_id_through_replication",
+            false,
+            async {
+                // Build a peer-side memory carrying alice's claim.
+                let mut alice_mem = catchup_memory("alice-note", "2026-05-10T10:00:00Z");
+                alice_mem.metadata = serde_json::json!({
+                    "agent_id": "ai:alice@plan-c",
+                    "shared": "alice wrote this"
+                });
 
-        let (url, hits, _, _) =
-            spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![alice_mem.clone()])).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
+                let (url, hits, _, _) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![alice_mem.clone()]))
+                        .await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
 
-        catchup_once(&cfg, &db).await;
+                catchup_once(&cfg, &db).await;
 
-        assert_eq!(hits.load(Ordering::Relaxed), 1, "catchup should hit once");
+                assert_eq!(hits.load(Ordering::Relaxed), 1, "catchup should hit once");
 
-        // Read back the replicated row and assert agent_id is intact.
-        let lock = db.lock().await;
-        let count: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1, "alice's row must land on the receiver");
+                // Read back the replicated row and assert agent_id is intact.
+                let lock = db.lock().await;
+                let count: i64 = lock
+                    .0
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 1, "alice's row must land on the receiver");
 
-        let (raw_metadata,): (String,) = lock
-            .0
-            .query_row(
-                "SELECT metadata FROM memories WHERE title='alice-note'",
-                [],
-                |r| Ok((r.get(0)?,)),
-            )
-            .unwrap();
-        let stored: serde_json::Value = serde_json::from_str(&raw_metadata).unwrap();
-        assert_eq!(
-            stored.get("agent_id").and_then(serde_json::Value::as_str),
-            Some("ai:alice@plan-c"),
-            "agent_id must survive federation replication verbatim — \
-             observed rewrite to receiver identity is the L11 NHI-D \
-             regression"
-        );
-        // Non-agent_id metadata fields must also round-trip.
-        assert_eq!(
-            stored.get("shared").and_then(serde_json::Value::as_str),
-            Some("alice wrote this"),
-            "sibling metadata fields must round-trip alongside agent_id"
+                let (raw_metadata,): (String,) = lock
+                    .0
+                    .query_row(
+                        "SELECT metadata FROM memories WHERE title='alice-note'",
+                        [],
+                        |r| Ok((r.get(0)?,)),
+                    )
+                    .unwrap();
+                let stored: serde_json::Value = serde_json::from_str(&raw_metadata).unwrap();
+                assert_eq!(
+                    stored.get("agent_id").and_then(serde_json::Value::as_str),
+                    Some("ai:alice@plan-c"),
+                    "agent_id must survive federation replication verbatim — \
+                 observed rewrite to receiver identity is the L11 NHI-D \
+                 regression"
+                );
+                // Non-agent_id metadata fields must also round-trip.
+                assert_eq!(
+                    stored.get("shared").and_then(serde_json::Value::as_str),
+                    Some("alice wrote this"),
+                    "sibling metadata fields must round-trip alongside agent_id"
+                );
+            },
         );
     }
 
@@ -2983,37 +3094,43 @@ mod tests {
     /// loop `continue`s without applying anything or advancing
     /// sync_state. Hits the `None => continue` arm at line ~1478
     /// (the existing F9 tests always include the `memories` array).
-    #[tokio::test]
-    async fn catchup_once_body_without_memories_key_is_skipped() {
-        // Hand-rolled handler returning `{"applied": 0}` (no memories key).
-        let app = Router::new().route(
-            "/api/v1/sync/since",
-            axum::routing::get(|| async {
-                (
-                    StatusCode::OK,
-                    AxumJson(serde_json::json!({"applied":0,"note":"empty cluster"})),
-                )
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        let url = format!("http://{addr}");
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
-        catchup_once(&cfg, &db).await;
-        let lock = db.lock().await;
-        let count: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "no memories key → no inserts");
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert!(
-            clock.entries.get("peer-0").is_none(),
-            "no memories key → sync_state untouched"
+    #[test]
+    fn catchup_once_body_without_memories_key_is_skipped() {
+        with_scoped_catchup_env(
+            "catchup_once_body_without_memories_key_is_skipped",
+            false,
+            async {
+                // Hand-rolled handler returning `{"applied": 0}` (no memories key).
+                let app = Router::new().route(
+                    "/api/v1/sync/since",
+                    axum::routing::get(|| async {
+                        (
+                            StatusCode::OK,
+                            AxumJson(serde_json::json!({"applied":0,"note":"empty cluster"})),
+                        )
+                    }),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.ok();
+                });
+                let url = format!("http://{addr}");
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
+                catchup_once(&cfg, &db).await;
+                let lock = db.lock().await;
+                let count: i64 = lock
+                    .0
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0, "no memories key → no inserts");
+                let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+                assert!(
+                    clock.entries.get("peer-0").is_none(),
+                    "no memories key → sync_state untouched"
+                );
+            },
         );
     }
 
@@ -3021,41 +3138,48 @@ mod tests {
     /// a `memories` array containing an unparseable element. The
     /// individual element is skipped (`serde_json::from_value` Err) and
     /// the rest of the batch is applied. Hits lines 1492-1494.
-    #[tokio::test]
-    async fn catchup_once_unparseable_individual_memory_is_skipped() {
-        // `memories[0]` is a valid Memory, `memories[1]` is a JSON object
-        // with the wrong shape (missing required fields).
-        let valid_mem = serde_json::to_value(catchup_memory("ok", "2026-04-26T10:00:00Z")).unwrap();
-        let bad_mem = serde_json::json!({"id":"oops","not_a_memory_field": true});
-        let app = Router::new().route(
-            "/api/v1/sync/since",
-            axum::routing::get(move || {
-                let valid = valid_mem.clone();
-                let bad = bad_mem.clone();
-                async move {
-                    (
-                        StatusCode::OK,
-                        AxumJson(serde_json::json!({"memories": [valid, bad]})),
-                    )
-                }
-            }),
+    #[test]
+    fn catchup_once_unparseable_individual_memory_is_skipped() {
+        with_scoped_catchup_env(
+            "catchup_once_unparseable_individual_memory_is_skipped",
+            false,
+            async {
+                // `memories[0]` is a valid Memory, `memories[1]` is a JSON object
+                // with the wrong shape (missing required fields).
+                let valid_mem =
+                    serde_json::to_value(catchup_memory("ok", "2026-04-26T10:00:00Z")).unwrap();
+                let bad_mem = serde_json::json!({"id":"oops","not_a_memory_field": true});
+                let app = Router::new().route(
+                    "/api/v1/sync/since",
+                    axum::routing::get(move || {
+                        let valid = valid_mem.clone();
+                        let bad = bad_mem.clone();
+                        async move {
+                            (
+                                StatusCode::OK,
+                                AxumJson(serde_json::json!({"memories": [valid, bad]})),
+                            )
+                        }
+                    }),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.ok();
+                });
+                let url = format!("http://{addr}");
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
+                catchup_once(&cfg, &db).await;
+                let lock = db.lock().await;
+                // Only the parseable memory landed.
+                let count: i64 = lock
+                    .0
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 1, "only parseable memory inserted");
+            },
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        let url = format!("http://{addr}");
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
-        catchup_once(&cfg, &db).await;
-        let lock = db.lock().await;
-        // Only the parseable memory landed.
-        let count: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1, "only parseable memory inserted");
     }
 
     /// W12-G #16: id-drift on `broadcast_delete_quorum` exercises the
@@ -3471,47 +3595,53 @@ mod tests {
     // observe at end of batch are both hit.
 
     #[cfg(feature = "sal")]
-    #[tokio::test]
-    async fn catchup_once_with_store_applies_via_sal_handle() {
-        use super::receive::catchup_once_with_store;
-        use crate::store::MemoryStore;
+    #[test]
+    fn catchup_once_with_store_applies_via_sal_handle() {
+        with_scoped_catchup_env(
+            "catchup_once_with_store_applies_via_sal_handle",
+            false,
+            async {
+                use super::receive::catchup_once_with_store;
+                use crate::store::MemoryStore;
 
-        let mem = catchup_memory("sal-applied", "2026-04-26T10:00:00Z");
-        let (url, hits, _, _) =
-            spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![mem.clone()])).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
-        // Build a SqliteStore on the same DB path the federation Db
-        // owns. Since build_test_db returns an in-memory db that is
-        // distinct from any SqliteStore-opened DB, we use a tempdir
-        // for the SAL store and a separate in-memory db for the
-        // Federation Db. The catchup path writes via the store; the
-        // vector-clock advancement happens on the Federation Db.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store_path = dir.path().join("store.db");
-        let store: Arc<dyn MemoryStore> = Arc::new(
-            crate::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
-        );
-        catchup_once_with_store(&cfg, &db, Some(&store)).await;
+                let mem = catchup_memory("sal-applied", "2026-04-26T10:00:00Z");
+                let (url, hits, _, _) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![mem.clone()])).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
+                // Build a SqliteStore on the same DB path the federation Db
+                // owns. Since build_test_db returns an in-memory db that is
+                // distinct from any SqliteStore-opened DB, we use a tempdir
+                // for the SAL store and a separate in-memory db for the
+                // Federation Db. The catchup path writes via the store; the
+                // vector-clock advancement happens on the Federation Db.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let store_path = dir.path().join("store.db");
+                let store: Arc<dyn MemoryStore> = Arc::new(
+                    crate::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
+                );
+                catchup_once_with_store(&cfg, &db, Some(&store)).await;
 
-        assert_eq!(hits.load(Ordering::Relaxed), 1, "peer must be hit once");
-        // The mem must have been applied via the SAL store handle —
-        // read it back through the store's get() method.
-        let ctx = crate::store::CallerContext::for_agent("test");
-        let got = store
-            .get(&ctx, &mem.id)
-            .await
-            .expect("SAL store should have the catchup memory");
-        assert_eq!(got.title, "sal-applied");
+                assert_eq!(hits.load(Ordering::Relaxed), 1, "peer must be hit once");
+                // The mem must have been applied via the SAL store handle —
+                // read it back through the store's get() method.
+                let ctx = crate::store::CallerContext::for_agent("test");
+                let got = store
+                    .get(&ctx, &mem.id)
+                    .await
+                    .expect("SAL store should have the catchup memory");
+                assert_eq!(got.title, "sal-applied");
 
-        // sync_state should have advanced to the memory's timestamp on
-        // the Federation Db (sync_state is always tracked via the
-        // local rusqlite handle even on SAL builds).
-        let lock = db.lock().await;
-        let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
-        assert_eq!(
-            clock.entries.get("peer-0").map(String::as_str),
-            Some("2026-04-26T10:00:00Z"),
+                // sync_state should have advanced to the memory's timestamp on
+                // the Federation Db (sync_state is always tracked via the
+                // local rusqlite handle even on SAL builds).
+                let lock = db.lock().await;
+                let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
+                assert_eq!(
+                    clock.entries.get("peer-0").map(String::as_str),
+                    Some("2026-04-26T10:00:00Z"),
+                );
+            },
         );
     }
 
@@ -3520,50 +3650,63 @@ mod tests {
     /// `else` branch (line 219-247 of receive.rs) is exercised by
     /// the SAL build.
     #[cfg(feature = "sal")]
-    #[tokio::test]
-    async fn catchup_once_with_store_none_uses_legacy_rusqlite() {
-        use super::receive::catchup_once_with_store;
-        let mem = catchup_memory("legacy-applied", "2026-04-26T10:00:00Z");
-        let (url, hits, _, _) =
-            spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![mem])).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
-        catchup_once_with_store(&cfg, &db, None).await;
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        let lock = db.lock().await;
-        let count: i64 = lock
-            .0
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1, "legacy path must insert the row locally");
+    #[test]
+    fn catchup_once_with_store_none_uses_legacy_rusqlite() {
+        with_scoped_catchup_env(
+            "catchup_once_with_store_none_uses_legacy_rusqlite",
+            false,
+            async {
+                use super::receive::catchup_once_with_store;
+                let mem = catchup_memory("legacy-applied", "2026-04-26T10:00:00Z");
+                let (url, hits, _, _) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(vec![mem])).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
+                catchup_once_with_store(&cfg, &db, None).await;
+                assert_eq!(hits.load(Ordering::Relaxed), 1);
+                let lock = db.lock().await;
+                let count: i64 = lock
+                    .0
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 1, "legacy path must insert the row locally");
+            },
+        );
     }
 
     /// SAL store path with an invalid memory in the batch — the
     /// `validate_memory` skip-branch must trigger and the valid
     /// neighbour must still apply via the store handle.
     #[cfg(feature = "sal")]
-    #[tokio::test]
-    async fn catchup_once_with_store_skips_invalid_memory_via_sal_path() {
-        use super::receive::catchup_once_with_store;
-        let valid = catchup_memory("sal-valid", "2026-04-26T10:00:00Z");
-        let mut bad = catchup_memory("sal-bad", "2026-04-26T10:00:01Z");
-        bad.source = "not-in-allowlist".to_string();
-        let mems = vec![valid.clone(), bad];
+    #[test]
+    fn catchup_once_with_store_skips_invalid_memory_via_sal_path() {
+        with_scoped_catchup_env(
+            "catchup_once_with_store_skips_invalid_memory_via_sal_path",
+            false,
+            async {
+                use super::receive::catchup_once_with_store;
+                let valid = catchup_memory("sal-valid", "2026-04-26T10:00:00Z");
+                let mut bad = catchup_memory("sal-bad", "2026-04-26T10:00:01Z");
+                bad.source = "not-in-allowlist".to_string();
+                let mems = vec![valid.clone(), bad];
 
-        let (url, _, _, _) = spawn_since_peer(SinceMockBehaviour::ReturnMemories(mems)).await;
-        let cfg = build_catchup_cfg(&url, 2000);
-        let db = build_test_db();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store: Arc<dyn crate::store::MemoryStore> = Arc::new(
-            crate::store::sqlite::SqliteStore::open(dir.path().join("store.db"))
-                .expect("open SqliteStore"),
-        );
-        catchup_once_with_store(&cfg, &db, Some(&store)).await;
-        // Only the valid memory should be in the SAL store.
-        let ctx = crate::store::CallerContext::for_agent("test");
-        assert!(
-            store.get(&ctx, &valid.id).await.is_ok(),
-            "valid memory must land via SAL store"
+                let (url, _, _, _) =
+                    spawn_since_peer(SinceMockBehaviour::ReturnMemories(mems)).await;
+                let cfg = build_catchup_cfg(&url, 2000);
+                let db = build_test_db();
+                let dir = tempfile::tempdir().expect("tempdir");
+                let store: Arc<dyn crate::store::MemoryStore> = Arc::new(
+                    crate::store::sqlite::SqliteStore::open(dir.path().join("store.db"))
+                        .expect("open SqliteStore"),
+                );
+                catchup_once_with_store(&cfg, &db, Some(&store)).await;
+                // Only the valid memory should be in the SAL store.
+                let ctx = crate::store::CallerContext::for_agent("test");
+                assert!(
+                    store.get(&ctx, &valid.id).await.is_ok(),
+                    "valid memory must land via SAL store"
+                );
+            },
         );
     }
 }

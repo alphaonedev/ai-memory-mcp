@@ -81,6 +81,11 @@ fn cmd(binary: &str) -> std::process::Command {
     // in their own test binaries.
     c.env("AI_MEMORY_FED_REQUIRE_SIG", "0");
     c.env("AI_MEMORY_FED_REQUIRE_NONCE", "0");
+    // #3582: these child-daemon fixtures test downstream replication with
+    // unsigned, header-less pushes. Select the existing Standard namespace
+    // opt-out explicitly; the parent process and tests/common stay unchanged.
+    // Default-required/scoped-allow state matrices run in their own binaries.
+    c.env("AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE", "0");
     // #1801→#1954 — the per-write CONTENT and per-signal AUTHOR signature
     // defaults flipped strict at v1.0.0. The leader daemons here fan out
     // client-authored rows (metadata.agent_id = the caller, e.g. `ai:s40`)

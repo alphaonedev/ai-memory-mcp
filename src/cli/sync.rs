@@ -681,6 +681,7 @@ pub async fn run_daemon(
     if args.peers.is_empty() {
         anyhow::bail!("at least one --peers URL is required");
     }
+    crate::federation::peer_posture::enforce_at_boot(true, None)?;
     let interval = args.interval.max(1);
     let batch_size = args.batch_size.max(1);
     let local_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;

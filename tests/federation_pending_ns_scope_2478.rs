@@ -625,37 +625,128 @@ async fn control_enrolled_scoped_peer_in_scope_pair_applies_2478() {
     );
 }
 
-// ---------------------------------------------------------------------
-// CONTROL B — ZERO-CONFIG availability guard. With no allowlist the whole
-// gate short-circuits and replication is byte-identical to pre-#2478.
-// This is the #2491 lesson pinned: a gate that runs unconditionally is a
-// silent replication outage.
-// ---------------------------------------------------------------------
-
+// #3582 — no allowlist is fail-closed by default. Explicit Standard opt-out
+// and an explicit peer scope retain availability. Every case checks storage.
 #[tokio::test]
-async fn control_zero_config_pendings_decisions_apply_2478() {
+async fn required_scope_pending_pair_postures_3582() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
-    set_posture(None, None);
-    let (router, db) = build_router_with_db();
-    register_approver(&db).await;
+    for (allowlist, require, allowed) in [
+        (None, None, false),
+        (None, Some("1"), false),
+        (None, Some("0"), true),
+        (Some(SCOPED_ALLOWLIST_WITH_VICTIM), Some("1"), true),
+    ] {
+        set_posture(allowlist, require);
+        let (router, db) = build_router_with_db();
+        register_approver(&db).await;
+        let pid = uuid::Uuid::new_v4().to_string();
+        let entry = pending_entry(&pid, "store", VICTIM_NS, None, &store_payload(VICTIM_NS));
+        let (status, report) = push_governance(&router, vec![entry], vec![approve(&pid)]).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(
+            count_ns(&db, VICTIM_NS).await,
+            i64::from(allowed),
+            "{report}"
+        );
+        let guard = db.lock().await;
+        let pending = ai_memory::db::get_pending_action(&guard.0, &pid).unwrap();
+        assert_eq!(pending.is_some(), allowed, "pending persistence: {report}");
+        if let Some(pending) = pending {
+            assert_eq!(pending.namespace, VICTIM_NS);
+            assert_eq!(pending.status, "approved", "{report}");
+            assert_eq!(pending.decided_by.as_deref(), Some(APPROVER));
+        }
+        assert_eq!(
+            counter(&report, "pendings_applied"),
+            i64::from(allowed),
+            "{report}"
+        );
+        assert_eq!(
+            counter(&report, "pending_decisions_applied"),
+            i64::from(allowed),
+            "{report}"
+        );
+        assert_eq!(counter(&report, "skipped"), i64::from(!allowed), "{report}");
+    }
+}
 
-    let pid = uuid::Uuid::new_v4().to_string();
-    let entry = pending_entry(&pid, "store", VICTIM_NS, None, &store_payload(VICTIM_NS));
-    let (status, report) = push_governance(&router, vec![entry], vec![approve(&pid)]).await;
-    assert!(status.is_success(), "{report}");
-    assert_eq!(
-        count_ns(&db, VICTIM_NS).await,
-        1,
-        "#2478 ZERO-CONFIG: with no AI_MEMORY_FED_PEER_ATTESTATION configured the \
-         governance lanes must be byte-identical to pre-#2478. Refusing here would \
-         be the #2491 silent-outage class in a new lane. Report: {report}"
-    );
-    assert_eq!(
-        counter(&report, "pending_decisions_applied"),
-        1,
-        "#2478 ZERO-CONFIG: the decision must be counted as applied"
-    );
+// Decisions-only pushes address a locally seeded pending, so blocking insertion
+// alone cannot make this test pass. Denials preserve the entire pending row.
+#[tokio::test]
+async fn required_scope_local_pending_decision_postures_3582() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    for (allowlist, require, allowed) in [
+        (None, None, false),
+        (None, Some("1"), false),
+        (None, Some("0"), true),
+        (Some(SCOPED_ALLOWLIST_WITH_VICTIM), Some("1"), true),
+    ] {
+        for approved in [true, false] {
+            set_posture(allowlist, require);
+            let (router, db) = build_router_with_db();
+            register_approver(&db).await;
+            let victim_id = seed_row(&router, VICTIM_NS, "3582 decision target").await;
+            let pid = seed_local_pending(
+                &db,
+                ai_memory::models::GovernedAction::Delete,
+                VICTIM_NS,
+                Some(&victim_id),
+                PEER_ID,
+                &json!({}),
+            )
+            .await;
+            let before = {
+                let guard = db.lock().await;
+                serde_json::to_value(ai_memory::db::get_pending_action(&guard.0, &pid).unwrap())
+                    .unwrap()
+            };
+            let decider = if approved { APPROVER } else { PEER_ID };
+            let (status, report) = push_governance(
+                &router,
+                vec![],
+                vec![json!({"id": pid, "approved": approved, "decider": decider})],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{report}");
+            assert_eq!(
+                row_exists(&db, &victim_id).await,
+                !(allowed && approved),
+                "{report}"
+            );
+            let guard = db.lock().await;
+            let after = ai_memory::db::get_pending_action(&guard.0, &pid)
+                .unwrap()
+                .expect("local pending survives");
+            if allowed {
+                assert_eq!(
+                    after.status,
+                    if approved { "approved" } else { "rejected" },
+                    "{report}"
+                );
+                assert_eq!(after.decided_by.as_deref(), Some(decider));
+                assert!(after.decided_at.is_some());
+            } else {
+                assert_eq!(
+                    serde_json::to_value(Some(after)).unwrap(),
+                    before,
+                    "no vote/status/payload mutation: {report}"
+                );
+            }
+            assert_eq!(
+                counter(&report, "pending_decisions_applied"),
+                i64::from(allowed),
+                "{report}"
+            );
+            assert_eq!(
+                counter(&report, "deleted"),
+                i64::from(allowed && approved),
+                "{report}"
+            );
+            assert_eq!(counter(&report, "skipped"), i64::from(!allowed), "{report}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -667,7 +758,7 @@ async fn control_zero_config_pendings_decisions_apply_2478() {
 async fn pending_executed_delete_is_visible_in_the_report_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
-    set_posture(None, None);
+    set_posture(Some(SCOPED_ALLOWLIST_WITH_VICTIM), None);
     let (router, db) = build_router_with_db();
     register_approver(&db).await;
 
@@ -679,7 +770,7 @@ async fn pending_executed_delete_is_visible_in_the_report_2478() {
 
     assert!(
         !row_exists(&db, &victim_id).await,
-        "precondition: the zero-config delete must actually execute. Report: {report}"
+        "precondition: the scoped delete must actually execute. Report: {report}"
     );
     assert_eq!(
         counter(&report, "deleted"),

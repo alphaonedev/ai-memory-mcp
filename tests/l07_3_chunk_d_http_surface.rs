@@ -79,6 +79,12 @@ fn lock_hmac() -> std::sync::MutexGuard<'static, ()> {
 static FED_LEGACY_BYPASS_INIT: std::sync::Once = std::sync::Once::new();
 fn install_federation_legacy_bypass() {
     FED_LEGACY_BYPASS_INIT.call_once(|| unsafe {
+        // #3582: explicit Standard namespace opt-out lets this downstream
+        // control run; the required-scope refusal is pinned in its own suite.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
         std::env::set_var("AI_MEMORY_FED_TRUST_BODY_AGENT_ID", "1");
         std::env::set_var("AI_MEMORY_FED_SYNC_TRUST_PEER", "1");
         // #1789 — v0.8 flipped peer enrollment to the secure default

@@ -488,3 +488,125 @@ async fn federated_global_standard_refused_on_postgres_2479_3075() {
     );
     assert_eq!(unsupported(&report), 0, "{report}");
 }
+
+/// #3582 — match the SQLite bind/global/parent/clear posture matrix on row state.
+#[tokio::test]
+async fn no_allowlist_namespace_meta_posture_matrix_on_postgres_3582() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _lock = FED_ENV_LOCK.lock().await;
+    let _guard = PostureGuard;
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        clear_posture();
+        // SAFETY: every test in this binary holds FED_ENV_LOCK, including awaits.
+        unsafe {
+            std::env::set_var(REQUIRE_ATTEST_ENV, "0");
+            std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
+            if scoped {
+                std::env::set_var(
+                    ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                    json!({PEER_ID: {"allowed_namespaces": ["**"],
+                        "allowed_sender_agent_ids": [PEER_ID]}})
+                    .to_string(),
+                );
+            }
+            if let Some(value) = require {
+                std::env::set_var(
+                    ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                    value,
+                );
+            }
+        }
+        let (router, store) = pg_router(&url).await;
+        let pool = raw_pool(&url).await;
+        let victim = uniq("victim3582");
+        let parented = uniq("parented3582");
+        let parent = uniq("parent3582");
+        let doomed = uniq("doomed3582");
+        let old_standard = uuid::Uuid::new_v4().to_string();
+        let new_standard = uuid::Uuid::new_v4().to_string();
+        seed_standard_memory(&store, &old_standard, &victim).await;
+        seed_standard_memory(&store, &new_standard, &victim).await;
+        for ns in [victim.as_str(), doomed.as_str(), "*"] {
+            store
+                .set_namespace_standard(&admin_ctx(), ns, &old_standard, None)
+                .await
+                .expect("local baseline binding");
+        }
+        let before = sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(m) FROM namespace_meta m WHERE namespace = ANY($1) ORDER BY namespace",
+        )
+        .bind(vec![
+            victim.as_str(),
+            parented.as_str(),
+            doomed.as_str(),
+            "*",
+        ])
+        .fetch_all(&pool)
+        .await
+        .expect("snapshot metadata");
+        let (status, report) = push_namespace_meta(
+            &router,
+            vec![
+                meta_entry(&victim, &new_standard, None),
+                meta_entry("*", &new_standard, None),
+                meta_entry(&parented, &new_standard, Some(&parent)),
+            ],
+            vec![&doomed],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        if allowed {
+            for ns in [victim.as_str(), "*"] {
+                assert_eq!(
+                    meta_row(&pool, ns).await,
+                    Some((new_standard.clone(), None)),
+                    "{report}"
+                );
+            }
+            assert_eq!(
+                meta_row(&pool, &parented).await,
+                Some((new_standard.clone(), Some(parent.clone()))),
+                "{report}"
+            );
+            assert!(meta_row(&pool, &doomed).await.is_none(), "{report}");
+        } else {
+            let after = sqlx::query_scalar::<_, Value>(
+                "SELECT to_jsonb(m) FROM namespace_meta m WHERE namespace = ANY($1) ORDER BY namespace",
+            ).bind(vec![victim.as_str(), parented.as_str(), doomed.as_str(), "*"])
+                .fetch_all(&pool).await.expect("snapshot metadata after refusal");
+            assert_eq!(
+                after, before,
+                "full rows unchanged: scoped={scoped} require={require:?}: {report}"
+            );
+        }
+        assert_eq!(
+            report["namespace_meta_applied"],
+            json!(if allowed { 3 } else { 0 }),
+            "{report}"
+        );
+        assert_eq!(
+            report["namespace_meta_cleared"],
+            json!(u64::from(allowed)),
+            "{report}"
+        );
+        assert_eq!(
+            report["namespace_meta_refused"],
+            json!(if allowed { 0 } else { 4 }),
+            "{report}"
+        );
+        assert_eq!(unsupported(&report), 0, "{report}");
+        store
+            .clear_namespace_standard(&admin_ctx(), "*")
+            .await
+            .expect("clear global test binding");
+        pool.close().await;
+    }
+}

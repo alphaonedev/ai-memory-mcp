@@ -84,6 +84,13 @@ fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
     let port = free_port().to_string();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        // #3582: this is a fresh-node fixture; do not inherit operator peers
+        // or enrollment from the host configuration and key directories.
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.path().join("home"))
+        .env("XDG_CONFIG_HOME", dir.path().join("home/.config"))
+        .env("AI_MEMORY_KEY_DIR", dir.path().join("keys"))
         .arg("--db")
         .arg(&db)
         .args(["serve", "--host", "127.0.0.1", "--port", &port])

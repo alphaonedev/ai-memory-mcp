@@ -514,89 +514,119 @@ async fn federated_action_transition_outside_peer_scope_refused_2711_pg() {
 }
 
 // ---------------------------------------------------------------------
-// Posture guard — zero-config replication must be unchanged on pg too.
+// #3582 — absent-allowlist denial and explicit authorization controls.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn zero_config_confinement_lanes_still_apply_2711_pg() {
+async fn no_allowlist_confinement_posture_matrix_3582_pg() {
     let Some(url) = pg_url() else {
         eprintln!(
-            "SKIP zero_config_confinement_lanes_still_apply_2711_pg: no AI_MEMORY_TEST_POSTGRES_URL"
+            "SKIP no_allowlist_confinement_posture_matrix_3582_pg: no AI_MEMORY_TEST_POSTGRES_URL"
         );
         return;
     };
     let _g = FED_ENV_LOCK.lock().await;
-    let peer = uniq("ai:zeroconf");
-    let ns = uniq("secure/ops");
-    unsafe {
-        std::env::set_var(REQUIRE_ATTEST_ENV, "0");
-        std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
-        std::env::set_var(
-            ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
-            "0",
+    // #3582: identical mutations under default/explicit denial, rollout opt-out,
+    // and an explicit peer scope. All environment access holds the binary lock.
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        let peer = uniq("ai:zeroconf");
+        let ns = uniq("secure/ops");
+        unsafe {
+            std::env::set_var(REQUIRE_ATTEST_ENV, "0");
+            std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
+            std::env::set_var(
+                ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
+                "0",
+            );
+            std::env::set_var(
+                ai_memory::federation::receive_auth::REQUIRE_TRANSITION_SIG_ENV,
+                "0",
+            );
+            std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+            std::env::remove_var(
+                ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            );
+        }
+        // SAFETY: every test in this binary holds FED_ENV_LOCK.
+        unsafe {
+            if scoped {
+                std::env::set_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                json!({peer.clone(): {"allowed_namespaces": [ns.clone()], "allowed_sender_agent_ids": [peer.clone()]}}).to_string());
+            }
+            if let Some(value) = require {
+                std::env::set_var(
+                    ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                    value,
+                );
+            }
+        }
+        let (router, store) = pg_router(&url).await;
+
+        // link between two rows in secure/ops
+        let src = uuid::Uuid::new_v4().to_string();
+        let tgt = uuid::Uuid::new_v4().to_string();
+        seed_memory(&store, &src, &ns).await;
+        seed_memory(&store, &tgt, &ns).await;
+        // action in secure/ops
+        let action = uniq("act-zc");
+        seed_pending_action(&store, &action, &ns).await;
+        // signal in secure/ops
+        let sig_id = uniq("sig-zc");
+
+        let status = push(
+            &router,
+            &peer,
+            &json!({
+                "sender_agent_id": peer,
+                "sender_clock": {"entries": {}},
+                "memories": [],
+                "links": [wire_link(&src, &tgt)],
+                "signals": [wire_signal(&sig_id, &ns, &peer)],
+                "action_transitions": [wire_unsigned_transition(&action, &peer)],
+                "dry_run": false,
+            }),
+        )
+        .await;
+        assert!(status.is_success());
+
+        assert_eq!(
+            !store
+                .get_links_for_anchor(&src)
+                .await
+                .expect("get_links_for_anchor")
+                .is_empty(),
+            allowed,
+            "#3582: link persisted state scoped={scoped} require={require:?}"
         );
-        std::env::set_var(
-            ai_memory::federation::receive_auth::REQUIRE_TRANSITION_SIG_ENV,
-            "0",
+        assert_eq!(
+            store
+                .signal_get(&admin_ctx(), &sig_id)
+                .await
+                .expect("signal_get")
+                .is_some(),
+            allowed,
+            "#3582: signal persisted state scoped={scoped} require={require:?}"
         );
-        std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
-        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        assert_eq!(
+            store
+                .action_get(&admin_ctx(), &action)
+                .await
+                .expect("action_get")
+                .expect("action present")
+                .state,
+            if allowed {
+                ai_memory::models::ActionState::Claimed
+            } else {
+                ai_memory::models::ActionState::Pending
+            },
+            "#3582: transition persisted state scoped={scoped} require={require:?}"
+        );
+
+        clear_posture();
     }
-    let (router, store) = pg_router(&url).await;
-
-    // link between two rows in secure/ops
-    let src = uuid::Uuid::new_v4().to_string();
-    let tgt = uuid::Uuid::new_v4().to_string();
-    seed_memory(&store, &src, &ns).await;
-    seed_memory(&store, &tgt, &ns).await;
-    // action in secure/ops
-    let action = uniq("act-zc");
-    seed_pending_action(&store, &action, &ns).await;
-    // signal in secure/ops
-    let sig_id = uniq("sig-zc");
-
-    let status = push(
-        &router,
-        &peer,
-        &json!({
-            "sender_agent_id": peer,
-            "sender_clock": {"entries": {}},
-            "memories": [],
-            "links": [wire_link(&src, &tgt)],
-            "signals": [wire_signal(&sig_id, &ns, &peer)],
-            "action_transitions": [wire_unsigned_transition(&action, &peer)],
-            "dry_run": false,
-        }),
-    )
-    .await;
-    assert!(status.is_success());
-
-    assert!(
-        !store
-            .get_links_for_anchor(&src)
-            .await
-            .expect("get_links_for_anchor")
-            .is_empty(),
-        "#2711 (pg): zero-config link replication must be byte-identical to pre-fix"
-    );
-    assert!(
-        store
-            .signal_get(&admin_ctx(), &sig_id)
-            .await
-            .expect("signal_get")
-            .is_some(),
-        "#2711 (pg): zero-config signal replication must be byte-identical to pre-fix"
-    );
-    assert_eq!(
-        store
-            .action_get(&admin_ctx(), &action)
-            .await
-            .expect("action_get")
-            .expect("action present")
-            .state,
-        ai_memory::models::ActionState::Claimed,
-        "#2711 (pg): zero-config transition replication must be byte-identical to pre-fix"
-    );
-
-    clear_posture();
 }

@@ -1881,7 +1881,7 @@ auditing against it does not conclude they are unset:
 - [ ] `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` — **defaults ON** at v1.0.0 (per-signal author attestation).
 - [ ] `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` — **defaults ON** (authority-lane, per-resolution signature).
 - [ ] `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` — **defaults ON** (authority-lane, per-transition signature).
-- [ ] `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` — **defaults ON**; an ENROLLED peer that declares an empty `allowed_namespaces` is refused. Read the knob's full contract before setting it falsy — it is **not** a general rollout hatch.
+- [ ] `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` — **defaults ON**; an absent allowlist and an enrolled peer with empty `allowed_namespaces` are refused (#3582). With peers configured, `asi-hard` requires a valid, nonempty `AI_MEMORY_FED_PEER_ATTESTATION` at boot; Standard warns. Only Standard permits the explicit namespace opt-out. Read the [full contract](federation.html#current-defaults-and-boot-posture-3582): `=0` does not admit anonymous/unlisted peers under a configured map or override declared scopes.
 - [ ] `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` — **defaults ON**; `--insecure-skip-server-verify` no longer suffices on its own.
 - [ ] `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — **defaults ON** for a *detected*-stale peer policy epoch (absent/undeterminable is fail-open by design).
 

@@ -174,6 +174,12 @@ async fn count_ns(db: &ai_memory::handlers::Db, ns: &str) -> i64 {
 /// must pass (x-peer-id == `sender_agent_id`). Held inside `ENV_LOCK`.
 fn reset_env() {
     unsafe {
+        // #3582: explicit Standard namespace opt-out lets this downstream
+        // control run; the required-scope refusal is pinned in its own suite.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
         std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);

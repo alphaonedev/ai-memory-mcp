@@ -379,46 +379,52 @@ async fn federated_deletion_outside_peer_scope_refused_1934_pg() {
 }
 
 // ---------------------------------------------------------------------
-// Posture guard — zero-config replication must be unchanged on pg too.
+// #3582 — absent-allowlist denial and explicit authorization controls.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn zero_config_federation_write_still_applies_2447_pg() {
+async fn no_allowlist_write_posture_matrix_3582_pg() {
     let Some(url) = pg_url() else {
-        eprintln!(
-            "SKIP zero_config_federation_write_still_applies_2447_pg: no AI_MEMORY_TEST_POSTGRES_URL"
-        );
+        eprintln!("SKIP no_allowlist_write_posture_matrix_3582_pg: no AI_MEMORY_TEST_POSTGRES_URL");
         return;
     };
     let _g = FED_ENV_LOCK.lock().await;
-    let peer = uniq("ai:zeroconf");
-    let ns = uniq("secure/ops");
-    unsafe {
-        std::env::set_var(REQUIRE_ATTEST_ENV, "0");
-        std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
-        std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
-        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
-    }
     let (router, store) = pg_router(&url).await;
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let status = push(
-        &router,
-        &peer,
-        &json!({
+    for (scoped, require, allowed) in [
+        (false, None, false),
+        (false, Some("1"), false),
+        (false, Some("0"), true),
+        (true, Some("1"), true),
+    ] {
+        let peer = uniq("ai:posture");
+        let root = uniq("public");
+        let ns = format!("{root}/ok");
+        set_scoped_posture(&peer, &root);
+        // SAFETY: this binary serializes all environment access under FED_ENV_LOCK.
+        unsafe {
+            if !scoped {
+                std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+            }
+            if let Some(value) = require {
+                std::env::set_var(
+                    ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                    value,
+                );
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let status = push(&router, &peer, &json!({
             "sender_agent_id": peer,
             "sender_clock": {"entries": {}},
-            "memories": [wire_memory(&id, &ns, &peer, "zero-config replication", "2026-07-01T00:00:00+00:00")],
+            "memories": [wire_memory(&id, &ns, &peer, "namespace posture matrix", "2026-07-01T00:00:00+00:00")],
             "dry_run": false,
-        }),
-    )
-    .await;
-    assert!(status.is_success());
-    assert_eq!(
-        stored_namespace(&store, &id).await.as_deref(),
-        Some(ns.as_str()),
-        "#2447 (pg): zero-config federation must be byte-identical to pre-fix"
-    );
-
-    clear_posture();
+        })).await;
+        assert!(status.is_success());
+        assert_eq!(
+            stored_namespace(&store, &id).await.as_deref(),
+            allowed.then_some(ns.as_str()),
+            "#3582: persisted state, scoped={scoped} require={require:?}"
+        );
+        clear_posture();
+    }
 }

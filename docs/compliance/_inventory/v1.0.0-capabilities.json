@@ -5,6 +5,24 @@
   "verification_commit_sha": "580d8427bb4da887f7a25731792c55c4e49d56d6",
   "verification_branch": "release/v1.0.0",
   "derivation_method": "Extend #1153 Task I: codegraph_explore / codegraph_node for symbol location + call paths; pin-verify every cited file:line with `git show 580d8427:<path>`; grep for literal-text capture and SSOT consts (CURRENT_SCHEMA_VERSION, EXPECTED_*, FIELD_COUNT, HOOK_EVENTS_COUNT, MemoryLinkRelation::COUNT, tool_names::ALL). No generator existed in scripts/ or xtask; none was invented. Inherited 27 rows re-anchored; 19 v0.8\u2013v1.0 defensive layers added on the same Task I 'under-credited layer' convention.",
+  "post_inventory_amendment_3582": {
+    "issue": "#3582",
+    "base_commit": "e34ee46caf0c7db8aff48b2768673918b8a79a85",
+    "scope": "Only the capabilities envelope, namespace and federation_namespace_confinement descriptions are amended for the #3582 candidate. Historical verification SHA, counts and all other rows remain the original inventory record. This is not a fleet inventory recapture or certification re-issue.",
+    "source_paths": [
+      "src/federation/peer_posture.rs",
+      "src/federation/receive_auth.rs",
+      "src/config.rs",
+      "src/mcp/tools/capabilities.rs",
+      "src/cli/doctor.rs"
+    ],
+    "test_paths": [
+      "tests/federation_peer_posture_3582.rs",
+      "tests/federation_namespace_gate_3582.rs",
+      "tests/federation_write_ns_scope_2447.rs",
+      "tests/federation_write_ns_scope_2447_pg.rs"
+    ]
+  },
   "prior_art": {
     "original_inventory": "docs/compliance/_inventory/v0.7.0-capabilities.json",
     "original_method": "docs/compliance/_inventory/v0.7.0-summary.md \u00a75 Reproducibility",
@@ -550,7 +568,7 @@
         "tests/capabilities_v3.rs",
         "tests/s75_capabilities_db_schema_version.rs"
       ],
-      "factual_description": "The capabilities envelope carries schema_version=3 with application blocks (Form 4/5/6). Clients may pin to v1 or v2 via accept= on memory_capabilities MCP or Accept-Capabilities HTTP header. Backwards compat preserved. v1.0.0 #2400 corrected the compaction block from planned=true under-claim to shipped-not-planned (ConsolidationPass landed at v0.8.0 #1749).",
+      "factual_description": "The capabilities envelope carries schema_version=3 with application blocks (Form 4/5/6). Clients may pin to v1 or v2 via accept= on memory_capabilities MCP or Accept-Capabilities HTTP header. Backwards compat preserved. v1.0.0 #2400 corrected the compaction block from planned=true under-claim to shipped-not-planned (ConsolidationPass landed at v0.8.0 #1749). #3582 adds optional federation_security to v2/v3 on the shared HTTP/MCP path for both backends: the daemon's completed boot evaluation, omitted before any evaluation. It is not a live enrollment rescan or a per-operation authorization grant. Local doctor marks outbound/listener argv unobservable; remote doctor uses this snapshot. v1 remains unchanged.",
       "verified_in_v0_7_0": true,
       "verified_in_v1_0_0": true,
       "schema_anchor": "Capabilities envelope schema_version = '3'",
@@ -639,7 +657,7 @@
         "src/validate.rs (validate_namespace)",
         "src/federation/receive_auth.rs:1008 (inbound_write_namespace_authorized \u2014 #2447)"
       ],
-      "factual_description": "Every memory carries a namespace string. Each namespace may carry a standard policy memory pointer (Batman Form 2 + Form 6). Hierarchical namespaces (slash-separated) are first-class at v1.0.0 \u2014 the v0.7.0 inventory's 'no slashes' claim is retired. Federation inbound writes are confined to the peer's declared allowed_namespaces (#2447 Layer 1 always-on; Layer 2 governed by AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE, default ON for enrolled-unscoped peers).",
+      "factual_description": "Every memory carries a namespace string. Each namespace may carry a standard policy memory pointer (Batman Form 2 + Form 6). Hierarchical namespaces (slash-separated) are first-class at v1.0.0 \u2014 the v0.7.0 inventory's 'no slashes' claim is retired. Federation inbound writes are confined to the peer's declared allowed_namespaces (#2447 Layer 1 always-on; Layer 2 governed by AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE, default ON for enrolled-unscoped peers and, since #3582, absent allowlists; explicit Standard opt-out only).",
       "verified_in_v0_7_0": true,
       "verified_in_v1_0_0": true,
       "schema_anchor": "v36 (namespace_standards)",
@@ -1300,7 +1318,7 @@
         "src/federation/receive_auth.rs (inbound_namespace_meta_authorized)",
         "src/federation/peer_attestation.rs:152 (PeerAttestationConfig)"
       ],
-      "factual_description": "Layer 1 (always-on under an enrolled posture) enforces a peer's declared non-empty allowed_namespaces against BOTH the inbound CLAIMED namespace and the STORED namespace of any local row with the same id (the stored check is load-bearing: merge_memory LWW would otherwise let a public/* peer relocate a secure/ops row). Layer 2 (AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE, default ON) refuses an enrolled peer that declared no scope. Zero-config (no allowlist) is byte-identical to pre-#2447. Also governs deletions, pendings/pending_decisions, and namespace_meta/clears. Global standard * is refused unless the peer declared **.",
+      "factual_description": "Layer 1 (always-on under an enrolled posture) enforces a peer's declared non-empty allowed_namespaces against BOTH the inbound CLAIMED namespace and the STORED namespace of any local row with the same id (the stored check is load-bearing: merge_memory LWW would otherwise let a public/* peer relocate a secure/ops row). Layer 2 (AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE, default ON) refuses an enrolled peer that declared no scope. #3582 additionally refuses absent-allowlist inbound writes on both backends; only Standard retains the explicit require-scope 0 namespace opt-out. With configured outbound peers or inbound enrollment/bindings, asi-hard requires a valid, nonempty AI_MEMORY_FED_PEER_ATTESTATION at boot; Standard warns. Incomplete inbound observation refuses hardened boot. Key enrollment is default-required and establishes identity, not namespace authority. Also governs deletions, pendings/pending_decisions, and namespace_meta/clears. With a configured allowlist, global standard * is refused unless the peer declared **.",
       "verified_in_v0_7_0": false,
       "verified_in_v1_0_0": true,
       "issue_references": [

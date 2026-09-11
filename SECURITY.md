@@ -17,6 +17,18 @@ ai-memory is a substrate for persistent AI/agent memory. Customers and AgenticMe
 
 Until a `v1.0.0` tag is cut, **v0.10.x is the newest published line** and every v0.7.x–v0.10.x line above stays active; v0.6.4 remains LTS through the v1.0 ship. Once v1.0 ships, the window narrows to the two most recent minor versions — v1.0.x plus the one before it — and the older 0.x lines move to end of life. The v1.0 ship date is operator-gated and not committed here.
 
+## Federation namespace authorization correction (#3582)
+
+Peer key enrollment, per-message signatures and nonce freshness are required
+by default. Namespace permission is a separate check: the default-on
+`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` now refuses inbound writes
+when `AI_MEMORY_FED_PEER_ATTESTATION` is absent. Configure explicit scopes
+for each peer. With any outbound peers or inbound enrollment/bindings,
+`asi-hard` refuses boot on an absent, empty or invalid map; Standard warns.
+Only Standard permits the existing explicit namespace opt-out (`=0`), which
+does not disable identity or signature checks. Ordinary doctor remains
+runnable. See [federation posture and capabilities](docs/federation.md#current-defaults-and-boot-posture-3582).
+
 ## v0.9.0 secure-default changes (BREAKING) — operator action may be required
 
 v0.9.0 ships a 49-fix security/code-review hardening pass ([#1885](https://github.com/alphaonedev/ai-memory-mcp/issues/1885)–[#1935](https://github.com/alphaonedev/ai-memory-mcp/issues/1935)); the two write-path-wide defaults below have already flipped in this release. Operators upgrading from v0.8.x must review these:

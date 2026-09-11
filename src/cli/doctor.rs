@@ -77,6 +77,8 @@ const FACT_ARCHIVE_ON_GC_SOURCE: &str = "archive_on_gc_source";
 const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
 const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
+/// #3582 — remote capabilities key and doctor fact for federation posture.
+const FACT_FEDERATION_SECURITY: &str = "federation_security";
 const SECTION_LLM_REACHABILITY: &str = "LLM Reachability (#1146)";
 const SECTION_EMBEDDINGS_REACHABILITY: &str = "Embeddings Reachability (#1598)";
 /// #3147 / #3155 — operator-visible identity health. Named to match the
@@ -964,6 +966,73 @@ fn snapshot_before_repair(
 // Local (--db) mode
 // ---------------------------------------------------------------------------
 
+fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report) -> ReportSection {
+    use crate::federation::peer_posture::Verdict;
+    let severity = match report.verdict {
+        Verdict::Refused => Severity::Critical,
+        Verdict::Warning => Severity::Warning,
+        Verdict::Unobservable => Severity::NotAvailable,
+        Verdict::Allowed | Verdict::NoPeersObserved => Severity::Info,
+    };
+    let severity = if report.refuses_boot() {
+        Severity::Critical
+    } else if report.observation_errors.is_empty() {
+        severity
+    } else {
+        severity_max(severity, Severity::Warning)
+    };
+    let mut facts = vec![
+        ("security_posture".into(), report.security_posture.clone()),
+        (
+            "outbound_peers".into(),
+            report.outbound_peers.as_str().into(),
+        ),
+        (
+            "inbound_bindings".into(),
+            report.inbound_bindings.as_str().into(),
+        ),
+        ("listener_mtls".into(), report.listener_mtls.as_str().into()),
+        (
+            "peer_allowlist".into(),
+            format!("{:?}", report.peer_allowlist),
+        ),
+        (
+            "key_enrollment_required".into(),
+            report.key_enrollment_required.to_string(),
+        ),
+        (
+            "require_push_namespace_scope".into(),
+            report.require_push_namespace_scope.to_string(),
+        ),
+    ];
+    facts.extend(
+        report
+            .observation_errors
+            .iter()
+            .map(|e| ("observation_error".into(), e.clone())),
+    );
+    let note = match report.verdict {
+        Verdict::Refused | Verdict::Warning => Some(
+            "#3582: peers configured, no usable peer allowlist. Configure a valid, nonempty \
+             AI_MEMORY_FED_PEER_ATTESTATION. Key enrollment establishes identity, not namespace \
+             authorization. Standard warns; asi-hard refuses boot."
+                .into(),
+        ),
+        Verdict::Unobservable => Some(
+            "Outbound peer lists and listener mTLS argv are unobservable from this process; \
+             use remote doctor for the daemon's boot evaluation."
+                .into(),
+        ),
+        Verdict::Allowed | Verdict::NoPeersObserved => None,
+    };
+    ReportSection {
+        name: "Federation peer authorization".into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
 fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     let mut sections = Vec::with_capacity(7);
 
@@ -972,6 +1041,9 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // `ai-memory.db` in `$PWD`, so the very next step ("could not open
     // database") is a SYMPTOM whose cause would otherwise never be printed.
     sections.push(section_config_health_3166());
+    sections.push(section_peer_allowlist_3582(
+        &crate::federation::peer_posture::observe(None),
+    ));
 
     // v1.0.0 (#3264) — Postgres extension health, BEFORE the SQLite open for
     // the same reason `section_config_health_3166` is: on a `postgres://`
@@ -3350,6 +3422,29 @@ fn section_capabilities_remote(url: &str, auth: &RemoteAuth) -> ReportSection {
 
     match http_get_json(url, auth) {
         Ok(v) => {
+            if let Some(value) = v.get(FACT_FEDERATION_SECURITY) {
+                match serde_json::from_value::<crate::federation::peer_posture::Report>(
+                    value.clone(),
+                ) {
+                    Ok(report) => {
+                        let section = section_peer_allowlist_3582(&report);
+                        severity = severity_max(severity, section.severity);
+                        facts.extend(section.facts);
+                        if let Some(message) = section.note {
+                            append_note(&mut note, &message);
+                        }
+                    }
+                    Err(_) => {
+                        severity = Severity::Warning;
+                        facts.push((
+                            FACT_FEDERATION_SECURITY.into(),
+                            "unreadable daemon evaluation".into(),
+                        ));
+                    }
+                }
+            } else {
+                facts.push((FACT_FEDERATION_SECURITY.into(), NOT_IN_RESPONSE.into()));
+            }
             // schema_version: "1" (legacy v0.6.3) or "2" (post-P1).
             let schema = v
                 .get(field_names::SCHEMA_VERSION)
@@ -3386,10 +3481,13 @@ fn section_capabilities_remote(url: &str, auth: &RemoteAuth) -> ReportSection {
                 ]
                 .contains(&tier)
                 {
-                    severity = Severity::Warning;
-                    note = Some(format!(
-                        "tier={tier} but recall_mode_active={recall_mode} — silent degradation"
-                    ));
+                    severity = severity_max(severity, Severity::Warning);
+                    append_note(
+                        &mut note,
+                        &format!(
+                            "tier={tier} but recall_mode_active={recall_mode} — silent degradation"
+                        ),
+                    );
                 }
             }
         }
@@ -3718,7 +3816,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_sixteen_sections() {
+    fn local_run_on_empty_db_produces_eighteen_sections_3582() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
@@ -3730,9 +3828,11 @@ mod tests {
         // "Embedding Space Census (#2167)"; #2985 added
         // "Atomisation Curator"; #3166 prepended "Configuration";
         // #3147/#3155 inserted "Identity" after Configuration — total is
-        // now 16; #3471 appended "Wake hub (#3471)" — total is now 17.
+        // now 16; #3471 appended "Wake hub (#3471)"; #3582 added
+        // "Federation peer authorization" before the database open and
+        // Identity — total is now 18.
         //
-        // #3264 note: "Postgres extensions (#3264)" is a CONDITIONAL 17th
+        // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
         // yields a `postgres://` DSN, or errors. #3264 review fix (B3):
         // `run_local_collect` holds `store_url_env_lock()` and CLEARS both
@@ -3740,18 +3840,19 @@ mod tests {
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
-        // DSN under that same lock. The count stays 16 on a SQLite
+        // DSN under that same lock. The count stays 18 on a SQLite
         // deployment, which is the invariant this test pins.
         //
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 17);
+        assert_eq!(report.sections.len(), 18);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Configuration",
+                "Federation peer authorization",
                 "Identity",
                 "Storage",
                 "Index",
@@ -4808,19 +4909,21 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn local_run_on_unopenable_db_returns_critical_storage_only() {
+    fn local_run_on_unopenable_db_preserves_independent_sections_3582() {
         let tmp = tempfile::tempdir().unwrap();
         let bad = tmp.path().join("not-a-db.db");
         // Write garbage so SQLite refuses to open it.
         std::fs::write(&bad, b"this is not a sqlite database, it's just text").unwrap();
         let report = run_local_collect(&bad);
         // #3166 — Configuration always renders; #3147 — Identity still
-        // renders (the keystore is independent of the database); Storage
-        // is the Critical open-failure section.
-        assert_eq!(report.sections.len(), 3);
+        // renders (the keystore is independent of the database); #3582
+        // peer authorization renders before the database open and Identity.
+        // Storage is the Critical failure.
+        assert_eq!(report.sections.len(), 4);
         assert_eq!(report.sections[0].name, "Configuration");
-        assert_eq!(report.sections[1].name, SECTION_IDENTITY);
-        let storage = &report.sections[2];
+        assert_eq!(report.sections[1].name, "Federation peer authorization");
+        assert_eq!(report.sections[2].name, SECTION_IDENTITY);
+        let storage = &report.sections[3];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
@@ -5159,6 +5262,49 @@ mod tests {
         assert_eq!(fact(cap, "schema_version"), "1");
         assert_eq!(fact(cap, "recall_mode_active"), "not_in_response");
         assert_eq!(fact(cap, "reranker_active"), "not_in_response");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_doctor_preserves_daemon_peer_finding_3582() {
+        use crate::federation::peer_posture::{Allowlist, Observation, evaluate};
+        use crate::security_profile::SecurityPosture;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for posture in [SecurityPosture::Standard, SecurityPosture::AsiHard] {
+            let daemon_report = evaluate(
+                posture,
+                Observation::Present,
+                Observation::Absent,
+                Observation::Absent,
+                Allowlist::Absent,
+            );
+            let mut caps = crate::config::FeatureTier::Keyword.config().capabilities();
+            caps.federation_security = Some(daemon_report);
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/capabilities"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&caps))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let url = format!("{}/api/v1/capabilities", server.uri());
+            let section = tokio::task::spawn_blocking(move || {
+                section_capabilities_remote(&url, &RemoteAuth::default())
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                section.severity,
+                if posture == SecurityPosture::AsiHard {
+                    Severity::Critical
+                } else {
+                    Severity::Warning
+                }
+            );
+            assert_eq!(fact(&section, "outbound_peers"), "present");
+            assert_eq!(fact(&section, "inbound_bindings"), "absent");
+            assert!(section.note.as_ref().unwrap().contains("#3582"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
