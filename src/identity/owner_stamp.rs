@@ -522,9 +522,17 @@ pub struct UnstampedCensus {
 /// sqlite census query — served by the `agent_id_idx` generated column for
 /// the live unstamped count (`NULL` also covers unparseable metadata, which no
 /// caller can prove it owns either).
+///
+/// The malformed count reads the JSON type from `metadata` itself, NOT
+/// `typeof(agent_id_idx)`: that column is declared `TEXT`, so its affinity
+/// coerces a numeric `agent_id` (`7`) to the text `'7'` and a type test on it
+/// can never see a malformed row. `json_valid` guards `json_type`, which
+/// raises on unparseable metadata (those rows are already unstamped).
 pub const SQLITE_CENSUS_SQL: &str = "SELECT \
      (SELECT COUNT(*) FROM memories WHERE agent_id_idx IS NULL OR agent_id_idx = ''), \
-     (SELECT COUNT(*) FROM memories WHERE typeof(agent_id_idx) NOT IN ('text', 'null')), \
+     (SELECT COUNT(*) FROM memories \
+        WHERE CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.agent_id') END \
+              NOT IN ('text', 'null')), \
      (SELECT COUNT(*) FROM archived_memories \
         WHERE json_extract(metadata, '$.agent_id') IS NULL \
            OR json_extract(metadata, '$.agent_id') = '')";
