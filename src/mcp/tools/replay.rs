@@ -224,7 +224,7 @@ pub fn handle_replay(
                 }));
             }
         };
-        if !crate::visibility::is_readable_on_query(&anchor, Some(&agent_id), Some(&anchor.namespace)) {
+        if !crate::visibility::is_readable_on_query(&anchor, Some(&agent_id), Some(anchor.namespace.as_str())) {
             return Ok(json!({
                 "memory_id": memory_id,
                 (field_names::TRANSCRIPTS): Vec::<Value>::new(),

@@ -391,10 +391,7 @@ pub fn http_admin_binding_admitted(
     if !enrolled_keys_present || binding.is_key_bound() {
         return true;
     }
-    match mode {
-        HttpIdentityMode::Off | HttpIdentityMode::Advisory => true,
-        HttpIdentityMode::Enforce => false,
-    }
+    mode != HttpIdentityMode::Enforce
 }
 
 #[cfg(test)]

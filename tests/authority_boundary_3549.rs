@@ -31,7 +31,10 @@ const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 // ---------------------------------------------------------------------------
 
 fn router(api_key: Option<&str>, admins: Vec<String>) -> axum::Router {
-    ai_memory::handlers::admin_role::mark_request_authn_configured(api_key.is_some());
+    // The #1570 authn flag is process-global; every router in this binary
+    // models an AUTHENTICATED deployment (the #984 fixture's posture) so the
+    // parallel test threads never race it in opposite directions.
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("open");
     let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
         conn,

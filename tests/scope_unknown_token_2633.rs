@@ -50,7 +50,7 @@ use ai_memory::visibility::{LEGACY_BROAD_SCOPES, is_readable_on_query};
 /// as the requested namespace lifts the #3348 ambient gate, so this is exactly
 /// the retired `is_visible_to_caller(row, caller)` truth table.
 fn is_visible_to_caller(row: &ai_memory::models::Memory, caller: &str) -> bool {
-    is_readable_on_query(row, Some(caller), Some(&row.namespace))
+    is_readable_on_query(row, Some(caller), Some(row.namespace.as_str()))
 }
 
 /// Near-misses of every real scope token, plus the case-variant the

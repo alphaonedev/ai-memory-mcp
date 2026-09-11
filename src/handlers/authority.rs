@@ -71,13 +71,14 @@ pub fn is_authority_exempt(path: &str) -> bool {
             .any(|p| path.starts_with(p))
 }
 
-/// The server-held state the layer resolves against.
+/// The server-held state the layer resolves against. Header trust (the
+/// #1570 "request authentication is configured" fact) is read from the
+/// boot-seeded `admin_role::request_authn_configured` flag, the same source
+/// `require_admin` consults, so the two can never disagree.
 #[derive(Clone)]
 pub struct AuthorityLayerState {
     /// The daemon state (admin allowlist, enrolled per-agent keys, posture).
     pub app: super::AppState,
-    /// The transport-auth state (shared key presence → header trust).
-    pub api_key: super::ApiKeyState,
 }
 
 /// The stable audit `kind` for a refusal recorded by this layer.

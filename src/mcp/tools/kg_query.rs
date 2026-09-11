@@ -110,7 +110,7 @@ impl McpTool for KgQueryTool {
 /// zero-config posture, byte-identical to pre-#3386.
 fn node_visible(mem: &crate::models::Memory, caller: Option<&str>, as_agent: Option<&str>) -> bool {
     if let Some(c) = caller
-        && !crate::visibility::is_readable_on_query(mem, Some(c), Some(&mem.namespace))
+        && !crate::visibility::is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str()))
     {
         return false;
     }

@@ -1388,7 +1388,7 @@ fn lookup_namespace_standard(
     }
     // #2537 — run the predicate on the typed `Memory` BEFORE serialization,
     // so a withheld standard's bytes are never materialised at all.
-    if caller.is_some_and(|c| !crate::visibility::is_readable_on_query(&mem, Some(c), Some(&mem.namespace))) {
+    if caller.is_some_and(|c| !crate::visibility::is_readable_on_query(&mem, Some(c), Some(mem.namespace.as_str()))) {
         tracing::debug!(
             target: "namespace.standard.withheld",
             namespace = %namespace,

@@ -1591,7 +1591,6 @@ pub fn build_router_with_timeout(
         .layer(axum::middleware::from_fn_with_state(
             handlers::authority::AuthorityLayerState {
                 app: app_state.clone(),
-                api_key: api_key_state.clone(),
             },
             handlers::authority::authority_layer,
         ))

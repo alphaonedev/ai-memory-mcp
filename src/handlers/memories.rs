@@ -148,7 +148,7 @@ pub async fn get_memory(
             // canonical `crate::visibility::is_visible_to_caller`
             // helper. Pre-#951 the inline check duplicated the
             // semantic at risk of drifting from the SAL version.
-            if !crate::visibility::is_readable_on_query(&mem, Some(&caller), Some(&mem.namespace)) {
+            if !crate::visibility::is_readable_on_query(&mem, Some(&caller), Some(mem.namespace.as_str())) {
                 tracing::warn!(
                     target: "ai_memory::visibility",
                     "GET /memories/{{id}} 404-masked: not visible to caller {caller} (id={})",

@@ -638,7 +638,7 @@ fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes, caller: Option<&str>)
         // the row or is its inbox target. Fail-closed when `caller` is
         // `None` (no identity → no private rows).
         MemoryScope::Private => {
-            caller.is_some_and(|c| crate::visibility::is_readable_on_query(mem, Some(c), Some(&mem.namespace)))
+            caller.is_some_and(|c| crate::visibility::is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str())))
         }
         MemoryScope::Team => matches_subtree(&mem.namespace, t.as_deref()),
         MemoryScope::Unit => matches_subtree(&mem.namespace, u.as_deref()),
@@ -24701,7 +24701,7 @@ mod tests {
                             && (scope == MemoryScope::Private.as_str()
                                 || scope == MemoryScope::Collective.as_str())
                         {
-                            let canon = crate::visibility::is_readable_on_query(&m, Some(c), Some(&m.namespace));
+                            let canon = crate::visibility::is_readable_on_query(&m, Some(c), Some(m.namespace.as_str()));
                             assert_eq!(
                                 sql, canon,
                                 "private/collective must be owner-keyed in ALL THREE — \

@@ -121,11 +121,52 @@ fn strip_line_comments(src: &str) -> String {
         .join("\n")
 }
 
-/// Everything before the trailing `#[cfg(test)]\nmod tests {` block (the
-/// `record_stop_structural_b7` convention).
-fn production_part(src: &str) -> &str {
-    let needle = "\n#[cfg(test)]\nmod tests {";
-    src.rfind(needle).map_or(src, |idx| &src[..idx])
+/// The production text of a file: every INLINE `#[cfg(test)] mod x { … }`
+/// block is removed by brace matching (an out-of-line `#[cfg(test)] mod x;`
+/// declaration has no body and is left alone). Deliberately tolerant — a
+/// brace inside a string literal in a test module can only make the strip
+/// end EARLY, which leaves test text in the scan and fails LOUD, never
+/// silently narrows it.
+fn production_part(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(attr) = rest.find("#[cfg(test)]") else {
+            out.push_str(rest);
+            return out;
+        };
+        let after_attr = &rest[attr + "#[cfg(test)]".len()..];
+        let trimmed = after_attr.trim_start();
+        let is_inline_mod = trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ");
+        let brace = trimmed.find('{');
+        let semi = trimmed.find(';');
+        let inline = is_inline_mod
+            && brace.is_some_and(|b| semi.is_none_or(|sc| b < sc));
+        if !inline {
+            let keep = attr + "#[cfg(test)]".len();
+            out.push_str(&rest[..keep]);
+            rest = &rest[keep..];
+            continue;
+        }
+        let open = attr + "#[cfg(test)]".len() + (after_attr.len() - trimmed.len()) + brace.expect("brace");
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (i, c) in rest[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&rest[..attr]);
+        rest = &rest[end..];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,15 +208,22 @@ fn parse_dispatch_wrappers(mcp_src: &str) -> BTreeMap<String, String> {
         .map_or(mcp_src.len(), |i| start + i);
     let region = &mcp_src[start..end];
     let mut out = BTreeMap::new();
-    for line in region.lines() {
-        let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix("fn dispatch_") {
-            let name_end = rest.find('(').expect("fn params");
-            let name = format!("dispatch_{}", &rest[..name_end]);
-            let params_end = rest[name_end..].find(')').expect("params close") + name_end;
-            let params = rest[name_end + 1..params_end].trim().to_string();
-            out.insert(name, params);
-        }
+    let mut cursor = 0;
+    while let Some(i) = region[cursor..].find("\nfn dispatch_") {
+        let s = cursor + i + "\nfn ".len();
+        let rest = &region[s..];
+        let name_end = rest.find('(').expect("fn params");
+        let name = rest[..name_end].to_string();
+        // The parameter list may span lines (rustfmt wraps long signatures).
+        let params_end = rest[name_end..].find(')').expect("params close") + name_end;
+        let params = rest[name_end + 1..params_end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_end_matches(',')
+            .to_string();
+        out.insert(name, params);
+        cursor = s + params_end;
     }
     out
 }
@@ -415,7 +463,7 @@ fn mcp_ctx_is_constructed_at_exactly_one_site_3549() {
     let mut sites = Vec::new();
     for f in &files {
         let src = fs::read_to_string(f).expect("read");
-        let prod = strip_line_comments(production_part(&src));
+        let prod = strip_line_comments(&production_part(&src));
         for (n, line) in prod.lines().enumerate() {
             if line.contains("ToolDispatchCtx {") && !line.contains("struct ToolDispatchCtx") {
                 sites.push(format!("{}:{}", rel(f), n + 1));
@@ -489,7 +537,7 @@ fn http_route_registrations_live_only_in_the_router_builder_3549() {
     let mut stray = Vec::new();
     for f in &files {
         let src = fs::read_to_string(f).expect("read");
-        let prod = strip_line_comments(production_part(&src));
+        let prod = strip_line_comments(&production_part(&src));
         if rel(f) == LIB {
             // Everything inside the builder is inventoried; anything else in
             // lib.rs is stray.
@@ -609,7 +657,7 @@ fn is_visible_to_caller_is_retired_as_a_public_predicate_3549() {
         if rel(f) == VISIBILITY {
             continue;
         }
-        let src = strip_line_comments(production_part(&fs::read_to_string(f).expect("read")));
+        let src = strip_line_comments(&production_part(&fs::read_to_string(f).expect("read")));
         for (n, line) in src.lines().enumerate() {
             if line.contains("is_visible_to_caller(") {
                 callers.push(format!("{}:{}", rel(f), n + 1));
@@ -655,7 +703,7 @@ fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
         let handler = handler_file_for(tool, &tool_files);
         let calls_funnel = handler.as_ref().is_some_and(|p| {
             let src = tool_files.iter().find(|(q, _)| q == p).map(|(_, s)| s.as_str()).unwrap_or("");
-            strip_line_comments(production_part(src)).contains("is_readable_on_query(")
+            strip_line_comments(&production_part(src)).contains("is_readable_on_query")
         });
         if calls_funnel {
             funnelled += 1;
