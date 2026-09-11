@@ -18,8 +18,8 @@ This page is the capture. It does **not** live under
 | Field | Value |
 |---|---|
 | AGE `extversion` | `1.8.0` |
-| Host | local certified PG 18 + AGE + pgvector (TLS verify-full, :5445) |
-| Database | throwaway `ai_memory_grok_3297` (created + dropped in the same probe; never `ai_memory_test`) |
+| Host | certified local PG 18 + AGE 1.8.0 + pgvector tier (TLS verify-full) |
+| Database | a throwaway database created and dropped inside the probe |
 | Date | 2026-09-11 |
 
 ## Grammar probes (list predicates)
