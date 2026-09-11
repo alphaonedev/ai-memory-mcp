@@ -4329,6 +4329,9 @@ mod tests {
             keep: 48,
             store_url: None,
         };
+        // A caller's earlier command may have left output in the buffers.
+        env.stdout.clear();
+        env.stderr.clear();
         {
             let mut out = env.output();
             run_backup(db, &args, true, &mut out).unwrap();
