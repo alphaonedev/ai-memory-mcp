@@ -29,6 +29,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rulings recorded in `SECURITY.md`: #3125 Standard posture (`enforce`,
   `Allow` absent rules, strict knob posture-gated) and F13 (stdio is one trust
   domain). Conductor ruling from the 3×3 vote on #3581.
+### Fixed (#3553 — SQLite `synchronous=NORMAL` default: `doctor` and `doctor --posture` attest the durability class; certified posture names `synchronous`)
+
+- **#3553 (data-integrity) — `ai-memory doctor` and `ai-memory doctor
+  --posture enterprise-federation` now NAME the SQLite `PRAGMA synchronous`
+  level and the durability class it buys.** The compiled default is
+  `NORMAL` (the #1579 B7 posture, UNCHANGED — `DEFAULT_DB_SYNCHRONOUS` is
+  untouched): under WAL that fsyncs per CHECKPOINT, so a power loss can
+  drop acknowledged commits, and the certification standard (§0.1 / §5)
+  makes `synchronous=FULL` the certified envelope with `doctor --posture`
+  as the attestation — yet no shipped command reported the level, so a
+  NORMAL ack could be presented as durable (a silently upgraded durability
+  class, §0.4). Plain `doctor`'s Storage section now carries
+  `synchronous` (the live pragma on the doctor's own read-only connection),
+  `synchronous_resolved` (level + the ladder rung that produced it),
+  `durability_class` (`local-only` + fsync cadence) and `rpo_on_power_loss`,
+  and is CRITICAL when the hardened / certified posture is engaged with the
+  level below `FULL`; the enterprise-federation posture gains check #21
+  (`ENTERPRISE_FEDERATION_CHECK_COUNT` 20 → 21): `FULL`/`EXTRA` passes,
+  anything else FAILS naming `synchronous` with the exact remediation, and
+  the row records whether the live pragma agreed with the resolved level.
+  **Load-bearing companion fix:** `storage::open_read_only` never applied
+  `PRAGMA synchronous`, so a read-only connection answered SQLite's
+  compiled `FULL` on a `NORMAL` process — the naive "read the live pragma"
+  fix would have attested `synchronous=FULL` for a store with
+  per-checkpoint fsync. The read-only funnel now mirrors the resolved level
+  exactly as it mirrors `mmap_size` (inert for a reader; pinned by
+  `open_read_only_mirrors_resolved_synchronous_3553`). One SSOT,
+  `storage::SynchronousLevel` (token grammar / pragma numbering / certified
+  floor / class / cadence / RPO), now backs the open funnels, the
+  `asi-hard` `AI_MEMORY_DB_SYNCHRONOUS=FULL` pin and both doctor surfaces.
+  Docs: durability table in PERFORMANCE.md §"Power-loss durability".
+  Ruling (5-agent vote `4d3ea1c5`, 4-1): no new `--posture asi-hard` name —
+  the standard names the unqualified `doctor --posture`, i.e. the existing
+  posture; the acceptance line's literal command still exits 2 as
+  "unrecognised posture" and the deviation is recorded on the issue.
 
 ### Fixed (#3519 — PostgreSQL bootstrap/migration advisory-lock wait no longer deadlocks concurrent boots)
 

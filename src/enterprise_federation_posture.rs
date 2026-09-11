@@ -91,6 +91,9 @@ use crate::config::{AppConfig, PermissionsMode};
 use crate::federation::peer_attestation::{PEER_ATTESTATION_ENV, PeerScope};
 use std::collections::HashMap;
 
+/// #3553 — the `PRAGMA synchronous` posture row (check #21) and its test.
+mod synchronous;
+
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
 /// name here — deliberately not a free-form string so a typo in
@@ -125,8 +128,12 @@ pub const ENV_PG_AT_REST_ATTESTED: &str = "AI_MEMORY_PG_AT_REST_ATTESTED";
 /// append-only-audit-spine-armed pairing, check #19) — a DELIBERATE, ratified
 /// re-cert, not a silent drift. #2991 raised it 19 → 20 (check #20: the R40
 /// escalate producer is armable — approver keys enrolled — so the wired L1-6
-/// producer routes to a SATISFIABLE signed-approval gate).
-pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 20;
+/// producer routes to a SATISFIABLE signed-approval gate). #3553 raised it
+/// 20 → 21 (check #21: the SQLite `PRAGMA synchronous` durability posture —
+/// standard §0.1 / §5 make the attached `doctor --posture` output the
+/// `synchronous=FULL` attestation, and until this row nothing in the report
+/// NAMED the level or the durability class it buys).
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 21;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -235,8 +242,27 @@ fn resolved_security_profile_label() -> &'static str {
 /// enterprise-federation posture. Pure / read-only: mutates no env var,
 /// touches no database. Safe to call from any live process (the
 /// `doctor` CLI, a running daemon's boot gate, or a test).
+///
+/// #3553 — the `PRAGMA synchronous` row (check #21) is rendered from the
+/// resolver alone here; a caller that HAS a connection (the `doctor` CLI)
+/// hands its own live observation to [`evaluate_with_live`] instead, so the
+/// row can corroborate the resolved level against what a connection this
+/// binary opened actually answers.
 #[must_use]
 pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
+    evaluate_with_live(app_config, None)
+}
+
+/// [`evaluate`] with an optional LIVE `PRAGMA synchronous` observation
+/// (#3553) taken by the caller on a connection THIS binary opened. `None`
+/// means "not observed" (the boot gate has no connection; `doctor --posture`
+/// could not open the store) and the row says so rather than inventing a
+/// green. Still touches no database itself.
+#[must_use]
+pub fn evaluate_with_live(
+    app_config: &AppConfig,
+    live_synchronous: Option<crate::storage::SynchronousLevel>,
+) -> Vec<PostureCheck> {
     let mut out = Vec::with_capacity(ENTERPRISE_FEDERATION_CHECK_COUNT);
 
     // ---- 1. asi-hard engaged --------------------------------------
@@ -759,6 +785,11 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
          can be approved rather than blocked by the keyless fail-closed guardrail",
     ));
 
+    // ---- 21. PRAGMA synchronous durability posture (#3553) ------------
+    // The row builder lives in `synchronous.rs` (submodule-over-bump); the
+    // rationale and the wording contract are documented there.
+    out.push(synchronous::check_synchronous(live_synchronous));
+
     debug_assert_eq!(
         out.len(),
         ENTERPRISE_FEDERATION_CHECK_COUNT,
@@ -877,13 +908,13 @@ mod tests {
     /// `AUDIT_DIR`.
     static POSTURE_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::config::test_env_lock()
     }
 
     /// # Safety
     /// Caller must hold [`env_lock`].
-    unsafe fn clear_all() {
+    pub(super) unsafe fn clear_all() {
         unsafe {
             std::env::remove_var(crate::security_profile::ENV_SECURITY_PROFILE);
             for (env, _) in crate::security_profile::pinned_knobs() {
@@ -901,7 +932,7 @@ mod tests {
     /// RAII guard mirroring `security_profile::tests::KnobsGuard` — a
     /// mid-test panic still restores the baseline for whatever `--lib`
     /// test runs next in the same process.
-    struct EnvGuard;
+    pub(super) struct EnvGuard;
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             // SAFETY: constructed only while the caller holds `env_lock()`.
@@ -909,7 +940,7 @@ mod tests {
         }
     }
 
-    fn find<'a>(checks: &'a [PostureCheck], control_prefix: &str) -> &'a PostureCheck {
+    pub(super) fn find<'a>(checks: &'a [PostureCheck], control_prefix: &str) -> &'a PostureCheck {
         checks
             .iter()
             .find(|c| c.control.starts_with(control_prefix))
@@ -933,7 +964,7 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
     }
 
-    fn set_fully_hardened_env() -> tempfile::NamedTempFile {
+    pub(super) fn set_fully_hardened_env() -> tempfile::NamedTempFile {
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
         }

@@ -2397,15 +2397,22 @@ pub async fn run(
             // the regular health pass entirely (same short-circuit shape as
             // `--tokens` / `--hooks` below). Machine-checks the RESOLVED
             // process configuration (env + build features + parsed peer
-            // config) against a named certified posture; never opens the
-            // DB. Exits non-zero on any deviation.
+            // config) against a named certified posture. #3553: the ONE
+            // thing it reads from the store is the live `PRAGMA synchronous`
+            // on its own read-only connection (best-effort; absent store →
+            // the row says "not observed"). Exits non-zero on any deviation.
             if let Some(posture) = a.posture.clone() {
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
                 let mut so = stdout.lock();
                 let mut se = stderr.lock();
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                let exit = cli::doctor::run_posture(&posture, a.json, &mut out)?;
+                let exit = cli::doctor::run_posture(
+                    &posture,
+                    a.json,
+                    Some(db_path_doctor.as_path()),
+                    &mut out,
+                )?;
                 std::process::exit(exit);
             }
             // v0.6.4-004 — `--tokens` (and its alias `--raw-table`) bypass

@@ -553,7 +553,9 @@ fn db_mmap_size() -> i64 {
 pub const ENV_DB_SYNCHRONOUS: &str = "AI_MEMORY_DB_SYNCHRONOUS";
 
 /// The SQLite pragma name the durability level is applied through (#3550:
-/// shared with `restore`'s pre-checkpoint `synchronous = FULL`).
+/// shared with `restore`'s pre-checkpoint `synchronous = FULL`; #3553: read
+/// back by [`live_synchronous`] so the writer, reader and diagnostic sites
+/// cannot name different pragmas).
 pub(crate) const PRAGMA_SYNCHRONOUS: &str = "synchronous";
 
 /// The compiled-default `PRAGMA synchronous` level. `NORMAL` keeps the
@@ -570,16 +572,193 @@ pub const DEFAULT_DB_SYNCHRONOUS: &str = "NORMAL";
 /// below the compiled floor.
 #[must_use]
 pub fn db_synchronous() -> &'static str {
-    match std::env::var(ENV_DB_SYNCHRONOUS) {
-        Ok(v) => match v.trim().to_ascii_uppercase().as_str() {
-            "OFF" => "OFF",
-            "FULL" => "FULL",
-            "EXTRA" => "EXTRA",
-            "NORMAL" => "NORMAL",
-            _ => DEFAULT_DB_SYNCHRONOUS,
-        },
-        Err(_) => DEFAULT_DB_SYNCHRONOUS,
+    resolved_synchronous().level.as_str()
+}
+
+/// v1.0.0 #3553 — the four `PRAGMA synchronous` levels, numbered as SQLite
+/// numbers them (`PRAGMA synchronous` answers `0`/`1`/`2`/`3`). ONE SSOT for
+/// the token grammar, the certified floor, and the durability class each
+/// level buys, shared by the open funnels, `security_profile::KNOBS`, the
+/// `doctor` Storage section and the `doctor --posture` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SynchronousLevel {
+    /// `0` — no fsync at all; the OS decides when bytes reach the platter.
+    Off,
+    /// `1` — under WAL, fsync at each CHECKPOINT, not each commit (the
+    /// compiled #1579 B7 default).
+    Normal,
+    /// `2` — fsync the WAL at every commit; an acknowledged write survives a
+    /// power cut on honest hardware.
+    Full,
+    /// `3` — `FULL` plus an fsync of the directory after every commit in
+    /// DELETE mode; under WAL it behaves as `FULL`.
+    Extra,
+}
+
+/// The single durability class a single-node SQLite store can ever be in
+/// (standard §0.2 vocabulary: `local-only` · `quorum W-of-N` ·
+/// `replicated+backup`). Quorum and replicated classes are federation
+/// properties (#3555), never something `PRAGMA synchronous` can raise.
+pub const DURABILITY_CLASS_LOCAL_ONLY: &str = "local-only";
+
+impl SynchronousLevel {
+    /// The canonical upper-case token (`OFF` / `NORMAL` / `FULL` / `EXTRA`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+            Self::Extra => "EXTRA",
+        }
     }
+
+    /// Parse an operator token (case-insensitive, trimmed). `None` for
+    /// anything outside the four-token grammar so a typo can never resolve
+    /// to a level — callers fall through to the compiled default.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_uppercase().as_str() {
+            "OFF" => Some(Self::Off),
+            "NORMAL" => Some(Self::Normal),
+            "FULL" => Some(Self::Full),
+            "EXTRA" => Some(Self::Extra),
+            _ => None,
+        }
+    }
+
+    /// Map the integer `PRAGMA synchronous` answers back to a level. `None`
+    /// for anything outside `0..=3` (never observed from SQLite; kept total
+    /// rather than panicking on a hostile or future engine — ERRORS-08).
+    #[must_use]
+    pub const fn from_pragma(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Off),
+            1 => Some(Self::Normal),
+            2 => Some(Self::Full),
+            3 => Some(Self::Extra),
+            _ => None,
+        }
+    }
+
+    /// The certified SQLite envelope (standard §0.1 / §5; the `asi-hard`
+    /// pin): `FULL` or the stronger `EXTRA`.
+    #[must_use]
+    pub const fn meets_certified_floor(self) -> bool {
+        matches!(self, Self::Full | Self::Extra)
+    }
+
+    /// When an acknowledged commit reaches stable storage under WAL.
+    #[must_use]
+    pub const fn fsync_cadence(self) -> &'static str {
+        match self {
+            Self::Off => "never (OS write-back only)",
+            Self::Normal => "per-checkpoint",
+            Self::Full | Self::Extra => "per-commit",
+        }
+    }
+
+    /// The recovery-point objective on a POWER LOSS (not a process crash —
+    /// WAL crash-consistency holds at every level; see PERFORMANCE.md
+    /// §"Power-loss durability"), stated as what an acknowledged write may
+    /// lose.
+    #[must_use]
+    pub const fn rpo_on_power_loss(self) -> &'static str {
+        match self {
+            Self::Off => "every acknowledged commit not yet written back by the OS",
+            Self::Normal => "acknowledged commits since the last WAL checkpoint",
+            Self::Full | Self::Extra => "none (each acknowledged commit is fsync'd)",
+        }
+    }
+}
+
+impl std::fmt::Display for SynchronousLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where the resolved [`SynchronousLevel`] came from (the ladder rung that
+/// won), so an operator-facing report can say WHY a process runs at a level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynchronousSource {
+    /// A recognised `AI_MEMORY_DB_SYNCHRONOUS` token.
+    Env,
+    /// The env was unset: the compiled [`DEFAULT_DB_SYNCHRONOUS`].
+    CompiledDefault,
+    /// The env was set to an UNRECOGNISED token and fell through to the
+    /// compiled default (a typo never weakens durability below the floor).
+    CompiledDefaultAfterUnrecognisedEnv,
+}
+
+impl SynchronousSource {
+    /// Short operator-facing label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env AI_MEMORY_DB_SYNCHRONOUS",
+            Self::CompiledDefault => "compiled default",
+            Self::CompiledDefaultAfterUnrecognisedEnv => {
+                "compiled default (AI_MEMORY_DB_SYNCHRONOUS set but unrecognised)"
+            }
+        }
+    }
+}
+
+/// The resolved `PRAGMA synchronous` posture of THIS process: the level every
+/// connection this binary opens ([`open`], [`open_unmigrated`],
+/// [`open_read_only`]) applies, and the rung of the ladder that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedSynchronous {
+    /// The level applied at every open.
+    pub level: SynchronousLevel,
+    /// Which ladder rung won.
+    pub source: SynchronousSource,
+}
+
+/// v1.0.0 #3553 — resolve the effective `PRAGMA synchronous` level AND its
+/// provenance. Same ladder as [`db_synchronous`] (which is now a thin view
+/// of this): a recognised env token > the compiled default.
+#[must_use]
+pub fn resolved_synchronous() -> ResolvedSynchronous {
+    let compiled =
+        SynchronousLevel::parse(DEFAULT_DB_SYNCHRONOUS).unwrap_or(SynchronousLevel::Normal);
+    match std::env::var(ENV_DB_SYNCHRONOUS) {
+        Ok(v) => match SynchronousLevel::parse(&v) {
+            Some(level) => ResolvedSynchronous {
+                level,
+                source: SynchronousSource::Env,
+            },
+            None => ResolvedSynchronous {
+                level: compiled,
+                source: SynchronousSource::CompiledDefaultAfterUnrecognisedEnv,
+            },
+        },
+        Err(_) => ResolvedSynchronous {
+            level: compiled,
+            source: SynchronousSource::CompiledDefault,
+        },
+    }
+}
+
+/// v1.0.0 #3553 — read the LIVE `PRAGMA synchronous` of `conn`.
+///
+/// `PRAGMA synchronous` is a per-CONNECTION setting that is never persisted
+/// in the database file, so this observes the connection it is handed — the
+/// posture THIS process applied at open — and can never be a statement about
+/// another process's connection. Every open funnel in this module applies
+/// [`db_synchronous`], so on a connection from those funnels the answer is
+/// the resolved level; a disagreement is a funnel defect worth surfacing,
+/// which is why the diagnostics read it rather than trusting the resolver.
+///
+/// # Errors
+/// The PRAGMA query failing, or an answer outside SQLite's `0..=3`.
+pub fn live_synchronous(conn: &Connection) -> Result<SynchronousLevel> {
+    let raw: i64 = conn
+        .pragma_query_value(None, PRAGMA_SYNCHRONOUS, |row| row.get(0))
+        .context("read PRAGMA synchronous")?;
+    SynchronousLevel::from_pragma(raw)
+        .ok_or_else(|| anyhow::anyhow!("PRAGMA synchronous answered {raw}, outside SQLite's 0..=3"))
 }
 
 /// v1.0.0 #2445 — read the recorded schema version WITHOUT coercing a failure
@@ -879,6 +1058,15 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
     // #1579 B7 — mirror the writer's memory-mapped I/O budget so the
     // read-pool shares the OS page cache reservation.
     conn.pragma_update(None, "mmap_size", db_mmap_size())?;
+    // v1.0.0 #3553 — mirror the writer's resolved `PRAGMA synchronous` too.
+    // A reader never fsyncs, so the level is inert here — but WITHOUT it a
+    // read-only connection reports SQLite's compiled default (`FULL` = 2),
+    // and `doctor` (which opens through this funnel) would print
+    // `synchronous=FULL` on a `NORMAL` deployment: the exact false green
+    // #3553 exists to prevent. With the mirror, every connection this binary
+    // opens answers the resolved level, so a live read is the funnel's
+    // output on any of them.
+    conn.pragma_update(None, PRAGMA_SYNCHRONOUS, db_synchronous())?;
     // Enforce read-only at the SQL layer (defense in depth on top of
     // SQLITE_OPEN_READ_ONLY): any INSERT/UPDATE/DELETE on a pool
     // connection is rejected rather than silently contending the writer.
@@ -1246,6 +1434,82 @@ mod tests {
         // dedicated child process, avoiding an in-process env race).
         assert_eq!(db_synchronous(), DEFAULT_DB_SYNCHRONOUS);
         assert_eq!(DEFAULT_DB_SYNCHRONOUS, "NORMAL");
+    }
+
+    /// v1.0.0 #3553 — the resolver's typed twin agrees with the string view
+    /// and names its provenance (the test binary never sets the env, so the
+    /// compiled-default rung is the one under test).
+    #[test]
+    fn resolved_synchronous_names_compiled_default_when_unset_3553() {
+        let r = resolved_synchronous();
+        assert_eq!(r.level.as_str(), db_synchronous());
+        assert_eq!(r.level, SynchronousLevel::Normal);
+        assert_eq!(r.source, SynchronousSource::CompiledDefault);
+        assert_eq!(r.level.fsync_cadence(), "per-checkpoint");
+        assert!(!r.level.meets_certified_floor());
+    }
+
+    /// v1.0.0 #3553 — token grammar / pragma numbering / certified floor,
+    /// pinned in one place so `security_profile::KNOBS`, `doctor` and the
+    /// posture row cannot disagree about what `FULL` means.
+    #[test]
+    fn synchronous_level_grammar_and_floor_3553() {
+        for (token, level, n) in [
+            ("off", SynchronousLevel::Off, 0),
+            (" Normal ", SynchronousLevel::Normal, 1),
+            ("FULL", SynchronousLevel::Full, 2),
+            ("extra", SynchronousLevel::Extra, 3),
+        ] {
+            assert_eq!(
+                SynchronousLevel::parse(token),
+                Some(level),
+                "token {token:?}"
+            );
+            assert_eq!(SynchronousLevel::from_pragma(n), Some(level), "pragma {n}");
+            assert_eq!(level.to_string(), level.as_str());
+        }
+        assert_eq!(SynchronousLevel::parse("fulll"), None);
+        assert_eq!(SynchronousLevel::parse(""), None);
+        assert_eq!(SynchronousLevel::from_pragma(4), None);
+        assert_eq!(SynchronousLevel::from_pragma(-1), None);
+        assert!(SynchronousLevel::Full.meets_certified_floor());
+        assert!(SynchronousLevel::Extra.meets_certified_floor());
+        assert!(!SynchronousLevel::Normal.meets_certified_floor());
+        assert!(!SynchronousLevel::Off.meets_certified_floor());
+        assert_eq!(SynchronousLevel::Full.fsync_cadence(), "per-commit");
+        assert_eq!(
+            SynchronousLevel::Off.fsync_cadence(),
+            "never (OS write-back only)"
+        );
+        assert!(
+            SynchronousLevel::Normal
+                .rpo_on_power_loss()
+                .contains("last WAL checkpoint")
+        );
+        assert!(
+            SynchronousLevel::Full
+                .rpo_on_power_loss()
+                .starts_with("none")
+        );
+    }
+
+    /// v1.0.0 #3553 — the read-only funnel MIRRORS the resolved level. Before
+    /// this pin a read-only connection answered SQLite's compiled default
+    /// (`FULL` = 2) on a `NORMAL` process, so `doctor` — which opens through
+    /// `open_read_only` — would have attested `synchronous=FULL` for a store
+    /// with per-checkpoint fsync: the false green #3553 names. The unseeded
+    /// test process resolves `NORMAL`, so the reader must answer `1`.
+    #[test]
+    fn open_read_only_mirrors_resolved_synchronous_3553() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("ro-sync.db");
+        drop(open(&path).expect("create"));
+        let reader = open_read_only(&path).expect("open read-only");
+        let live = live_synchronous(&reader).expect("live pragma");
+        assert_eq!(live, resolved_synchronous().level);
+        assert_eq!(live, SynchronousLevel::Normal);
+        let writer = open(&path).expect("reopen writer");
+        assert_eq!(live_synchronous(&writer).expect("writer pragma"), live);
     }
 
     #[test]

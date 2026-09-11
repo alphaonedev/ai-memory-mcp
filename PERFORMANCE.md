@@ -366,6 +366,38 @@ Ladder: `AI_MEMORY_DB_SYNCHRONOUS` env > compiled default `NORMAL`
 (SSOT: `src/storage/connection.rs::db_synchronous`). The `asi-hard`
 hardened profile (below) pins this to `FULL`.
 
+**Durability class per level (#3553).** `PRAGMA synchronous` is a
+per-connection setting that is never persisted in the database file, so
+the level is a property of the PROCESS that opened the store, not of the
+store. The table below is the declaration the certification standard's
+§0.2 RPO clause refers to for a single-node SQLite store; the standard
+§0.2 durability class is `local-only` at every level (`quorum W-of-N`
+and `replicated+backup` are federation properties, tracked under #3555),
+and the level decides the fsync cadence INSIDE that class. SSOT:
+`src/storage/connection.rs::SynchronousLevel`.
+
+| Level | Durability class | fsync cadence (WAL) | RPO on POWER LOSS (not a process crash) | Certified envelope (§0.1 / §5) |
+|---|---|---|---|---|
+| `OFF` | `local-only` | never (OS write-back only) | every acknowledged commit not yet written back by the OS | outside |
+| `NORMAL` (compiled default) | `local-only` | per-checkpoint | acknowledged commits since the last WAL checkpoint | inside ONLY as `local-only` with this RPO declared |
+| `FULL` (`asi-hard` pin) | `local-only` | per-commit | none — each acknowledged commit is fsync'd | inside |
+| `EXTRA` | `local-only` | per-commit (plus a directory fsync in rollback-journal mode; identical to `FULL` under WAL) | none | inside |
+
+Process-death (crash / SIGKILL) durability is the same at every level —
+that is the WAL crash-consistency the harness below proves; only the
+power-loss column differs. **How to read it back:** `ai-memory doctor`
+prints `synchronous` (the live `PRAGMA synchronous` on the doctor's own
+read-only connection — every open funnel, the read-only one included,
+applies the resolved level, so this is the funnel's output and NOT a
+statement about a running daemon's connection), `synchronous_resolved`
+(the level + which ladder rung produced it), `durability_class` and
+`rpo_on_power_loss` in the Storage section, and escalates to CRITICAL
+when the hardened / certified posture is engaged and the level is below
+`FULL`. `ai-memory doctor --posture enterprise-federation` carries the
+same posture as its `PRAGMA synchronous` row (check #21): `FULL`/`EXTRA`
+passes, anything else FAILS naming `synchronous`, and the row states
+whether the live pragma agreed with the resolved level.
+
 **What the harness proves.** `tests/power_loss_durability.rs` spawns a
 child process that opens the DB under `synchronous=FULL`, commits a
 batch of writes, and is HARD-ABORTED (`std::process::abort()`, the
