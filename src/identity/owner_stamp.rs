@@ -33,9 +33,11 @@
 //!    unstamped row emits a structured WARN (`target: authz.unstamped`) plus
 //!    the `ai_memory_unstamped_mutation_allowed_total{backend,funnel}` counter.
 //!    `refuse` refuses an unstamped row on EVERY caller-scoped mutation funnel
-//!    of both backends. An unrecognised value resolves to `refuse` (an
-//!    unrecognised token must never silently widen a security control —
-//!    the #131 / FBL-14 rule). `asi-hard` pins `refuse`.
+//!    of both backends. Any other token REFUSES boot ([`validate_boot_token`],
+//!    Conductor ruling condition 1); a library caller that skips the boot
+//!    check still resolves it to `refuse` (an unrecognised token must never
+//!    silently widen a security control — the #131 / FBL-14 rule).
+//!    `asi-hard` pins `refuse`.
 //!
 //! The migration path the vote requires is operator-driven: `ai-memory doctor`
 //! counts unstamped + malformed rows, the operator re-owns them with
@@ -214,7 +216,9 @@ pub enum UnstampedMutationMode {
 
 impl UnstampedMutationMode {
     /// Parse one token. `None` = unset/blank (→ the compiled default);
-    /// an unrecognised token → [`Self::Refuse`] (FBL-14: never widen).
+    /// an unrecognised token → [`Self::Refuse`] (FBL-14: never widen). Boot
+    /// refuses such a token outright ([`validate_boot_token`]); this arm is
+    /// the fail-closed floor for a caller that skipped the boot check.
     #[must_use]
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
@@ -251,6 +255,33 @@ impl UnstampedMutationMode {
 pub fn is_recognised_token(raw: &str) -> bool {
     let raw = raw.trim();
     raw.is_empty() || raw.eq_ignore_ascii_case(MODE_WARN) || raw.eq_ignore_ascii_case(MODE_REFUSE)
+}
+
+/// Boot-time grammar check for [`ENV_UNSTAMPED_MUTATION`] (Conductor ruling on
+/// #3124, condition 1 — a mandate-class knob). The knob accepts exactly `warn`
+/// | `refuse` (trimmed, case-insensitive; empty / unset = `warn`); any other
+/// token, or a non-UTF-8 value, REFUSES boot naming the knob, the token and
+/// the grammar. Called from the binary's pre-runtime phase for every verb but
+/// `doctor` (which must stay runnable to diagnose the refusal). A library
+/// caller that never runs this check still fails CLOSED: [`mode`] resolves an
+/// unrecognised token to `refuse`.
+///
+/// # Errors
+///
+/// The value is set but is not a recognised token.
+pub fn validate_boot_token() -> anyhow::Result<()> {
+    match std::env::var(ENV_UNSTAMPED_MUTATION) {
+        Ok(raw) if !is_recognised_token(&raw) => Err(anyhow::anyhow!(
+            "{ENV_UNSTAMPED_MUTATION}={raw:?} is not a recognised value: accepted \
+             {MODE_WARN} | {MODE_REFUSE} (case-insensitive; empty or unset = {MODE_WARN}) — \
+             refusing to boot rather than guess the unstamped-row mutation posture (#3124)"
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "{ENV_UNSTAMPED_MUTATION} is set to a non-UTF-8 value: accepted {MODE_WARN} | \
+             {MODE_REFUSE} — refusing to boot (#3124)"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Resolve the process posture from [`ENV_UNSTAMPED_MUTATION`]. Read per call
@@ -400,7 +431,7 @@ pub fn admit_unstamped_rows(
                 target: TRACE_TARGET,
                 backend,
                 funnel,
-                target,
+                subject = target,
                 caller,
                 rows,
                 "caller-scoped mutation admitted on {rows} UNSTAMPED (legacy-unowned) row(s); \
@@ -415,7 +446,7 @@ pub fn admit_unstamped_rows(
                 target: TRACE_TARGET,
                 backend,
                 funnel,
-                target,
+                subject = target,
                 caller,
                 rows,
                 "caller-scoped mutation REFUSED on {rows} UNSTAMPED (legacy-unowned) row(s) \

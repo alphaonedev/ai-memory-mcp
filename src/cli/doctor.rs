@@ -1358,7 +1358,7 @@ fn section_unstamped_owners_3124(
     {
         facts.push((
             "unrecognised_value".into(),
-            format!("{raw:?} (resolved fail-closed to refuse)"),
+            format!("{raw:?} (boot refuses this value; accepted: warn | refuse)"),
         ));
     }
     let c = match census {

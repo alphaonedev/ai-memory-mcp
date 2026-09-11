@@ -25,7 +25,7 @@
 mod common;
 
 use ai_memory::identity::owner_stamp::{
-    ENV_UNSTAMPED_MUTATION, MODE_REFUSE, MODE_WARN, PG_CENSUS_SQL, REASON_UNSTAMPED_REFUSED,
+    ENV_UNSTAMPED_MUTATION, MODE_REFUSE, MODE_WARN, PG_CENSUS_SQL,
 };
 use ai_memory::models::{Memory, MemoryLink, MemoryLinkRelation, Tier};
 use ai_memory::store::postgres::PostgresStore;
@@ -254,31 +254,39 @@ fn pg_archive_restore_follows_the_posture() {
     }
 }
 
-/// The trait `update` refusal on an unstamped row carries a stable reason
-/// that is not the cross-owner text (the operator is told to re-own, not
-/// that someone else owns the row).
+/// Condition 2 of the Conductor ruling: the pg #1628 refusal on an unstamped
+/// row is BYTE-IDENTICAL to today in both postures (the wire-pinned reason
+/// text is unchanged, and `warn` does not turn it into an admission).
 #[test]
-fn pg_unstamped_refusal_reason_is_stable() {
-    let _p = posture(MODE_REFUSE);
-    runtime().block_on(async {
-        let Some(store) = live_pg().await else { return };
-        let ns = ns();
-        let id = seed(&store, &ns, "pg-reason", &json!({})).await;
-        let err = store
-            .update(&CallerContext::for_agent("ai:bob"), &id, patch("x"))
-            .await
-            .expect_err("DENIED");
-        let StoreError::PermissionDenied { reason, .. } = err else {
-            panic!("expected PermissionDenied");
-        };
-        assert!(!reason.contains("does not own memory (owner:"), "{reason}");
-        // The sqlite twin carries the shared #3124 reason; pg keeps its
-        // #1628 wire-pinned text. Both name the missing stamp.
-        assert!(
-            reason.contains("agent_id") || reason == REASON_UNSTAMPED_REFUSED,
-            "{reason}"
-        );
-    });
+fn pg_unstamped_refusal_reason_is_byte_identical_in_both_postures() {
+    for mode in [MODE_WARN, MODE_REFUSE] {
+        let _p = posture(mode);
+        runtime().block_on(async {
+            let Some(store) = live_pg().await else { return };
+            let ns = ns();
+            let id = seed(&store, &ns, "pg-reason", &json!({})).await;
+            let bob = CallerContext::for_agent("ai:bob");
+            let err = store
+                .update(&bob, &id, patch("x"))
+                .await
+                .expect_err("DENIED");
+            let StoreError::PermissionDenied { reason, .. } = err else {
+                panic!("expected PermissionDenied");
+            };
+            assert_eq!(
+                reason, "memory has no agent_id stamp; tenant writes refused (use admin path)",
+                "{mode}"
+            );
+            let err = store.delete(&bob, &id).await.expect_err("DENIED");
+            let StoreError::PermissionDenied { reason, .. } = err else {
+                panic!("expected PermissionDenied");
+            };
+            assert_eq!(
+                reason, "memory has no agent_id stamp; tenant deletes refused (use admin path)",
+                "{mode}"
+            );
+        });
+    }
 }
 
 /// The doctor census query counts unstamped / malformed / archived-unstamped
