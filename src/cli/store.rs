@@ -18,6 +18,12 @@ use std::path::Path;
 /// from main.rs verbatim in W5a — fields and attrs unchanged.
 #[derive(Args)]
 pub struct StoreArgs {
+    /// Deterministic ruling identity within this exact namespace.
+    #[arg(long)]
+    pub ruling_key: Option<String>,
+    /// Supersede as an operator-allowlisted hardened principal.
+    #[arg(long)]
+    pub as_admin: bool,
     /// Memory tier. `default_value` must be a literal at attribute-parse
     /// time, so the wire string is kept here verbatim; it is byte-equal
     /// to `crate::models::Tier::Mid.as_str()` (pm-v3.1 PR6 #1174 sweep
@@ -257,6 +263,17 @@ pub(crate) fn run_with_curator(
         }
     }
 
+    if let Some(key) = &args.ruling_key {
+        metadata[models::field_names::RULING_KEY] = serde_json::json!(key);
+        crate::storage::supersession::ruling_key(&metadata)?;
+    }
+    let keyed_store = args.ruling_key.is_some();
+    let mut supersession_principal = if keyed_store {
+        identity::supersession::SupersessionPrincipal::from_process_environment()?
+    } else {
+        None
+    };
+
     // v0.7.0 F2.3 (#1427) — Form-4 + Form-6 caller-supplied fields.
     // Validate each before constructing the Memory; clap-side validation
     // is permissive (Option<String>) and the validator carries the
@@ -392,8 +409,16 @@ pub(crate) fn run_with_curator(
             .ok_or_else(|| {
                 anyhow::anyhow!("--write-v2 file did not contain a write_v2 envelope")
             })?;
-        identity::attest_v2::stamp_v2_sync(&conn, &mut mem, &agent_id, &presented)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if keyed_store {
+            supersession_principal = Some(
+                identity::supersession::SupersessionPrincipal::verify_v2_sync(
+                    &conn, &mut mem, &agent_id, &presented,
+                )?,
+            );
+        } else {
+            identity::attest_v2::stamp_v2_sync(&conn, &mut mem, &agent_id, &presented)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
     } else {
         let signature: Option<Vec<u8>> = if args.sign {
             let dir = identity::keypair::default_key_dir()?;
@@ -434,6 +459,13 @@ pub(crate) fn run_with_curator(
         // across every federation relay hop. Self-authored + non-clobbering.
         if let Some(sig) = signature.as_deref() {
             identity::attest::persist_write_signature(&mut mem, sig);
+            if keyed_store {
+                supersession_principal = Some(
+                    identity::supersession::SupersessionPrincipal::verify_v1_sync(
+                        &conn, &mem, &agent_id, sig,
+                    )?,
+                );
+            }
         }
     }
 
@@ -482,7 +514,27 @@ pub(crate) fn run_with_curator(
     }
     let contradictions =
         db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
-    let actual_id = db::insert(&conn, &mem)?;
+    let supersession_result = if keyed_store {
+        Some(crate::storage::supersession::store(
+            &conn,
+            &mem,
+            crate::storage::supersession::SupersessionRequest {
+                principal: supersession_principal.as_ref(),
+                as_admin: args.as_admin,
+            },
+            None,
+        )?)
+    } else {
+        None
+    };
+    let actual_id = if let Some(result) = &supersession_result {
+        if let Some(old) = &result.superseded {
+            mem.metadata[models::field_names::SUPERSEDED_ID] = serde_json::json!(old);
+        }
+        result.id.clone()
+    } else {
+        db::insert(&conn, &mem)?
+    };
 
     // PR-5 (issue #487): security audit trail. No-op when disabled.
     // Built once so both arms share the same actor (the write already
@@ -615,6 +667,9 @@ pub(crate) fn run_with_curator(
         // keys the MCP twin emits, produced by the SAME merge helper, so
         // a scripting caller reads one contract on both surfaces.
         atomise_disposition.merge_into_response(&mut j);
+        if let Some(result) = &supersession_result {
+            result.add_response_fields(&mut j);
+        }
         writeln!(out.stdout, "{}", serde_json::to_string(&j)?)?;
     } else {
         // #3025 — echo the PERSISTED tier/namespace, not the requested ones.
@@ -685,6 +740,8 @@ mod tests {
 
     fn default_args() -> StoreArgs {
         StoreArgs {
+            ruling_key: None,
+            as_admin: false,
             tier: Tier::Mid.as_str().to_string(),
             namespace: Some("test-ns".to_string()),
             title: "test title".to_string(),

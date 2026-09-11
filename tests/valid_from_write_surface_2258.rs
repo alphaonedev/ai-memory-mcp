@@ -265,6 +265,8 @@ fn mcp_store_rejects_malformed_valid_from() {
 
 fn cli_store_args(title: &str, ns: &str) -> ai_memory::cli::store::StoreArgs {
     ai_memory::cli::store::StoreArgs {
+        ruling_key: None,
+        as_admin: false,
         tier: "long".to_string(),
         namespace: Some(ns.to_string()),
         title: title.to_string(),

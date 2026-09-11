@@ -959,6 +959,20 @@ pub async fn bulk_create(
         if secret_refused.contains(&index) {
             continue;
         }
+        if body
+            .metadata
+            .get(crate::models::field_names::RULING_KEY)
+            .is_some()
+        {
+            let error = super::create::CreateFieldError {
+                status: StatusCode::BAD_REQUEST,
+                code: crate::storage::supersession::KEYED_BULK_UNSUPPORTED,
+                field: crate::models::field_names::RULING_KEY,
+                message: crate::storage::supersession::KeyedBulkUnsupported.to_string(),
+            };
+            ledger.reject_class(index, error.field, error.as_bulk_class(), &error.message);
+            continue;
+        }
         if let Err(e) = validate::RequestValidator::validate_create(body) {
             ledger.reject(index, &e.field, &e.to_string());
             continue;

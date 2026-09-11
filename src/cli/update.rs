@@ -200,6 +200,7 @@ pub fn run(
             // wholesale.
             let existing =
                 db::get(&conn, &resolved_id)?.map_or_else(|| serde_json::json!({}), |m| m.metadata);
+            crate::identity::supersession::validate_ruling_key_update(&existing, &v)?;
             Some(crate::identity::preserve_update_provenance_keys(
                 &existing, &v,
             ))

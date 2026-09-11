@@ -150,6 +150,8 @@ fn event_named<'a>(bodies: &'a [serde_json::Value], event: &str) -> Option<&'a s
 
 fn store_args(namespace: &str, title: &str, content: &str) -> ai_memory::cli::store::StoreArgs {
     ai_memory::cli::store::StoreArgs {
+        ruling_key: None,
+        as_admin: false,
         tier: "mid".to_string(),
         namespace: Some(namespace.to_string()),
         title: title.to_string(),

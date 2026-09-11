@@ -119,6 +119,9 @@ fn main() -> Result<()> {
             }
         }
     };
+    ai_memory::identity::set_admin_agent_ids(ai_memory::daemon_runtime::resolve_admin_agent_ids(
+        app_config.admin.as_ref(),
+    ));
     config::AppConfig::write_default_if_missing();
 
     // #1889 — ALL env mutation (passphrase-file export + anonymize seeding)

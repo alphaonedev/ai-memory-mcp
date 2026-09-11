@@ -573,6 +573,18 @@ pub async fn update_memory(
             return resp;
         }
     }
+    if let (Some(existing), Some(incoming)) = (existing_for_authz.as_ref(), body.metadata.as_ref())
+    {
+        if let Err(e) =
+            crate::identity::supersession::validate_ruling_key_update(&existing.metadata, incoming)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
     // Preserve existing agent_id when caller provides new metadata — provenance
     // is immutable after first write (see NHI design in crate::identity).
     let preserved_metadata = body.metadata.as_ref().map(|new_meta| {

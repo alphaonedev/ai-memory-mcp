@@ -381,6 +381,11 @@ pub struct SubkeyCertRecord {
 }
 
 impl PresentedWriteV2 {
+    /// Verified edges use the exact signature bytes for durable replay admission.
+    pub(crate) fn write_signature(&self) -> &[u8] {
+        &self.write_signature
+    }
+
     /// Build the [`SubkeyCertRecord`] audit copy for the just-verified
     /// presentation. Call ONLY after [`verify_v2_write`] succeeded.
     #[must_use]
@@ -509,6 +514,48 @@ pub fn stamp_v2_sync(
     }
     stamp_agent_attested(mem);
     if let Err(e) = crate::db::insert_subkey_cert(conn, &presented.to_record()) {
+        tracing::warn!(error = %e, "v2 subkey-cert TOFU persist failed (write still attested)");
+    }
+    Ok(())
+}
+
+/// SAL twin of the complete live v2 gate, including revocation.
+///
+/// # Errors
+/// Any missing key, verification or revocation lookup failure refuses the write.
+#[cfg(feature = "sal")]
+pub async fn stamp_v2_async(
+    store: &dyn crate::store::MemoryStore,
+    mem: &mut crate::models::Memory,
+    agent_id: &str,
+    presented: &PresentedWriteV2,
+) -> anyhow::Result<()> {
+    adopt_created_at(mem, presented)?;
+    let root_b64 = store
+        .agent_pubkey(agent_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!(AttestV2Error::NoRootKey))?;
+    let root = crate::identity::keypair::decode_public_base64(&root_b64)
+        .map_err(|_| anyhow::anyhow!(AttestV2Error::BadRootKey))?;
+    verify_v2_write(
+        &root,
+        agent_id,
+        &mem.namespace,
+        &mem.title,
+        mem.memory_kind.as_str(),
+        &mem.created_at,
+        &mem.content,
+        presented,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+    if store
+        .subkey_is_revoked(agent_id, &presented.cert.instance_key_id)
+        .await?
+    {
+        anyhow::bail!("{}", AttestV2Error::SubkeyRevoked);
+    }
+    stamp_agent_attested(mem);
+    if let Err(e) = store.insert_subkey_cert(&presented.to_record()).await {
         tracing::warn!(error = %e, "v2 subkey-cert TOFU persist failed (write still attested)");
     }
     Ok(())

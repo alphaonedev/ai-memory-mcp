@@ -502,6 +502,65 @@ impl MemoryStore for SqliteStore {
     /// still does NOT implement [`MemoryStore::store_with_embedding`]: that
     /// method's contract is a single inline write postgres has and sqlite
     /// does not.
+    async fn subkey_is_revoked(
+        &self,
+        principal: &str,
+        instance_key_id: &[u8],
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::db::subkey_is_revoked(&conn, principal, instance_key_id).map_err(box_err)
+    }
+
+    async fn insert_subkey_cert(
+        &self,
+        record: &crate::identity::attest_v2::SubkeyCertRecord,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        crate::db::insert_subkey_cert(&conn, record).map_err(box_err)
+    }
+
+    async fn store_with_supersession(
+        &self,
+        ctx: &CallerContext,
+        memory: &Memory,
+        embedding: Option<&[f32]>,
+        space: Option<&str>,
+        request: crate::storage::supersession::SupersessionRequest<'_>,
+    ) -> StoreResult<crate::storage::supersession::SupersessionResult> {
+        self.gate_record_stop()?;
+        let stamped;
+        let memory = if ctx.bypass_visibility {
+            let mut value = memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut value.metadata);
+            stamped = value;
+            &stamped
+        } else {
+            memory
+        };
+        let vector = match embedding {
+            Some(vector) if !vector.is_empty() => Some((
+                vector,
+                space
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| StoreError::InvalidInput {
+                        detail: "supersession embedding requires a space stamp".into(),
+                    })?,
+            )),
+            _ => None,
+        };
+        let conn = self.state.lock().await;
+        crate::storage::supersession::store(&conn, memory, request, vector).map_err(|e| {
+            if let Some(conflict) = e.downcast_ref::<crate::storage::ConflictError>() {
+                StoreError::Conflict {
+                    id: conflict.existing_id.clone(),
+                }
+            } else {
+                box_err(e)
+            }
+        })
+    }
+
     async fn store_with_embedding_no_overwrite(
         &self,
         ctx: &CallerContext,

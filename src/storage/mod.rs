@@ -885,6 +885,7 @@ pub mod model_attest;
 /// the sal-gated `crate::store`) so record-stop compiles + works in the
 /// default (non-`sal`) sqlite build. The sal surface wraps it.
 pub mod record_stop;
+pub mod supersession;
 // v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
 // silently open and WRITE a NEWER database). Its own module so the pure
 // verdict is shared verbatim by the sqlite and postgres funnels.
@@ -4091,6 +4092,13 @@ pub fn update_with_expected_version(
         existing.metadata.get("agent_id").and_then(|v| v.as_str()),
         metadata,
     )?;
+    if let Some(incoming) = metadata {
+        crate::identity::supersession::validate_ruling_key_update(&existing.metadata, incoming)?;
+    }
+    let preserved_metadata = metadata.map(|incoming| {
+        crate::identity::preserve_update_provenance_keys(&existing.metadata, incoming)
+    });
+    let metadata = preserved_metadata.as_ref();
     let metadata = metadata.unwrap_or(&existing.metadata);
     // #3420 (security-high) — reconcile the row's ATTESTATION with the signed
     // envelope this update is about to write. `PUT /memories/{id}` (and the MCP
@@ -4528,6 +4536,10 @@ pub fn update_with_archive_on_supersede(
     let patched_metadata = metadata
         .cloned()
         .unwrap_or_else(|| existing.metadata.clone());
+    crate::identity::supersession::validate_ruling_key_update(
+        &existing.metadata,
+        &patched_metadata,
+    )?;
     let mut new_metadata =
         crate::identity::preserve_update_provenance_keys(&existing.metadata, &patched_metadata);
     if let serde_json::Value::Object(ref mut m) = new_metadata {
