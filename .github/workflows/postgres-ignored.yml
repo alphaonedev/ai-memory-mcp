@@ -14,9 +14,10 @@
 # per-job ephemeral db pattern as cert-postgres-age.yml.
 #
 # RUNNER PLACEMENT — self-hosted linux-fed (pg-tier). Needs :5445.
-# NOT a required context (do not add to ci-allow.ssot / T2-1).
-# Job-level `if:` is legitimate here: not a required context, not a
-# matrix (check-required-contexts.sh rule (b1) does not apply).
+# Required context as of #3552 (N24). Job-level `if:` is same-repo-only
+# (forks cannot use linux-fed); listed in
+# required-contexts-joblevel-if-allow.txt so rule (b2) is honest about
+# skip=satisfied on fork PRs. Not a matrix (rule (b1) does not apply).
 
 name: Postgres ignored tests (#3274)
 
@@ -101,7 +102,21 @@ jobs:
       - name: cargo test --features sal-postgres -- --ignored
         run: |
           set -euo pipefail
-          cargo test --features sal-postgres -- --ignored --test-threads=1
+          # #3552 non-vacuity: list first, then run, then FAIL if executed
+          # < listed or < the committed ratchet (or if any skip: line
+          # appears — live_pg() connect failure is FAIL in a cert leg).
+          mkdir -p .local-runs
+          LIST_OUT=".local-runs/postgres-ignored-list.txt"
+          TEST_OUT=".local-runs/postgres-ignored-run.txt"
+          cargo test --features sal-postgres -- --ignored --list | tee "$LIST_OUT"
+          LISTED="$(grep -c ': test$' "$LIST_OUT" || true)"
+          set +e
+          cargo test --features sal-postgres -- --ignored --test-threads=1 2>&1 | tee "$TEST_OUT"
+          rc="${PIPESTATUS[0]}"
+          set -e
+          bash scripts/check-cert-leg-nonvacuity.sh \
+            --leg postgres-ignored --log "$TEST_OUT" --listed "$LISTED"
+          exit "$rc"
 
       - name: Cleanup enterprise-fed ephemeral db
         if: always()

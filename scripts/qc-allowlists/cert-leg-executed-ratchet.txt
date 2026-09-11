@@ -1,0 +1,15 @@
+# cert-leg-executed-ratchet.txt — minimum EXECUTED test count per certified-pin
+# CI leg (#3552 / N24). HARD-FAIL if a run's executed count (passed+failed
+# summed across every `test result:` line in the cargo log) is below the
+# floor. Growing is free. LOWERING requires an allowlist entry in
+# cert-leg-executed-allow.txt with an issue link.
+#
+# Floors measured from the latest green in-PR runs on release/v1.0.0
+# (2026-09-11, run 34547403050 / 34547403199). A leg that executes 0
+# tests is the pre-#3552 silent-green class.
+#
+# FORMAT: <leg-id> <min-executed>
+# Whole-line `#` comments and blanks ignored.
+#
+cert-postgres-age 152
+postgres-ignored 154

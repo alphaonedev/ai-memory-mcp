@@ -1,0 +1,12 @@
+# cert-leg-executed-allow.txt — LOWERING ledger for the certified-pin
+# executed-count ratchet (#3552). Empty is the passing state.
+#
+# FORMAT: <leg-id> <new-floor> <YYYY-MM-DD> #<issue> [note]
+# The new-floor MUST be < the committed ratchet value; the issue is
+# what closes the drop. A malformed / undated / issue-less line
+# HARD-FAILS so this cannot rot into an unexplained suppression.
+#
+# STALE: an entry whose new-floor is >= the ratchet (the drop already
+# landed, or never applied) FAILS. Delete it after the ratchet file
+# is updated, or do not add it.
+#

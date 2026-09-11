@@ -10,8 +10,8 @@
 # ============================================================================ 
 #
 # fetched-from: alphaonedev/ai-memory-mcp release/v1.0.0
-# fetched-at:   2026-09-11T05:26Z
-# count:        38
+# fetched-at:   2026-09-11T07:44Z
+# count:        40
 # enforce_admins: true
 # strict:         true
 #
@@ -19,6 +19,7 @@ Benchmark-claim canon gate (#2879)
 Build-script custom-build ledger gate (#2635)
 C8 caller-context allowlist check
 Capacity-claim ceiling gate (#2869)
+Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)
 Check (linux-fed,enterprise-fed)
 Check (macos-fed,enterprise-fed)
 Check (macos-fed,sqlite)
@@ -45,6 +46,7 @@ Named-CI-job existence + enforcement-truthfulness gate (#2629)
 Non-Rust conformance-reader proof gate (#2452)
 Per-Module Coverage Thresholds
 Postgres feature gate
+Postgres ignored tests (sal-postgres --ignored)
 Required-context + classify-base soundness gate (#2494/#2496/#2508)
 SAL-only feature gate
 SDK-path vs routes.rs membership gate (#2629)
