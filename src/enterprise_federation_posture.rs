@@ -94,6 +94,9 @@ use std::collections::HashMap;
 /// #3553 — the `PRAGMA synchronous` posture row (check #21) and its test.
 mod synchronous;
 
+/// #3199 — the backup-manifest-signing posture row (check #22) and its test.
+mod backup_signing;
+
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
 /// name here — deliberately not a free-form string so a typo in
@@ -132,8 +135,9 @@ pub const ENV_PG_AT_REST_ATTESTED: &str = "AI_MEMORY_PG_AT_REST_ATTESTED";
 /// 20 → 21 (check #21: the SQLite `PRAGMA synchronous` durability posture —
 /// standard §0.1 / §5 make the attached `doctor --posture` output the
 /// `synchronous=FULL` attestation, and until this row nothing in the report
-/// NAMED the level or the durability class it buys).
-pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 21;
+/// NAMED the level or the durability class it buys). #3199 raised it
+/// 21 → 22 (check #22: backup manifests verify against the operator key).
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 22;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -790,6 +794,9 @@ pub fn evaluate_with_live(
     // rationale and the wording contract are documented there.
     out.push(synchronous::check_synchronous(live_synchronous));
 
+    // ---- 22. backup manifest signing (#3199; N/A on postgres) ----------
+    out.push(backup_signing::check_backup_signing(backend_is_postgres));
+
     debug_assert_eq!(
         out.len(),
         ENTERPRISE_FEDERATION_CHECK_COUNT,
@@ -1003,6 +1010,13 @@ mod tests {
                 approver_pubkey_b64_for_test(),
             );
         }
+        // #3199 check #22 — the operator public key restore verifies backups
+        // against, in the per-process test key sandbox (no env write).
+        let (keys, pk) = (
+            crate::identity::keypair::default_key_dir(),
+            approver_pubkey_b64_for_test(),
+        );
+        std::fs::write(keys.expect("key dir").join("operator.key.pub"), pk).expect("write pubkey");
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED. Process-global `OnceLock`
         // install, isolated per env-isolated child

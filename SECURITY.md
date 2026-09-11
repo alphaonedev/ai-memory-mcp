@@ -70,6 +70,7 @@ v1.0.0 flips the federation-receive and federation-transport lanes to fail-close
 | **#1801→#1954** Inbound relayed SIGNAL author attestation | `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG=1` (was `0`/permissive through v0.10.0) | signal-lane sibling of the write-sig flip; UNSET resolves STRICT (an unenrolled `from_agent` is per-signal skipped). `=0` reverts for a rollout window. |
 | **#1936** Inbound federated commit-checkpoint RESOLUTION signature | `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG=1` (fail-closed) | a resolved checkpoint is an authority-granting write; an unsigned / non-enrolled resolution is per-item skipped. `=0` for a heterogeneous-rollout window. |
 | **#1947** Cross-node governance `policy_version` staleness | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=1` (refuse a DETECTED-stale push) | a push advertising a strictly-lower `sender_policy_seq` is refused `409 stale_policy_version`; an ABSENT/undeterminable epoch is fail-OPEN (existing federation is not hard-refused). `=0` accepts stale-policy pushes during a deliberate heterogeneous-governance rollout. |
+| **#3199** `restore` verifies an operator-signed manifest | an unsigned / legacy manifest is REFUSED; a bare `restore --from <dir>` is REFUSED | take a fresh `backup` after upgrading (it signs with the operator key; create one with `ai-memory rules keygen`). Name the backup with `--snapshot <id>` or pass `--latest`. A legacy backup restores with `--allow-unsigned-manifest` under the standard posture only. See the trust model below. |
 | **#2447** Inbound WRITE namespace confinement (Layer 2) | `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=1` (fail-closed for an ENROLLED peer that declares no scope) | short-circuits entirely on zero-config (no `AI_MEMORY_FED_PEER_ATTESTATION`), so it cannot brick zero-config federation. An enrolled peer with empty `allowed_namespaces` must declare its real scope (or `["**"]` for a deliberate per-peer allow-all); `=0` is a fleet-wide rollout window (NOT a header-less / unenrolled anonymity grant — those shapes are refused unconditionally). |
 
 **Known posture notes (by design — not vulnerabilities):**
@@ -91,7 +92,27 @@ The wake hub is a same-host, content-free hint plane. It is **not** an authority
 | Laundered injection through an agent that trusts A2A input | A hub delegation (`a2a-hub/join/v1`) is refused as a caller identity or write authority; SDK-edge screen on A2A payloads (v1.1.0 BabelTele, item 6) | An agent that treats a wake as a command is that agent's bug |
 | Hub-process compromise | Distinct `User=ai-memory-hub` / launchd `UserName`; `InaccessiblePaths=/var/lib/ai-memory`; `RestrictAddressFamilies=AF_UNIX` (TCP only behind an operator `--tcp` drop-in that is **not** shipped). Pins: `tests/wake_hub_process_isolation_3578.rs` | Compromised hub can drop/delay hints. It cannot mint identities or reach the store |
 
-Packaging: `packaging/systemd/ai-memory-wake-hub.service` and `scripts/templates/dev.alphaone.ai-memory.wake-hub.plist`. The refresher (`ai-memory-wake-hub-refresh.service`) is the unit that opens the store; it runs as `User=ai-memory` and `install(1)`s the 0600 snapshot as the hub uid. Red-team acceptance cases live on [#3473](https://github.com/alphaonedev/ai-memory-mcp/issues/3473). The certification-standard rows are `docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md` §0.6.
+Packaging: `packaging/systemd/ai-memory-wake-hub.service` and `scripts/templates/dev.alphaone.ai-memory.wake-hub.plist`.
+
+## Backup and restore trust model (#3199, v1.0.0)
+
+`ai-memory restore` replaces the live database, so it is an apply path: it must not publish bytes that nobody vouches for. Before #3199 a backup manifest was a sha256 of its snapshot written next to it, and anyone who could write the backup directory could replace both files; `restore` then picked the newest file by modification time, which the same writer controls.
+
+| Threat (writer of the backup directory, no key) | Control |
+|---|---|
+| Swap the snapshot and rewrite the manifest to match | `backup` signs the manifest with the **operator key**. The signature covers every field `restore` decides on, including the snapshot's sha256 and **file name**. `restore` verifies it against the operator public key it resolves itself (`AI_MEMORY_OPERATOR_PUBKEY`, then the key directory). It never trusts a key the manifest carries. |
+| Write a fresh unsigned manifest | Refused by default. `--allow-unsigned-manifest` accepts one under the standard posture, with a WARN and a forensic audit row. Under `asi-hard` it is refused. |
+| Sign with their own key, or keep half a signature | Refused. No flag accepts a signature that does not verify. |
+| Rename an older signed pair to look newer | Refused: the signed name must match the file. |
+| Steer the choice with modification times | There is no mtime choice any more. A `--from` directory needs `--snapshot <id>` or `--latest`. `--latest` orders by the SIGNED creation time among manifests that verify, and a candidate that fails verification makes it refuse, naming the file. |
+| Plant future-dated files so rotation deletes real backups (#3604) | Rotation counts and orders only verified backups, and never deletes a file it cannot verify. |
+| Restore a manifest-less file (`.bak`, `.pre-restore`, `.pre-repair`) | Only with `--skip-verify`, which WARNs and writes an audit row under the standard posture and is refused under `asi-hard`. |
+
+**Manifests stay beside their snapshots.** This is a deliberate deviation from the original "move the manifest out of the backup directory" fix line (5-agent vote `51c21dfd`, Q6, acknowledged by the Conductor). Once a manifest is signed and the verification key is resolved out of band, where the manifest is stored adds no integrity: an attacker who can write the directory can still delete a backup, but cannot make a forged or altered one restore.
+
+**Scope.** `backup` / `restore` are SQLite-only; a PostgreSQL store is refused by design, and PostgreSQL disaster recovery (`pg_dump`, PITR) is outside the product (see `docs/production-deployment.md`). `ai-memory doctor --posture enterprise-federation` includes a backup-signing row: the operator public key must resolve and any local operator signing key must match it (N/A on PostgreSQL). An unsigned or legacy restore is on the certification standard's NOT CERTIFIED list.
+
+**Residuals.** A writer of the directory can delete backups: keep copies off-host. The signing key is the operator key, so whoever holds it can mint a backup that restores. The durability of a new backup (#3605) is reported as `durable` in `backup --json`; on a filesystem where the directory fsync fails, older backups are not rotated and `asi-hard` exits non-zero. The refresher (`ai-memory-wake-hub-refresh.service`) is the unit that opens the store; it runs as `User=ai-memory` and `install(1)`s the 0600 snapshot as the hub uid. Red-team acceptance cases live on [#3473](https://github.com/alphaonedev/ai-memory-mcp/issues/3473). The certification-standard rows are `docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md` §0.6.
 
 ## Reporting a vulnerability
 

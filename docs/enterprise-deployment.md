@@ -246,9 +246,11 @@ ai-memory/keys/`.
 Hourly local + weekly off-host:
 `0 * * * * ai-memory backup --to /var/backups/ai-memory --keep 48`
 plus weekly rsync to a separate failure domain. `ai-memory backup`
-is a `VACUUM INTO` wrapper that emits a defragmented snapshot +
-sha256 manifest; `ai-memory restore --from <dir>` verifies the manifest
-before swapping in the snapshot.
+is a `VACUUM INTO` wrapper that emits a defragmented snapshot + a
+manifest signed with the operator key; `ai-memory restore --from <dir>
+--latest` verifies that signature and the sha256 it covers before
+swapping in the snapshot (#3199; the backup host needs the operator key,
+see [`CLI_REFERENCE.md` §"Signed manifests"](CLI_REFERENCE.html#signed-manifests-v100-3199)).
 
 This topology is SQLite (T1 singleton), so the cron line above is
 correct as written. On any Postgres-backed topology (T3+) use `pg_dump`
@@ -1787,7 +1789,7 @@ quarterly restore drill is the only mechanical defense against the
 Drill on a scratch host:
 
 ```bash
-ai-memory restore --from /var/backups/ai-memory --yes       # 1. uses newest snapshot (--yes: scripted, no prompt)
+ai-memory restore --from /var/backups/ai-memory --latest --yes   # 1. newest signed backup (--yes: scripted, no prompt)
 ai-memory serve --db /var/lib/ai-memory/restored.db         # 2. boots; schema ladder re-applies idempotently
 ai-memory verify-signed-events-chain --format json | jq .chain_holds   # 3. expected: true
 ai-memory doctor --json                                     # 4. 10-section health pass

@@ -141,8 +141,16 @@ impl PublishIo for FaultIo {
     }
 }
 
-const STANDARD: RestorePolicy = RestorePolicy { asi_hard: false };
-const ASI_HARD: RestorePolicy = RestorePolicy { asi_hard: true };
+/// Standard posture, verifying against the module's test operator key
+/// (#3199: a policy now carries a key, so these are no longer `const`s).
+fn standard() -> RestorePolicy {
+    test_restore_policy(false)
+}
+
+/// The asi-hard posture, verifying against the module's test operator key.
+fn asi_hard() -> RestorePolicy {
+    test_restore_policy(true)
+}
 
 const ALL_STEPS: [PublishStep; 7] = [
     PublishStep::Staged,
@@ -159,6 +167,8 @@ fn restore_args_3550(from: PathBuf) -> RestoreArgs {
         from,
         snapshot: None,
         skip_verify: false,
+        latest: false,
+        allow_unsigned_manifest: false,
         store_url: None,
         yes: true,
     }
@@ -298,7 +308,7 @@ fn restore_refuses_to_publish_when_a_sidecar_unlink_fails_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect_err("an unlink failure must refuse the restore")
@@ -353,7 +363,7 @@ fn no_sidecar_exists_at_the_instant_the_restore_is_published_3550() {
             &restore_args_3550(snap.clone()),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect("restore must succeed");
@@ -459,7 +469,7 @@ fn a_writer_starting_mid_restore_is_refused_at_every_locked_step_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect("restore must succeed");
@@ -513,7 +523,7 @@ fn a_connection_opened_mid_restore_cannot_use_the_replaced_file_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect("restore must succeed");
@@ -584,7 +594,7 @@ fn a_ghost_cannot_write_when_the_post_publish_fsync_fails_3550() {
             &restore_args_3550(snap),
             true,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect("Standard publishes and reports the missing fsync");
@@ -616,7 +626,7 @@ fn both_fsyncs_failing_leaves_the_orphan_and_says_so_3550() {
             &restore_args_3550(snap),
             true,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect("Standard publishes and reports the missing fsyncs");
@@ -656,7 +666,7 @@ fn a_crash_at_any_publish_step_leaves_old_or_new_never_a_mix_3550() {
                     &restore_args_3550(snap.clone()),
                     false,
                     &mut out,
-                    STANDARD,
+                    standard(),
                     &mut io,
                 )
             }))
@@ -732,7 +742,7 @@ fn an_abort_at_any_publish_step_leaves_old_or_new_never_a_mix_3550() {
             &restore_args_3550(child_path(CHILD_SNAPSHOT_ENV)),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         );
         panic!("the restore must have aborted at {step:?}; it returned {outcome:?}");
@@ -841,7 +851,7 @@ fn standard_reports_a_failed_directory_fsync_as_not_durable_3550() {
                 &restore_args_3550(snap),
                 true,
                 &mut out,
-                STANDARD,
+                standard(),
                 &mut io,
             )
             .expect("Standard publishes despite a failed directory fsync");
@@ -879,7 +889,7 @@ fn restore_json_reports_a_durable_explicit_publish_3550() {
             &restore_args_3550(snap),
             true,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect("restore must succeed");
@@ -911,7 +921,7 @@ fn asi_hard_enforces_a_durable_publish_3550() {
             &restore_args_3550(snap),
             true,
             &mut out,
-            ASI_HARD,
+            asi_hard(),
             &mut io,
         )
         .expect_err("asi-hard must refuse a publish it cannot make durable")
@@ -935,7 +945,7 @@ fn asi_hard_enforces_a_durable_publish_3550() {
             &restore_args_3550(snap),
             true,
             &mut out,
-            ASI_HARD,
+            asi_hard(),
             &mut io,
         )
         .expect_err("asi-hard must exit non-zero on a non-durable publish")
@@ -951,20 +961,52 @@ fn asi_hard_enforces_a_durable_publish_3550() {
 /// Move a second, DIFFERENT snapshot into `dir` under the id `id`
 /// (so two snapshots share one directory without waiting a second for a
 /// distinct `backup` timestamp).
-fn plant_snapshot(env: &mut TestEnv, dir: &Path, id: &str, rows: usize) -> PathBuf {
+///
+/// v1.0.0 #3199 — a signed manifest names its snapshot, so the moved pair is
+/// RE-SIGNED under its new name with the test operator key, and its signed
+/// `created_at` is the timestamp in `id` (what `--latest` orders by).
+pub(super) fn plant_snapshot(env: &mut TestEnv, dir: &Path, id: &str, rows: usize) -> PathBuf {
     let scratch = TestEnv::fresh();
     let db = scratch.db_path.clone();
     for i in 0..rows {
         seed_memory(&db, "ns", &format!("planted-{i}"), "p");
     }
     let staging = dir.with_extension(format!("plant-{id}"));
-    let manifest = take_backup(env, &db, &staging);
-    let snap = dir.join(format!("{id}.{SNAPSHOT_FILE_EXT}"));
-    std::fs::rename(staging.join(&manifest.snapshot), &snap).expect("move snapshot");
-    let m = BackupManifest {
-        snapshot: format!("{id}.{SNAPSHOT_FILE_EXT}"),
-        ..manifest
+    let taken = take_backup(env, &db, &staging);
+    let name = format!("{id}.{SNAPSHOT_FILE_EXT}");
+    let snap = dir.join(&name);
+    std::fs::rename(staging.join(&taken.snapshot), &snap).expect("move snapshot");
+    let created_at = chrono::NaiveDateTime::parse_from_str(
+        id.strip_prefix(SNAPSHOT_FILE_PREFIX)
+            .expect("planted ids carry the snapshot prefix"),
+        BACKUP_TS_FMT,
+    )
+    .expect("planted ids carry a backup timestamp")
+    .and_utc()
+    .to_rfc3339();
+    let payload = manifest::SignedPayload {
+        dst: manifest::MANIFEST_DOMAIN.to_owned(),
+        v: manifest::PAYLOAD_VERSION,
+        snapshot: name.clone(),
+        sha256: taken.sha256.clone(),
+        bytes: taken.bytes,
+        source_db: taken.source_db.clone(),
+        version: taken.version.clone(),
+        created_at: created_at.clone(),
+        backend: BACKEND_SQLITE.to_owned(),
+        schema_version: taken.schema_version.expect("backup records the schema"),
+        memory_count: taken.memory_count.expect("backup records the count"),
     };
+    let mut m = BackupManifest {
+        snapshot: name,
+        created_at,
+        manifest_version: None,
+        signed_payload: None,
+        signature: None,
+        signer: None,
+        ..taken
+    };
+    manifest::sign_into(&mut m, &payload, &test_operator_key()).expect("sign manifest");
     std::fs::write(
         dir.join(manifest_file_name(id)),
         serde_json::to_string(&m).expect("manifest json"),
@@ -974,9 +1016,13 @@ fn plant_snapshot(env: &mut TestEnv, dir: &Path, id: &str, rows: usize) -> PathB
 }
 
 /// Cert battery: "misleading mtimes". The older snapshot is given the
-/// newest mtime. Without `--snapshot` it is what the fallback picks — and
-/// the operator is told so; with `--snapshot` the named one is restored
-/// whatever the mtimes say.
+/// newest mtime. With `--snapshot` the named one is restored whatever the
+/// mtimes say.
+///
+/// v1.0.0 #3199 (rule (e), old-contract pin changed): the #3550 half that
+/// asserted the mtime FALLBACK picked the older snapshot is replaced. A bare
+/// directory is now refused, and `--latest` follows the SIGNED `created_at`
+/// (the newer snapshot) — the misleading mtime is ignored.
 #[test]
 fn snapshot_flag_beats_a_misleading_mtime_3550() {
     let _g = crate::store_url::store_url_env_lock()
@@ -988,7 +1034,7 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
     let dir = db.parent().unwrap().join("backups-3550-mtime");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let old = plant_snapshot(&mut env, &dir, "ai-memory-2026-01-01T000000Z", 3);
-    plant_snapshot(&mut env, &dir, "ai-memory-2026-06-01T000000Z", 1);
+    let newer = plant_snapshot(&mut env, &dir, "ai-memory-2026-06-01T000000Z", 1);
     let future = std::time::SystemTime::now()
         + std::time::Duration::from_secs(
             u64::try_from(crate::SECS_PER_HOUR).expect("positive const"),
@@ -999,8 +1045,35 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
         .and_then(|f| f.set_modified(future))
         .expect("give the OLD snapshot the newest mtime");
 
-    // Fallback: follows the mtime, and says so.
+    // #3199 — a bare directory is refused; nothing is chosen by mtime.
+    let live_before = file_sha256(&db);
     let mut args = restore_args_3550(dir.clone());
+    let err = {
+        let mut out = env.output();
+        run_restore_with(
+            &db,
+            &args,
+            true,
+            &mut out,
+            standard(),
+            &mut FaultIo::default(),
+        )
+        .expect_err("a bare --from directory is refused (#3199)")
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--snapshot") && msg.contains("--latest"),
+        "got: {msg}"
+    );
+    assert_eq!(
+        file_sha256(&db),
+        live_before,
+        "the live database is untouched"
+    );
+
+    // #3199 — `--latest` follows the SIGNED created_at: the June snapshot,
+    // although the January one carries the newest mtime.
+    args.latest = true;
     {
         let mut out = env.output();
         run_restore_with(
@@ -1008,25 +1081,25 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
             &args,
             true,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
-        .expect("fallback restore");
+        .expect("--latest restore");
     }
     assert_eq!(
         json_envelope(&env)["selected_by"],
-        serde_json::json!("mtime")
-    );
-    assert!(
-        env.stderr_str().contains("MODIFICATION TIME"),
-        "{}",
-        env.stderr_str()
+        serde_json::json!("latest")
     );
     assert_eq!(
-        memory_rows(&db),
-        3,
-        "the mtime pick is the (older) 3-row snapshot"
+        json_envelope(&env)["manifest_verification"],
+        serde_json::json!("signed")
     );
+    assert_eq!(
+        file_sha256(&db),
+        file_sha256(&newer),
+        "--latest restores the newest SIGNED backup, not the newest mtime"
+    );
+    args.latest = false;
 
     // Every accepted spelling of the id restores the named snapshot.
     for name in [
@@ -1054,7 +1127,7 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
                 &args,
                 true,
                 &mut out,
-                STANDARD,
+                standard(),
                 &mut FaultIo::default(),
             )
             .unwrap_or_else(|e| panic!("--snapshot {name}: {e:#}"));
@@ -1073,6 +1146,8 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
 }
 
 /// asi-hard refuses the mtime pick outright and lists the candidates.
+/// (v1.0.0 #3199: the bare-directory refusal now holds under EVERY posture;
+/// this stays as the asi-hard witness.)
 #[test]
 fn asi_hard_refuses_the_mtime_pick_and_lists_candidates_3550() {
     let _g = crate::store_url::store_url_env_lock()
@@ -1092,7 +1167,7 @@ fn asi_hard_refuses_the_mtime_pick_and_lists_candidates_3550() {
             &restore_args_3550(dir),
             false,
             &mut out,
-            ASI_HARD,
+            asi_hard(),
             &mut FaultIo::default(),
         )
         .expect_err("asi-hard must refuse the mtime pick")
@@ -1168,7 +1243,7 @@ fn snapshot_flag_refusals_3550() {
                 &args,
                 false,
                 &mut out,
-                STANDARD,
+                standard(),
                 &mut FaultIo::default(),
             )
             .expect_err("must refuse")
@@ -1207,7 +1282,7 @@ fn restore_keeps_the_replaced_databases_permissions_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect("restore must succeed");
@@ -1235,7 +1310,7 @@ fn a_hard_linked_old_database_is_left_intact_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect("restore must succeed");
@@ -1277,7 +1352,7 @@ fn a_sidecar_appearing_during_the_publish_is_reported_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect_err("a sidecar that appeared must fail the restore")
@@ -1341,7 +1416,7 @@ fn restore_refuses_a_wal_it_cannot_checkpoint_3550() {
     let _g = crate::store_url::store_url_env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for policy in [STANDARD, ASI_HARD] {
+    for policy in [standard(), asi_hard()] {
         let mut env = TestEnv::fresh();
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "ckpt");
         let dir = db.parent().unwrap().to_path_buf();
@@ -1412,7 +1487,7 @@ fn restore_refuses_when_the_staged_file_cannot_be_locked_3550() {
     let _g = crate::store_url::store_url_env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for policy in [STANDARD, ASI_HARD] {
+    for policy in [standard(), asi_hard()] {
         let mut env = TestEnv::fresh();
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "staged-lock");
         let mut io = FaultIo {
@@ -1467,7 +1542,7 @@ fn restore_over_an_unlockable_target_refuses_and_the_escape_works_3550() {
             &restore_args_3550(snap.clone()),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect_err("an unlockable target must refuse the restore")
@@ -1484,7 +1559,7 @@ fn restore_over_an_unlockable_target_refuses_and_the_escape_works_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect("restore into the emptied target");
@@ -1511,7 +1586,7 @@ fn restore_into_an_empty_target_publishes_without_replacing_3550() {
             &restore_args_3550(snap.clone()),
             true,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect("restore into an empty target");
@@ -1562,7 +1637,7 @@ fn a_database_appearing_at_an_empty_target_is_never_replaced_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect_err("a database that appeared must not be replaced")
@@ -1605,7 +1680,7 @@ fn orphan_sidecars_beside_a_missing_database_are_kept_not_deleted_3550() {
             &restore_args_3550(snap.clone()),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect("restore beside orphans");
@@ -1657,7 +1732,7 @@ fn an_empty_target_publish_that_cannot_link_refuses_3550() {
             &restore_args_3550(snap),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut io,
         )
         .expect_err("no hard links: refuse")
@@ -1690,7 +1765,7 @@ fn a_symlinked_target_restores_the_real_database_3550() {
             &restore_args_3550(snap.clone()),
             false,
             &mut out,
-            STANDARD,
+            standard(),
             &mut FaultIo::default(),
         )
         .expect("restore through the link");
