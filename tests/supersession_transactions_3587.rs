@@ -507,6 +507,72 @@ async fn conflicts_and_namespaces(backend: &Backend) {
     }
 }
 
+async fn precise_predecessor_selection(backend: &Backend) {
+    let owner = principal(OWNER);
+    let request = SupersessionRequest {
+        principal: Some(&owner),
+        as_admin: false,
+    };
+    for (older_time, latest_time, equal_instant) in [
+        // julianday collapses these instants; the larger id belongs to OLDER.
+        (
+            "2026-09-09T00:00:00.000100Z",
+            "2026-09-09T00:00:00.000200Z",
+            false,
+        ),
+        // Lexical order disagrees with chronological order across offsets.
+        ("2026-09-09T05:30:00+05:30", "2026-09-09T00:00:01Z", false),
+        // Equal instants, different offsets: preserve the descending-id tie break.
+        ("2026-09-09T05:30:00+05:30", "2026-09-09T00:00:00Z", true),
+    ] {
+        for foreign_latest in [false, true] {
+            let (mut older, new) = pair();
+            let mut latest = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                title: "latest predecessor".into(),
+                ..older.clone()
+            };
+            if (latest.id > older.id) != equal_instant {
+                std::mem::swap(&mut latest.id, &mut older.id);
+            }
+            older.created_at = older_time.into();
+            latest.created_at = latest_time.into();
+            backend.seed(&older).await;
+            backend.seed(&latest).await;
+            if foreign_latest {
+                let mut metadata = latest.metadata.clone();
+                metadata["agent_id"] = json!("ai:foreign-3587");
+                backend.set_metadata(&latest, metadata).await;
+            }
+            let older_before = backend.snapshot(&older.id, false).await;
+            let latest_before = backend.snapshot(&latest.id, false).await;
+            let result = backend.store(&new, request).await.unwrap();
+            assert_eq!(backend.snapshot(&older.id, false).await, older_before);
+            assert!(backend.snapshot(&older.id, true).await.is_none());
+            assert!(backend.snapshot(&new.id, false).await.is_some());
+            if foreign_latest {
+                // Never bypass the latest row's owner by choosing an older one.
+                assert_eq!(result.refusal, Some(SupersessionRefusal::OwnerMismatch));
+                assert!(result.superseded.is_none());
+                assert_eq!(backend.snapshot(&latest.id, false).await, latest_before);
+                assert!(backend.snapshot(&latest.id, true).await.is_none());
+            } else {
+                assert!(result.refusal.is_none());
+                assert_eq!(result.superseded.as_deref(), Some(latest.id.as_str()));
+                assert!(backend.snapshot(&latest.id, false).await.is_none());
+                assert_eq!(
+                    backend.metadata(&latest.id, true).await["superseded_by"],
+                    new.id
+                );
+                assert_eq!(
+                    backend.metadata(&new.id, false).await["superseded_id"],
+                    latest.id
+                );
+            }
+        }
+    }
+}
+
 async fn archive_replay(backend: &Backend) {
     let owner = principal(OWNER);
     let foreign = principal("ai:foreign-3587");
@@ -598,6 +664,7 @@ async fn matrix(backend: &Backend) {
     ADMIN_INIT.call_once(|| ai_memory::identity::set_admin_agent_ids(vec![ADMIN.into()]));
     authority_matrix(backend).await;
     conflicts_and_namespaces(backend).await;
+    precise_predecessor_selection(backend).await;
     archive_replay(backend).await;
     rollback(backend).await;
     upsert_preserves_ruling_key(backend).await;
@@ -701,6 +768,44 @@ async fn concurrent_first_writes(backend: &Backend) {
 #[tokio::test]
 async fn direct_sqlite_supersession_transactions_3587() {
     matrix(&Backend::sqlite()).await;
+}
+
+#[tokio::test]
+async fn invalid_sqlite_predecessor_time_fails_closed_3587() {
+    let backend = Backend::sqlite();
+    let (old, new) = pair();
+    backend.seed(&old).await;
+    match &backend {
+        Backend::Sqlite { conn, .. } => {
+            conn.execute(
+                "UPDATE memories SET created_at = 'invalid' WHERE id = ?1",
+                [&old.id],
+            )
+            .unwrap();
+        }
+        #[cfg(feature = "sal-postgres")]
+        Backend::Postgres { .. } => unreachable!("SQLite fixture"),
+    }
+    let before = backend.snapshot(&old.id, false).await;
+    let owner = principal(OWNER);
+    let error = backend
+        .store(
+            &new,
+            SupersessionRequest {
+                principal: Some(&owner),
+                as_admin: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("invalid supersession predecessor timestamp")
+    );
+    assert_eq!(backend.snapshot(&old.id, false).await, before);
+    assert!(backend.snapshot(&old.id, true).await.is_none());
+    assert!(backend.snapshot(&new.id, false).await.is_none());
 }
 
 #[cfg(feature = "sal")]
