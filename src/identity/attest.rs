@@ -194,8 +194,8 @@ pub enum WriteSurface {
 /// (`resolve_inbound_attribution`, #1464), not this flag.
 #[must_use]
 pub fn require_agent_attestation_for(surface: WriteSurface) -> bool {
-    resolve_require_agent_attestation(
-        std::env::var(ENV_REQUIRE_AGENT_ATTESTATION).ok().as_deref(),
+    surface_attestation(
+        crate::env_flag::knobs::REQUIRE_AGENT_ATTESTATION.explicit(),
         surface,
     )
 }
@@ -221,10 +221,10 @@ pub const ENV_REQUIRE_AGENT_ATTESTATION: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTA
 /// unsigned MCP/CLI store.
 #[must_use]
 pub fn global_strict_attestation_enabled() -> bool {
-    matches!(
-        std::env::var(ENV_REQUIRE_AGENT_ATTESTATION).ok().as_deref(),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true")
-    )
+    // #3618 — through the #3200 shared grammar, the same object the
+    // `asi-hard` floor asks, so `=yes` can no longer meet the floor while
+    // this gate reads it as off.
+    crate::env_flag::knobs::REQUIRE_AGENT_ATTESTATION.explicit() == Some(true)
 }
 
 /// Stable refusal string for a memory-creating surface that presents no
@@ -300,19 +300,26 @@ pub fn stamp_claimed_if_absent(metadata: &mut serde_json::Value) {
     }
 }
 
-/// I/O-free parse core for [`require_agent_attestation_for`] (#1985).
+/// I/O-free core for [`require_agent_attestation_for`] (#1985).
 ///
-/// Explicit falsy (`0`/`false`, case-insensitive) → permissive on every
-/// surface; explicit truthy (`1`/`true`, case-insensitive) → required on
-/// every surface; unset or any unrecognized value → the surface-scoped
-/// compiled default (HTTP-direct fails CLOSED, MCP/CLI operator-as-actor stay
-/// permissive) so a typo fails closed on the network surface.
+/// #3200 / #3618 — the shared grammar: an explicit falsy token
+/// (`0`/`false`/`no`/`off`) is permissive on every surface; an explicit
+/// truthy token (`1`/`true`/`yes`/`on`) is required on every surface; unset
+/// (absent or empty) keeps the surface-scoped compiled default (HTTP-direct
+/// fails CLOSED, MCP/CLI operator-as-actor stay permissive). An unrecognised
+/// token refuses boot in the pre-runtime sweep; a lazy read of one is
+/// REQUIRED on every surface (a mandate fails closed).
+fn surface_attestation(explicit: Option<bool>, surface: WriteSurface) -> bool {
+    explicit.unwrap_or(matches!(surface, WriteSurface::HttpDirect))
+}
+
+/// Token-level twin of [`surface_attestation`] for the parse-matrix test.
+#[cfg(test)]
 fn resolve_require_agent_attestation(value: Option<&str>, surface: WriteSurface) -> bool {
-    match value {
-        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
-        _ => matches!(surface, WriteSurface::HttpDirect),
-    }
+    surface_attestation(
+        crate::env_flag::resolve(value, crate::env_flag::Polarity::Mandate),
+        surface,
+    )
 }
 
 /// #1751/#1985 — pin the parallel lib-test binary to the explicit
@@ -1820,7 +1827,9 @@ mod tests {
         use WriteSurface::{Cli, HttpDirect, Mcp};
 
         // ---- Explicit opt-OUT spellings → permissive on EVERY surface. ----
-        for v in ["0", "false", "FALSE", "False"] {
+        // #3200 (rule (e)): `no`/`off` joined the opt-out set (they used to
+        // fall to the surface default).
+        for v in ["0", "false", "FALSE", "False", "no", "off", " 0"] {
             for surface in [HttpDirect, Mcp, Cli] {
                 assert!(
                     !resolve_require_agent_attestation(Some(v), surface),
@@ -1830,7 +1839,9 @@ mod tests {
         }
 
         // ---- Explicit opt-IN spellings → required on EVERY surface. ----
-        for v in ["1", "true", "TRUE", "True"] {
+        // #3618: `yes`/`on`/padded `1` joined the opt-in set (the `asi-hard`
+        // floor already accepted them while this reader ignored them).
+        for v in ["1", "true", "TRUE", "True", "yes", "on", " 1", "true "] {
             for surface in [HttpDirect, Mcp, Cli] {
                 assert!(
                     resolve_require_agent_attestation(Some(v), surface),
@@ -1839,9 +1850,20 @@ mod tests {
             }
         }
 
-        // ---- Unset / unrecognized → surface-scoped compiled default:
+        // ---- Unrecognised → REQUIRED everywhere (a mandate fails closed;
+        // the boot sweep refuses it before any write in a normal boot). ----
+        for v in ["yes-please", "2", "maybe"] {
+            for surface in [HttpDirect, Mcp, Cli] {
+                assert!(
+                    resolve_require_agent_attestation(Some(v), surface),
+                    "{v} must fail closed (required) on {surface:?}"
+                );
+            }
+        }
+
+        // ---- Unset / empty → surface-scoped compiled default:
         // HttpDirect fails CLOSED, MCP/CLI operator-as-actor stay permissive.
-        for value in [None, Some("no"), Some(""), Some("yes-please"), Some("2")] {
+        for value in [None, Some(""), Some("  ")] {
             assert!(
                 resolve_require_agent_attestation(value, HttpDirect),
                 "{value:?} must require attestation on the HTTP-direct surface (fail-closed)"

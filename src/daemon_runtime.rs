@@ -3257,9 +3257,7 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
         let mode = meta.permissions().mode();
         let lax_bits = mode & 0o077;
         if lax_bits != 0 {
-            let fail_open = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            let fail_open = crate::env_flag::knobs::PASSPHRASE_FILE_ALLOW_LAX_PERMS.enabled();
             if fail_open {
                 tracing::warn!(
                     target: "ai_memory::daemon_runtime",
@@ -5271,19 +5269,7 @@ const WIRE_ACTION_ACTOR: &str = "daemon:wire_action";
 // the write pre-hook below, keeping the read + write governance-error posture
 // identical cross-surface.
 pub fn governance_fail_open_on_error() -> bool {
-    std::env::var(ENV_GOVERNANCE_FAIL_OPEN)
-        .map(|v| governance_fail_open_value_enabled(&v))
-        .unwrap_or(false)
-}
-
-/// Value-level half of [`governance_fail_open_on_error`]. The live grammar
-/// is exact `"1"` OR case-insensitive `"true"` — NOT the house `is_truthy`
-/// set (`yes`/`on` do NOT arm fail-OPEN) and NOT trimmed. Shared with the
-/// `asi-hard` KNOBS `meets_floor` (#3168) so a value the live reader would
-/// not arm cannot refuse boot (NB1).
-#[must_use]
-pub(crate) fn governance_fail_open_value_enabled(v: &str) -> bool {
-    v == "1" || v.eq_ignore_ascii_case("true")
+    crate::env_flag::knobs::GOVERNANCE_FAIL_OPEN_ON_ERROR.enabled()
 }
 
 /// #1455 legacy fail-open opt-out env var — one spelling shared by the
@@ -5537,9 +5523,7 @@ pub(crate) fn install_governance_pre_write_hook(
                     // governance posture surface so an audit can
                     // detect the legacy-permissive mode.
                     let reason = format!("governance:consultation_failed: {e}");
-                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
+                    let fail_open = governance_fail_open_on_error();
                     // Emit a governance.refusal-shaped row to the
                     // deferred audit queue regardless of the
                     // open/closed decision so the audit chain
@@ -5692,9 +5676,7 @@ pub(crate) fn install_governance_pre_action_hook(
                     // #1054 — same fail-CLOSED posture as the storage hook;
                     // env escape hatch AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1.
                     let reason = format!("governance:consultation_failed: {e}");
-                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
+                    let fail_open = governance_fail_open_on_error();
                     let synthetic_refusal = RuleDecision::Refuse {
                         rule_id: "governance:consultation_failed".to_string(),
                         reason: reason.clone(),
@@ -5846,24 +5828,7 @@ fn governance_consultation_unavailable_inner(
 /// string the daemon sees does not reflect off-host reachability, so the
 /// string-match loopback guard alone cannot protect them.
 fn require_api_key_strict() -> bool {
-    require_api_key_strict_value(std::env::var("AI_MEMORY_REQUIRE_API_KEY").ok().as_deref())
-}
-
-/// Pure parser for the [`require_api_key_strict`] env value — truthy on
-/// `"1"` / `"true"` (case-insensitive), false otherwise (including absent).
-///
-/// Factored out so the parse behaviour is unit-testable WITHOUT mutating the
-/// process-global `AI_MEMORY_REQUIRE_API_KEY`. The pre-#2567 test set/removed
-/// that var directly, which under the DEFAULT multi-threaded test harness (the
-/// SAL-only feature gate — the `--test-threads=1` coverage/postgres gates
-/// serialise and so never saw it) RACED any concurrently-running test that
-/// reads it through the boot path (`serve` → [`api_key_bind_guard`] →
-/// `require_api_key_strict`), causing a spurious #1458 API-key refusal in
-/// `serve_bootstrap_failure_returns_typed_fatal_shutdown`.
-fn require_api_key_strict_value(value: Option<&str>) -> bool {
-    value
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::env_flag::knobs::REQUIRE_API_KEY.enabled()
 }
 
 /// #2032 M2 (class-a, 5-agent vote `4d3ea1c5`) — env name for the
@@ -5886,24 +5851,19 @@ pub const ENV_ALLOW_PLAINTEXT_NONLOOPBACK: &str = "AI_MEMORY_ALLOW_PLAINTEXT_NON
 pub const ENV_REQUIRE_TLS: &str = "AI_MEMORY_REQUIRE_TLS";
 
 /// #2032 M2 — resolve the `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` escape
-/// hatch (default `false`). Mirrors the truthy grammar of
-/// [`require_api_key_strict`] (`1` / `true`, case-insensitive). Consumed by
+/// hatch (default `false`) through the #3200 shared grammar. Consumed by
 /// [`tls_bind_guard`].
 #[must_use]
 pub fn allow_plaintext_nonloopback_enabled() -> bool {
-    std::env::var(ENV_ALLOW_PLAINTEXT_NONLOOPBACK)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::env_flag::knobs::ALLOW_PLAINTEXT_NONLOOPBACK.enabled()
 }
 
 /// #2032 M2 — resolve the `AI_MEMORY_REQUIRE_TLS` fail-closed opt-in
-/// (default `false`). Mirrors the truthy grammar of
-/// [`require_api_key_strict`]. Consumed by [`tls_bind_guard`].
+/// (default `false`) through the #3200 shared grammar. Consumed by
+/// [`tls_bind_guard`].
 #[must_use]
 pub fn require_tls_enabled() -> bool {
-    std::env::var(ENV_REQUIRE_TLS)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::env_flag::knobs::REQUIRE_TLS.enabled()
 }
 
 /// #1458 (SEC, MED) — decide whether the daemon may bind given the
@@ -9906,19 +9866,22 @@ mod tests {
     /// RACED `serve_bootstrap_failure_returns_typed_fatal_shutdown` — running
     /// concurrently, that test read the transient `"1"` through the boot path
     /// and hit the #1458 API-key refusal instead of its expected DB-path
-    /// failure. The parse logic now lives in the pure
-    /// `require_api_key_strict_value`, exercised here with literal values and
+    /// failure. The parse is pure and exercised here with literal values and
     /// ZERO global-env mutation, so no concurrent reader can ever observe a
     /// transient value (this was the SOLE writer of that var in the crate).
+    ///
+    /// #3200 (rule (e)) — the knob now reads through the shared grammar, so
+    /// `yes` ENABLES the mandate (it silently did not before) and an empty
+    /// value is unset.
     #[test]
     fn require_api_key_strict_env_parse_1458() {
-        assert!(!require_api_key_strict_value(None));
-        assert!(require_api_key_strict_value(Some("1")));
-        assert!(require_api_key_strict_value(Some("TRUE")));
-        assert!(require_api_key_strict_value(Some("true")));
-        assert!(!require_api_key_strict_value(Some("0")));
-        assert!(!require_api_key_strict_value(Some("yes")));
-        assert!(!require_api_key_strict_value(Some("")));
+        let knob = &crate::env_flag::knobs::REQUIRE_API_KEY;
+        for on in ["1", "TRUE", "true", "yes", "on", " 1"] {
+            assert!(knob.value_enabled(on), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off", ""] {
+            assert!(!knob.value_enabled(off), "{off:?}");
+        }
     }
 
     // ----- helpers -------------------------------------------------------

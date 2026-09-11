@@ -121,7 +121,7 @@ pub const ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE: &str =
 /// verbatim in the posture output as an operator vouch, NOT as machine-proven
 /// encryption. See the cert doc's control #15 labeling
 /// (`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`). Reuses the
-/// house truthy grammar ([`is_truthy`]). sqlite/sqlcipher keeps its
+/// #3200 shared grammar ([`crate::env_flag`]). sqlite/sqlcipher keeps its
 /// byte-identical structural predicate (this const is unread on that leg).
 pub const ENV_PG_AT_REST_ATTESTED: &str = "AI_MEMORY_PG_AT_REST_ATTESTED";
 
@@ -187,15 +187,6 @@ fn check(
             remediation.to_string()
         },
     }
-}
-
-/// The house truthy grammar (`1`/`true`/`yes`/`on`, case-insensitive,
-/// trimmed) shared by every `AI_MEMORY_*` boolean knob in this crate.
-fn is_truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 /// #3061 — best-effort machine check that a `postgres://` DSN pins libpq's
@@ -530,12 +521,10 @@ pub fn evaluate_with_live(
     ));
 
     // ---- 13. AI_MEMORY_FED_SYNC_TRUST_PEER — MUST BE UNSET ---------
-    // NB1 fix — call the REAL reader (`peer_attestation::sync_trust_peer_bypass`,
-    // exact-literal `"1"` match, `src/federation/peer_attestation.rs:366`)
-    // instead of the broader local `is_truthy` grammar (`1`/`true`/`yes`/`on`).
-    // The real gate trips ONLY on the literal `1`, so e.g. `=true` never
-    // opens the bypass in production but `must_be_unset_env`'s truthy
-    // grammar would have false-FAILED this check against a compliant env.
+    // NB1 fix — call the REAL reader (`peer_attestation::sync_trust_peer_bypass`)
+    // rather than a re-derived grammar, so this check and the live gate can
+    // never disagree about which tokens open the bypass (#3200: both read
+    // through the shared grammar).
     let sync_trust_bypassed = crate::federation::peer_attestation::sync_trust_peer_bypass();
     out.push(check(
         crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
@@ -601,7 +590,7 @@ pub fn evaluate_with_live(
         let tls_verify_full = dsn_pins_sslmode_verify_full(dsn);
         let attested_raw =
             std::env::var(ENV_PG_AT_REST_ATTESTED).unwrap_or_else(|_| "(unset)".to_string());
-        let attested = is_truthy(&attested_raw);
+        let attested = crate::env_flag::knobs::PG_AT_REST_ATTESTED.enabled();
         out.push(check(
             &format!("{ENV_PG_AT_REST_ATTESTED} (postgres at-rest, COMPENSATING control)"),
             "postgres backend: store DSN pins TLS sslmode=verify-full (machine-checked) AND \
@@ -693,7 +682,7 @@ pub fn evaluate_with_live(
     // `evaluate` previously never read this knob, so `doctor --posture`
     // could PASS a process whose daemon would NOT refuse boot on later
     // drift (`enforce_at_boot_pre_runtime` returns Ok when unset).
-    // Reuses the real reader — the same `is_truthy` grammar the boot
+    // Reuses the real reader — the same #3200 shared grammar the boot
     // gate itself uses.
     let boot_gate_armed = enterprise_federation_posture_required();
     out.push(check(
@@ -816,9 +805,7 @@ pub fn all_pass(checks: &[PostureCheck]) -> bool {
 /// enterprise-federation posture gate.
 #[must_use]
 pub fn enterprise_federation_posture_required() -> bool {
-    std::env::var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE)
-        .map(|v| is_truthy(&v))
-        .unwrap_or(false)
+    crate::env_flag::knobs::REQUIRE_ENTERPRISE_FEDERATION_POSTURE.enabled()
 }
 
 /// Pre-runtime boot gate (§5.3 "validates and refuses to boot
