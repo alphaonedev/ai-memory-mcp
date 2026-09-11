@@ -426,33 +426,6 @@ fn stage_and_verify(
     verify_staged_integrity(staged, out, json_out)
 }
 
-/// v1.0.0 #3131 — REFUSE the staged replacement unless the whole file
-/// verifies.
-///
-/// `staged` lives in the same directory as the target, so the caller's
-/// `rename` is an atomic, same-filesystem swap. A partial copy (ENOSPC, an
-/// interrupt) or a structurally damaged snapshot therefore fails HERE, while
-/// the operator's original is still the file at the target path — the live
-/// corpus is never the thing left truncated.
-///
-/// v1.0.0 #3508/#3510 — the verdict comes from
-/// [`crate::storage::sqlite_integrity::check`], the ONE implementation of the
-/// whole-database check: `PRAGMA integrity_check` answering `ok` stopped
-/// meaning "every page was examined" the moment a root-less schema object
-/// (the v98 `inbox_namespace_aliases` VIEW, `memories_fts`) could head the
-/// schema hash, and the shared helper re-asserts the page accounting SQLite
-/// then skips. Which control carried the verdict is PRINTED rather than
-/// logged: the #3508 residual was a `tracing::warn!` no CLI surface could
-/// see, and a disaster-recovery gate that cannot say what it checked is not
-/// a gate an operator can rely on.
-///
-/// # Errors
-/// The staged file cannot be opened, it fails the integrity verdict, or this
-/// build cannot COMPLETE the check (no `dbstat`, an unreadable auto-vacuum
-/// geometry) — in which case it refuses rather than publishing a replacement
-/// it could not verify.
-fn verify_staged_integrity(staged: &Path, out: &mut CliOutput<'_>, json_out: bool) -> Result<()> {
-
 /// Owner-only mode for a file restore creates before it knows better (the
 /// staged replacement, a rollback copy of a target that had no mode to copy).
 #[cfg(unix)]
@@ -510,6 +483,32 @@ fn stage_snapshot(snapshot: &Path, staged: &Path) -> Result<()> {
     })
 }
 
+/// v1.0.0 #3131 — REFUSE the staged replacement unless the whole file
+/// verifies.
+///
+/// `staged` lives in the same directory as the target, so the caller's
+/// `rename` is an atomic, same-filesystem swap. A partial copy (ENOSPC, an
+/// interrupt) or a structurally damaged snapshot therefore fails HERE, while
+/// the operator's original is still the file at the target path — the live
+/// corpus is never the thing left truncated.
+///
+/// v1.0.0 #3508/#3510 — the verdict comes from
+/// [`crate::storage::sqlite_integrity::check`], the ONE implementation of the
+/// whole-database check: `PRAGMA integrity_check` answering `ok` stopped
+/// meaning "every page was examined" the moment a root-less schema object
+/// (the v98 `inbox_namespace_aliases` VIEW, `memories_fts`) could head the
+/// schema hash, and the shared helper re-asserts the page accounting SQLite
+/// then skips. Which control carried the verdict is PRINTED rather than
+/// logged: the #3508 residual was a `tracing::warn!` no CLI surface could
+/// see, and a disaster-recovery gate that cannot say what it checked is not
+/// a gate an operator can rely on.
+///
+/// # Errors
+/// The staged file cannot be opened, it fails the integrity verdict, or this
+/// build cannot COMPLETE the check (no `dbstat`, an unreadable auto-vacuum
+/// geometry) — in which case it refuses rather than publishing a replacement
+/// it could not verify.
+fn verify_staged_integrity(staged: &Path, out: &mut CliOutput<'_>, json_out: bool) -> Result<()> {
     let probe = db::open_read_only(staged).with_context(|| {
         format!(
             "the staged restore {} is not a readable SQLite database — refusing to \
