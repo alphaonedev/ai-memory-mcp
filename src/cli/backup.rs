@@ -1703,15 +1703,15 @@ fn run_restore_with(
     {
         held.new_lock = match lock_exclusive(&staged_path) {
             Ok(conn) => Some(conn),
-        Err(LockError::Open(e) | LockError::Busy(e) | LockError::Probe(e)) => {
-            writeln!(
-                out.stderr,
-                "warning: could not lock the staged restore {} ({e}); publishing without \
+            Err(LockError::Open(e) | LockError::Busy(e) | LockError::Probe(e)) => {
+                writeln!(
+                    out.stderr,
+                    "warning: could not lock the staged restore {} ({e}); publishing without \
                  it — make sure no daemon/MCP server starts on {} until this finishes \
                  (#3550)",
-                staged_path.display(),
-                target_db.display()
-            )?;
+                    staged_path.display(),
+                    target_db.display()
+                )?;
                 None
             }
         };
@@ -3093,12 +3093,22 @@ mod tests {
         };
         let err = {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), false, &mut out, STANDARD, &mut io)
-                .expect_err("an unlink failure must refuse the restore")
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                false,
+                &mut out,
+                STANDARD,
+                &mut io,
+            )
+            .expect_err("an unlink failure must refuse the restore")
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("refusing to publish"), "got: {msg}");
-        assert!(io.remove_calls >= 1, "the unlink must actually have been attempted");
+        assert!(
+            io.remove_calls >= 1,
+            "the unlink must actually have been attempted"
+        );
         assert!(
             !io.steps.contains(&PublishStep::Published),
             "nothing may be published after a failed unlink: {:?}",
@@ -3138,8 +3148,15 @@ mod tests {
         };
         {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap.clone()), false, &mut out, STANDARD, &mut io)
-                .expect("restore must succeed");
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap.clone()),
+                false,
+                &mut out,
+                STANDARD,
+                &mut io,
+            )
+            .expect("restore must succeed");
         }
         let seen = seen.borrow();
         let at = |step: PublishStep| {
@@ -3149,14 +3166,23 @@ mod tests {
                 .unwrap_or_else(|| panic!("step {step:?} never reached: {seen:?}"))
         };
         let (_, cleared_sidecars, cleared_len) = at(PublishStep::SidecarsCleared);
-        assert_eq!(cleared_sidecars, "", "sidecars must be gone before the rename");
-        assert_eq!(cleared_len, old_len, "the OLD database must still be the target then");
+        assert_eq!(
+            cleared_sidecars, "",
+            "sidecars must be gone before the rename"
+        );
+        assert_eq!(
+            cleared_len, old_len,
+            "the OLD database must still be the target then"
+        );
         let (_, published_sidecars, published_len) = at(PublishStep::Published);
         assert_eq!(
             published_sidecars, "",
             "no sidecar may exist at the instant the new file is at target_db"
         );
-        assert_eq!(published_len, snapshot_len, "the replacement must be the target");
+        assert_eq!(
+            published_len, snapshot_len,
+            "the replacement must be the target"
+        );
         assert_eq!(
             std::fs::read(&db).expect("read restored db"),
             std::fs::read(&snap).expect("read snapshot"),
@@ -3197,13 +3223,27 @@ mod tests {
         };
         {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), false, &mut out, STANDARD, &mut io)
-                .expect("restore must succeed");
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                false,
+                &mut out,
+                STANDARD,
+                &mut io,
+            )
+            .expect("restore must succeed");
         }
         let refused = refused.borrow();
-        assert_eq!(refused.len(), ALL_STEPS.len() - 1, "every locked step observed");
+        assert_eq!(
+            refused.len(),
+            ALL_STEPS.len() - 1,
+            "every locked step observed"
+        );
         for (step, was_busy) in refused.iter() {
-            assert!(was_busy, "a writer must get SQLITE_BUSY at {step:?}: {refused:?}");
+            assert!(
+                was_busy,
+                "a writer must get SQLITE_BUSY at {step:?}: {refused:?}"
+            );
         }
         assert_eq!(memory_rows(&db), 1, "the restore must have landed intact");
     }
@@ -3233,8 +3273,15 @@ mod tests {
         };
         {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), false, &mut out, STANDARD, &mut io)
-                .expect("restore must succeed");
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                false,
+                &mut out,
+                STANDARD,
+                &mut io,
+            )
+            .expect("restore must succeed");
         }
         let ghost = ghost.borrow_mut().take().expect("ghost opened");
         let write = ghost.execute_batch(
@@ -3283,7 +3330,10 @@ mod tests {
                     )
                 }))
             };
-            assert!(unwound.is_err(), "the injected crash at {crash_at:?} must fire");
+            assert!(
+                unwound.is_err(),
+                "the injected crash at {crash_at:?} must fire"
+            );
             let published = matches!(
                 crash_at,
                 PublishStep::Published | PublishStep::PostPublishSynced
@@ -3296,7 +3346,11 @@ mod tests {
                 );
                 assert_eq!(memory_rows(&db), 1, "{crash_at:?}");
             } else {
-                assert_eq!(memory_rows(&db), 2, "before the rename the old DB stays ({crash_at:?})");
+                assert_eq!(
+                    memory_rows(&db),
+                    2,
+                    "before the rename the old DB stays ({crash_at:?})"
+                );
             }
             let probe = db::open_read_only(&db).expect("target opens");
             assert!(
@@ -3309,7 +3363,11 @@ mod tests {
             drop(probe);
             if !matches!(crash_at, PublishStep::Staged | PublishStep::Locked) {
                 let aside = find_pre_restore_copy(db.parent().unwrap());
-                assert_eq!(memory_rows(&aside), 2, "rollback copy intact ({crash_at:?})");
+                assert_eq!(
+                    memory_rows(&aside),
+                    2,
+                    "rollback copy intact ({crash_at:?})"
+                );
             }
         }
     }
@@ -3335,12 +3393,27 @@ mod tests {
             };
             {
                 let mut out = env.output();
-                run_restore_with(&db, &restore_args_3550(snap), true, &mut out, STANDARD, &mut io)
-                    .expect("Standard publishes despite a failed directory fsync");
+                run_restore_with(
+                    &db,
+                    &restore_args_3550(snap),
+                    true,
+                    &mut out,
+                    STANDARD,
+                    &mut io,
+                )
+                .expect("Standard publishes despite a failed directory fsync");
             }
             let v = json_envelope(&env);
-            assert_eq!(v["durable_publish"], serde_json::json!(false), "{before}/{after}");
-            assert!(env.stderr_str().contains("fsync"), "must warn: {}", env.stderr_str());
+            assert_eq!(
+                v["durable_publish"],
+                serde_json::json!(false),
+                "{before}/{after}"
+            );
+            assert!(
+                env.stderr_str().contains("fsync"),
+                "must warn: {}",
+                env.stderr_str()
+            );
             assert_eq!(memory_rows(&db), 1, "published ({before}/{after})");
         }
     }
@@ -3387,8 +3460,15 @@ mod tests {
         };
         let err = {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), true, &mut out, ASI_HARD, &mut io)
-                .expect_err("asi-hard must refuse a publish it cannot make durable")
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                true,
+                &mut out,
+                ASI_HARD,
+                &mut io,
+            )
+            .expect_err("asi-hard must refuse a publish it cannot make durable")
         };
         assert!(format!("{err:#}").contains("asi-hard"), "got: {err:#}");
         assert!(!io.steps.contains(&PublishStep::Published));
@@ -3404,11 +3484,21 @@ mod tests {
         };
         let err = {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), true, &mut out, ASI_HARD, &mut io)
-                .expect_err("asi-hard must exit non-zero on a non-durable publish")
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                true,
+                &mut out,
+                ASI_HARD,
+                &mut io,
+            )
+            .expect_err("asi-hard must exit non-zero on a non-durable publish")
         };
         assert!(format!("{err:#}").contains("durable"), "got: {err:#}");
-        assert_eq!(json_envelope(&env)["durable_publish"], serde_json::json!(false));
+        assert_eq!(
+            json_envelope(&env)["durable_publish"],
+            serde_json::json!(false)
+        );
         assert_eq!(memory_rows(&db), 1, "the restore itself was published");
     }
 
@@ -3464,12 +3554,30 @@ mod tests {
         let mut args = restore_args_3550(dir.clone());
         {
             let mut out = env.output();
-            run_restore_with(&db, &args, true, &mut out, STANDARD, &mut FaultIo::default())
-                .expect("fallback restore");
+            run_restore_with(
+                &db,
+                &args,
+                true,
+                &mut out,
+                STANDARD,
+                &mut FaultIo::default(),
+            )
+            .expect("fallback restore");
         }
-        assert_eq!(json_envelope(&env)["selected_by"], serde_json::json!("mtime"));
-        assert!(env.stderr_str().contains("MODIFICATION TIME"), "{}", env.stderr_str());
-        assert_eq!(memory_rows(&db), 3, "the mtime pick is the (older) 3-row snapshot");
+        assert_eq!(
+            json_envelope(&env)["selected_by"],
+            serde_json::json!("mtime")
+        );
+        assert!(
+            env.stderr_str().contains("MODIFICATION TIME"),
+            "{}",
+            env.stderr_str()
+        );
+        assert_eq!(
+            memory_rows(&db),
+            3,
+            "the mtime pick is the (older) 3-row snapshot"
+        );
 
         // Every accepted spelling of the id restores the named snapshot.
         for name in [
@@ -3481,7 +3589,10 @@ mod tests {
             env.stderr.clear();
             // Each restore leaves a rollback copy; distinct timestamps are not
             // guaranteed within one second, so clear the previous one.
-            for e in std::fs::read_dir(db.parent().unwrap()).expect("dir").flatten() {
+            for e in std::fs::read_dir(db.parent().unwrap())
+                .expect("dir")
+                .flatten()
+            {
                 if e.file_name().to_string_lossy().contains(PRE_RESTORE_INFIX) {
                     let _ = std::fs::remove_file(e.path());
                 }
@@ -3489,12 +3600,26 @@ mod tests {
             args.snapshot = Some(name.to_owned());
             {
                 let mut out = env.output();
-                run_restore_with(&db, &args, true, &mut out, STANDARD, &mut FaultIo::default())
-                    .unwrap_or_else(|e| panic!("--snapshot {name}: {e:#}"));
+                run_restore_with(
+                    &db,
+                    &args,
+                    true,
+                    &mut out,
+                    STANDARD,
+                    &mut FaultIo::default(),
+                )
+                .unwrap_or_else(|e| panic!("--snapshot {name}: {e:#}"));
             }
-            assert_eq!(json_envelope(&env)["selected_by"], serde_json::json!("explicit"));
+            assert_eq!(
+                json_envelope(&env)["selected_by"],
+                serde_json::json!("explicit")
+            );
             assert!(!env.stderr_str().contains("MODIFICATION TIME"), "{name}");
-            assert_eq!(memory_rows(&db), 1, "--snapshot {name} restores the named snapshot");
+            assert_eq!(
+                memory_rows(&db),
+                1,
+                "--snapshot {name} restores the named snapshot"
+            );
         }
     }
 
@@ -3525,8 +3650,15 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("--snapshot"), "got: {msg}");
-        assert!(msg.contains("ai-memory-2026-01-01T000000Z"), "candidates listed: {msg}");
-        assert_eq!(std::fs::read(&db).expect("read live db"), before, "untouched");
+        assert!(
+            msg.contains("ai-memory-2026-01-01T000000Z"),
+            "candidates listed: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&db).expect("read live db"),
+            before,
+            "untouched"
+        );
     }
 
     #[test]
@@ -3565,7 +3697,11 @@ mod tests {
         let before = std::fs::read(&db).expect("read live db");
         let mut cases: Vec<(PathBuf, String, &str)> = vec![
             (dir.clone(), "../escape".into(), "not a snapshot name"),
-            (snap.clone(), "ai-memory-2026-01-01T000000Z".into(), "not a directory"),
+            (
+                snap.clone(),
+                "ai-memory-2026-01-01T000000Z".into(),
+                "not a directory",
+            ),
             (dir.clone(), "ai-memory-missing".into(), "no snapshot"),
         ];
         #[cfg(unix)]
@@ -3578,13 +3714,27 @@ mod tests {
             args.snapshot = Some(name.clone());
             let err = {
                 let mut out = env.output();
-                run_restore_with(&db, &args, false, &mut out, STANDARD, &mut FaultIo::default())
-                    .expect_err("must refuse")
+                run_restore_with(
+                    &db,
+                    &args,
+                    false,
+                    &mut out,
+                    STANDARD,
+                    &mut FaultIo::default(),
+                )
+                .expect_err("must refuse")
             };
             let msg = format!("{err:#}");
-            assert!(msg.contains(want), "--snapshot {name}: want {want:?}, got: {msg}");
+            assert!(
+                msg.contains(want),
+                "--snapshot {name}: want {want:?}, got: {msg}"
+            );
         }
-        assert_eq!(std::fs::read(&db).expect("read live db"), before, "untouched");
+        assert_eq!(
+            std::fs::read(&db).expect("read live db"),
+            before,
+            "untouched"
+        );
     }
 
     /// The restored database keeps the permissions of the one it replaced,
@@ -3603,8 +3753,15 @@ mod tests {
         std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o640)).expect("chmod");
         {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), false, &mut out, STANDARD, &mut FaultIo::default())
-                .expect("restore must succeed");
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                false,
+                &mut out,
+                STANDARD,
+                &mut FaultIo::default(),
+            )
+            .expect("restore must succeed");
         }
         let mode = std::fs::metadata(&db).expect("stat").permissions().mode() & 0o7777;
         assert_eq!(mode, 0o640, "the replaced database's mode is kept");
@@ -3624,11 +3781,26 @@ mod tests {
         std::fs::hard_link(&db, &link).expect("hard link");
         {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), false, &mut out, STANDARD, &mut FaultIo::default())
-                .expect("restore must succeed");
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                false,
+                &mut out,
+                STANDARD,
+                &mut FaultIo::default(),
+            )
+            .expect("restore must succeed");
         }
-        assert_eq!(memory_rows(&link), 2, "the linked old database must still open");
-        assert!(env.stderr_str().contains("hard"), "must warn: {}", env.stderr_str());
+        assert_eq!(
+            memory_rows(&link),
+            2,
+            "the linked old database must still open"
+        );
+        assert!(
+            env.stderr_str().contains("hard"),
+            "must warn: {}",
+            env.stderr_str()
+        );
         assert_eq!(memory_rows(&db), 1);
     }
 
@@ -3651,8 +3823,15 @@ mod tests {
         };
         let err = {
             let mut out = env.output();
-            run_restore_with(&db, &restore_args_3550(snap), false, &mut out, STANDARD, &mut io)
-                .expect_err("a sidecar that appeared must fail the restore")
+            run_restore_with(
+                &db,
+                &restore_args_3550(snap),
+                false,
+                &mut out,
+                STANDARD,
+                &mut io,
+            )
+            .expect_err("a sidecar that appeared must fail the restore")
         };
         assert!(format!("{err:#}").contains("appeared"), "got: {err:#}");
         let _ = std::fs::remove_file(sidecar_path(&db, "-journal"));
