@@ -946,7 +946,11 @@ fn approval_signature_3587(canonical: &str) -> String {
 }
 
 async fn http_approve(router: &axum::Router, pid: &str, agent: &str) -> (StatusCode, Value) {
-    let ts = chrono::Utc::now().timestamp().to_string();
+    // The verifier's replay cache keys on the signature (which does not
+    // cover X-Agent-Id), so every call signs a DISTINCT in-window timestamp.
+    static CALLS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let back = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ts = (chrono::Utc::now().timestamp() - back).to_string();
     let sig = approval_signature_3587(&format!("{ts}.POST.{pid}."));
     let req = Request::builder()
         .method("POST")
