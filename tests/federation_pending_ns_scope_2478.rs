@@ -923,11 +923,37 @@ async fn federated_decision_on_local_proposal_refused_even_with_gate_off_3587() 
 // it; any other registered approver is refused 403 BEFORE the row is approved.
 // ---------------------------------------------------------------------
 
+/// Clears the process-global approval HMAC secret on drop (incl. unwind).
+struct HmacReset;
+
+impl Drop for HmacReset {
+    fn drop(&mut self) {
+        ai_memory::config::set_active_hooks_hmac_secret(None);
+    }
+}
+
+const APPROVAL_HMAC_SECRET_3587: &str = "3587-proposal-approval-hmac-secret-for-tests";
+
+/// K7 approval signature (`verify_approval_hmac` canonical: key =
+/// SHA-256(secret), sig = hex(HMAC-SHA256(key, "<ts>.POST.<id>.<body>"))).
+fn approval_signature_3587(canonical: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    let key = Sha256::digest(APPROVAL_HMAC_SECRET_3587.as_bytes());
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("hmac key");
+    mac.update(canonical.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 async fn http_approve(router: &axum::Router, pid: &str, agent: &str) -> (StatusCode, Value) {
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let sig = approval_signature_3587(&format!("{ts}.POST.{pid}."));
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/pending/{pid}/approve"))
         .header("x-agent-id", agent)
+        .header("x-ai-memory-signature", format!("sha256={sig}"))
+        .header("x-ai-memory-timestamp", ts)
         .body(Body::empty())
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
@@ -965,6 +991,8 @@ async fn http_owner_approves_proposal_and_non_owner_is_refused_3587() {
     }
     let (old, new) = seed_supersession_pair(&router).await;
     let pid = queue_local_proposal(&db, &old, &new).await;
+    ai_memory::config::set_active_hooks_hmac_secret(Some(APPROVAL_HMAC_SECRET_3587.to_string()));
+    let _hmac = HmacReset;
 
     // A registered, non-requester approver who does not own OLD: refused
     // before approval — the row stays pending and nothing is archived.
