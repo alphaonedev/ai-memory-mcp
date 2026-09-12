@@ -38,8 +38,8 @@ pub enum ReflectError {
     /// the offending id so the caller can name the missing source.
     SourceNotFound(String),
     /// Proposed reflection depth exceeds the resolved namespace cap.
-    /// The triple is the structured payload Task 5/8 will attach to
-    /// the audit row.
+    /// The triple is internal diagnostic/audit data, potentially derived
+    /// from a private standard. Never render it in a tenant response (#3638).
     DepthExceeded {
         attempted: u32,
         cap: u32,
@@ -643,9 +643,11 @@ pub fn reflect_with_hooks_for_caller(
         // validation error rather than smashing the existing row.
         let actual_id = insert_with_conflict(conn, &new_mem, ConflictMode::Error).map_err(|e| {
             if e.downcast_ref::<crate::storage::ConflictError>().is_some() {
-                ReflectError::Validation(format!(
-                    "reflection title collides with an existing memory in the same namespace: {e}"
-                ))
+                tracing::warn!(target: "mcp.reflect", error = %e, "reflection title conflict");
+                ReflectError::Validation(
+                    "reflection title collides with an existing memory in the same namespace"
+                        .into(),
+                )
             } else {
                 ReflectError::Database(e.to_string())
             }
