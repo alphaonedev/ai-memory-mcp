@@ -1279,29 +1279,40 @@ pub fn check_agent_action_cached(
     Ok(decision)
 }
 
+/// In-memory commitment preimage. Never queued or written to the forensic file.
+#[derive(Serialize)]
+struct ForensicActionContent<'a> {
+    action: &'a AgentAction,
+    decision_detail: &'a Decision,
+}
+
 /// v0.7.0 #697 — translate a `(action, decision)` into the forensic
 /// log shape and emit. No-op when the forensic sink is uninitialised.
 fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decision) {
     let (decision_str, rule_id) = match decision {
-        Decision::Allow => ("allow", String::new()),
-        Decision::Refuse { rule_id, .. } => ("refuse", rule_id.clone()),
-        Decision::Warn { rule_id, .. } => ("warn", rule_id.clone()),
-        Decision::Escalate { rule_id, .. } => ("escalate", rule_id.clone()),
+        Decision::Allow => ("allow", ""),
+        Decision::Refuse { rule_id, .. } => ("refuse", rule_id.as_str()),
+        Decision::Warn { rule_id, .. } => ("warn", rule_id.as_str()),
+        Decision::Escalate { rule_id, .. } => ("escalate", rule_id.as_str()),
     };
-    // payload is `{action, decision_detail}` — keeps the forensic row
-    // self-describing without depending on cross-table joins for a
-    // SIEM walking the chain.
-    let payload = serde_json::json!({
-        "action": action,
-        "decision_detail": decision,
-    });
-    crate::governance::audit::record_decision(
+    // #3647: commit to the full content in memory, but allow only identity,
+    // outcome and a hash-only envelope into the signed JSONL retention domain.
+    let content = ForensicActionContent {
+        action,
+        decision_detail: decision,
+    };
+    if let Err(error) = crate::governance::audit::try_record_sensitive_decision(
         agent_id,
         decision_str,
         action.kind(),
-        &rule_id,
-        payload,
-    );
+        rule_id,
+        &content,
+    ) {
+        tracing::error!(
+            target: crate::governance::audit::AUDIT_TRACE_TARGET,
+            "forensic: emission failed: {error}"
+        );
+    }
 }
 
 /// Append a `governance.check` row to `signed_events`. Helper so
@@ -1830,6 +1841,171 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_3647_unserializable_action_never_falls_back_to_plaintext() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _forensic = forensic_lock();
+        let _ = crate::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch forensic directory");
+        crate::governance::audit::init(tmp.path(), None).expect("init");
+        let action = AgentAction::Bash {
+            command: "ISSUE_3647_SERIALIZATION_SECRET".into(),
+            cwd: Some(std::ffi::OsString::from_vec(vec![0xff]).into()),
+        };
+        emit_forensic_decision("agent:3647", &action, &Decision::Allow);
+        crate::governance::audit::shutdown();
+        assert_eq!(std::fs::read_dir(tmp.path()).expect("directory").count(), 0);
+    }
+
+    #[test]
+    fn issue_3647_refused_command_is_redacted_through_public_checks() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let _ = crate::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch forensic directory");
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R3647",
+            action_kinds::BASH,
+            r#"{"command_substring":"ISSUE_3647"}"#,
+            "refuse",
+            true,
+        );
+        crate::governance::audit::init(tmp.path(), None).expect("init");
+        let action = AgentAction::Bash {
+            command: "ISSUE_3647_REFUSED_COMMAND_TOKEN".into(),
+            cwd: None,
+        };
+        assert!(
+            check_agent_action(&conn, "agent:3647", &action)
+                .expect("check")
+                .is_refusal()
+        );
+        assert!(
+            check_agent_action_no_audit(&conn, &action)
+                .expect("check")
+                .is_refusal()
+        );
+        crate::governance::audit::shutdown();
+        let mut count = 0;
+        for entry in std::fs::read_dir(tmp.path()).expect("directory") {
+            let body = std::fs::read_to_string(entry.expect("entry").path()).expect("JSONL");
+            assert!(!body.contains("ISSUE_3647_REFUSED_COMMAND_TOKEN"));
+            for line in body.lines() {
+                let row: crate::governance::audit::ForensicDecision =
+                    serde_json::from_str(line).expect("row");
+                assert_eq!(row.decision, "refuse");
+                assert_eq!(row.rule_id, "R3647");
+                assert_eq!(row.payload["sensitive_fields"], "hash_only");
+                count += 1;
+            }
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn issue_3647_forensic_actions_and_outcomes_never_persist_secrets() {
+        let _forensic = forensic_lock();
+        let _ = crate::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch forensic directory");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[37; 32]);
+        let public_key = key.verifying_key();
+        crate::governance::audit::init(tmp.path(), Some(key)).expect("init");
+        let secret = "ISSUE_3647_SENTINEL_TOKEN";
+        let actions = [
+            AgentAction::Bash {
+                command: secret.into(),
+                cwd: Some(secret.into()),
+            },
+            AgentAction::FilesystemWrite {
+                path: secret.into(),
+                byte_estimate: Some(3647),
+            },
+            AgentAction::NetworkRequest {
+                host: secret.into(),
+                scheme: secret.into(),
+            },
+            AgentAction::ProcessSpawn {
+                binary: secret.into(),
+                args: vec![secret.into()],
+            },
+            AgentAction::Custom {
+                custom_kind: secret.into(),
+                payload: serde_json::json!({secret: [secret]}),
+            },
+            AgentAction::Read {
+                surface: secret.into(),
+                namespace: Some(secret.into()),
+                query: Some(secret.into()),
+            },
+        ];
+        let decisions = [
+            Decision::Allow,
+            Decision::Refuse {
+                rule_id: "R3647".into(),
+                reason: secret.into(),
+            },
+            Decision::Warn {
+                rule_id: "R3647".into(),
+                reason: secret.into(),
+            },
+            Decision::Escalate {
+                rule_id: "R3647".into(),
+                reason: secret.into(),
+            },
+        ];
+        for action in &actions {
+            for decision in &decisions {
+                emit_forensic_decision("agent:3647", action, decision);
+            }
+        }
+        crate::governance::audit::shutdown();
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(tmp.path()).expect("read directory") {
+            let body = std::fs::read_to_string(entry.expect("entry").path()).expect("JSONL");
+            assert!(
+                !body.contains(secret),
+                "sensitive action or reason persisted"
+            );
+            for line in body.lines() {
+                rows.push(
+                    serde_json::from_str::<crate::governance::audit::ForensicDecision>(line)
+                        .expect("row"),
+                );
+            }
+        }
+        assert_eq!(rows.len(), 24);
+        for ((action, decision), row) in actions
+            .iter()
+            .flat_map(|a| decisions.iter().map(move |d| (a, d)))
+            .zip(&rows)
+        {
+            assert_eq!(row.actor, "agent:3647");
+            assert_eq!(row.kind, action.kind());
+            assert_eq!(
+                row.decision,
+                serde_json::to_value(decision).expect("decision")["decision"]
+            );
+            let canonical = serde_json::json!({"action": action, "decision_detail": decision});
+            let hash = payload_hash(&serde_json::to_vec(&canonical).expect("canonical"));
+            assert_eq!(
+                row.payload,
+                serde_json::json!({
+                    "content_hash": hex::encode(hash),
+                    "sensitive_fields": "hash_only",
+                })
+            );
+        }
+        let report =
+            crate::governance::audit::verify_since(tmp.path(), "2000-01-01", Some(&public_key))
+                .expect("verify");
+        assert_eq!(report.total_lines, 24);
+        assert!(report.first_failure.is_none(), "redacted chain must verify");
     }
 
     #[test]

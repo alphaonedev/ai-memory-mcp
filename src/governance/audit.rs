@@ -5,7 +5,8 @@
 //!
 //! Every governance decision (allow / refuse / warn) emitted by the
 //! agent-action engine OR the deferred-audit pipeline lands in an
-//! append-only forensic log:
+//! append-only forensic log when `audit.enabled` is true. Action content and
+//! decision reasons are replaced by a hash-only envelope before signing (#3647):
 //!
 //! ```text
 //! <forensic_dir>/forensic-<YYYY-MM-DD>.jsonl
@@ -50,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Tracing target for the forensic audit sink (#1558 tracing-target SSOT).
-const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
+pub(crate) const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
 
 /// Sentinel `prev_hash` for the first line of a fresh chain.
 pub const CHAIN_HEAD_PREV_HASH: &str =
@@ -337,7 +338,7 @@ pub fn try_sign_audit_payload(payload_hash: &[u8]) -> Option<(Vec<u8>, &'static 
 }
 
 /// `true` when the daemon has installed a process-wide audit-row
-/// signing key via `init`. Used by tests + diagnostics; production
+/// signing key via `init` or `init_audit_signers`. Used by tests + diagnostics; production
 /// code paths use `try_sign_audit_payload` directly.
 #[must_use]
 pub fn audit_key_is_installed() -> bool {
@@ -350,14 +351,11 @@ struct ForensicSink {
     signing_key: Option<SigningKey>,
 }
 
-/// Initialise the forensic audit sink.
+/// Install database audit signers independently of forensic file enablement.
 ///
-/// # Errors
-/// - The directory cannot be created.
-pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
-    let last_hash = read_chain_tail(dir).unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
+/// The first installed daemon/recorder key wins for the process lifetime.
+/// Missing recorder keys retain the existing unsigned/daemon fallback posture.
+pub fn init_audit_signers(signing_key: Option<&SigningKey>) {
     // v0.7.0 #1035 — install the same key into the process-wide
     // SQL-side audit-row signer if one was provided. Cloning the
     // ed25519 SigningKey is cheap (32-byte SecretKey copy); both
@@ -371,7 +369,7 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     // repeatedly — the SqliteSignedEventsSink path keeps using the
     // first-installed key, which is the documented v0.7 posture
     // (one daemon == one signing identity per process lifetime).
-    if let Some(key) = signing_key.as_ref() {
+    if let Some(key) = signing_key {
         let _ = DAEMON_AUDIT_KEY.set(key.clone());
     }
     // v0.9.0 G9 (#1826) — co-install the process-static RECORDER signer
@@ -384,6 +382,17 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
             let _ = RECORDER_KEY.set(sk);
         }
     }
+}
+
+/// Initialise the forensic audit sink.
+///
+/// # Errors
+/// - The directory cannot be created.
+pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
+    let last_hash = read_chain_tail(dir).unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
+    init_audit_signers(signing_key.as_ref());
     let new_sink = ForensicSink {
         dir: dir.to_path_buf(),
         last_hash,
@@ -425,7 +434,38 @@ pub fn is_enabled() -> bool {
     sink().lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// Record a governance decision to the forensic log.
+/// Record sensitive content as a SHA-256 commitment, never as plaintext (#3647).
+///
+/// Only the identity/outcome arguments and a fixed hash-only envelope reach
+/// the signer and writer. Action fields and free-form decision reasons must
+/// use this boundary rather than the metadata-only `try_record_decision` API.
+/// Serialization failure emits no row; there is no raw-content fallback.
+///
+/// # Errors
+/// Returns an error if serialization or forensic emission fails.
+pub(crate) fn try_record_sensitive_decision(
+    actor: &str,
+    decision: &str,
+    kind: &str,
+    rule_id: &str,
+    content: &impl Serialize,
+) -> Result<()> {
+    // Normalize object key ordering before hashing, matching the existing
+    // action/decision JSON commitment shape. Both conversions are fallible.
+    let content =
+        serde_json::to_value(content).context("building sensitive forensic commitment")?;
+    let bytes = serde_json::to_vec(&content).context("serialising sensitive forensic content")?;
+    let payload = serde_json::json!({
+        "content_hash": hex::encode(Sha256::digest(&bytes)),
+        "sensitive_fields": "hash_only",
+    });
+    try_record_decision(actor, decision, kind, rule_id, payload)
+}
+
+/// Record allowlisted governance metadata to the forensic log.
+///
+/// Callers must not pass action content or free-form sensitive reasons here;
+/// use `try_record_sensitive_decision` for those inputs.
 ///
 /// # Errors
 /// - The current-day file cannot be opened for append.
@@ -1786,7 +1826,7 @@ pub const REQUIRE_ROLE_SEPARATION_ENV: &str = "AI_MEMORY_REQUIRE_ROLE_SEPARATION
 /// separator keeps the concatenation unambiguous.
 pub const DOMAIN_RECORDER: &[u8] = b"ai-memory:gov-recorder:v1\x1f";
 
-/// Process-static RECORDER signing key, installed once by [`init`] (co-located
+/// Process-static RECORDER signing key, installed by [`init_audit_signers`] (co-located
 /// with [`DAEMON_AUDIT_KEY`]) so the per-row recorder signature stays off the
 /// key-file I/O path. Empty until a recorder key is enrolled (opt-in).
 static RECORDER_KEY: OnceLock<SigningKey> = OnceLock::new();
@@ -3389,6 +3429,26 @@ mod tests {
             }
         }
         init(dir, key).expect("forensic init");
+    }
+
+    #[test]
+    fn issue_3647_database_signer_does_not_enable_forensic_files() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _ = crate::identity::test_key_dir::install();
+        shutdown();
+        let key = fresh_key();
+        init_audit_signers(Some(&key));
+        assert!(!is_enabled());
+        let content_hash = Sha256::digest(b"issue-3647-database-audit");
+        let (signature, _) =
+            try_sign_audit_payload(&content_hash).expect("database signer installed");
+        let verifier = resolve_daemon_verifying_key().expect("installed verifier");
+        verifier
+            .verify_strict(
+                &content_hash,
+                &Signature::from_slice(&signature).expect("signature"),
+            )
+            .expect("database signature verifies while file sink is disabled");
     }
 
     #[test]
