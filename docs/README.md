@@ -36,6 +36,9 @@ authoritative for its topic; this page is just the map.
 
 ## Start here
 
+- **[Integrate any agent with A2A](a2a-integration.html)** — enrolment, wake-driven
+  loops, SDK receivers, federation and production troubleshooting.
+
 - **[QUICKSTART.md](QUICKSTART.html)** — first memory stored + recalled
   in under 5 minutes (CLI, MCP, HTTP paths).
 - **[GLOSSARY.md](GLOSSARY.html)** — every concept (agent, tier, scope,

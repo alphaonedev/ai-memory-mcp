@@ -1838,7 +1838,8 @@ A Unix-domain-socket switch (mode **0600**, inside an owner-only **0700**
 directory, peer credentials checked with `SO_PEERCRED` on Linux and
 `LOCAL_PEERPID` + `getpeereid` on macOS) that pushes a bounded, **content-free
 wake hint** to agents on this host, so a recipient learns "you have inbox row X"
-in about a millisecond instead of on its next poll.
+with a millisecond design target instead of waiting for its next poll.
+Acceptance-latency measurement #3473 remains open.
 
 **It carries no message bodies.** The v1 protocol has no `request` / `reply` /
 `notify` kinds at all; the largest routed payload is a 256-byte
@@ -2104,6 +2105,21 @@ the same key directory, or whose window has passed, is refused BEFORE the socket
 is dialled. The socket itself is checked the way the hub hardened it: an
 owner-only (0700) directory holding an owner-only (0600) socket, both owned by
 the caller.
+
+For enrolment and a complete shell gate, see [Integrate any agent](a2a-integration.md).
+
+### `notify` — send a durable inbox message
+
+```bash
+ai-memory --agent-id ai:worker notify --target-agent-id ai:coordinator \
+  --title 'Pass complete' --payload 'Review is ready.' --json
+```
+
+`--target-agent-id`, `--title` and `--payload` are required. The global
+`--agent-id` is the sender. This local CLI command uses its selected SQLite
+store; use the daemon's `POST /api/v1/notify` (`content` or `payload`) for its
+configured wake sink and federation fanout. Authenticate HTTP with `X-API-Key`
+when configured, and set `X-Agent-Id` to the sender.
 
 ### `inbox --wait` — block until there is mail (v1.0.0, #3470 / EPIC #3466)
 
