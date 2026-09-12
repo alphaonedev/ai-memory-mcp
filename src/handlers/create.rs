@@ -1043,6 +1043,8 @@ async fn fanout_and_assemble_create_response(
             Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
                 Ok(got) => {
                     response["quorum_acks"] = json!(got);
+                    response["quorum_n"] = json!(fed.policy.n);
+                    response["quorum_required"] = json!(fed.policy.w);
                     return (StatusCode::CREATED, Json(response)).into_response();
                 }
                 Err(err) => {
@@ -1521,15 +1523,16 @@ async fn create_memory_postgres(
     // #1480 — evaluate the pipelined quorum result now that the local
     // write is durable and audit/dispatch have fired. A failed quorum
     // returns 503 but never rolls back the local write (ADR-0001).
+    let mut receipt_quorum = None;
     if let Some(quorum_res) = quorum_outcome {
         match quorum_res {
-            Ok(tracker) => {
-                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                    // #869 — typed 503 envelope via the shared helper.
+            Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+                Ok(got) => receipt_quorum = Some(got),
+                Err(err) => {
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                     return super::under_replicated_response(&payload);
                 }
-            }
+            },
             Err(err) => {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                 return super::under_replicated_response(&payload);
@@ -1563,6 +1566,11 @@ async fn create_memory_postgres(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    if let (Some(got), Some(fed)) = (receipt_quorum, app.federation.as_ref()) {
+        payload["quorum_acks"] = json!(got);
+        payload["quorum_n"] = json!(fed.policy.n);
+        payload["quorum_required"] = json!(fed.policy.w);
+    }
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id));
         if let Some(field) = auto_tag_outcome.response_field() {
@@ -1580,6 +1588,23 @@ async fn create_memory_postgres(
 }
 
 pub async fn create_memory(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
+) -> impl IntoResponse {
+    let response = create_memory_write(State(app.clone()), headers, JsonOrBadRequest(body))
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_memory_write(
     State(app): State<AppState>,
     headers: HeaderMap,
     JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
