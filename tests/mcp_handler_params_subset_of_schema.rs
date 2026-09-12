@@ -33,6 +33,12 @@
 //! `store/`, so a validator split across `store/validation.rs` and
 //! `store/mod.rs` is judged as one unit).
 //!
+//! #3632 additionally parses Rust sources throughout `src/`, resolves `&str`
+//! constants and aliases by module, and follows free-function calls forwarding
+//! `params` / `arguments` into helpers. Their const reads are charged to every
+//! calling tool unit, including calls through other helpers. See the support
+//! module for the deliberately bounded source-analysis contract.
+//!
 //! Anything genuinely read-but-not-declared belongs in [`ALLOWED_READS`]
 //! with a reason — the point is that adding it is a deliberate, reviewed
 //! act rather than an invisible drift.
@@ -45,6 +51,9 @@
 //! parse is deliberately conservative: it only matches receivers literally
 //! named `params` / `arguments` (so `metadata.get(...)` and
 //! `row.get(...)` are ignored), and comments are stripped first.
+
+#[path = "support/handler_param_helpers.rs"]
+mod handler_param_helpers;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -94,7 +103,10 @@ fn const_map(src: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in src.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("pub const ") else {
+        let Some(rest) = line
+            .strip_prefix("pub const ")
+            .or_else(|| line.strip_prefix("const "))
+        else {
             continue;
         };
         let Some((name, tail)) = rest.split_once(':') else {
@@ -257,11 +269,10 @@ fn read_keys(src: &str, params: &BTreeMap<String, String>) -> BTreeSet<String> {
 /// Every `.rs` file under `dir`, recursively.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("cannot scan {}: {error}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("source directory entry readable").path();
         if path.is_dir() {
             out.extend(rust_files(&path));
         } else if path.extension().is_some_and(|e| e == "rs") {
@@ -380,6 +391,21 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
         }
     }
 
+    let mut helpers = handler_param_helpers::Index::default();
+    let src_root = manifest.join("src");
+    for file in rust_files(&src_root) {
+        let source = std::fs::read_to_string(&file).expect("source readable");
+        helpers
+            .add_file(
+                file.strip_prefix(&src_root).expect("source under src"),
+                &source,
+            )
+            .unwrap_or_else(|error| panic!("#3632: cannot parse {}: {error}", file.display()));
+    }
+    for (unit, reads) in helpers.unit_reads() {
+        unit_reads.entry(unit).or_default().extend(reads);
+    }
+
     let mut failures: Vec<String> = Vec::new();
     for (unit, reads) in &unit_reads {
         let declared = unit_declared.get(unit).cloned().unwrap_or_default();
@@ -436,4 +462,132 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
         "ALLOWED_READS has stale entries no handler reads any more: {stale:?} — \
          remove them so the allowlist keeps naming only real exceptions"
     );
+}
+
+#[test]
+fn private_helper_const_read_is_visible_3632() {
+    let helper = r#"
+        const HIDDEN: &str = "undeclared_3632";
+        pub fn parse(params: &Value) { let _ = params.get(HIDDEN); }
+    "#;
+    assert_eq!(
+        read_keys(helper, &const_map(helper)),
+        BTreeSet::from(["undeclared_3632".to_string()]),
+        "a private const in an external helper must not bypass the audit"
+    );
+}
+
+#[test]
+fn helper_const_reads_follow_calling_units_3632() -> Result<(), Box<dyn std::error::Error>> {
+    let mut index = handler_param_helpers::Index::default();
+    for (file, source) in [
+        (
+            "identity/keys.rs",
+            r#"pub const HIDDEN: &str = "undeclared_3632";"#,
+        ),
+        (
+            "identity/helper.rs",
+            r#"
+            use crate::identity::keys::HIDDEN as IMPORTED;
+            const ALIAS: &'static str = IMPORTED;
+            pub fn parse(params: &Value) { let _ = params.get(ALIAS); }
+            pub fn forward(params: &Value) { parse(params); }
+            pub fn unused(params: &Value) { let _ = params[UNUSED]; }
+            const UNUSED: &str = "not_called";
+        "#,
+        ),
+        (
+            "unrelated/helper.rs",
+            r#"
+            const ALIAS: &str = "wrong_module";
+            pub fn parse(params: &Value) { let _ = params[ALIAS]; }
+        "#,
+        ),
+        (
+            "mcp/tools/store/mod.rs",
+            r"
+            use crate::identity::helper::forward as read_envelope;
+            fn handle(params: &Value) { read_envelope(params); }
+        ",
+        ),
+        (
+            "mcp/tools/update.rs",
+            r"
+            fn handle(arguments: &Value) { crate::identity::helper::parse(arguments); }
+        ",
+        ),
+        (
+            "mcp/tools/search.rs",
+            r#"
+            fn handle(params: &Value) {
+                // crate::identity::helper::parse(params);
+                let _ = "crate::identity::helper::parse(params)";
+            }
+        "#,
+        ),
+    ] {
+        index.add_file(Path::new(file), source)?;
+    }
+    let reads = index.unit_reads();
+    let expected = BTreeSet::from(["undeclared_3632".to_string()]);
+    assert_eq!(reads.get("store"), Some(&expected));
+    assert_eq!(reads.get("update.rs"), Some(&expected));
+    assert!(
+        !reads.contains_key("search.rs"),
+        "comments and strings are not calls"
+    );
+    // The exact subset operation used by the live audit must reject the planted
+    // key, then accept it only once that calling unit declares it.
+    let declared = BTreeSet::from(["content".to_string()]);
+    assert_eq!(
+        reads["store"]
+            .difference(&declared)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    assert!(reads["store"].difference(&expected).next().is_none());
+    Ok(())
+}
+
+#[test]
+fn helper_index_reads_and_recursive_calls_3632() -> Result<(), Box<dyn std::error::Error>> {
+    let mut index = handler_param_helpers::Index::default();
+    index.add_file(
+        Path::new("helper.rs"),
+        r#"
+        const KEY: &str = "index_3632";
+        pub fn parse(arguments: &Value) { let _ = arguments[KEY]; recurse(arguments); }
+        fn recurse(params: &Value) { parse(params); }
+        #[cfg(test)] mod tests {
+            pub fn parse(params: &Value) { let _ = params[NO_SUCH_CONST]; }
+        }
+    "#,
+    )?;
+    index.add_file(
+        Path::new("mcp/tools/store.rs"),
+        r"
+        fn handle(params: &Value) { crate::helper::parse(&params); }
+    ",
+    )?;
+    assert_eq!(
+        index.unit_reads()["store.rs"],
+        BTreeSet::from(["index_3632".to_string()])
+    );
+    Ok(())
+}
+
+#[test]
+#[should_panic(expected = "#3632: unresolved const")]
+fn unresolved_helper_const_fails_closed_3632() {
+    let mut index = handler_param_helpers::Index::default();
+    index
+        .add_file(
+            Path::new("mcp/tools/store.rs"),
+            r"
+        fn handle(params: &Value) { let _ = params.get(MISSING_KEY); }
+    ",
+        )
+        .expect("fixture parses");
+    index.unit_reads();
 }

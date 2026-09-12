@@ -356,6 +356,8 @@ fs-notify = ["dep:notify"]
 vectorlite = ["rusqlite/load_extension"]
 
 [dev-dependencies]
+# #3632: parse helper calls and const aliases for the handler/schema audit.
+syn = { version = "2", features = ["full", "visit"] }
 ai-memory = { path = ".", features = ["test-support"] }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
