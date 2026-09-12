@@ -10,6 +10,12 @@
               "null"
             ]
           },
+          "as_admin": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "capability": {
             "type": [
               "string",
@@ -129,6 +135,13 @@
           "valid_until": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "write_v2": {
+            "additionalProperties": true,
+            "type": [
+              "object",
               "null"
             ]
           }
