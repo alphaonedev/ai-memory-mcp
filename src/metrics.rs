@@ -231,6 +231,20 @@ pub struct Metrics {
     /// §federation-push-DLQ. It should fall to zero and stay there.
     pub federation_push_dlq_legacy_positional: IntCounter,
 
+    /// #3658 — replay-tick LOCAL bookkeeping writes that FAILED, labeled
+    /// by the write (`bump_attempt` | `note_throttled` | `mark_replayed`;
+    /// closed set — [`crate::federation::push_dlq::DlqBookkeepingOp`]).
+    ///
+    /// Pre-#3658 `replay_once` discarded these `Result`s at the
+    /// `dyn FederationDlqSink` boundary, so a broken local DLQ store (disk,
+    /// lock, schema) looked exactly like a failing PEER: `attempt_count`
+    /// and `last_error` froze at their pre-tick values, quarantine never
+    /// arrived, and the surrounding log described the peer outcome only.
+    /// This counter is the signal that separates the two. It increments
+    /// once per failed write, so it is a rate; sustained non-zero means the
+    /// DLQ store is not persisting, whatever the peers are doing.
+    pub federation_push_dlq_bookkeeping_failed: IntCounterVec,
+
     /// #2716 (CB-12) — cumulative count of pending federated ERASURES /
     /// DELETES that the replay worker SUPERSEDED instead of propagating,
     /// because the target id is LIVE again locally with an `updated_at`
@@ -766,6 +780,21 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_legacy_positional.clone()))?;
 
+        // #3658 — LOCAL DLQ bookkeeping failures, by op (closed set).
+        let federation_push_dlq_bookkeeping_failed = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_push_dlq_bookkeeping_failed_total",
+                "Federation push-DLQ replay bookkeeping writes that FAILED, labeled by \
+                 the write (op=bump_attempt|note_throttled|mark_replayed). This is the \
+                 LOCAL DLQ store failing to persist, not the peer: the row's attempt \
+                 budget and last_error stay frozen at their pre-tick values and it is \
+                 re-POSTed next tick. Sustained non-zero means the DLQ store is broken \
+                 (disk, lock, schema). #3658.",
+            ),
+            &["op"],
+        )?;
+        registry.register(Box::new(federation_push_dlq_bookkeeping_failed.clone()))?;
+
         // #2716 (CB-12) — federated erasure/delete supersede observability.
         let federation_erasure_superseded = IntCounter::new(
             "ai_memory_federation_erasure_superseded_total",
@@ -1096,6 +1125,7 @@ impl Metrics {
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
             federation_push_dlq_legacy_positional,
+            federation_push_dlq_bookkeeping_failed,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
             operator_dequarantined,

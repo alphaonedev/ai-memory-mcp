@@ -1715,6 +1715,7 @@ From `src/metrics.rs`:
 |---|---|
 | `ai_memory_federation_push_dlq_depth` (gauge) | Current count of pending federation_push_dlq rows. Page on >0 sustained. |
 | `ai_memory_federation_push_dlq_quarantined_total` (counter) | Monotonic counter of DLQ rows the replay worker gave up on. Page on any increment. |
+| `ai_memory_federation_push_dlq_bookkeeping_failed_total{op}` (counter) | #3658 — LOCAL DLQ bookkeeping writes (`bump_attempt` / `note_throttled` / `mark_replayed`) that failed to persist. This is the DLQ store, not the peer: budgets freeze and rows cannot reach quarantine. Page on sustained increment. |
 | `ai_memory_federation_fanout_retry_total` (counter) | Cross-peer retry events. Trend high under cross-DC partition. |
 | `ai_memory_federation_fanout_dropped_total` (counter) | Post-quorum drops (peer rewrote id or refused to ack). Page on sustained increment. |
 | `ai_memory_federation_partial_quorum_total` (counter) | Quorum met but some peer(s) didn't ack. Investigate trend lines. |

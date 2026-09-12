@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3658 — federation DLQ bookkeeping failures are handled, counted and named)
+
+- **#3658 (observability, HIGH; audit #3645 F12) — `replay_once` no longer
+  discards the `Result` of its local bookkeeping writes at the
+  `dyn FederationDlqSink` boundary.** Every `bump_dlq_attempt`,
+  `note_dlq_throttled` and `mark_dlq_row_replayed` call (including the two
+  inside erasure-sentinel expansion) goes through one handler that logs the
+  failure at `error` with row / peer / op / error and the consequence,
+  increments the new closed-label counter
+  `ai_memory_federation_push_dlq_bookkeeping_failed_total{op}`, and records it
+  on the new `ReplayTick` summary `replay_once` now returns. Defined behaviour
+  on failed persistence: the tick continues, the row keeps its pre-tick
+  `attempt_count` / `last_error` and is re-POSTed next tick; a tick-level
+  `error` summarises the count. Pre-fix a broken local DLQ store (disk, lock,
+  dropped table) was indistinguishable from a failing peer, and rows whose
+  budget could never burn never reached quarantine. Fault-injected per op
+  through the mock sink and through the real SQLite sink (500 / 429 / 200
+  peers), with a dropped-table propagation pin and an env-gated Postgres twin.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`
