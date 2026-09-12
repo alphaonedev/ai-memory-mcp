@@ -403,23 +403,56 @@ pub fn namespace_read_scope_admits(caller: &str, namespace: &str) -> bool {
 /// twin of the HTTP `handlers::parity::require_caller_owns_memory` gate, lifted
 /// here so the MCP mutation surface (which calls raw `db::*` and historically
 /// skipped the owner check that HTTP + the postgres SAL enforce) inherits the
-/// IDENTICAL, deliberately LENIENT, single-tenant-safe semantics:
+/// IDENTICAL semantics:
 ///
-///   * an UNSTAMPED row (no `agent_id`) is mutable by anyone — legacy / unowned
-///     rows are not locked out (this is what keeps the single-operator default,
-///     where rows may carry no stamp, working);
 ///   * a SELF-OWNED row (`agent_id == caller`) is mutable;
 ///   * the `daemon` principal bypasses (curator / internal);
 ///   * when `allow_inbox`, the inbox recipient (`target_agent_id == caller`)
-///     may mutate (mirrors the HTTP delete-side `allow_inbox=true`).
+///     of a row that is NOT unstamped may mutate (mirrors the HTTP delete-side
+///     `allow_inbox=true`);
+///   * an UNSTAMPED row (missing / null / `""` `agent_id` — the ONE
+///     definition in [`crate::identity::owner_stamp::OwnerStamp`], #3124) is
+///     decided by [`crate::identity::owner_stamp::admit_unstamped`]: admitted
+///     with a WARN + counter under `AI_MEMORY_UNSTAMPED_MUTATION=warn` (the
+///     default, the pre-#3124 outcome of every sqlite funnel), refused under
+///     `refuse`;
+///   * a MALFORMED (non-string) `agent_id` is never matched and never admitted
+///     as unstamped (pre-#3124 the `as_str()` read treated it as unstamped and
+///     mutable by anyone).
 ///
-/// Only a row owned by a DIFFERENT, named agent is refused — closing the
-/// cross-owner MCP mutation gap (#1786) without breaking the single-tenant
-/// default. NOTE: `agent_id` is a CLAIMED identity, so this gate's strength is
-/// bounded by caller attestation (#48) — it closes the unstamped/cross-id gap,
-/// not impersonation by a caller who claims the owner's id.
+/// Every other row — one owned by a DIFFERENT, named agent — is refused.
+/// `site` labels the funnel on the #3124 observability counter. NOTE:
+/// `agent_id` is a CLAIMED identity, so this gate's strength is bounded by
+/// caller attestation (#48) — it closes the unstamped/cross-id gap, not
+/// impersonation by a caller who claims the owner's id.
 #[must_use]
-pub fn caller_owns_for_mutation(mem: &Memory, caller: &str, allow_inbox: bool) -> bool {
+pub fn caller_owns_for_mutation(
+    mem: &Memory,
+    caller: &str,
+    allow_inbox: bool,
+    site: crate::identity::owner_stamp::MutationSite,
+) -> bool {
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
+        return true;
+    }
+    crate::identity::owner_stamp::metadata_admits_mutation(
+        &mem.metadata,
+        &mem.id,
+        caller,
+        allow_inbox,
+        site,
+    )
+}
+
+/// v1.0.0 #3124 — the PRE-#3124 ownership predicate, kept verbatim for the ONE
+/// read-side consumer (`storage::archive_row_readable`, #3382), which reuses an
+/// ownership check to scope archive LISTINGS. Reads are not mutations: the
+/// `AI_MEMORY_UNSTAMPED_MUTATION` knob deliberately does not change which
+/// archived rows a caller can SEE, so this stays side-effect free (no WARN, no
+/// counter) and keeps the legacy semantics exactly. Never use it to admit a
+/// write — [`caller_owns_for_mutation`] is the mutation gate.
+#[must_use]
+pub fn legacy_owner_admits_read(mem: &Memory, caller: &str, allow_inbox: bool) -> bool {
     let owner = mem
         .metadata
         .get(crate::META_KEY_AGENT_ID)
@@ -1106,22 +1139,68 @@ mod tests {
 
     #[test]
     fn caller_owns_for_mutation_1786() {
-        // Unstamped row → ANYONE may mutate (single-tenant-safe: legacy/unowned
-        // rows are not locked out). This is the deliberate lenience that keeps
-        // the single-operator default working.
+        use crate::identity::owner_stamp::{
+            MutationSite, UnstampedMutationMode, funnel, metadata_admits_mutation_with_mode,
+        };
+        let site = MutationSite::sqlite(funnel::UPDATE);
+        // #3124 rule (e) census — the pre-#3124 pin "Unstamped row → ANYONE
+        // may mutate" is the `warn` (default) posture of the ONE predicate;
+        // `refuse` is its twin. Pinned through the explicit-mode seam so no
+        // lib test has to mutate the process environment.
         let unstamped = mem_with_metadata(json!({}));
-        assert!(caller_owns_for_mutation(&unstamped, "ai:alice", false));
+        assert!(metadata_admits_mutation_with_mode(
+            &unstamped.metadata,
+            &unstamped.id,
+            "ai:alice",
+            false,
+            site,
+            UnstampedMutationMode::Warn
+        ));
+        assert!(!metadata_admits_mutation_with_mode(
+            &unstamped.metadata,
+            &unstamped.id,
+            "ai:alice",
+            false,
+            site,
+            UnstampedMutationMode::Refuse
+        ));
+        // #3124 R2 — a MALFORMED (non-string) owner is neither matched nor
+        // admitted as unstamped, in either posture (pre-#3124 `as_str()`
+        // treated it as unstamped → mutable by anyone).
+        let malformed = mem_with_metadata(json!({"agent_id": 123}));
+        for mode in [UnstampedMutationMode::Warn, UnstampedMutationMode::Refuse] {
+            assert!(!metadata_admits_mutation_with_mode(
+                &malformed.metadata,
+                &malformed.id,
+                "123",
+                false,
+                site,
+                mode
+            ));
+        }
+        // #3124 — an unstamped row is not an addressed inbox row: the inbox
+        // carve-out does not rescue it under `refuse` (the #1628 shape).
+        let unstamped_inbox = mem_with_metadata(json!({"target_agent_id": "ai:bob"}));
+        assert!(!metadata_admits_mutation_with_mode(
+            &unstamped_inbox.metadata,
+            &unstamped_inbox.id,
+            "ai:bob",
+            true,
+            site,
+            UnstampedMutationMode::Refuse
+        ));
 
         // Self-owned → ok; cross-owner → REFUSED (the gap #1786 closes).
         let alice = mem_with_metadata(json!({"agent_id": "ai:alice"}));
-        assert!(caller_owns_for_mutation(&alice, "ai:alice", false));
-        assert!(!caller_owns_for_mutation(&alice, "ai:bob", false));
+        assert!(caller_owns_for_mutation(&alice, "ai:alice", false, site));
+        assert!(!caller_owns_for_mutation(&alice, "ai:bob", false, site));
 
         // Daemon principal bypasses (curator / internal mutations).
         assert!(caller_owns_for_mutation(
             &alice,
             crate::identity::sentinels::DAEMON_PRINCIPAL,
-            false
+            false,
+            site
         ));
 
         // Inbox carve-out applies ONLY when allow_inbox=true (delete-side).
@@ -1130,13 +1209,33 @@ mod tests {
             "target_agent_id": "ai:bob"
         }));
         assert!(
-            !caller_owns_for_mutation(&inbox, "ai:bob", false),
+            !caller_owns_for_mutation(&inbox, "ai:bob", false, site),
             "no inbox carve-out without allow_inbox"
         );
         assert!(
-            caller_owns_for_mutation(&inbox, "ai:bob", true),
+            caller_owns_for_mutation(&inbox, "ai:bob", true, site),
             "inbox recipient may mutate with allow_inbox"
         );
+    }
+
+    #[test]
+    fn legacy_owner_admits_read_is_unchanged_3124() {
+        // The read-side predicate keeps the pre-#3124 semantics verbatim.
+        assert!(legacy_owner_admits_read(
+            &mem_with_metadata(json!({})),
+            "ai:x",
+            true
+        ));
+        assert!(legacy_owner_admits_read(
+            &mem_with_metadata(json!({"agent_id": 7})),
+            "ai:x",
+            false
+        ));
+        assert!(!legacy_owner_admits_read(
+            &mem_with_metadata(json!({"agent_id": "ai:a"})),
+            "ai:x",
+            false
+        ));
     }
 
     // -----------------------------------------------------------------------

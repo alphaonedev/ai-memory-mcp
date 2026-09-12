@@ -162,7 +162,17 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
             .await,
         "RECLASSIFY_MEMORY_KIND",
     );
-    refused(s.reown(&ctx, "ns", "agent-b", false, true).await, "REOWN");
+    refused(
+        s.reown(
+            &ctx,
+            Some("ns"),
+            "agent-b",
+            ai_memory::storage::ReownSelect::Owned,
+            true,
+        )
+        .await,
+        "REOWN",
+    );
     refused(s.size_gc("ns", 1_024, false).await, "SIZE_GC");
     refused(s.delete_link(&ctx, "a", "b").await, "DELETE_LINK");
 

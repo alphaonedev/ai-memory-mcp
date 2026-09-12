@@ -674,21 +674,21 @@ pub async fn create_link(
                 .into_response();
         }
     };
-    let source_owner = source_mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let source_target = source_mem
-        .metadata
-        .get(field_names::TARGET_AGENT_ID)
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let is_unowned_legacy = source_owner.is_empty();
-    if !is_unowned_legacy
-        && source_owner != caller
-        && source_target != caller
-        && caller != sentinels::DAEMON_PRINCIPAL
+    // #3124 — the ONE cross-backend mutation predicate (inbox recipient of a
+    // stamped row admitted; an unstamped row decided by
+    // `AI_MEMORY_UNSTAMPED_MUTATION`; a malformed owner never matched).
+    let source_owner =
+        crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata).owner_for_display();
+    if caller != sentinels::DAEMON_PRINCIPAL
+        && !crate::identity::owner_stamp::metadata_admits_mutation(
+            &source_mem.metadata,
+            &source_id,
+            &caller,
+            true,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::LINK,
+            ),
+        )
     {
         tracing::warn!(
             target: super::AUTHZ_TRACE_TARGET,
@@ -1000,32 +1000,32 @@ pub async fn delete_link(
         // hold an edge), mirroring the sqlite missing-source path.
         match app.store.get(&ctx, &source_id).await {
             Ok(source_mem) => {
-                let source_owner = source_mem
-                    .metadata
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let source_target = source_mem
-                    .metadata
-                    .get(field_names::TARGET_AGENT_ID)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let target_mem_owner = app.store.get(&ctx, &target_id).await.ok().and_then(|m| {
-                    m.metadata
-                        .get("agent_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
+                let source_owner =
+                    crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
+                        .owner_for_display()
+                        .to_string();
+                let target_meta = app
+                    .store
+                    .get(&ctx, &target_id)
+                    .await
+                    .ok()
+                    .map(|m| m.metadata);
+                let target_mem_owner = target_meta.as_ref().map(|m| {
+                    crate::identity::owner_stamp::OwnerStamp::of(m)
+                        .owner_for_display()
+                        .to_string()
                 });
-                let is_unowned_legacy =
-                    source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
-                let owns_source = source_owner == caller || source_target == caller;
-                let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
-                if !is_unowned_legacy
-                    && !owns_source
-                    && !owns_target
-                    && caller != sentinels::DAEMON_PRINCIPAL
+                // #3124 — the ONE predicate, link-delete (symmetric) form.
+                if caller != sentinels::DAEMON_PRINCIPAL
+                    && !crate::identity::owner_stamp::unlink_admitted(
+                        &source_mem.metadata,
+                        target_meta.as_ref(),
+                        &source_id,
+                        &caller,
+                        crate::identity::owner_stamp::MutationSite::postgres(
+                            crate::identity::owner_stamp::funnel::UNLINK,
+                        ),
+                    )
                 {
                     tracing::warn!(
                         target: super::AUTHZ_TRACE_TARGET,
@@ -1102,29 +1102,30 @@ pub async fn delete_link(
             };
         }
     };
-    let target_mem_owner = db::get(&lock.0, &target_id).ok().flatten().and_then(|m| {
-        m.metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
+    let target_meta = db::get(&lock.0, &target_id)
+        .ok()
+        .flatten()
+        .map(|m| m.metadata);
+    let target_mem_owner = target_meta.as_ref().map(|m| {
+        crate::identity::owner_stamp::OwnerStamp::of(m)
+            .owner_for_display()
+            .to_string()
     });
-    let source_owner = source_mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+    let source_owner = crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
+        .owner_for_display()
         .to_string();
-    let source_target = source_mem
-        .metadata
-        .get(field_names::TARGET_AGENT_ID)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let is_unowned_legacy =
-        source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
-    let owns_source = source_owner == caller || source_target == caller;
-    let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
-    if !is_unowned_legacy && !owns_source && !owns_target && caller != sentinels::DAEMON_PRINCIPAL {
+    // #3124 — the ONE predicate, link-delete (symmetric) form.
+    if caller != sentinels::DAEMON_PRINCIPAL
+        && !crate::identity::owner_stamp::unlink_admitted(
+            &source_mem.metadata,
+            target_meta.as_ref(),
+            &source_id,
+            &caller,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::UNLINK,
+            ),
+        )
+    {
         drop(lock);
         tracing::warn!(
             target: super::AUTHZ_TRACE_TARGET,

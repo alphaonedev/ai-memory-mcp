@@ -6,6 +6,12 @@
 
 src/cli/agents.rs:DAEMON_PRINCIPAL
 src/cli/commands/undo_edit.rs:AI_OPERATOR
+# #3124 R4 (Conductor ruling condition 4) — `ai-memory reown` on a postgres
+# store: an OPERATOR-only admin lane (CLI-only verb, no MCP / HTTP surface;
+# reaching it requires the store credentials, the `quarantine release`
+# posture). `actor` is the RESOLVED operator principal (`reown::resolve_operator`,
+# anonymous refused) and is the attribution of the `memory.reowned` chain row.
+src/cli/reown.rs:actor
 src/cli/curator.rs:AI_CURATOR
 src/cli/stop.rs:AI_OPERATOR
 src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID

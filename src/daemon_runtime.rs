@@ -2871,13 +2871,9 @@ pub async fn run(
             }
         }
         Command::Reown(a) => {
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            // v0.8.0 #1709/#1720 WS-B B2 — namespace ownership re-stamp.
-            match cli::reown::run(&db_path, &a, &mut out)? {
+            // v0.8.0 #1709/#1720 WS-B B2 + v1.0.0 #3124 R4 — backend routing
+            // lives in `cli::reown::dispatch` (qual_10 budget).
+            match cli::reown::dispatch(&a, &db_path, app_config, cli_agent_id.as_deref()).await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
