@@ -128,6 +128,10 @@ mod domain_tags {
     /// #3204 item 2 — attested checkpoint resolution (`checkpoints.signature`),
     /// the separation-of-duties freeze anchor. Same gap as [`SIGNAL`].
     pub const CHECKPOINT_RESOLUTION: &str = "ai-memory/checkpoint-resolution/v1";
+    /// #3616 — federated action-state transition attestation.
+    pub const TRANSITION: &str = "ai-memory/transition/v1";
+    /// #3616 — persisted, re-signable routine freeze attestation.
+    pub const ROUTINE_FREEZE: &str = "ai-memory/routine-freeze/v1";
 }
 
 /// #1931 — the map key carrying the [`domain_tags`] value. Distinct from every
@@ -638,11 +642,16 @@ pub struct SignableTransition<'a> {
 /// [`canonical_cbor_signal`]), so producer and verifier commit to byte-identical
 /// bytes regardless of struct-literal field order.
 ///
+/// #3616 — includes `_dst = "ai-memory/transition/v1"`. Verification rejects
+/// legacy untagged signatures with no fallback; federated peers must upgrade
+/// in lockstep before exchanging newly signed transitions.
+///
 /// # Errors
 /// Returns the `ciborium` encode error on a pathological serialization
 /// failure.
 pub fn canonical_cbor_transition(t: &SignableTransition<'_>) -> Result<Vec<u8>> {
     let value = canonical_cbor_map(vec![
+        domain_separation_pair(domain_tags::TRANSITION),
         ("action_id", ciborium::Value::Text(t.action_id.to_string())),
         ("namespace", ciborium::Value::Text(t.namespace.to_string())),
         (
@@ -971,6 +980,10 @@ pub struct SignableRoutineFreeze<'a> {
 /// the same `SignableRoutineFreeze` twice (or on a different host) produces
 /// identical bytes — the precondition Ed25519 needs.
 ///
+/// #3616 — includes `_dst = "ai-memory/routine-freeze/v1"`. Legacy untagged
+/// signatures fail verification without fallback. Re-freeze persisted routines
+/// with a signing key to refresh their attestations.
+///
 /// # Errors
 ///
 /// Returns an error only when CBOR serialization fails — in practice
@@ -979,6 +992,7 @@ pub struct SignableRoutineFreeze<'a> {
 /// truncated payload.
 pub fn canonical_cbor_routine_freeze(r: &SignableRoutineFreeze<'_>) -> Result<Vec<u8>> {
     let value = canonical_cbor_map(vec![
+        domain_separation_pair(domain_tags::ROUTINE_FREEZE),
         (
             "routine_id",
             ciborium::Value::Text(r.routine_id.to_string()),
@@ -1038,14 +1052,12 @@ pub fn sign_routine_freeze(
 /// [`crate::identity::cid::CID_DOMAIN`] and `signed_events`'
 /// `CAUSE_PREIMAGE_DOMAIN`.
 ///
-/// This prefix is LOAD-BEARING and deliberately closes the historical
-/// gap that the other `Signable*` types in this module share: their
-/// domain separation is *implicit* in the per-type field set (they all
-/// sign bare canonical CBOR under `verify_strict`). A succession record
-/// hands off an *identity*, so a cross-protocol reinterpretation of its
-/// signature would be catastrophic — the explicit domain byte-string
-/// makes reuse of a succession signature as any other payload (or vice
-/// versa) impossible.
+/// This prefix is LOAD-BEARING: succession signs this prefix followed by
+/// its canonical CBOR body. Preserve these frozen v1 bytes. The explicit
+/// persisted-version migration for epoch manifests and successions is tracked
+/// in #3644 (split from #3616); it must retain v1 verification and select v2
+/// from an explicit version discriminator, never from payload shape or tag
+/// presence. Other tagged maps in this module use [`domain_tags`].
 // M-DOCUMENTED-MAGIC: versioned (`-v1`) so a future pre-image change is
 // a distinct domain rather than a silent collision.
 pub const LINEAGE_DOMAIN: &[u8] = b"agent-lineage-succession-v1\0";
@@ -1255,6 +1267,91 @@ mod tests {
     use super::*;
     use crate::identity::keypair;
     use ed25519_dalek::Verifier;
+
+    // Re-encode a canonical map with an absent or substituted domain tag.
+    fn issue_3616_retag(bytes: &[u8], tag: Option<&str>) -> Result<Vec<u8>> {
+        let value: ciborium::Value = ciborium::de::from_reader(bytes)?;
+        let ciborium::Value::Map(mut entries) = value else {
+            anyhow::bail!("expected canonical map");
+        };
+        entries.retain(|(key, _)| key.as_text() != Some(DOMAIN_SEP_KEY));
+        if let Some(tag) = tag {
+            entries.insert(
+                0,
+                (
+                    ciborium::Value::Text(DOMAIN_SEP_KEY.into()),
+                    ciborium::Value::Text(tag.into()),
+                ),
+            );
+        }
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&ciborium::Value::Map(entries), &mut out)?;
+        Ok(out)
+    }
+
+    /// DENIED: legacy bare maps and another context's tag, even with the
+    /// genuine key. ALLOWED: new signatures over the exact versioned tag.
+    #[test]
+    fn issue_3616_transition_domain_tag_denied_and_allowed() -> Result<()> {
+        use crate::identity::verify::verify_transition;
+        let transition = SignableTransition {
+            action_id: "act-001",
+            namespace: "team/alpha",
+            from_state: "pending",
+            to_state: "claimed",
+            claimed_by: Some("ai:worker"),
+            nonce: &[0xAB, 0xCD, 0xEF],
+            created_at: 1_700_000_000,
+        };
+        let kp = keypair::generate("alice")?;
+        let private = kp.private.as_ref().context("test signing key")?;
+        let pk = kp.public.to_bytes();
+        let bytes = canonical_cbor_transition(&transition)?;
+        for tag in [None, Some("ai-memory/routine-freeze/v1")] {
+            let sig = private.sign(&issue_3616_retag(&bytes, tag)?).to_bytes();
+            assert!(
+                !verify_transition(&transition, &sig, &pk),
+                "legacy or wrong-domain transition must be denied"
+            );
+        }
+        assert_eq!(
+            bytes,
+            issue_3616_retag(&bytes, Some("ai-memory/transition/v1"))?
+        );
+        assert!(
+            verify_transition(&transition, &sign_transition(&kp, &transition)?, &pk),
+            "tagged transition must be allowed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn issue_3616_routine_freeze_domain_tag_denied_and_allowed() -> Result<()> {
+        use crate::identity::verify::verify_routine_freeze;
+        let template = [0x33; 32];
+        let parameters = [0x44; 32];
+        let freeze = routine_freeze_fixture(&template, &parameters);
+        let kp = keypair::generate("alice")?;
+        let private = kp.private.as_ref().context("test signing key")?;
+        let pk = kp.public.to_bytes();
+        let bytes = canonical_cbor_routine_freeze(&freeze)?;
+        for tag in [None, Some("ai-memory/transition/v1")] {
+            let sig = private.sign(&issue_3616_retag(&bytes, tag)?).to_bytes();
+            assert!(
+                !verify_routine_freeze(&freeze, &sig, &pk),
+                "legacy or wrong-domain freeze must be denied"
+            );
+        }
+        assert_eq!(
+            bytes,
+            issue_3616_retag(&bytes, Some("ai-memory/routine-freeze/v1"))?
+        );
+        assert!(
+            verify_routine_freeze(&freeze, &sign_routine_freeze(&kp, &freeze)?, &pk),
+            "tagged freeze must be allowed"
+        );
+        Ok(())
+    }
 
     fn link_fixture() -> SignableLink<'static> {
         SignableLink {
@@ -1702,15 +1799,16 @@ mod tests {
             created_at: 1_700_000_000,
         };
         let bytes = canonical_cbor_transition(&t).expect("encode");
-        // 7 entries (0xA7), first key the 5-char `nonce` (0x65 'n' …).
+        // 8 entries (0xA8): 7 payload fields + the #3616 `_dst` tag.
         assert_eq!(
             &bytes[0..3],
-            &[0xA7, 0x65, b'n'],
-            "canonical map must open with 7 entries and the shortest key `nonce`"
+            &[0xA8, 0x64, b'_'],
+            "canonical map must open with 8 entries and the shortest key `_dst`"
         );
         assert_canonical_order(
             &bytes,
             &[
+                "_dst",
                 "nonce",
                 "to_state",
                 "action_id",
@@ -1797,15 +1895,16 @@ mod tests {
         let parameters = [0x44u8; 32];
         let bytes = canonical_cbor_routine_freeze(&routine_freeze_fixture(&template, &parameters))
             .expect("encode");
-        // 6 entries (0xA6), first key the 4-char `name` (0x64 'n' …).
+        // 7 entries (0xA7): `_dst` sorts before the equal-length `name`.
         assert_eq!(
             &bytes[0..3],
-            &[0xA6, 0x64, b'n'],
-            "canonical map must open with 6 entries and the shortest key `name`"
+            &[0xA7, 0x64, b'_'],
+            "canonical map must open with 7 entries and the first key `_dst`"
         );
         assert_canonical_order(
             &bytes,
             &[
+                "_dst",
                 "name",
                 "frozen_at",
                 "namespace",
