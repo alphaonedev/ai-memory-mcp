@@ -509,14 +509,17 @@ fn router(state: ai_memory::handlers::AppState) -> axum::Router {
     ai_memory::build_router(api_key_state, state)
 }
 
-fn sqlite_router() -> axum::Router {
+/// The router plus the directory that owns its store file. The caller holds
+/// the `TempDir` for the whole cell: dropping it removes the database AND its
+/// `-wal` / `-shm` siblings, which a single-file temp guard would not own
+/// (#3669).
+fn sqlite_router() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir for SqliteStore");
     // `#[cfg]` is not allowed on a call argument, so the two builds build
     // the state in separate statements.
     #[cfg(feature = "sal")]
     let state = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let path = dir.path().join("store.db");
         let store: Arc<dyn ai_memory::store::MemoryStore> =
             Arc::new(ai_memory::store::sqlite::SqliteStore::open(&path).expect("open store"));
         app_state(
@@ -527,7 +530,7 @@ fn sqlite_router() -> axum::Router {
     };
     #[cfg(not(feature = "sal"))]
     let state = app_state(scratch_db(), ai_memory::handlers::StorageBackend::Sqlite);
-    router(state)
+    (router(state), dir)
 }
 
 /// The shared `/sync/push` scenario: a delivered notify wakes a real
@@ -593,7 +596,8 @@ async fn sync_push_scenario(router: &axum::Router, hub_id: &str) {
 async fn sqlite_sync_push_applied_inbox_row_wakes_a_real_listener_3631() {
     let _lock = FED_ENV_LOCK.lock().await;
     let _posture = set_posture();
-    sync_push_scenario(&sqlite_router(), "hub-3631-push").await;
+    let (router, _store_dir) = sqlite_router();
+    sync_push_scenario(&router, "hub-3631-push").await;
 }
 
 /// The catch-up scenario against whatever apply path `spawn` drives: the
