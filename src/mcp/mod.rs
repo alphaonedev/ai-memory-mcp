@@ -179,6 +179,9 @@ fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
     }
 }
 
+#[cfg(test)]
+mod provider_redaction_3648_tests;
+
 /// PR-5 (issue #487): emit an audit event for an MCP `tools/call`
 /// dispatch. Per-handler emissions inside `handle_store` /
 /// `handle_delete` already produce their canonical events; this
@@ -7081,7 +7084,10 @@ mod tests {
     /// Build a fully-defaulted handle_request invocation against an
     /// in-memory connection. Returns the response so individual tests
     /// can assert on `error` / `result` shape.
-    fn invoke_handle_request(conn: &rusqlite::Connection, req: &RpcRequest) -> RpcResponse {
+    pub(super) fn invoke_handle_request(
+        conn: &rusqlite::Connection,
+        req: &RpcRequest,
+    ) -> RpcResponse {
         // #1751 — pin the lib-test binary to the explicit permissive
         // attestation opt-out so unsigned `memory_store` dispatches keep
         // exercising their actual subject matter.
