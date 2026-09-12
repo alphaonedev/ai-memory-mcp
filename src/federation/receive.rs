@@ -25,6 +25,8 @@ fn log_catchup_http_skip(peer_id: &str, status: impl std::fmt::Display) {
 }
 
 fn log_catchup_unreachable(peer_id: &str, e: impl std::fmt::Display) {
+    // #3667 — a reqwest error names the request URL, query string included.
+    let e = crate::logging::redact_urls_in_message(&e.to_string());
     tracing::debug!("catchup: peer {peer_id} unreachable: {e}");
 }
 

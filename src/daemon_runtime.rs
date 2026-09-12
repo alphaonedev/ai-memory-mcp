@@ -8597,6 +8597,7 @@ pub async fn sync_cycle_once(
     batch_size: usize,
 ) -> Result<()> {
     let peer_url = peer_url.trim_end_matches('/');
+    let peer_log = crate::logging::redact_url_password(peer_url); // #3667: never log credentials
 
     // --- PULL --------------------------------------------------------
     let since = {
@@ -8677,7 +8678,7 @@ pub async fn sync_cycle_once(
             Err(reason) => {
                 tracing::warn!(
                     target: crate::federation::SCOPE_TRACE_TARGET,
-                    peer = %peer_url,
+                    peer = %peer_log,
                     candidate = %candidate,
                     reason,
                     "sync-daemon: refusing peer-advertised next_since cursor; leaving \
@@ -8695,7 +8696,7 @@ pub async fn sync_cycle_once(
                 Err(reason) => {
                     tracing::warn!(
                         target: crate::federation::SCOPE_TRACE_TARGET,
-                        peer = %peer_url,
+                        peer = %peer_log,
                         candidate = %fallback,
                         reason,
                         "sync-daemon: refusing peer memories.last() watermark; leaving \
@@ -8768,7 +8769,7 @@ pub async fn sync_cycle_once(
                     apply_halted = true;
                     tracing::warn!(
                         target: crate::federation::SCOPE_TRACE_TARGET,
-                        peer = %peer_url,
+                        peer = %peer_log,
                         memory_id = %to_insert.id,
                         error = %e,
                         "sync-daemon: non-durable apply — halting cursor advance so \
@@ -8862,7 +8863,7 @@ pub async fn sync_cycle_once(
         }
     }
 
-    tracing::info!("sync-daemon: peer={peer_url} pulled={pull_count} pushed={push_count}");
+    tracing::info!("sync-daemon: peer={peer_log} pulled={pull_count} pushed={push_count}");
     Ok(())
 }
 
@@ -8941,7 +8942,8 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
                 )
                 .await
                 {
-                    tracing::warn!("sync-daemon: peer {peer_url} cycle failed: {e}");
+                    let e = crate::logging::redact_urls_in_message(&format!("{peer_url} cycle failed: {e}"));
+                    tracing::warn!("sync-daemon: peer {e}");
                 }
             });
         }

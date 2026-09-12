@@ -158,10 +158,11 @@ fn redact_in(value: &mut toml::Value, under_secret_key: bool) {
         other => {
             if under_secret_key {
                 *other = toml::Value::String(CONFIG_REDACTION_MASK.to_string());
-            } else if let toml::Value::String(s) = other
-                && let Some(screened) = crate::secret_screen::redact_for_storage(s)
-            {
-                *s = screened;
+            } else if let toml::Value::String(s) = other {
+                // #3667 — `base_url` / `url` / `db` values carry URL
+                // credentials under key names no secret heuristic matches.
+                let url_masked = crate::logging::redact_urls_in_message(s);
+                *s = crate::secret_screen::redact_for_storage(&url_masked).unwrap_or(url_masked);
             }
         }
     }
@@ -658,5 +659,28 @@ hmac_secret = "hmac-secret-must-not-leak"
             2,
             "both backticked payloads must be masked: {got}"
         );
+    }
+
+    /// #3667 — URL-valued keys (`base_url`, `url`, `ollama_url`, `db`) have
+    /// no secret-shaped NAME, so their credentials must be masked by value.
+    #[test]
+    fn url_credentials_are_masked_by_value_3667() {
+        let mut value: toml::Value = toml::from_str(
+            r#"
+db = "postgres://ai:DB_CANARY@db.internal/ai?password=Q_CANARY&sslmode=verify-full"
+[llm]
+base_url = "https://svc:LLM_CANARY@llm.internal/v1"
+[embeddings]
+url = "http://localhost:11434"
+"#,
+        )
+        .expect("fixture parses");
+        redact_toml_value(&mut value);
+        let rendered = toml::to_string_pretty(&value).expect("render");
+        for secret in ["DB_CANARY", "Q_CANARY", "LLM_CANARY"] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+        assert!(rendered.contains("sslmode=verify-full"), "{rendered}");
+        assert!(rendered.contains("http://localhost:11434"), "{rendered}");
     }
 }

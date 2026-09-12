@@ -1160,8 +1160,8 @@ fn redact_message_query_secrets(msg: &str) -> String {
 /// masks secret query assignments across the whole message.
 ///
 /// Punctuation and literal spaces are legal inside a userinfo password, so
-/// a run's `@` is located (the last one before the next `?`) before any
-/// whitespace boundary is applied to the host and path. A run that
+/// a run's `@` is located (the last one before the next `?` or URL) before
+/// any whitespace boundary is applied to the host and path. A run that
 /// contains a SECOND scheme separator is ambiguous — a comma may separate
 /// URLs or belong to a password — so it and the rest of the message are
 /// masked. Over-masking costs prose; under-masking costs a credential.
@@ -1181,8 +1181,18 @@ pub fn redact_urls_in_message(msg: &str) -> String {
         out.push_str(&rest[..scheme_start]);
         let authority_start = sep + URL_SCHEME_SEPARATOR.len();
         let after_scheme = &rest[authority_start..];
-        let query_start = after_scheme.find('?').unwrap_or(after_scheme.len());
-        let userinfo_end = after_scheme[..query_start]
+        // The userinfo `@` is searched up to the query or the next URL's
+        // scheme, so a second URL's credentials are never read as this
+        // one's.
+        let mut region_end = after_scheme.find('?').unwrap_or(after_scheme.len());
+        if let Some(next_sep) = after_scheme[..region_end].find(URL_SCHEME_SEPARATOR) {
+            let mut next_scheme = next_sep;
+            while next_scheme > 0 && is_scheme_byte(after_scheme.as_bytes()[next_scheme - 1]) {
+                next_scheme -= 1;
+            }
+            region_end = next_scheme;
+        }
+        let userinfo_end = after_scheme[..region_end]
             .rfind('@')
             .map_or(0, |at| at + 1);
         let token_start = authority_start + userinfo_end;

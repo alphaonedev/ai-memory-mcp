@@ -364,7 +364,12 @@ pub mod msg {
     /// `"network: {e}"`.
     #[must_use]
     pub fn network(e: impl std::fmt::Display) -> String {
-        format!("network: {e}")
+        // #3667 — a reqwest error's Display appends `for url (…)`, and only
+        // the userinfo is stripped from it: a `?password=` survives.
+        format!(
+            "network: {}",
+            crate::logging::redact_urls_in_message(&e.to_string())
+        )
     }
 
     /// `"unsubscribe: {e}"`.
@@ -1585,6 +1590,10 @@ mod tests {
             "zstd decompress body: truncated"
         );
         assert_eq!(msg::network("timeout"), "network: timeout");
+        assert_eq!(
+            msg::network("error sending request for url (https://h/v1?password=C1&x=1)"),
+            "network: error sending request for url (https://h/v1?password=****&x=1)"
+        );
         assert_eq!(msg::unsubscribe("missing id"), "unsubscribe: missing id");
     }
 

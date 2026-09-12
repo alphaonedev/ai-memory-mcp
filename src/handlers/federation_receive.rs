@@ -4435,8 +4435,16 @@ pub async fn sync_push(
     // Receiver's current clock, returned so the sender can learn which
     // peers the receiver has seen. Phase 3 Task 3a.1 will use this to
     // short-circuit redundant pushes.
-    let receiver_clock = db::sync_state_load(&lock.0, &local_agent_id)
-        .unwrap_or_else(|_| crate::models::VectorClock::default());
+    // #3667 — `sync-daemon` keys `sync_state` by its `--peers` URL, which
+    // may carry `user:pass@` or `?password=`; never echo that to a peer.
+    let receiver_clock = crate::models::VectorClock {
+        entries: db::sync_state_load(&lock.0, &local_agent_id)
+            .unwrap_or_default()
+            .entries
+            .into_iter()
+            .map(|(peer, at)| (crate::logging::redact_url_password(&peer), at))
+            .collect(),
+    };
 
     // Release DB lock before touching the HNSW index — the vector index
     // has its own mutex and holding both serializes unrelated writers.
