@@ -12,12 +12,15 @@
 > [#3472](https://github.com/alphaonedev/ai-memory-mcp/issues/3472) (this page:
 > the certification stance and the removal proof).
 
+Start with [Integrate any agent](a2a-integration.md) for the end-to-end setup.
+
 ## What the wake plane is for
 
 Before it existed, `memory_notify` wrote a durable inbox row and dispatched
 nothing. A recipient learned it had mail only by polling `memory_inbox`. The
 wake plane closes that gap: a committed notify pushes a bounded, content-free
-HINT to the recipient in about a millisecond, so the poll becomes a safety net
+HINT to the recipient with a millisecond design target (measurement #3473
+remains open), so the poll becomes a safety net
 instead of the delivery mechanism.
 
 Three pieces:
