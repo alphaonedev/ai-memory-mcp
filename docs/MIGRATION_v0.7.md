@@ -36,7 +36,7 @@ layout: doc
 | QW-1 file-backed reflection export | `memory_export_reflection` MCP tool | Opt-IN per namespace | `auto_export_reflections_to_filesystem = true` |
 | QW-2 persona-as-artifact | `memory_persona` + `memory_persona_generate` tools, `MemoryKind::Persona` | Opt-IN per namespace | `auto_persona_trigger_every_n_memories = N` ([doc](persona.html)) |
 | QW-3 context-offload primitive | `memory_offload` + `memory_deref` tools | Caller-driven | [doc](context-offload.html) |
-| Provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) | `LlmProvider::OpenAiCompatible` wire shape, 15 vendor aliases, `OllamaClient::from_env()` | Backend defaults to `ollama` if `AI_MEMORY_LLM_BACKEND` unset — every v0.6.4 caller keeps working | Set `AI_MEMORY_LLM_BACKEND` + (alias-specific) API key env var to route the smart / autonomous tier to any of xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp |
+| Provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) | `LlmProvider::OpenAiCompatible` wire shape, 14 vendor aliases, `OllamaClient::from_env()` | Backend defaults to `ollama` if `AI_MEMORY_LLM_BACKEND` unset — every v0.6.4 caller keeps working | Set `AI_MEMORY_LLM_BACKEND` + (alias-specific) API key env var to route the smart / autonomous tier to any of xAI / OpenAI / Anthropic / Gemini / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp |
 | Mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068)) | `aarch64-apple-ios` + `aarch64-linux-android` cross-compile gates, iOS xcframework + Android jniLibs release artifacts, simulator/emulator runtime tests | No change for desktop deploys | Consume `ai-memory-ios.xcframework.tar.gz` + `ai-memory-android.tar.gz` release artifacts; C-ABI FFI surface itself lands v0.7.x |
 
 ---
@@ -383,7 +383,7 @@ Operator docs: [`docs/governance.md`](governance.html), [`docs/policy-engine.md`
 v0.7.0 promotes the LLM client to a provider-agnostic substrate. Pre-v0.7.0
 the smart and autonomous tiers required local Ollama; post-v0.7.0 the same
 tiers run against any of: local Ollama, xAI Grok, OpenAI, Anthropic (via
-the OpenAI shim), Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba),
+the OpenAI shim), Google Gemini, Kimi (Moonshot), Qwen (Alibaba),
 Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio,
 vLLM, or llama.cpp server.
 
@@ -409,7 +409,7 @@ db   = "/Users/<you>/.claude/ai-memory.db"
 
 [llm]
 backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
-                                       # deepseek | kimi | qwen | mistral | groq |
+                                       # kimi | qwen | mistral | groq |
                                        # together | cerebras | openrouter |
                                        # fireworks | lmstudio | openai-compatible
 model       = "grok-4.3"               # vendor-specific identifier

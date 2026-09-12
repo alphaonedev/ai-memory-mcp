@@ -939,7 +939,7 @@ pub struct CapabilityModels {
 /// - `llm` — `"none"` when no LLM is configured; bare `model` for
 ///   Ollama backends (legacy banner shape); `backend:model` for
 ///   every OpenAI-compatible vendor (xAI, OpenAI, Anthropic,
-///   Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+///   Gemini, Kimi, Qwen, Mistral, Groq, Together,
 ///   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp).
 /// - `embedding` — `"none"` when the tier preset disables the
 ///   embedder (`keyword` tier); otherwise the resolver's canonical
@@ -3809,7 +3809,7 @@ pub struct LlmSection {
     /// Backend selector. One of: `ollama` (native `/api/chat` +
     /// `/api/embed`, no auth), `openai-compatible` (generic; requires
     /// explicit `base_url`), or an alias that pre-fills `base_url`
-    /// (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`,
+    /// (`openai`, `xai`, `anthropic`, `gemini`, `kimi`,
     /// `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
     /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
     /// (treated as `ollama`).
@@ -7696,7 +7696,6 @@ fn backend_default_model(backend: &str) -> &'static str {
         "openai" => "gpt-5",
         "anthropic" => "claude-opus-4.7",
         "gemini" => "gemini-2.0-flash",
-        "deepseek" => "deepseek-chat",
         "kimi" | "moonshot" => "moonshot-v1-8k",
         "qwen" | "dashscope" => "qwen-max",
         "mistral" => "mistral-large-latest",
@@ -7725,7 +7724,6 @@ fn backend_default_base_url(backend: &str) -> &'static str {
         "xai" => "https://api.x.ai/v1",
         "anthropic" => "https://api.anthropic.com/v1",
         "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
-        "deepseek" => "https://api.deepseek.com/v1",
         "kimi" | "moonshot" => "https://api.moonshot.cn/v1",
         "qwen" | "dashscope" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "mistral" => "https://api.mistral.ai/v1",
@@ -7751,7 +7749,6 @@ fn alias_api_key_env_vars_for_resolver(alias: &str) -> &'static [&'static str] {
         "xai" => &["XAI_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
         "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
@@ -13330,7 +13327,6 @@ legacy_scoring = false
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
-            "DEEPSEEK_API_KEY",
             "AI_MEMORY_EMBED_BACKFILL_BATCH",
             "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS",
         ] {
@@ -13871,6 +13867,48 @@ max_page_size = 1000000
             "vendor-default base_url applied"
         );
         assert_eq!(resolved.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_llm_config_path_refuses_retired_alias_at_construct_3627() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let alias = crate::llm::retired_llm_alias_3627();
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some(alias.clone()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(
+            resolved.backend, alias,
+            "#3627: resolver must surface the configured selector, not rewrite it"
+        );
+        // Match, not expect_err: OllamaClient is not Debug (holds the API key).
+        let err = match crate::llm::OllamaClient::build_from_resolved(&resolved) {
+            Ok(_) => panic!("#3627: config path must refuse the retired alias at construct"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a recognized"),
+            "#3627: config refusal must use the standard unknown-alias error; got {msg}"
+        );
+        assert!(
+            msg.contains("ollama") && msg.contains("openai-compatible"),
+            "#3627: config refusal must name accepted aliases; got {msg}"
+        );
+        // The unknown-alias error quotes the rejected selector; only
+        // the Valid-values suffix is the operator-facing accepted list.
+        let valid = msg
+            .split("Valid values:")
+            .nth(1)
+            .expect("#3627: unknown-alias error must list Valid values");
+        assert!(
+            !valid.contains(&alias),
+            "#3627: valid-values list must not re-advertise the retired alias; got {msg}"
+        );
+        scrub_llm_env();
     }
 
     #[test]

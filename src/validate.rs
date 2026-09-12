@@ -83,7 +83,7 @@ pub(crate) const VALID_SOURCES: &[&str] = &[
 /// a single vendor's name on every reflection — regardless of which
 /// AI NHI made the call — is a monoculture defect: forensic queries
 /// keyed on `source = 'claude'` silently miss every row minted by an
-/// OpenAI / xAI / Anthropic / Gemini / DeepSeek / Groq / etc. NHI.
+/// OpenAI / xAI / Anthropic / Gemini / Groq / etc. NHI.
 ///
 /// **Migration:** pre-existing rows with `source = "claude"` are
 /// untouched. New substrate writes stamp `DEFAULT_NHI_SOURCE`. Tests

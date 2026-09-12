@@ -50,7 +50,7 @@
 | **An engineer / architect** | PostgreSQL + Apache AGE storage (multi-writer, KG-heavy) | [`docs/postgres-age-guide.md`](docs/postgres-age-guide.md) — postgres operator guide. Read [Backend parity](#backend-parity) first: Postgres serves a **subset** of the HTTP surface and cannot host the stdio MCP path. |
 | **A decision-maker** evaluating adoption | — | [`docs/audience/decision-maker.html`](https://alphaonedev.github.io/ai-memory-mcp/audience/decision-maker.html) |
 
-> Configuring the LLM backend (xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, or local Ollama)? See [`docs/integrations/llm-backends.md`](docs/integrations/llm-backends.md) — the MCP env-block recipe is the same regardless of installation path.
+> Configuring the LLM backend (xAI Grok, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, or local Ollama)? See [`docs/integrations/llm-backends.md`](docs/integrations/llm-backends.md) — the MCP env-block recipe is the same regardless of installation path.
 
 ---
 
@@ -403,7 +403,7 @@ Verify: `ai-memory boot --quiet --limit 1` should report `llm=xai:grok-4.3`. Can
 >
 > MCP clients spawn the server as a fresh subprocess with only the `env:` keys from the MCP config — shell exports in `.zshrc` / `.bashrc` don't reach it. The `[llm]` config-file path above retires this paper-cut (every surface reads the same file). **Inline API keys in `config.toml` are rejected at parse time** — use `api_key_env` or `api_key_file`. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146). Full per-backend recipes: [`docs/integrations/llm-backends.md`](docs/integrations/llm-backends.md).
 
-> **Tier flag:** The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. Smart and autonomous tiers need an LLM backend — **post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** that is any of: local [Ollama](https://ollama.com), xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp server — selected via `AI_MEMORY_LLM_BACKEND`. The `--tier` flag **must** be passed in the args — the `config.toml` tier setting is not used when the MCP server is launched by an AI client.
+> **Tier flag:** The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. Smart and autonomous tiers need an LLM backend — **post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** that is any of: local [Ollama](https://ollama.com), xAI Grok, OpenAI, Anthropic, Google Gemini, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp server — selected via `AI_MEMORY_LLM_BACKEND`. The `--tier` flag **must** be passed in the args — the `config.toml` tier setting is not used when the MCP server is launched by an AI client.
 
 > **Important:** MCP servers are **not** configured in `settings.json` or `settings.local.json` — those files do not support `mcpServers`.
 
@@ -853,7 +853,7 @@ The `token-budget` workflow runs on every PR and reports three cl100k_base-measu
 - **hf-hub** -- download models from Hugging Face Hub
 - **tokenizers** -- Hugging Face tokenizers for text preprocessing
 - **instant-distance** -- approximate nearest neighbor search
-- **reqwest** -- HTTP client for LLM-backend communication (smart/autonomous tiers — any provider per #1067: Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server)
+- **reqwest** -- HTTP client for LLM-backend communication (smart/autonomous tiers — any provider per #1067: Ollama, xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server)
 
 ---
 
@@ -884,7 +884,7 @@ Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500
 | **keyword** | **96.4%** | binary-faithful (`harness.py`) | None |
 | **semantic** | **96.8%** | binary-faithful (`harness.py`) | Embedding model (~100 MB) |
 | **autonomous** | **95.8%** | binary-faithful (`harness.py`) | Embedding model + cross-encoder reranker |
-| **smart** (keyword + LLM query expansion) | **97.2%** (Gemma 4, cloud-API venue; historical `gemma3:4b` 97.8% retired per [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975)) | **shadow** (`harness_99.py` — re-implements scoring outside the binary) | Any LLM backend (e.g. local Ollama + Gemma; or xAI Grok 4.3, OpenAI gpt-5, Anthropic Claude Opus 4.7, Gemini, DeepSeek, etc. post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) |
+| **smart** (keyword + LLM query expansion) | **97.2%** (Gemma 4, cloud-API venue; historical `gemma3:4b` 97.8% retired per [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975)) | **shadow** (`harness_99.py` — re-implements scoring outside the binary) | Any LLM backend (e.g. local Ollama + Gemma; or xAI Grok 4.3, OpenAI gpt-5, Anthropic Claude Opus 4.7, Gemini, etc. post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) |
 
 **Read the `autonomous` row.** On this dataset the cross-encoder reranker measures *below* both the semantic tier and the keyword baseline at every K. LongMemEval-S is lexical-match-heavy; paying for embeddings + rerank buys nothing here. We publish the row because a benchmark table that silently drops its worst tier is not a benchmark table.
 
@@ -989,7 +989,7 @@ ai-memory supports 4 feature tiers, selected at startup with `ai-memory mcp --ti
 |------|---------------|-------------------|-----------------|
 | **keyword** | FTS5 only | Baseline 104-entry surface — tier gates models/features, NOT the advertised tool surface | 0 MB |
 | **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings (384-dim), HNSW index — same 104-entry surface | ~256 MB |
-| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + LLM-backed `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, full 104-entry surface. LLM provider is operator-selected via `AI_MEMORY_LLM_BACKEND` ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) — local Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp. | ~1 GB (local Ollama) / ~0 GB (remote API) |
+| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + LLM-backed `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, full 104-entry surface. LLM provider is operator-selected via `AI_MEMORY_LLM_BACKEND` ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) — local Ollama, xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp. | ~1 GB (local Ollama) / ~0 GB (remote API) |
 | **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + neural cross-encoder (ms-marco-MiniLM), memory reflection, full 104-entry surface. Same LLM-provider freedom as smart tier. | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder only) |
 
 ### Capability Matrix
@@ -1018,12 +1018,12 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | LLM | -- | -- | operator-selected (#1067) — default `gemma3:4b` local; remote endpoints carry no local footprint | operator-selected (#1067) — default `gemma3:4b` local; remote endpoints carry no local footprint |
 | **Resources** | | | | |
 | RAM | 0 MB | ~256 MB | ~1 GB | ~4 GB |
-| External dependencies | None | None | LLM backend (Ollama / xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp — #1067) | LLM backend (same choices as smart) |
+| External dependencies | None | None | LLM backend (Ollama / xAI / OpenAI / Anthropic / Gemini / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp — #1067) | LLM backend (same choices as smart) |
 | MCP tools exposed (at `--profile full`) [^tools] | 104 | 104 | 104 | 104 |
 
 [^tools]: MCP tool surface is orthogonal to recall tier — every tier sees the same 104 advertised entries at `--profile full` (103 callable tools + the always-on `memory_capabilities` bootstrap). The default `--profile core` advertises **8** at boot regardless of tier, counted the same way: the 7 Core-family tools plus that same bootstrap entry; the other 96 callable tools load on demand. Both numbers on this page are *advertised entries*, so 8 and 104 are directly comparable. What tier gates is models (embedder, cross-encoder, LLM) and feature behaviour (cosine similarity, LLM expansion, reranking), not the advertised tool count. Pinned by `Profile::full().expected_tool_count()` + `const_count_matches_full_profile` in `src/mcp/registry.rs`.
 
-**Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that can be local ([Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server) or any OpenAI-compatible remote endpoint (xAI, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selection is by `AI_MEMORY_LLM_BACKEND` env var; per-vendor API keys via `XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `DEEPSEEK_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / etc. or the canonical `AI_MEMORY_LLM_API_KEY`.
+**Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that can be local ([Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server) or any OpenAI-compatible remote endpoint (xAI, OpenAI, Anthropic via OpenAI shim, Google Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selection is by `AI_MEMORY_LLM_BACKEND` env var; per-vendor API keys via `XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / etc. or the canonical `AI_MEMORY_LLM_API_KEY`.
 
 **Tiers gate features, not models — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers gate features, not vendors either.** The `--tier` flag controls which tools are exposed. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or via the canonical `[llm]` section in `~/.config/ai-memory/config.toml` — see [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md) for the v0.7.x enterprise schema and the migration tool). For example, run autonomous tier (full 104-entry surface + reranker) against xAI Grok 4 via the OpenAI-compatible alias:
 

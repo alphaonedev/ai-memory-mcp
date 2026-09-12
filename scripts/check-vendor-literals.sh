@@ -13,7 +13,7 @@
 # Two checks:
 #
 #   (A) Vendor-monoculture gate. Every `"claude" | "openai" | "xai" |
-#       "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" |
+#       "anthropic" | "gemini" | "groq" | "ollama" |
 #       "grok" | "mistral" | "cohere" | "huggingface"` literal outside
 #       the 9-file substrate allowlist is a HARD-BLOCK. Vendor strings
 #       are legitimate only in:
@@ -87,7 +87,7 @@ ALLOWED_FILES=(
     "tools/t0-orchestrate/src/main.rs"
     # v0.9.0 §25.3 S1 (#1870) — the conservative model-FAMILY normalizer
     # table (`family_of`): the vendor-family stems (claude/anthropic/grok/
-    # deepseek/mistral/gemini/…) ARE the routing key of the normalization,
+    # mistral/gemini/…) ARE the routing key of the normalization,
     # exactly the `src/mine.rs::Format::Claude` vendor-keyed-enum precedent.
     "src/identity/model_family.rs"
 )
@@ -95,7 +95,7 @@ ALLOWED_FILES=(
 # Vendor identifiers to gate. Keep this list narrow — over-broad gates
 # create reviewer friction. Add a new vendor only when an actual
 # alias-table entry lands in `src/llm.rs`.
-VENDOR_PATTERN='(claude|openai|xai|anthropic|gemini|deepseek|groq|ollama|grok|mistral|cohere|huggingface)'
+VENDOR_PATTERN='(claude|openai|xai|anthropic|gemini|groq|ollama|grok|mistral|cohere|huggingface)'
 
 # SECS_PER_* magic numbers. Catches the literal forms PR3 extracted
 # named constants for — both unseparated (`3600`) and underscore-

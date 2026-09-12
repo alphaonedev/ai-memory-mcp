@@ -98,7 +98,6 @@ const FORBIDDEN_VENDOR_DEFAULTS: &[&str] = &[
     "xai",
     "anthropic",
     "gemini",
-    "deepseek",
     "groq",
     "mistral",
     "ollama",

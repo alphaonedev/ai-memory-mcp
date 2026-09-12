@@ -349,7 +349,6 @@ pre-configured vendor aliases.
 | `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
 | `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
-| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
 | `kimi` (= `moonshot`) | `https://api.moonshot.cn/v1` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
 | `qwen` (= `dashscope`) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY`, `QWEN_API_KEY` |
 | `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
@@ -373,7 +372,7 @@ pre-configured vendor aliases.
   Treated as **secret** (never echoed in capabilities / banners / audit
   rows).
 - `AI_MEMORY_LLM_MODEL` — model identifier passed through verbatim.
-  Vendor-specific (e.g. `grok-4` for xAI, `deepseek-chat` for DeepSeek,
+  Vendor-specific (e.g. `grok-4` for xAI,
   `qwen-max` for Qwen, `gemma3:4b` for Ollama).
 
 **Tier independence.** The substrate's tier no longer dictates which
@@ -864,7 +863,7 @@ replaces the dual `ACTIVE_*` / `OVERRIDE_*` static pairs.
 [`scripts/check-vendor-literals.sh`](../../scripts/check-vendor-literals.sh)
 ([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200))
 HARD-BLOCKs (a) vendor-monoculture literals (`"claude"`, `"openai"`,
-`"xai"`, `"anthropic"`, `"gemini"`, `"deepseek"`, `"groq"`, `"ollama"`,
+`"xai"`, `"anthropic"`, `"gemini"`, `"groq"`, `"ollama"`,
 `"grok"`, `"mistral"`, `"cohere"`, `"huggingface"`) outside the 7-file
 substrate carve-out (`src/llm.rs`, `src/config.rs`, `src/mine.rs`,
 `src/validate.rs`, `src/cli/wrap.rs`, `src/llm_cli_wrap.rs`,

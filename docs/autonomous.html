@@ -253,7 +253,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Autonomous-tier intelligence.</h1>
-  <p class="tagline">Auto-tagging. Auto-consolidation. Query expansion. Contradiction detection. Memory reflection. Six features that turn ai-memory from a store into an agent &mdash; <strong>local-first by default</strong> (Gemma via Ollama) and, as of v0.7.0 (#1067 + #1146), <strong>provider-agnostic by config</strong>: route any of these through xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or any other OpenAI-compatible endpoint via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code>. Local stays the default for the privacy story below; cloud unlocks the CPU-only and cellphone postures. <strong>Canonical schema (single source of truth, every surface):</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>. <strong>Per-vendor recipes (config.toml + MCP env-block override):</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/integrations/llm-backends.md">integrations/llm-backends.md</a>.</p>
+  <p class="tagline">Auto-tagging. Auto-consolidation. Query expansion. Contradiction detection. Memory reflection. Six features that turn ai-memory from a store into an agent &mdash; <strong>local-first by default</strong> (Gemma via Ollama) and, as of v0.7.0 (#1067 + #1146), <strong>provider-agnostic by config</strong>: route any of these through xAI Grok, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or any other OpenAI-compatible endpoint via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code>. Local stays the default for the privacy story below; cloud unlocks the CPU-only and cellphone postures. <strong>Canonical schema (single source of truth, every surface):</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>. <strong>Per-vendor recipes (config.toml + MCP env-block override):</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/integrations/llm-backends.md">integrations/llm-backends.md</a>.</p>
   <div class="pills">
     <span class="pill">Ollama local (default)</span>
     <span class="pill">15+ cloud vendors via #1067</span>
@@ -494,7 +494,7 @@ EOF
 
     <h3 style="font-family:var(--font-sans);font-size:1.15rem;margin-top:1.75rem">A. Cloud API — no local model, no GPU (OpenRouter shown as one low-cost example)</h3>
     <div class="snip"><span class="cm"># Any OpenAI-compatible vendor works (openai | xai | anthropic | gemini |</span>
-<span class="cm"># deepseek | kimi | qwen | mistral | groq | together | cerebras |</span>
+<span class="cm"># kimi | qwen | mistral | groq | together | cerebras |</span>
 <span class="cm"># openrouter | fireworks | …). OpenRouter + a Gemma 4 chat model is shown</span>
 <span class="cm"># here only as a low-cost EXAMPLE — swap `model` for any model the vendor serves.</span>
 <span class="ok">$</span> cat &gt; ~/.config/ai-memory/config.toml &lt;&lt;EOF

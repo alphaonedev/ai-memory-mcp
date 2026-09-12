@@ -177,7 +177,6 @@
     "openai": "gpt-5",
     "anthropic": "claude-opus-4.7",
     "gemini": "gemini-2.0-flash",
-    "deepseek": "deepseek-chat",
     "kimi_moonshot": "moonshot-v1-8k",
     "qwen_dashscope": "qwen-max",
     "mistral": "mistral-large-latest",

@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The live merge gate requires a real Fable APPROVE-MERGE signal naming
   the head SHA.
 
+### Removed
+
+- **The `deepseek` LLM provider alias is removed from the product and every current doc** ([#3627](https://github.com/alphaonedev/ai-memory-mcp/issues/3627)). An explicit `AI_MEMORY_LLM_BACKEND` / `[llm].backend` of that token is now refused with the standard unknown-alias error naming the accepted selectors (no silent fallback to the Ollama default URL). Historical release records (earlier CHANGELOG sections, `.github/release-body-v0.8.0.md`, `docs/compliance/_inventory/v0.7.0-capabilities.json`) stay as past-release facts.
+
 ### Security (#3549 — one caller-authority resolver beneath every handler)
 
 - **#3549 (SECURITY, ga-blocker) — `identity::authority::Authority { principal,
