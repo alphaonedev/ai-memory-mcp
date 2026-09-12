@@ -18,7 +18,9 @@
 //! ## Severity rules (initial)
 //!
 //! - **Critical:** dim_violations > 0; pending_actions older than 24h;
-//!   sync skew > 600s; HNSW evictions > 0.
+//!   a sync peer not observed for > 600s, a peer clock leading this one
+//!   beyond the pull-cursor bound, or an unreadable `sync_state` (#3655);
+//!   HNSW evictions > 0.
 //! - **Warning:** silent-degrade flag from Capabilities v2
 //!   (recall_mode != "hybrid" on capable tiers); subscription delivery
 //!   success < 95% over the lifetime of the subscription.
@@ -36,8 +38,10 @@
 //!   has been wired yet. The doctor consults the Capabilities response
 //!   for the *active* mode at this instant and reports it as the only
 //!   data point.
-//! - **Sync mesh** (T3+): we report `last_pulled_at` skew across
-//!   `sync_state` rows when present, otherwise NOT_AVAILABLE.
+//! - **Sync mesh** (T3+, #3655): every `sync_state` row is aged against the
+//!   probe time (`observed` = `last_pulled_at`, `data` = `last_seen_at`,
+//!   `pushed` = `last_pushed_at`); an empty table is NOT_AVAILABLE, an
+//!   unreadable one is Critical, a malformed row is Warning.
 //!
 //! ## Anti-goals (per spec)
 //!
@@ -88,6 +92,27 @@ const FACT_RPO_ON_POWER_LOSS: &str = "rpo_on_power_loss";
 /// exact confusion #3385 was filed over.
 const FACT_ARCHIVE_ON_GC_SOURCE: &str = "archive_on_gc_source";
 const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
+/// #3655 — a peer this node has not OBSERVED (`last_pulled_at`) for longer
+/// than this is stale: **Critical**. The documented 600 s ceiling, kept —
+/// the sync daemon's default cycle is 2 s, so this is hundreds of missed
+/// cycles, not one slow one.
+const SYNC_PEER_STALE_SECS: i64 = 10 * crate::SECS_PER_MINUTE;
+/// #3655 — the Sync section's fact keys. Per-peer facts are
+/// `peer::<agent>/<peer>::<suffix>`.
+const FACT_PEER_COUNT: &str = "peer_count";
+const FACT_PROBED_AT: &str = "probed_at";
+const FACT_INVALID_ROWS: &str = "invalid_rows";
+const FACT_STALE_PEERS: &str = "stale_peers";
+const FACT_MAX_OBSERVED_AGE_SECS: &str = "max_observed_age_secs";
+const FACT_MAX_DATA_AGE_SECS: &str = "max_data_age_secs";
+const PEER_FACT_PREFIX: &str = "peer::";
+const PEER_FACT_OBSERVED_AGE: &str = "observed_age_secs";
+const PEER_FACT_DATA_AGE: &str = "data_age_secs";
+const PEER_FACT_PUSHED_AGE: &str = "pushed_age_secs";
+const PEER_FACT_CLOCK_LEAD: &str = "clock_lead_secs";
+const PEER_FACT_INVALID: &str = "invalid";
+const PEER_NEVER_PUSHED: &str = "never_pushed";
+const SYNC_STATE_UNREADABLE: &str = "unreadable";
 const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
 /// #3582 — remote capabilities key and doctor fact for federation posture.
@@ -2723,16 +2748,54 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
 }
 
 fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
-    let mut facts = Vec::new();
+    section_sync_at(conn, chrono::Utc::now())
+}
+
+/// v1.0.0 #3655 — the Sync section, aged against an explicit probe time.
+///
+/// Four states, kept distinct because each is a different operator action:
+/// - **unreadable** (`sync_state` cannot be queried) → **Critical**. The
+///   pre-#3655 section turned this into `peer_count = 0` and called the node
+///   a singleton.
+/// - **empty** (no rows) → **N/A**, the single-node case.
+/// - **invalid** rows (NULL / non-RFC 3339 cursors) → **Warning**, counted
+///   and named; never silently skipped.
+/// - **valid** rows → each cursor is aged against `now`. A peer not observed
+///   for > [`SYNC_PEER_STALE_SECS`] is **Critical** (the "equal but old"
+///   case the old `|seen - pulled|` skew could never see); a peer whose
+///   data is stamped further into this node's future than the daemon's own
+///   pull-cursor bound is **Critical** (clocks disagree; its cursors will be
+///   refused). A quiet peer — old data, recent observation — is **Info**.
+fn section_sync_at(
+    conn: &rusqlite::Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ReportSection {
+    use crate::daemon_runtime::PULL_CURSOR_FUTURE_SKEW_SECS;
+
+    let mut facts: Vec<(String, String)> = vec![(FACT_PROBED_AT.into(), now.to_rfc3339())];
     let mut severity = Severity::Info;
     let mut note: Option<String> = None;
 
-    let peer_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
-        .unwrap_or(0);
-    facts.push(("peer_count".into(), peer_count.to_string()));
+    let watermarks = match db::doctor_sync_peer_watermarks(conn, now) {
+        Ok(w) => w,
+        Err(e) => {
+            facts.push(("sync_state".into(), SYNC_STATE_UNREADABLE.into()));
+            facts.push(("sync_query_error".into(), e.to_string()));
+            return ReportSection {
+                name: "Sync".into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some(
+                    "the sync_state table could not be read — peer health is UNKNOWN; this is \
+                     not a single-node deployment until the table can be read"
+                        .into(),
+                ),
+            };
+        }
+    };
 
-    if peer_count == 0 {
+    facts.push((FACT_PEER_COUNT.into(), watermarks.row_count().to_string()));
+    if watermarks.row_count() == 0 {
         facts.push((
             FACT_MAX_SKEW_SECS.into(),
             "not_observed (no peers registered)".into(),
@@ -2745,23 +2808,90 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
         };
     }
 
-    match db::doctor_max_sync_skew_secs(conn) {
-        Ok(Some(skew)) => {
-            facts.push((FACT_MAX_SKEW_SECS.into(), skew.to_string()));
-            if skew > 600 {
-                severity = Severity::Critical;
-                note = Some(format!(
-                    "max sync skew is {skew}s (>600s threshold) — peer mesh is drifting"
-                ));
-            }
+    facts.push((
+        FACT_INVALID_ROWS.into(),
+        watermarks.invalid.len().to_string(),
+    ));
+    for (label, reason) in &watermarks.invalid {
+        facts.push((
+            format!("{PEER_FACT_PREFIX}{label}::{PEER_FACT_INVALID}"),
+            reason.clone(),
+        ));
+    }
+    if !watermarks.invalid.is_empty() {
+        severity = Severity::Warning;
+        append_note(
+            &mut note,
+            &format!(
+                "{} sync_state row(s) have cursors that cannot be read — they are not \
+                 counted as healthy peers",
+                watermarks.invalid.len()
+            ),
+        );
+    }
+
+    let mut stale_peers = 0usize;
+    let mut max_observed: Option<i64> = None;
+    let mut max_data: Option<i64> = None;
+    let mut max_lead_abs: Option<i64> = None;
+    for peer in &watermarks.peers {
+        let key = |suffix: &str| {
+            format!(
+                "{PEER_FACT_PREFIX}{}/{}::{suffix}",
+                peer.agent_id, peer.peer_id
+            )
+        };
+        facts.push((
+            key(PEER_FACT_OBSERVED_AGE),
+            peer.observed_age_secs.to_string(),
+        ));
+        facts.push((key(PEER_FACT_DATA_AGE), peer.data_age_secs.to_string()));
+        facts.push((
+            key(PEER_FACT_PUSHED_AGE),
+            peer.pushed_age_secs
+                .map_or_else(|| PEER_NEVER_PUSHED.to_string(), |a| a.to_string()),
+        ));
+        facts.push((key(PEER_FACT_CLOCK_LEAD), peer.clock_lead_secs.to_string()));
+        max_observed =
+            Some(max_observed.map_or(peer.observed_age_secs, |m| m.max(peer.observed_age_secs)));
+        max_data = Some(max_data.map_or(peer.data_age_secs, |m| m.max(peer.data_age_secs)));
+        let lead_abs = peer.clock_lead_secs.saturating_abs();
+        max_lead_abs = Some(max_lead_abs.map_or(lead_abs, |m| m.max(lead_abs)));
+
+        if peer.observed_age_secs > SYNC_PEER_STALE_SECS {
+            stale_peers = stale_peers.saturating_add(1);
+            severity = Severity::Critical;
+            append_note(
+                &mut note,
+                &format!(
+                    "peer {} last observed {}s ago (>{SYNC_PEER_STALE_SECS}s threshold) — the \
+                     mesh is not converging through this node",
+                    peer.peer_id, peer.observed_age_secs
+                ),
+            );
         }
-        Ok(None) => {
-            facts.push((FACT_MAX_SKEW_SECS.into(), "not_observed".into()));
-        }
-        Err(e) => {
-            facts.push(("sync_query_error".into(), e.to_string()));
+        if peer.clock_lead_secs > PULL_CURSOR_FUTURE_SKEW_SECS {
+            severity = Severity::Critical;
+            append_note(
+                &mut note,
+                &format!(
+                    "peer {} stamps data {}s ahead of this clock (>{PULL_CURSOR_FUTURE_SKEW_SECS}s \
+                     pull-cursor bound) — clocks disagree and its cursors will be refused",
+                    peer.peer_id, peer.clock_lead_secs
+                ),
+            );
         }
     }
+    facts.push((FACT_STALE_PEERS.into(), stale_peers.to_string()));
+    // Summary ages are MEASURED maxima over valid rows; with no valid row
+    // there is nothing to summarise and the facts say so.
+    let render_max =
+        |m: Option<i64>| m.map_or_else(|| "not_observed".to_string(), |v| v.to_string());
+    facts.push((FACT_MAX_OBSERVED_AGE_SECS.into(), render_max(max_observed)));
+    facts.push((FACT_MAX_DATA_AGE_SECS.into(), render_max(max_data)));
+    // Kept for existing consumers: the largest |seen - pulled| over valid
+    // rows. It no longer drives severity — see `clock_lead_secs`.
+    facts.push((FACT_MAX_SKEW_SECS.into(), render_max(max_lead_abs)));
 
     ReportSection {
         name: "Sync".into(),
@@ -6157,38 +6287,189 @@ enabled = true
         );
     }
 
-    /// Sync section `Ok(None)` skew arm: a registered peer whose
-    /// `last_pulled_at` is NULL yields peer_count ≥ 1 but no measurable
-    /// skew — the section must render `not_observed` at INFO rather
-    /// than N/A (the no-peers early return) or CRIT.
+    /// #3655 — a row whose cursor cannot be read is an INVALID row: counted,
+    /// named with the offending column, and a Warning. It was previously
+    /// skipped by the probe and the section stayed Info ("not_observed").
     #[test]
-    fn sync_section_not_observed_when_peer_has_no_pull_timestamp() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
-        conn.execute_batch(
-            "CREATE TABLE sync_state(last_seen_at TEXT, last_pulled_at TEXT);
-             INSERT INTO sync_state(last_seen_at, last_pulled_at)
-             VALUES ('2026-01-01T00:00:00Z', NULL);",
-        )
-        .expect("seed peer row");
-        let section = section_sync(&conn);
-        assert_eq!(section.severity, Severity::Info);
+    fn sync_section_warns_on_malformed_cursor_3655() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', '2026-01-01T00:00:00Z', 'not-a-timestamp')",
+                [],
+            )
+            .unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let sync = find(&report, "Sync");
+        assert_eq!(sync.severity, Severity::Warning, "{sync:?}");
+        assert_eq!(fact(sync, FACT_PEER_COUNT), "1");
+        assert_eq!(fact(sync, FACT_INVALID_ROWS), "1");
+        assert!(fact(sync, "peer::me/peer-1::invalid").contains("last_pulled_at"));
+        assert_eq!(fact(sync, FACT_STALE_PEERS), "0");
+        assert_eq!(fact(sync, FACT_MAX_SKEW_SECS), "not_observed");
         assert!(
-            section
-                .facts
-                .iter()
-                .any(|(k, v)| k == "max_skew_secs" && v == "not_observed"),
-            "facts: {:?}",
-            section.facts
-        );
-        assert!(
-            section
-                .facts
-                .iter()
-                .any(|(k, v)| k == "peer_count" && v == "1"),
-            "facts: {:?}",
-            section.facts
+            sync.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot be read")
         );
     }
+
+    /// #3655 — an unreadable `sync_state` is a FAILED probe: Critical, and
+    /// never reported as a single-node deployment. Pre-fix the COUNT error
+    /// became `peer_count = 0` → N/A with the single-node note.
+    #[test]
+    fn sync_section_critical_when_sync_state_unreadable_3655() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            conn.execute_batch("DROP TABLE sync_state;").unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let sync = find(&report, "Sync");
+        assert_eq!(sync.severity, Severity::Critical, "{sync:?}");
+        assert_eq!(fact(sync, "sync_state"), SYNC_STATE_UNREADABLE);
+        assert!(fact(sync, "sync_query_error").contains("sync_state"));
+        assert!(
+            sync.facts.iter().all(|(k, _)| k != FACT_PEER_COUNT),
+            "{sync:?}"
+        );
+        assert!(
+            !sync
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("single-node deployment or")
+        );
+        assert_eq!(report.overall, Severity::Critical);
+    }
+
+    /// #3655 — the audit's headline case: both cursors EQUAL but hours old.
+    /// The old `|seen - pulled|` skew was 0 → Info; aged against the probe
+    /// time the peer has not been observed for two hours → Critical.
+    #[test]
+    fn sync_section_critical_when_peer_cursors_equal_but_old_3655() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(2 * crate::SECS_PER_HOUR))
+                .to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', ?1, ?1)",
+                params![old],
+            )
+            .unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let sync = find(&report, "Sync");
+        assert_eq!(sync.severity, Severity::Critical, "{sync:?}");
+        assert_eq!(fact(sync, FACT_STALE_PEERS), "1");
+        assert_eq!(fact(sync, "peer::me/peer-1::clock_lead_secs"), "0");
+        assert!(
+            fact(sync, "peer::me/peer-1::observed_age_secs")
+                .parse::<i64>()
+                .unwrap()
+                >= 2 * crate::SECS_PER_HOUR
+        );
+        assert!(
+            sync.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("last observed")
+        );
+    }
+
+    /// #3655 — per-peer ages against a pinned probe time, the probe time
+    /// itself, a never-pushed peer, and a quiet peer (old data, recent
+    /// observation) that is NOT a finding. The old probe called the quiet
+    /// peer Critical (|seen - pulled| = 2 h) — a false alarm.
+    #[test]
+    fn sync_section_reports_per_peer_ages_against_probe_time_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let t = |secs_ago: i64| (now - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+            conn.execute_batch(&format!(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at) VALUES \
+                 ('me', 'quiet', '{}', '{}', NULL), \
+                 ('me', 'fresh', '{}', '{}', '{}');",
+                t(2 * crate::SECS_PER_HOUR),
+                t(30),
+                t(10),
+                t(10),
+                t(5),
+            ))
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Info, "{section:?}");
+            assert_eq!(fact(&section, FACT_PROBED_AT), now.to_rfc3339());
+            assert_eq!(fact(&section, FACT_PEER_COUNT), "2");
+            assert_eq!(fact(&section, FACT_INVALID_ROWS), "0");
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(fact(&section, "peer::me/quiet::observed_age_secs"), "30");
+            assert_eq!(
+                fact(&section, "peer::me/quiet::data_age_secs"),
+                (2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(
+                fact(&section, "peer::me/quiet::pushed_age_secs"),
+                PEER_NEVER_PUSHED
+            );
+            // Quiet peer: data older than the observation → NEGATIVE lead, no finding.
+            assert_eq!(
+                fact(&section, "peer::me/quiet::clock_lead_secs"),
+                (30 - 2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(fact(&section, "peer::me/fresh::pushed_age_secs"), "5");
+            assert_eq!(fact(&section, FACT_MAX_OBSERVED_AGE_SECS), "30");
+            assert_eq!(
+                fact(&section, FACT_MAX_DATA_AGE_SECS),
+                (2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(
+                fact(&section, FACT_MAX_SKEW_SECS),
+                (2 * crate::SECS_PER_HOUR - 30).to_string()
+            );
+        }
+    }
+
+    /// #3655 — a peer whose data is stamped beyond the daemon's own
+    /// pull-cursor future bound is a clock disagreement: Critical, named.
+    #[test]
+    fn sync_section_critical_when_peer_clock_leads_beyond_bound_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let ahead = (now + chrono::Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', ?1, ?2)",
+                params![ahead, now.to_rfc3339()],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Critical, "{section:?}");
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::clock_lead_secs"),
+                crate::SECS_PER_HOUR.to_string()
+            );
+            assert!(
+                section
+                    .note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("clocks disagree")
+            );
+        }
+    }
+
     // ---------------------------------------------------------------
     // #1146 / #1598 reachability probes + #1598 GPU policy — coverage
     // lift (GA push). Driven by wiremock + spawn_blocking (the

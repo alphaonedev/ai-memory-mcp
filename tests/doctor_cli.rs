@@ -285,6 +285,82 @@ fn doctor_remote_queries_capabilities_endpoint() {
     assert_eq!(v["mode"].as_str().unwrap(), "remote");
 }
 
+/// v1.0.0 #3655 — end-to-end through the binary: a peer whose two cursors
+/// are EQUAL but hours old is a stale peer (Critical, exit 2), not a healthy
+/// one; and an unreadable `sync_state` is Critical, never "single-node".
+/// Pre-fix the first case rendered Info (|seen - pulled| = 0) and the second
+/// rendered N/A with the single-node note.
+#[test]
+fn doctor_sync_flags_stale_peer_and_unreadable_table_3655() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    init_db(&db);
+    let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+             VALUES ('me', 'peer-1', ?1, ?1)",
+            params![old],
+        )
+        .unwrap();
+    }
+    let sync_section = |db: &Path| -> serde_json::Value {
+        let out = ai_memory(db)
+            .args(["doctor", "--json"])
+            .assert()
+            .code(2)
+            .get_output()
+            .stdout
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Sync")
+            .cloned()
+            .expect("Sync section")
+    };
+    let fact = |s: &serde_json::Value, key: &str| -> String {
+        s["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f[0] == key)
+            .unwrap_or_else(|| panic!("fact {key} missing in {s}"))[1]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let stale = sync_section(&db);
+    assert_eq!(stale["severity"], "critical", "{stale}");
+    assert_eq!(fact(&stale, "stale_peers"), "1");
+    assert_eq!(fact(&stale, "peer::me/peer-1::clock_lead_secs"), "0");
+    assert!(
+        fact(&stale, "peer::me/peer-1::observed_age_secs")
+            .parse::<i64>()
+            .unwrap()
+            >= 7_000
+    );
+
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE sync_state;").unwrap();
+    }
+    let unreadable = sync_section(&db);
+    assert_eq!(unreadable["severity"], "critical", "{unreadable}");
+    assert_eq!(fact(&unreadable, "sync_state"), "unreadable");
+    assert!(
+        !unreadable["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("single-node deployment or"),
+        "{unreadable}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Local serve helper. `free_port` consolidated into `tests/common/mod.rs`
 // by issue #854.
