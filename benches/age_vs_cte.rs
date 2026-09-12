@@ -416,14 +416,7 @@ fn report_for(backend: &'static str, samples: &[u128]) -> BackendReport {
 /// the bench prints lands in CI logs.
 #[cfg(feature = "sal-postgres")]
 fn redact(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let (scheme, rest) = url.split_at(scheme_end + 3);
-        if let Some(at) = rest.find('@') {
-            let after = &rest[at..];
-            return format!("{scheme}***{after}");
-        }
-    }
-    url.to_string()
+    ai_memory::logging::redact_url_password(url)
 }
 
 #[cfg(feature = "sal-postgres")]

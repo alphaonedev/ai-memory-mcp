@@ -919,100 +919,288 @@ fn rotation_for(cfg: &LoggingConfig) -> Rotation {
 // #1579 A3 (SECURITY) — store-URL credential redaction for logs
 // ---------------------------------------------------------------------------
 
-/// Mask substituted for the userinfo password portion of a URL by
-/// [`redact_url_password`] / [`redact_urls_in_message`]. The username
-/// and host stay readable so operators can still correlate the log
-/// line with the deployment; only the secret is destroyed.
+/// Mask substituted for URL passwords, or for an ambiguous URL/diagnostic
+/// whose credential boundaries cannot safely be preserved.
 pub const URL_PASSWORD_MASK: &str = "****";
 
-/// #1579 A3 (SECURITY) — redact the userinfo *password* portion of a
-/// single URL: `postgres://user:hunter2@host:5432/db` becomes
-/// `postgres://user:****@host:5432/db`.
+/// URL scheme boundary shared by the diagnostic scanners.
+const URL_SCHEME_SEPARATOR: &str = "://";
+
+/// #3667 — WHATWG "special" schemes whose parser accepts userinfo WITHOUT
+/// the canonical `//` (`https:u:p@h`, `https:/u:p@h`, `https:\\u:p@h`,
+/// `https:///u:p@h` all parse with credentials). Non-special schemes such
+/// as `postgres:` have no authority without `//`, so their only credential
+/// channel is the query, which [`redact_query_secrets`] masks anyway.
+const SPECIAL_URL_SCHEMES: &[&str] = &["http:", "https:", "ftp:", "ws:", "wss:"];
+
+/// #3667 — query keys whose VALUE is masked, matched as a substring of the
+/// decoded, ASCII-lowercased key. `password` is the one SQLx honours; the
+/// rest are the same secret carried by other URL consumers (libpq-style
+/// `sslpassword`, vendor `?token=` / `access_token`). Over-masking costs a
+/// diagnostic value; under-masking costs a credential.
+const SECRET_QUERY_KEY_FRAGMENTS: &[&str] = &["pass", "pwd", "secret", "token", "credential"];
+
+/// #3667 — query keys whose value is masked on an EXACT decoded match
+/// (too short to match as fragments without masking benign keys).
+const SECRET_QUERY_KEYS: &[&str] = &[
+    "key",
+    "apikey",
+    "api_key",
+    "api-key",
+    "access_key",
+    "auth",
+    "sig",
+    "signature",
+];
+
+/// URL parsers delete ASCII tab / CR / LF anywhere in the input.
+const URL_PARSER_STRIPPED: [char; 3] = ['\t', '\r', '\n'];
+
+/// True when `input` holds a special-scheme URL whose authority is written
+/// in a non-canonical form AND carries an `@` — i.e. userinfo the textual
+/// scanners below would not find at the canonical position. Such input is
+/// masked whole rather than guessed at (#3667). The scheme must start at a
+/// scheme boundary (`rows:` is not `ws:`) and the `@` requirement keeps
+/// ordinary prose such as `HTTP: 404` readable.
+fn has_ambiguous_url_scheme(input: &str) -> bool {
+    let normalized = input.replace(URL_PARSER_STRIPPED, "").to_ascii_lowercase();
+    SPECIAL_URL_SCHEMES.iter().any(|scheme| {
+        normalized.match_indices(scheme).any(|(start, _)| {
+            let at_boundary = normalized[..start]
+                .bytes()
+                .next_back()
+                .is_none_or(|b| !is_scheme_byte(b));
+            // `scheme` is ASCII, so `start + scheme.len()` is a char boundary.
+            let suffix = &normalized[start + scheme.len()..];
+            let canonical = suffix
+                .strip_prefix("//")
+                .is_some_and(|authority| !authority.starts_with(['/', '\\']));
+            at_boundary && !canonical && suffix.contains('@')
+        })
+    })
+}
+
+/// RFC 3986 scheme characters after the first letter.
+fn is_scheme_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+}
+
+/// #1579 A3 / #3667 (SECURITY) — redact the credentials in a single URL:
+/// the userinfo password (`postgres://user:****@host/db`) AND the value of
+/// every secret query parameter (`?password=****`, repeated and
+/// percent-encoded keys included — SQLx accepts the password in either
+/// place). Usernames, hosts and non-secret query parameters stay readable
+/// so operators can still correlate the line with the deployment.
 ///
-/// The P3 perf-audit found the daemon boot line logging the FULL
-/// `--store-url` (password included) to journald at INFO
-/// (`src/daemon_runtime.rs::build_store_handle`). Every log / error /
-/// trace / CLI-output site that emits a store URL routes through this
-/// helper (or [`redact_urls_in_message`] for free-text diagnostics).
-///
-/// Behaviour:
-/// - URL without userinfo (`postgres://host/db`, `sqlite:///path`)
-///   → returned unchanged.
-/// - Userinfo without a password (`postgres://user@host/db`)
-///   → returned unchanged (no secret present).
-/// - Non-URL input (plain filesystem path) → returned unchanged.
-///
-/// Deliberately textual (no `url` crate parse) so a *malformed* URL
-/// containing credentials is still scrubbed rather than passed
-/// through on a parse error.
+/// Boundaries are scanned TEXTUALLY, never parsed, so a malformed URL (bad
+/// host, port or percent escape) is still scrubbed instead of being echoed
+/// back verbatim through a parse error. The userinfo `@` is the LAST one
+/// before the query, so an unescaped `/` or `#` inside a password cannot
+/// end the scan early. Non-canonical special-scheme credentials are masked
+/// whole. Input without a scheme separator keeps its query scrubbed and is
+/// otherwise returned unchanged (a plain filesystem path passes through).
 #[must_use]
 pub fn redact_url_password(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let authority_start = scheme_end + 3;
-    let rest = &url[authority_start..];
-    // The authority component ends at the first '/', '?' or '#'.
-    let authority_end = rest
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |i| authority_start + i);
-    let authority = &url[authority_start..authority_end];
-    // Userinfo is everything before the LAST '@' in the authority
-    // (RFC 3986 — the host may not contain '@', so the last one wins).
-    let Some(at_pos) = authority.rfind('@') else {
-        return url.to_string();
-    };
-    let userinfo = &authority[..at_pos];
-    // Password is everything after the FIRST ':' in the userinfo.
-    let Some(colon_pos) = userinfo.find(':') else {
-        return url.to_string();
-    };
+    if has_ambiguous_url_scheme(url) {
+        return URL_PASSWORD_MASK.to_string();
+    }
     let mut out = String::with_capacity(url.len());
-    out.push_str(&url[..authority_start + colon_pos + 1]);
-    out.push_str(URL_PASSWORD_MASK);
-    out.push_str(&url[authority_start + at_pos..]);
+    let Some((scheme, rest)) = url.split_once(URL_SCHEME_SEPARATOR) else {
+        redact_query_secrets(url, &mut out);
+        return out;
+    };
+    out.push_str(scheme);
+    out.push_str(URL_SCHEME_SEPARATOR);
+    let query_start = rest.find('?').unwrap_or(rest.len());
+    let after_userinfo = match rest[..query_start].rfind('@') {
+        Some(at) => {
+            let userinfo = &rest[..at];
+            match userinfo.split_once(':') {
+                Some((user, _password)) => {
+                    out.push_str(user);
+                    out.push(':');
+                    out.push_str(URL_PASSWORD_MASK);
+                }
+                None => out.push_str(userinfo),
+            }
+            out.push('@');
+            &rest[at + 1..]
+        }
+        None => rest,
+    };
+    let host_end = after_userinfo
+        .find(['/', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    out.push_str(&after_userinfo[..host_end]);
+    redact_query_secrets(&after_userinfo[host_end..], &mut out);
     out
 }
 
-/// #1579 A3 (SECURITY) — companion to [`redact_url_password`] for
-/// free-text diagnostics that may EMBED a URL (e.g. a wrapped
-/// `sqlx::Error::Configuration("invalid url postgres://…")` whose
-/// Display interpolates the connection target). Scans the message for
-/// `scheme://` runs and masks the userinfo password inside each one;
-/// every other byte passes through unchanged.
-#[must_use]
-pub fn redact_urls_in_message(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    while let Some(sep) = rest.find("://") {
-        // Walk back over scheme characters already buffered.
-        let mut scheme_start = sep;
-        while scheme_start > 0 {
-            let c = rest.as_bytes()[scheme_start - 1];
-            if c.is_ascii_alphanumeric() || c == b'+' || c == b'-' || c == b'.' {
-                scheme_start -= 1;
-            } else {
-                break;
+/// Copy `suffix` (path, query, fragment) into `out`, masking the value of
+/// every secret query parameter. Scans pairs textually so the enclosing URL
+/// need not be valid.
+fn redact_query_secrets(suffix: &str, out: &mut String) {
+    let (before_fragment, fragment) = match suffix.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (suffix, None),
+    };
+    if let Some((path, query)) = before_fragment.split_once('?') {
+        out.push_str(path);
+        out.push('?');
+        for (index, pair) in query.split('&').enumerate() {
+            if index != 0 {
+                out.push('&');
+            }
+            match pair.split_once('=') {
+                Some((key, _value)) if is_secret_query_key(key) => {
+                    out.push_str(key);
+                    out.push('=');
+                    out.push_str(URL_PASSWORD_MASK);
+                }
+                _ => out.push_str(pair),
             }
         }
-        out.push_str(&rest[..scheme_start]);
-        // The URL run ends at the first whitespace / quote / brace /
-        // paren / comma / semicolon / angle bracket — same boundary
-        // set as `handlers::postgres_gate::sanitize_store_err_message`.
-        let url_end = rest[sep..]
-            .find(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '"' | '\'' | '`' | '{' | '}' | '(' | ')' | ',' | ';' | '<' | '>'
-                    )
-            })
-            .map_or(rest.len(), |i| sep + i);
-        out.push_str(&redact_url_password(&rest[scheme_start..url_end]));
-        rest = &rest[url_end..];
+    } else {
+        out.push_str(before_fragment);
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+}
+
+/// Decode a query key the way `application/x-www-form-urlencoded` (and so
+/// SQLx's `Url::query_pairs`) does — `+` is a space, `%XX` is a byte, an
+/// invalid escape stays literal — after the URL parser's tab/CR/LF removal.
+fn decode_query_key(key: &str) -> String {
+    let bytes: Vec<u8> = key
+        .bytes()
+        .filter(|b| !matches!(b, b'\t' | b'\r' | b'\n'))
+        .collect();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = match &bytes[i..] {
+            [b'%', hi, lo, ..] => hex_value(*hi)
+                .zip(hex_value(*lo))
+                .map(|(h, l)| (h << 4) | l),
+            _ => None,
+        };
+        match (bytes[i], escaped) {
+            (_, Some(byte)) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            (b'+', None) => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            (byte, None) => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Value of one ASCII hex digit.
+fn hex_value(b: u8) -> Option<u8> {
+    // `to_digit(16)` is < 16, so the narrowing is lossless.
+    char::from(b).to_digit(16).and_then(|d| u8::try_from(d).ok())
+}
+
+/// Whether the decoded query `key` names a secret (#3667).
+fn is_secret_query_key(key: &str) -> bool {
+    let decoded = decode_query_key(key).to_ascii_lowercase();
+    SECRET_QUERY_KEY_FRAGMENTS
+        .iter()
+        .any(|fragment| decoded.contains(fragment))
+        || SECRET_QUERY_KEYS.contains(&decoded.as_str())
+}
+
+/// Mask secret query assignments anywhere in free text. A URL query value
+/// may hold literal spaces, so the value runs to the next `&` or `#` and
+/// trailing prose can be masked with it. Only whitespace-free keys are
+/// considered: no key containing a space decodes to one a URL consumer
+/// honours, and prose between a `?` and a later `=` is not a key.
+fn redact_message_query_secrets(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(boundary) = rest.find(['?', '&']) {
+        let (prefix, query) = rest.split_at(boundary);
+        out.push_str(prefix);
+        // `query` starts at an ASCII '?' or '&', hence this is a char boundary.
+        let (marker, after_marker) = query.split_at(1);
+        out.push_str(marker);
+        let key_end = after_marker
+            .find(['=', '&', '#', '?', ' '])
+            .unwrap_or(after_marker.len());
+        let (key, remaining) = after_marker.split_at(key_end);
+        out.push_str(key);
+        match remaining.strip_prefix('=') {
+            Some(value) if is_secret_query_key(key) => {
+                out.push('=');
+                out.push_str(URL_PASSWORD_MASK);
+                let value_end = value.find(['&', '#']).unwrap_or(value.len());
+                rest = &value[value_end..];
+            }
+            _ => rest = remaining,
+        }
     }
     out.push_str(rest);
     out
+}
+
+/// #1579 A3 / #3667 — companion to [`redact_url_password`] for free-text
+/// diagnostics that may EMBED a URL (e.g. a wrapped
+/// `sqlx::Error::Configuration("invalid url postgres://…")` whose Display
+/// interpolates the connection target). Scans the message for `scheme://`
+/// runs and masks authority and query credentials inside each one, then
+/// masks secret query assignments across the whole message.
+///
+/// Punctuation and literal spaces are legal inside a userinfo password, so
+/// a run's `@` is located (the last one before the next `?`) before any
+/// whitespace boundary is applied to the host and path. A run that
+/// contains a SECOND scheme separator is ambiguous — a comma may separate
+/// URLs or belong to a password — so it and the rest of the message are
+/// masked. Over-masking costs prose; under-masking costs a credential.
+#[must_use]
+pub fn redact_urls_in_message(msg: &str) -> String {
+    if has_ambiguous_url_scheme(msg) {
+        return URL_PASSWORD_MASK.to_string();
+    }
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(sep) = rest.find(URL_SCHEME_SEPARATOR) {
+        // Walk back over scheme characters already buffered.
+        let mut scheme_start = sep;
+        while scheme_start > 0 && is_scheme_byte(rest.as_bytes()[scheme_start - 1]) {
+            scheme_start -= 1;
+        }
+        out.push_str(&rest[..scheme_start]);
+        let authority_start = sep + URL_SCHEME_SEPARATOR.len();
+        let after_scheme = &rest[authority_start..];
+        let query_start = after_scheme.find('?').unwrap_or(after_scheme.len());
+        let userinfo_end = after_scheme[..query_start]
+            .rfind('@')
+            .map_or(0, |at| at + 1);
+        let token_start = authority_start + userinfo_end;
+        let url_end = rest[token_start..]
+            .find(|c: char| c.is_ascii_whitespace() && !URL_PARSER_STRIPPED.contains(&c))
+            .map_or(rest.len(), |i| token_start + i);
+        let url = &rest[scheme_start..url_end];
+        if url.matches(URL_SCHEME_SEPARATOR).nth(1).is_some() {
+            out.push_str(URL_PASSWORD_MASK);
+            return redact_message_query_secrets(&out);
+        }
+        out.push_str(&redact_url_password(url));
+        rest = &rest[url_end..];
+    }
+    out.push_str(rest);
+    // Userinfo is masked first: `&password=` may itself sit inside an
+    // authority password, and the query pass must not consume its `@`.
+    redact_message_query_secrets(&out)
 }
 
 #[cfg(test)]
@@ -1448,6 +1636,163 @@ mod tests {
     // -----------------------------------------------------------------
     // #1579 A3 (SECURITY) — store-URL credential redaction
     // -----------------------------------------------------------------
+
+    #[test]
+    fn issue_3667_query_password_representations() {
+        for (url, expected) in [
+            (
+                "postgres://user@db/memory?password=CANARY",
+                "postgres://user@db/memory?password=****",
+            ),
+            (
+                "postgres://db/memory?password=CANARY",
+                "postgres://db/memory?password=****",
+            ),
+            (
+                "postgresql://u:AUTH@db/m?%70ass%77ord=ENC%26ODED&password=SECOND&sslmode=require",
+                "postgresql://u:****@db/m?%70ass%77ord=****&password=****&sslmode=require",
+            ),
+            (
+                "postgres://[broken/m?password=BAD%ZZ&password=&password=LAST",
+                "postgres://[broken/m?password=****&password=****&password=****",
+            ),
+            (
+                "https://usér:AUTH@host/p?password=秘密&x=1",
+                "https://usér:****@host/p?password=****&x=1",
+            ),
+            (
+                "postgres://db/m?pass\tword=CANARY",
+                "postgres://db/m?pass\tword=****",
+            ),
+            // Non-canonical forms without userinfo keep their query scrubbed.
+            (
+                "postgres:memory?password=CANARY",
+                "postgres:memory?password=****",
+            ),
+            (
+                "https:host/m?%70assword=CANARY",
+                "https:host/m?%70assword=****",
+            ),
+            // A password may hold an unescaped `/` or `#`: the userinfo `@`
+            // is the last one before the query, never the first delimiter.
+            (
+                "postgres://u:pa/ss#x@db/m?sslmode=require",
+                "postgres://u:****@db/m?sslmode=require",
+            ),
+            // Secret keys other URL consumers honour are masked too.
+            (
+                "https://h/v1?key=K1&access_token=T1&sslpassword=S1&PASSWORD=P1&x=1",
+                "https://h/v1?key=****&access_token=****&sslpassword=****&PASSWORD=****&x=1",
+            ),
+            // `+` decodes to a space and an invalid escape stays literal,
+            // exactly as `application/x-www-form-urlencoded` decoding does.
+            ("postgres://db/m?%ZZpassword=C1", "postgres://db/m?%ZZpassword=****"),
+            ("/var/lib/ai-memory/ai.db", "/var/lib/ai-memory/ai.db"),
+            ("https:/u:AUTH_CANARY@host/m", URL_PASSWORD_MASK),
+            ("https:///u:AUTH_CANARY@host/m", URL_PASSWORD_MASK),
+            ("ht\ttps:/u:AUTH_CANARY@host/m", URL_PASSWORD_MASK),
+        ] {
+            assert_eq!(redact_url_password(url), expected);
+        }
+    }
+
+    #[test]
+    fn issue_3667_message_query_passwords() {
+        let clean = redact_urls_in_message(
+            "failed postgres://u@db/m?%70assword=CANARY%26VALUE&password=SECOND (timeout)",
+        );
+        assert_eq!(
+            clean,
+            "failed postgres://u@db/m?%70assword=****&password=****"
+        );
+    }
+
+    #[test]
+    fn issue_3667_message_password_punctuation() {
+        let clean =
+            redact_urls_in_message("failed postgres://u@db/m?password=CANARY,TAIL;MORE'END");
+        assert_eq!(clean, "failed postgres://u@db/m?password=****");
+    }
+
+    #[test]
+    fn issue_3667_preserves_nonsecret_query_and_fragment() {
+        let url = "postgres://db/m?sslmode=require&options=a:b@c&application_name=助手#section";
+        assert_eq!(redact_url_password(url), url);
+        let input = "postgres://db/m?password=CANARY%23FRAGMENT&sslmode=require#section";
+        let clean = redact_url_password(input);
+        assert_eq!(
+            clean,
+            "postgres://db/m?password=****&sslmode=require#section"
+        );
+        assert_eq!(redact_url_password(&clean), clean);
+    }
+
+    #[test]
+    fn issue_3667_message_masks_ambiguous_password_tail() {
+        for url in [
+            "postgres://u@db/m?password=CANARY SECRET_TAIL",
+            "postgres://u@db/m?pass\tword=CANARY SECRET_TAIL",
+            "postgres://u@db/m?application_name=my app&%70assword=CANARY SECRET_TAIL",
+        ] {
+            let clean = redact_urls_in_message(url);
+            assert!(!clean.contains("CANARY"), "{clean}");
+            assert!(!clean.contains("SECRET_TAIL"), "{clean}");
+            assert!(clean.ends_with(URL_PASSWORD_MASK), "{clean}");
+        }
+    }
+
+    #[test]
+    fn issue_3667_message_adjacent_urls_are_fail_closed() {
+        let clean = redact_urls_in_message(
+            "from https://public.example,postgres://u:AUTH_CANARY@db/m?password=QUERY_CANARY",
+        );
+        assert!(!clean.contains("AUTH_CANARY"), "{clean}");
+        assert!(!clean.contains("QUERY_CANARY"), "{clean}");
+        for msg in [
+            "failed https:/u:AUTH_CANARY@host/m",
+            "failed https:///u:AUTH_CANARY@host/m",
+            "failed ht\ttps:/u:AUTH_CANARY@host/m",
+            "failed https:u:AUTH_CANARY@host/m",
+        ] {
+            let clean = redact_urls_in_message(msg);
+            assert_eq!(clean, URL_PASSWORD_MASK);
+        }
+        for msg in [
+            "failed https:host/m?%70assword=QUERY_CANARY",
+            "failed postgres:memory?password=QUERY_CANARY",
+        ] {
+            let clean = redact_urls_in_message(msg);
+            assert!(!clean.contains("QUERY_CANARY"), "{clean}");
+            assert!(clean.starts_with("failed "), "{clean}");
+        }
+    }
+
+    /// #3667 — the fail-closed forms must not swallow ordinary prose: a word
+    /// ending in a scheme name is not a scheme, a special scheme without any
+    /// `@` carries no userinfo, and `postgres:` has no authority without `//`.
+    #[test]
+    fn issue_3667_message_prose_is_not_masked() {
+        for msg in [
+            "archived rows: 5; news: none; draws: 2",
+            "upstream answered HTTP: 404 not found",
+            "backend unavailable: postgres: apply v89 blocking ddl: deadlock detected",
+            "LLM Reachability: https://api.example.com/v1 (200 OK)",
+        ] {
+            assert_eq!(redact_urls_in_message(msg), msg);
+        }
+    }
+
+    #[test]
+    fn issue_3667_message_handles_query_syntax_in_userinfo() {
+        for msg in [
+            "failed postgres://u:AUTH_CANARY&password=OTHER_CANARY@db/m",
+            "failed postgres://u:AUTH_CANARY OTHER_CANARY@db/m",
+        ] {
+            let clean = redact_urls_in_message(msg);
+            assert!(!clean.contains("AUTH_CANARY"), "{clean}");
+            assert!(!clean.contains("OTHER_CANARY"), "{clean}");
+        }
+    }
 
     #[test]
     fn redact_masks_postgres_password() {
