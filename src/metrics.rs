@@ -17,6 +17,32 @@ use prometheus::{
     TextEncoder,
 };
 
+/// Wire names of the series `ai-memory doctor --remote` reads back from
+/// `GET /api/v1/metrics` (v1.0.0 #3656). ONE definition each: the registry
+/// registers the series under these names and the doctor parses the scrape
+/// for the same constants, so a rename cannot silently turn a measured value
+/// into `not_in_response` on the operator's dashboard.
+pub mod names {
+    /// Current HNSW vector index population (gauge).
+    pub const HNSW_SIZE: &str = "ai_memory_hnsw_size";
+    /// Cumulative HNSW oldest-eviction count since process start (counter).
+    pub const HNSW_EVICTIONS_TOTAL: &str = "ai_memory_hnsw_evictions_total";
+    /// Total webhook deliveries attempted since process start (counter).
+    pub const WEBHOOK_DISPATCHED_TOTAL: &str = "ai_memory_webhook_dispatched_total";
+    /// Webhook deliveries that failed after all retries (counter).
+    pub const WEBHOOK_FAILED_TOTAL: &str = "ai_memory_webhook_failed_total";
+    /// Current count of active webhook subscriptions (gauge).
+    pub const SUBSCRIPTIONS_ACTIVE: &str = "ai_memory_subscriptions_active";
+    /// Subscription DLQ inserts refused at the per-subscription depth cap (counter).
+    pub const SUBSCRIPTION_DLQ_OVERFLOW_TOTAL: &str = "ai_memory_subscription_dlq_overflow_total";
+    /// Pending `federation_push_dlq` rows (gauge, refreshed per replay tick).
+    pub const FEDERATION_PUSH_DLQ_DEPTH: &str = "ai_memory_federation_push_dlq_depth";
+    /// Post-quorum fanout tasks whose outcome could not be observed (counter, by `reason`).
+    pub const FEDERATION_FANOUT_DROPPED_TOTAL: &str = "ai_memory_federation_fanout_dropped_total";
+    /// Quorum writes where at least one configured peer missed the deadline (counter).
+    pub const FEDERATION_PARTIAL_QUORUM_TOTAL: &str = "ai_memory_federation_partial_quorum_total";
+}
+
 // =====================================================================
 // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability.
 //
@@ -566,13 +592,13 @@ impl Metrics {
         registry.register(Box::new(contradiction_detected_total.clone()))?;
 
         let webhook_dispatched_total = IntCounter::new(
-            "ai_memory_webhook_dispatched_total",
+            names::WEBHOOK_DISPATCHED_TOTAL,
             "Total webhook deliveries attempted.",
         )?;
         registry.register(Box::new(webhook_dispatched_total.clone()))?;
 
         let webhook_failed_total = IntCounter::new(
-            "ai_memory_webhook_failed_total",
+            names::WEBHOOK_FAILED_TOTAL,
             "Webhook deliveries that failed after all retries.",
         )?;
         registry.register(Box::new(webhook_failed_total.clone()))?;
@@ -589,14 +615,12 @@ impl Metrics {
         )?;
         registry.register(Box::new(memories_gauge_refreshed_at.clone()))?;
 
-        let hnsw_size_gauge = IntGauge::new(
-            "ai_memory_hnsw_size",
-            "Current HNSW vector index population.",
-        )?;
+        let hnsw_size_gauge =
+            IntGauge::new(names::HNSW_SIZE, "Current HNSW vector index population.")?;
         registry.register(Box::new(hnsw_size_gauge.clone()))?;
 
         let subscriptions_active_gauge = IntGauge::new(
-            "ai_memory_subscriptions_active",
+            names::SUBSCRIPTIONS_ACTIVE,
             "Current count of active webhook subscriptions.",
         )?;
         registry.register(Box::new(subscriptions_active_gauge.clone()))?;
@@ -638,7 +662,7 @@ impl Metrics {
 
         let federation_fanout_dropped_total = IntCounterVec::new(
             prometheus::Opts::new(
-                "ai_memory_federation_fanout_dropped_total",
+                names::FEDERATION_FANOUT_DROPPED_TOTAL,
                 "Post-quorum fanout tasks whose outcome could not be observed. \
                  reason=shutdown|panic|join_error. Non-zero indicates mesh divergence risk.",
             ),
@@ -660,7 +684,7 @@ impl Metrics {
 
         // H9 (v0.7.0 round-2) — partial-quorum observability.
         let federation_partial_quorum_total = IntCounter::new(
-            "ai_memory_federation_partial_quorum_total",
+            names::FEDERATION_PARTIAL_QUORUM_TOTAL,
             "Quorum writes that succeeded (W met) but where at least one \
              configured peer did not ack inside the deadline.",
         )?;
@@ -693,7 +717,7 @@ impl Metrics {
 
         // v0.7.0 Track D #933 — federation push DLQ depth gauge.
         let federation_push_dlq_depth = IntGauge::new(
-            "ai_memory_federation_push_dlq_depth",
+            names::FEDERATION_PUSH_DLQ_DEPTH,
             "Current count of pending federation_push_dlq rows \
              (replayed_at IS NULL). Refreshed on every replay tick. \
              Non-zero sustained depth indicates one or more peers are \
@@ -821,7 +845,7 @@ impl Metrics {
         // are surfaced at `/metrics` so the eviction signal is
         // scrape-visible without going through `memory_stats`.
         let hnsw_evictions_total = IntCounter::new(
-            "ai_memory_hnsw_evictions_total",
+            names::HNSW_EVICTIONS_TOTAL,
             "Cumulative HNSW oldest-eviction count since process start. \
              Non-zero indicates the in-memory vector index has hit \
              MAX_ENTRIES and dropped older embeddings; recall quality \
@@ -840,7 +864,7 @@ impl Metrics {
 
         // #1253 (MED, 2026-05-25) — subscription DLQ overflow counter.
         let subscription_dlq_overflow_total = IntCounter::new(
-            "ai_memory_subscription_dlq_overflow_total",
+            names::SUBSCRIPTION_DLQ_OVERFLOW_TOTAL,
             "Monotonic counter of subscription_dlq inserts refused \
              because the per-subscription DLQ depth had already hit \
              MAX_SUBSCRIPTION_DLQ_ROWS (10_000). Non-zero indicates a \

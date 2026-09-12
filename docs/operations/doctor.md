@@ -5,7 +5,8 @@ layout: doc
 
 **Phase P7 / R7** (v0.6.3.1). Read-only health-and-fitness report for an
 ai-memory deployment. Runs against a local SQLite DB or, with `--remote`,
-against a live `ai-memory serve` daemon (the **fleet doctor** mode at T3+).
+against a live `ai-memory serve` daemon (the **fleet doctor** — see
+[Remote (fleet) mode](#remote-fleet-mode)).
 
 ## Quick start
 
@@ -23,7 +24,7 @@ ai-memory doctor --json | jq '.sections[] | select(.severity == "critical")'
 # Treat warnings as failures (useful for `pre-commit` / CI gates).
 ai-memory doctor --fail-on-warn
 
-# Fleet doctor — read a remote daemon's capabilities + stats endpoints.
+# Fleet doctor — read a live daemon's health, capabilities, stats + metrics endpoints.
 ai-memory doctor --remote https://node-a.example.com:9077
 
 # Combine: JSON + remote, no DB lookup at all.
@@ -73,6 +74,34 @@ sections.
   An UNUSABLE configuration reports the load `error` instead: no config was
   resolved, so there is no honest effective policy to print.
 
+### Health (`--remote` only, #3656)
+
+Reads `GET /api/v1/health` and renders the body at **every** HTTP status — a
+`503` is the daemon's fail-closed answer and its body names which check
+failed, so the status alone is never the finding.
+
+- `http_status`, `daemon_status` (`ok` / `error`), `daemon_version`.
+- `check_connection`, `check_fts_index` — the O(1) liveness probes (`ok` /
+  `reachable` / `error`, or `not_applicable` for `fts_index` on Postgres).
+- `fts_integrity_status` — the daemon's **cached** deep verdict: `ok`,
+  `pending`, `stale`, `failed`, `disabled`. Alongside it:
+  `fts_integrity_checked_at` (`never` when no check has completed),
+  `fts_integrity_interval_secs`, and `fts_integrity_age_secs` — the age
+  **measured by the doctor's own clock**, rendered only when a check completed.
+- `embedder_ready`, `federation_enabled`.
+- `proves` — states the boundary in the report itself: liveness + cached FTS
+  integrity verdict only, not wake-plane (#3657) or replication (#3654)
+  readiness.
+
+Severity: **Critical** when the HTTP status is not 2xx, `daemon_status` is not
+`ok`, a liveness probe reports `error`, or the verdict is `failed`.
+**Warning** when the verdict is `stale` (the checker stopped), `disabled` (an
+absent control is not a passing one), or `ok` but older than 3 ×
+`fts_integrity_interval_secs` by the doctor's clock (the checker stopped after
+the daemon last evaluated itself, or the two clocks disagree). `pending` is
+**Info** with a note that integrity is not yet asserted — it is not a failure,
+and it is not a pass.
+
 ### Storage
 
 - `total_memories`, `expiring_within_1h`, `links`, `db_size_bytes`
@@ -81,6 +110,8 @@ sections.
   with their namespace's modal dim. **Critical** when > 0.
   - On pre-P2 schemas the column doesn't exist; the field renders as
     `not_observed (pre-P2 schema)` with no severity bump.
+  - `--remote` mode (#3656) reads it from `/api/v1/stats` with the same rule;
+    a daemon whose stats omit the field renders `not_in_response`.
 
 ### Index
 
@@ -92,6 +123,10 @@ sections.
   **Critical** when > 0 once P3 wires the counter; `not_observed` until
   then. The doctor still raises a **warning** when `hnsw_size >= 95k`
   as a forward-leaning hint.
+- `--remote` mode (#3656): `index_evictions_total` is read from
+  `/api/v1/stats` — the daemon's process-local P3 counter, **Critical** when
+  > 0 — and `hnsw_size` from the live `ai_memory_hnsw_size` gauge on
+  `/api/v1/metrics`.
 
 ### Recall
 
@@ -119,6 +154,13 @@ sections.
 - `max_skew_secs` — max `|last_seen_at - last_pulled_at|` across peers.
   **Critical** when > 600s.
 - `N/A` when no peers are registered (single-node deployment).
+- `--remote` mode (#3656): `federation_enabled` (from `/health`; the section
+  is **N/A** when `false`), then from `/api/v1/metrics` `push_dlq_depth`
+  (**Warning** when > 0), `partial_quorum_total`, and `fanout_dropped_total`
+  (**Warning** when > 0). `max_skew_secs` and `last_successful_push_age_secs`
+  render `unavailable` — neither has a remote surface (peer push freshness
+  lands with #3654) — and `convergence` renders `not_asserted`: quiet counters
+  are not proof that a mesh has converged.
 
 ### Webhook
 
@@ -128,6 +170,11 @@ sections.
 - `success_rate_pct` — `(dispatched - failed) / dispatched * 100`.
   **Warning** when < 95% over the lifetime totals (P5 will refine this
   to a rolling-1h window).
+- `--remote` mode (#3656): `subscriptions_active`, `dispatched_total`,
+  `failed_total`, `success_rate_pct` (same 95% rule) and
+  `subscription_dlq_overflow_total` (**Warning** when > 0), all from the
+  daemon's process-lifetime counters on `/api/v1/metrics` — a daemon restart
+  resets them, and the section's note says so.
 
 ### Capabilities
 
@@ -211,22 +258,50 @@ able to hang against a wedged hub.
 
 | Severity | Trigger |
 |----------|---------|
-| **Critical** | `dim_violations > 0`; pending action older than 24h; sync skew > 600s; HNSW evictions > 0; a live wake-hub socket that is not owner-only (#3471) |
-| **Warning**  | Capabilities v2 reports a silent-degrade flag (`recall_mode_active != hybrid` on a capable tier); subscription delivery success < 95% |
+| **Critical** | `dim_violations > 0`; pending action older than 24h; sync skew > 600s; HNSW evictions > 0; a live wake-hub socket that is not owner-only (#3471); in `--remote`, a daemon whose `/health` is not 2xx / `ok`, a failed liveness probe, or a `failed` FTS integrity verdict (#3656) |
+| **Warning**  | Capabilities v2 reports a silent-degrade flag (`recall_mode_active != hybrid` on a capable tier); subscription delivery success < 95%; in `--remote`, a `stale` or `disabled` integrity verdict, an `ok` verdict older than 3× its interval by the doctor's clock, a non-empty federation push DLQ, dropped fanout outcomes, or subscription DLQ overflow (#3656) |
 | **Info**     | Anything else worth surfacing |
-| **N/A**      | The section can't be queried in this mode (raw SQL section in `--remote`, P2/P3-only fields on a pre-P2/P3 schema) |
+| **N/A**      | The section can't be queried in this mode (`Governance` in `--remote`; a remote surface that could not be read — the section carries its `error` rather than an invented value; P2/P3-only fields on a pre-P2/P3 schema) |
 
 ## Remote (fleet) mode
 
-`--remote <url>` queries the daemon's existing HTTP surfaces:
+`--remote <url>` (v1.0.0 #3656) reads four of the daemon's existing HTTP
+surfaces and renders eight sections — `Health`, `Capabilities`, `Recall`,
+`Storage`, `Index`, `Governance`, `Sync`, `Webhook` — so a fleet sweep can use
+the same `jq` selectors as a local run:
 
-- `GET /api/v1/capabilities` — the full Capabilities v2 (P1) JSON.
-- `GET /api/v1/stats` — total memories, expiring soon, link count.
+| Surface | Sections | What it proves |
+|---|---|---|
+| `GET /api/v1/health` | Health, Sync | liveness (connection + FTS reachability), the **cached** FTS integrity verdict with its age, embedder wiring, whether federation is configured |
+| `GET /api/v1/capabilities` | Capabilities, Recall | the Capabilities v2 document |
+| `GET /api/v1/stats` | Storage, Index | corpus counts, `dim_violations`, `index_evictions_total` |
+| `GET /api/v1/metrics` | Index, Sync, Webhook | the daemon's live Prometheus registry |
 
-Sections that need raw SQL access (`Index`, `Governance`, `Sync`,
-`Webhook`) render as **N/A** in remote mode. T3+ deployments will gain
-a `/api/v1/doctor` endpoint that returns those sections directly so the
-fleet doctor stops being read-by-API-only — tracked under R7.
+Three rules hold across every remote section:
+
+- **No number the doctor did not measure.** A field the daemon did not return
+  renders `not_in_response`; a series absent from the scrape renders
+  `not_in_response`, never `0`; a surface that could not be read renders its
+  `error` and the section is **N/A**, never **INFO**.
+- **A quiet node is never reported healthy.** `pending`, `stale` and
+  `disabled` integrity verdicts are "no assertion" and the note says so; an
+  `ok` verdict is re-aged by the doctor's own clock (see the Health section
+  above). `Sync` states
+  `convergence = not_asserted` instead of inferring it from an empty DLQ.
+- **Unavailable, disabled and failed stay distinct**, because each is a
+  different operator action.
+
+`Governance` is the one section that stays **N/A** remotely: pending-action
+age has no unscoped remote surface (`GET /api/v1/pending` is caller-scoped, so
+a count read through one credential is not the node's queue). Run
+`doctor --db` on the node for it. `/health` is the only surface exempt from
+the api-key gate; the other three present the `--api-key` / mTLS posture from
+#2815. `/api/v1/stats` is additionally **admin-only** (#946): pass the global
+`--agent-id` of an entry in the daemon's `[admin] agent_ids` so the Storage
+and Index sections can read it — sent as `X-Agent-Id`, so it must be
+key-attested under the daemon's identity posture. Without it the daemon
+answers `403` and both sections say so (`/api/v1/stats is admin-only`)
+instead of rendering a bare HTTP error.
 
 Example fleet sweep:
 

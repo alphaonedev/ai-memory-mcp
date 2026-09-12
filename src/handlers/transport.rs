@@ -1170,6 +1170,30 @@ pub async fn api_key_auth(
     next.run(req).await.into_response()
 }
 
+// v1.0.0 #3656 — the `/health` body keys, ONE definition each. The handler
+// renders them and `ai-memory doctor --remote` reads them back, so the two
+// cannot drift into a doctor that reports a live field as `not_in_response`.
+/// Top-level: `"ok"` when the probe passed, `"error"` otherwise.
+pub const HEALTH_KEY_STATUS: &str = "status";
+/// Top-level: the daemon's `PKG_VERSION`.
+pub const HEALTH_KEY_VERSION: &str = "version";
+/// Top-level: whether an embedder object is wired into this process.
+pub const HEALTH_KEY_EMBEDDER_READY: &str = "embedder_ready";
+/// Top-level: whether federation is configured on this node.
+pub const HEALTH_KEY_FEDERATION_ENABLED: &str = "federation_enabled";
+/// Top-level object of the O(1) liveness probes.
+pub const HEALTH_KEY_CHECKS: &str = "checks";
+/// `checks.connection` — the connection answered SQL.
+pub const HEALTH_KEY_CONNECTION: &str = "connection";
+/// `checks.fts_index` — the FTS5 index is REACHABLE (not verified).
+pub const HEALTH_KEY_FTS_INDEX: &str = "fts_index";
+/// Top-level object of the CACHED deep-integrity verdict (#2579).
+pub const HEALTH_KEY_FTS_INTEGRITY: &str = "fts_integrity";
+/// `fts_integrity.checked_at` — RFC3339 of the last completed check, or null.
+pub const HEALTH_KEY_CHECKED_AT: &str = "checked_at";
+/// `fts_integrity.interval_secs` — the configured cadence (`0` = disabled).
+pub const HEALTH_KEY_INTERVAL_SECS: &str = "interval_secs";
+
 /// `checks.*` value for a probe that answered.
 pub const PROBE_OK: &str = "ok";
 /// `checks.fts_index` value: the FTS5 index answered a bounded MATCH.
@@ -1261,23 +1285,23 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
     (
         code,
         Json(json!({
-            "status": if ok { PROBE_OK } else { PROBE_ERROR },
+            HEALTH_KEY_STATUS: if ok { PROBE_OK } else { PROBE_ERROR },
             "service": "ai-memory",
-            "version": crate::PKG_VERSION,
-            "embedder_ready": app.embedder.as_ref().is_some(),
-            "federation_enabled": app.federation.as_ref().is_some(),
+            HEALTH_KEY_VERSION: crate::PKG_VERSION,
+            HEALTH_KEY_EMBEDDER_READY: app.embedder.as_ref().is_some(),
+            HEALTH_KEY_FEDERATION_ENABLED: app.federation.as_ref().is_some(),
             // #2579 — state WHAT this probe verified, so a shallow pass can
             // never be mistaken for a deep one (#2444/#2445).
-            "checks": {
-                "connection": if connection_ok { PROBE_OK } else { PROBE_ERROR },
-                "fts_index": fts_state,
+            HEALTH_KEY_CHECKS: {
+                HEALTH_KEY_CONNECTION: if connection_ok { PROBE_OK } else { PROBE_ERROR },
+                HEALTH_KEY_FTS_INDEX: fts_state,
             },
             // #2579 — the deep verdict, with its age. `pending` = no check
             // has completed yet; `stale` = the checker stopped running.
-            "fts_integrity": {
-                "status": verdict.as_str(),
-                "checked_at": checked_at,
-                "interval_secs": app.runtime.fts_integrity.interval_secs(),
+            HEALTH_KEY_FTS_INTEGRITY: {
+                HEALTH_KEY_STATUS: verdict.as_str(),
+                HEALTH_KEY_CHECKED_AT: checked_at,
+                HEALTH_KEY_INTERVAL_SECS: app.runtime.fts_integrity.interval_secs(),
             },
         })),
     )

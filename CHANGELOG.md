@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3656 — remote doctor consumes `/health` and the fleet counters)
+
+- **#3656 (observability, HIGH; audit #3645 F10) — `ai-memory doctor --remote`
+  now probes `GET /api/v1/health` and renders a `Health` section first, reading
+  the body at every status so a `503` names the failed check; the cached FTS
+  integrity verdict keeps its `ok` / `pending` / `stale` / `failed` / `disabled`
+  distinctions, and an `ok` verdict is re-aged by the doctor's clock against
+  the daemon's own `3 × interval_secs` ceiling.** `Index`, `Sync` and `Webhook`
+  are no longer blanket `N/A` stubs: `index_evictions_total` and
+  `dim_violations` come from `/api/v1/stats` (both **Critical** when > 0,
+  matching local mode), and the federation DLQ / fanout / partial-quorum and
+  webhook delivery counters come from `/api/v1/metrics`. An absent series
+  renders `not_in_response`, never `0`; an unreadable surface is **N/A** with
+  its error; `Sync` states `convergence = not_asserted` (peer push freshness
+  lands with #3654) and `Governance` stays `N/A` with the reason (the pending
+  list is caller-scoped). New `cli::doctor_remote` module; the `/health` body
+  keys and the consumed metric names each have one definition shared by the
+  writer and the reader.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`

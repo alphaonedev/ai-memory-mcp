@@ -285,6 +285,157 @@ fn doctor_remote_queries_capabilities_endpoint() {
     assert_eq!(v["mode"].as_str().unwrap(), "remote");
 }
 
+/// v1.0.0 #3656 — against a LIVE daemon the remote doctor must render the
+/// daemon's own `/health` verdict and the metrics-backed fleet sections, and
+/// must no longer stub Index / Sync / Webhook as raw-SQL N/A.
+#[test]
+fn doctor_remote_reports_daemon_health_and_fleet_sections_3656() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    // `/api/v1/stats` is admin-only (#946): give the daemon an allowlist
+    // through its config root, and let the header identity be trusted (no
+    // api key on this fixture — the #1570 escape hatch, pinned elsewhere).
+    let admin_id = "ai:doctor-admin-3656";
+    let xdg = tmp.path().join("xdg");
+    std::fs::create_dir_all(xdg.join("ai-memory")).unwrap();
+    std::fs::write(
+        xdg.join("ai-memory").join("config.toml"),
+        format!("[admin]\nagent_ids = [\"{admin_id}\"]\n"),
+    )
+    .unwrap();
+    let serve = spawn_serve_with(&db, &|cmd| {
+        cmd.env_remove("AI_MEMORY_NO_CONFIG")
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AI_MEMORY_ADMIN_HEADER_TRUST", "1");
+    });
+
+    // Without an identity the admin-only stats read is refused — and the
+    // report must SAY so rather than render a bare HTTP error as a fault.
+    let anon = ai_memory(&db)
+        .args(["doctor", "--remote", &serve.base_url(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let anon: serde_json::Value = serde_json::from_slice(&anon).unwrap();
+    let anon_storage = anon["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "Storage")
+        .unwrap();
+    assert!(
+        anon_storage["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("admin-only"),
+        "{anon_storage}"
+    );
+
+    let json_out = ai_memory(&db)
+        .args([
+            "--agent-id",
+            admin_id,
+            "doctor",
+            "--remote",
+            &serve.base_url(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+    let sections = v["sections"].as_array().unwrap();
+    let names: Vec<&str> = sections
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Health",
+            "Capabilities",
+            "Recall",
+            "Storage",
+            "Index",
+            "Governance",
+            "Sync",
+            "Webhook"
+        ],
+        "{names:?}"
+    );
+    let section = |name: &str| {
+        sections
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("section {name} missing"))
+    };
+    let fact = |s: &serde_json::Value, key: &str| -> String {
+        s["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f[0] == key)
+            .unwrap_or_else(|| panic!("fact {key} missing in {s}"))[1]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let health = section("Health");
+    assert_eq!(fact(health, "http_status"), "200");
+    assert_eq!(fact(health, "daemon_status"), "ok");
+    assert_eq!(fact(health, "check_connection"), "ok");
+    // A fresh daemon may not have completed its first paced check: the
+    // verdict is one of the daemon's own tags, and never `failed` on an
+    // empty store.
+    let verdict = fact(health, "fts_integrity_status");
+    assert!(
+        ["pending", "ok", "stale", "disabled"].contains(&verdict.as_str()),
+        "unexpected verdict {verdict}"
+    );
+    assert_ne!(health["severity"], "critical", "{health}");
+    assert!(fact(health, "proves").contains("liveness"));
+
+    // MEASURED from the live daemon: the field is in /stats, so a zero here
+    // is a reading, not an invention.
+    assert_eq!(fact(section("Index"), "index_evictions_total"), "0");
+    assert_eq!(fact(section("Storage"), "dim_violations"), "0");
+    assert_eq!(fact(section("Webhook"), "dispatched_total"), "0");
+    assert_eq!(fact(section("Sync"), "federation_enabled"), "false");
+    assert_eq!(section("Sync")["severity"], "notavailable");
+
+    // Only Governance keeps the raw-SQL hint; the served sections carry none.
+    for name in ["Health", "Index", "Sync", "Webhook"] {
+        assert!(
+            section(name)["facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f[0] != "hint"),
+            "{name} is still a raw-SQL stub: {}",
+            section(name)
+        );
+    }
+    assert!(fact(section("Governance"), "hint").contains("--db mode"));
+
+    // Text mode renders the new section under its severity tag.
+    ai_memory(&db)
+        .args([
+            "--agent-id",
+            admin_id,
+            "doctor",
+            "--remote",
+            &serve.base_url(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("] Health"));
+}
+
 // ---------------------------------------------------------------------------
 // Local serve helper. `free_port` consolidated into `tests/common/mod.rs`
 // by issue #854.
@@ -314,8 +465,14 @@ impl Drop for ServeChild {
 /// `free_port()` TOCTOU bind race (see [`SPAWN_BIND_RETRY_ATTEMPTS`]); a
 /// real startup crash is surfaced immediately with the child's stderr.
 fn spawn_serve(db: &Path) -> ServeChild {
+    spawn_serve_with(db, &|_| {})
+}
+
+/// #3656 — `[spawn_serve]` with a hook that adjusts the child's environment
+/// before it starts (an admin allowlist, a config root, …).
+fn spawn_serve_with(db: &Path, configure: &dyn Fn(&mut StdCommand)) -> ServeChild {
     for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
-        match try_spawn_serve_once(db) {
+        match try_spawn_serve_once(db, configure) {
             Ok(child) => return child,
             Err(SpawnFailure::BindRace { stderr }) => {
                 eprintln!(
@@ -347,7 +504,10 @@ fn spawn_serve(db: &Path) -> ServeChild {
 /// Single spawn-and-wait attempt backing [`spawn_serve`]. Captures the
 /// child's stderr so the outcome can distinguish a retryable port race
 /// from a genuine startup crash (and so panics carry real diagnostics).
-fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
+fn try_spawn_serve_once(
+    db: &Path,
+    configure: &dyn Fn(&mut StdCommand),
+) -> Result<ServeChild, SpawnFailure> {
     let port = free_port();
     let port_s = port.to_string();
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"));
@@ -374,6 +534,7 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure(&mut cmd);
     let mut child = cmd.spawn().expect("spawn ai-memory serve");
 
     // Drain stdout to the void; capture stderr into a shared buffer so an

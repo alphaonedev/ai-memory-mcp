@@ -1129,10 +1129,16 @@ caller id and whether a signing key for THAT id is enrolled.
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
 
+In `--remote` mode (v1.0.0 #3656) the report reads `/api/v1/health`,
+`/api/v1/capabilities`, `/api/v1/stats` and `/api/v1/metrics`; `/api/v1/stats`
+is admin-only, so pass the global `--agent-id` of an `[admin] agent_ids` entry
+(sent as `X-Agent-Id`) or the Storage and Index sections report the `403` by
+name. See [`docs/operations/doctor.md`](operations/doctor.md).
+
 ```bash
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'
-ai-memory doctor --remote https://memory.prod.example.com
+ai-memory --agent-id ai:operator doctor --remote https://memory.prod.example.com
 
 # Certified enterprise posture: TLS + mandatory client-cert mTLS + api-key.
 ai-memory doctor --remote https://memory.prod.example.com \

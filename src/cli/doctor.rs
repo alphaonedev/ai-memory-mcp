@@ -7,7 +7,9 @@
 //! integrity (P2), and recall observability (P3) — plus the v0.6.3 stats /
 //! governance / subscription tables, and produces a human-readable health
 //! report with severity tagging. It also has a `--json` mode for CI usage
-//! and a `--remote <url>` mode that becomes the **fleet doctor** at T3+.
+//! and a `--remote <url>` mode (the fleet doctor) that reads a live daemon's
+//! `/health`, `/capabilities`, `/stats` and `/metrics` surfaces — v1.0.0 #3656,
+//! sections in [`crate::cli::doctor_remote`].
 //!
 //! Exit codes:
 //!   - `0` — healthy (no warnings or critical findings).
@@ -63,7 +65,7 @@ const FACT_CONFIG_PATH: &str = "config_path";
 const FACT_DB_SCHEMA: &str = "db_schema";
 const FACT_BINARY_SUPPORTS_SCHEMA: &str = "binary_supports_schema";
 const FACT_SCHEMA_STAMP: &str = "schema_stamp";
-const FACT_DIM_VIOLATIONS: &str = "dim_violations";
+pub(super) const FACT_DIM_VIOLATIONS: &str = "dim_violations";
 
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
 /// (see [`crate::storage::schema_integrity`]).
@@ -87,7 +89,7 @@ const FACT_RPO_ON_POWER_LOSS: &str = "rpo_on_power_loss";
 /// `[storage]` key they wrote is the one actually governing GC, which is the
 /// exact confusion #3385 was filed over.
 const FACT_ARCHIVE_ON_GC_SOURCE: &str = "archive_on_gc_source";
-const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
+pub(super) const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
 const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
 /// #3582 — remote capabilities key and doctor fact for federation posture.
@@ -108,7 +110,26 @@ const MSG_HTTP_CLIENT_BUILD_FAILED: &str = "http client build failed";
 /// #1558 batch 5 wave 3 — placeholder fact value rendered when the
 /// probed capabilities payload does not carry the requested feature
 /// key (older daemons).
-const NOT_IN_RESPONSE: &str = "not_in_response";
+pub(super) const NOT_IN_RESPONSE: &str = "not_in_response";
+/// HTTP status fact rendered by every probe section (LLM / embeddings
+/// reachability, and the #3656 remote Health section).
+pub(super) const FACT_HTTP_STATUS: &str = "http_status";
+/// P3 eviction counter fact — local mode cannot observe the daemon's
+/// process-local counter; remote mode reads it from `/api/v1/stats` (#3656).
+pub(super) const FACT_INDEX_EVICTIONS_TOTAL: &str = "index_evictions_total";
+/// Webhook delivery facts shared by the local (table totals) and remote
+/// (process-lifetime counters, #3656) sections.
+pub(super) const FACT_DISPATCHED_TOTAL: &str = "dispatched_total";
+pub(super) const FACT_FAILED_TOTAL: &str = "failed_total";
+pub(super) const FACT_SUCCESS_RATE_PCT: &str = "success_rate_pct";
+/// `success_rate_pct` value when nothing has been dispatched yet.
+pub(super) const MSG_NO_DELIVERIES_YET: &str = "no_deliveries_yet";
+/// Webhook delivery success below this percentage is a Warning, in both
+/// modes. One threshold; the note renders it.
+pub(super) const WEBHOOK_SUCCESS_WARN_PCT: f64 = 95.0;
+/// #3656 — why Governance stays N/A in remote mode.
+const MSG_GOVERNANCE_REMOTE_SCOPED: &str = "pending-action age has no unscoped remote surface \
+                                            (GET /api/v1/pending is caller-scoped)";
 
 /// #1558 batch 5 wave 3 — placeholder fact value for the recall-mode /
 /// reranker distribution rows, which need the P3 rolling counter that
@@ -296,6 +317,11 @@ pub(crate) struct RemoteAuth {
     client_cert: Option<PathBuf>,
     client_key: Option<PathBuf>,
     api_key: Option<String>,
+    /// #3656 — the caller identity presented as `X-Agent-Id`. `/api/v1/stats`
+    /// is admin-only (#946), so without an allowlisted id the Storage and
+    /// Index sections cannot be read. Taken from the global `--agent-id`;
+    /// nothing is sent when the operator gave none (the pre-#3656 client).
+    agent_id: Option<String>,
 }
 
 /// #2815 / #1927 — resolve the api-key WITHOUT putting it on argv when the
@@ -728,6 +754,7 @@ pub fn run(db_path: &Path, args: &DoctorArgs, out: &mut CliOutput<'_>) -> Result
             client_cert: args.client_cert.clone(),
             client_key: args.client_key.clone(),
             api_key: resolve_doctor_api_key(args)?,
+            agent_id: args.agent_id.clone(),
         };
         run_remote(url, db_path, &auth)
     } else {
@@ -1983,9 +2010,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
         Ok(Some(n)) => {
             facts.push((FACT_DIM_VIOLATIONS.into(), n.to_string()));
             severity = Severity::Critical;
-            note = Some(format!(
-                "{n} memories have an embedding dim that disagrees with their namespace's modal dim"
-            ));
+            note = Some(dim_violations_note(n));
         }
         Ok(None) => {
             facts.push((
@@ -2139,7 +2164,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
 /// both live in `Index`). A bare `note = Some(..)` silently erases whatever
 /// an earlier probe reported — the second finding hides the first, and which
 /// one survives depends on source order rather than on severity.
-fn append_note(note: &mut Option<String>, extra: &str) {
+pub(super) fn append_note(note: &mut Option<String>, extra: &str) {
     match note {
         Some(existing) => {
             existing.push_str(" | ");
@@ -2186,7 +2211,7 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     // Eviction counter (P3). Until P3 wires the in-memory counter into a
     // queryable surface, render NOT_AVAILABLE without a severity bump.
     facts.push((
-        "index_evictions_total".into(),
+        FACT_INDEX_EVICTIONS_TOTAL.into(),
         "not_observed (pre-P3 surface)".into(),
     ));
 
@@ -2780,24 +2805,24 @@ fn section_webhook(conn: &rusqlite::Connection) -> ReportSection {
     facts.push(("subscription_count".into(), sub_count.to_string()));
 
     let (dispatched, failed) = db::doctor_webhook_delivery_totals(conn).unwrap_or((0, 0));
-    facts.push(("dispatched_total".into(), dispatched.to_string()));
-    facts.push(("failed_total".into(), failed.to_string()));
+    facts.push((FACT_DISPATCHED_TOTAL.into(), dispatched.to_string()));
+    facts.push((FACT_FAILED_TOTAL.into(), failed.to_string()));
 
     if dispatched > 0 {
         let success_rate = ((dispatched.saturating_sub(failed)) as f64 / dispatched as f64) * 100.0;
-        facts.push(("success_rate_pct".into(), format!("{success_rate:.2}")));
+        facts.push((FACT_SUCCESS_RATE_PCT.into(), format!("{success_rate:.2}")));
         // 95% lifetime success threshold. P5 will refine this to a
         // rolling-1h window when the dispatch table grows a timestamp
         // log; for now we use the lifetime totals already present in
         // `subscriptions.dispatch_count` / `failure_count`.
-        if success_rate < 95.0 {
+        if success_rate < WEBHOOK_SUCCESS_WARN_PCT {
             severity = Severity::Warning;
             note = Some(format!(
-                "lifetime delivery success {success_rate:.2}% < 95% threshold"
+                "lifetime delivery success {success_rate:.2}% < {WEBHOOK_SUCCESS_WARN_PCT}% threshold"
             ));
         }
     } else {
-        facts.push(("success_rate_pct".into(), "no_deliveries_yet".into()));
+        facts.push((FACT_SUCCESS_RATE_PCT.into(), MSG_NO_DELIVERIES_YET.into()));
     }
 
     ReportSection {
@@ -2937,7 +2962,7 @@ fn section_llm_reachability_1146() -> ReportSection {
         Ok(resp) => {
             let status = resp.status();
             let elapsed_ms = started.elapsed().as_millis();
-            facts.push(("http_status".into(), status.as_u16().to_string()));
+            facts.push((FACT_HTTP_STATUS.into(), status.as_u16().to_string()));
             facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
 
             if status.is_success() {
@@ -3143,7 +3168,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         Ok(resp) => {
             let status = resp.status();
             let elapsed_ms = started.elapsed().as_millis();
-            facts.push(("http_status".into(), status.as_u16().to_string()));
+            facts.push((FACT_HTTP_STATUS.into(), status.as_u16().to_string()));
             facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
 
             if status.is_success() {
@@ -3469,39 +3494,49 @@ pub(super) fn severity_max(a: Severity, b: Severity) -> Severity {
 // ---------------------------------------------------------------------------
 
 fn run_remote(url: &str, db_path: &Path, auth: &RemoteAuth) -> Report {
-    let mut sections = Vec::with_capacity(2);
+    use crate::cli::doctor_remote::{
+        HealthProbe, fetch_metrics, section_health_remote, section_index_remote,
+        section_sync_remote, section_webhook_remote,
+    };
+    use crate::handlers::routes;
 
     let base = url.trim_end_matches('/');
-    let cap_url = format!("{base}{}", crate::handlers::routes::CAPABILITIES);
-    let stats_url = format!("{base}{}", crate::handlers::routes::STATS);
+    let cap_url = format!("{base}{}", routes::CAPABILITIES);
+    let stats_url = format!("{base}{}", routes::STATS);
+    let health_url = format!("{base}{}", routes::HEALTH);
+    let metrics_url = format!("{base}{}", routes::METRICS);
 
+    // #3656 — the liveness probe FIRST: it is the daemon's own verdict on
+    // itself, and every section below is read through that same daemon.
+    let HealthProbe {
+        section: health,
+        federation_enabled,
+    } = section_health_remote(&health_url, auth, chrono::Utc::now().timestamp());
+    // Fetched ONCE each: Storage and Index share the stats document; Index,
+    // Sync and Webhook share the scrape.
+    let stats = http_get_json(&stats_url, auth);
+    let metrics = fetch_metrics(&metrics_url, auth);
+
+    let mut sections = Vec::with_capacity(8);
+    sections.push(health);
     sections.push(section_capabilities_remote(&cap_url, auth));
     sections.push(section_recall_remote(&cap_url, auth));
-    sections.push(section_storage_remote(&stats_url, auth));
-    sections.push(ReportSection {
-        name: "Index".into(),
-        severity: Severity::NotAvailable,
-        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
-        note: None,
-    });
+    sections.push(section_storage_remote(&stats));
+    sections.push(section_index_remote(&stats, &metrics));
+    // Governance is the ONE section with no honest remote read: the pending
+    // list is caller-scoped, so a count through one credential is not the
+    // node's queue. Say so rather than render a scoped number as the total.
     sections.push(ReportSection {
         name: "Governance".into(),
         severity: Severity::NotAvailable,
-        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
+        facts: vec![
+            ("hint".into(), MSG_RAW_SQL_DB_MODE.into()),
+            ("reason".into(), MSG_GOVERNANCE_REMOTE_SCOPED.into()),
+        ],
         note: None,
     });
-    sections.push(ReportSection {
-        name: "Sync".into(),
-        severity: Severity::NotAvailable,
-        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
-        note: None,
-    });
-    sections.push(ReportSection {
-        name: "Webhook".into(),
-        severity: Severity::NotAvailable,
-        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
-        note: None,
-    });
+    sections.push(section_sync_remote(federation_enabled, &metrics));
+    sections.push(section_webhook_remote(&metrics));
 
     Report {
         mode: "remote".into(),
@@ -3512,17 +3547,29 @@ fn run_remote(url: &str, db_path: &Path, auth: &RemoteAuth) -> Report {
     }
 }
 
-/// Fetch a JSON document from `url` with a short timeout, presenting the
-/// #2815 transport posture (private-CA root, mTLS client identity, api-key
-/// header). Returns `Err` on transport failure or non-2xx status.
+/// Whether an HTTP status is a 2xx success. One predicate for every remote
+/// surface, so "success" cannot be spelled two ways.
+pub(super) fn http_success(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+/// #3656 — `GET url` returning `(status, body)` at EVERY status. Transport
+/// failures are the only `Err`: a `503` from `/health` is an answer whose
+/// body names the failed check, and the Health section must read it.
 ///
 /// The TLS pieces reuse the sync client's builders
 /// (`cli::sync::parse_ca_certificate` / `cli::sync::sync_client_identity`) so
 /// the fleet verbs and the doctor cannot disagree about what a `--ca-cert` or
-/// a `--client-cert` pair means. The secure default is unchanged: with no
-/// flags this is byte-for-byte the pre-#2815 client (public webpki roots, no
-/// client identity, no header) — nothing is loosened, a capability is added.
-fn http_get_json(url: &str, auth: &RemoteAuth) -> Result<Value> {
+/// a `--client-cert` pair means (#2815). The secure default is unchanged: with
+/// no flags this is byte-for-byte the pre-#2815 client (public webpki roots,
+/// no client identity, no header) — nothing is loosened, a capability is
+/// added.
+///
+/// # Errors
+///
+/// Client construction (bad `--ca-cert` / `--client-cert` material), the
+/// request itself, or reading the body.
+pub(super) fn http_get_raw(url: &str, auth: &RemoteAuth) -> Result<(u16, String)> {
     let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5));
     if let Some(ca_path) = auth.ca_cert.as_deref() {
         let ca_pem = std::fs::read(ca_path)
@@ -3541,12 +3588,72 @@ fn http_get_json(url: &str, auth: &RemoteAuth) -> Result<Value> {
     if let Some(key) = auth.api_key.as_deref() {
         req = req.header(crate::HEADER_API_KEY, key);
     }
-    let resp = req.send().context("HTTP GET")?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("HTTP {status} from {url}");
+    if let Some(agent_id) = auth.agent_id.as_deref() {
+        req = req.header(crate::HEADER_AGENT_ID, agent_id);
     }
-    resp.json::<Value>().context("decoding JSON response")
+    let resp = req.send().context("HTTP GET")?;
+    let status = resp.status().as_u16();
+    let body = resp.text().context("reading response body")?;
+    Ok((status, body))
+}
+
+/// Fetch a JSON document from `url` with a short timeout, presenting the
+/// #2815 transport posture (private-CA root, mTLS client identity, api-key
+/// header). Returns `Err` on transport failure or non-2xx status.
+///
+/// The TLS pieces reuse the sync client's builders
+/// (`cli::sync::parse_ca_certificate` / `cli::sync::sync_client_identity`) so
+/// the fleet verbs and the doctor cannot disagree about what a `--ca-cert` or
+/// a `--client-cert` pair means. The secure default is unchanged: with no
+/// flags this is byte-for-byte the pre-#2815 client (public webpki roots, no
+/// client identity, no header) — nothing is loosened, a capability is added.
+/// #3656 — a non-2xx answer from a remote surface, typed so a consumer can
+/// branch on the status (the Storage and Index sections name the admin gate
+/// on `403`) without parsing the message (ERRORS-10 / ERRORS-11).
+#[derive(Debug)]
+pub(super) struct HttpStatusError {
+    pub(super) status: u16,
+    url: String,
+}
+
+impl HttpStatusError {
+    pub(super) fn new(status: u16, url: &str) -> Self {
+        Self {
+            status,
+            url: url.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {} from {}", self.status, self.url)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
+/// `/api/v1/stats` is admin-only (#946). When the daemon refused the read,
+/// say WHY and what to pass — an `error: HTTP 403` fact alone reads as a
+/// transient fault, and the pre-#3656 remote doctor rendered exactly that on
+/// every live daemon.
+pub(super) const MSG_STATS_ADMIN_ONLY: &str = "/api/v1/stats is admin-only (#946): run doctor with \
+                                              --agent-id <an id in the daemon's [admin] agent_ids> \
+                                              under the daemon's api-key / mTLS posture";
+
+/// The note to attach when `stats` failed with a `403`, else `None`.
+pub(super) fn stats_forbidden_note(e: &anyhow::Error) -> Option<&'static str> {
+    e.downcast_ref::<HttpStatusError>()
+        .filter(|h| h.status == reqwest::StatusCode::FORBIDDEN.as_u16())
+        .map(|_| MSG_STATS_ADMIN_ONLY)
+}
+
+fn http_get_json(url: &str, auth: &RemoteAuth) -> Result<Value> {
+    let (status, body) = http_get_raw(url, auth)?;
+    if !http_success(status) {
+        return Err(HttpStatusError::new(status, url).into());
+    }
+    serde_json::from_str::<Value>(&body).context("decoding JSON response")
 }
 
 fn section_capabilities_remote(url: &str, auth: &RemoteAuth) -> ReportSection {
@@ -3673,11 +3780,20 @@ fn section_recall_remote(cap_url: &str, auth: &RemoteAuth) -> ReportSection {
     }
 }
 
-fn section_storage_remote(stats_url: &str, auth: &RemoteAuth) -> ReportSection {
+/// The remote Storage section over the shared `/api/v1/stats` document.
+///
+/// #3656 — `dim_violations` is READ: the P2 surface has been on `/stats`
+/// since v0.6.3.1, yet this section still rendered "lands at /api/v1/stats".
+/// Same rule as local mode: **Critical** when > 0. An unreadable stats
+/// document stays `Info` with its error (remote storage is best-effort; the
+/// SQL truth is `--db` mode) — the pre-#3656 contract, pinned by
+/// `remote_storage_500_renders_error_without_severity_bump`.
+fn section_storage_remote(stats: &Result<Value>) -> ReportSection {
     let mut facts = Vec::new();
-    let severity = Severity::Info;
+    let mut severity = Severity::Info;
+    let mut note: Option<String> = None;
 
-    match http_get_json(stats_url, auth) {
+    match stats {
         Ok(v) => {
             if let Some(total) = v.get("total").and_then(Value::as_u64) {
                 facts.push((field_names::TOTAL_MEMORIES.into(), total.to_string()));
@@ -3688,13 +3804,21 @@ fn section_storage_remote(stats_url: &str, auth: &RemoteAuth) -> ReportSection {
             if let Some(links) = v.get("links_count").and_then(Value::as_u64) {
                 facts.push(("links".into(), links.to_string()));
             }
-            facts.push((
-                FACT_DIM_VIOLATIONS.into(),
-                "not_in_remote_response (P2 surface lands at /api/v1/stats)".into(),
-            ));
+            match v.get(FACT_DIM_VIOLATIONS).and_then(Value::as_u64) {
+                Some(0) => facts.push((FACT_DIM_VIOLATIONS.into(), "0".into())),
+                Some(n) => {
+                    facts.push((FACT_DIM_VIOLATIONS.into(), n.to_string()));
+                    severity = Severity::Critical;
+                    note = Some(dim_violations_note(n));
+                }
+                None => facts.push((FACT_DIM_VIOLATIONS.into(), NOT_IN_RESPONSE.into())),
+            }
         }
         Err(e) => {
             facts.push(("error".into(), e.to_string()));
+            if let Some(msg) = stats_forbidden_note(e) {
+                append_note(&mut note, msg);
+            }
         }
     }
 
@@ -3702,8 +3826,14 @@ fn section_storage_remote(stats_url: &str, auth: &RemoteAuth) -> ReportSection {
         name: "Storage".into(),
         severity,
         facts,
-        note: None,
+        note,
     }
+}
+
+/// The Critical note for a non-zero `dim_violations` count — one wording for
+/// the local (SQL) and remote (`/stats`) Storage sections.
+fn dim_violations_note(n: impl std::fmt::Display) -> String {
+    format!("{n} memories have an embedding dim that disagrees with their namespace's modal dim")
 }
 
 // ---------------------------------------------------------------------------
@@ -5338,8 +5468,9 @@ mod tests {
         let report = run_remote_in_blocking(server.uri(), env.db_path.clone()).await;
         assert_eq!(report.mode, "remote");
         assert!(report.source.starts_with(&server.uri()));
-        // Sections: 7 total — Capabilities, Recall, Storage, Index, Governance, Sync, Webhook.
-        assert_eq!(report.sections.len(), 7);
+        // Sections: 8 total — Health (#3656) first, then Capabilities, Recall,
+        // Storage, Index, Governance, Sync, Webhook.
+        assert_eq!(report.sections.len(), 8);
 
         let cap = find(&report, "Capabilities");
         assert_eq!(cap.severity, Severity::Info);
@@ -5356,11 +5487,225 @@ mod tests {
         assert_eq!(fact(storage, "expiring_within_1h"), "1");
         assert_eq!(fact(storage, "links"), "3");
 
-        // Raw-SQL sections must be NotAvailable in remote mode.
-        for raw in ["Index", "Governance", "Sync", "Webhook"] {
-            let s = find(&report, raw);
-            assert_eq!(s.severity, Severity::NotAvailable);
-            assert!(fact(s, "hint").contains("--db mode"));
+        // #3656 — Governance is the ONE section still NotAvailable remotely
+        // (the pending list is caller-scoped), and it says why. Index, Sync
+        // and Webhook are daemon-served now and carry no raw-SQL hint.
+        let gov = find(&report, "Governance");
+        assert_eq!(gov.severity, Severity::NotAvailable);
+        assert!(fact(gov, "hint").contains("--db mode"));
+        assert!(fact(gov, "reason").contains("caller-scoped"));
+        for served in ["Index", "Sync", "Webhook"] {
+            let s = find(&report, served);
+            assert!(
+                s.facts.iter().all(|(k, _)| k != "hint"),
+                "{served} must not be a raw-SQL stub any more: {s:?}"
+            );
+        }
+    }
+
+    /// #3656 — a daemon that answers `/health` 200 with a pending verdict and
+    /// `/metrics` with a quiet scrape, so tests about OTHER sections keep
+    /// their exit-0 / Info expectations now that the remote doctor probes
+    /// both surfaces.
+    async fn mount_quiet_health_and_metrics(server: &wiremock::MockServer) {
+        use crate::handlers::transport as t;
+        use crate::metrics::names as m;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(crate::handlers::routes::HEALTH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                t::HEALTH_KEY_STATUS: t::PROBE_OK,
+                t::HEALTH_KEY_VERSION: crate::PKG_VERSION,
+                t::HEALTH_KEY_EMBEDDER_READY: false,
+                t::HEALTH_KEY_FEDERATION_ENABLED: false,
+                t::HEALTH_KEY_CHECKS: {
+                    t::HEALTH_KEY_CONNECTION: t::PROBE_OK,
+                    t::HEALTH_KEY_FTS_INDEX: t::PROBE_REACHABLE,
+                },
+                t::HEALTH_KEY_FTS_INTEGRITY: {
+                    t::HEALTH_KEY_STATUS: crate::background::fts_integrity::VERDICT_PENDING,
+                    t::HEALTH_KEY_CHECKED_AT: serde_json::Value::Null,
+                    t::HEALTH_KEY_INTERVAL_SECS: 900,
+                },
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(crate::handlers::routes::METRICS))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{} 0\n{} 0\n{} 0\n{} 0\n{} 0\n",
+                m::HNSW_SIZE,
+                m::WEBHOOK_DISPATCHED_TOTAL,
+                m::WEBHOOK_FAILED_TOTAL,
+                m::SUBSCRIPTIONS_ACTIVE,
+                m::SUBSCRIPTION_DLQ_OVERFLOW_TOTAL,
+            )))
+            .mount(server)
+            .await;
+    }
+
+    /// #3656 — composition: Health leads, the daemon-served sections follow in
+    /// the local order, and a quiet healthy daemon is overall Info.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_report_is_health_first_then_daemon_served_sections_3656() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": "2",
+                "features": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stats"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total": 5,
+                FACT_DIM_VIOLATIONS: 0,
+                FACT_INDEX_EVICTIONS_TOTAL: 0
+            })))
+            .mount(&server)
+            .await;
+        mount_quiet_health_and_metrics(&server).await;
+        let env = TestEnv::fresh();
+        let report = run_remote_in_blocking(server.uri(), env.db_path.clone()).await;
+        let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                crate::cli::doctor_remote::SECTION_HEALTH,
+                "Capabilities",
+                "Recall",
+                "Storage",
+                "Index",
+                "Governance",
+                "Sync",
+                "Webhook"
+            ]
+        );
+        assert_eq!(report.overall, Severity::Info, "{report:?}");
+        let health = find(&report, crate::cli::doctor_remote::SECTION_HEALTH);
+        assert_eq!(fact(health, FACT_HTTP_STATUS), "200");
+        assert_eq!(
+            fact(find(&report, "Index"), FACT_INDEX_EVICTIONS_TOTAL),
+            "0"
+        );
+        assert_eq!(fact(find(&report, "Storage"), FACT_DIM_VIOLATIONS), "0");
+        assert_eq!(
+            fact(find(&report, "Webhook"), FACT_SUCCESS_RATE_PCT),
+            MSG_NO_DELIVERIES_YET
+        );
+        // federation_enabled=false → Sync is honestly N/A, not Info.
+        assert_eq!(find(&report, "Sync").severity, Severity::NotAvailable);
+    }
+
+    /// #3656 — the audit's fixture: healthy stats but a FAILED health verdict
+    /// and a stale-looking component. Pre-fix the report never asked
+    /// `/health`, so this daemon rendered overall Info.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_failed_health_is_critical_despite_healthy_stats_3656() {
+        use crate::handlers::transport as t;
+        use crate::metrics::names as m;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": "2",
+                "features": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stats"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total": 42,
+                "expiring_soon": 0,
+                "links_count": 3,
+                FACT_DIM_VIOLATIONS: 0,
+                FACT_INDEX_EVICTIONS_TOTAL: 0
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(crate::handlers::routes::HEALTH))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                t::HEALTH_KEY_STATUS: t::PROBE_ERROR,
+                t::HEALTH_KEY_FEDERATION_ENABLED: true,
+                t::HEALTH_KEY_CHECKS: {
+                    t::HEALTH_KEY_CONNECTION: t::PROBE_OK,
+                    t::HEALTH_KEY_FTS_INDEX: t::PROBE_REACHABLE,
+                },
+                t::HEALTH_KEY_FTS_INTEGRITY: {
+                    t::HEALTH_KEY_STATUS: crate::background::fts_integrity::VERDICT_FAILED,
+                    t::HEALTH_KEY_CHECKED_AT: chrono::Utc::now().to_rfc3339(),
+                    t::HEALTH_KEY_INTERVAL_SECS: 900,
+                },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(crate::handlers::routes::METRICS))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{} 1\n{} 100\n{} 100\n",
+                m::FEDERATION_PUSH_DLQ_DEPTH,
+                m::WEBHOOK_DISPATCHED_TOTAL,
+                m::WEBHOOK_FAILED_TOTAL,
+            )))
+            .mount(&server)
+            .await;
+        let env = TestEnv::fresh();
+        let report = run_remote_in_blocking(server.uri(), env.db_path.clone()).await;
+        let health = find(&report, crate::cli::doctor_remote::SECTION_HEALTH);
+        assert_eq!(health.severity, Severity::Critical, "{health:?}");
+        assert_eq!(fact(health, FACT_HTTP_STATUS), "503");
+        assert_eq!(fact(health, "fts_integrity_status"), "failed");
+        // The healthy stats are still rendered — and do not mask the verdict.
+        let storage = find(&report, "Storage");
+        assert_eq!(storage.severity, Severity::Info);
+        assert_eq!(fact(storage, "total_memories"), "42");
+        assert_eq!(find(&report, "Sync").severity, Severity::Warning);
+        assert_eq!(find(&report, "Webhook").severity, Severity::Warning);
+        assert_eq!(
+            fact(find(&report, "Webhook"), FACT_SUCCESS_RATE_PCT),
+            "0.00"
+        );
+        assert_eq!(report.overall, Severity::Critical);
+    }
+
+    /// #3656 — `dim_violations` is on `/stats` and must be read there with
+    /// the local rule; an older daemon without the field is `not_in_response`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_storage_reads_dim_violations_from_stats_3656() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (body, expect, severity) in [
+            (
+                serde_json::json!({ "total": 1, FACT_DIM_VIOLATIONS: 2 }),
+                "2",
+                Severity::Critical,
+            ),
+            (
+                serde_json::json!({ "total": 1 }),
+                NOT_IN_RESPONSE,
+                Severity::Info,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/stats"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            let env = TestEnv::fresh();
+            let report = run_remote_in_blocking(server.uri(), env.db_path.clone()).await;
+            let storage = find(&report, "Storage");
+            assert_eq!(fact(storage, FACT_DIM_VIOLATIONS), expect);
+            assert_eq!(storage.severity, severity, "{storage:?}");
         }
     }
 
@@ -5528,6 +5873,8 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        // #3656 — the remote doctor now probes /health and /metrics too.
+        mount_quiet_health_and_metrics(&server).await;
 
         let env_db = TestEnv::fresh().db_path;
         let url = server.uri();
