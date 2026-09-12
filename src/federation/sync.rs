@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
-use tokio::task::JoinSet;
 
 use crate::federation::identity::chain::CHAIN_HEADER;
 use crate::federation::identity::credential::CREDENTIAL_HEADER;
@@ -17,7 +16,8 @@ use crate::federation::identity::outbound;
 use crate::models::{Memory, MemoryLink, NamespaceMetaEntry, PendingAction, PendingDecision};
 use crate::replication::{AckTracker, QuorumError};
 
-use super::FederationConfig;
+use super::peer_tasks::PeerTasks;
+use super::{FederationConfig, PeerEndpoint};
 
 /// #1558 batch 5 wave 2 — `QuorumError::LocalWriteFailed` detail used
 /// at every `Arc::try_unwrap(tracker)` finalise point in this file
@@ -219,7 +219,37 @@ fn build_governed_peer_post(
 /// run with api-key auth accept the outbound POST. When `None`, no
 /// header is attached — backwards-compatible with mTLS-only and
 /// no-auth deployments.
+/// POST one `/sync/push` body to `peer` and classify the answer.
+///
+/// #3654 — takes the whole [`PeerEndpoint`] rather than its URL so every
+/// attempt is recorded against the peer's push freshness
+/// (`super::freshness`). Every outbound push — the thirteen fan-out lanes via
+/// [`post_and_classify`] and the DLQ replayer — goes through here, so a push
+/// that is not observed cannot be written without changing this signature.
 pub(super) async fn post_once(
+    client: &reqwest::Client,
+    peer: &PeerEndpoint,
+    body: &serde_json::Value,
+    expected_id: &str,
+    idempotency_key: Option<&str>,
+    api_key: Option<&str>,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+) -> AckOutcome {
+    let outcome = post_once_unobserved(
+        client,
+        &peer.sync_push_url,
+        body,
+        expected_id,
+        idempotency_key,
+        api_key,
+        signing_key,
+    )
+    .await;
+    super::freshness::record_push_outcome(&peer.id, &outcome);
+    outcome
+}
+
+async fn post_once_unobserved(
     client: &reqwest::Client,
     url: &str,
     body: &serde_json::Value,
@@ -388,7 +418,7 @@ pub(super) const FANOUT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// `AckOutcome` per peer, now reflecting the best of two attempts.
 pub(super) async fn post_and_classify(
     client: &reqwest::Client,
-    url: &str,
+    peer: &PeerEndpoint,
     body: &serde_json::Value,
     expected_id: &str,
     idempotency_key: Option<&str>,
@@ -397,7 +427,7 @@ pub(super) async fn post_and_classify(
 ) -> AckOutcome {
     match post_once(
         client,
-        url,
+        peer,
         body,
         expected_id,
         idempotency_key,
@@ -417,7 +447,7 @@ pub(super) async fn post_and_classify(
             tokio::time::sleep(FANOUT_RETRY_BACKOFF).await;
             match post_once(
                 client,
-                url,
+                peer,
                 body,
                 expected_id,
                 idempotency_key,
@@ -655,7 +685,7 @@ pub async fn broadcast_store_quorum_with_embedding(
         body[field_names::EMBEDDINGS] = serde_json::json!([se]);
     }
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     // v0.7.0 Track D #933 — collect the set of peer ids that were
     // dispatched so the DLQ landing pass at the bottom of this
     // function can compute "configured ∖ acked = silently-failed"
@@ -666,16 +696,16 @@ pub async fn broadcast_store_quorum_with_embedding(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let id = peer.id.clone();
         let mem_id = mem.id.clone();
         let payload = body.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &mem_id,
                 Some(&mem_id),
@@ -885,7 +915,7 @@ pub async fn broadcast_delete_quorum(
         "dry_run": false,
     });
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     // #2498 — mirror of the #933 store-lane bookkeeping. Snapshot the
     // dispatched peer ids BEFORE the fanout so the DLQ landing pass at
     // the bottom can compute "dispatched ∖ acked = did-not-converge"
@@ -902,16 +932,16 @@ pub async fn broadcast_delete_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -1097,19 +1127,19 @@ pub async fn broadcast_archive_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -1212,19 +1242,19 @@ pub async fn broadcast_restore_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -1322,19 +1352,19 @@ pub async fn broadcast_link_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let log_id = log_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &log_id,
                 Some(&log_id),
@@ -1461,19 +1491,19 @@ pub async fn broadcast_consolidate_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = new_mem.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -1580,19 +1610,19 @@ pub async fn broadcast_pending_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = pending.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -1694,19 +1724,19 @@ pub async fn broadcast_pending_decision_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = decision.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -1863,19 +1893,19 @@ pub async fn broadcast_action_transition_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = op.action_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -1994,19 +2024,19 @@ pub async fn broadcast_checkpoint_resolution_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = checkpoint.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -2109,19 +2139,19 @@ pub async fn broadcast_signal_create_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target_id = signal.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target_id,
                 Some(&target_id),
@@ -2225,19 +2255,19 @@ pub async fn broadcast_namespace_meta_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target = target_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target,
                 Some(&target),
@@ -2345,19 +2375,19 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
-    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
-        let url = peer.sync_push_url.clone();
+        let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
         let target = target_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             let outcome = post_and_classify(
                 &client,
-                &url,
+                &endpoint,
                 &payload,
                 &target,
                 Some(&target),
@@ -2476,7 +2506,7 @@ pub async fn bulk_catchup_push(
         "memories": memories,
         "dry_run": false,
     });
-    let mut joins: JoinSet<(String, Result<(), String>)> = JoinSet::new();
+    let mut joins: PeerTasks<(String, Result<(), String>)> = PeerTasks::new();
     for peer in &config.peers {
         let client = config.client.clone();
         let url = peer.sync_push_url.clone();
@@ -2484,7 +2514,7 @@ pub async fn bulk_catchup_push(
         let payload = body.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        joins.spawn(peer.id.clone(), async move {
             // #3148 — the catch-up batch is a FULL memory-content egress, so
             // it goes through the SAME `build_governed_peer_post` builder the
             // per-row fanout uses: the `NetworkRequest` governance gate runs
@@ -2502,18 +2532,44 @@ pub async fn bulk_catchup_push(
                 signing_key.as_deref(),
             ) {
                 Ok(req) => req,
-                Err(reason) => return (id, Err(reason)),
+                Err(reason) => {
+                    // #3654 — a local refusal before any byte left is still a
+                    // failed push to this peer.
+                    super::freshness::record(
+                        &id,
+                        super::freshness::Direction::Push,
+                        super::freshness::Observation::Failure(
+                            super::freshness::FailureClass::Other,
+                        ),
+                    );
+                    return (id, Err(reason));
+                }
             };
             // No Idempotency-Key on the batch — the batch is itself an
             // idempotent replay, and the peer's `insert_if_newer`
             // dedupes per row by (id, updated_at).
             req = req.header(CATCHUP_HEADER, CATCHUP_HEADER_VALUE_BULK);
-            let outcome = match req.send().await {
+            use super::freshness::{FailureClass, Observation};
+            let (outcome, observation) = match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
                     // #1579 B5 — drain the (success) body so the
                     // connection returns to the keep-alive pool.
-                    let _ = resp.bytes().await;
-                    Ok(())
+                    // #3654 — and read the receiver's own report while doing
+                    // so: the peer's push freshness counts a batch as a
+                    // success only when the peer applied it (#2341). An
+                    // unreadable 2xx body stays an ack, as in `post_once`.
+                    let applied = resp.bytes().await.ok().is_none_or(|bytes| {
+                        serde_json::from_slice::<serde_json::Value>(&bytes)
+                            .ok()
+                            .and_then(|v| success_report_non_ack_reason(&v))
+                            .is_none()
+                    });
+                    let observation = if applied {
+                        Observation::Success
+                    } else {
+                        Observation::Failure(FailureClass::NotApplied)
+                    };
+                    (Ok(()), observation)
                 }
                 Ok(resp) => {
                     // #1579 B5 — same drain on the error arm; see
@@ -2522,10 +2578,17 @@ pub async fn bulk_catchup_push(
                     let _ = resp.bytes().await;
                     // #3148 — reuse the canonical `http {status}` shape helper
                     // rather than re-inlining the literal (pm-v3.1).
-                    Err(http_status_reason(status))
+                    (
+                        Err(http_status_reason(status)),
+                        Observation::Failure(FailureClass::from_http_status(status.as_u16())),
+                    )
                 }
-                Err(e) => Err(crate::errors::msg::network(e)),
+                Err(e) => (
+                    Err(crate::errors::msg::network(e)),
+                    Observation::Failure(FailureClass::Unreachable),
+                ),
             };
+            super::freshness::record(&id, super::freshness::Direction::Push, observation);
             (id, outcome)
         });
     }
@@ -2538,8 +2601,11 @@ pub async fn bulk_catchup_push(
             }
             Ok((_, Ok(()))) => {}
             Err(e) => {
-                tracing::warn!("bulk_catchup_push: join error: {e:?}");
-                errors.push(("unknown".to_string(), e.to_string()));
+                // #3654 — the failed task keeps its peer (pre-#3654 this
+                // pushed the literal "unknown").
+                tracing::warn!("bulk_catchup_push: join error: {e}");
+                let reason = e.error.to_string();
+                errors.push((e.peer_id, reason));
             }
         }
     }
