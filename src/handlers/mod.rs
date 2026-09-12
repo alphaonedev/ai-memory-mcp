@@ -134,6 +134,8 @@ pub mod kg;
 pub mod links;
 pub mod memories;
 pub mod memories_query;
+/// Authenticated health-only API and transport scope boundary (#3646).
+pub mod monitoring;
 pub mod parity;
 pub mod postgres_gate;
 pub mod power;
