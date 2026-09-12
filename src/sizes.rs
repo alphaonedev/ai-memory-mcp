@@ -120,7 +120,14 @@ pub fn tool_sizes_under_ci_gate() -> usize {
 /// under 11_000). Measured 26_691; ceiling restores ~1.3K headroom,
 /// matching the historical bump cadence. rust-1.98: named const, not a
 /// duplicated magic number across five pins.
-pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_000;
+///
+/// 2026-09-12 #3587 — 28_000 → 29_000. Keyed supersession declares two
+/// `memory_store` properties the handler honours (`as_admin`, and the
+/// #1942 stage-3 `write_v2` envelope, which becomes supersession
+/// evidence) — the #3171 declare-what-you-honour rule. Measured 28_072
+/// (verbose path only; the trimmed wire stays under 11_000); the ceiling
+/// restores ~0.9K headroom.
+pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 29_000;
 
 /// Sum of every tool's `total_tokens` (verbose schema) — the
 /// worst-case prefix cost on a `verbose=true` opt-in harness with
@@ -287,10 +294,11 @@ mod tests {
             (5_000..=super::VERBOSE_FULL_PROFILE_CEILING_TOKENS).contains(&total),
             "full-profile total {total} tokens is outside the measured \
              cl100k_base range (5K-{}K, post-#987 D1.6; upper bound raised \
-             17K->18K->20K->22K->25K->28K across the v0.8.0 #1709 Pillar-1 memory_action_* / \
+             17K->18K->20K->22K->25K->28K->29K across the v0.8.0 #1709 Pillar-1 memory_action_* / \
              memory_lease_* / memory_routine_* , the v1.0.0 #2024 skill \
-             retire/delete tool additions, and the 2026-08-22 #3171 honest-docs \
-             + 26 declared properties, measured 26_691). If the schema grew intentionally, update \
+             retire/delete tool additions, the 2026-08-22 #3171 honest-docs \
+             + 26 declared properties, and the #3587 memory_store as_admin + write_v2 \
+             declarations, measured 28_072). If the schema grew intentionally, update \
              `crate::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS` (the SSOT).",
             super::VERBOSE_FULL_PROFILE_CEILING_TOKENS / 1_000
         );

@@ -467,7 +467,7 @@ fn gap7_token_budget_guard_still_passes_post_decoration() {
         verbose <= ai_memory::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS,
         "Gap 7 regression: verbose full-profile total {verbose} exceeds the \
          {}-token ceiling (SSOT `sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS`; \
-         last bump 2026-08-22 #3171 25K->28K for honest-docs + 26 declared properties)",
+         last bump 2026-09-12 #3587 28K->29K for the memory_store as_admin + write_v2 declarations)",
         ai_memory::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS
     );
 }
