@@ -485,6 +485,92 @@ impl Drop for LlmProvider {
     }
 }
 
+/// #3648: only bounded, application-owned diagnostics may cross the provider
+/// boundary. Never retain response bodies or arbitrary downstream error sources.
+#[derive(Debug)]
+pub(crate) struct ProviderError {
+    provider: &'static str,
+    failure: ProviderFailure,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider {}: {}", self.provider, self.failure)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+#[derive(Debug)]
+enum ProviderFailure {
+    Http(u16),
+    InvalidResponse,
+    InvalidJson,
+    Read,
+    Timeout,
+    Connection,
+    Request,
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(status) => write!(f, "http_status={status}"),
+            Self::InvalidResponse => f.write_str("invalid_response"),
+            Self::InvalidJson => f.write_str("invalid_json"),
+            Self::Read => f.write_str("response_read_failed"),
+            Self::Timeout => f.write_str("request_timeout"),
+            Self::Connection => f.write_str("connection_failed"),
+            Self::Request => f.write_str("request_failed"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderFailure {}
+
+impl LlmProvider {
+    const fn safe_name(&self) -> &'static str {
+        match self {
+            Self::Ollama => BACKEND_OLLAMA,
+            Self::OpenAiCompatible { .. } => "openai_compatible",
+        }
+    }
+
+    fn failure(&self, failure: ProviderFailure) -> ProviderError {
+        ProviderError {
+            provider: self.safe_name(),
+            failure,
+        }
+    }
+
+    fn transport_error(&self, error: &reqwest::Error) -> anyhow::Error {
+        // #3648: preserve classification, never the URL or arbitrary source text.
+        let failure = if error.is_timeout() {
+            ProviderFailure::Timeout
+        } else if error.is_connect() {
+            ProviderFailure::Connection
+        } else {
+            ProviderFailure::Request
+        };
+        self.failure(failure).into()
+    }
+
+    fn http_error(&self, status: reqwest::StatusCode) -> anyhow::Error {
+        self.failure(ProviderFailure::Http(status.as_u16())).into()
+    }
+
+    // The cause comes only from the sanitized response reader below.
+    fn parse_error(&self, cause: anyhow::Error, description: &'static str) -> anyhow::Error {
+        cause
+            .context(self.failure(ProviderFailure::InvalidResponse))
+            .context(description)
+    }
+
+    fn invalid_response(&self, description: &'static str) -> anyhow::Error {
+        anyhow::Error::new(self.failure(ProviderFailure::InvalidResponse)).context(description)
+    }
+}
+
 /// #1866 (§11.5 B7-FC-1) — a function/tool definition offered to the LLM
 /// on a tool-calling request.
 ///
@@ -727,7 +813,8 @@ async fn read_capped_bytes_inner(mut resp: reqwest::Response, cap: usize) -> Res
     while let Some(chunk) = resp
         .chunk()
         .await
-        .context("Failed to read LLM response chunk")?
+        // #3648: transport sources can carry sensitive URLs; discard at this boundary.
+        .map_err(|_| ProviderFailure::Read)?
     {
         if buf.len().saturating_add(chunk.len()) > cap {
             return Err(anyhow!(
@@ -744,18 +831,8 @@ async fn read_capped_bytes_inner(mut resp: reqwest::Response, cap: usize) -> Res
 /// memory.
 async fn read_capped_json(resp: reqwest::Response) -> Result<Value> {
     let bytes = read_capped_bytes(resp).await?;
-    serde_json::from_slice(&bytes).context("Failed to parse LLM response body as JSON")
-}
-
-/// Buffer a response body under [`MAX_LLM_RESPONSE_BYTES`] and decode it
-/// as UTF-8 (lossy). Drop-in replacement for `resp.text().await` used on
-/// error paths so a hostile endpoint cannot blow memory through an
-/// oversize *error* body either.
-async fn read_capped_text(resp: reqwest::Response) -> String {
-    match read_capped_bytes(resp).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => format!("<error body unavailable: {e}>"),
-    }
+    // #3648: parser diagnostics are downstream data, not safe log metadata.
+    serde_json::from_slice(&bytes).map_err(|_| ProviderFailure::InvalidJson.into())
 }
 
 /// #1393 — system prompt for [`OllamaClient::classify_kind`]. Constrains the
@@ -1669,8 +1746,7 @@ impl OllamaClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Ollama pull failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         tracing::info!("Model '{}' pulled successfully", self.model);
@@ -1717,7 +1793,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         // v0.7.0 (issue #1237, #691 fold-1) — governance NetworkRequest gate.
@@ -1771,7 +1847,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(self.provider.transport_error(&e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -1780,29 +1856,31 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Chat generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context(ERR_PARSE_CHAT));
+                return Err(self.provider.parse_error(e, ERR_PARSE_CHAT));
             }
         };
 
         let response_text = match &self.provider {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
-                .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'message.content' field in chat output")
+                })?
                 .to_string(),
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
-                    anyhow!(
+                    self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
-                         chat response; got: {body}"
+                         chat response",
                     )
                 })?
                 .to_string(),
@@ -1866,7 +1944,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -1923,7 +2001,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(self.provider.transport_error(&e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -1932,15 +2010,14 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Chat generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context(ERR_PARSE_CHAT));
+                return Err(self.provider.parse_error(e, ERR_PARSE_CHAT));
             }
         };
 
@@ -1959,14 +2036,17 @@ impl OllamaClient {
         let response_text = match &self.provider {
             LlmProvider::Ollama => message["content"]
                 .as_str()
-                .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'message.content' field in chat output")
+                })?
                 .to_string(),
             LlmProvider::OpenAiCompatible { .. } => message["content"]
                 .as_str()
                 .ok_or_else(|| {
-                    anyhow!(
+                    self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
-                         chat response; got: {body}"
+                         chat response",
                     )
                 })?
                 .to_string(),
@@ -2137,7 +2217,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2182,7 +2262,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(self.provider.transport_error(&e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -2191,29 +2271,31 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context(ERR_PARSE_CHAT));
+                return Err(self.provider.parse_error(e, ERR_PARSE_CHAT));
             }
         };
 
         let response_text = match &self.provider {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
-                .ok_or_else(|| anyhow!("Missing 'message.content' in chat response"))?
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'message.content' in chat response")
+                })?
                 .to_string(),
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
-                    anyhow!(
+                    self.provider.invalid_response(
                         "Missing 'choices[0].message.content' in OpenAI-compatible \
-                         chat response; got: {body}"
+                         chat response",
                     )
                 })?
                 .to_string(),
@@ -2301,7 +2383,7 @@ impl OllamaClient {
                 "Failed to send generate request: circuit breaker open \
                  (last failure within {}s); ollama at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2317,7 +2399,10 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send generate request"));
+                return Err(self
+                    .provider
+                    .transport_error(&e)
+                    .context("Failed to send generate request"));
             }
         };
 
@@ -2326,21 +2411,25 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let parsed: Value = match read_capped_json(resp).await {
             Ok(v) => v,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse generate response"));
+                return Err(self
+                    .provider
+                    .parse_error(e, "Failed to parse generate response"));
             }
         };
 
         let response_text = parsed["response"]
             .as_str()
-            .ok_or_else(|| anyhow!("Missing 'response' field in generate output"))?
+            .ok_or_else(|| {
+                self.provider
+                    .invalid_response("Missing 'response' field in generate output")
+            })?
             .to_string();
 
         self.note_success();
@@ -2443,7 +2532,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2493,7 +2582,10 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
+                return Err(self
+                    .provider
+                    .transport_error(&e)
+                    .context("Failed to send embed request"));
             }
         };
 
@@ -2502,15 +2594,16 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Embed failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse embed response"));
+                return Err(self
+                    .provider
+                    .parse_error(e, "Failed to parse embed response"));
             }
         };
 
@@ -2519,12 +2612,14 @@ impl OllamaClient {
                 .as_array()
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow!("Missing 'embeddings[0]' in Ollama embed response"))?,
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'embeddings[0]' in Ollama embed response")
+                })?,
             LlmProvider::OpenAiCompatible { .. } => {
                 body["data"][0]["embedding"].as_array().ok_or_else(|| {
-                    anyhow!(
-                        "Missing 'data[0].embedding' in OpenAI-compatible embed response; \
-                         got: {body}"
+                    self.provider.invalid_response(
+                        "Missing 'data[0].embedding' in OpenAI-compatible embed response",
                     )
                 })?
             }
@@ -2654,7 +2749,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2690,7 +2785,10 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
+                return Err(self
+                    .provider
+                    .transport_error(&e)
+                    .context("Failed to send embed request"));
             }
         };
 
@@ -2699,19 +2797,21 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Embed failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse embed response"));
+                return Err(self
+                    .provider
+                    .parse_error(e, "Failed to parse embed response"));
             }
         };
 
-        let parsed = parse_openai_embeddings_batch(&body, chunk.len())?;
+        let parsed = parse_openai_embeddings_batch(&body, chunk.len())
+            .map_err(|_| self.provider.failure(ProviderFailure::InvalidResponse))?;
         self.note_success();
         Ok(parsed)
     }
@@ -2776,8 +2876,7 @@ impl OllamaClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Ollama embed model pull failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         tracing::info!("Embedding model '{}' pulled successfully", model);

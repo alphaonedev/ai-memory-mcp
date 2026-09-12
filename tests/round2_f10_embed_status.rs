@@ -295,3 +295,82 @@ async fn http_keyword_only_node_does_not_surface_embed_status() {
     // future change that reorganises the response builder.
     assert!(payload.get("id").and_then(|v| v.as_str()).is_some());
 }
+
+#[derive(Clone, Default)]
+struct RedactionLog3648(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for RedactionLog3648 {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// #3648: provider echoes must never reach create HTTP responses or logs.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_provider_echo_is_redacted_3648() {
+    use ai_memory::llm::OllamaClient;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SECRET: &str = "provider-echo-credential-3648";
+    let logs = RedactionLog3648::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    for ollama in [false, true] {
+        for (status, malformed_json) in [(401, false), (200, false), (200, true)] {
+            let server = MockServer::start().await;
+            let body = if malformed_json {
+                format!("{{{SECRET}")
+            } else {
+                json!({"error": SECRET}).to_string()
+            };
+            Mock::given(method("POST"))
+                .and(path(if ollama { "/api/embed" } else { "/embeddings" }))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            let client = if ollama {
+                OllamaClient::new_with_url_no_health_check(&server.uri(), "test").unwrap()
+            } else {
+                OllamaClient::new_openai_compatible(&server.uri(), "test", "test-key").unwrap()
+            };
+            let embedder = Embedder::new_remote(Arc::new(client), "test".to_string(), 4);
+            let (router, _db) = build_router_with_embedder(Some(embedder));
+            let (code, payload) = post(&router, json!({
+            "title": "redaction regression", "content": "ordinary memory", "agent_id": "test-agent"
+        })).await;
+            assert_eq!(code, StatusCode::CREATED, "{payload}");
+            assert_eq!(payload["embed_status"], "failed", "{payload}");
+            let reason = payload["embed_status_reason"].as_str().unwrap();
+            assert!(!reason.contains(SECRET), "provider echo leaked: {reason}");
+            assert!(reason.len() < 256, "failure metadata must be bounded");
+            let provider = if ollama {
+                "ollama"
+            } else {
+                "openai_compatible"
+            };
+            assert!(
+                reason.contains(provider),
+                "must retain safe provider identity: {reason}"
+            );
+        }
+    }
+    let rendered = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        rendered.contains("embed_with_status: embedder failed"),
+        "must capture failure logs"
+    );
+    assert!(
+        !rendered.contains(SECRET),
+        "provider echo leaked to logs: {rendered}"
+    );
+}
