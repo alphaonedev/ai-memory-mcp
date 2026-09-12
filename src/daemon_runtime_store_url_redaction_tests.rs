@@ -59,9 +59,7 @@ async fn issue_3667_boot_log_redacts_query_password() {
         "boot line must log the redacted URL; got:\n{logs}"
     );
     assert!(
-        !logs.contains(secret)
-            && !logs.contains("AUTH_CANARY")
-            && !logs.contains("SECOND_CANARY"),
+        !logs.contains(secret) && !logs.contains("AUTH_CANARY") && !logs.contains("SECOND_CANARY"),
         "store-URL password leaked into the boot log:\n{logs}"
     );
 }

@@ -165,6 +165,14 @@ pub mod error_codes {
 // those irreducible sites stay below the ratchet's 3-site threshold.
 // ---------------------------------------------------------------------------
 
+/// #3667 — wrap a reqwest transport error in `context`, dropping the request
+/// URL reqwest appends to its Display: reqwest strips the userinfo from that
+/// URL but keeps the query, so a credentialed base URL would leak through it.
+#[must_use]
+pub fn without_request_url(e: reqwest::Error, context: &'static str) -> anyhow::Error {
+    anyhow::Error::new(e.without_url()).context(context)
+}
+
 #[allow(dead_code)]
 pub mod msg {
     // ---- sanitized 500 body (issue #851 canonical envelope) -----------------
@@ -1595,6 +1603,28 @@ mod tests {
             "network: error sending request for url (https://h/v1?password=****&x=1)"
         );
         assert_eq!(msg::unsubscribe("missing id"), "unsubscribe: missing id");
+    }
+
+    /// #3667 — reqwest keeps a URL's query in its error Display (only the
+    /// userinfo is stripped); `without_request_url` must drop the URL. A
+    /// disallowed scheme fails before any socket is opened.
+    #[test]
+    fn without_request_url_drops_the_query_3667() {
+        let err = reqwest::blocking::Client::new()
+            .get("ftp://h/v1?password=Q_CANARY_3667")
+            .send()
+            .expect_err("ftp is not an allowed scheme");
+        assert!(
+            format!("{err}").contains("Q_CANARY_3667"),
+            "precondition: reqwest renders the query: {err}"
+        );
+        let wrapped = without_request_url(err, "Failed to send chat request");
+        let rendered = format!("{wrapped:#}");
+        assert!(!rendered.contains("Q_CANARY_3667"), "{rendered}");
+        assert!(
+            rendered.starts_with("Failed to send chat request"),
+            "{rendered}"
+        );
     }
 
     #[test]

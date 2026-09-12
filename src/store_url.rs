@@ -314,14 +314,16 @@ mod tests {
         assert!(url_carries_credentials(
             "postgres://user:hunter2@db.internal/mem"
         ));
-        assert!(!url_carries_credentials(
-            "postgres://user@db.internal/mem"
-        ));
+        assert!(!url_carries_credentials("postgres://user@db.internal/mem"));
         assert!(!url_carries_credentials("postgres://db.internal/mem"));
         assert!(!url_carries_credentials("sqlite:///var/lib/mem.db"));
         // #3667 — a query-form password is the same argv exposure.
-        assert!(url_carries_credentials("postgres://user@db/mem?%70assword=x"));
-        assert!(!url_carries_credentials("postgres://db/mem?sslmode=verify-full"));
+        assert!(url_carries_credentials(
+            "postgres://user@db/mem?%70assword=x"
+        ));
+        assert!(!url_carries_credentials(
+            "postgres://db/mem?sslmode=verify-full"
+        ));
     }
 
     /// #2679 — a postgres:// URL on the env channel is refused on a binary

@@ -1107,7 +1107,9 @@ fn decode_query_key(key: &str) -> String {
 /// Value of one ASCII hex digit.
 fn hex_value(b: u8) -> Option<u8> {
     // `to_digit(16)` is < 16, so the narrowing is lossless.
-    char::from(b).to_digit(16).and_then(|d| u8::try_from(d).ok())
+    char::from(b)
+        .to_digit(16)
+        .and_then(|d| u8::try_from(d).ok())
 }
 
 /// Whether the decoded query `key` names a secret (#3667).
@@ -1192,9 +1194,7 @@ pub fn redact_urls_in_message(msg: &str) -> String {
             }
             region_end = next_scheme;
         }
-        let userinfo_end = after_scheme[..region_end]
-            .rfind('@')
-            .map_or(0, |at| at + 1);
+        let userinfo_end = after_scheme[..region_end].rfind('@').map_or(0, |at| at + 1);
         let token_start = authority_start + userinfo_end;
         let url_end = rest[token_start..]
             .find(|c: char| c.is_ascii_whitespace() && !URL_PARSER_STRIPPED.contains(&c))
@@ -1696,7 +1696,10 @@ mod tests {
             ),
             // `+` decodes to a space and an invalid escape stays literal,
             // exactly as `application/x-www-form-urlencoded` decoding does.
-            ("postgres://db/m?%ZZpassword=C1", "postgres://db/m?%ZZpassword=****"),
+            (
+                "postgres://db/m?%ZZpassword=C1",
+                "postgres://db/m?%ZZpassword=****",
+            ),
             ("/var/lib/ai-memory/ai.db", "/var/lib/ai-memory/ai.db"),
             ("https:/u:AUTH_CANARY@host/m", URL_PASSWORD_MASK),
             ("https:///u:AUTH_CANARY@host/m", URL_PASSWORD_MASK),
