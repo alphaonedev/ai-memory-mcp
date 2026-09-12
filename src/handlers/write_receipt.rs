@@ -54,9 +54,15 @@ async fn decorate(
     let mut receipt: Value = serde_json::from_slice(&bytes)?;
     let mut durability = local(app, writer).await?;
     if let (Some(acks), Some(n), Some(required)) = (
-        receipt.get("quorum_acks").and_then(Value::as_u64),
-        receipt.get("quorum_n").and_then(Value::as_u64),
-        receipt.get("quorum_required").and_then(Value::as_u64),
+        receipt
+            .get(crate::write_receipt::QUORUM_ACKS_FIELD)
+            .and_then(Value::as_u64),
+        receipt
+            .get(crate::write_receipt::QUORUM_N_FIELD)
+            .and_then(Value::as_u64),
+        receipt
+            .get(crate::write_receipt::QUORUM_REQUIRED_FIELD)
+            .and_then(Value::as_u64),
     ) {
         let backup = std::env::var(crate::write_receipt::BACKUP_ATTESTATION_ENV)
             .is_ok_and(|value| value == "attested");
