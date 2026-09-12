@@ -17,6 +17,117 @@ use prometheus::{
     TextEncoder,
 };
 
+/// Prometheus family name for per-cause wake drops (#3657).
+pub const METRIC_WAKE_DROPS_TOTAL: &str = "ai_memory_wake_drops_total";
+/// Prometheus family name for backstop-poll reliance (#3657).
+pub const METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL: &str = "ai_memory_wake_backstop_reliance_total";
+/// Prometheus family name for hub-vs-backstop fallback posture (#3657).
+pub const METRIC_WAKE_FALLBACK_STATE: &str = "ai_memory_wake_fallback_state";
+/// Prometheus family name for the daemon→hub hand-off occupancy (#3657).
+pub const METRIC_WAKE_QUEUE_PRESSURE: &str = "ai_memory_wake_queue_pressure";
+
+/// Label name on [`METRIC_WAKE_DROPS_TOTAL`].
+pub const WAKE_DROP_LABEL: &str = "cause";
+
+/// Prometheus `cause` label: recipient was never seen (hub `offline_unknown`).
+pub const WAKE_CAUSE_UNKNOWN: &str = "unknown";
+/// Prometheus `cause` label: a recipient queue or the egress budget was full
+/// (sink view of a hub overflow).
+pub const WAKE_CAUSE_OVERFLOW: &str = "overflow";
+/// Prometheus `cause` label: the recipient is not something this plane may
+/// address.
+pub const WAKE_CAUSE_UNADDRESSABLE: &str = "unaddressable";
+/// Prometheus `cause` label: the frame would have violated a hub wire bound.
+pub const WAKE_CAUSE_UNENCODABLE: &str = "unencodable";
+/// Prometheus `cause` label: the bounded daemon→hub hand-off channel was full.
+pub const WAKE_CAUSE_TRANSPORT_FULL: &str = "transport_full";
+/// Prometheus `cause` label: no hub connection was up to carry the frame.
+pub const WAKE_CAUSE_HUB_DOWN: &str = "hub_down";
+/// Prometheus `cause` label: the bus dropped frames before the sink saw them.
+pub const WAKE_CAUSE_BUS_LAGGED: &str = "bus_lagged";
+/// Prometheus `cause` label: hub per-recipient byte cap (#3471).
+pub const WAKE_CAUSE_RECIPIENT_QUEUE_FULL: &str = "recipient_queue_full";
+/// Prometheus `cause` label: hub-wide egress budget (#3471).
+pub const WAKE_CAUSE_GLOBAL_EGRESS_FULL: &str = "global_egress_full";
+/// Prometheus `cause` label: hub per-recipient frame-count channel (#3471).
+pub const WAKE_CAUSE_CHANNEL_FULL: &str = "channel_full";
+/// Prometheus `cause` label: hub writer failed after accept (#3471).
+pub const WAKE_CAUSE_WRITE_FAILED: &str = "write_failed";
+
+/// [`wake_fallback_state`] value: no boot decision has been observed yet.
+/// This is UNAVAILABLE, never "healthy".
+pub const WAKE_FALLBACK_UNOBSERVED: i64 = 0;
+/// [`wake_fallback_state`] value: a hub session is live.
+pub const WAKE_FALLBACK_HUB_LIVE: i64 = 1;
+/// [`wake_fallback_state`] value: recipients rely on the backstop poll.
+pub const WAKE_FALLBACK_BACKSTOP: i64 = 2;
+
+/// Closed set of wake-drop causes published on [`METRIC_WAKE_DROPS_TOTAL`].
+///
+/// Sink-side causes come from [`crate::wake_sink::SinkMetrics`]; hub-side
+/// causes come from [`crate::wake_hub::metrics::HubMetrics`]. The two
+/// layers must not collapse into one unlabeled total (#3657).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeDropCause {
+    /// Recipient offline and never seen.
+    Unknown,
+    /// A recipient queue or the hub-wide egress budget was full (sink view).
+    Overflow,
+    /// The recipient is not something this plane may address.
+    Unaddressable,
+    /// The frame would have violated a hub wire bound.
+    Unencodable,
+    /// The bounded daemon→hub hand-off channel was full.
+    TransportFull,
+    /// No hub connection was up to carry the frame.
+    HubDown,
+    /// The bus dropped frames before the sink saw them.
+    BusLagged,
+    /// Hub: per-recipient byte cap.
+    RecipientQueueFull,
+    /// Hub: hub-wide egress budget.
+    GlobalEgressFull,
+    /// Hub: per-recipient frame-count channel.
+    ChannelFull,
+    /// Hub: writer failed after accept.
+    WriteFailed,
+}
+
+impl WakeDropCause {
+    /// Stable Prometheus label value. Closed set; never renamed.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Unknown => WAKE_CAUSE_UNKNOWN,
+            Self::Overflow => WAKE_CAUSE_OVERFLOW,
+            Self::Unaddressable => WAKE_CAUSE_UNADDRESSABLE,
+            Self::Unencodable => WAKE_CAUSE_UNENCODABLE,
+            Self::TransportFull => WAKE_CAUSE_TRANSPORT_FULL,
+            Self::HubDown => WAKE_CAUSE_HUB_DOWN,
+            Self::BusLagged => WAKE_CAUSE_BUS_LAGGED,
+            Self::RecipientQueueFull => WAKE_CAUSE_RECIPIENT_QUEUE_FULL,
+            Self::GlobalEgressFull => WAKE_CAUSE_GLOBAL_EGRESS_FULL,
+            Self::ChannelFull => WAKE_CAUSE_CHANNEL_FULL,
+            Self::WriteFailed => WAKE_CAUSE_WRITE_FAILED,
+        }
+    }
+
+    /// Every published cause, in the HELP-string order.
+    pub const ALL: [Self; 11] = [
+        Self::Unknown,
+        Self::Overflow,
+        Self::Unaddressable,
+        Self::Unencodable,
+        Self::TransportFull,
+        Self::HubDown,
+        Self::BusLagged,
+        Self::RecipientQueueFull,
+        Self::GlobalEgressFull,
+        Self::ChannelFull,
+        Self::WriteFailed,
+    ];
+}
+
 // =====================================================================
 // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability.
 //
@@ -475,6 +586,29 @@ pub struct Metrics {
     /// relational edge exists but will never reach the AGE graph until the
     /// row is repaired/re-enqueued.
     pub age_projection_quarantined_total: IntCounter,
+
+    /// #3657 — wake-plane hints that were NOT delivered, labeled by cause.
+    /// Closed set: see [`WakeDropCause`]. A single unlabeled drops total is
+    /// deliberately NOT emitted: an operator cannot tell overflow from a
+    /// dead hub from that number, and backstop reliance is the signal that
+    /// the plane has quietly died.
+    pub wake_drops_total: IntCounterVec,
+
+    /// #3657 — times a listener's bounded backstop poll was the delivery
+    /// mechanism (a `WakeReason::Backstop` signal was offered). Climbing
+    /// while hub sessions are not is "the wake plane has quietly died".
+    pub wake_backstop_reliance_total: IntCounter,
+
+    /// #3657 — daemon-side wake fallback posture. `0` = not yet observed
+    /// (unavailable, never "healthy"), `1` = hub session live, `2` =
+    /// recipients are on the backstop poll (hub down, refused, or never
+    /// configured).
+    pub wake_fallback_state: IntGauge,
+
+    /// #3657 — frames currently sitting in the daemon→hub hand-off
+    /// channel. Measured on the UDS sink; `0` after process start until
+    /// the first `on_wake`.
+    pub wake_queue_pressure: IntGauge,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -1070,6 +1204,44 @@ impl Metrics {
         )?;
         registry.register(Box::new(age_projection_quarantined_total.clone()))?;
 
+        let wake_drops_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                METRIC_WAKE_DROPS_TOTAL,
+                "Wake-plane hints that were not delivered, labeled by cause \
+                 (#3657). Closed set: unknown|overflow|unaddressable|\
+                 unencodable|transport_full|hub_down|bus_lagged|\
+                 recipient_queue_full|global_egress_full|channel_full|\
+                 write_failed. A single unlabeled drops total is \
+                 deliberately not emitted.",
+            ),
+            &[WAKE_DROP_LABEL],
+        )?;
+        registry.register(Box::new(wake_drops_total.clone()))?;
+
+        let wake_backstop_reliance_total = IntCounter::new(
+            METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL,
+            "Times a wake listener's bounded backstop poll was the delivery \
+             mechanism (#3657). Climbing while hub sessions are not is the \
+             signal that the wake plane has quietly died. Never a substitute \
+             for per-cause drop counts.",
+        )?;
+        registry.register(Box::new(wake_backstop_reliance_total.clone()))?;
+
+        let wake_fallback_state = IntGauge::new(
+            METRIC_WAKE_FALLBACK_STATE,
+            "Daemon wake-plane fallback posture (#3657). 0 = not yet \
+             observed (unavailable, never healthy), 1 = hub session live, \
+             2 = recipients rely on the backstop poll.",
+        )?;
+        registry.register(Box::new(wake_fallback_state.clone()))?;
+
+        let wake_queue_pressure = IntGauge::new(
+            METRIC_WAKE_QUEUE_PRESSURE,
+            "Frames currently queued on the daemon→hub hand-off channel \
+             (#3657). Measured; not inferred from configuration.",
+        )?;
+        registry.register(Box::new(wake_queue_pressure.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -1123,6 +1295,10 @@ impl Metrics {
             age_projection_pending_depth,
             age_projection_failed_total,
             age_projection_quarantined_total,
+            wake_drops_total,
+            wake_backstop_reliance_total,
+            wake_fallback_state,
+            wake_queue_pressure,
         })
     }
 }
@@ -1368,6 +1544,68 @@ pub fn auto_export_spawn_failed_count() -> u64 {
     registry().auto_export_spawn_failed_total.get()
 }
 
+/// #3657 — record one undelivered wake hint under a closed-set cause.
+pub fn inc_wake_drop(cause: WakeDropCause) {
+    inc_wake_drop_by(cause, 1);
+}
+
+/// #3657 — record `n` undelivered wake hints under a closed-set cause.
+/// `n == 0` is a no-op so a zero-width bus-lag report cannot mint a sample.
+pub fn inc_wake_drop_by(cause: WakeDropCause, n: u64) {
+    if n == 0 {
+        return;
+    }
+    registry()
+        .wake_drops_total
+        .with_label_values(&[cause.as_label()])
+        .inc_by(n);
+}
+
+/// Current value of one cause on [`METRIC_WAKE_DROPS_TOTAL`].
+#[must_use]
+pub fn wake_drop_count(cause: WakeDropCause) -> u64 {
+    registry()
+        .wake_drops_total
+        .with_label_values(&[cause.as_label()])
+        .get()
+}
+
+/// #3657 — record one backstop-poll delivery (the listener offered a
+/// `WakeReason::Backstop` signal). This is the "plane has quietly died"
+/// counter; it is independent of per-cause drop counts.
+pub fn inc_wake_backstop_reliance() {
+    registry().wake_backstop_reliance_total.inc();
+}
+
+/// Current value of [`METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL`].
+#[must_use]
+pub fn wake_backstop_reliance_count() -> u64 {
+    registry().wake_backstop_reliance_total.get()
+}
+
+/// #3657 — publish the measured hub-vs-backstop posture.
+pub fn set_wake_fallback_state(state: i64) {
+    registry().wake_fallback_state.set(state);
+}
+
+/// Current [`METRIC_WAKE_FALLBACK_STATE`].
+#[must_use]
+pub fn wake_fallback_state() -> i64 {
+    registry().wake_fallback_state.get()
+}
+
+/// #3657 — publish the measured daemon→hub hand-off occupancy.
+pub fn set_wake_queue_pressure(frames: usize) {
+    let value = i64::try_from(frames).unwrap_or(i64::MAX);
+    registry().wake_queue_pressure.set(value);
+}
+
+/// Current [`METRIC_WAKE_QUEUE_PRESSURE`].
+#[must_use]
+pub fn wake_queue_pressure() -> i64 {
+    registry().wake_queue_pressure.get()
+}
+
 /// Render the current registry state to the Prometheus text exposition
 /// format. Ignores errors from the encoder (unreachable in practice) and
 /// returns an empty string — the scrape returns 200 with a possibly-empty
@@ -1475,6 +1713,10 @@ mod tests {
         record_federation_inbound_cred(true);
         set_federation_cred_max_age_seconds(0);
         set_federation_renewal_lag_seconds(0);
+        inc_wake_drop(WakeDropCause::HubDown);
+        inc_wake_backstop_reliance();
+        set_wake_fallback_state(WAKE_FALLBACK_BACKSTOP);
+        set_wake_queue_pressure(1);
 
         let text = render();
         for name in [
@@ -1497,6 +1739,11 @@ mod tests {
             "ai_memory_federation_inbound_cred_total",
             "ai_memory_federation_cred_max_age_seconds",
             "ai_memory_federation_renewal_lag_seconds",
+            // #3657 — wake-plane scrape. Tickle so the families appear.
+            METRIC_WAKE_DROPS_TOTAL,
+            METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL,
+            METRIC_WAKE_FALLBACK_STATE,
+            METRIC_WAKE_QUEUE_PRESSURE,
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }

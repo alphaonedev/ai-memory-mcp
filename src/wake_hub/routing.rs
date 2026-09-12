@@ -280,9 +280,9 @@ impl EnqueueRefusal {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::RecipientQueueFull => "recipient_queue_full",
-            Self::GlobalEgressFull => "global_egress_full",
-            Self::ChannelFull => "channel_full",
+            Self::RecipientQueueFull => crate::metrics::WAKE_CAUSE_RECIPIENT_QUEUE_FULL,
+            Self::GlobalEgressFull => crate::metrics::WAKE_CAUSE_GLOBAL_EGRESS_FULL,
+            Self::ChannelFull => crate::metrics::WAKE_CAUSE_CHANNEL_FULL,
         }
     }
 }

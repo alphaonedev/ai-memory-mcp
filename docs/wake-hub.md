@@ -855,7 +855,14 @@ reads "healthy" from an inconclusive probe is worse than no probe.
 The hub's counters, gauges and histograms are read through one stable JSON
 shape (`wake_hub::metrics::MetricsSnapshot::to_json`), published at rest by
 `wake-hub --posture --json` under `metrics_schema` so an exporter can be
-written against a documented contract:
+written against a documented contract. The **daemon** scrape (`GET /metrics`)
+is a separate registry: as of #3657 it emits `ai_memory_wake_drops_total{cause=...}`
+(never an unlabeled drops total), `ai_memory_wake_backstop_reliance_total`,
+`ai_memory_wake_fallback_state` and `ai_memory_wake_queue_pressure`. The
+health-monitoring JSON surface (#3646) gathers from that registry; it does
+not invent a second transport. Hub-process census (connected agents, egress
+bytes) still lives on the hub snapshot — a scrape of the daemon cannot see
+another process without a transport, and this lane does not add one:
 
 | Family | Answers |
 |---|---|

@@ -287,6 +287,8 @@ impl InboxWakeSink for UdsWakeSink {
         }
         // `try_send` never suspends: the bus pump must not be parked by a slow
         // or absent hub.
+        let queued = self.tx.max_capacity().saturating_sub(self.tx.capacity());
+        crate::metrics::set_wake_queue_pressure(queued);
         match self.tx.try_send(wake.frame) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -332,6 +334,7 @@ pub fn install_uds(
 ) -> Result<Arc<SinkMetrics>> {
     let sink = UdsWakeSink::spawn(cfg, credential)?;
     let metrics = sink.metrics();
+    crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
     if !crate::inbox_wake::install_sink(Arc::new(sink)) {
         // Dropping the sink closes the hand-off channel, so the forwarder task
         // we just started shuts itself down rather than lingering.
@@ -340,6 +343,7 @@ pub fn install_uds(
              Tokio runtime; refusing to replace it"
         );
     }
+    super::remember_installed_sink_metrics(Arc::clone(&metrics));
     tracing::info!(
         "wake sink: wake-hub forwarder attached to the agent_notified bus; clients must \
          still poll their inbox at least every {BACKSTOP_POLL_MAX:?}"
@@ -399,6 +403,7 @@ async fn forwarder_loop(
                 return;
             }
             Err(e) => {
+                crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
                 if started.elapsed() >= HEALTHY_SESSION {
                     // This connection carried wakes for a while before it
                     // broke, so the ladder it inherited describes an outage
@@ -444,6 +449,7 @@ async fn connect_and_pump(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = FramedRead::new(read_half, codec());
     handshake(cfg, credential, &mut reader, &mut write_half).await?;
+    crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_HUB_LIVE);
     tracing::info!(
         socket = %cfg.socket_path.display(),
         "wake sink: authenticated to the wake-hub as {WAKE_HUB_PRODUCER}"
@@ -717,6 +723,7 @@ mod tests {
     /// bus pump and never fails the committed notify.
     #[tokio::test]
     async fn a_full_handoff_channel_drops_and_counts_3469() {
+        let before = crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::TransportFull);
         let (sink, _rx) = sink_with_depth(1);
         sink.on_wake(&event("bob"));
         sink.on_wake(&event("bob"));
@@ -724,16 +731,35 @@ mod tests {
         assert_eq!(s.wakes_seen, 2);
         assert_eq!(s.dropped_transport_full, 1);
         assert_eq!(s.total_dropped(), 1);
+        assert!(
+            crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::TransportFull)
+                >= before + 1,
+            "overflow must scrape as cause=transport_full, not an unlabeled total"
+        );
+        let text = crate::metrics::render();
+        assert!(
+            text.contains("cause=\"transport_full\""),
+            "scrape missing labeled overflow:\n{text}"
+        );
     }
 
     /// DENIED: a stopped forwarder drops and counts on its own line, so "the
     /// hub went away" never looks like "the fleet went quiet".
     #[tokio::test]
     async fn a_closed_forwarder_drops_on_its_own_counter_3469() {
+        let before = crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::HubDown);
         let (sink, rx) = sink_with_depth(4);
         drop(rx);
         sink.on_wake(&event("bob"));
         assert_eq!(sink.metrics().snapshot().dropped_hub_down, 1);
+        assert!(
+            crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::HubDown) >= before + 1
+        );
+        let text = crate::metrics::render();
+        assert!(
+            text.contains("cause=\"hub_down\""),
+            "hub failure must scrape as its own cause:\n{text}"
+        );
     }
 
     /// DENIED: an unaddressable recipient never reaches the transport.

@@ -204,6 +204,8 @@ pub struct ClientMetrics {
     coalesced: AtomicU64,
     sessions: AtomicU64,
     reconnects: AtomicU64,
+    /// Times a `WakeReason::Backstop` signal was offered (#3657).
+    backstop_reliance: AtomicU64,
 }
 
 /// A point-in-time copy of [`ClientMetrics`].
@@ -220,6 +222,17 @@ pub struct ClientMetricsSnapshot {
 }
 
 impl ClientMetrics {
+    /// Times the bounded backstop poll was the delivery mechanism (#3657).
+    #[must_use]
+    pub fn backstop_reliance(&self) -> u64 {
+        self.backstop_reliance.load(Ordering::Relaxed)
+    }
+
+    fn record_backstop(&self) {
+        self.backstop_reliance.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::inc_wake_backstop_reliance();
+    }
+
     /// Read every counter.
     #[must_use]
     pub fn snapshot(&self) -> ClientMetricsSnapshot {
@@ -531,13 +544,20 @@ async fn run_session(
 /// signal referred to, so the drop coalesces reads that would have returned
 /// the same rows. It is counted all the same.
 fn offer(tx: &mpsc::Sender<WakeSignal>, signal: WakeSignal, metrics: &ClientMetrics) -> bool {
+    let backstop = matches!(signal.reason, WakeReason::Backstop);
     match tx.try_send(signal) {
         Ok(()) => {
             metrics.signals.fetch_add(1, Ordering::Relaxed);
+            if backstop {
+                metrics.record_backstop();
+            }
             true
         }
         Err(mpsc::error::TrySendError::Full(dropped)) => {
             metrics.coalesced.fetch_add(1, Ordering::Relaxed);
+            if backstop {
+                metrics.record_backstop();
+            }
             tracing::debug!(
                 reason = dropped.reason.label(),
                 "wake listener: a catch-up read is already queued; coalescing this signal"
@@ -598,6 +618,21 @@ mod tests {
 
         cfg.poll_interval = Duration::from_secs(1);
         cfg.validate().expect("a tighter poll is always allowed");
+    }
+
+    #[test]
+    fn offering_a_backstop_signal_counts_reliance_3657() {
+        let before = crate::metrics::wake_backstop_reliance_count();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let metrics = ClientMetrics::default();
+        assert!(offer(&tx, WakeSignal::bare(WakeReason::Backstop), &metrics));
+        assert_eq!(metrics.backstop_reliance(), 1);
+        assert!(crate::metrics::wake_backstop_reliance_count() >= before + 1);
+        let text = crate::metrics::render();
+        assert!(
+            text.contains(crate::metrics::METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL),
+            "{text}"
+        );
     }
 
     /// The reconnect ladder is bounded by the backstop: waiting longer than

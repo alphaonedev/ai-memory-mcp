@@ -166,6 +166,7 @@ pub fn install_from_config(app_config: &AppConfig) -> Result<WakeSinkBoot> {
 pub fn install_from_config_logged(app_config: &AppConfig) -> WakeSinkBoot {
     match install_from_config(app_config) {
         Ok(WakeSinkBoot::NotConfigured) => {
+            crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
             tracing::debug!(
                 "wake sink: `[wake_hub].sink_socket` is unset; no wake forwarder started \
                  (recipients rely on their backstop poll)"
@@ -177,6 +178,7 @@ pub fn install_from_config_logged(app_config: &AppConfig) -> WakeSinkBoot {
             installed
         }
         Err(e) => {
+            crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
             tracing::error!(
                 "wake sink: `[wake_hub].sink_socket` IS configured but the forwarder was \
                  REFUSED, so this daemon is pushing no wakes and its recipients are \

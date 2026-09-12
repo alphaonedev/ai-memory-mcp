@@ -78,6 +78,7 @@
 //! sees a gap collapse that wait to ONE catch-up inbox read.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 
@@ -100,6 +101,27 @@ pub mod uds;
 /// sees a [`crate::wake_hub::frame::WakeMeta::seq_high_watermark`] gap should
 /// read immediately rather than wait it out.
 pub const BACKSTOP_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Process-wide handle to the installed sink's counters (#3657).
+///
+/// `install_uds` / `install_in_process` already keep the `Arc` alive inside
+/// the bus sink; this slot is the extra handle boot used to discard. A
+/// second install is refused at the bus, so `OnceLock` is the matching
+/// "write once" shape.
+static INSTALLED_SINK_METRICS: OnceLock<Arc<SinkMetrics>> = OnceLock::new();
+
+/// Keep the installed sink's counters reachable after boot returns.
+///
+/// A second call is a no-op: the bus already refused a replacement sink.
+pub fn remember_installed_sink_metrics(metrics: Arc<SinkMetrics>) {
+    let _ = INSTALLED_SINK_METRICS.set(metrics);
+}
+
+/// The counters of the sink currently attached to the wake bus, if any.
+#[must_use]
+pub fn installed_sink_metrics() -> Option<Arc<SinkMetrics>> {
+    INSTALLED_SINK_METRICS.get().map(Arc::clone)
+}
 
 /// Label [`crate::write_events::content_digest`] puts in front of the hex
 /// digest on the bus. The hub carries the 32 RAW bytes instead, so this module
@@ -330,8 +352,9 @@ impl SinkMetricsSnapshot {
 
 /// Live counters for one wake sink.
 ///
-/// All `Relaxed` (`CONCURRENCY-07`): independent statistics, nothing is
-/// published through them.
+/// All `Relaxed` (`CONCURRENCY-07`): independent statistics. Drop counters
+/// are dual-written onto the process-global Prometheus registry (#3657)
+/// so `GET /metrics` scrapes the same causes an in-process snapshot shows.
 #[derive(Debug, Default)]
 pub struct SinkMetrics {
     wakes_seen: AtomicU64,
@@ -358,23 +381,36 @@ macro_rules! bump {
     };
 }
 
+/// Drop counters dual-write onto [`crate::metrics::METRIC_WAKE_DROPS_TOTAL`]
+/// so a scrape sees the same cause the in-process snapshot does (#3657).
+macro_rules! bump_drop {
+    ($(($name:ident, $cause:ident)),+ $(,)?) => {
+        $(
+            #[doc = concat!("Increment the `", stringify!($name), "` counter.")]
+            pub fn $name(&self) {
+                self.$name.fetch_add(1, Ordering::Relaxed);
+                crate::metrics::inc_wake_drop(crate::metrics::WakeDropCause::$cause);
+            }
+        )+
+    };
+}
+
 impl SinkMetrics {
-    bump!(
-        wakes_seen,
-        delivered,
-        coalesced,
-        dropped_unknown,
-        dropped_overflow,
-        dropped_unaddressable,
-        dropped_unencodable,
-        dropped_transport_full,
-        dropped_hub_down,
-        meta_shed,
+    bump!(wakes_seen, delivered, coalesced, meta_shed,);
+
+    bump_drop!(
+        (dropped_unknown, Unknown),
+        (dropped_overflow, Overflow),
+        (dropped_unaddressable, Unaddressable),
+        (dropped_unencodable, Unencodable),
+        (dropped_transport_full, TransportFull),
+        (dropped_hub_down, HubDown),
     );
 
     /// Record `missed` frames the BUS dropped before this sink saw them.
     pub fn bus_lagged(&self, missed: u64) {
         self.bus_lagged.fetch_add(missed, Ordering::Relaxed);
+        crate::metrics::inc_wake_drop_by(crate::metrics::WakeDropCause::BusLagged, missed);
     }
 
     /// Read every counter.

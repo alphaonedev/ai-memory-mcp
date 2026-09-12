@@ -169,6 +169,22 @@ macro_rules! counter {
     };
 }
 
+/// Drop counters dual-write onto [`crate::metrics::METRIC_WAKE_DROPS_TOTAL`]
+/// so a scrape of the process registry sees per-cause hub drops (#3657).
+/// The aggregate [`HubMetrics::overflow`] stays local: it is not a scrape
+/// series, because a single drops total is what this issue refuses to emit.
+macro_rules! counter_and_wake_drop {
+    ($(($name:ident, $cause:ident)),+ $(,)?) => {
+        $(
+            /// Increment this counter by one.
+            pub fn $name(&self) {
+                self.$name.fetch_add(1, Ordering::Relaxed);
+                crate::metrics::inc_wake_drop(crate::metrics::WakeDropCause::$cause);
+            }
+        )+
+    };
+}
+
 impl HubMetrics {
     counter!(
         accepted,
@@ -179,17 +195,20 @@ impl HubMetrics {
         denied_forged_from,
         rate_limited,
         overflow,
-        drop_recipient_queue_full,
-        drop_global_egress_full,
-        drop_channel_full,
-        drop_write_failed,
         frames_in,
         frames_out,
         wakes_routed,
         pending_coalesced,
-        pending_dropped_unknown,
         sessions_replaced,
         slow_consumer_events,
+    );
+
+    counter_and_wake_drop!(
+        (drop_recipient_queue_full, RecipientQueueFull),
+        (drop_global_egress_full, GlobalEgressFull),
+        (drop_channel_full, ChannelFull),
+        (drop_write_failed, WriteFailed),
+        (pending_dropped_unknown, Unknown),
     );
 
     /// Add `n` per-recipient deliveries from one routed wake.
@@ -342,10 +361,10 @@ impl MetricsSnapshot {
             },
             "drops": {
                 "overflow_total": self.overflow,
-                "recipient_queue_full": self.drop_recipient_queue_full,
-                "global_egress_full": self.drop_global_egress_full,
-                "channel_full": self.drop_channel_full,
-                "write_failed": self.drop_write_failed,
+                (crate::metrics::WAKE_CAUSE_RECIPIENT_QUEUE_FULL): self.drop_recipient_queue_full,
+                (crate::metrics::WAKE_CAUSE_GLOBAL_EGRESS_FULL): self.drop_global_egress_full,
+                (crate::metrics::WAKE_CAUSE_CHANNEL_FULL): self.drop_channel_full,
+                (crate::metrics::WAKE_CAUSE_WRITE_FAILED): self.drop_write_failed,
                 "offline_unknown": self.pending_dropped_unknown,
             },
             "traffic": {
