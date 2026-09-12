@@ -4081,7 +4081,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_eighteen_sections_3582() {
+    fn local_run_on_empty_db_produces_nineteen_sections_3582_3124() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
@@ -4095,7 +4095,9 @@ mod tests {
         // #3147/#3155 inserted "Identity" after Configuration — total is
         // now 16; #3471 appended "Wake hub (#3471)"; #3582 added
         // "Federation peer authorization" before the database open and
-        // Identity — total is now 18.
+        // Identity — total is now 18; #3124 added the unconditional
+        // "Unstamped owners (#3124)" census after "Corpus Lifecycle (#1965)"
+        // — total is now 19.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -4105,13 +4107,13 @@ mod tests {
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
-        // DSN under that same lock. The count stays 18 on a SQLite
+        // DSN under that same lock. The count stays 19 on a SQLite
         // deployment, which is the invariant this test pins.
         //
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 18);
+        assert_eq!(report.sections.len(), 19);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -4124,6 +4126,7 @@ mod tests {
                 "Embedding Space Census (#2167)",
                 "Recall Index Coverage (#1964)",
                 "Corpus Lifecycle (#1965)",
+                SECTION_UNSTAMPED_OWNERS,
                 "Recall",
                 "Governance",
                 "Sync",

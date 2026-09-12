@@ -227,6 +227,66 @@ pub fn run(
     Ok(0)
 }
 
+/// #3124 R4 — route `ai-memory reown` to its backend. A `postgres://` store
+/// (the flag or the #1927 env channels, resolved exactly as `curator` /
+/// `serve` resolve it) goes through the SAL [`run_store`]; the async store
+/// build happens BEFORE the stdout lock is taken (the `quarantine`
+/// precedent). A non-postgres `--store-url` is refused (it would silently
+/// operate a different database than the one named). Everything else is the
+/// local SQLite leg [`run`], which keeps the #2572 funnel.
+///
+/// # Errors
+///
+/// Store-url resolution, the store build, or the selected leg failed.
+pub async fn dispatch(
+    args: &ReownArgs,
+    db_path: &Path,
+    app_config: &crate::config::AppConfig,
+    cli_agent_id: Option<&str>,
+) -> Result<i32> {
+    let resolved = crate::store_url::resolve_store_url(args.store_url.as_deref())?;
+    if let Some(url) = resolved
+        .as_deref()
+        .filter(|u| crate::store_url::is_postgres_url(u))
+    {
+        #[cfg(feature = "sal")]
+        {
+            let store =
+                crate::daemon_runtime::build_curator_store(Some(url), db_path, app_config).await?;
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = CliOutput::from_std(&mut so, &mut se);
+            return run_store(store.as_ref(), args, cli_agent_id, &mut out).await;
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            let _ = app_config;
+            anyhow::bail!(
+                "reown on {} requires the 'sal' build feature; this binary was built \
+                 without it",
+                crate::logging::redact_url_password(url)
+            );
+        }
+    }
+    if let Some(flag) = args.store_url.as_deref()
+        && !crate::store_url::is_postgres_url(flag)
+    {
+        anyhow::bail!(
+            "reown --store-url accepts a postgres:// store only; use --db for a \
+             SQLite file (got {})",
+            crate::logging::redact_url_password(flag)
+        );
+    }
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut so = stdout.lock();
+    let mut se = stderr.lock();
+    let mut out = CliOutput::from_std(&mut so, &mut se);
+    run(db_path, args, cli_agent_id, &mut out)
+}
+
 /// #3124 R4 — run the reown migration through the SAL (the postgres leg).
 /// The operator lane is an ADMIN lane: `for_admin` because the admin posture
 /// is structural — reaching this verb requires local CLI access to the store
