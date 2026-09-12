@@ -956,33 +956,78 @@ const SECRET_QUERY_KEYS: &[&str] = &[
 /// URL parsers delete ASCII tab / CR / LF anywhere in the input.
 const URL_PARSER_STRIPPED: [char; 3] = ['\t', '\r', '\n'];
 
-/// True when `input` holds a special-scheme URL whose authority is written
-/// in a non-canonical form AND carries an `@` — i.e. userinfo the textual
-/// scanners below would not find at the canonical position. Such input is
-/// masked whole rather than guessed at (#3667). The scheme must start at a
-/// scheme boundary (`rows:` is not `ws:`) and the `@` requirement keeps
-/// ordinary prose such as `HTTP: 404` readable.
-fn has_ambiguous_url_scheme(input: &str) -> bool {
-    let normalized = input.replace(URL_PARSER_STRIPPED, "").to_ascii_lowercase();
-    SPECIAL_URL_SCHEMES.iter().any(|scheme| {
-        normalized.match_indices(scheme).any(|(start, _)| {
-            let at_boundary = normalized[..start]
-                .bytes()
-                .next_back()
-                .is_none_or(|b| !is_scheme_byte(b));
-            // `scheme` is ASCII, so `start + scheme.len()` is a char boundary.
-            let suffix = &normalized[start + scheme.len()..];
-            let canonical = suffix
-                .strip_prefix("//")
-                .is_some_and(|authority| !authority.starts_with(['/', '\\']));
-            at_boundary && !canonical && suffix.contains('@')
+/// Characters that end a URL authority for the WHATWG parser SQLx and
+/// reqwest use (`\` only for special schemes; treating it as an end for all
+/// schemes can only shorten the authority, never hide a password).
+const URL_AUTHORITY_TERMINATORS: [char; 4] = ['/', '?', '#', '\\'];
+
+/// Prose punctuation that may trail a URL in free text (`…:9077.`,
+/// `(https://h:443)`), stripped before a port is judged numeric.
+const PROSE_TRAILING_PUNCTUATION: [char; 9] = ['.', ',', ';', ':', '!', ')', ']', '}', '>'];
+
+/// True when the single URL-like `token` (no separating whitespace) holds a
+/// special-scheme URL whose authority is written in a non-canonical form AND
+/// carries an `@` before its query, or holds a `scheme://…@` whose `://`
+/// only appears once the characters URL parsers delete are removed
+/// (`https:/\t/u:p@h`) — userinfo the textual scanners
+/// below would not find at the canonical position (#3667). The scheme must
+/// start at a scheme boundary: `rows:` is not `ws:` and the `ws:` in the
+/// agent id `ai:ws:x@h` follows a `:`, so it is not a scheme either.
+fn has_ambiguous_url_scheme(token: &str) -> bool {
+    // Both shapes below need an `@`; most tokens have none, so skip the
+    // normalizing allocation for them.
+    if !token.contains('@') {
+        return false;
+    }
+    let normalized = token.replace(URL_PARSER_STRIPPED, "").to_ascii_lowercase();
+    let split_canonical = !token.contains(URL_SCHEME_SEPARATOR)
+        && normalized
+            .find(URL_SCHEME_SEPARATOR)
+            .is_some_and(|sep| normalized[sep..].contains('@'));
+    split_canonical
+        || SPECIAL_URL_SCHEMES.iter().any(|scheme| {
+            normalized.match_indices(scheme).any(|(start, _)| {
+                let at_boundary = normalized[..start]
+                    .bytes()
+                    .next_back()
+                    .is_none_or(|b| !is_scheme_byte(b) && !matches!(b, b':' | b'@'));
+                // `scheme` is ASCII, so `start + scheme.len()` is a char boundary.
+                let suffix = &normalized[start + scheme.len()..];
+                let canonical = suffix
+                    .strip_prefix("//")
+                    .is_some_and(|authority| !authority.starts_with(['/', '\\']));
+                let before_query = &suffix[..suffix.find('?').unwrap_or(suffix.len())];
+                at_boundary && !canonical && before_query.contains('@')
+            })
         })
-    })
 }
 
 /// RFC 3986 scheme characters after the first letter.
 fn is_scheme_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+}
+
+/// #3667 — offset in `rest` (the text after `://`) where a password begins
+/// when the authority has no `@` yet reads as `user:secret`: its first colon
+/// (after any bracketed IPv6 host) is followed by something that is not a
+/// port. A URL parser rejects such input as a bad port and may echo it
+/// back, and in free text an unencoded space in a password splits the URL
+/// before its `@`. `host:9077` and `[::1]:9077` are ports, not passwords.
+fn hidden_password_start(rest: &str) -> Option<usize> {
+    let authority = &rest[..rest.find(URL_AUTHORITY_TERMINATORS).unwrap_or(rest.len())];
+    if authority.contains('@') {
+        return None;
+    }
+    let host_end = if authority.starts_with('[') {
+        authority
+            .find(']')
+            .map_or(authority.len(), |close| close + 1)
+    } else {
+        0
+    };
+    let colon = host_end + authority[host_end..].find(':')?;
+    let port = authority[colon + 1..].trim_end_matches(PROSE_TRAILING_PUNCTUATION);
+    (!port.bytes().all(|b| b.is_ascii_digit())).then_some(colon + 1)
 }
 
 /// #1579 A3 / #3667 (SECURITY) — redact the credentials in a single URL:
@@ -1026,7 +1071,23 @@ pub fn redact_url_password(url: &str) -> String {
             out.push('@');
             &rest[at + 1..]
         }
-        None => rest,
+        None => match hidden_password_start(rest) {
+            // A `?` inside the password hides its `@` from the scan above
+            // (`postgres://u:pa?ss@h`); the password runs to the last `@`,
+            // or to the end when there is none.
+            Some(password_start) => {
+                out.push_str(&rest[..password_start]);
+                out.push_str(URL_PASSWORD_MASK);
+                match rest.rfind('@') {
+                    Some(at) => {
+                        out.push('@');
+                        &rest[at + 1..]
+                    }
+                    None => return out,
+                }
+            }
+            None => rest,
+        },
     };
     let host_end = after_userinfo
         .find(['/', '?', '#'])
@@ -1161,19 +1222,26 @@ fn redact_message_query_secrets(msg: &str) -> String {
 /// runs and masks authority and query credentials inside each one, then
 /// masks secret query assignments across the whole message.
 ///
-/// Punctuation and literal spaces are legal inside a userinfo password, so
-/// a run's `@` is located (the last one before the next `?` or URL) before
-/// any whitespace boundary is applied to the host and path. A run that
-/// contains a SECOND scheme separator is ambiguous — a comma may separate
-/// URLs or belong to a password — so it and the rest of the message are
-/// masked. Over-masking costs prose; under-masking costs a credential.
+/// A URL in free text ends at whitespace or where the next URL's scheme
+/// begins, so the userinfo `@` of one URL is searched only inside its own
+/// token: an agent id such as `ai:claude-code@pop-os` later in the sentence
+/// is never read as that URL's credentials (a redaction that invents a
+/// credential is worse than one that misses one). Inside the token the `@`
+/// is the last one before the query, so an unescaped `/` or `#` in a
+/// password cannot end the scan early. A second URL can never belong to a
+/// password: a parser ends the authority at its first `/`.
+///
+/// When a token's authority reads as `user:secret` and the token holds no
+/// `@` at all, the password is known to begin but not where it ends (an
+/// unencoded space splits it from its `@`), so the rest of the message is
+/// masked — the query-value rule, where a value may also hold spaces. A
+/// non-canonical special-scheme token (`https:u:p@h`) is masked as a whole
+/// token; the prose around it stays readable.
 #[must_use]
 pub fn redact_urls_in_message(msg: &str) -> String {
-    if has_ambiguous_url_scheme(msg) {
-        return URL_PASSWORD_MASK.to_string();
-    }
+    let msg = mask_ambiguous_url_tokens(msg);
     let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
+    let mut rest = msg.as_str();
     while let Some(sep) = rest.find(URL_SCHEME_SEPARATOR) {
         // Walk back over scheme characters already buffered.
         let mut scheme_start = sep;
@@ -1183,34 +1251,56 @@ pub fn redact_urls_in_message(msg: &str) -> String {
         out.push_str(&rest[..scheme_start]);
         let authority_start = sep + URL_SCHEME_SEPARATOR.len();
         let after_scheme = &rest[authority_start..];
-        // The userinfo `@` is searched up to the query or the next URL's
-        // scheme, so a second URL's credentials are never read as this
-        // one's.
-        let mut region_end = after_scheme.find('?').unwrap_or(after_scheme.len());
-        if let Some(next_sep) = after_scheme[..region_end].find(URL_SCHEME_SEPARATOR) {
+        let mut token_len = after_scheme
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(after_scheme.len());
+        if let Some(next_sep) = after_scheme[..token_len].find(URL_SCHEME_SEPARATOR) {
             let mut next_scheme = next_sep;
             while next_scheme > 0 && is_scheme_byte(after_scheme.as_bytes()[next_scheme - 1]) {
                 next_scheme -= 1;
             }
-            region_end = next_scheme;
+            token_len = next_scheme;
         }
-        let userinfo_end = after_scheme[..region_end].rfind('@').map_or(0, |at| at + 1);
-        let token_start = authority_start + userinfo_end;
-        let url_end = rest[token_start..]
-            .find(|c: char| c.is_ascii_whitespace() && !URL_PARSER_STRIPPED.contains(&c))
-            .map_or(rest.len(), |i| token_start + i);
-        let url = &rest[scheme_start..url_end];
-        if url.matches(URL_SCHEME_SEPARATOR).nth(1).is_some() {
-            out.push_str(URL_PASSWORD_MASK);
+        let token = &after_scheme[..token_len];
+        let url_end = authority_start + token_len;
+        out.push_str(&redact_url_password(&rest[scheme_start..url_end]));
+        if !token.contains('@') && hidden_password_start(token).is_some() {
             return redact_message_query_secrets(&out);
         }
-        out.push_str(&redact_url_password(url));
         rest = &rest[url_end..];
     }
     out.push_str(rest);
     // Userinfo is masked first: `&password=` may itself sit inside an
     // authority password, and the query pass must not consume its `@`.
     redact_message_query_secrets(&out)
+}
+
+/// Replace every whitespace-separated token of `msg` that
+/// [`has_ambiguous_url_scheme`] flags with [`URL_PASSWORD_MASK`], keeping
+/// the separators and every other token. A tab does not separate tokens
+/// here: URL parsers delete it, so `ht\ttps:/u:p@h` is one URL. A line
+/// break does, because it ends a line of text, and a URL at the end of one
+/// line must not absorb an agent id that starts the next.
+fn mask_ambiguous_url_tokens(msg: &str) -> String {
+    let is_separator = |c: char| c.is_ascii_whitespace() && c != '\t';
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while !rest.is_empty() {
+        let token_len = rest.find(is_separator).unwrap_or(rest.len());
+        let token = &rest[..token_len];
+        out.push_str(if has_ambiguous_url_scheme(token) {
+            URL_PASSWORD_MASK
+        } else {
+            token
+        });
+        let after_token = &rest[token_len..];
+        let separator_len = after_token
+            .find(|c: char| !is_separator(c))
+            .unwrap_or(after_token.len());
+        out.push_str(&after_token[..separator_len]);
+        rest = &after_token[separator_len..];
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1761,14 +1851,16 @@ mod tests {
         );
         assert!(!clean.contains("AUTH_CANARY"), "{clean}");
         assert!(!clean.contains("QUERY_CANARY"), "{clean}");
+        // Only the ambiguous token is masked; the prose around it survives.
         for msg in [
             "failed https:/u:AUTH_CANARY@host/m",
             "failed https:///u:AUTH_CANARY@host/m",
             "failed ht\ttps:/u:AUTH_CANARY@host/m",
             "failed https:u:AUTH_CANARY@host/m",
+            "failed https:/\t/u:AUTH_CANARY@host/m",
         ] {
             let clean = redact_urls_in_message(msg);
-            assert_eq!(clean, URL_PASSWORD_MASK);
+            assert_eq!(clean, format!("failed {URL_PASSWORD_MASK}"));
         }
         for msg in [
             "failed https:host/m?%70assword=QUERY_CANARY",
@@ -1793,6 +1885,61 @@ mod tests {
         ] {
             assert_eq!(redact_urls_in_message(msg), msg);
         }
+    }
+
+    /// #3667 review D1 — an `@` later in the SENTENCE is not this URL's
+    /// userinfo. Agent ids carry `@` and sit next to peer URLs in federation
+    /// messages; reading one as userinfo erased the diagnostic and printed a
+    /// credentialed URL (`peer.example:****@pop-os`) that never existed.
+    #[test]
+    fn issue_3667_review_d1_agent_id_is_not_userinfo() {
+        for msg in [
+            "peer https://peer.example:9077 refused write from agent ai:claude-code@pop-os",
+            "sync https://peer-a:9077/api/v1/sync/push failed for ai:codex@f2: timeout",
+            "peer https://[::1]:9077 answered 401 to ai:x@h",
+            "pushed to https://h:9077/api/v1/sync/push?peer=ai:x@y ok",
+            "peers:\nhttps://peer-a:9077\nhttps://peer-b:9077\nagent ai:codex@f2",
+            "peers:\nhttps://peer-a:9077\nai:codex@f2",
+            "reached https://api.example.com:443, agent ai:x@h.",
+        ] {
+            assert_eq!(redact_urls_in_message(msg), msg);
+        }
+    }
+
+    /// #3667 review D2 — a scheme word followed by an `@` somewhere later
+    /// no longer blanks the message; only a genuinely ambiguous TOKEN is
+    /// masked, and the rest of the sentence stays readable.
+    #[test]
+    fn issue_3667_review_d2_scheme_word_keeps_message() {
+        for msg in [
+            "reflect refused: HTTP: 404 for ai:x@host",
+            "upstream https: timeout; retried by ai:claude-code@pop-os",
+            "agent ai:ws:x@h joined",
+        ] {
+            assert_eq!(redact_urls_in_message(msg), msg);
+        }
+        assert_eq!(
+            redact_urls_in_message("failed https:u:AUTH_CANARY@host/m for ai:x@host"),
+            format!("failed {URL_PASSWORD_MASK} for ai:x@host")
+        );
+    }
+
+    /// #3667 review R1 — a `?` inside a userinfo password hid its `@` from
+    /// the scan and the password passed through in both forms.
+    #[test]
+    fn issue_3667_review_r1_question_mark_in_password() {
+        assert_eq!(
+            redact_url_password("postgres://u:pa?ss@host/db?sslmode=require"),
+            "postgres://u:****@host/db?sslmode=require"
+        );
+        assert_eq!(
+            redact_urls_in_message("bad url postgres://u:pa?ss@host/db (port)"),
+            "bad url postgres://u:****@host/db (port)"
+        );
+        assert_eq!(
+            redact_url_password("postgres://u:pa?ss"),
+            "postgres://u:****"
+        );
     }
 
     #[test]
