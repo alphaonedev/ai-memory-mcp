@@ -198,9 +198,10 @@ pub fn host_is_loopback(host: &str) -> bool {
 /// plaintext to a non-loopback peer, or does not name a usable scheme.
 pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
     let trimmed = raw.trim();
+    let display_url = crate::logging::redact_url_password(trimmed);
     let parsed = reqwest::Url::parse(trimmed).map_err(|e| {
         format!(
-            "federation peer URL {trimmed:?} is not a valid absolute URL ({e}). \
+            "federation peer URL {display_url:?} is not a valid absolute URL ({e}). \
              Peers must be given as `https://host:port` (or `http://127.0.0.1:port` \
              for a loopback-only development mesh)."
         )
@@ -215,9 +216,9 @@ pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
             if plaintext_peers_allowed() {
                 tracing::warn!(
                     target: "federation",
-                    peer_url = %trimmed,
+                    peer_url = %display_url,
                     host = %host,
-                    "federation peer {trimmed} uses PLAINTEXT http:// to a non-loopback \
+                    "federation peer {display_url} uses PLAINTEXT http:// to a non-loopback \
                      host — replicated memory CONTENT crosses the network in the clear \
                      and is readable/modifiable by anyone on the path. Accepted only \
                      because {} is set. Move the peer to https:// .",
@@ -226,7 +227,7 @@ pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
                 return Ok(());
             }
             Err(format!(
-                "refusing federation peer {trimmed:?}: plaintext http:// to the \
+                "refusing federation peer {display_url:?}: plaintext http:// to the \
                  non-loopback host {host:?} would replicate memory CONTENT across \
                  the network in the clear (federation is not end-to-end encrypted). \
                  Use https:// for this peer — pair it with --quorum-ca-cert for a \
@@ -238,7 +239,7 @@ pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
             ))
         }
         other => Err(format!(
-            "refusing federation peer {trimmed:?}: unsupported scheme {other:?}. \
+            "refusing federation peer {display_url:?}: unsupported scheme {other:?}. \
              Federation peers speak HTTPS (or plaintext HTTP to loopback only)."
         )),
     }
@@ -2514,6 +2515,17 @@ mod tests {
                 "#2677: decimal/hex IPv4 loopback forms normalise to 127.0.0.1 \
                  and must stay exempt: {peer}"
             );
+        }
+    }
+    #[test]
+    fn issue_3667_peer_refusal_redacts_credentials() {
+        for url in [
+            "https://u:AUTH_CANARY@[broken/m?password=QUERY_CANARY",
+            "ftp://u:AUTH_CANARY@peer/m?%70assword=QUERY_CANARY",
+        ] {
+            let err = validate_peer_url_scheme(url).unwrap_err();
+            assert!(!err.contains("AUTH_CANARY"), "{err}");
+            assert!(!err.contains("QUERY_CANARY"), "{err}");
         }
     }
 }

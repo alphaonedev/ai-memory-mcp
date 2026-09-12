@@ -228,6 +228,23 @@ pub struct Report {
 }
 
 impl Report {
+    /// #3667: scrub URLs in every diagnostic field, including provider/peer
+    /// errors and remote source URLs, before either JSON or text rendering.
+    fn redact_urls(&mut self) {
+        use crate::logging::redact_urls_in_message;
+        self.source = redact_urls_in_message(&self.source);
+        for section in &mut self.sections {
+            section.name = redact_urls_in_message(&section.name);
+            for (key, value) in &mut section.facts {
+                *key = redact_urls_in_message(key);
+                *value = redact_urls_in_message(value);
+            }
+            if let Some(note) = &mut section.note {
+                *note = redact_urls_in_message(note);
+            }
+        }
+    }
+
     /// Compute the overall severity as the max across sections (CRIT > WARN > INFO > N/A).
     fn rank(s: Severity) -> u8 {
         match s {
@@ -734,6 +751,7 @@ pub fn run(db_path: &Path, args: &DoctorArgs, out: &mut CliOutput<'_>) -> Result
         run_local(db_path, args.agent_id.as_deref())
     };
     report.compute_overall();
+    report.redact_urls();
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;

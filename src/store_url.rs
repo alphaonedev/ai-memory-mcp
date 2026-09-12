@@ -381,4 +381,15 @@ mod tests {
             std::env::remove_var(STORE_URL_ENV);
         }
     }
+    #[cfg(not(feature = "sal-postgres"))]
+    #[test]
+    fn issue_3667_feature_refusal_redacts_query_passwords() {
+        let url = "postgres://u:AUTH_CANARY@db/m?%70assword=QUERY_CANARY&password=SECOND_CANARY";
+        let err = refuse_postgres_store_url_without_feature(Some(url)).unwrap_err();
+        let text = format!("{err:#}");
+        for secret in ["AUTH_CANARY", "QUERY_CANARY", "SECOND_CANARY"] {
+            assert!(!text.contains(secret), "refusal leaked: {text}");
+        }
+        assert!(text.contains("sal-postgres"));
+    }
 }

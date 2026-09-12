@@ -9129,6 +9129,9 @@ fn _imports_in_use(_: Instant, _: Duration) {}
 #[cfg(test)]
 #[path = "daemon_runtime_shutdown_tests.rs"]
 mod daemon_runtime_shutdown_tests;
+#[cfg(all(test, feature = "sal-postgres"))]
+#[path = "daemon_runtime_store_url_redaction_tests.rs"]
+mod store_url_redaction_3667_tests;
 
 #[cfg(test)]
 #[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields

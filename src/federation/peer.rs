@@ -279,6 +279,8 @@ impl FederationConfig {
             crate::tls::validate_peer_url_scheme(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
             let normalized = normalize_peer_url(raw);
             if !seen_urls.insert(normalized.clone()) {
+                let raw = crate::logging::redact_url_password(raw);
+                let normalized = crate::logging::redact_url_password(&normalized);
                 return Err(anyhow::anyhow!(
                     "duplicate peer URL in --quorum-peers: {raw} (normalized: {normalized}) \
                      — duplicates would let a single peer contribute to quorum more than once"
@@ -331,7 +333,7 @@ impl FederationConfig {
                     target: FED_LOG_TARGET,
                     peer_index = i,
                     peer_id = %id,
-                    url = trimmed,
+                    url = %crate::logging::redact_url_password(trimmed),
                     "registered peer (#2442: peer_id is derived from the URL, not the \
                      flag position; this line is the id -> url map for DLQ triage)"
                 );
@@ -368,6 +370,8 @@ impl FederationConfig {
             .map(|(peer, raw)| (peer.id.as_str(), raw.as_str()))
             .collect();
         if let Some((first, duplicate, id)) = first_peer_id_collision(&id_url_pairs) {
+            let first = crate::logging::redact_url_password(first);
+            let duplicate = crate::logging::redact_url_password(duplicate);
             return Err(anyhow::anyhow!(
                 "federation peer-id collision in --quorum-peers: {first} and {duplicate} both \
                  derive the stable peer id {id} — refusing to start, because a shared routing \
@@ -684,5 +688,27 @@ mod build_pinning_tests {
             super::stable_peer_id("https://p.example:9443"),
             "a port change is a DIFFERENT peer and must mint a different key"
         );
+    }
+    #[test]
+    fn issue_3667_duplicate_peer_refusal_redacts_credentials() {
+        let url = "https://u:AUTH_CANARY@peer/m?%70assword=QUERY_CANARY".to_string();
+        let err = match FederationConfig::build(
+            1,
+            &[url.clone(), url],
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+            "test-agent".into(),
+            None,
+        ) {
+            Ok(_) => panic!("duplicate peers must fail before client construction"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(text.contains("duplicate peer URL"));
+        assert!(!text.contains("AUTH_CANARY"), "{text}");
+        assert!(!text.contains("QUERY_CANARY"), "{text}");
+        assert!(!text.contains("query_canary"), "{text}");
     }
 }
