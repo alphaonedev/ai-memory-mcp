@@ -46,7 +46,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
-use ai_memory::embeddings::Embedder;
+use ai_memory::embeddings::{EmbedStatus, Embedder};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 
 /// #1751 — pin this test binary (and any spawned `ai-memory` child, which
@@ -372,5 +372,51 @@ async fn http_provider_echo_is_redacted_3648() {
     assert!(
         !rendered.contains(SECRET),
         "provider echo leaked to logs: {rendered}"
+    );
+}
+
+// #3648: local failures remain actionable for operators while wire metadata is bounded.
+#[test]
+fn local_embedder_cause_is_operator_only_3648() {
+    use candle_core::{DType, Device};
+    use candle_nn::VarBuilder;
+    use candle_transformers::models::bert::{BertModel, Config};
+    use tokenizers::{Tokenizer, models::wordlevel::WordLevel};
+
+    let config = Config {
+        vocab_size: 1,
+        hidden_size: 2,
+        num_hidden_layers: 0,
+        num_attention_heads: 1,
+        intermediate_size: 2,
+        max_position_embeddings: 2,
+        type_vocab_size: 1,
+        ..Config::default()
+    };
+    let device = Device::Cpu;
+    let model = BertModel::load(VarBuilder::zeros(DType::F32, &device), &config).unwrap();
+    // An empty vocabulary cannot encode input: no model downloads or network needed.
+    let embedder = Embedder::Local {
+        model: Arc::new(model),
+        tokenizer: Arc::new(Tokenizer::new(WordLevel::default())),
+        device,
+    };
+    let cause = embedder.embed("local failure").unwrap_err();
+    let logs = RedactionLog3648::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let (vector, status) = tracing::subscriber::with_default(subscriber, || {
+        embedder.embed_with_status("local failure")
+    });
+    assert!(vector.is_none());
+    assert_eq!(status, EmbedStatus::Failed("embedding_failed".to_string()));
+    let rendered = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        rendered.contains(&format!("{cause:#}")),
+        "operator log must retain the complete local error chain: {rendered}"
     );
 }

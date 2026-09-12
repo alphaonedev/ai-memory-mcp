@@ -1444,7 +1444,8 @@ impl Embedder {
                 let reason = e
                     .downcast_ref::<crate::llm::ProviderError>()
                     .map_or_else(|| "embedding_failed".to_string(), ToString::to_string);
-                tracing::warn!(target: "embeddings.degrade", reason = %reason, "embed_with_status: embedder failed");
+                // Provider errors are sanitized upstream; preserve local causes for operators.
+                tracing::warn!(target: "embeddings.degrade", reason = %format_args!("{e:#}"), "embed_with_status: embedder failed");
                 (None, EmbedStatus::Failed(reason))
             }
         }
