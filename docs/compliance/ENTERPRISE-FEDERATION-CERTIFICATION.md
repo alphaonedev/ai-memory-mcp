@@ -602,7 +602,7 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 | Environment | Exit | Result |
 |---|---|---|
 | Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 10 `[FAIL]` rows of 22** (named below; `cert-3607/posture-bare-env.out`) |
-| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor. |
+| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor at the bound tip (pre-#3124; a post-#3124 re-bind measures 28/28). |
 | Same hardened non-sqlcipher env **with the boot gate ARMED** | **1** | the binary **refuses to boot**, naming the below-floor control (`posture-hardened-boot-refusal.out`) — #2911 item 1's enforcement demonstrated, not merely reported |
 | Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`cert-3607/posture-sqlcipher-pass.out`; 22 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
 
@@ -640,8 +640,8 @@ code.)
    (#3124 — a caller-scoped mutation of an UNSTAMPED, legacy-unowned row
    is refused on every funnel of both backends; the documented `standard`
    default stays `warn`), and the doctor render is
-   `pinned_knobs().len()`-driven. The `cert-55/` recapture (pre-#3124)
-   **measures** `27/27 at floor` on the hardened non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the
+   `pinned_knobs().len()`-driven. The `cert-55/` and `cert-3607/` recaptures (both pre-#3124)
+   **measure** `27/27 at floor` on the hardened non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the
    row is one check regardless of the knob count).
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
 4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
