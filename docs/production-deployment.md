@@ -289,7 +289,7 @@ plumbing required.
 For MCP usage, the LLM env vars MUST live inside the MCP server
 config's `env:` block. Copy-pasteable per-backend recipes (Ollama,
 LMStudio, vLLM, llama.cpp server, xAI, OpenAI, Anthropic, Gemini,
-DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter,
+Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter,
 Fireworks) + multi-agent / multi-DC / fleet considerations:
 [`integrations/llm-backends.md`](integrations/llm-backends.html).
 

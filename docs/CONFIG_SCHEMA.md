@@ -33,7 +33,7 @@ db   = "/Users/fate/.claude/ai-memory.db"
 # ---------------------------------------------------------------------
 [llm]
 backend     = "xai"           # ollama | openai | xai | anthropic | gemini |
-                              # deepseek | kimi | qwen | mistral | groq |
+                              # kimi | qwen | mistral | groq |
                               # together | cerebras | openrouter |
                               # fireworks | lmstudio | vllm | openai-compatible
 model       = "grok-4.3"      # vendor-specific identifier
@@ -653,7 +653,6 @@ order:
    - `openai` → `OPENAI_API_KEY`
    - `anthropic` → `ANTHROPIC_API_KEY`
    - `gemini` → `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
-   - `deepseek` → `DEEPSEEK_API_KEY`
    - `kimi` / `moonshot` → `MOONSHOT_API_KEY` (or `KIMI_API_KEY`)
    - `qwen` / `dashscope` → `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`)
    - `mistral` → `MISTRAL_API_KEY`
@@ -681,7 +680,6 @@ operator does not override:
 | `xai`            | `https://api.x.ai/v1`                             | `grok-4.3`                                      |
 | `anthropic`      | `https://api.anthropic.com/v1`                    | `claude-opus-4.7`                               |
 | `gemini`         | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash`                      |
-| `deepseek`       | `https://api.deepseek.com/v1`                     | `deepseek-chat`                                 |
 | `kimi`/`moonshot`| `https://api.moonshot.cn/v1`                      | `moonshot-v1-8k`                                |
 | `qwen`/`dashscope`| `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-max`                                |
 | `mistral`        | `https://api.mistral.ai/v1`                       | `mistral-large-latest`                          |
