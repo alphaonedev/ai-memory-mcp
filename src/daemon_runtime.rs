@@ -8942,7 +8942,9 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
                 )
                 .await
                 {
-                    let e = crate::logging::redact_urls_in_message(&format!("{peer_url} cycle failed: {e}"));
+                    let e = crate::logging::redact_urls_in_message(&format!(
+                        "{peer_url} cycle failed: {e}"
+                    ));
                     tracing::warn!("sync-daemon: peer {e}");
                 }
             });

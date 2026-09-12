@@ -48,6 +48,7 @@
 //! Ollama returns `function.arguments` as an object, OpenAI-compatible
 //! backends as a JSON string that is re-parsed on ingest.
 
+use crate::errors::without_request_url;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Mutex;
@@ -1463,7 +1464,7 @@ impl OllamaClient {
             return Err(anyhow!(
                 "Ollama is not running or not reachable at {}. \
                  Start it with: ollama serve",
-                instance.display_base_url()
+                crate::logging::redact_url_password(&instance.base_url)
             ));
         }
 
@@ -1521,11 +1522,6 @@ impl OllamaClient {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_tests_without_probe(base_url: &str, model: &str) -> Result<Self> {
         Self::new_with_url_no_health_check(base_url, model)
-    }
-
-    /// #3667 — `base_url` with credentials masked, for every message.
-    fn display_base_url(&self) -> String {
-        crate::logging::redact_url_password(&self.base_url)
     }
 
     /// v0.7.0 F6 — observe the breaker's state without acquiring it for
@@ -1633,7 +1629,7 @@ impl OllamaClient {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("Failed to list Ollama models")?;
+            .map_err(|e| without_request_url(e, "Failed to list Ollama models"))?;
 
         let body: Value = read_capped_json(resp)
             .await
@@ -1670,7 +1666,7 @@ impl OllamaClient {
             .json(&json!({ "name": self.model }))
             .send()
             .await
-            .context("Failed to pull model from Ollama")?;
+            .map_err(|e| without_request_url(e, "Failed to pull model from Ollama"))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1722,7 +1718,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.display_base_url(),
+                crate::logging::redact_url_password(&self.base_url),
             ));
         }
         // v0.7.0 (issue #1237, #691 fold-1) — governance NetworkRequest gate.
@@ -1776,7 +1772,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(without_request_url(e, ERR_SEND_CHAT));
             }
         };
 
@@ -1871,7 +1867,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.display_base_url(),
+                crate::logging::redact_url_password(&self.base_url),
             ));
         }
         self.check_outbound()?;
@@ -1928,7 +1924,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(without_request_url(e, ERR_SEND_CHAT));
             }
         };
 
@@ -2142,7 +2138,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.display_base_url(),
+                crate::logging::redact_url_password(&self.base_url),
             ));
         }
         self.check_outbound()?;
@@ -2187,7 +2183,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(without_request_url(e, ERR_SEND_CHAT));
             }
         };
 
@@ -2259,7 +2255,7 @@ impl OllamaClient {
         let host = url
             .as_ref()
             .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| self.display_base_url());
+            .unwrap_or_else(|| crate::logging::redact_url_password(&self.base_url));
         let scheme = url
             .as_ref()
             .map(|u| u.scheme().to_string())
@@ -2306,7 +2302,7 @@ impl OllamaClient {
                 "Failed to send generate request: circuit breaker open \
                  (last failure within {}s); ollama at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.display_base_url(),
+                crate::logging::redact_url_password(&self.base_url),
             ));
         }
         self.check_outbound()?;
@@ -2322,7 +2318,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send generate request"));
+                return Err(without_request_url(e, "Failed to send generate request"));
             }
         };
 
@@ -2423,7 +2419,7 @@ impl OllamaClient {
                     "embed request exceeded the recall budget of {} ms ({}); \
                      recall degrades to keyword — raise or disable the budget with {}",
                     budget.as_millis(),
-                    self.display_base_url(),
+                    crate::logging::redact_url_password(&self.base_url),
                     crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS,
                 ))
             }
@@ -2448,7 +2444,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.display_base_url(),
+                crate::logging::redact_url_password(&self.base_url),
             ));
         }
         self.check_outbound()?;
@@ -2498,7 +2494,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
+                return Err(without_request_url(e, "Failed to send embed request"));
             }
         };
 
@@ -2659,7 +2655,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.display_base_url(),
+                crate::logging::redact_url_password(&self.base_url),
             ));
         }
         self.check_outbound()?;
@@ -2695,7 +2691,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
+                return Err(without_request_url(e, "Failed to send embed request"));
             }
         };
 
@@ -2748,7 +2744,7 @@ impl OllamaClient {
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .context("Failed to list Ollama models")?;
+            .map_err(|e| without_request_url(e, "Failed to list Ollama models"))?;
 
         let body: Value = read_capped_json(resp)
             .await
@@ -2777,7 +2773,7 @@ impl OllamaClient {
             .json(&json!({ "name": model }))
             .send()
             .await
-            .context("Failed to pull embedding model from Ollama")?;
+            .map_err(|e| without_request_url(e, "Failed to pull embedding model from Ollama"))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
