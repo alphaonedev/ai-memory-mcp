@@ -170,6 +170,21 @@ pub(super) fn handle_update(
     vector_index: Option<&dyn VectorSearchIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    let mut receipt = handle_update_inner(conn, params, embedder, vector_index, mcp_client)?;
+    crate::write_receipt::WriteDurability::sqlite(conn)
+        .and_then(|durability| durability.attach(&mut receipt))
+        .map_err(|error| error.to_string())?;
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_update_inner(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&dyn VectorSearchIndex>,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
     let id = params["id"]
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;

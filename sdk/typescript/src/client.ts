@@ -42,6 +42,7 @@ import type {
   ListQuery,
   ListResponse,
   Memory,
+  MemoryWriteReceipt,
   MemoryDetail,
   MemoryLink,
   MetricsResponse,
@@ -295,7 +296,7 @@ export class AiMemoryClient {
   async store(
     body: CreateMemoryRequest,
     opts?: StoreOptions,
-  ): Promise<Memory> {
+  ): Promise<MemoryWriteReceipt> {
     let payload = body;
     if (opts?.signingKey) {
       if (body.signature) {
@@ -329,7 +330,7 @@ export class AiMemoryClient {
         }),
       };
     }
-    return this.call<Memory, CreateMemoryRequest>({
+    return this.call<MemoryWriteReceipt, CreateMemoryRequest>({
       method: "POST",
       path: "/api/v1/memories",
       body: payload,
@@ -382,7 +383,7 @@ export class AiMemoryClient {
     id: string,
     body: UpdateMemoryRequest,
     opts?: UpdateOptions,
-  ): Promise<Memory> {
+  ): Promise<MemoryWriteReceipt> {
     const requestOpts: RequestOptions | undefined =
       opts?.expectedVersion === undefined
         ? opts
@@ -390,7 +391,7 @@ export class AiMemoryClient {
             ...opts,
             headers: { ...(opts.headers ?? {}), "if-match": String(opts.expectedVersion) },
           };
-    return this.call<Memory, UpdateMemoryRequest>({
+    return this.call<MemoryWriteReceipt, UpdateMemoryRequest>({
       method: "PUT",
       path: `/api/v1/memories/${encodeURIComponent(id)}`,
       body,
