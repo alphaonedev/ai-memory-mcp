@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Registry, TextEncoder,
 };
 
 // =====================================================================
@@ -149,6 +149,35 @@ pub struct Metrics {
     /// non-zero rate to detect mesh-divergence drift early — before a
     /// follow-up catchup sync surfaces the gap.
     pub federation_partial_quorum_total: IntCounter,
+    /// #3654 — configured federation membership (the census): `1` per
+    /// configured peer. `peer` is the minted `peer-h1…` id (or a hashed
+    /// label for an id of unknown shape — see `federation::freshness`).
+    pub federation_peer_configured: IntGaugeVec,
+    /// #3654 — unix seconds (local clock) of the last attempted exchange
+    /// with a peer, per `direction` (`pull` catch-up / `push` fan-out).
+    /// Absent until the first attempt.
+    pub federation_peer_last_attempt_timestamp_seconds: IntGaugeVec,
+    /// #3654 — unix seconds (local clock) of the last SUCCESSFUL exchange
+    /// with a peer, per `direction`. A push only counts when the peer's own
+    /// report says it applied the items (#2341). Absent until the first
+    /// success.
+    pub federation_peer_last_success_timestamp_seconds: IntGaugeVec,
+    /// #3654 — failed attempts since the last success, per peer and
+    /// `direction`.
+    pub federation_peer_consecutive_failures: IntGaugeVec,
+    /// #3654 — failed attempts per peer, `direction` and closed-set `class`.
+    pub federation_peer_failures_total: IntCounterVec,
+    /// #3654 — peer clock minus local clock, whole seconds, from the peer's
+    /// HTTP `Date` header on the last catch-up response.
+    pub federation_peer_clock_skew_seconds: IntGaugeVec,
+    /// #3654 — pending push-DLQ rows per peer, refreshed each replay tick.
+    pub federation_peer_push_dlq_depth: IntGaugeVec,
+    /// #3654 — unix seconds of the oldest pending push-DLQ failure per peer.
+    /// Absent when the peer's backlog is empty.
+    pub federation_peer_push_dlq_oldest_failed_timestamp_seconds: IntGaugeVec,
+    /// #3654 — the configured catch-up interval in seconds. Absent when the
+    /// catch-up loop is not running.
+    pub federation_catchup_interval_seconds: IntGauge,
     /// Cluster-A COR-3 (v0.7.0): count of memory rows whose Form 4
     /// fact-provenance JSON columns (`citations`, `source_span`,
     /// `confidence_signals`, or pre-Form-4 `metadata`) failed to parse
@@ -666,6 +695,92 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_partial_quorum_total.clone()))?;
 
+        // #3654 — per-peer federation freshness. The `peer` label is bounded
+        // by configured membership and never carries a URL.
+        let federation_peer_configured = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_configured",
+                "1 for every peer in this node's configured federation membership (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_configured.clone()))?;
+        let federation_peer_last_attempt_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_last_attempt_timestamp_seconds",
+                "Unix seconds (local clock) of the last attempted exchange with a peer. \
+                 direction=pull|push. Absent until the first attempt (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_last_attempt_timestamp_seconds.clone(),
+        ))?;
+        let federation_peer_last_success_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_last_success_timestamp_seconds",
+                "Unix seconds (local clock) of the last successful exchange with a peer; \
+                 a push counts only when the peer applied it. direction=pull|push. \
+                 Absent until the first success (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_last_success_timestamp_seconds.clone(),
+        ))?;
+        let federation_peer_consecutive_failures = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_consecutive_failures",
+                "Failed attempts since the last success with a peer. direction=pull|push (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(federation_peer_consecutive_failures.clone()))?;
+        let federation_peer_failures_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_failures_total",
+                "Failed exchanges with a peer. direction=pull|push; class=unauthorized|\
+                 throttled|rejected|server_error|unreachable|bad_response|not_applied|\
+                 task_failed|other (#3654).",
+            ),
+            &["peer", "direction", "class"],
+        )?;
+        registry.register(Box::new(federation_peer_failures_total.clone()))?;
+        let federation_peer_clock_skew_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_clock_skew_seconds",
+                "Peer clock minus local clock in whole seconds, from the peer's HTTP Date \
+                 header on the last catch-up response (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_clock_skew_seconds.clone()))?;
+        let federation_peer_push_dlq_depth = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_push_dlq_depth",
+                "Pending federation_push_dlq rows per peer, refreshed each replay tick (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_push_dlq_depth.clone()))?;
+        let federation_peer_push_dlq_oldest_failed_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_push_dlq_oldest_failed_timestamp_seconds",
+                "Unix seconds of the oldest pending federation_push_dlq failure per peer; \
+                 absent when the peer's backlog is empty (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_push_dlq_oldest_failed_timestamp_seconds.clone(),
+        ))?;
+        let federation_catchup_interval_seconds = IntGauge::new(
+            "ai_memory_federation_catchup_interval_seconds",
+            "Configured federation catch-up interval in seconds; absent when the \
+             catch-up loop is not running (#3654).",
+        )?;
+        registry.register(Box::new(federation_catchup_interval_seconds.clone()))?;
+
         // Cluster-A COR-3 (v0.7.0) — corrupt-provenance observability.
         let corrupt_provenance_rows_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -1089,6 +1204,15 @@ impl Metrics {
             federation_fanout_dropped_total,
             federation_fanout_retry_total,
             federation_partial_quorum_total,
+            federation_peer_configured,
+            federation_peer_last_attempt_timestamp_seconds,
+            federation_peer_last_success_timestamp_seconds,
+            federation_peer_consecutive_failures,
+            federation_peer_failures_total,
+            federation_peer_clock_skew_seconds,
+            federation_peer_push_dlq_depth,
+            federation_peer_push_dlq_oldest_failed_timestamp_seconds,
+            federation_catchup_interval_seconds,
             corrupt_provenance_rows_total,
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,

@@ -57,10 +57,15 @@
 /// steer with a count containing `429`).
 mod dlq_class;
 pub mod erasure_outbox;
+// #3654 — per-peer federation freshness (census, attempt/success, streaks,
+// clock skew, per-peer DLQ backlog) and its Prometheus series.
+pub mod freshness;
 pub mod identity;
 pub mod peer;
 pub mod peer_attestation;
 pub mod peer_posture;
+// #3654 — per-peer fan-out task set that keeps its peer on a JoinError.
+mod peer_tasks;
 // v0.7.0 Track D #933 — federation push DLQ + replay worker.
 // #2678: the module is ungated on the default (sqlite-only) build so
 // failed fanouts land in `federation_push_dlq` rather than being
@@ -2434,6 +2439,16 @@ mod tests {
     // (`spawn_mock_peer`, `spawn_since_peer`) and do not require disk.
     // -----------------------------------------------------------------
 
+    /// #3654 — `post_once` / `post_and_classify` take the whole peer so every
+    /// attempt is recorded against its freshness; the direct tests below wrap
+    /// a bare URL in a throwaway endpoint.
+    fn test_peer(url: &str) -> PeerEndpoint {
+        PeerEndpoint {
+            id: format!("peer-test-{}", uuid::Uuid::new_v4()),
+            sync_push_url: url.to_string(),
+        }
+    }
+
     /// W12-G #1: `post_and_classify` returns `Fail` after retry also fails,
     /// and the failure string carries BOTH attempts' reasons (`first:` /
     /// `retry:` prefixes). Hits the `Fail(format!("first: {}; retry: {}"))`
@@ -2450,7 +2465,8 @@ mod tests {
         let target = format!("{url}/api/v1/sync/push");
 
         let outcome =
-            post_and_classify(&client, &target, &body, "mem-x", Some("mem-x"), None, None).await;
+            post_and_classify(&client, &test_peer(&target), &body, "mem-x", Some("mem-x"), None, None)
+                .await;
         match outcome {
             AckOutcome::Fail(reason) => {
                 assert!(
@@ -2508,7 +2524,8 @@ mod tests {
             .unwrap();
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
         let outcome =
-            post_and_classify(&client, &url, &body, "mem-x", Some("mem-x"), None, None).await;
+            post_and_classify(&client, &test_peer(&url), &body, "mem-x", Some("mem-x"), None, None)
+                .await;
         assert!(
             matches!(outcome, AckOutcome::IdDrift),
             "expected IdDrift, got {outcome:?}"
@@ -2546,7 +2563,8 @@ mod tests {
             .build()
             .unwrap();
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
-        super::sync::post_once(&client, &url, &body, "mem-x", Some("mem-x"), None, None).await
+        super::sync::post_once(&client, &test_peer(&url), &body, "mem-x", Some("mem-x"), None, None)
+            .await
     }
 
     /// #2341 — a postgres receiver's 200 carrying `unsupported_on_postgres`

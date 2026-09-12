@@ -103,11 +103,12 @@ const PEER_ID_DERIVATION_DOMAIN: &[u8] = b"ai-memory:peer-id:v1\0";
 ///   colliding with a SPECIFIC existing peer's URL.
 /// * The id must nevertheless stay SHORT and FIXED-WIDTH — it is a durable
 ///   routing key in `federation_push_dlq.peer_id` and `sync_state.peer_id`,
-///   and a structured log field. `peer-h` + 32 = 38 ASCII characters,
-///   bounded and constant. Note the `#304` label-space concern that the
-///   pre-#2442 comment cited does NOT apply: `PeerEndpoint.id` reaches zero
-///   Prometheus labels at v1.0.0 (see the corrected comment in `build`), so
-///   widening the digest costs no cardinality.
+///   and a structured log field. `peer-h1` + 32 = 39 ASCII characters,
+///   bounded and constant. Since #3654 the id IS a Prometheus label (the
+///   per-peer freshness series in `federation::freshness`), and that is fine
+///   for the same reason: the label space is bounded by configured
+///   membership, not by the digest width, so widening the digest costs no
+///   cardinality.
 const STABLE_PEER_ID_HASH_NIBBLES: usize = 32;
 
 /// #2442 — canonical form of a peer URL for IDENTITY purposes.
@@ -188,6 +189,21 @@ fn first_peer_id_collision<'a>(ids: &[(&'a str, &'a str)]) -> Option<(&'a str, &
         }
     }
     None
+}
+
+/// #3654 — true when `peer_id` has exactly the shape [`stable_peer_id`]
+/// mints: [`STABLE_PEER_ID_PREFIX`] followed by
+/// [`STABLE_PEER_ID_HASH_NIBBLES`] lowercase hex nibbles. Such an id is
+/// short, fixed-width and carries no part of the peer URL, so it is safe to
+/// use verbatim as a metric label.
+#[must_use]
+pub fn is_minted_peer_id(peer_id: &str) -> bool {
+    peer_id
+        .strip_prefix(STABLE_PEER_ID_PREFIX)
+        .is_some_and(|rest| {
+            rest.len() == STABLE_PEER_ID_HASH_NIBBLES
+                && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
 }
 
 /// #2442 — true when `peer_id` carries the pre-#2442 POSITIONAL shape
@@ -298,14 +314,14 @@ impl FederationConfig {
                 //
                 //  * It said "`id` is used as a Prometheus metric label; keep
                 //    it low-cardinality (#304 nit — prior form
-                //    `peer-{i}:{url}` blew up the label space)". VERIFIED
-                //    FALSE at v1.0.0: `PeerEndpoint.id` reaches ZERO metric
-                //    labels. Every `with_label_values` call in the federation
-                //    lane takes a closed-set token — `cause` in
-                //    `push_dlq.rs`, `outcome`/`reason` in `sync.rs` — and
-                //    `federation_partial_quorum_total` is a bare IntCounter.
-                //    The id is a structured LOG field and, far more
-                //    importantly, a DURABLE KEY.
+                //    `peer-{i}:{url}` blew up the label space)". Through
+                //    #2442 the id reached ZERO metric labels. Since #3654 it
+                //    labels the per-peer freshness series
+                //    (`federation::freshness`), where cardinality is bounded
+                //    by configured membership and an id of unknown shape is
+                //    hashed before it can reach a label. It is also a
+                //    structured LOG field and, far more importantly, a
+                //    DURABLE KEY.
                 //  * Treating it as "just a label" is what let it be
                 //    positional. It is the routing key of the push DLQ
                 //    (`federation_push_dlq.peer_id`) and of the `sync_state`
@@ -344,7 +360,7 @@ impl FederationConfig {
 
         // #2442 — fail CLOSED on an actually-observed peer-id collision.
         //
-        // The 48-bit truncation makes this astronomically unlikely at the
+        // The 128-bit truncation makes this astronomically unlikely at the
         // fleet sizes v1.0.0 certifies (see `STABLE_PEER_ID_HASH_NIBBLES`),
         // but "unlikely" is not a data-integrity guarantee: two peers sharing
         // a routing key would merge their DLQ rows and misroute content
@@ -375,6 +391,10 @@ impl FederationConfig {
                  writes to the wrong host (#2442). Change one peer's URL spelling."
             ));
         }
+
+        // #3654 — publish the configured membership (the census) so a peer
+        // that never answers is still visible as an expected peer.
+        super::freshness::note_configured(&peers);
 
         // Federation client tuning.
         //
@@ -684,5 +704,28 @@ mod build_pinning_tests {
             super::stable_peer_id("https://p.example:9443"),
             "a port change is a DIFFERENT peer and must mint a different key"
         );
+    }
+}
+
+#[cfg(test)]
+mod minted_peer_id_tests_3654 {
+    use super::{is_legacy_positional_peer_id, is_minted_peer_id, stable_peer_id};
+
+    #[test]
+    fn every_minted_id_is_recognised_and_nothing_else_is() {
+        for url in [
+            "https://peer-a.example:9077",
+            "https://user:secret@peer-b.example",
+            "http://127.0.0.1:4001/",
+        ] {
+            let id = stable_peer_id(url);
+            assert!(is_minted_peer_id(&id), "{id} minted from {url}");
+            assert!(!is_legacy_positional_peer_id(&id));
+        }
+        assert!(!is_minted_peer_id("peer-3"));
+        assert!(!is_minted_peer_id("peer-h1"));
+        assert!(!is_minted_peer_id(&format!("peer-h1{}", "A".repeat(32))));
+        assert!(!is_minted_peer_id(&format!("peer-h1{}", "0".repeat(33))));
+        assert!(!is_minted_peer_id("peer-0:https://peer.example"));
     }
 }
