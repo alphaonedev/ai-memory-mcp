@@ -27798,17 +27798,19 @@ impl MemoryStore for PostgresStore {
         // Twin of `notification::invalidation::list_dependents_of_invalidated`
         // (sqlite): inbound `reflects_on` edges, no valid_until filter
         // (parity with the sqlite MCP handler).
-        let rows = sqlx::query(
+        let sql = format!(
             "SELECT m.id, m.namespace \
              FROM memory_links l \
              JOIN memories m ON m.id = l.source_id \
-             WHERE l.target_id = $1 AND l.relation = $2",
-        )
-        .bind(memory_id)
-        .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("list_dependents_of_invalidated", e))?;
+             WHERE l.target_id = $1 AND l.relation = $2 {}",
+            crate::models::quarantine_hidden_clause("m"),
+        );
+        let rows = sqlx::query(&sql)
+            .bind(memory_id)
+            .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("list_dependents_of_invalidated", e))?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(crate::store::InvalidationDependent {
