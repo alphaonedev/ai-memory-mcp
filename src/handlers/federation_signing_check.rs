@@ -651,6 +651,10 @@ pub(super) async fn sync_push_via_store(
         // merge-over-existing path re-asserts `agent_attested` atomically when the
         // persisted row is byte-identical to the signed unit this node verified;
         // `row_is_agent_attested` reads the post-`apply` `to_insert`.
+        // #3631 — postgres twin of the sqlite funnel's pre-apply inbox probe.
+        let inbox_wake_pre =
+            crate::federation::applied_wake::probe_store(app.store.as_ref(), &ctx, &to_insert)
+                .await;
         match app
             .store
             .merge_inbound(
@@ -670,6 +674,16 @@ pub(super) async fn sync_push_via_store(
                 if crate::handlers::federation_receive::row_is_agent_attested(&to_insert) {
                     let _ = app.store.dequarantine(&applied_id).await;
                 }
+                // #3631 — wake the local recipient when this apply delivered
+                // an inbox message it has not seen (postgres twin).
+                crate::federation::applied_wake::fire_store(
+                    app.store.as_ref(),
+                    &ctx,
+                    inbox_wake_pre,
+                    &to_insert,
+                    &applied_id,
+                )
+                .await;
                 // v0.7.0 Wave-3 Continuation 5 (S18+S79 federation
                 // semantic recall) — the postgres `embedding` column
                 // must land populated or peer-side semantic recall

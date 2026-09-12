@@ -2904,6 +2904,10 @@ pub async fn sync_push(
         // `sanitize` otherwise demotes it to `claimed`). `row_is_agent_attested`
         // reads the post-`apply` `to_insert` (THIS node's verdict, never a peer
         // self-assertion).
+        // #3631 — what the inbox row looked like before this apply, so a
+        // delivered notify can wake its recipient below (non-inbox rows: no
+        // read at all).
+        let inbox_wake_pre = crate::federation::applied_wake::probe_sqlite(&lock.0, &to_insert);
         match db::merge_inbound(&lock.0, &to_insert, row_is_agent_attested(&to_insert)) {
             Ok(actual_id) => {
                 applied += 1;
@@ -2915,6 +2919,15 @@ pub async fn sync_push(
                 if row_is_agent_attested(&to_insert) {
                     let _ = db::dequarantine(&lock.0, &actual_id);
                 }
+                // #3631 — the row is committed (no outer transaction on this
+                // funnel): wake the local recipient when this apply delivered
+                // an inbox message it has not seen.
+                crate::federation::applied_wake::fire_sqlite(
+                    &lock.0,
+                    inbox_wake_pre,
+                    &to_insert,
+                    &actual_id,
+                );
                 // #1566 / #1579 B1 — store a dim-matching shipped
                 // vector directly (no local embed at all); anything
                 // else falls back to the deferred background embed.
