@@ -1092,6 +1092,11 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // `ai-memory.db` in `$PWD`, so the very next step ("could not open
     // database") is a SYMPTOM whose cause would otherwise never be printed.
     sections.push(section_config_health_3166());
+    // #3651 — the log sink is initialised before any command runs; a sink
+    // that cannot be built refuses every command but this one.
+    sections.push(section_logging_pipeline_3651(
+        &crate::logging::log_pipeline_status(),
+    ));
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -1607,6 +1612,79 @@ fn section_config_health_3166() -> ReportSection {
                  to boot on it (exit 78, #3166) rather than silently opening the \
                  relative `ai-memory.db` in the current directory. Every section below \
                  reflects COMPILED DEFAULTS, not your configuration."
+                    .into(),
+            ),
+        },
+    }
+}
+
+/// #3651 — the operational log pipeline of THIS process. It answers whether
+/// the configured sink can be initialised, which is what decides whether
+/// every other command starts; a running daemon's live delivery counters are
+/// the `ai_memory_log_*` metrics on its `/metrics` endpoint.
+fn section_logging_pipeline_3651(status: &crate::logging::LogPipelineStatus) -> ReportSection {
+    use crate::logging::LogPipelineState;
+    const NAME: &str = "Logging pipeline (#3651)";
+    let sink = status.sink.map_or("none", crate::config::LogSink::as_str);
+    match status.state {
+        LogPipelineState::NotConfigured => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Info,
+            facts: vec![(
+                "state".into(),
+                "not configured ([logging].enabled is off)".into(),
+            )],
+            note: None,
+        },
+        LogPipelineState::Active => {
+            let failures = status.write_failures.unwrap_or(0);
+            let dropped = status.queue_dropped.unwrap_or(0);
+            let last = status
+                .last_delivery_unix_ms
+                .and_then(|ms| i64::try_from(ms).ok())
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map_or_else(|| "none yet".to_string(), |at| at.to_rfc3339());
+            let lossy = failures > 0 || dropped > 0;
+            ReportSection {
+                name: NAME.into(),
+                severity: if lossy {
+                    Severity::Warning
+                } else {
+                    Severity::Info
+                },
+                facts: vec![
+                    ("state".into(), "active".into()),
+                    ("sink".into(), sink.into()),
+                    (
+                        "records_delivered".into(),
+                        status.records_delivered.unwrap_or(0).to_string(),
+                    ),
+                    ("write_failures".into(), failures.to_string()),
+                    ("queue_dropped".into(), dropped.to_string()),
+                    ("last_delivery".into(), last),
+                    (
+                        "scope".into(),
+                        "this doctor process; a daemon reports ai_memory_log_* on /metrics".into(),
+                    ),
+                ],
+                note: lossy.then(|| {
+                    "the sink lost records in this process; stderr carries the \
+                     rate-limited reason"
+                        .into()
+                }),
+            }
+        }
+        LogPipelineState::Failed => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Critical,
+            facts: vec![
+                ("state".into(), "FAILED".into()),
+                ("sink".into(), sink.into()),
+                ("error".into(), status.failure.clone().unwrap_or_default()),
+            ],
+            note: Some(
+                "every other ai-memory command refuses to start (exit 78) until the sink \
+                 is fixed, another sink is selected, or [logging].enabled = false"
                     .into(),
             ),
         },
@@ -3964,7 +4042,8 @@ mod tests {
         // #3147/#3155 inserted "Identity" after Configuration — total is
         // now 16; #3471 appended "Wake hub (#3471)"; #3582 added
         // "Federation peer authorization" before the database open and
-        // Identity — total is now 18.
+        // Identity — total is now 18; #3651 added "Logging pipeline (#3651)"
+        // right after Configuration — total is now 19.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -3980,12 +4059,13 @@ mod tests {
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 18);
+        assert_eq!(report.sections.len(), 19);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Configuration",
+                "Logging pipeline (#3651)",
                 "Federation peer authorization",
                 "Identity",
                 "Storage",
@@ -5113,17 +5193,84 @@ mod tests {
         // #3166 — Configuration always renders; #3147 — Identity still
         // renders (the keystore is independent of the database); #3582
         // peer authorization renders before the database open and Identity.
-        // Storage is the Critical failure.
-        assert_eq!(report.sections.len(), 4);
+        // Storage is the Critical failure. #3651 — the logging pipeline
+        // is independent of the database too, so it renders here as well.
+        assert_eq!(report.sections.len(), 5);
         assert_eq!(report.sections[0].name, "Configuration");
-        assert_eq!(report.sections[1].name, "Federation peer authorization");
-        assert_eq!(report.sections[2].name, SECTION_IDENTITY);
-        let storage = &report.sections[3];
+        assert_eq!(report.sections[1].name, "Logging pipeline (#3651)");
+        assert_eq!(report.sections[2].name, "Federation peer authorization");
+        assert_eq!(report.sections[3].name, SECTION_IDENTITY);
+        let storage = &report.sections[4];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
         assert_eq!(report.overall, Severity::Critical);
         assert!(storage.note.as_ref().unwrap().contains("could not open"));
+    }
+
+    // -------------------------------------------------------------------
+    // #3651 — logging pipeline section
+    // -------------------------------------------------------------------
+
+    fn pipeline_status(
+        state: crate::logging::LogPipelineState,
+    ) -> crate::logging::LogPipelineStatus {
+        crate::logging::LogPipelineStatus {
+            state,
+            sink: None,
+            records_delivered: None,
+            write_failures: None,
+            queue_dropped: None,
+            last_delivery_unix_ms: None,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn logging_section_is_info_when_not_configured_3651() {
+        let s = section_logging_pipeline_3651(&pipeline_status(
+            crate::logging::LogPipelineState::NotConfigured,
+        ));
+        assert_eq!(s.severity, Severity::Info);
+        assert!(s.note.is_none());
+    }
+
+    #[test]
+    fn logging_section_is_critical_and_names_the_error_when_failed_3651() {
+        let mut status = pipeline_status(crate::logging::LogPipelineState::Failed);
+        status.sink = Some(crate::config::LogSink::Syslog);
+        status.failure = Some("requires a build with `--features syslog`".into());
+        let s = section_logging_pipeline_3651(&status);
+        assert_eq!(s.severity, Severity::Critical);
+        assert!(s.facts.contains(&("sink".into(), "syslog".into())));
+        assert!(
+            s.facts
+                .iter()
+                .any(|(k, v)| k == "error" && v.contains("--features syslog"))
+        );
+        assert!(s.note.as_deref().is_some_and(|n| n.contains("exit 78")));
+    }
+
+    #[test]
+    fn logging_section_warns_when_an_active_sink_lost_records_3651() {
+        let mut status = pipeline_status(crate::logging::LogPipelineState::Active);
+        status.sink = Some(crate::config::LogSink::File);
+        status.records_delivered = Some(10);
+        status.write_failures = Some(0);
+        status.queue_dropped = Some(0);
+        status.last_delivery_unix_ms = Some(1_700_000_000_000);
+        let clean = section_logging_pipeline_3651(&status);
+        assert_eq!(clean.severity, Severity::Info);
+        assert!(
+            clean
+                .facts
+                .contains(&("records_delivered".into(), "10".into()))
+        );
+
+        status.queue_dropped = Some(3);
+        let lossy = section_logging_pipeline_3651(&status);
+        assert_eq!(lossy.severity, Severity::Warning);
+        assert!(lossy.facts.contains(&("queue_dropped".into(), "3".into())));
     }
 
     // -------------------------------------------------------------------

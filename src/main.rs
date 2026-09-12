@@ -39,7 +39,8 @@ use ai_memory::tls;
 //   - `subscriptions::validate_hmac_secret_hex` — subscriptions tests
 //   - `permissions::set_active_permission_rules` — permissions tests
 //   - `logging::init_file_logging` / `audit::init_from_config` — their
-//     own module tests
+//     own module tests; the #3651 sink-failure refusal (exit 78) and its
+//     `doctor` exception drive the real binary in `tests/logging_pipeline_3651.rs`
 //   - `init_forensic_audit` — see `tests::init_forensic_audit_*` below
 //   - `daemon_runtime::run` — the serve_*/cli_*/cov_* integration suite
 // The `std::process::exit(78)` arm (invalid hmac secret) is documented
@@ -245,11 +246,25 @@ fn main() -> Result<()> {
     // disabled. The `_log_guard` MUST stay in scope for the lifetime
     // of the process — when dropped it flushes the non-blocking
     // tracing writer to disk.
-    let _log_guard =
-        logging::init_file_logging(&app_config.effective_logging()).unwrap_or_else(|e| {
-            eprintln!("ai-memory: file logging init failed (continuing without): {e}");
+    //
+    // #3651 (5-agent vote, 5/5): an operator who enabled logging and whose
+    // selected sink cannot be initialised gets a refusal, not a process
+    // that runs while its collector receives nothing. `doctor` is the one
+    // exception, so the failure stays diagnosable (the #2386 precedent).
+    let _log_guard = match logging::init_file_logging(&app_config.effective_logging()) {
+        Ok(guard) => guard,
+        Err(e) if is_doctor => {
+            eprintln!(
+                "ai-memory: the configured log sink failed to initialise; `doctor` \
+                 continues so it can report it: {e:#}"
+            );
             None
-        });
+        }
+        Err(e) => {
+            eprintln!("{}", logging::boot_refusal_message(&e));
+            std::process::exit(config::EX_CONFIG);
+        }
+    };
     if let Err(e) = audit::init_from_config(&app_config.effective_audit()) {
         eprintln!("ai-memory: audit init failed (continuing without): {e}");
     }

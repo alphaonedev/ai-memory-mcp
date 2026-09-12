@@ -472,6 +472,11 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_memories` | gauge | Corpus size. Refreshed on a paced loop (`AI_MEMORY_METRICS_GAUGE_REFRESH_SECS`, default `60`; `0` disables the loop), not per scrape. |
 | `ai_memory_memories_refreshed_at_seconds` | gauge | UNIX seconds at which the gauge above was last recomputed; `0` = never. **Not optional — alert on `time() - ai_memory_memories_refreshed_at_seconds`.** Without it a dead refresher would freeze a plausible-looking count forever, including through a mass deletion, while Prometheus `up` stayed `1`. |
 | `ai_memory_admission_shed_total` | counter | Requests shed by admission control with a typed `503`. |
+| `ai_memory_log_pipeline_active` | gauge | 1 when the configured operational log sink is installed and receiving events; 0 when logging is disabled (#3651). |
+| `ai_memory_log_records_delivered_total` | counter | Log records written to the configured sink without error. Present only while a log pipeline is active (#3651). |
+| `ai_memory_log_write_failures_total` | counter | Failed writes and flushes of the configured log sink; each lost at least one record (#3651). |
+| `ai_memory_log_queue_dropped_total` | counter | Log records dropped because the sink's worker queue was full (#3651). |
+| `ai_memory_log_last_delivery_seconds` | gauge | UNIX time of the most recent successful log delivery. Absent until the first delivery; never `0` (#3651). |
 | `ai_memory_recall_embed_degraded_total` | counter | Recalls that exceeded `AI_MEMORY_RECALL_EMBED_BUDGET_MS` and degraded to keyword (#2577). |
 | `ai_memory_rerank_budget_degraded_total` | counter | Recalls whose cross-encoder stage was skipped pre-flight under `AI_MEMORY_RERANK_BUDGET_MS`, shipping the hybrid ordering (#2608). |
 | `ai_memory_query_embed_cache_hits_total` | counter | Query-embedding cache hits (#2577). |

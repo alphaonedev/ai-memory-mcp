@@ -26,13 +26,18 @@
 //! See [`docs/security/audit-trail.md`](../docs/security/audit-trail.md)
 //! for the SIEM ingestion guide.
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{
+    DEFAULT_BUFFERED_LINES_LIMIT, ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard,
+};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
-use crate::config::LoggingConfig;
+use crate::config::{LogSink, LoggingConfig};
 use crate::log_paths;
 
 /// Default file prefix written by the rolling appender. Concrete
@@ -45,14 +50,12 @@ const DEFAULT_PREFIX: &str = "ai-memory.log";
 /// wave 4).
 pub const DEFAULT_LOG_DIRECTIVE: &str = "ai_memory=info";
 
-/// Initialise the file logging facility. Returns a [`WorkerGuard`] that
-/// the caller MUST keep alive for the lifetime of the process — when
-/// dropped it flushes the in-memory buffer to disk. Returns `None`
-/// when logging is disabled.
-///
-/// # Errors
-/// - The configured log directory cannot be created.
-/// - The rolling file appender cannot be constructed.
+/// #3651 — minimum spacing between two stderr diagnostics about a failing
+/// sink. The first failure is reported at once; later ones inside the window
+/// are counted and folded into the next report, so a dead collector cannot
+/// flood the one channel that still works.
+const SINK_DIAGNOSTIC_INTERVAL_MS: u64 = 60_000;
+
 /// Build the `EnvFilter` for `level`, falling back to `info` on a
 /// malformed directive. PURE — no global subscriber install, no I/O —
 /// so the level-parse fallback can be asserted deterministically
@@ -159,112 +162,435 @@ pub fn init_console_tracing(extra_directives: &[&str]) {
     }
 }
 
-pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
+/// #3651 — delivery accounting for one log pipeline.
+///
+/// Shared between the writer on the non-blocking worker thread and every
+/// status reader. Each counter is an independent monotonic tally and nothing
+/// else is published through it, so `Relaxed` is sufficient (CONCURRENCY-07).
+#[derive(Debug, Default)]
+pub struct DeliveryStats {
+    delivered: AtomicU64,
+    write_failures: AtomicU64,
+    last_success_unix_ms: AtomicU64,
+    last_diagnostic_unix_ms: AtomicU64,
+    suppressed_diagnostics: AtomicU64,
+}
+
+impl DeliveryStats {
+    /// Record one record handed to the sink's destination without error.
+    pub fn record_success(&self, now_unix_ms: u64) {
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+        self.last_success_unix_ms
+            .fetch_max(now_unix_ms, Ordering::Relaxed);
+    }
+
+    /// Record one failed write or flush. Returns `Some(suppressed)` when a
+    /// diagnostic is due now, `suppressed` being the number of failures
+    /// folded into it since the previous one, and `None` while the
+    /// [`SINK_DIAGNOSTIC_INTERVAL_MS`] rate limit holds.
+    pub fn record_failure(&self, now_unix_ms: u64) -> Option<u64> {
+        self.write_failures.fetch_add(1, Ordering::Relaxed);
+        let last = self.last_diagnostic_unix_ms.load(Ordering::Relaxed);
+        let due = last == 0 || now_unix_ms.saturating_sub(last) >= SINK_DIAGNOSTIC_INTERVAL_MS;
+        if due
+            && self
+                .last_diagnostic_unix_ms
+                .compare_exchange(last, now_unix_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            Some(self.suppressed_diagnostics.swap(0, Ordering::Relaxed))
+        } else {
+            self.suppressed_diagnostics.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Records delivered to the destination since the pipeline was built.
+    pub fn delivered(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
+
+    /// Failed writes and flushes since the pipeline was built.
+    pub fn write_failures(&self) -> u64 {
+        self.write_failures.load(Ordering::Relaxed)
+    }
+
+    /// Wall-clock time of the most recent successful delivery, or `None`
+    /// when nothing has been delivered yet.
+    pub fn last_success_unix_ms(&self) -> Option<u64> {
+        let at = self.last_success_unix_ms.load(Ordering::Relaxed);
+        (at != 0).then_some(at)
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// #3651 — the stderr line reported when a sink fails to deliver. Stderr is a
+/// channel independent of every sink: the file and syslog sinks never write
+/// to it, and the stdout sink writes to a different stream.
+fn sink_failure_diagnostic(sink: LogSink, err: &io::Error, suppressed: u64) -> String {
+    format!(
+        "ai-memory: the {} log sink failed to deliver a record: {err} \
+         ({suppressed} further failures since the previous report); records are \
+         being dropped, see {}",
+        sink.as_str(),
+        crate::metrics::LOG_WRITE_FAILURES_TOTAL
+    )
+}
+
+/// #3651 — wraps the destination writer that runs on the non-blocking worker.
+///
+/// The `tracing_appender` worker discards write errors without a trace. This
+/// wrapper is where they become visible: every record is counted as delivered
+/// or failed, and failures are reported on stderr at most once per
+/// [`SINK_DIAGNOSTIC_INTERVAL_MS`]. The error is then swallowed, because the
+/// pipeline is lossy by design and must never stall or stop the worker.
+struct DeliveryTracker<W> {
+    inner: W,
+    sink: LogSink,
+    stats: Arc<DeliveryStats>,
+}
+
+impl<W: Write> DeliveryTracker<W> {
+    fn note_failure(&self, err: &io::Error) {
+        if let Some(suppressed) = self.stats.record_failure(now_unix_ms()) {
+            // Nothing is left to report a failing stderr to.
+            let _ = writeln!(
+                io::stderr(),
+                "{}",
+                sink_failure_diagnostic(self.sink, err, suppressed)
+            );
+        }
+    }
+}
+
+impl<W: Write> Write for DeliveryTracker<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self.inner.write_all(buf) {
+            Ok(()) => self.stats.record_success(now_unix_ms()),
+            Err(e) => self.note_failure(&e),
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Err(e) = self.inner.flush() {
+            self.note_failure(&e);
+        }
+        Ok(())
+    }
+}
+
+/// Wrap `inner` in a [`DeliveryTracker`] behind a lossy non-blocking worker
+/// and keep the worker's queue-overflow counter, which `tracing_appender`
+/// otherwise leaves unobserved.
+fn tracked_non_blocking<W: Write + Send + 'static>(
+    inner: W,
+    sink: LogSink,
+    stats: Arc<DeliveryStats>,
+    buffered_lines_limit: usize,
+) -> (NonBlocking, WorkerGuard, ErrorCounter) {
+    let (writer, guard) = NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(buffered_lines_limit)
+        .finish(DeliveryTracker { inner, sink, stats });
+    let queue_dropped = writer.error_counter();
+    (writer, guard, queue_dropped)
+}
+
+/// Build the fmt subscriber for `cfg` over `writer` (level + structured).
+fn fmt_dispatch<W>(cfg: &LoggingConfig, writer: W) -> tracing::Dispatch
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    let level = cfg.level.as_deref().unwrap_or("info");
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(level_filter_or_info_fallback(level))
+        .with_writer(writer);
+    if cfg.structured.unwrap_or(false) {
+        tracing::Dispatch::new(builder.json().finish())
+    } else {
+        tracing::Dispatch::new(builder.finish())
+    }
+}
+
+/// #3651 — whether the operational log pipeline is running in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogPipelineState {
+    /// `[logging].enabled` is off, or nothing initialised logging here.
+    NotConfigured,
+    /// The selected sink is this process's log destination.
+    Active,
+    /// The selected sink could not be initialised; see
+    /// [`LogPipelineStatus::failure`].
+    Failed,
+}
+
+/// #3651 — a snapshot of the log pipeline. Counters are `None` unless the
+/// pipeline is [`LogPipelineState::Active`]: a number nothing measured is
+/// never reported as zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPipelineStatus {
+    /// Whether the pipeline is running.
+    pub state: LogPipelineState,
+    /// The sink the configuration selected, when logging is enabled.
+    pub sink: Option<LogSink>,
+    /// Records written to the destination without error.
+    pub records_delivered: Option<u64>,
+    /// Failed writes and flushes; each one lost at least one record.
+    pub write_failures: Option<u64>,
+    /// Records dropped because the worker queue was full.
+    pub queue_dropped: Option<u64>,
+    /// Wall-clock time of the most recent successful delivery.
+    pub last_delivery_unix_ms: Option<u64>,
+    /// Why initialisation failed, when [`LogPipelineState::Failed`].
+    pub failure: Option<String>,
+}
+
+impl LogPipelineStatus {
+    fn active(sink: LogSink, stats: &DeliveryStats, queue_dropped: &ErrorCounter) -> Self {
+        Self {
+            state: LogPipelineState::Active,
+            sink: Some(sink),
+            records_delivered: Some(stats.delivered()),
+            write_failures: Some(stats.write_failures()),
+            queue_dropped: Some(u64::try_from(queue_dropped.dropped_lines()).unwrap_or(u64::MAX)),
+            last_delivery_unix_ms: stats.last_success_unix_ms(),
+            failure: None,
+        }
+    }
+}
+
+/// #3651 — a fully built logging pipeline that is not yet the process-wide
+/// subscriber. [`init_file_logging`] installs one; tests drive one through
+/// [`tracing::dispatcher::with_default`] without touching global state.
+#[derive(Debug)]
+pub struct LogPipeline {
+    sink: LogSink,
+    dispatch: tracing::Dispatch,
+    guard: WorkerGuard,
+    stats: Arc<DeliveryStats>,
+    queue_dropped: ErrorCounter,
+}
+
+impl LogPipeline {
+    /// The sink this pipeline writes to.
+    #[must_use]
+    pub fn sink(&self) -> LogSink {
+        self.sink
+    }
+
+    /// The subscriber, for scoped use with [`tracing::dispatcher::with_default`].
+    #[must_use]
+    pub fn dispatch(&self) -> &tracing::Dispatch {
+        &self.dispatch
+    }
+
+    /// Current delivery counters of this pipeline.
+    #[must_use]
+    pub fn status(&self) -> LogPipelineStatus {
+        LogPipelineStatus::active(self.sink, &self.stats, &self.queue_dropped)
+    }
+
+    /// Stop the worker, flushing everything already queued.
+    pub fn shutdown(self) {
+        drop(self.guard);
+    }
+}
+
+/// The pipeline that won the process-wide install, if any.
+struct InstalledPipeline {
+    sink: LogSink,
+    stats: Arc<DeliveryStats>,
+    queue_dropped: ErrorCounter,
+}
+
+static INSTALLED_PIPELINE: OnceLock<InstalledPipeline> = OnceLock::new();
+static PIPELINE_BOOT_FAILURE: OnceLock<(LogSink, String)> = OnceLock::new();
+
+fn record_boot_failure(sink: LogSink, err: &anyhow::Error) {
+    // First failure wins; a later one in the same process describes the
+    // same broken configuration.
+    let _ = PIPELINE_BOOT_FAILURE.set((sink, format!("{err:#}")));
+}
+
+/// #3651 — the state and delivery counters of this process's log pipeline.
+#[must_use]
+pub fn log_pipeline_status() -> LogPipelineStatus {
+    if let Some(p) = INSTALLED_PIPELINE.get() {
+        return LogPipelineStatus::active(p.sink, &p.stats, &p.queue_dropped);
+    }
+    if let Some((sink, reason)) = PIPELINE_BOOT_FAILURE.get() {
+        return LogPipelineStatus {
+            state: LogPipelineState::Failed,
+            sink: Some(*sink),
+            records_delivered: None,
+            write_failures: None,
+            queue_dropped: None,
+            last_delivery_unix_ms: None,
+            failure: Some(reason.clone()),
+        };
+    }
+    LogPipelineStatus {
+        state: LogPipelineState::NotConfigured,
+        sink: None,
+        records_delivered: None,
+        write_failures: None,
+        queue_dropped: None,
+        last_delivery_unix_ms: None,
+        failure: None,
+    }
+}
+
+/// #3651 — the message the binary prints when it refuses to start because
+/// the configured log sink failed.
+#[must_use]
+pub fn boot_refusal_message(err: &anyhow::Error) -> String {
+    format!(
+        "ai-memory: refusing to start: [logging] is enabled but its sink could not be \
+         initialised: {err:#}\n  Fix the sink ([logging] in config.toml, AI_MEMORY_LOG_SINK), \
+         select another sink, or set [logging].enabled = false. `ai-memory doctor` still \
+         runs and reports this."
+    )
+}
+
+/// Build the configured logging pipeline without installing it. Returns
+/// `None` when logging is disabled.
+///
+/// # Errors
+/// The selected sink cannot be built: the log directory is unusable, or the
+/// syslog sink is misconfigured or not compiled into this binary.
+pub fn build_log_pipeline(cfg: &LoggingConfig) -> Result<Option<LogPipeline>> {
     if !cfg.enabled.unwrap_or(false) {
         return Ok(None);
     }
     // #1463 Tier 1 — resolve the sink ONCE here at boot. The store/recall
-    // hot path never reads this; it only selects WHERE the global tracing
-    // subscriber's non-blocking worker writes (file appender vs stdout), so
-    // the two sinks are byte-identical on every request path. A configured
-    // but unrecognized value falls back to `file` with a loud WARN rather
-    // than silently misrouting (louder than `rotation_for`'s silent default).
-    if let Some(bad) = unrecognized_sink_value(cfg) {
-        tracing::warn!(
-            target: "logging",
-            value = %bad,
-            "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
-             falling back to the file sink. Valid: file | stdout | syslog"
-        );
-    }
-    // #1765 Tier 2 — the remote syslog sink uses a level-aware `MakeWriter`
-    // (so each record's RFC-5424 PRI severity reflects the event's tracing
-    // Level) rather than the File/Stdout `NonBlocking` writer, so it installs
-    // its own subscriber and returns early. It fail-CLOSES when the crate was
-    // built WITHOUT `--features syslog` (see `init_syslog_logging`).
-    if crate::config::resolve_log_sink(cfg) == crate::config::LogSink::Syslog {
-        return init_syslog_logging(cfg);
-    }
-    let (writer, guard) = match crate::config::resolve_log_sink(cfg) {
-        // Structured/plain stdout for OS-tier capture (systemd-journald /
-        // launchd unified log / Windows Event Log). Same non-blocking worker
-        // as the file path, so the `write(2)` to a possibly-pipe stdout fd
-        // happens on the worker thread, NEVER on a store/recall call site.
-        crate::config::LogSink::Stdout => tracing_appender::non_blocking(std::io::stdout()),
-        crate::config::LogSink::File => {
+    // hot path never reads this; it only selects WHERE the subscriber's
+    // non-blocking worker writes.
+    let sink = crate::config::resolve_log_sink(cfg);
+    let stats = Arc::new(DeliveryStats::default());
+    let (dispatch, guard, queue_dropped) = match sink {
+        // #1765 Tier 2 — the syslog sink needs a level-aware `MakeWriter`
+        // so each record's RFC-5424 severity follows the event's level. It
+        // fails closed when the binary was built without `--features syslog`.
+        LogSink::Syslog => build_syslog_dispatch(cfg, &stats)?,
+        // Stdout for OS-tier capture (journald / launchd / Event Log). The
+        // `write(2)` to a possibly-pipe stdout happens on the worker thread,
+        // never on a store/recall call site.
+        LogSink::Stdout => {
+            let (writer, guard, dropped) = tracked_non_blocking(
+                std::io::stdout(),
+                sink,
+                Arc::clone(&stats),
+                DEFAULT_BUFFERED_LINES_LIMIT,
+            );
+            (fmt_dispatch(cfg, writer), guard, dropped)
+        }
+        LogSink::File => {
             let dir = resolve_log_dir(cfg);
             log_paths::ensure_dir_secure(&dir)
                 .with_context(|| format!("creating log dir {}", dir.display()))?;
-            // COVERAGE: build_appender Err-arm (line 57) reachable when the
-            //           rolling-file builder rejects the dir; exercised
-            //           indirectly by build_appender_returns_context_on_unwritable_dir
-            //           and propagates here in production. Not deterministic on
-            //           macOS because the appender accepts non-dir paths lazily.
             let appender = build_appender(&dir, cfg)?;
-            tracing_appender::non_blocking(appender)
-        }
-        // Dispatched to `init_syslog_logging` by the early-return above.
-        crate::config::LogSink::Syslog => {
-            unreachable!("LogSink::Syslog is handled before this match")
+            let (writer, guard, dropped) = tracked_non_blocking(
+                appender,
+                sink,
+                Arc::clone(&stats),
+                DEFAULT_BUFFERED_LINES_LIMIT,
+            );
+            (fmt_dispatch(cfg, writer), guard, dropped)
         }
     };
-    // Capture the writer in the static slot so the daemon's tracing
-    // subscriber can drain it. `try_init` so multiple test runs
-    // (each spinning a fresh subscriber) don't poison the global.
-    let level = cfg.level.as_deref().unwrap_or("info");
-    let filter = level_filter_or_info_fallback(level);
-    let structured = cfg.structured.unwrap_or(false);
-    let res = if structured {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(writer)
-            .json()
-            .try_init()
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(writer)
-            .try_init()
-    };
-    if let Err(e) = res {
-        // COVERAGE: tracing::debug! lazy-format closure (line 81)
-        //           unreachable when the subscriber filter is INFO
-        //           (default in tests) — debug! short-circuits before
-        //           invoking the format closure. Documented per L0.7
-        //           playbook §3c.
-        tracing::debug!("file logging subscriber already initialised: {e}");
+    // A configured but unrecognised sink value falls back to `file`. Say so
+    // in the sink the operator will actually read.
+    if let Some(bad) = unrecognized_sink_value(cfg) {
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::warn!(
+                target: "logging",
+                value = %bad,
+                "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
+                 falling back to the file sink. Valid: file | stdout | syslog"
+            );
+        });
     }
-    Ok(Some(guard))
+    Ok(Some(LogPipeline {
+        sink,
+        dispatch,
+        guard,
+        stats,
+        queue_dropped,
+    }))
 }
 
-/// #1765 Tier 2 — install the OS-agnostic remote-syslog tracing subscriber.
-/// Split out of [`init_file_logging`] because the syslog sink uses a
-/// level-aware `MakeWriter` (so each record's RFC-5424 PRI severity reflects
-/// the event's tracing `Level`) instead of the File/Stdout `NonBlocking`
-/// writer. The actual framing + socket writer live in the `syslog` submodule,
-/// compiled only under `--features syslog`.
-#[cfg(feature = "syslog")]
-fn init_syslog_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
-    let (make_writer, guard) = syslog::build_syslog_make_writer(cfg)?;
-    let level = cfg.level.as_deref().unwrap_or("info");
-    let filter = level_filter_or_info_fallback(level);
-    let structured = cfg.structured.unwrap_or(false);
-    let res = if structured {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(make_writer)
-            .json()
-            .try_init()
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(make_writer)
-            .try_init()
+/// Initialise the operational logging pipeline and install it as the
+/// process-wide tracing subscriber. Returns the [`WorkerGuard`] the caller
+/// MUST keep alive for the life of the process (dropping it flushes and stops
+/// the writer), or `None` when logging is disabled.
+///
+/// #3651 — every failure is returned and recorded for
+/// [`log_pipeline_status`]; none is reduced to a log line with no working
+/// sink to land in. The binary refuses to start on it, `doctor` excepted.
+///
+/// # Errors
+/// - The selected sink cannot be built (see [`build_log_pipeline`]).
+/// - Another tracing subscriber is already installed, so the selected sink
+///   would receive nothing.
+pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
+    let pipeline = match build_log_pipeline(cfg) {
+        Ok(Some(pipeline)) => pipeline,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            record_boot_failure(crate::config::resolve_log_sink(cfg), &e);
+            return Err(e);
+        }
     };
-    if let Err(e) = res {
-        tracing::debug!("syslog logging subscriber already initialised: {e}");
+    install_log_pipeline(pipeline).map(Some)
+}
+
+fn install_log_pipeline(pipeline: LogPipeline) -> Result<WorkerGuard> {
+    let LogPipeline {
+        sink,
+        dispatch,
+        guard,
+        stats,
+        queue_dropped,
+    } = pipeline;
+    if let Err(e) = tracing_subscriber::util::SubscriberInitExt::try_init(dispatch) {
+        let err = anyhow::anyhow!(
+            "the {} log sink could not be installed because another tracing subscriber \
+             is already active in this process, so it would receive no events: {e}",
+            sink.as_str()
+        );
+        record_boot_failure(sink, &err);
+        return Err(err);
     }
-    Ok(Some(guard))
+    // `try_init` succeeded, so this is the process's one and only install.
+    let _ = INSTALLED_PIPELINE.set(InstalledPipeline {
+        sink,
+        stats,
+        queue_dropped,
+    });
+    Ok(guard)
+}
+
+/// #1765 Tier 2 — build the OS-agnostic remote-syslog subscriber. The framing
+/// and socket writer live in the `syslog` submodule, compiled only under
+/// `--features syslog`.
+#[cfg(feature = "syslog")]
+fn build_syslog_dispatch(
+    cfg: &LoggingConfig,
+    stats: &Arc<DeliveryStats>,
+) -> Result<(tracing::Dispatch, WorkerGuard, ErrorCounter)> {
+    let (make_writer, guard, queue_dropped) = syslog::build_syslog_make_writer(cfg, stats)?;
+    Ok((fmt_dispatch(cfg, make_writer), guard, queue_dropped))
 }
 
 /// #1765 Tier 2 — fail-CLOSED stub when the crate was built WITHOUT
@@ -274,7 +600,10 @@ fn init_syslog_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
 /// believe logs are shipped to a hardened collector), so we error at boot
 /// instead — unlike Tier-1's warn-and-fallback for an *unrecognized* value.
 #[cfg(not(feature = "syslog"))]
-fn init_syslog_logging(_cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
+fn build_syslog_dispatch(
+    _cfg: &LoggingConfig,
+    _stats: &Arc<DeliveryStats>,
+) -> Result<(tracing::Dispatch, WorkerGuard, ErrorCounter)> {
     anyhow::bail!(
         "log sink 'syslog' (AI_MEMORY_LOG_SINK / [logging].sink) requires a build with \
          `--features syslog`; this binary was compiled without it. Rebuild with the \
@@ -290,13 +619,17 @@ fn init_syslog_logging(_cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
 /// and gethostname deps — no `tracing-journald` / syslog crate.
 #[cfg(feature = "syslog")]
 mod syslog {
-    use super::{LoggingConfig, WorkerGuard};
+    use super::{
+        DEFAULT_BUFFERED_LINES_LIMIT, DeliveryStats, ErrorCounter, LogSink, LoggingConfig,
+        WorkerGuard,
+    };
     use anyhow::{Context, Result, bail};
     use std::io::{self, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
     use tracing::Metadata;
     use tracing_appender::non_blocking::NonBlocking;
     use tracing_subscriber::fmt::MakeWriter;
@@ -309,7 +642,19 @@ mod syslog {
     const SYSLOG_FACILITY_LOCAL0: u8 = 16;
     /// Bounded connect timeout so a dead / blackholed collector can never stall
     /// the appender worker thread indefinitely (it is lossy, never blocking).
+    /// #3651 — a DEADLINE shared by every resolved address, not a per-address
+    /// allowance.
     const SYSLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// #3651 — the system resolver has no timeout of its own.
+    const SYSLOG_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+    /// #3651 — socket write/read bound. Covers the record write, the flush,
+    /// and the TLS handshake reads that ride on the first write.
+    const SYSLOG_IO_TIMEOUT: Duration = Duration::from_secs(5);
+    /// #3651 — reconnect backoff after a failed connect or send. While it
+    /// holds, records are dropped at once instead of each paying a connect
+    /// timeout on the worker (which would fill the queue behind it).
+    const SYSLOG_RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+    const SYSLOG_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
     /// Default RFC 5424 `APP-NAME` when the operator sets none.
     const DEFAULT_APP_NAME: &str = "ai-memory";
 
@@ -495,11 +840,12 @@ mod syslog {
     /// `io::Write` that ships already-framed RFC-5424 records to the collector
     /// over TCP/TLS. Lives behind `tracing_appender::non_blocking`, so every
     /// `write` here runs on the dedicated appender worker thread — NEVER on a
-    /// store/recall call site. LOSSY: a connect/send failure drops the record
-    /// (bumping `dropped`) and clears the connection for a fresh attempt next
-    /// time; it never blocks the daemon and never errors upward (which would
-    /// crash the worker). Blocking on an attacker-reachable/dead collector
-    /// would be self-DoS, so lossy is the secure posture.
+    /// store/recall call site. A connect/send failure clears the connection,
+    /// starts the reconnect backoff and RETURNS the error to the
+    /// `DeliveryTracker` that wraps this writer (#3651), which counts it,
+    /// reports it on stderr, and drops the record. Blocking on an
+    /// attacker-reachable/dead collector would be self-DoS, so lossy is the
+    /// secure posture — but no longer a silent one.
     struct SyslogSocketWriter {
         address: String,
         transport: Transport,
@@ -508,26 +854,98 @@ mod syslog {
             rustls::pki_types::ServerName<'static>,
         )>,
         conn: Option<Conn>,
-        dropped: u64,
+        retry_at: Option<Instant>,
+        backoff: Duration,
+    }
+
+    /// Resolve `address` with the system resolver, waiting at most `timeout`.
+    fn resolve_bounded(address: &str, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
+        let owned = address.to_string();
+        resolve_with_deadline(
+            move || owned.to_socket_addrs().map(Iterator::collect),
+            timeout,
+        )
+    }
+
+    /// Run `resolve` on a helper thread and wait at most `timeout` for it. On
+    /// expiry the helper is abandoned (it exits when the resolver returns) and
+    /// the caller gets `TimedOut`. One helper starts per reconnect attempt and
+    /// attempts are spaced by the backoff (1 s doubling to 60 s), so a
+    /// resolver that never returns leaves at most one abandoned thread per
+    /// minute once the backoff is saturated.
+    fn resolve_with_deadline<F>(resolve: F, timeout: Duration) -> io::Result<Vec<SocketAddr>>
+    where
+        F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("ai-memory-syslog-dns".to_string())
+            .spawn(move || {
+                // The receiver is gone once the caller timed out.
+                let _ = tx.send(resolve());
+            })?;
+        match rx.recv_timeout(timeout) {
+            Ok(resolved) => resolved,
+            Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "syslog collector address did not resolve in time",
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "syslog address resolver exited without a result",
+            )),
+        }
+    }
+
+    /// Connect to the first reachable address before `deadline`.
+    fn connect_any(
+        address: &str,
+        addrs: &[SocketAddr],
+        deadline: Instant,
+    ) -> io::Result<TcpStream> {
+        let mut last_err = None;
+        for addr in addrs {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match TcpStream::connect_timeout(addr, remaining) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("syslog address {address:?} resolved to no reachable socket addr"),
+            )
+        }))
     }
 
     impl SyslogSocketWriter {
+        fn new(
+            address: String,
+            transport: Transport,
+            tls: Option<(
+                Arc<rustls::ClientConfig>,
+                rustls::pki_types::ServerName<'static>,
+            )>,
+        ) -> Self {
+            Self {
+                address,
+                transport,
+                tls,
+                conn: None,
+                retry_at: None,
+                backoff: SYSLOG_RECONNECT_BACKOFF_MIN,
+            }
+        }
+
         fn connect(&self) -> io::Result<Conn> {
-            let addr = self
-                .address
-                .to_socket_addrs()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-                .next()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "syslog address {:?} resolved to no socket addr",
-                            self.address
-                        ),
-                    )
-                })?;
-            let tcp = TcpStream::connect_timeout(&addr, SYSLOG_CONNECT_TIMEOUT)?;
+            let deadline = Instant::now() + SYSLOG_CONNECT_TIMEOUT;
+            let addrs = resolve_bounded(&self.address, SYSLOG_DNS_TIMEOUT)?;
+            let tcp = connect_any(&self.address, &addrs, deadline)?;
+            tcp.set_write_timeout(Some(SYSLOG_IO_TIMEOUT))?;
+            tcp.set_read_timeout(Some(SYSLOG_IO_TIMEOUT))?;
             match (self.transport, &self.tls) {
                 (Transport::Tls, Some((config, server_name))) => {
                     let client = rustls::ClientConnection::new(config.clone(), server_name.clone())
@@ -538,18 +956,49 @@ mod syslog {
             }
         }
 
+        fn schedule_retry(&mut self) {
+            self.retry_at = Some(Instant::now() + self.backoff);
+            self.backoff = self
+                .backoff
+                .saturating_mul(2)
+                .min(SYSLOG_RECONNECT_BACKOFF_MAX);
+        }
+
         fn send(&mut self, framed: &[u8]) -> io::Result<()> {
-            if self.conn.is_none() {
-                self.conn = Some(self.connect()?);
-            }
-            let res = match self.conn.as_mut().expect("conn set above") {
+            let mut conn = match self.conn.take() {
+                Some(conn) => conn,
+                None => {
+                    if self.retry_at.is_some_and(|at| Instant::now() < at) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "syslog collector unreachable; reconnect backoff in effect",
+                        ));
+                    }
+                    match self.connect() {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            self.schedule_retry();
+                            return Err(e);
+                        }
+                    }
+                }
+            };
+            let res = match &mut conn {
                 Conn::Plain(s) => s.write_all(framed).and_then(|()| s.flush()),
                 Conn::Tls(s) => s.write_all(framed).and_then(|()| s.flush()),
             };
-            if res.is_err() {
-                self.conn = None;
+            match res {
+                Ok(()) => {
+                    self.conn = Some(conn);
+                    self.retry_at = None;
+                    self.backoff = SYSLOG_RECONNECT_BACKOFF_MIN;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.schedule_retry();
+                    Err(e)
+                }
             }
-            res
         }
     }
 
@@ -557,9 +1006,7 @@ mod syslog {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             // `buf` is exactly one octet-counted frame (the frame writer enqueues
             // each record with a single write; `NonBlocking` forwards it whole).
-            if self.send(buf).is_err() {
-                self.dropped = self.dropped.saturating_add(1);
-            }
+            self.send(buf)?;
             Ok(buf.len())
         }
 
@@ -655,7 +1102,8 @@ mod syslog {
     /// so all socket I/O runs on the worker thread, off every call site.
     pub(super) fn build_syslog_make_writer(
         cfg: &LoggingConfig,
-    ) -> Result<(SyslogMakeWriter, WorkerGuard)> {
+        stats: &Arc<DeliveryStats>,
+    ) -> Result<(SyslogMakeWriter, WorkerGuard, ErrorCounter)> {
         let sc = resolve_syslog_config(cfg)?;
         let tls = match sc.transport {
             Transport::Tls => {
@@ -671,14 +1119,13 @@ mod syslog {
             }
             Transport::Tcp => None,
         };
-        let socket = SyslogSocketWriter {
-            address: sc.address.clone(),
-            transport: sc.transport,
-            tls,
-            conn: None,
-            dropped: 0,
-        };
-        let (nb, guard) = tracing_appender::non_blocking(socket);
+        let socket = SyslogSocketWriter::new(sc.address.clone(), sc.transport, tls);
+        let (nb, guard, queue_dropped) = super::tracked_non_blocking(
+            socket,
+            LogSink::Syslog,
+            Arc::clone(stats),
+            DEFAULT_BUFFERED_LINES_LIMIT,
+        );
         let host = nilvalue_token(&gethostname::gethostname().to_string_lossy());
         let make = SyslogMakeWriter {
             nb,
@@ -686,7 +1133,7 @@ mod syslog {
             app: Arc::from(nilvalue_token(&sc.app_name).as_str()),
             procid: Arc::from(std::process::id().to_string().as_str()),
         };
-        Ok((make, guard))
+        Ok((make, guard, queue_dropped))
     }
 
     #[cfg(test)]
@@ -820,31 +1267,113 @@ mod syslog {
             assert!(err.contains("invalid syslog transport"), "got: {err}");
         }
 
-        // ── socket writer: lossy on a dead collector (dead-port precedent) ──
+        // ── socket writer: a dead collector is reported, bounded and lossy ──
+
+        fn plain_writer(address: &str) -> SyslogSocketWriter {
+            SyslogSocketWriter::new(address.to_string(), Transport::Tcp, None)
+        }
 
         #[test]
-        fn socket_writer_is_lossy_on_connect_refused() {
-            // Port 1 on loopback: nothing binds → connect refused → the write
-            // must DROP (bump the counter) and return Ok, never panic / block /
-            // error upward (which would crash the appender worker).
-            let mut w = SyslogSocketWriter {
-                address: "127.0.0.1:1".to_string(),
-                transport: Transport::Tcp,
-                tls: None,
-                conn: None,
-                dropped: 0,
+        fn socket_writer_reports_refused_connect_and_backs_off() {
+            // #3651 — port 1 on loopback: nothing binds, so connect is refused.
+            // The error must reach the caller (the `DeliveryTracker`) instead
+            // of being turned into a silent `Ok`, and the backoff must make
+            // the NEXT record fail at once without another connect attempt.
+            let mut w = plain_writer("127.0.0.1:1");
+            let framed = octet_count(&format_rfc5424(6, "t", "h", "a", "1", b"hi"));
+            assert!(w.write(&framed).is_err(), "a refused connect is an error");
+            assert!(w.conn.is_none(), "a failed send leaves no connection");
+            assert!(w.retry_at.is_some(), "a failed connect starts the backoff");
+
+            let started = Instant::now();
+            let err = w.write(&framed).expect_err("backoff drops the record");
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert!(
+                started.elapsed() < SYSLOG_RECONNECT_BACKOFF_MIN,
+                "a record inside the backoff must not pay a connect attempt"
+            );
+        }
+
+        #[test]
+        fn backoff_doubles_to_the_cap() {
+            let mut w = plain_writer("127.0.0.1:1");
+            for _ in 0..16 {
+                w.schedule_retry();
+            }
+            assert_eq!(w.backoff, SYSLOG_RECONNECT_BACKOFF_MAX);
+        }
+
+        #[test]
+        fn tracked_sink_counts_an_unavailable_collector() {
+            // #3651 — end to end through the worker-side wrapper: the record is
+            // dropped, the worker is not stopped (`Ok`), and the loss is counted
+            // with no delivery recorded.
+            let stats = Arc::new(DeliveryStats::default());
+            let mut tracked = super::super::DeliveryTracker {
+                inner: plain_writer("127.0.0.1:1"),
+                sink: LogSink::Syslog,
+                stats: Arc::clone(&stats),
             };
             let framed = octet_count(&format_rfc5424(6, "t", "h", "a", "1", b"hi"));
-            let n = w.write(&framed).expect("lossy write returns Ok");
-            assert_eq!(n, framed.len());
-            assert_eq!(
-                w.dropped, 1,
-                "the refused send must increment the drop counter"
-            );
-            assert!(
-                w.conn.is_none(),
-                "a failed send clears the connection for retry"
-            );
+            tracked
+                .write_all(&framed)
+                .expect("the worker never sees the error");
+            tracked
+                .write_all(&framed)
+                .expect("the worker never sees the error");
+            assert_eq!(stats.write_failures(), 2);
+            assert_eq!(stats.delivered(), 0);
+            assert_eq!(stats.last_success_unix_ms(), None);
+        }
+
+        #[test]
+        fn tracked_sink_counts_delivery_to_a_live_collector() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let address = listener.local_addr().expect("local addr").to_string();
+            let reader = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = Vec::new();
+                io::Read::read_to_end(&mut stream, &mut buf).expect("read");
+                buf
+            });
+            let stats = Arc::new(DeliveryStats::default());
+            let framed = octet_count(&format_rfc5424(6, "t", "h", "a", "1", b"hi"));
+            {
+                let mut tracked = super::super::DeliveryTracker {
+                    inner: plain_writer(&address),
+                    sink: LogSink::Syslog,
+                    stats: Arc::clone(&stats),
+                };
+                tracked.write_all(&framed).expect("write");
+            }
+            assert_eq!(reader.join().expect("reader"), framed);
+            assert_eq!(stats.delivered(), 1);
+            assert_eq!(stats.write_failures(), 0);
+            assert!(stats.last_success_unix_ms().is_some());
+        }
+
+        #[test]
+        fn address_resolution_is_bounded() {
+            // #3651 — a resolver that hangs must not hold the worker past the
+            // deadline.
+            let started = Instant::now();
+            let err = resolve_with_deadline(
+                || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(Vec::new())
+                },
+                Duration::from_millis(50),
+            )
+            .expect_err("a hung resolver times out");
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn empty_resolution_is_an_error_not_a_panic() {
+            let err = connect_any("nowhere:1", &[], Instant::now() + SYSLOG_CONNECT_TIMEOUT)
+                .expect_err("no addresses");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
 
         #[test]
@@ -1084,7 +1613,9 @@ mod tests {
             syslog_address: Some("logs.example.com:6514".to_string()),
             ..Default::default()
         };
-        let err = init_syslog_logging(&cfg).unwrap_err().to_string();
+        let err = build_syslog_dispatch(&cfg, &Arc::new(DeliveryStats::default()))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("requires a build with `--features syslog`"),
             "got: {err}"
@@ -1101,26 +1632,15 @@ mod tests {
             enabled: Some(true),
             ..Default::default()
         };
-        let err = init_syslog_logging(&cfg).unwrap_err().to_string();
+        let err = build_syslog_dispatch(&cfg, &Arc::new(DeliveryStats::default()))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("requires a collector address"), "got: {err}");
-    }
-
-    /// Process-wide lock so tests that swap the global tracing
-    /// subscriber via `try_init` don't race each other.
-    fn subscriber_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        // COVERAGE: poisoned-lock recovery closure (line 204) reachable
-        //           only after a test thread panics holding the lock.
-        //           Tests are non-panicking so the closure body stays
-        //           uncovered — structural cap per L0.7 playbook §3c.
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
     }
 
     #[test]
     fn init_file_logging_returns_guard_when_enabled() {
-        let _g = subscriber_lock();
+        let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = LoggingConfig {
             enabled: Some(true),
@@ -1130,18 +1650,25 @@ mod tests {
             structured: Some(false),
             ..Default::default()
         };
-        // The first call returns Some(guard); the appender lazily
-        // creates the file on first write so we just verify a guard
-        // came back and the configured dir survives.
-        let guard = init_file_logging(&cfg).unwrap();
-        assert!(
-            guard.is_some(),
-            "init_file_logging must return a WorkerGuard when enabled"
-        );
-        assert!(tmp.path().is_dir());
-        // Guard drop flushes the buffer; explicit drop confirms no
-        // panic on shutdown.
-        drop(guard);
+        // #3651 — built, not installed: the pipeline is driven through a
+        // scoped dispatcher so no test depends on which one won the global.
+        let pipeline = build_log_pipeline(&cfg)
+            .unwrap()
+            .expect("an enabled file sink builds a pipeline");
+        tracing::dispatcher::with_default(pipeline.dispatch(), || {
+            tracing::info!(target: "ai_memory", "pipeline-3651-probe");
+        });
+        let stats = Arc::clone(&pipeline.stats);
+        // Dropping the guard flushes the queue and joins the worker.
+        pipeline.shutdown();
+        assert_eq!(stats.delivered(), 1, "the one event was delivered");
+        assert_eq!(stats.write_failures(), 0);
+        assert!(stats.last_success_unix_ms().is_some());
+        let written: String = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert!(written.contains("pipeline-3651-probe"), "got: {written}");
     }
 
     /// #1463 Tier 1 — `sink = "stdout"` selects the stdout non-blocking
@@ -1151,7 +1678,7 @@ mod tests {
     /// so this is race-free.
     #[test]
     fn init_file_logging_returns_guard_when_stdout_sink() {
-        let _g = subscriber_lock();
+        let _env = crate::test_support::env_lock();
         let cfg = LoggingConfig {
             enabled: Some(true),
             sink: Some("stdout".to_string()),
@@ -1159,12 +1686,11 @@ mod tests {
             level: Some("info".to_string()),
             ..Default::default()
         };
-        let guard = init_file_logging(&cfg).unwrap();
+        let pipeline = build_log_pipeline(&cfg).unwrap();
         assert!(
-            guard.is_some(),
-            "stdout sink must return a WorkerGuard when enabled"
+            pipeline.is_some(),
+            "stdout sink must build a pipeline when enabled"
         );
-        drop(guard);
     }
 
     #[test]
@@ -1190,7 +1716,7 @@ mod tests {
 
     #[test]
     fn init_file_logging_emits_structured_json_when_configured() {
-        let _g = subscriber_lock();
+        let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = LoggingConfig {
             enabled: Some(true),
@@ -1200,9 +1726,20 @@ mod tests {
             structured: Some(true),
             ..Default::default()
         };
-        let guard = init_file_logging(&cfg).unwrap();
-        assert!(guard.is_some(), "structured branch must produce a guard");
-        drop(guard);
+        let pipeline = build_log_pipeline(&cfg)
+            .unwrap()
+            .expect("structured branch must build a pipeline");
+        tracing::dispatcher::with_default(pipeline.dispatch(), || {
+            tracing::info!(target: "ai_memory", "structured-3651-probe");
+        });
+        pipeline.shutdown();
+        let written: String = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        let line = written.lines().next().expect("one record written");
+        let record: serde_json::Value = serde_json::from_str(line).expect("structured = JSON");
+        assert_eq!(record["fields"]["message"], "structured-3651-probe");
     }
 
     #[test]
@@ -1314,30 +1851,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // L0.7-2 Tier A — try_init second-call debug path + default-cfg
-    // pass-through (`enabled = None` -> disabled)
+    // L0.7-2 Tier A — default-cfg pass-through (`enabled = None` ->
+    // disabled). #3651 retired the "second init returns Some(guard)" pin:
+    // a duplicate install is now an error, proven in its own process by
+    // tests/logging_pipeline_3651.rs.
     // -----------------------------------------------------------------
-
-    #[test]
-    fn init_file_logging_second_call_does_not_panic() {
-        let _g = subscriber_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = LoggingConfig {
-            enabled: Some(true),
-            path: Some(tmp.path().to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
-            ..Default::default()
-        };
-        // First call sets up the global subscriber (or no-ops if a
-        // prior test already grabbed it). Second call's try_init must
-        // fail-soft via the debug! arm without panicking.
-        let _first = init_file_logging(&cfg);
-        let second = init_file_logging(&cfg).expect("second init must not error");
-        assert!(
-            second.is_some(),
-            "second init still returns Some(guard); try_init failure goes to debug! not Err"
-        );
-    }
 
     #[test]
     fn init_file_logging_default_enabled_field_is_off() {
@@ -1346,6 +1864,163 @@ mod tests {
         let cfg = LoggingConfig::default();
         let guard = init_file_logging(&cfg).expect("disabled returns Ok(None)");
         assert!(guard.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // #3651 — delivery accounting, rate-limited diagnostics, queue loss
+    // -----------------------------------------------------------------
+
+    /// A destination that refuses every write, as a full disk or a closed
+    /// pipe does.
+    struct RefusingWriter;
+
+    impl Write for RefusingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::StorageFull, "no space left"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::StorageFull, "no space left"))
+        }
+    }
+
+    #[test]
+    fn failed_writes_are_counted_and_never_reach_the_worker() {
+        let stats = Arc::new(DeliveryStats::default());
+        let mut tracked = DeliveryTracker {
+            inner: RefusingWriter,
+            sink: LogSink::File,
+            stats: Arc::clone(&stats),
+        };
+        // `Ok` keeps the worker alive; the loss is in the counters.
+        tracked
+            .write_all(b"one\n")
+            .expect("the worker never sees the error");
+        tracked.flush().expect("the worker never sees the error");
+        assert_eq!(
+            stats.write_failures(),
+            2,
+            "a failed write and a failed flush"
+        );
+        assert_eq!(stats.delivered(), 0);
+        assert_eq!(stats.last_success_unix_ms(), None);
+    }
+
+    #[test]
+    fn successful_writes_record_delivery_time() {
+        let stats = Arc::new(DeliveryStats::default());
+        let mut tracked = DeliveryTracker {
+            inner: Vec::new(),
+            sink: LogSink::Stdout,
+            stats: Arc::clone(&stats),
+        };
+        tracked.write_all(b"one\n").unwrap();
+        tracked.write_all(b"two\n").unwrap();
+        assert_eq!(tracked.inner, b"one\ntwo\n");
+        assert_eq!(stats.delivered(), 2);
+        assert_eq!(stats.write_failures(), 0);
+        assert!(stats.last_success_unix_ms().is_some());
+    }
+
+    #[test]
+    fn failure_diagnostics_are_rate_limited() {
+        let stats = DeliveryStats::default();
+        let t0 = 1_000_000;
+        assert_eq!(
+            stats.record_failure(t0),
+            Some(0),
+            "the first failure reports at once"
+        );
+        assert_eq!(stats.record_failure(t0 + 1), None);
+        assert_eq!(
+            stats.record_failure(t0 + SINK_DIAGNOSTIC_INTERVAL_MS - 1),
+            None
+        );
+        assert_eq!(
+            stats.record_failure(t0 + SINK_DIAGNOSTIC_INTERVAL_MS),
+            Some(2),
+            "the next report carries the failures folded since the last one"
+        );
+        assert_eq!(
+            stats.write_failures(),
+            4,
+            "every failure is counted, reported or not"
+        );
+    }
+
+    #[test]
+    fn failure_diagnostic_names_the_sink_and_the_counter() {
+        let err = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        let line = sink_failure_diagnostic(LogSink::Syslog, &err, 7);
+        assert!(line.contains("syslog log sink"), "got: {line}");
+        assert!(line.contains("refused"), "got: {line}");
+        assert!(line.contains("7 further failures"), "got: {line}");
+        assert!(
+            line.contains(crate::metrics::LOG_WRITE_FAILURES_TOTAL),
+            "got: {line}"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_is_counted_as_dropped() {
+        // A destination that blocks until released stands in for a stalled
+        // stdout pipe. With a one-line queue, everything past the line the
+        // worker holds and the one queued behind it is dropped.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        struct Stalled(std::sync::mpsc::Receiver<()>);
+        impl Write for Stalled {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                // Ends with an error once the sender is dropped; the
+                // DeliveryTracker counts it and the test does not care.
+                let _ = self.0.recv();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let stats = Arc::new(DeliveryStats::default());
+        let (mut writer, guard, queue_dropped) =
+            tracked_non_blocking(Stalled(release_rx), LogSink::Stdout, stats, 1);
+        for _ in 0..10 {
+            writer.write_all(b"line\n").unwrap();
+        }
+        let dropped = queue_dropped.dropped_lines();
+        assert!(
+            dropped >= 8,
+            "expected at least 8 dropped lines, got {dropped}"
+        );
+        drop(release_tx);
+        drop(guard);
+    }
+
+    #[test]
+    fn status_reports_counters_only_for_an_active_pipeline() {
+        let stats = DeliveryStats::default();
+        stats.record_success(42);
+        let (writer, guard, queue_dropped) = tracked_non_blocking(
+            Vec::new(),
+            LogSink::File,
+            Arc::new(DeliveryStats::default()),
+            1,
+        );
+        let status = LogPipelineStatus::active(LogSink::File, &stats, &queue_dropped);
+        assert_eq!(status.state, LogPipelineState::Active);
+        assert_eq!(status.sink, Some(LogSink::File));
+        assert_eq!(status.records_delivered, Some(1));
+        assert_eq!(status.write_failures, Some(0));
+        assert_eq!(status.queue_dropped, Some(0));
+        assert_eq!(status.last_delivery_unix_ms, Some(42));
+        drop(writer);
+        drop(guard);
+    }
+
+    #[test]
+    fn boot_refusal_message_names_the_error_and_the_remedies() {
+        let msg = boot_refusal_message(&anyhow::anyhow!("creating log dir /nope"));
+        assert!(msg.contains("refusing to start"), "got: {msg}");
+        assert!(msg.contains("creating log dir /nope"), "got: {msg}");
+        assert!(msg.contains("[logging].enabled = false"), "got: {msg}");
+        assert!(msg.contains("ai-memory doctor"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------
@@ -1360,7 +2035,7 @@ mod tests {
         // failure. ensure_dir_secure fails when create_dir_all fails;
         // we trigger that by pointing path at a child of a regular
         // file (ENOTDIR).
-        let _g = subscriber_lock();
+        let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"file").unwrap();
@@ -1372,12 +2047,7 @@ mod tests {
             rotation: Some("never".to_string()),
             ..Default::default()
         };
-        let res = init_file_logging(&cfg);
-        assert!(
-            res.is_err(),
-            "init_file_logging must propagate create_dir failure"
-        );
-        let err = res.unwrap_err();
+        let err = build_log_pipeline(&cfg).expect_err("create_dir failure must propagate");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("creating log dir") || msg.contains("creating log directory"),
@@ -1392,7 +2062,7 @@ mod tests {
         // resolve_log_dir errors when the config path is world-writable;
         // the fallback then picks the platform default.
         use std::os::unix::fs::PermissionsExt;
-        let _g = subscriber_lock();
+        let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let bad = tmp.path().join("worldwrite");
         std::fs::create_dir(&bad).unwrap();
