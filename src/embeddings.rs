@@ -1439,7 +1439,11 @@ impl Embedder {
             ),
             Ok(v) => (Some(v), EmbedStatus::Indexed),
             Err(e) => {
-                let reason = format!("{e:#}");
+                // #3648: arbitrary local/remote error chains are not caller-safe.
+                // Downcast only the bounded provider diagnostic; discard all contexts.
+                let reason = e
+                    .downcast_ref::<crate::llm::ProviderError>()
+                    .map_or_else(|| "embedding_failed".to_string(), ToString::to_string);
                 tracing::warn!(target: "embeddings.degrade", reason = %reason, "embed_with_status: embedder failed");
                 (None, EmbedStatus::Failed(reason))
             }

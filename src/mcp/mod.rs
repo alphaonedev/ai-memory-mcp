@@ -179,6 +179,19 @@ fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
     }
 }
 
+// #3648: handler strings may contain arbitrary downstream data.
+const MCP_TOOL_FAILED: &str = "mcp_tool_failed";
+
+fn log_dispatch_outcome(elapsed_ms: u64, result: &Result<Value, String>) {
+    match result {
+        Ok(_) => tracing::info!(elapsed_ms, "ok"),
+        Err(_) => tracing::warn!(elapsed_ms, error_code = MCP_TOOL_FAILED, "err"),
+    }
+}
+
+#[cfg(test)]
+mod provider_redaction_3648_tests;
+
 /// PR-5 (issue #487): emit an audit event for an MCP `tools/call`
 /// dispatch. Per-handler emissions inside `handle_store` /
 /// `handle_delete` already produce their canonical events; this
@@ -241,8 +254,8 @@ fn audit_emit_for_mcp_dispatch(
             scope: None,
         },
     );
-    if let Err(e) = result {
-        builder = builder.error(e.clone());
+    if result.is_err() {
+        builder = builder.error(MCP_TOOL_FAILED.to_string());
     }
     crate::audit::emit(builder);
 }
@@ -3702,10 +3715,7 @@ fn handle_request(
             // exporters can chart per-tool p95/p99 against PERFORMANCE.md
             // budgets without needing per-handler instrumentation.
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            match &result {
-                Ok(_) => tracing::info!(elapsed_ms, "ok"),
-                Err(err) => tracing::warn!(elapsed_ms, error = %err, "err"),
-            }
+            log_dispatch_outcome(elapsed_ms, &result);
 
             // PR-5 (issue #487): MCP-dispatch-level audit emission for
             // mutation/recall tools that the per-handler instrumentation
