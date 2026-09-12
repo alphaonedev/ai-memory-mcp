@@ -12800,9 +12800,24 @@ mod tests {
             text.contains("REFLECTION_DEPTH_EXCEEDED"),
             "expected typed error prefix; got {text}",
         );
-        assert!(text.contains("depth 2"), "got {text}");
-        assert!(text.contains("max_reflection_depth 1"), "got {text}",);
-        assert!(text.contains("namespace='team/r-depth'"), "got {text}",);
+        // #3638 — the tenant gets the typed code and nothing else. The
+        // attempted depth, the namespace's configured cap and the namespace
+        // name are PRIVATE POLICY: they go to the operator's log, never to
+        // the caller who tripped the limit. Asserting their ABSENCE is the
+        // point of this test now — it is the redaction guard, not a
+        // formatting check.
+        assert!(
+            !text.contains("depth 2"),
+            "attempted depth leaked to the tenant: {text}",
+        );
+        assert!(
+            !text.contains("max_reflection_depth"),
+            "configured cap leaked to the tenant: {text}",
+        );
+        assert!(
+            !text.contains("team/r-depth"),
+            "namespace leaked to the tenant: {text}",
+        );
     }
 
     // ─── C. Authorization / approval-gate path (L1-8) ────────────────
@@ -12836,8 +12851,15 @@ mod tests {
         assert!(payload["pending_id"].is_string());
         assert_eq!(payload["action"], "reflect");
         assert_eq!(payload["namespace"], "team/r-approve");
+        // The caller's OWN proposed depth is their input coming back and
+        // stays. The namespace's configured approval threshold does not:
+        // #3638 moved it to the operator log, because it tells a tenant
+        // where another namespace's policy boundary sits.
         assert_eq!(payload["proposed_depth"], 2);
-        assert_eq!(payload["require_approval_above_depth"], 1);
+        assert!(
+            payload.get("require_approval_above_depth").is_none(),
+            "private approval threshold leaked to the tenant: {payload}",
+        );
     }
 
     #[test]
