@@ -1,31 +1,77 @@
+# 2026-09-12: one-time operator-authorized coverage correction for #3623.
+# The old scanner skipped roughly 13.9k production lines; newly frozen counts
+# are pre-existing duplication, verified against unmodified release sources.
+# Test-item literals are removed; no new production duplication is grandfathered.
+# Burn-down: #3668. The decrease-only ratchet resumes after this correction.
 # hardcoded-literal duplication baseline (ratchet; counts may only DECREASE).
 # Regenerate with: scripts/check-hardcoded-literals.sh --update-baseline
 # Format: <site-count><TAB><literal>. Burn this down; never grow it.
-3	AI_MEMORY_LLM_API_KEY
+3	<anonymous>
+5	AI_MEMORY_EMBED_OFFLINE
 3	AI_MEMORY_LLM_BACKEND
 4	AI_MEMORY_LLM_BASE_URL
 3	ANTHROPIC_API_KEY
-4	{}/api/tags
-3	application/json
-3	confidence
-3	content-type
-4	create_time
-4	{decision}
 3	GOOGLE_API_KEY
-9	http://localhost:11434
-5	mini_lm_l6_v2
-3	nomic-ai/nomic-embed-text-v1.5
-4	nomic-embed-text-v1.5
-4	nomic_embed_v15
 3	OPENAI_API_KEY
-6	openrouter
-3	schema_version
-4	sentence-transformers/all-MiniLM-L6-v2
 5	T0-A1-CORE
 4	T0-A2-CORE
 3	T0-A2-FULL
 3	T0-A2-GRAPH
 3	T0-CONTRACT
-6	to_describe_to_user
 3	What tools do you have available right now? Answer in one sentence to a non-technical user.
 3	XAI_API_KEY
+3	ai_memory::identity::attest
+10	ai_memory::identity::replay
+3	application/json
+5	attest_level
+3	autonomous
+3	budget_overflow
+3	budget_tokens_remaining
+3	budget_tokens_used
+5	confidence
+3	config.json
+3	conflict: already exists
+3	content-type
+4	create_time
+3	created_at
+3	current_version
+3	delivered_at
+3	derives_from
+7	description
+4	edit_source
+4	expected_version
+3	expires_at
+3	federation::peer_attestation
+3	folder_path
+4	governance
+8	http://localhost:11434
+3	inline_skill
+6	inputSchema
+3	iterations
+3	loaded_under_active_profile
+3	memory_recall (rerank stage, depth=1)
+4	memory_search (FTS5)
+5	memory_store
+4	memory_store (no embedding)
+5	mini_lm_l6_v2
+3	model_family
+3	nomic-ai/nomic-embed-text-v1.5
+3	nomic-embed-text-v1.5
+4	nomic_embed_v15
+3	observations
+3	older_than_days
+6	openrouter
+3	owner-level action has no resolvable owner
+7	pending_id
+3	potential_contradictions
+6	properties
+5	recall response is always a JSON object
+6	schema_version
+4	sentence-transformers/all-MiniLM-L6-v2
+3	set_embeddings_batch
+3	target_tier 'short' is not a valid promote target (would be a downgrade)
+3	target_tier must be one of 'mid' or 'long' (got '{other}')
+6	to_describe_to_user
+3	to_namespace
+3	update_embedding
+4	{decision}

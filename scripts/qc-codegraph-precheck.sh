@@ -36,6 +36,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT}/scripts/lib/production-lines.sh"
 ALLOW_DIR="${ROOT}/scripts/qc-codegraph-allowlists"
 ALLOW_FOR_AGENT="${ALLOW_DIR}/caller-context-literals.txt"
 ALLOW_FOR_ADMIN="${ALLOW_DIR}/for-admin-bypass.txt"
@@ -57,6 +58,7 @@ fi
 # production file containing a sentinel-form for_admin call, expects
 # the main check to HARD-BLOCK, then cleans up.
 if [[ "${1:-}" == "--self-test" ]]; then
+    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     PROBE="${ROOT}/src/c8_probe_1651.rs"
     trap 'rm -f "${PROBE}"' EXIT
     cat > "${PROBE}" <<'PROBE_EOF'
@@ -73,47 +75,16 @@ PROBE_EOF
     exit 0
 fi
 
-# Enumerate "production" sites: rg/grep through src/, then drop any
-# line that is inside a `#[cfg(test)] mod tests {` block. The
-# heuristic: per-file, the first occurrence of `#[cfg(test)]` (or
-# `#[cfg(any(test, ...))]` etc.) starts the test region; everything
-# above it is production. Test files (`*test*.rs`) are skipped
-# entirely.
+# Enumerate production sites through the shared #3623 item filter.
 collect_sites () {
     local pattern="$1"
     local mode="${2:-literal}"
     local out=""
-    # find src files, skip *test*.rs by name + tests/ subdirs of src
+    # Find src files; production_lines applies the test exclusions.
     while IFS= read -r -d '' f; do
-        # Skip files whose basename signals test-only.
-        local bn
-        bn="$(basename "$f")"
-        case "$bn" in
-            *test*.rs|tests.rs) continue ;;
-        esac
-        # Find the test-region boundary: the first NON-COMMENT
-        # `#[cfg(test)]` attribute whose next line opens a `mod` block.
-        # #1651 — the old "first #[cfg(test)] anywhere" heuristic was
-        # defeated by (a) a comment mentioning the attribute
-        # (daemon_runtime.rs:2062 hid the EMBEDDING_BACKFILL site 2000
-        # lines later) and (b) `#[cfg(test)] use ...` import gates
-        # (curator/compaction.rs:52). Only a cfg(test) mod ends the
-        # production region.
-        local test_line=999999999
-        local tl nl
-        while IFS=: read -r tl _; do
-            [[ -z "${tl}" ]] && continue
-            # comment lines can't carry a live attribute
-            if sed -n "${tl}p" "$f" | grep -qE '^[[:space:]]*(//|\*)'; then
-                continue
-            fi
-            nl=$(sed -n "$((tl + 1))p" "$f")
-            if printf '%s\n' "$nl" | grep -qE '^[[:space:]]*(pub( |\() *)?mod '; then
-                test_line=$tl
-                break
-            fi
-        done <<< "$(grep -n '#\[cfg(test)\]\|#\[cfg(any(test' "$f" 2>/dev/null || true)"
-        # Find matching lines and filter to lineno < test_line.
+        local production
+        production="$(production_lines "$f")"
+        # Find matching lines with original source line numbers.
         # Pattern format: `for_agent("LIT")` or `for_admin("LIT")`.
         #
         # NOTE: the inner match list is captured into a variable and fed
@@ -129,17 +100,14 @@ collect_sites () {
             # bypass is the call itself, in ANY argument form. The
             # pre-#1651 literal-only grep went blind when #1558 moved
             # every site onto sentinel consts.
-            matches="$(grep -n "${pattern}(" "$f" 2>/dev/null || true)"
+            matches="$(printf '%s\n' "$production" | grep -n "${pattern}(" || true)"
         else
-            matches="$(grep -n "${pattern}(\"" "$f" 2>/dev/null || true)"
+            matches="$(printf '%s\n' "$production" | grep -n "${pattern}(\"" || true)"
         fi
         [[ -z "${matches}" ]] && continue
         while IFS=: read -r lineno content; do
             # Skip blank/no-match
             [[ -z "${lineno}" ]] && continue
-            if (( lineno >= test_line )); then
-                continue
-            fi
             # Skip comment lines (//, ///, block-comment continuations) —
             # prose mentioning the call is not a call site (#1651).
             if printf '%s\n' "$content" | grep -qE '^[[:space:]]*(//|\*)'; then
@@ -172,6 +140,17 @@ collect_sites () {
                 # Strip the absolute prefix so the allowlist is
                 # repo-root-relative (and stable across checkouts).
                 local rel="${f#"${ROOT}/"}"
+                # #3623 Conductor ruling: this one tenant-reachable governance
+                # read is adjudicated separately by #3638 (policy disclosure
+                # redaction). It is NOT an approved system-internal bypass.
+                # Re-pinned at release e8d8eb67a after the authorized rebase.
+                # Pin the exact release-base site, not the file/principal: a
+                # moved, changed, or additional call must be reviewed again.
+                if [[ "$mode" == "any-arg" && "$rel" == "src/store/postgres.rs" \
+                    && "$lineno" == 31500 \
+                    && "$content" == '            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);' ]]; then
+                    continue
+                fi
                 out+="${rel}:${lineno}:${literal}"$'\n'
             fi
         done <<< "${matches}"
