@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
+
+- **#3273 (governance / process integrity) — the merge commits `c3344757`
+  (#3240) and `06e6d01b` (#3235) both claimed "Fable final-gate reviewed +
+  approved; required CI green incl. postgres lane." Both clauses are
+  false.** Fable never reviewed or approved either merge (they pre-date
+  the 2026-08-27 operator-directed merge gate). The required "Certified
+  pg+AGE cells" check was RED at both merge times; for #3240 it was red
+  on PR head `9ef4a636` (job 98372981498, `recall_purity_p01_postgres.rs:316`).
+  Git merge messages are immutable; this dated note is the public
+  correction. The technical work in those merges is assessed separately.
+  The live merge gate requires a real Fable APPROVE-MERGE signal naming
+  the head SHA.
+
 ### Security (#3549 — one caller-authority resolver beneath every handler)
 
 - **#3549 (SECURITY, ga-blocker) — `identity::authority::Authority { principal,
