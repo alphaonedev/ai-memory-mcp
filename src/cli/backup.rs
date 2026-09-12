@@ -2069,17 +2069,55 @@ struct ManifestFacts {
 /// manifest vouched for (`--skip-verify`, `--allow-unsigned-manifest`).
 const RESTORE_UNVERIFIED_AUDIT_KIND: &str = "backup_restore_unverified";
 
-/// v1.0.0 #3199 — WARN on stderr and record a forensic audit row for a
-/// restore that no verified manifest vouches for. The audit row goes to the
-/// off-database forensic JSONL, which survives the file swap; when that sink
-/// is not configured the `--json` envelope says so.
+/// v1.0.0 #3661 — the forensic-audit `kind` of the INTENT row, written before
+/// any byte is staged so an aborted unverified restore leaves evidence too.
+const RESTORE_UNVERIFIED_INTENT_KIND: &str = "backup_restore_unverified_intent";
+
+/// v1.0.0 #3661 — what [`note_unverified_restore`] persisted before the
+/// restore staged a byte, carried to the outcome so the two rows link.
+struct RestoreEvidence {
+    /// The intent journal entry, as written (its hash is the outcome's
+    /// `intent_ref`).
+    intent: crate::restore_evidence::RestoreEvidenceEntry,
+    /// `persisted` / `disabled` / `failed: <e>` for the forensic intent row.
+    forensic: String,
+    /// `persisted` / `failed: <e>` for the journal append (path when ok).
+    journal: Result<PathBuf, String>,
+    actor: String,
+}
+
+/// Render a sink outcome for the envelope: `persisted`, `disabled`, or
+/// `failed: <reason>`.
+fn sink_outcome<T>(r: &Result<Option<T>>) -> String {
+    match r {
+        Ok(Some(_)) => crate::restore_evidence::SINK_PERSISTED.to_string(),
+        Ok(None) => crate::restore_evidence::SINK_DISABLED.to_string(),
+        Err(e) => format!("{}{e:#}", crate::restore_evidence::SINK_FAILED_PREFIX),
+    }
+}
+
+/// v1.0.0 #3199 / #3661 — WARN on stderr and persist the INTENT of a restore
+/// that no verified manifest vouches for, before any byte is staged.
+///
+/// Two sinks, each acknowledged and each reported apart (#3661):
+/// - the off-database forensic JSONL, through
+///   [`crate::governance::audit::try_record_decision_acked`] — write + fsync
+///   acknowledged, `disabled` when the sink is not configured;
+/// - the restore-evidence journal beside the target
+///   ([`crate::restore_evidence::append`]) — fsynced, present whether or not
+///   the forensic sink is, and imported into the `signed_events` spine at the
+///   next open of whatever database is live at that path.
+///
+/// A sink that fails is WARNed on stderr and reported in the envelope; it
+/// does not stop the restore under the standard posture (the asi-hard
+/// posture refuses unverified restores before this runs).
 fn note_unverified_restore(
     out: &mut CliOutput<'_>,
     snapshot: &Path,
     target: &Path,
     outcome: ManifestVerification,
     detail: &str,
-) -> Result<()> {
+) -> Result<RestoreEvidence> {
     writeln!(
         out.stderr,
         "WARNING: restoring {} over {} WITHOUT a verified manifest ({detail}). Nothing \
@@ -2087,12 +2125,12 @@ fn note_unverified_restore(
         snapshot.display(),
         target.display()
     )?;
-    let caller = crate::identity::resolve_agent_id(None, None)
+    let actor = crate::identity::resolve_agent_id(None, None)
         .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
-    crate::governance::audit::record_decision(
-        &caller,
+    let forensic = crate::governance::audit::try_record_decision_acked(
+        &actor,
         "allow",
-        RESTORE_UNVERIFIED_AUDIT_KIND,
+        RESTORE_UNVERIFIED_INTENT_KIND,
         "",
         serde_json::json!({
             "outcome": outcome.as_str(),
@@ -2101,7 +2139,124 @@ fn note_unverified_restore(
             "target": target.to_string_lossy(),
         }),
     );
+    let forensic_outcome = sink_outcome(&forensic);
+    let intent = crate::restore_evidence::RestoreEvidenceEntry {
+        schema: crate::restore_evidence::JOURNAL_SCHEMA,
+        phase: crate::restore_evidence::PHASE_INTENT.to_string(),
+        ts: chrono::Utc::now().to_rfc3339(),
+        actor: actor.clone(),
+        snapshot: snapshot.to_string_lossy().into_owned(),
+        target: target.to_string_lossy().into_owned(),
+        verification: outcome.as_str().to_string(),
+        detail: detail.to_string(),
+        forensic_row: forensic.as_ref().ok().cloned().flatten(),
+        forensic_sink: forensic_outcome.clone(),
+        intent_ref: None,
+        rollback: None,
+        durable_publish: None,
+        imported_at: None,
+    };
+    let journal = crate::restore_evidence::append(target, &intent).map_err(|e| format!("{e:#}"));
+    report_evidence_failures(out, "intent", &forensic_outcome, &journal)?;
+    Ok(RestoreEvidence {
+        intent,
+        forensic: forensic_outcome,
+        journal,
+        actor,
+    })
+}
+
+/// v1.0.0 #3661 — say on stderr, at the moment it happens, which evidence
+/// sink did NOT persist. Silence here is the defect: evidence that exists
+/// only in the terminal is not evidence.
+fn report_evidence_failures(
+    out: &mut CliOutput<'_>,
+    phase: &str,
+    forensic: &str,
+    journal: &Result<PathBuf, String>,
+) -> Result<()> {
+    if let Some(reason) = forensic.strip_prefix(crate::restore_evidence::SINK_FAILED_PREFIX) {
+        writeln!(
+            out.stderr,
+            "WARNING: the forensic audit row for this unverified restore ({phase}) could not \
+             be persisted: {reason} (#3661)"
+        )?;
+    }
+    if let Err(reason) = journal {
+        writeln!(
+            out.stderr,
+            "WARNING: the restore-evidence journal entry ({phase}) could not be persisted: \
+             {reason} — nothing durable outside this terminal records this restore (#3661)"
+        )?;
+    }
     Ok(())
+}
+
+/// v1.0.0 #3661 — after the publish: the acknowledged forensic OUTCOME row
+/// (linked to the intent row), the journal `outcome` entry (linked to the
+/// intent entry), and the `audit_sink` envelope object reporting what each
+/// sink actually persisted. The spine row lands at the next open.
+fn record_restore_outcome(
+    evidence: &RestoreEvidence,
+    snapshot: &Path,
+    target: &Path,
+    verification: ManifestVerification,
+    rollback: Option<&Path>,
+    durable_publish: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<serde_json::Value> {
+    let intent_hash = evidence.intent.entry_hash();
+    let forensic = crate::governance::audit::try_record_decision_acked(
+        &evidence.actor,
+        "allow",
+        RESTORE_UNVERIFIED_AUDIT_KIND,
+        "",
+        serde_json::json!({
+            "outcome": verification.as_str(),
+            "detail": evidence.intent.detail,
+            "snapshot": snapshot.to_string_lossy(),
+            "target": target.to_string_lossy(),
+            "rollback": rollback.map(|p| p.to_string_lossy().into_owned()),
+            "durable_publish": durable_publish,
+            "intent_forensic_row": evidence.intent.forensic_row,
+            "intent_journal_entry": intent_hash,
+        }),
+    );
+    let forensic_outcome = sink_outcome(&forensic);
+    let outcome = crate::restore_evidence::RestoreEvidenceEntry {
+        schema: crate::restore_evidence::JOURNAL_SCHEMA,
+        phase: crate::restore_evidence::PHASE_OUTCOME.to_string(),
+        ts: chrono::Utc::now().to_rfc3339(),
+        actor: evidence.actor.clone(),
+        snapshot: snapshot.to_string_lossy().into_owned(),
+        target: target.to_string_lossy().into_owned(),
+        verification: verification.as_str().to_string(),
+        detail: evidence.intent.detail.clone(),
+        forensic_row: forensic.as_ref().ok().cloned().flatten(),
+        forensic_sink: forensic_outcome.clone(),
+        intent_ref: Some(intent_hash),
+        rollback: rollback.map(|p| p.to_string_lossy().into_owned()),
+        durable_publish: Some(durable_publish),
+        imported_at: None,
+    };
+    let journal = crate::restore_evidence::append(target, &outcome).map_err(|e| format!("{e:#}"));
+    report_evidence_failures(out, "outcome", &forensic_outcome, &journal)?;
+    let journal_value = |r: &Result<PathBuf, String>| match r {
+        Ok(_) => serde_json::Value::String(crate::restore_evidence::SINK_PERSISTED.to_string()),
+        Err(e) => serde_json::Value::String(format!(
+            "{}{e}",
+            crate::restore_evidence::SINK_FAILED_PREFIX
+        )),
+    };
+    Ok(serde_json::json!({
+        "forensic": { "intent": evidence.forensic, "outcome": forensic_outcome },
+        "journal": {
+            "path": crate::restore_evidence::journal_path(target).to_string_lossy(),
+            "intent": journal_value(&evidence.journal),
+            "outcome": journal_value(&journal),
+        },
+        "spine": crate::restore_evidence::SPINE_PENDING_IMPORT,
+    }))
 }
 
 /// v1.0.0 #3550 — what a restore holds on the old and the new database
@@ -2285,14 +2440,16 @@ fn run_restore_with(
     //
     // Manifest pre-checks that need no bytes: cross-backend and
     // forward-schema. The sha256 itself is checked on the STAGED copy below.
+    // #3661 — the intent evidence, persisted before any byte is staged.
+    let mut evidence: Option<RestoreEvidence> = None;
     let (manifest, verification) = if args.skip_verify {
-        note_unverified_restore(
+        evidence = Some(note_unverified_restore(
             out,
             &snapshot_path,
             &target_db,
             ManifestVerification::Skipped,
             "--skip-verify: no manifest was read",
-        )?;
+        )?);
         (None, ManifestVerification::Skipped)
     } else {
         if !manifest_path.exists() {
@@ -2350,13 +2507,13 @@ fn run_restore_with(
                         manifest_path.display()
                     );
                 }
-                note_unverified_restore(
+                evidence = Some(note_unverified_restore(
                     out,
                     &snapshot_path,
                     &target_db,
                     ManifestVerification::UnsignedAllowed,
                     detail,
-                )?;
+                )?);
                 (
                     ManifestFacts {
                         sha256: plain.sha256,
@@ -2822,6 +2979,21 @@ fn run_restore_with(
     remove_staged_sidecars(&staged_path);
 
     let durable_publish = pre_sync.is_ok() && post_sync.is_ok();
+    // #3661 — the outcome evidence, linked to the intent, each sink reported
+    // as it actually persisted. `None` for a signed restore (nothing to
+    // record).
+    let audit_sink = match evidence.as_ref() {
+        Some(ev) => Some(record_restore_outcome(
+            ev,
+            &snapshot_path,
+            &target_db,
+            verification,
+            rollback.as_deref(),
+            durable_publish,
+            out,
+        )?),
+        None => None,
+    };
     if json_out {
         writeln!(
             out.stdout,
@@ -2841,15 +3013,11 @@ fn run_restore_with(
                 "selected_by": selected_by.as_str(),
                 // v1.0.0 #3199 — `signed`, `unsigned_allowed` or `skipped`.
                 "manifest_verification": verification.as_str(),
-                // v1.0.0 #3199 — where the audit row for an unverified
-                // restore went; `null` for a signed one (nothing to record).
-                "audit_sink": (verification != ManifestVerification::Signed).then(|| {
-                    if crate::governance::audit::is_enabled() {
-                        "forensic_jsonl"
-                    } else {
-                        "disabled"
-                    }
-                }),
+                // v1.0.0 #3199 / #3661 — what each evidence sink ACTUALLY
+                // persisted for an unverified restore (`forensic.{intent,
+                // outcome}`, `journal.{path,intent,outcome}`, `spine`); `null`
+                // for a signed one (nothing to record).
+                "audit_sink": audit_sink,
             })
         )?;
     } else {
@@ -2859,6 +3027,19 @@ fn run_restore_with(
             snapshot_path.display(),
             target_db.display()
         )?;
+        if let Some(sink) = audit_sink.as_ref() {
+            writeln!(
+                out.stdout,
+                "Evidence: forensic intent={} outcome={}; journal {} (intent={} outcome={}); \
+                 spine: {} (#3661)",
+                sink["forensic"]["intent"].as_str().unwrap_or_default(),
+                sink["forensic"]["outcome"].as_str().unwrap_or_default(),
+                sink["journal"]["path"].as_str().unwrap_or_default(),
+                sink["journal"]["intent"].as_str().unwrap_or_default(),
+                sink["journal"]["outcome"].as_str().unwrap_or_default(),
+                sink["spine"].as_str().unwrap_or_default(),
+            )?;
+        }
         if let Some(path) = rollback.as_ref() {
             writeln!(
                 out.stdout,
@@ -4139,6 +4320,7 @@ mod tests {
 
     // v1.0.0 #3199 — the signed-manifest cert battery lives in
     // `src/cli/backup/tests/signed_manifest_3199.rs`.
+    mod restore_evidence_3661;
     mod signed_manifest_3199;
 
     /// `stage_and_verify` never touches the target: that is the whole point

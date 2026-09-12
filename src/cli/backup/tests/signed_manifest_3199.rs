@@ -363,9 +363,10 @@ fn an_unsigned_manifest_restores_only_with_the_flag_3199() {
     restore(&mut env, &db, &args, test_restore_policy(false)).expect("explicitly accepted");
     let e = envelope(&env);
     assert_eq!(e[VERIFICATION], serde_json::json!("unsigned_allowed"));
+    // #3661 — the sink report is an object naming what each sink persisted.
     assert!(
-        e["audit_sink"].is_string(),
-        "the audit sink is reported: {e}"
+        e["audit_sink"].is_object() && e["audit_sink"]["forensic"]["intent"].is_string(),
+        "the audit sinks are reported: {e}"
     );
     assert!(
         env.stderr_str().contains(UNVERIFIED_WARNING),

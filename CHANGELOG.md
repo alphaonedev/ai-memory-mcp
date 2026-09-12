@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3661 — unverified-restore evidence is durable, acknowledged and imported into the spine)
+
+- **#3661 (observability, HIGH; audit #3645 F15) — a restore that no verified
+  manifest vouched for (`--skip-verify`, `--allow-unsigned-manifest`) now
+  leaves evidence that outlives the terminal.** The forensic rows (a new
+  `backup_restore_unverified_intent` before any byte is staged, the existing
+  `backup_restore_unverified` after the publish) go through the new
+  `governance::audit::try_record_decision_acked` — write + fsync acknowledged,
+  `disabled` reported apart from `failed` — instead of the fire-and-forget
+  `record_decision` that swallowed writer failures. A fsynced journal beside
+  the database (`<db>.restore-evidence.jsonl`, new `restore_evidence` module)
+  records `intent` and `outcome` lines linked by hash whether or not the
+  forensic sink is configured, and `db::open` imports every un-imported line
+  as a `backup.restore_unverified` signed event into the spine of whichever
+  database is live at that path (restored, rolled back, or left by an aborted
+  publish), then stamps it — one `stat` per open when no journal exists, and
+  never a refused open. `--json` `audit_sink` becomes an object reporting what
+  each sink actually persisted (`forensic.{intent,outcome}`,
+  `journal.{path,intent,outcome}`, `spine`), and every sink failure is WARNed
+  on stderr. Tests: acknowledged sinks + import at next open, forensic-sink
+  failure (read-only directory), sink disabled, rollback copy-back, aborted
+  publish (intent-only), journal idempotency and malformed-line tolerance.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`

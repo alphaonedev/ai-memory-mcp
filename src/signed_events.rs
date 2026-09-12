@@ -170,6 +170,12 @@ pub(crate) const SIGNED_EVENTS_TRACE_TARGET: &str = "signed_events";
 
 #[allow(dead_code)]
 pub mod event_types {
+    /// v1.0.0 #3661 — one entry of the restore-evidence journal imported into
+    /// this spine at open: a restore that no verified manifest vouched for
+    /// (`intent` before the bytes were staged, `outcome` after the publish).
+    /// The payload hash commits to the journal line, which names the
+    /// acknowledged forensic row.
+    pub const BACKUP_RESTORE_UNVERIFIED: &str = "backup.restore_unverified";
     /// `signed_events.event_type` for `db::create_link` /
     /// `db::create_link_signed` writes (the canonical link-write audit
     /// emission). 4 production callsites pre-sweep: 2 in

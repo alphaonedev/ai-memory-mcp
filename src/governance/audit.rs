@@ -143,6 +143,14 @@ enum WriteOp {
         path: PathBuf,
         line: String,
     },
+    /// #3661 — an append whose caller waits for the write AND its fsync,
+    /// and is told the outcome. Restore evidence uses it: "enqueued" is not
+    /// "persisted".
+    AppendAcked {
+        path: PathBuf,
+        line: String,
+        ack: Sender<std::result::Result<(), String>>,
+    },
     Barrier(Sender<()>),
     /// Flush and drop any cached destination handle. Sent by `init` so a
     /// re-init never keeps writing to a handle whose file was rotated or
@@ -202,32 +210,23 @@ fn run_writer(rx: Receiver<WriteOp>) {
         for op in batch {
             match op {
                 WriteOp::Append { path, line } => {
-                    let reopen = open_file.as_ref().map_or(true, |(p, _)| p != &path);
-                    if reopen {
-                        match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(file) => open_file = Some((path, file)),
-                            Err(e) => {
-                                tracing::error!(
-                                    target: AUDIT_TRACE_TARGET,
-                                    "forensic: opening {} failed: {e}",
-                                    path.display()
-                                );
-                                open_file = None;
-                                continue;
-                            }
-                        }
+                    if write_line(&mut open_file, path, &line).is_ok() {
+                        needs_flush = true;
                     }
-                    if let Some((path, file)) = open_file.as_mut() {
-                        if let Err(e) = writeln!(file, "{line}") {
-                            tracing::error!(
-                                target: AUDIT_TRACE_TARGET,
-                                "forensic: appending to {} failed: {e}",
-                                path.display()
-                            );
-                        } else {
-                            needs_flush = true;
-                        }
+                }
+                // #3661 — acknowledged append: the caller learns whether the
+                // row reached stable storage (write + fsync), not only that
+                // it was enqueued.
+                WriteOp::AppendAcked { path, line, ack } => {
+                    let result = write_line(&mut open_file, path, &line).and_then(|()| {
+                        open_file
+                            .as_mut()
+                            .map_or(Ok(()), |(_, file)| file.sync_data())
+                    });
+                    if result.is_ok() {
+                        needs_flush = true;
                     }
+                    let _ = ack.send(result.map_err(|e| e.to_string()));
                 }
                 WriteOp::Barrier(ack) => pending_barriers.push(ack),
                 WriteOp::Reset => {
@@ -249,6 +248,41 @@ fn run_writer(rx: Receiver<WriteOp>) {
             let _ = ack.send(());
         }
     }
+}
+
+/// Open (or reuse) the destination file and append one line. The error is
+/// logged here once and returned, so an acknowledged append can report it
+/// while the fire-and-forget path keeps its logged-and-dropped posture.
+fn write_line(
+    open_file: &mut Option<(PathBuf, File)>,
+    path: PathBuf,
+    line: &str,
+) -> std::io::Result<()> {
+    let reopen = open_file.as_ref().is_none_or(|(p, _)| p != &path);
+    if reopen {
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => *open_file = Some((path, file)),
+            Err(e) => {
+                tracing::error!(
+                    target: AUDIT_TRACE_TARGET,
+                    "forensic: opening {} failed: {e}",
+                    path.display()
+                );
+                *open_file = None;
+                return Err(e);
+            }
+        }
+    }
+    let Some((path, file)) = open_file.as_mut() else {
+        return Err(std::io::Error::other("forensic: no destination file"));
+    };
+    writeln!(file, "{line}").inspect_err(|e| {
+        tracing::error!(
+            target: AUDIT_TRACE_TARGET,
+            "forensic: appending to {} failed: {e}",
+            path.display()
+        );
+    })
 }
 
 /// Block until the background writer has durably appended every row
@@ -438,11 +472,74 @@ pub fn try_record_decision(
     rule_id: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
+    let Some((file_path, line, _hash)) =
+        prepare_forensic_row(actor, decision, kind, rule_id, payload)?
+    else {
+        return Ok(());
+    };
+    writer()?
+        .send(WriteOp::Append {
+            path: file_path,
+            line,
+        })
+        .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
+    Ok(())
+}
+
+/// v1.0.0 #3661 — the ACKNOWLEDGED sibling of [`try_record_decision`]: blocks
+/// until the background writer has appended the row and `fsync`ed the file,
+/// and returns the row's self-hash so durable evidence elsewhere can name it.
+///
+/// Returns `Ok(None)` when the forensic sink is not configured — "disabled"
+/// is a different fact from "failed", and callers report the two apart.
+///
+/// # Errors
+///
+/// The sink lock is poisoned, the row cannot be serialised, the writer
+/// thread is unavailable, or the append / fsync failed.
+pub fn try_record_decision_acked(
+    actor: &str,
+    decision: &str,
+    kind: &str,
+    rule_id: &str,
+    payload: serde_json::Value,
+) -> Result<Option<String>> {
+    let Some((file_path, line, hash)) =
+        prepare_forensic_row(actor, decision, kind, rule_id, payload)?
+    else {
+        return Ok(None);
+    };
+    let (ack, done) = std::sync::mpsc::channel();
+    writer()?
+        .send(WriteOp::AppendAcked {
+            path: file_path,
+            line,
+            ack,
+        })
+        .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
+    match done.recv() {
+        Ok(Ok(())) => Ok(Some(hash)),
+        Ok(Err(e)) => Err(anyhow!("forensic append failed: {e}")),
+        Err(_) => Err(anyhow!("forensic audit writer dropped the acknowledgement")),
+    }
+}
+
+/// Build, sign, hash-chain and serialise one forensic row under the sink
+/// lock, advancing the in-memory chain head. Returns `None` when no sink is
+/// configured. Shared by the fire-and-forget and the acknowledged appends so
+/// the two cannot diverge in what a row is.
+fn prepare_forensic_row(
+    actor: &str,
+    decision: &str,
+    kind: &str,
+    rule_id: &str,
+    payload: serde_json::Value,
+) -> Result<Option<(PathBuf, String, String)>> {
     let mut guard = sink()
         .lock()
         .map_err(|_| anyhow!("forensic sink mutex poisoned"))?;
     let Some(s) = guard.as_mut() else {
-        return Ok(());
+        return Ok(None);
     };
 
     let now = Utc::now();
@@ -470,20 +567,12 @@ pub fn try_record_decision(
     let line = serde_json::to_string(&row).context("serialising forensic row")?;
     let file_path = daily_path(&s.dir, &now);
 
-    // Advance the in-memory chain head and enqueue the durable append —
-    // both while still holding the sink lock, so the order rows reach the
-    // background writer equals their `prev_hash` chain order (and hence
-    // their on-disk order). The blocking open()/write() now runs off the
-    // request thread, removing per-write file I/O from this serialized
-    // critical section (#1472).
-    s.last_hash = self_hash;
-    writer()?
-        .send(WriteOp::Append {
-            path: file_path,
-            line,
-        })
-        .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
-    Ok(())
+    // Advance the in-memory chain head while still holding the sink lock, so
+    // the order rows reach the background writer equals their `prev_hash`
+    // chain order (and hence their on-disk order). The blocking open()/write()
+    // runs off the request thread (#1472).
+    s.last_hash = self_hash.clone();
+    Ok(Some((file_path, line, self_hash)))
 }
 
 /// Fire-and-forget wrapper. Errors logged + swallowed.

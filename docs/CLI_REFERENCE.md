@@ -749,10 +749,30 @@ restored the attacker's bytes. Now:
 | Unsigned (pre-v1.0.0, or taken without the key) | refused unless `--allow-unsigned-manifest` | refused |
 | No manifest (`.bak`, `.pre-restore`, `.pre-repair`) | refused unless `--skip-verify` | refused |
 
-Every accepted unverified restore prints a `WARNING` on stderr, records
-a `backup_restore_unverified` decision in the forensic audit log when
-that sink is enabled, and reports it in `--json` (`manifest_verification`
-and `audit_sink`).
+Every accepted unverified restore prints a `WARNING` on stderr and leaves
+durable evidence in three places (v1.0.0 #3661; pre-#3661 the only record
+was that warning plus a fire-and-forget forensic row whose writer failures
+were swallowed):
+
+- **Forensic audit log** (when that sink is enabled): a
+  `backup_restore_unverified_intent` decision BEFORE any byte is staged and a
+  `backup_restore_unverified` decision after the publish, each **acknowledged**
+  — the restore waits for the append and its fsync and reports the result.
+- **A journal beside the database**, `<db>.restore-evidence.jsonl`: an
+  `intent` line and an `outcome` line (linked by hash, each naming its
+  forensic row), fsynced on write. It is a sibling file of the path, not
+  content of the database, so it survives the swap and a rollback copy-back.
+- **The `signed_events` spine, at the next open**: `db::open` imports every
+  not-yet-imported journal line as a `backup.restore_unverified` signed event
+  into whichever database is live at that path — the restored one, the
+  rolled-back one, or the one an aborted publish left — and stamps the line
+  `imported_at`. The import never refuses an open.
+
+`--json` reports `manifest_verification` and an `audit_sink` object that says
+what each sink ACTUALLY persisted: `forensic.{intent,outcome}` and
+`journal.{intent,outcome}` are `persisted`, `disabled` (forensic only) or
+`failed: <reason>`; `journal.path` names the file; `spine` is
+`pending_import_at_next_open`. A sink that fails is also WARNed on stderr.
 
 **`backup` without a key.** Under the standard posture a host with no
 operator signing key writes an **unsigned** manifest and WARNs; that

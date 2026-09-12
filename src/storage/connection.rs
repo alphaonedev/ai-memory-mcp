@@ -1017,6 +1017,12 @@ pub fn open(path: &Path) -> Result<Connection> {
     // check withholds (Unknown) and this is a silent no-op.
     crate::governance::audit::enforce_rollback_check_at_open(&conn)
         .context("open-time rollback-evidence check")?;
+    // v1.0.0 #3661 — import the restore-evidence journal beside this path (an
+    // unverified restore's `intent` / `outcome` entries) into the
+    // `signed_events` spine of whichever database is live here: the restored
+    // one, or the rolled-back one. One `stat` when there is no journal; never
+    // refuses the open (a DR restore must stay openable).
+    crate::restore_evidence::import_at_open(&conn, path);
     Ok(conn)
 }
 

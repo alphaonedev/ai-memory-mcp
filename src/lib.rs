@@ -833,6 +833,9 @@ pub mod vectorlite;
 // refusals. Extends the substrate's default-deny-able egress posture to
 // outbound LLM/embedding vendor POSTs at the semantic/smart tiers.
 pub mod egress;
+/// v1.0.0 #3661 — durable evidence for unverified restores (journal beside the
+/// database + import into the signed-events spine at the next open).
+pub mod restore_evidence;
 // v1.0.0 G28 (#1838) — forbidden-export-class taxonomy + fail-closed
 // export-boundary enforcement (private key material / master-threshold
 // secrets / governance signing keys / biometric-behavioral embeddings must
