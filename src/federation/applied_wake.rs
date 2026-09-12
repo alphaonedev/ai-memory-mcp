@@ -225,7 +225,10 @@ async fn store_get(
 }
 
 /// SAL probe (the postgres receive funnel and the SAL catch-up), taken before
-/// the apply with the same caller context the apply uses.
+/// the apply. `ctx` must read without visibility filtering (an admin context),
+/// like the sqlite probe's `db::get`: an inbox row is private to its
+/// recipient, so a sender-scoped read would miss a row already held and let a
+/// replay wake again. The same holds for [`fire_store`].
 #[cfg(feature = "sal")]
 pub(crate) async fn probe_store(
     store: &dyn crate::store::MemoryStore,

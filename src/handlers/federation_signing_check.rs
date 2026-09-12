@@ -275,6 +275,13 @@ pub(super) async fn sync_push_via_store(
     }
 
     let ctx = crate::store::CallerContext::for_agent(body.sender_agent_id.clone());
+    // #3631 — the inbox-wake probes must read the row whatever its scope, as
+    // the sqlite twin's `db::get` does. An inbox row is private to its
+    // recipient, so reading it as the sender would hide it: the post-apply
+    // read would never wake, and a pre-apply read of a row already held would
+    // miss it and let a replay wake again. The read feeds only the wake
+    // decision; nothing it returns reaches the peer.
+    let inbox_wake_ctx = federation_apply_ctx(body.sender_agent_id.clone());
     // Wave-2 B5 — SAL `/sync/push` write-dispatch record-stop CHOKEPOINT
     // (postgres twin of `refuse_if_record_stopped` on the sqlite path).
     // Every receive write below is fenced here so a new funnel cannot
@@ -652,9 +659,12 @@ pub(super) async fn sync_push_via_store(
         // persisted row is byte-identical to the signed unit this node verified;
         // `row_is_agent_attested` reads the post-`apply` `to_insert`.
         // #3631 — postgres twin of the sqlite funnel's pre-apply inbox probe.
-        let inbox_wake_pre =
-            crate::federation::applied_wake::probe_store(app.store.as_ref(), &ctx, &to_insert)
-                .await;
+        let inbox_wake_pre = crate::federation::applied_wake::probe_store(
+            app.store.as_ref(),
+            &inbox_wake_ctx,
+            &to_insert,
+        )
+        .await;
         match app
             .store
             .merge_inbound(
@@ -678,7 +688,7 @@ pub(super) async fn sync_push_via_store(
                 // an inbox message it has not seen (postgres twin).
                 crate::federation::applied_wake::fire_store(
                     app.store.as_ref(),
-                    &ctx,
+                    &inbox_wake_ctx,
                     inbox_wake_pre,
                     &to_insert,
                     &applied_id,
