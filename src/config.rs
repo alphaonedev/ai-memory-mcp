@@ -4155,6 +4155,24 @@ pub struct CuratorSection {
     /// [`ENV_TRANSCRIPT_CLASSIFY_ENABLED`]).
     #[serde(default)]
     pub transcript_classify_enabled: Option<bool>,
+
+    /// #3587 U3 — `[curator].stale_ruling_days`: age in days after which a
+    /// live, un-superseded ruling (tag `ruling` or `metadata.ruling_key`) is
+    /// reported stale by the curator's stale-ruling sweep. `None` / `0`
+    /// resolves to the named const
+    /// [`crate::curator::DEFAULT_STALE_RULING_DAYS`] (14). CONFIG-FILE-ONLY:
+    /// there is deliberately NO env override for this knob.
+    #[serde(default)]
+    pub stale_ruling_days: Option<u64>,
+
+    /// #3587 U3 — `[curator].notify_agent_id`: the RECIPIENT of the
+    /// stale-ruling digest. `None` (the default) disables the digest — the
+    /// sweep still detects and reports. This is never the sender: the digest
+    /// is always sent by the curator's own resolved id. Validated against the
+    /// reserved-agent-id set at curator startup (audit-A F14). CONFIG-FILE-ONLY:
+    /// no env override.
+    #[serde(default)]
+    pub notify_agent_id: Option<String>,
 }
 
 /// v0.8.0 #1749 — `[curator.compaction]` activation knobs for the Pillar-2.5
@@ -9785,6 +9803,36 @@ impl AppConfig {
             .unwrap_or(false)
     }
 
+    /// #3587 U3 — resolve `[curator].stale_ruling_days`.
+    ///
+    /// CONFIG-FILE-ONLY (no env override, by the GA "no new env knobs" rule
+    /// recorded in the #3587 audit). `None` and `0` both resolve to the named
+    /// const [`crate::curator::DEFAULT_STALE_RULING_DAYS`] so a typo can never
+    /// flag the whole corpus as stale.
+    #[must_use]
+    pub fn resolve_stale_ruling_days(&self) -> u64 {
+        self.curator
+            .as_ref()
+            .and_then(|c| c.stale_ruling_days)
+            .filter(|d| *d > 0)
+            .unwrap_or(crate::curator::DEFAULT_STALE_RULING_DAYS)
+    }
+
+    /// #3587 U3 — resolve `[curator].notify_agent_id`, the stale-ruling digest
+    /// RECIPIENT. CONFIG-FILE-ONLY (no env override). Blank / whitespace-only
+    /// values are treated as unset. This value is validated against the
+    /// reserved-agent-id set before any sweep runs (audit-A F14) — see
+    /// [`crate::curator::validate_notify_agent_id`].
+    #[must_use]
+    pub fn resolve_curator_notify_agent_id(&self) -> Option<String> {
+        self.curator
+            .as_ref()
+            .and_then(|c| c.notify_agent_id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// v0.8.0 #1750 — resolve the consolidation cosine gate threshold. Uniform
     /// ladder: `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` env >
     /// `[curator.compaction].cosine_threshold` config > compiled default
@@ -14841,6 +14889,7 @@ max_page_size = 1000000
                 reflection_namespaces: Some(ns_map),
                 confidence_decay_half_life_days: None,
                 compaction: None,
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -14880,6 +14929,7 @@ max_page_size = 1000000
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: Some(hl),
                 compaction: None,
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -14925,6 +14975,7 @@ max_page_size = 1000000
                     enabled: Some(true),
                     cosine_threshold: None,
                 }),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -14942,6 +14993,7 @@ max_page_size = 1000000
                     enabled: Some(false),
                     cosine_threshold: None,
                 }),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -14957,6 +15009,7 @@ max_page_size = 1000000
                     enabled: None,
                     cosine_threshold: None,
                 }),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -14983,6 +15036,7 @@ max_page_size = 1000000
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: None,
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -14997,6 +15051,7 @@ max_page_size = 1000000
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: None,
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -15012,6 +15067,7 @@ max_page_size = 1000000
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: None,
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -15046,6 +15102,7 @@ max_page_size = 1000000
                     enabled: None,
                     cosine_threshold: Some(0.9),
                 }),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -15064,6 +15121,7 @@ max_page_size = 1000000
                     enabled: None,
                     cosine_threshold: Some(1.5),
                 }),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };

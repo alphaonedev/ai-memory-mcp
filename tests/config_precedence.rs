@@ -395,6 +395,7 @@ fn test_compaction_enabled_env_overrides_config_and_default() {
                 enabled,
                 cosine_threshold: None,
             }),
+            ..Default::default()
         }),
         ..AppConfig::default()
     };
@@ -516,6 +517,7 @@ fn test_compaction_cosine_threshold_env_overrides_config_and_default() {
                 enabled: None,
                 cosine_threshold: ct,
             }),
+            ..Default::default()
         }),
         ..AppConfig::default()
     };
@@ -1618,5 +1620,69 @@ mod strict_decrypt_reads_2383 {
                 "{falsy:?} must fall through to the split posture"
             );
         }
+    }
+}
+
+/// #3587 U3 — the stale-ruling knobs are CONFIG-FILE-ONLY by design: the GA
+/// "no new env knobs" rule means there is deliberately no `AI_MEMORY_*`
+/// override for either. These tests pin that posture plus the two
+/// fall-through rules (unset and `0` both resolve to the compiled 14-day
+/// default, so a typo can never flag the whole corpus as stale) and the
+/// recipient's blank-is-unset normalization.
+mod stale_ruling_config_3587 {
+    use super::EnvVarGuard;
+    use ai_memory::config::{AppConfig, CuratorSection};
+    use ai_memory::curator::DEFAULT_STALE_RULING_DAYS;
+
+    fn with_curator(days: Option<u64>, notify: Option<&str>) -> AppConfig {
+        AppConfig {
+            curator: Some(CuratorSection {
+                stale_ruling_days: days,
+                notify_agent_id: notify.map(str::to_string),
+                ..CuratorSection::default()
+            }),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn stale_ruling_days_is_config_file_only_3587() {
+        // An env var that merely LOOKS like the knob must be ignored.
+        let _env = EnvVarGuard::set("AI_MEMORY_CURATOR_STALE_RULING_DAYS", "99".to_string());
+        assert_eq!(
+            with_curator(None, None).resolve_stale_ruling_days(),
+            DEFAULT_STALE_RULING_DAYS,
+            "unset resolves to the compiled default, not the env"
+        );
+        assert_eq!(
+            with_curator(Some(3), None).resolve_stale_ruling_days(),
+            3,
+            "the config value wins over the (ignored) env"
+        );
+        assert_eq!(
+            with_curator(Some(0), None).resolve_stale_ruling_days(),
+            DEFAULT_STALE_RULING_DAYS,
+            "0 is a typo guard, not 'everything is stale'"
+        );
+    }
+
+    #[test]
+    fn notify_agent_recipient_resolution_3587() {
+        assert_eq!(
+            with_curator(None, None).resolve_curator_notify_agent_id(),
+            None
+        );
+        assert_eq!(
+            with_curator(None, Some("  ai:fable  "))
+                .resolve_curator_notify_agent_id()
+                .as_deref(),
+            Some("ai:fable"),
+            "surrounding whitespace is trimmed"
+        );
+        assert_eq!(
+            with_curator(None, Some("   ")).resolve_curator_notify_agent_id(),
+            None,
+            "blank is treated as unset (digest disabled)"
+        );
     }
 }

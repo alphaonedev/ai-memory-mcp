@@ -4183,6 +4183,26 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3587 U3 — read-only scan for live stale rulings: rows that are
+    /// rulings (tag `ruling` or a `metadata.ruling_key`), older than
+    /// `cutoff_rfc3339`, carrying no supersede / verify marker, and — for
+    /// keyed rows — the latest for their `(namespace, ruling_key)`.
+    ///
+    /// This is a pure SELECT; the U3 guarantee is that it never writes to the
+    /// ruling rows (`version` / `updated_at` unchanged, `archived_memories`
+    /// delta 0). Both adapters override.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn list_stale_rulings(
+        &self,
+        _cutoff_rfc3339: &str,
+        _cap: usize,
+    ) -> StoreResult<Vec<crate::storage::StaleRuling>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_STALE_RULINGS".to_string(),
+        })
+    }
+
     /// Restore an archived memory back to the live `memories` table.
     /// Returns true iff a row was restored. Adapters MUST:
     /// 1. Return Ok(false) when no archive row matches.

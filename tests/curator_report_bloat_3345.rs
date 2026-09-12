@@ -98,7 +98,7 @@ fn seed_substrate_and_ordinary(conn: &rusqlite::Connection) -> String {
 
 fn write_self_report(conn: &rusqlite::Connection) {
     let pass = ai_memory::autonomy::AutonomyPassReport::default();
-    ai_memory::autonomy::persist_self_report(conn, 12, &pass, 1, 0, 0, 0)
+    ai_memory::autonomy::persist_self_report(conn, 12, &pass, 1, 0, 0, 0, 0, &[])
         .expect("persist_self_report");
 }
 

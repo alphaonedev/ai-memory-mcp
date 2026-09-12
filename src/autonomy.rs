@@ -973,6 +973,11 @@ pub fn persist_self_report(
     // themselves.
     personas_generated: usize,
     errors_total: usize,
+    // #3587 U3 — stale-ruling sweep summary. `stale_ruling_ids` is ALREADY the
+    // capped top-N list (the caller never passes the full set), so the durable
+    // `_curator/reports` row stays bounded (#3345).
+    stale_rulings_found: usize,
+    stale_ruling_ids: &[String],
 ) -> Result<()> {
     let now = chrono::Utc::now();
     let ts = now.to_rfc3339();
@@ -982,6 +987,8 @@ pub fn persist_self_report(
         "auto_tagged": auto_tagged,
         "contradictions_found": contradictions_found,
         "personas_generated": personas_generated,
+        "stale_rulings_found": stale_rulings_found,
+        "stale_ruling_ids": stale_ruling_ids,
         "clusters_formed": pass_report.clusters_formed,
         "memories_consolidated": pass_report.memories_consolidated,
         "memories_forgotten": pass_report.memories_forgotten,
@@ -2239,7 +2246,7 @@ mod tests {
             errors: vec![],
             ..AutonomyPassReport::default()
         };
-        persist_self_report(&conn, 1234, &pass, 3, 0, 0, 0).unwrap();
+        persist_self_report(&conn, 1234, &pass, 3, 0, 0, 0, 0, &[]).unwrap();
         let reports = db::list(
             &conn,
             Some("_curator/reports"),

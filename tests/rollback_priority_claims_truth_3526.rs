@@ -248,6 +248,7 @@ mod sal {
             apply: false,
             rollback: None,
             rollback_last: None,
+            stale_rulings: false,
             reflect: false,
             namespace: None,
             max_depth: None,

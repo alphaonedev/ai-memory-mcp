@@ -2769,6 +2769,17 @@ impl MemoryStore for SqliteStore {
         db::size_gc(&conn, namespace, max_corpus_bytes, archive).map_err(box_err)
     }
 
+    async fn list_stale_rulings(
+        &self,
+        cutoff_rfc3339: &str,
+        cap: usize,
+    ) -> StoreResult<Vec<crate::storage::StaleRuling>> {
+        // READ-ONLY: unlike `size_gc`, this is a pure SELECT, so it must NOT
+        // consult the #3175 record-stop write gate (a read is never a write).
+        let conn = self.state.lock().await;
+        db::list_stale_rulings(&conn, cutoff_rfc3339, cap).map_err(box_err)
+    }
+
     async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         // v1.0.0 #3271 (in-class parity) — honour the trait's caller-owns
         // contract on this adapter too. Pre-fix this method discarded `_ctx`
