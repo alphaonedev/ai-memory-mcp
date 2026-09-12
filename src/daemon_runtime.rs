@@ -2871,65 +2871,9 @@ pub async fn run(
             }
         }
         Command::Reown(a) => {
-            // v0.8.0 #1709/#1720 WS-B B2 — namespace ownership re-stamp.
-            // v1.0.0 #3124 R4 — a `postgres://` store (the flag or the
-            // #1927 env channels, resolved exactly as `curator` / `serve`
-            // resolve it) routes through the SAL `MemoryStore::reown`; the
-            // async store build happens BEFORE the stdout lock is taken so no
-            // `!Send` guard is held across an `.await` (the `quarantine`
-            // precedent). Everything else is the local SQLite leg, which keeps
-            // the #2572 funnel.
-            let resolved = crate::store_url::resolve_store_url(a.store_url.as_deref())?;
-            let pg_url = resolved
-                .as_deref()
-                .filter(|u| crate::store_url::is_postgres_url(u));
-            if let Some(url) = pg_url {
-                #[cfg(feature = "sal")]
-                {
-                    let store = build_curator_store(Some(url), &db_path, app_config).await?;
-                    let stdout = std::io::stdout();
-                    let stderr = std::io::stderr();
-                    let mut so = stdout.lock();
-                    let mut se = stderr.lock();
-                    let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                    match cli::reown::run_store(
-                        store.as_ref(),
-                        &a,
-                        cli_agent_id.as_deref(),
-                        &mut out,
-                    )
-                    .await?
-                    {
-                        0 => return Ok(()),
-                        code => std::process::exit(code),
-                    }
-                }
-                #[cfg(not(feature = "sal"))]
-                {
-                    anyhow::bail!(
-                        "reown on {} requires the 'sal' build feature; this binary was built \
-                         without it",
-                        crate::logging::redact_url_password(url)
-                    );
-                }
-            }
-            if let Some(flag) = a.store_url.as_deref()
-                && !crate::store_url::is_postgres_url(flag)
-            {
-                // A non-postgres `--store-url` would silently operate a
-                // different database than the one named; refuse instead.
-                anyhow::bail!(
-                    "reown --store-url accepts a postgres:// store only; use --db for a \
-                     SQLite file (got {})",
-                    crate::logging::redact_url_password(flag)
-                );
-            }
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::reown::run(&db_path, &a, cli_agent_id.as_deref(), &mut out)? {
+            // v0.8.0 #1709/#1720 WS-B B2 + v1.0.0 #3124 R4 — backend routing
+            // lives in `cli::reown::dispatch` (qual_10 budget).
+            match cli::reown::dispatch(&a, &db_path, app_config, cli_agent_id.as_deref()).await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
