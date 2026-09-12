@@ -18,6 +18,12 @@ use rusqlite::Connection;
 
 use crate::models::{GovernancePolicy, Memory, MemoryKind, Tier};
 
+/// #3638 — ONE named tracing target for every reflection diagnostic, on both
+/// the storage and MCP sides, so the refusal detail an operator needs is
+/// filterable by a single stable target instead of a magic string repeated at
+/// each emit site.
+pub(crate) const REFLECT_TRACE_TARGET: &str = "mcp.reflect";
+
 use super::{
     ConflictMode, create_link_signed, get, insert_with_conflict, resolve_governance_policy,
 };
@@ -643,7 +649,7 @@ pub fn reflect_with_hooks_for_caller(
         // validation error rather than smashing the existing row.
         let actual_id = insert_with_conflict(conn, &new_mem, ConflictMode::Error).map_err(|e| {
             if e.downcast_ref::<crate::storage::ConflictError>().is_some() {
-                tracing::warn!(target: "mcp.reflect", error = %e, "reflection title conflict");
+                tracing::warn!(target: REFLECT_TRACE_TARGET, error = %e, "reflection title conflict");
                 ReflectError::Validation(
                     "reflection title collides with an existing memory in the same namespace"
                         .into(),

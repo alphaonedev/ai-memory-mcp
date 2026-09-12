@@ -46,7 +46,7 @@ use std::path::Path;
 /// receive fixed messages too. The typed error and its Display stay intact
 /// for internal diagnostics and audit consumers.
 pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
-    tracing::warn!(target: "mcp.reflect", error = %err, "reflection refused");
+    tracing::warn!(target: crate::storage::reflect::REFLECT_TRACE_TARGET, error = %err, "reflection refused");
     match err {
         db::ReflectError::Validation(m) => m,
         db::ReflectError::SourceNotFound(id) => format!("source memory not found: {id}"),
@@ -91,7 +91,7 @@ fn fold_entity_id_into_metadata(metadata: &mut Value, top_level: Option<&str>) {
         Some(present) => {
             if present != alias {
                 tracing::warn!(
-                    target: "mcp.reflect",
+                    target: crate::storage::reflect::REFLECT_TRACE_TARGET,
                     "top-level entity_id alias shadowed by metadata.entity_id (using metadata)"
                 );
             }
@@ -559,7 +559,7 @@ pub fn handle_reflect_caller(
                     })?;
                     crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
                     tracing::info!(
-                        target: "mcp.reflect",
+                        target: crate::storage::reflect::REFLECT_TRACE_TARGET,
                         namespace = %ns,
                         proposed_depth = new_depth_u32,
                         require_approval_above_depth = threshold,
