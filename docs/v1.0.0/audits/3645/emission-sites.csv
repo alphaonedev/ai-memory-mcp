@@ -1,0 +1,1645 @@
+file,line,area,level,target
+loadtest/src/main.rs,177,loadtest/src,eprintln,(module default)
+loadtest/src/main.rs,183,loadtest/src,eprintln,(module default)
+loadtest/src/main.rs,525,loadtest/src,println,(module default)
+loadtest/src/main.rs,526,loadtest/src,println,(module default)
+loadtest/src/main.rs,532,loadtest/src,println,(module default)
+loadtest/src/main.rs,541,loadtest/src,println,(module default)
+loadtest/src/main.rs,542,loadtest/src,println,(module default)
+loadtest/src/main.rs,545,loadtest/src,println,(module default)
+loadtest/src/main.rs,550,loadtest/src,println,(module default)
+loadtest/src/main.rs,559,loadtest/src,println,(module default)
+loadtest/src/main.rs,560,loadtest/src,println,(module default)
+loadtest/src/main.rs,562,loadtest/src,println,(module default)
+loadtest/src/main.rs,565,loadtest/src,println,(module default)
+loadtest/src/main.rs,568,loadtest/src,println,(module default)
+loadtest/src/main.rs,576,loadtest/src,println,(module default)
+loadtest/src/main.rs,577,loadtest/src,println,(module default)
+loadtest/src/main.rs,702,loadtest/src,eprintln,(module default)
+src/actions/mod.rs,953,src/actions,info,lease.sweep
+src/approvals.rs,763,src/approvals.rs,warn,approvals.signed
+src/approvals.rs,1092,src/approvals.rs,warn,approvals.signed
+src/atomisation/curator.rs,271,src/atomisation,warn,atomisation::curator
+src/atomisation/curator.rs,279,src/atomisation,warn,atomisation::curator
+src/atomisation/mod.rs,520,src/atomisation,warn,atomisation
+src/audit.rs,315,src/audit.rs,warn,(module default)
+src/audit.rs,440,src/audit.rs,warn,ai_memory::audit
+src/audit.rs,576,src/audit.rs,error,(module default)
+src/audit.rs,944,src/audit.rs,warn,audit.attestation
+src/autonomy.rs,448,src/autonomy.rs,warn,(module default)
+src/background/access_fold.rs,80,src/background,info,access.fold
+src/background/access_fold.rs,84,src/background,warn,access.fold
+src/background/access_fold.rs,168,src/background,info,access.fold
+src/background/access_fold.rs,172,src/background,warn,access.fold
+src/background/access_fold.rs,181,src/background,info,(module default)
+src/background/access_fold.rs,184,src/background,warn,(module default)
+src/background/atomise_worker.rs,155,src/background,warn,atomise.worker
+src/background/atomise_worker.rs,178,src/background,warn,(module default)
+src/background/atomise_worker.rs,187,src/background,warn,(module default)
+src/background/atomise_worker.rs,236,src/background,info,atomise.worker
+src/background/atomise_worker.rs,243,src/background,info,atomise.worker
+src/background/atomise_worker.rs,248,src/background,error,atomise.worker
+src/background/atomise_worker.rs,269,src/background,warn,atomise.worker
+src/background/auto_tag_worker.rs,125,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,134,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,193,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,201,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,256,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,292,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,300,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,333,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,369,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,382,src/background,warn,(module default)
+src/background/auto_tag_worker.rs,516,src/background,eprintln,(module default)
+src/background/auto_tag_worker.rs,600,src/background,eprintln,(module default)
+src/background/fts_integrity.rs,440,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,453,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,483,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,506,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,530,src/background,error,ai_memory::fts_integrity
+src/background/fts_integrity.rs,573,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,601,src/background,error,ai_memory::fts_integrity
+src/background/fts_integrity.rs,611,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,652,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,676,src/background,info,ai_memory::fts_integrity
+src/background/fts_integrity.rs,694,src/background,warn,ai_memory::fts_integrity
+src/background/fts_integrity.rs,713,src/background,error,ai_memory::fts_integrity
+src/background/lease_sweep.rs,78,src/background,info,lease.sweep
+src/background/lease_sweep.rs,82,src/background,warn,lease.sweep
+src/background/memories_gauge.rs,132,src/background,warn,ai_memory::metrics_gauge
+src/background/memories_gauge.rs,169,src/background,info,ai_memory::metrics_gauge
+src/background/memories_gauge.rs,185,src/background,error,ai_memory::metrics_gauge
+src/background/memories_gauge.rs,255,src/background,warn,ai_memory::metrics_gauge
+src/background/memories_gauge.rs,289,src/background,info,ai_memory::metrics_gauge
+src/background/offload_ttl_sweep.rs,110,src/background,warn,offload.ttl_sweep
+src/background/offload_ttl_sweep.rs,122,src/background,info,offload.ttl_sweep
+src/cli/agents.rs,997,src/cli,println,(module default)
+src/cli/agents.rs,1006,src/cli,println,(module default)
+src/cli/agents.rs,1031,src/cli,println,(module default)
+src/cli/agents.rs,1040,src/cli,println,(module default)
+src/cli/backup.rs,1416,src/cli,warn,schema_guard
+src/cli/commands/atomise.rs,475,src/cli,warn,(module default)
+src/cli/commands/atomise.rs,493,src/cli,warn,(module default)
+src/cli/commands/inbox.rs,173,src/cli,debug,(module default)
+src/cli/commands/inbox.rs,176,src/cli,debug,(module default)
+src/cli/commands/inbox.rs,184,src/cli,warn,(module default)
+src/cli/commands/reembed.rs,507,src/cli,warn,(module default)
+src/cli/curator.rs,166,src/cli,warn,(module default)
+src/cli/curator.rs,463,src/cli,debug,(module default)
+src/cli/curator.rs,587,src/cli,info,(module default)
+src/cli/curator.rs,610,src/cli,info,(module default)
+src/cli/curator.rs,629,src/cli,info,(module default)
+src/cli/curator.rs,775,src/cli,info,curator::compaction
+src/cli/curator.rs,1195,src/cli,info,(module default)
+src/cli/governance_check_action.rs,492,src/cli,warn,(module default)
+src/cli/io.rs,743,src/cli,warn,(module default)
+src/cli/post_store.rs,149,src/cli,warn,(module default)
+src/cli/rules.rs,306,src/cli,warn,(module default)
+src/cli/schema_init.rs,718,src/cli,warn,schema_init
+src/cli/schema_init.rs,731,src/cli,warn,schema_init
+src/cli/schema_init.rs,754,src/cli,warn,schema_init
+src/cli/shell.rs,485,src/cli,println,(module default)
+src/cli/shell.rs,493,src/cli,eprint,(module default)
+src/cli/shell.rs,508,src/cli,println,(module default)
+src/cli/sync.rs,122,src/cli,warn,(module default)
+src/cli/sync.rs,219,src/cli,warn,(module default)
+src/cli/sync.rs,228,src/cli,warn,(module default)
+src/cli/sync.rs,364,src/cli,warn,(module default)
+src/cli/sync.rs,383,src/cli,warn,(module default)
+src/cli/sync.rs,432,src/cli,warn,(module default)
+src/cli/sync.rs,494,src/cli,warn,(module default)
+src/cli/sync.rs,696,src/cli,info,(module default)
+src/cli/sync.rs,790,src/cli,warn,(module default)
+src/cli/verify.rs,122,src/cli,warn,cid.enforce
+src/cli/verify.rs,124,src/cli,info,cid.enforce
+src/cli/wake_hub.rs,483,src/cli,info,(module default)
+src/cli/wake_hub.rs,497,src/cli,warn,(module default)
+src/cli/wake_listen.rs,368,src/cli,warn,(module default)
+src/cli/wake_listen.rs,374,src/cli,warn,(module default)
+src/cli/wake_listen.rs,380,src/cli,error,(module default)
+src/cli/wake_listen.rs,469,src/cli,warn,(module default)
+src/cli/wake_listen.rs,495,src/cli,info,(module default)
+src/cli/wake_listen.rs,507,src/cli,info,(module default)
+src/cli/wake_listen.rs,513,src/cli,warn,(module default)
+src/cli/wake_listen.rs,525,src/cli,error,(module default)
+src/cli/wrap.rs,366,src/cli,warn,(module default)
+src/confidence/calibrate.rs,365,src/confidence,info,confidence.calibrate
+src/confidence/calibrate.rs,584,src/confidence,info,confidence.calibrate
+src/confidence/calibrate.rs,608,src/confidence,info,confidence.calibrate
+src/confidence/shadow.rs,316,src/confidence,warn,confidence.shadow
+src/config.rs,189,src/config.rs,warn,config.max_memory_mb
+src/config.rs,244,src/config.rs,eprintln,(module default)
+src/config.rs,252,src/config.rs,eprintln,(module default)
+src/config.rs,2879,src/config.rs,eprintln,(module default)
+src/config.rs,2923,src/config.rs,eprintln,(module default)
+src/config.rs,2948,src/config.rs,eprintln,(module default)
+src/config.rs,2969,src/config.rs,eprintln,(module default)
+src/config.rs,3757,src/config.rs,warn,(module default)
+src/config.rs,5281,src/config.rs,error,(module default)
+src/config.rs,6010,src/config.rs,eprintln,(module default)
+src/config.rs,6423,src/config.rs,warn,(module default)
+src/config.rs,6825,src/config.rs,warn,governance
+src/config.rs,8087,src/config.rs,warn,(module default)
+src/config.rs,8281,src/config.rs,eprintln,(module default)
+src/config.rs,8286,src/config.rs,eprintln,(module default)
+src/config.rs,8298,src/config.rs,eprintln,(module default)
+src/config.rs,8315,src/config.rs,eprintln,(module default)
+src/config.rs,8415,src/config.rs,eprintln,(module default)
+src/config.rs,8477,src/config.rs,eprintln,(module default)
+src/config.rs,8490,src/config.rs,eprintln,(module default)
+src/config.rs,8663,src/config.rs,warn,(module default)
+src/config.rs,8721,src/config.rs,eprintln,(module default)
+src/config.rs,8753,src/config.rs,eprintln,(module default)
+src/config.rs,8778,src/config.rs,eprintln,(module default)
+src/config.rs,8864,src/config.rs,eprintln,(module default)
+src/config.rs,8877,src/config.rs,eprintln,(module default)
+src/config.rs,8955,src/config.rs,warn,governance
+src/config.rs,8988,src/config.rs,eprintln,(module default)
+src/config.rs,9156,src/config.rs,warn,(module default)
+src/config.rs,9504,src/config.rs,warn,(module default)
+src/config.rs,9519,src/config.rs,warn,(module default)
+src/config.rs,9599,src/config.rs,warn,(module default)
+src/coordination_audit.rs,131,src/coordination_audit.rs,warn,ai_memory::coordination
+src/cost/mod.rs,194,src/cost,debug,cost
+src/cost/mod.rs,216,src/cost,debug,cost
+src/cost/mod.rs,280,src/cost,debug,cost
+src/cost/mod.rs,311,src/cost,debug,cost
+src/cost/mod.rs,340,src/cost,debug,cost
+src/cost/postgres.rs,45,src/cost,debug,cost
+src/cost/postgres.rs,80,src/cost,debug,cost
+src/cost/postgres.rs,144,src/cost,debug,cost
+src/cost/postgres.rs,174,src/cost,debug,cost
+src/cost/postgres.rs,356,src/cost,debug,cost
+src/curator/compaction.rs,288,src/curator,warn,curator::compaction
+src/curator/compaction.rs,551,src/curator,warn,curator::compaction
+src/curator/compaction.rs,593,src/curator,warn,curator::compaction
+src/curator/compaction.rs,632,src/curator,error,curator::compaction
+src/curator/compaction.rs,696,src/curator,warn,curator::compaction
+src/curator/decorrelation_probe.rs,489,src/curator,warn,reflection.decorrelation.advisory
+src/curator/decorrelation_probe.rs,530,src/curator,warn,reflection.decorrelation.advisory
+src/curator/decorrelation_probe.rs,555,src/curator,warn,reflection.decorrelation.advisory
+src/curator/mod.rs,539,src/curator,warn,(module default)
+src/curator/mod.rs,554,src/curator,warn,(module default)
+src/curator/mod.rs,746,src/curator,error,(module default)
+src/curator/mod.rs,1065,src/curator,info,(module default)
+src/curator/mod.rs,1082,src/curator,error,(module default)
+src/curator/mod.rs,1100,src/curator,info,(module default)
+src/curator/mod.rs,1113,src/curator,error,(module default)
+src/curator/mod.rs,1125,src/curator,info,(module default)
+src/curator/mod.rs,1128,src/curator,warn,(module default)
+src/curator/mod.rs,1132,src/curator,error,(module default)
+src/curator/mod.rs,1144,src/curator,info,(module default)
+src/daemon_runtime.rs,1270,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,1440,src/daemon_runtime.rs,info,security.posture
+src/daemon_runtime.rs,1448,src/daemon_runtime.rs,warn,security.posture
+src/daemon_runtime.rs,1476,src/daemon_runtime.rs,info,security.posture.enterprise_federation
+src/daemon_runtime.rs,1485,src/daemon_runtime.rs,warn,security.posture.enterprise_federation
+src/daemon_runtime.rs,1495,src/daemon_runtime.rs,warn,security.posture.enterprise_federation
+src/daemon_runtime.rs,1681,src/daemon_runtime.rs,error,compliance.unenforced
+src/daemon_runtime.rs,1771,src/daemon_runtime.rs,eprintln,(module default)
+src/daemon_runtime.rs,1952,src/daemon_runtime.rs,print,(module default)
+src/daemon_runtime.rs,2318,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,3123,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3264,src/daemon_runtime.rs,warn,ai_memory::daemon_runtime
+src/daemon_runtime.rs,3423,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3486,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3553,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,3561,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3607,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,3633,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3662,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,3676,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,3698,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,3775,src/daemon_runtime.rs,debug,(module default)
+src/daemon_runtime.rs,3807,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3832,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,3841,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3849,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3905,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3916,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,3964,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4011,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4087,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4108,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4134,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4145,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4160,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4242,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4330,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4333,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4335,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4339,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4342,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4346,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4348,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4363,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4381,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4407,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4457,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4465,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4474,src/daemon_runtime.rs,debug,(module default)
+src/daemon_runtime.rs,4538,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4541,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4544,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4549,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4575,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4579,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4587,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4590,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4614,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4628,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4634,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4669,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4677,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4734,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4740,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4774,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,4780,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,4800,src/daemon_runtime.rs,debug,(module default)
+src/daemon_runtime.rs,4801,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5064,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5078,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5116,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5134,src/daemon_runtime.rs,debug,(module default)
+src/daemon_runtime.rs,5224,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5348,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5358,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5381,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5396,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5468,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5485,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5564,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5572,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5590,src/daemon_runtime.rs,debug,(module default)
+src/daemon_runtime.rs,5595,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5643,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5660,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5675,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5714,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5723,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5737,src/daemon_runtime.rs,debug,(module default)
+src/daemon_runtime.rs,5742,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,5825,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,5832,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6194,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6217,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6232,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6337,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6351,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6404,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,6443,src/daemon_runtime.rs,warn,ai_memory::daemon_runtime
+src/daemon_runtime.rs,6613,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,6623,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,6638,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,6644,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,6730,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,6733,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,6735,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6751,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6887,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,6999,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7037,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7044,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,7092,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7117,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7124,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,7149,src/daemon_runtime.rs,warn,http::auth
+src/daemon_runtime.rs,7171,src/daemon_runtime.rs,warn,http::auth
+src/daemon_runtime.rs,7219,src/daemon_runtime.rs,info,http::auth
+src/daemon_runtime.rs,7275,src/daemon_runtime.rs,warn,http::auth
+src/daemon_runtime.rs,7364,src/daemon_runtime.rs,warn,ai_memory::identity::replay
+src/daemon_runtime.rs,7677,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7682,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7698,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,7814,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,7818,src/daemon_runtime.rs,eprintln,(module default)
+src/daemon_runtime.rs,7826,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,7827,src/daemon_runtime.rs,eprintln,(module default)
+src/daemon_runtime.rs,7846,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,7847,src/daemon_runtime.rs,eprintln,(module default)
+src/daemon_runtime.rs,7881,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,7883,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7891,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7930,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7937,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7962,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,7966,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,7997,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,8019,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,8025,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,8034,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,8080,src/daemon_runtime.rs,warn,federation::attestation
+src/daemon_runtime.rs,8083,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,8104,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,8110,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,8159,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,8193,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,8204,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,8223,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,8227,src/daemon_runtime.rs,error,(module default)
+src/daemon_runtime.rs,8312,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8325,src/daemon_runtime.rs,print,(module default)
+src/daemon_runtime.rs,8327,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8328,src/daemon_runtime.rs,print,(module default)
+src/daemon_runtime.rs,8386,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8395,src/daemon_runtime.rs,print,(module default)
+src/daemon_runtime.rs,8437,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8439,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8440,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8441,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8442,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8443,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8444,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8445,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8449,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8450,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8451,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8453,src/daemon_runtime.rs,println,(module default)
+src/daemon_runtime.rs,8678,src/daemon_runtime.rs,warn,federation::scope
+src/daemon_runtime.rs,8696,src/daemon_runtime.rs,warn,federation::scope
+src/daemon_runtime.rs,8769,src/daemon_runtime.rs,warn,federation::scope
+src/daemon_runtime.rs,8865,src/daemon_runtime.rs,info,(module default)
+src/daemon_runtime.rs,8944,src/daemon_runtime.rs,warn,(module default)
+src/daemon_runtime.rs,8953,src/daemon_runtime.rs,info,(module default)
+src/egress.rs,180,src/egress.rs,warn,(module default)
+src/egress.rs,366,src/egress.rs,warn,(module default)
+src/egress.rs,374,src/egress.rs,warn,(module default)
+src/embeddings.rs,130,src/embeddings.rs,warn,recall.embed.budget
+src/embeddings.rs,334,src/embeddings.rs,warn,recall.embed.degraded
+src/embeddings.rs,1051,src/embeddings.rs,eprintln,(module default)
+src/embeddings.rs,1219,src/embeddings.rs,eprintln,(module default)
+src/embeddings.rs,1443,src/embeddings.rs,warn,embeddings.degrade
+src/embeddings.rs,2023,src/embeddings.rs,warn,embeddings.capability_drift
+src/erasure/archive_sync.rs,315,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,343,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,436,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,464,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,478,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,655,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,682,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,766,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,779,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1007,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1085,src/erasure,info,erasure::cold_tier
+src/erasure/archive_sync.rs,1118,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1206,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1220,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1235,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1242,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1258,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1267,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1300,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1317,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1330,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1355,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1378,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1390,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1406,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1416,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1440,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1455,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1489,src/erasure,warn,erasure::cold_tier
+src/erasure/archive_sync.rs,1547,src/erasure,info,erasure::cold_tier
+src/erasure/store.rs,548,src/erasure,warn,erasure::cold_tier
+src/erasure/store.rs,559,src/erasure,warn,erasure::cold_tier
+src/erasure/store.rs,653,src/erasure,warn,erasure::cold_tier
+src/erasure/store.rs,837,src/erasure,warn,(module default)
+src/erasure/store.rs,840,src/erasure,warn,(module default)
+src/erasure/store.rs,880,src/erasure,warn,(module default)
+src/export_taxonomy.rs,374,src/export_taxonomy.rs,warn,(module default)
+src/export_taxonomy.rs,380,src/export_taxonomy.rs,warn,(module default)
+src/export_taxonomy.rs,466,src/export_taxonomy.rs,warn,(module default)
+src/export_taxonomy.rs,471,src/export_taxonomy.rs,warn,(module default)
+src/federation/erasure_outbox.rs,279,src/federation,info,ai_memory::federation::erasure_outbox
+src/federation/erasure_outbox.rs,285,src/federation,warn,ai_memory::federation::erasure_outbox
+src/federation/erasure_outbox.rs,292,src/federation,info,ai_memory::federation::erasure_outbox
+src/federation/erasure_outbox.rs,299,src/federation,warn,ai_memory::federation::erasure_outbox
+src/federation/erasure_outbox.rs,364,src/federation,info,ai_memory::federation::erasure_outbox
+src/federation/erasure_outbox.rs,406,src/federation,warn,ai_memory::federation::erasure_outbox
+src/federation/erasure_outbox.rs,417,src/federation,error,ai_memory::federation::erasure_outbox
+src/federation/erasure_outbox.rs,463,src/federation,warn,ai_memory::federation::erasure_outbox
+src/federation/identity/outbound.rs,137,src/federation,warn,federation::signing
+src/federation/identity/outbound.rs,149,src/federation,warn,federation::signing
+src/federation/identity/renewal.rs,96,src/federation,warn,federation::signing
+src/federation/identity/renewal.rs,103,src/federation,info,federation::signing
+src/federation/identity/renewal.rs,128,src/federation,warn,federation::signing
+src/federation/identity/renewal.rs,132,src/federation,info,federation::signing
+src/federation/identity/renewal.rs,189,src/federation,warn,federation::signing
+src/federation/identity/renewal.rs,202,src/federation,warn,federation::signing
+src/federation/identity/renewal.rs,236,src/federation,warn,federation::signing
+src/federation/identity/trust_bundle.rs,178,src/federation,warn,(module default)
+src/federation/identity/trust_bundle.rs,187,src/federation,warn,(module default)
+src/federation/peer.rs,330,src/federation,info,federation
+src/federation/peer.rs,429,src/federation,info,federation
+src/federation/peer.rs,540,src/federation,warn,federation
+src/federation/peer_attestation.rs,251,src/federation,warn,federation::peer_attestation
+src/federation/peer_attestation.rs,283,src/federation,warn,federation::peer_attestation
+src/federation/peer_attestation.rs,361,src/federation,warn,federation::peer_attestation
+src/federation/peer_posture.rs,279,src/federation,eprintln,(module default)
+src/federation/push_dlq.rs,395,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,615,src/federation,info,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,619,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,636,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,647,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,663,src/federation,info,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,691,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,703,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,791,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,816,src/federation,debug,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,838,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,872,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,880,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,905,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,941,src/federation,info,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,953,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,966,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,988,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,998,src/federation,debug,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1017,src/federation,debug,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1063,src/federation,error,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1078,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1101,src/federation,info,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1118,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1130,src/federation,debug,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1148,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1176,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1188,src/federation,info,ai_memory::federation::push_dlq
+src/federation/push_dlq.rs,1198,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/receive.rs,24,src/federation,debug,(module default)
+src/federation/receive.rs,28,src/federation,debug,(module default)
+src/federation/receive.rs,32,src/federation,warn,(module default)
+src/federation/receive.rs,36,src/federation,info,(module default)
+src/federation/receive.rs,40,src/federation,warn,(module default)
+src/federation/receive.rs,44,src/federation,warn,federation::attestation
+src/federation/receive.rs,87,src/federation,warn,(module default)
+src/federation/receive.rs,255,src/federation,warn,federation::scope
+src/federation/receive.rs,598,src/federation,warn,(module default)
+src/federation/receive.rs,703,src/federation,info,(module default)
+src/federation/receive.rs,894,src/federation,info,(module default)
+src/federation/receive_auth.rs,612,src/federation,warn,(module default)
+src/federation/receive_auth.rs,615,src/federation,warn,(module default)
+src/federation/receive_auth.rs,828,src/federation,warn,federation::attestation
+src/federation/receive_auth.rs,1147,src/federation,warn,federation::attestation
+src/federation/receive_auth.rs,1250,src/federation,warn,federation::attestation
+src/federation/receive_auth.rs,1317,src/federation,warn,federation::attestation
+src/federation/receive_auth.rs,1352,src/federation,warn,federation::attestation
+src/federation/receive_auth.rs,1424,src/federation,warn,federation::attestation
+src/federation/receive_auth.rs,1545,src/federation,warn,federation::attestation
+src/federation/receive_auth.rs,1596,src/federation,warn,federation::attestation
+src/federation/sync.rs,190,src/federation,warn,federation::signing
+src/federation/sync.rs,204,src/federation,warn,federation::signing
+src/federation/sync.rs,430,src/federation,debug,(module default)
+src/federation/sync.rs,562,src/federation,warn,ai_memory::federation::push_dlq
+src/federation/sync.rs,571,src/federation,info,ai_memory::federation::push_dlq
+src/federation/sync.rs,631,src/federation,info,ai_memory::federation::sync
+src/federation/sync.rs,717,src/federation,warn,(module default)
+src/federation/sync.rs,721,src/federation,warn,(module default)
+src/federation/sync.rs,758,src/federation,debug,(module default)
+src/federation/sync.rs,761,src/federation,warn,(module default)
+src/federation/sync.rs,770,src/federation,warn,(module default)
+src/federation/sync.rs,779,src/federation,warn,(module default)
+src/federation/sync.rs,812,src/federation,warn,(module default)
+src/federation/sync.rs,947,src/federation,warn,(module default)
+src/federation/sync.rs,951,src/federation,warn,(module default)
+src/federation/sync.rs,965,src/federation,debug,(module default)
+src/federation/sync.rs,1138,src/federation,warn,(module default)
+src/federation/sync.rs,1142,src/federation,warn,(module default)
+src/federation/sync.rs,1156,src/federation,debug,(module default)
+src/federation/sync.rs,1253,src/federation,warn,(module default)
+src/federation/sync.rs,1257,src/federation,warn,(module default)
+src/federation/sync.rs,1271,src/federation,debug,(module default)
+src/federation/sync.rs,1363,src/federation,warn,(module default)
+src/federation/sync.rs,1367,src/federation,warn,(module default)
+src/federation/sync.rs,1381,src/federation,debug,(module default)
+src/federation/sync.rs,1502,src/federation,warn,(module default)
+src/federation/sync.rs,1509,src/federation,warn,(module default)
+src/federation/sync.rs,1523,src/federation,debug,(module default)
+src/federation/sync.rs,1621,src/federation,warn,(module default)
+src/federation/sync.rs,1628,src/federation,warn,(module default)
+src/federation/sync.rs,1642,src/federation,debug,(module default)
+src/federation/sync.rs,1735,src/federation,warn,(module default)
+src/federation/sync.rs,1742,src/federation,warn,(module default)
+src/federation/sync.rs,1756,src/federation,debug,(module default)
+src/federation/sync.rs,1904,src/federation,warn,(module default)
+src/federation/sync.rs,1911,src/federation,warn,(module default)
+src/federation/sync.rs,1925,src/federation,debug,(module default)
+src/federation/sync.rs,2035,src/federation,warn,(module default)
+src/federation/sync.rs,2042,src/federation,warn,(module default)
+src/federation/sync.rs,2056,src/federation,debug,(module default)
+src/federation/sync.rs,2150,src/federation,warn,(module default)
+src/federation/sync.rs,2157,src/federation,warn,(module default)
+src/federation/sync.rs,2171,src/federation,debug,(module default)
+src/federation/sync.rs,2266,src/federation,warn,(module default)
+src/federation/sync.rs,2273,src/federation,warn,(module default)
+src/federation/sync.rs,2287,src/federation,debug,(module default)
+src/federation/sync.rs,2386,src/federation,warn,(module default)
+src/federation/sync.rs,2393,src/federation,warn,(module default)
+src/federation/sync.rs,2407,src/federation,debug,(module default)
+src/federation/sync.rs,2536,src/federation,warn,(module default)
+src/federation/sync.rs,2541,src/federation,warn,(module default)
+src/forensic/bundle.rs,466,src/forensic,warn,(module default)
+src/governance/agent_action.rs,1121,src/governance,error,governance.rules
+src/governance/agent_action.rs,1373,src/governance,warn,(module default)
+src/governance/agent_action.rs,1466,src/governance,warn,(module default)
+src/governance/agent_action.rs,1488,src/governance,warn,(module default)
+src/governance/audit.rs,210,src/governance,error,ai_memory::governance::audit
+src/governance/audit.rs,222,src/governance,error,ai_memory::governance::audit
+src/governance/audit.rs,268,src/governance,error,ai_memory::governance::audit
+src/governance/audit.rs,498,src/governance,error,ai_memory::governance::audit
+src/governance/audit.rs,654,src/governance,warn,ai_memory::governance::audit
+src/governance/audit.rs,919,src/governance,debug,(module default)
+src/governance/audit.rs,925,src/governance,warn,(module default)
+src/governance/audit.rs,1172,src/governance,warn,ai_memory::governance::audit
+src/governance/audit.rs,1539,src/governance,debug,(module default)
+src/governance/audit.rs,1544,src/governance,debug,(module default)
+src/governance/audit.rs,1546,src/governance,warn,(module default)
+src/governance/audit.rs,1831,src/governance,warn,(module default)
+src/governance/audit.rs,2731,src/governance,warn,ai_memory::governance::audit
+src/governance/audit.rs,2909,src/governance,warn,ai_memory::governance::audit
+src/governance/audit.rs,3079,src/governance,warn,ai_memory::governance::audit
+src/governance/audit.rs,3231,src/governance,warn,ai_memory::governance::audit
+src/governance/audit.rs,3259,src/governance,info,ai_memory::governance::audit
+src/governance/capability.rs,1193,src/governance,warn,governance
+src/governance/capability.rs,1257,src/governance,warn,governance
+src/governance/capability.rs,1354,src/governance,warn,governance
+src/governance/deferred_audit.rs,799,src/governance,error,(module default)
+src/governance/deferred_audit.rs,886,src/governance,error,(module default)
+src/governance/deferred_audit.rs,1341,src/governance,error,(module default)
+src/governance/deferred_audit.rs,1993,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2006,src/governance,error,(module default)
+src/governance/deferred_audit.rs,2051,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2058,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2067,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2075,src/governance,info,(module default)
+src/governance/deferred_audit.rs,2192,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2202,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2207,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2472,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2485,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2547,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2595,src/governance,error,(module default)
+src/governance/deferred_audit.rs,2689,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2800,src/governance,warn,(module default)
+src/governance/deferred_audit.rs,2818,src/governance,error,(module default)
+src/governance/deferred_audit.rs,2827,src/governance,error,(module default)
+src/governance/deferred_audit.rs,2842,src/governance,error,(module default)
+src/governance/deferred_audit.rs,2852,src/governance,error,(module default)
+src/governance/deferred_audit.rs,3075,src/governance,error,(module default)
+src/governance/deferred_audit.rs,3086,src/governance,error,(module default)
+src/governance/deferred_audit.rs,3124,src/governance,error,(module default)
+src/governance/deferred_audit.rs,3141,src/governance,error,(module default)
+src/governance/mod.rs,796,src/governance,warn,(module default)
+src/governance/policy_version.rs,233,src/governance,warn,(module default)
+src/governance/rules_store.rs,315,src/governance,error,(module default)
+src/governance/rules_store.rs,325,src/governance,warn,(module default)
+src/governance/rules_store.rs,576,src/governance,error,(module default)
+src/governance/wire_check.rs,150,src/governance,error,governance
+src/handlers/admin.rs,292,src/handlers,warn,(module default)
+src/handlers/admin.rs,403,src/handlers,warn,identity.bind.challenge_miss
+src/handlers/admin.rs,429,src/handlers,warn,identity.bind.proof_invalid
+src/handlers/admin.rs,813,src/handlers,error,(module default)
+src/handlers/admin.rs,852,src/handlers,error,(module default)
+src/handlers/admin.rs,967,src/handlers,warn,(module default)
+src/handlers/admin.rs,988,src/handlers,warn,(module default)
+src/handlers/admin.rs,1079,src/handlers,warn,(module default)
+src/handlers/admin.rs,1117,src/handlers,warn,(module default)
+src/handlers/admin.rs,1140,src/handlers,error,(module default)
+src/handlers/admin.rs,1304,src/handlers,warn,(module default)
+src/handlers/admin.rs,1321,src/handlers,error,(module default)
+src/handlers/admin.rs,1345,src/handlers,warn,(module default)
+src/handlers/admin.rs,1353,src/handlers,warn,(module default)
+src/handlers/admin.rs,1363,src/handlers,warn,(module default)
+src/handlers/admin.rs,1449,src/handlers,warn,(module default)
+src/handlers/admin.rs,1497,src/handlers,warn,(module default)
+src/handlers/admin.rs,1510,src/handlers,error,(module default)
+src/handlers/admin.rs,1530,src/handlers,warn,(module default)
+src/handlers/admin.rs,1538,src/handlers,warn,(module default)
+src/handlers/admin.rs,1548,src/handlers,warn,(module default)
+src/handlers/admin.rs,1640,src/handlers,warn,(module default)
+src/handlers/agent_api_key.rs,1347,src/handlers,warn,http::auth
+src/handlers/approvals.rs,139,src/handlers,warn,(module default)
+src/handlers/approvals.rs,159,src/handlers,warn,(module default)
+src/handlers/approvals.rs,167,src/handlers,warn,(module default)
+src/handlers/approvals.rs,173,src/handlers,warn,(module default)
+src/handlers/approvals.rs,196,src/handlers,warn,(module default)
+src/handlers/approvals.rs,454,src/handlers,error,(module default)
+src/handlers/approvals.rs,612,src/handlers,error,(module default)
+src/handlers/approvals.rs,943,src/handlers,error,(module default)
+src/handlers/archive.rs,278,src/handlers,warn,(module default)
+src/handlers/archive.rs,652,src/handlers,error,(module default)
+src/handlers/archive.rs,685,src/handlers,warn,(module default)
+src/handlers/authority.rs,149,src/handlers,warn,ai_memory::authz
+src/handlers/bulk.rs,236,src/handlers,warn,bulk_create
+src/handlers/bulk.rs,243,src/handlers,warn,bulk_create
+src/handlers/bulk.rs,320,src/handlers,warn,bulk_create
+src/handlers/bulk.rs,377,src/handlers,warn,bulk_create
+src/handlers/bulk.rs,605,src/handlers,warn,bulk_create
+src/handlers/bulk.rs,610,src/handlers,warn,bulk_create
+src/handlers/bulk.rs,767,src/handlers,warn,(module default)
+src/handlers/bulk.rs,778,src/handlers,warn,(module default)
+src/handlers/bulk.rs,1271,src/handlers,error,(module default)
+src/handlers/bulk.rs,1305,src/handlers,warn,(module default)
+src/handlers/bulk.rs,1714,src/handlers,warn,(module default)
+src/handlers/bulk.rs,1728,src/handlers,error,(module default)
+src/handlers/bulk.rs,1742,src/handlers,warn,(module default)
+src/handlers/coordination.rs,383,src/handlers,error,(module default)
+src/handlers/coordination.rs,652,src/handlers,warn,(module default)
+src/handlers/create.rs,517,src/handlers,error,(module default)
+src/handlers/create.rs,528,src/handlers,error,(module default)
+src/handlers/create.rs,766,src/handlers,warn,(module default)
+src/handlers/create.rs,809,src/handlers,error,(module default)
+src/handlers/create.rs,837,src/handlers,warn,(module default)
+src/handlers/create.rs,885,src/handlers,info,(module default)
+src/handlers/create.rs,1423,src/handlers,debug,ai_memory::federation::sync
+src/handlers/create.rs,1460,src/handlers,debug,ai_memory::federation::sync
+src/handlers/create.rs,1857,src/handlers,info,create_memory
+src/handlers/create.rs,1888,src/handlers,warn,(module default)
+src/handlers/errors.rs,215,src/handlers,error,(module default)
+src/handlers/errors.rs,230,src/handlers,error,(module default)
+src/handlers/errors.rs,269,src/handlers,error,(module default)
+src/handlers/errors.rs,286,src/handlers,warn,(module default)
+src/handlers/errors.rs,320,src/handlers,error,(module default)
+src/handlers/federation_receive.rs,56,src/handlers,warn,federation::peer_id
+src/handlers/federation_receive.rs,142,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,151,src/handlers,debug,federation::attestation
+src/handlers/federation_receive.rs,164,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,179,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,197,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,212,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,259,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,285,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,387,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,395,src/handlers,error,federation::attestation
+src/handlers/federation_receive.rs,412,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,465,src/handlers,debug,(module default)
+src/handlers/federation_receive.rs,478,src/handlers,warn,federation::clock_skew
+src/handlers/federation_receive.rs,579,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,700,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,770,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,787,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,832,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,859,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1106,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1120,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1135,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1153,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1254,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1273,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1351,src/handlers,warn,federation.quarantine.unattributed
+src/handlers/federation_receive.rs,1592,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1697,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1788,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1890,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1928,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,1994,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,2001,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,2014,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,2249,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,2303,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,2315,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,2623,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,2654,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,2838,src/handlers,warn,federation::quota
+src/handlers/federation_receive.rs,2888,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,2951,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,2978,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3009,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3129,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3163,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3209,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3224,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3277,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3295,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3304,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3361,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3374,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3386,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3439,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3471,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3500,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3520,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3536,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3552,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3614,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3677,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3741,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3760,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3770,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3797,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3820,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,3845,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3871,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3919,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3948,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3955,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,3985,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,4052,src/handlers,warn,federation::signing
+src/handlers/federation_receive.rs,4072,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,4081,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,4147,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,4214,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,4231,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,4243,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,4252,src/handlers,warn,federation::attestation
+src/handlers/federation_receive.rs,4329,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,4387,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,4399,src/handlers,warn,(module default)
+src/handlers/federation_receive.rs,4424,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,158,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,375,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,401,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,587,src/handlers,warn,federation::quota
+src/handlers/federation_signing_check.rs,627,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,706,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,733,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,790,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,872,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,906,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,957,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,977,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,993,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1040,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1061,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1151,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1162,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1169,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1194,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1266,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,1290,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1299,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1356,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1372,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1390,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1403,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1449,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1483,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1511,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1553,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1569,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1583,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1608,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1670,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1729,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1743,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1755,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1764,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1829,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1846,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1881,src/handlers,warn,federation::attestation
+src/handlers/federation_signing_check.rs,1898,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,1976,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,2028,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,2110,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,2117,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,2127,src/handlers,warn,(module default)
+src/handlers/federation_signing_check.rs,2159,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2249,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2262,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2277,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2287,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2298,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2361,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2386,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2408,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2426,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2437,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2455,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2481,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2498,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2710,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2735,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2757,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2775,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2786,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2804,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2830,src/handlers,warn,federation::signing
+src/handlers/federation_signing_check.rs,2847,src/handlers,warn,federation::signing
+src/handlers/federation_sync_since.rs,110,src/handlers,warn,federation::scope
+src/handlers/federation_sync_since.rs,293,src/handlers,warn,federation::scope
+src/handlers/federation_sync_since.rs,396,src/handlers,error,(module default)
+src/handlers/federation_sync_since.rs,453,src/handlers,debug,(module default)
+src/handlers/governance.rs,328,src/handlers,warn,(module default)
+src/handlers/governance.rs,460,src/handlers,error,(module default)
+src/handlers/hook_subscribers.rs,501,src/handlers,warn,ai_memory::authz
+src/handlers/hook_subscribers.rs,524,src/handlers,warn,ai_memory::authz
+src/handlers/hook_subscribers.rs,654,src/handlers,warn,ai_memory::authz
+src/handlers/hook_subscribers.rs,717,src/handlers,error,(module default)
+src/handlers/hook_subscribers.rs,742,src/handlers,warn,ai_memory::authz
+src/handlers/http.rs,179,src/handlers,warn,(module default)
+src/handlers/http.rs,203,src/handlers,warn,(module default)
+src/handlers/http.rs,274,src/handlers,warn,pre_store.auto_atomise
+src/handlers/http.rs,311,src/handlers,warn,pre_store.auto_atomise
+src/handlers/http.rs,329,src/handlers,warn,pre_store.auto_atomise
+src/handlers/http.rs,436,src/handlers,warn,(module default)
+src/handlers/http.rs,464,src/handlers,warn,(module default)
+src/handlers/http.rs,465,src/handlers,warn,(module default)
+src/handlers/identity_binding.rs,242,src/handlers,warn,http::auth
+src/handlers/identity_binding.rs,314,src/handlers,info,http::auth
+src/handlers/identity_binding.rs,327,src/handlers,warn,http::auth
+src/handlers/identity_binding.rs,511,src/handlers,warn,ai_memory::authz
+src/handlers/identity_binding.rs,523,src/handlers,warn,ai_memory::authz
+src/handlers/inbox_stream.rs,163,src/handlers,error,(module default)
+src/handlers/kg.rs,664,src/handlers,error,(module default)
+src/handlers/kg.rs,685,src/handlers,error,(module default)
+src/handlers/kg.rs,707,src/handlers,error,(module default)
+src/handlers/kg.rs,734,src/handlers,warn,ai_memory::authz
+src/handlers/kg.rs,969,src/handlers,error,(module default)
+src/handlers/kg.rs,984,src/handlers,error,(module default)
+src/handlers/kg.rs,1000,src/handlers,error,(module default)
+src/handlers/kg.rs,1029,src/handlers,warn,ai_memory::authz
+src/handlers/links.rs,100,src/handlers,warn,ai_memory::verify
+src/handlers/links.rs,192,src/handlers,warn,ai_memory::verify
+src/handlers/links.rs,588,src/handlers,warn,(module default)
+src/handlers/links.rs,669,src/handlers,error,(module default)
+src/handlers/links.rs,693,src/handlers,warn,ai_memory::authz
+src/handlers/links.rs,738,src/handlers,error,(module default)
+src/handlers/links.rs,782,src/handlers,warn,(module default)
+src/handlers/links.rs,792,src/handlers,warn,(module default)
+src/handlers/links.rs,866,src/handlers,warn,(module default)
+src/handlers/links.rs,1030,src/handlers,warn,ai_memory::authz
+src/handlers/links.rs,1083,src/handlers,error,(module default)
+src/handlers/links.rs,1129,src/handlers,warn,ai_memory::authz
+src/handlers/links.rs,1500,src/handlers,error,(module default)
+src/handlers/memories.rs,86,src/handlers,warn,(module default)
+src/handlers/memories.rs,192,src/handlers,warn,ai_memory::visibility
+src/handlers/memories.rs,708,src/handlers,error,(module default)
+src/handlers/memories.rs,784,src/handlers,warn,(module default)
+src/handlers/memories.rs,796,src/handlers,warn,(module default)
+src/handlers/memories.rs,966,src/handlers,error,(module default)
+src/handlers/memories.rs,1756,src/handlers,error,(module default)
+src/handlers/memories_query.rs,120,src/handlers,debug,(module default)
+src/handlers/memories_query.rs,125,src/handlers,debug,(module default)
+src/handlers/memories_query.rs,698,src/handlers,error,(module default)
+src/handlers/mod.rs,234,src/handlers,warn,governance
+src/handlers/parity.rs,159,src/handlers,warn,(module default)
+src/handlers/parity.rs,256,src/handlers,warn,handlers::parity
+src/handlers/parity.rs,649,src/handlers,warn,ai_memory::authz
+src/handlers/postgres_gate.rs,813,src/handlers,debug,(module default)
+src/handlers/postgres_gate.rs,821,src/handlers,debug,(module default)
+src/handlers/postgres_gate.rs,914,src/handlers,error,(module default)
+src/handlers/postgres_gate.rs,972,src/handlers,error,(module default)
+src/handlers/power.rs,264,src/handlers,error,(module default)
+src/handlers/power.rs,870,src/handlers,warn,(module default)
+src/handlers/power.rs,949,src/handlers,warn,(module default)
+src/handlers/power_consolidation.rs,132,src/handlers,warn,(module default)
+src/handlers/power_consolidation.rs,240,src/handlers,error,(module default)
+src/handlers/power_consolidation.rs,306,src/handlers,warn,(module default)
+src/handlers/power_consolidation.rs,562,src/handlers,error,(module default)
+src/handlers/power_consolidation.rs,657,src/handlers,error,(module default)
+src/handlers/power_consolidation.rs,762,src/handlers,error,(module default)
+src/handlers/power_consolidation.rs,966,src/handlers,warn,(module default)
+src/handlers/power_consolidation.rs,974,src/handlers,warn,(module default)
+src/handlers/power_consolidation.rs,1049,src/handlers,warn,(module default)
+src/handlers/power_consolidation.rs,1057,src/handlers,warn,(module default)
+src/handlers/power_consolidation.rs,1124,src/handlers,error,(module default)
+src/handlers/read_pool.rs,257,src/handlers,warn,ai_memory::read_pool
+src/handlers/read_pool.rs,281,src/handlers,error,ai_memory::read_pool
+src/handlers/recall.rs,649,src/handlers,warn,(module default)
+src/handlers/recall.rs,684,src/handlers,error,(module default)
+src/handlers/recall.rs,724,src/handlers,warn,(module default)
+src/handlers/recall.rs,820,src/handlers,warn,(module default)
+src/handlers/recall.rs,1048,src/handlers,warn,(module default)
+src/handlers/recall.rs,1058,src/handlers,warn,ai_memory::handlers::db_op
+src/handlers/recall.rs,1148,src/handlers,error,(module default)
+src/handlers/route_1111.rs,62,src/handlers,warn,(module default)
+src/handlers/route_1111.rs,98,src/handlers,warn,(module default)
+src/handlers/route_1111.rs,105,src/handlers,warn,(module default)
+src/handlers/route_1111.rs,217,src/handlers,info,memory_smart_load
+src/handlers/route_1111.rs,965,src/handlers,error,(module default)
+src/handlers/route_1111.rs,1036,src/handlers,warn,handlers::route_1111
+src/handlers/share.rs,111,src/handlers,warn,(module default)
+src/handlers/skills.rs,193,src/handlers,error,ai_memory::handlers::skills
+src/handlers/skills.rs,239,src/handlers,error,ai_memory::handlers::skills
+src/handlers/skills.rs,457,src/handlers,error,ai_memory::handlers::skills
+src/handlers/subscriptions.rs,222,src/handlers,warn,(module default)
+src/handlers/subscriptions.rs,794,src/handlers,error,(module default)
+src/handlers/subscriptions.rs,835,src/handlers,error,(module default)
+src/handlers/subscriptions.rs,958,src/handlers,error,(module default)
+src/handlers/subscriptions.rs,1057,src/handlers,warn,(module default)
+src/handlers/subscriptions.rs,1110,src/handlers,warn,(module default)
+src/handlers/subscriptions.rs,1193,src/handlers,debug,(module default)
+src/handlers/subscriptions.rs,1200,src/handlers,debug,(module default)
+src/handlers/system.rs,143,src/handlers,warn,capabilities
+src/handlers/system.rs,261,src/handlers,error,(module default)
+src/handlers/transport.rs,125,src/handlers,error,ai_memory::handlers::db_op
+src/handlers/transport.rs,138,src/handlers,error,ai_memory::handlers::db_op
+src/handlers/transport.rs,684,src/handlers,warn,(module default)
+src/handlers/transport.rs,1065,src/handlers,warn,http::auth
+src/handlers/transport.rs,1130,src/handlers,warn,ai_memory::authz
+src/handlers/transport.rs,1147,src/handlers,warn,ai_memory::authz
+src/handlers/transport.rs,1304,src/handlers,error,ai_memory::handlers::db_op
+src/handlers/transport.rs,1384,src/handlers,error,ai_memory::handlers::db_op
+src/hnsw.rs,407,src/hnsw.rs,warn,(module default)
+src/hnsw.rs,950,src/hnsw.rs,error,(module default)
+src/hnsw.rs,966,src/hnsw.rs,error,hnsw.eviction
+src/hnsw.rs,1026,src/hnsw.rs,warn,hnsw.eviction
+src/hnsw.rs,1055,src/hnsw.rs,warn,hnsw.eviction
+src/hnsw.rs,1163,src/hnsw.rs,error,hnsw.eviction
+src/hnsw.rs,1565,src/hnsw.rs,warn,hnsw.rebuild
+src/hooks/chain.rs,424,src/hooks,warn,(module default)
+src/hooks/chain.rs,433,src/hooks,warn,(module default)
+src/hooks/chain.rs,496,src/hooks,warn,(module default)
+src/hooks/chain.rs,505,src/hooks,warn,(module default)
+src/hooks/chain.rs,880,src/hooks,warn,(module default)
+src/hooks/config.rs,511,src/hooks,error,(module default)
+src/hooks/config.rs,522,src/hooks,info,(module default)
+src/hooks/config.rs,533,src/hooks,error,(module default)
+src/hooks/config.rs,554,src/hooks,warn,(module default)
+src/hooks/decision.rs,329,src/hooks,warn,(module default)
+src/hooks/enforce.rs,158,src/hooks,warn,hooks.enforce.violation
+src/hooks/enforce.rs,209,src/hooks,warn,hooks.enforce.namespace_unresolved
+src/hooks/enforce.rs,227,src/hooks,warn,hooks.enforce.namespace_unresolved
+src/hooks/executor.rs,235,src/hooks,debug,(module default)
+src/hooks/executor.rs,362,src/hooks,warn,(module default)
+src/hooks/executor.rs,799,src/hooks,debug,(module default)
+src/hooks/executor.rs,1020,src/hooks,warn,(module default)
+src/hooks/post_reflect/auto_export.rs,152,src/hooks,warn,post_reflect.auto_export
+src/hooks/post_reflect/auto_export.rs,171,src/hooks,warn,post_reflect.auto_export
+src/hooks/post_reflect/auto_persona.rs,121,src/hooks,warn,post_reflect.auto_persona
+src/hooks/post_reflect/auto_persona.rs,185,src/hooks,debug,post_reflect.auto_persona
+src/hooks/pre_store/auto_atomise.rs,296,src/hooks,warn,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,345,src/hooks,warn,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,407,src/hooks,info,pre_store.auto_atomise.sync
+src/hooks/pre_store/auto_atomise.rs,417,src/hooks,info,pre_store.auto_atomise.sync
+src/hooks/pre_store/auto_atomise.rs,424,src/hooks,info,pre_store.auto_atomise.sync
+src/hooks/pre_store/auto_atomise.rs,431,src/hooks,error,pre_store.auto_atomise.sync
+src/hooks/pre_store/auto_atomise.rs,464,src/hooks,error,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,478,src/hooks,info,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,490,src/hooks,info,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,498,src/hooks,warn,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,505,src/hooks,error,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,513,src/hooks,info,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,520,src/hooks,info,pre_store.auto_atomise
+src/hooks/pre_store/auto_atomise.rs,526,src/hooks,error,pre_store.auto_atomise
+src/hooks/pre_store/auto_classify_kind.rs,289,src/hooks,debug,(module default)
+src/hooks/recall.rs,191,src/hooks,warn,(module default)
+src/identity/attest.rs,969,src/identity,warn,ai_memory::identity::attest
+src/identity/attest.rs,1168,src/identity,error,ai_memory::identity::attest
+src/identity/attest.rs,1208,src/identity,error,ai_memory::identity::attest
+src/identity/attest_v2.rs,512,src/identity,warn,(module default)
+src/identity/hub_cache.rs,192,src/identity,warn,identity::hub_cache::producer_binding
+src/identity/hub_cache.rs,203,src/identity,warn,identity::hub_cache::producer_binding
+src/identity/keypair.rs,1083,src/identity,info,(module default)
+src/identity/keypair.rs,1129,src/identity,warn,identity::keypair
+src/identity/keypair.rs,1147,src/identity,warn,identity::keypair
+src/identity/keypair.rs,1179,src/identity,info,(module default)
+src/identity/keypair.rs,1624,src/identity,warn,identity::keypair
+src/identity/lineage.rs,975,src/identity,warn,identity.lineage.recovery
+src/identity/mod.rs,693,src/identity,debug,(module default)
+src/identity/mod.rs,819,src/identity,eprintln,(module default)
+src/identity/mod.rs,882,src/identity,warn,(module default)
+src/identity/replay.rs,175,src/identity,warn,ai_memory::identity::replay
+src/identity/replay.rs,763,src/identity,warn,ai_memory::identity::replay
+src/identity/replay.rs,812,src/identity,info,ai_memory::identity::replay
+src/identity/replay.rs,817,src/identity,warn,ai_memory::identity::replay
+src/identity/replay.rs,862,src/identity,warn,ai_memory::identity::replay
+src/identity/replay.rs,886,src/identity,warn,ai_memory::identity::replay
+src/identity/replay.rs,905,src/identity,warn,ai_memory::identity::replay
+src/identity/replay.rs,919,src/identity,warn,ai_memory::identity::replay
+src/identity/replay.rs,964,src/identity,warn,ai_memory::identity::replay
+src/identity/verify.rs,561,src/identity,warn,(module default)
+src/inbox_wake.rs,264,src/inbox_wake.rs,warn,(module default)
+src/inbox_wake.rs,305,src/inbox_wake.rs,warn,(module default)
+src/inbox_wake.rs,312,src/inbox_wake.rs,warn,(module default)
+src/lib.rs,1189,src/lib.rs,warn,(module default)
+src/lib.rs,1692,src/lib.rs,warn,(module default)
+src/llm.rs,1291,src/llm.rs,debug,(module default)
+src/llm.rs,1349,src/llm.rs,debug,(module default)
+src/llm.rs,1572,src/llm.rs,warn,(module default)
+src/llm.rs,1652,src/llm.rs,info,(module default)
+src/llm.rs,1676,src/llm.rs,info,(module default)
+src/llm.rs,2628,src/llm.rs,warn,(module default)
+src/llm.rs,2764,src/llm.rs,info,(module default)
+src/llm.rs,2783,src/llm.rs,info,(module default)
+src/logging.rs,158,src/logging.rs,warn,logging
+src/logging.rs,173,src/logging.rs,warn,logging
+src/logging.rs,235,src/logging.rs,debug,(module default)
+src/logging.rs,265,src/logging.rs,debug,(module default)
+src/main.rs,99,src/main.rs,eprintln,(module default)
+src/main.rs,101,src/main.rs,eprintln,(module default)
+src/main.rs,109,src/main.rs,eprintln,(module default)
+src/main.rs,214,src/main.rs,eprintln,(module default)
+src/main.rs,250,src/main.rs,eprintln,(module default)
+src/main.rs,254,src/main.rs,eprintln,(module default)
+src/main.rs,339,src/main.rs,eprintln,(module default)
+src/main.rs,349,src/main.rs,eprintln,(module default)
+src/mcp/mod.rs,335,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,1395,src/mcp,debug,namespace.standard.not_live
+src/mcp/mod.rs,1407,src/mcp,debug,namespace.standard.withheld
+src/mcp/mod.rs,1776,src/mcp,warn,hooks
+src/mcp/mod.rs,1812,src/mcp,error,hooks
+src/mcp/mod.rs,1966,src/mcp,error,hooks
+src/mcp/mod.rs,1993,src/mcp,warn,hooks
+src/mcp/mod.rs,2784,src/mcp,warn,(module default)
+src/mcp/mod.rs,3336,src/mcp,error,(module default)
+src/mcp/mod.rs,3553,src/mcp,debug,ai_memory::mcp
+src/mcp/mod.rs,3630,src/mcp,error,ai_memory::authz
+src/mcp/mod.rs,3706,src/mcp,info,(module default)
+src/mcp/mod.rs,3707,src/mcp,warn,(module default)
+src/mcp/mod.rs,3846,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,3859,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,3925,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,3935,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,3941,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4155,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4164,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4180,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4196,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4205,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4215,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4290,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4296,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4478,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4526,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4554,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4580,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4594,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4599,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4617,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4620,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4631,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4635,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4640,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4704,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4724,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4761,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4768,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4783,src/mcp,warn,(module default)
+src/mcp/mod.rs,4794,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4798,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4811,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4854,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4878,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4892,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4897,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4925,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4928,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4930,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4947,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4966,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4975,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,4990,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,5034,src/mcp,warn,pre_store.auto_atomise
+src/mcp/mod.rs,5035,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,5048,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,5154,src/mcp,eprintln,(module default)
+src/mcp/mod.rs,5263,src/mcp,warn,(module default)
+src/mcp/mod.rs,5305,src/mcp,info,(module default)
+src/mcp/mod.rs,5317,src/mcp,warn,(module default)
+src/mcp/mod.rs,5364,src/mcp,eprintln,(module default)
+src/mcp/tools/action.rs,29,src/mcp,warn,coordination.lease_sweep
+src/mcp/tools/archive.rs,369,src/mcp,warn,(module default)
+src/mcp/tools/consolidate.rs,239,src/mcp,warn,(module default)
+src/mcp/tools/consolidate.rs,254,src/mcp,warn,(module default)
+src/mcp/tools/find_paths.rs,96,src/mcp,error,(module default)
+src/mcp/tools/kg_timeline.rs,79,src/mcp,error,(module default)
+src/mcp/tools/lineage.rs,99,src/mcp,error,(module default)
+src/mcp/tools/link.rs,232,src/mcp,warn,signed_events
+src/mcp/tools/link.rs,417,src/mcp,warn,notification.invalidation
+src/mcp/tools/link.rs,445,src/mcp,warn,notification.invalidation
+src/mcp/tools/load_family.rs,513,src/mcp,info,memory_smart_load
+src/mcp/tools/namespace.rs,669,src/mcp,warn,ai_memory::governance::policy_read
+src/mcp/tools/namespace.rs,931,src/mcp,info,(module default)
+src/mcp/tools/offload.rs,85,src/mcp,debug,(module default)
+src/mcp/tools/offload.rs,88,src/mcp,warn,(module default)
+src/mcp/tools/pending.rs,272,src/mcp,warn,(module default)
+src/mcp/tools/recall.rs,812,src/mcp,warn,observations
+src/mcp/tools/reflect.rs,130,src/mcp,warn,mcp.reflect
+src/mcp/tools/reflect.rs,688,src/mcp,warn,(module default)
+src/mcp/tools/reflect.rs,699,src/mcp,warn,(module default)
+src/mcp/tools/session_start.rs,159,src/mcp,warn,(module default)
+src/mcp/tools/skill_zstd.rs,49,src/mcp,warn,skills.bomb
+src/mcp/tools/store/embed.rs,76,src/mcp,warn,(module default)
+src/mcp/tools/store/embed.rs,84,src/mcp,warn,(module default)
+src/mcp/tools/store/legacy_classifier.rs,108,src/mcp,warn,(module default)
+src/mcp/tools/store/legacy_classifier.rs,124,src/mcp,warn,(module default)
+src/mcp/tools/store/legacy_classifier.rs,161,src/mcp,warn,(module default)
+src/mcp/tools/store/mod.rs,656,src/mcp,warn,synthesis
+src/mcp/tools/store/mod.rs,730,src/mcp,warn,synthesis
+src/mcp/tools/store/mod.rs,939,src/mcp,info,memory_store
+src/mcp/tools/store/mod.rs,1048,src/mcp,info,(module default)
+src/mcp/tools/store/synthesis.rs,68,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,123,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,213,src/mcp,info,synthesis
+src/mcp/tools/store/synthesis.rs,229,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,249,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,292,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,335,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,348,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,437,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,461,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,537,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,546,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,565,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,678,src/mcp,warn,synthesis
+src/mcp/tools/store/synthesis.rs,684,src/mcp,warn,synthesis
+src/migrate.rs,372,src/migrate.rs,warn,(module default)
+src/notification/invalidation.rs,301,src/notification,warn,signed_events
+src/observations/gc.rs,93,src/observations,warn,observations
+src/observations/mod.rs,410,src/observations,warn,observations
+src/offload/mod.rs,349,src/offload,info,(module default)
+src/portability/import.rs,362,src/portability,warn,portability::import
+src/portability/import.rs,489,src/portability,warn,portability::import
+src/portability/import.rs,623,src/portability,warn,portability::import
+src/portability/import.rs,683,src/portability,warn,portability::import
+src/portability/import.rs,791,src/portability,warn,portability::import
+src/portability/import.rs,821,src/portability,warn,portability::import
+src/portability/import.rs,968,src/portability,warn,portability::import
+src/portability/import.rs,990,src/portability,warn,portability::import
+src/portability/import.rs,1151,src/portability,warn,portability::import
+src/portability/import.rs,1228,src/portability,warn,portability::import
+src/portability/import.rs,1338,src/portability,warn,portability::import
+src/portability/import.rs,1839,src/portability,warn,portability::import
+src/portability/import.rs,1851,src/portability,warn,portability::import
+src/portability/import.rs,1869,src/portability,warn,portability::import
+src/portability/import.rs,1885,src/portability,warn,portability::import
+src/portability/import.rs,1899,src/portability,warn,portability::import
+src/quotas.rs,454,src/quotas.rs,warn,(module default)
+src/recover/durability.rs,99,src/recover,eprintln,(module default)
+src/recover/watcher.rs,629,src/recover,warn,(module default)
+src/recover/watcher.rs,803,src/recover,warn,(module default)
+src/recover/watcher.rs,805,src/recover,info,(module default)
+src/recover/watcher.rs,859,src/recover,info,(module default)
+src/recover/watcher.rs,879,src/recover,info,(module default)
+src/recover/watcher.rs,980,src/recover,warn,(module default)
+src/recover/watcher.rs,1007,src/recover,warn,(module default)
+src/recover/watcher.rs,1010,src/recover,info,(module default)
+src/recover/watcher.rs,1063,src/recover,warn,(module default)
+src/recover/watcher.rs,1069,src/recover,info,(module default)
+src/reload.rs,244,src/reload.rs,eprintln,(module default)
+src/reload.rs,249,src/reload.rs,warn,(module default)
+src/reload.rs,271,src/reload.rs,eprintln,(module default)
+src/reload.rs,279,src/reload.rs,info,(module default)
+src/reload.rs,293,src/reload.rs,eprintln,(module default)
+src/reload.rs,295,src/reload.rs,warn,(module default)
+src/reload.rs,307,src/reload.rs,eprintln,(module default)
+src/reload.rs,314,src/reload.rs,warn,(module default)
+src/reload.rs,323,src/reload.rs,eprintln,(module default)
+src/reload.rs,330,src/reload.rs,warn,(module default)
+src/reload.rs,369,src/reload.rs,warn,(module default)
+src/reload.rs,384,src/reload.rs,info,(module default)
+src/reload.rs,386,src/reload.rs,info,(module default)
+src/reranker.rs,538,src/reranker.rs,warn,rerank.budget
+src/reranker.rs,994,src/reranker.rs,warn,reranker.fallback
+src/reranker.rs,1001,src/reranker.rs,eprintln,(module default)
+src/reranker.rs,1051,src/reranker.rs,debug,reranker.warmup
+src/reranker.rs,1266,src/reranker.rs,warn,(module default)
+src/reranker.rs,1455,src/reranker.rs,warn,(module default)
+src/reranker.rs,1579,src/reranker.rs,warn,(module default)
+src/reranker.rs,2199,src/reranker.rs,warn,reranker
+src/reranker.rs,2356,src/reranker.rs,warn,rerank.budget.degraded
+src/secret_screen.rs,468,src/secret_screen.rs,warn,secret.refused
+src/secret_screen.rs,512,src/secret_screen.rs,warn,secret.redacted
+src/secret_screen.rs,981,src/secret_screen.rs,warn,secret.redacted
+src/secret_screen.rs,1071,src/secret_screen.rs,warn,secret.redacted
+src/secret_screen.rs,1113,src/secret_screen.rs,warn,secret.redacted
+src/signed_events.rs,940,src/signed_events.rs,error,(module default)
+src/signed_events.rs,3049,src/signed_events.rs,warn,signed_events
+src/signed_events.rs,3140,src/signed_events.rs,warn,signed_events
+src/spawn_audit.rs,204,src/spawn_audit.rs,debug,signed_events
+src/spawn_audit.rs,222,src/spawn_audit.rs,warn,signed_events
+src/spawn_audit.rs,230,src/spawn_audit.rs,warn,signed_events
+src/storage/connection.rs,279,src/storage,error,ai_memory::storage::txn_guard
+src/storage/connection.rs,1178,src/storage,warn,ai_memory::storage::checks
+src/storage/doctor.rs,318,src/storage,warn,(module default)
+src/storage/doctor.rs,479,src/storage,warn,(module default)
+src/storage/embed_skip.rs,352,src/storage,info,(module default)
+src/storage/embed_skip.rs,371,src/storage,warn,(module default)
+src/storage/embed_skip.rs,376,src/storage,warn,(module default)
+src/storage/embed_skip.rs,391,src/storage,warn,(module default)
+src/storage/embed_skip.rs,448,src/storage,warn,(module default)
+src/storage/embed_skip.rs,454,src/storage,warn,(module default)
+src/storage/embed_skip.rs,513,src/storage,warn,(module default)
+src/storage/migrations.rs,1895,src/storage,info,(module default)
+src/storage/migrations.rs,3048,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3109,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3268,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3301,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3452,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3568,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3796,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3880,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3902,src/storage,debug,ai_memory::storage::migrations
+src/storage/migrations.rs,3926,src/storage,debug,ai_memory::storage::migrations
+src/storage/mod.rs,389,src/storage,warn,covenant.why_trace
+src/storage/mod.rs,544,src/storage,warn,covenant.authorship_immutable
+src/storage/mod.rs,1087,src/storage,warn,(module default)
+src/storage/mod.rs,1106,src/storage,warn,(module default)
+src/storage/mod.rs,1124,src/storage,warn,(module default)
+src/storage/mod.rs,1141,src/storage,warn,(module default)
+src/storage/mod.rs,1284,src/storage,warn,encryption.undecryptable_row_skipped
+src/storage/mod.rs,1535,src/storage,warn,encryption.undecryptable_row_skipped
+src/storage/mod.rs,3602,src/storage,warn,(module default)
+src/storage/mod.rs,3905,src/storage,warn,ai_memory::quarantine
+src/storage/mod.rs,4130,src/storage,warn,ai_memory::storage::update
+src/storage/mod.rs,4571,src/storage,warn,ai_memory::storage::update
+src/storage/mod.rs,4741,src/storage,warn,ai_memory::governance::standard_severed
+src/storage/mod.rs,9695,src/storage,warn,signed_events
+src/storage/mod.rs,9703,src/storage,warn,signed_events
+src/storage/mod.rs,9974,src/storage,warn,signed_events
+src/storage/mod.rs,9984,src/storage,warn,signed_events
+src/storage/mod.rs,10273,src/storage,warn,(module default)
+src/storage/mod.rs,10281,src/storage,warn,(module default)
+src/storage/mod.rs,11128,src/storage,warn,(module default)
+src/storage/mod.rs,11141,src/storage,warn,(module default)
+src/storage/mod.rs,11477,src/storage,trace,proactive_conflict
+src/storage/mod.rs,11598,src/storage,warn,(module default)
+src/storage/mod.rs,11608,src/storage,warn,(module default)
+src/storage/mod.rs,15256,src/storage,warn,(module default)
+src/storage/mod.rs,15782,src/storage,warn,(module default)
+src/storage/mod.rs,15795,src/storage,warn,(module default)
+src/storage/mod.rs,15802,src/storage,warn,(module default)
+src/storage/mod.rs,15812,src/storage,debug,(module default)
+src/storage/mod.rs,15815,src/storage,warn,(module default)
+src/storage/mod.rs,16515,src/storage,warn,(module default)
+src/storage/mod.rs,16765,src/storage,warn,(module default)
+src/storage/mod.rs,17068,src/storage,warn,erasure::cold_tier
+src/storage/mod.rs,17466,src/storage,info,forget.tombstone
+src/storage/mod.rs,18931,src/storage,warn,(module default)
+src/storage/mod.rs,19432,src/storage,warn,(module default)
+src/storage/mod.rs,19460,src/storage,warn,(module default)
+src/storage/mod.rs,19467,src/storage,info,(module default)
+src/storage/mod.rs,19494,src/storage,info,(module default)
+src/storage/mod.rs,19500,src/storage,warn,(module default)
+src/storage/mod.rs,19520,src/storage,warn,(module default)
+src/storage/mod.rs,19533,src/storage,warn,(module default)
+src/storage/mod.rs,19652,src/storage,debug,(module default)
+src/storage/mod.rs,19662,src/storage,warn,(module default)
+src/storage/mod.rs,19671,src/storage,warn,(module default)
+src/storage/mod.rs,20529,src/storage,warn,(module default)
+src/storage/mod.rs,20985,src/storage,warn,(module default)
+src/storage/mod.rs,21030,src/storage,warn,(module default)
+src/storage/mod.rs,21043,src/storage,warn,(module default)
+src/storage/mod.rs,21753,src/storage,warn,ai_memory::governance::chain_graft
+src/storage/mod.rs,21942,src/storage,warn,ai_memory::governance::policy_read
+src/storage/mod.rs,22087,src/storage,warn,ai_memory::governance::standard_severed
+src/storage/mod.rs,22438,src/storage,warn,ai_memory::governance
+src/storage/mod.rs,22588,src/storage,warn,ai_memory::governance
+src/storage/mod.rs,22599,src/storage,warn,ai_memory::governance
+src/storage/mod.rs,22908,src/storage,warn,signed_events
+src/storage/mod.rs,22944,src/storage,warn,signed_events
+src/storage/reflect.rs,500,src/storage,warn,federation::reflection_bookkeeping
+src/storage/reflect.rs,849,src/storage,warn,signed_events
+src/storage/reflect.rs,879,src/storage,warn,signed_events
+src/storage/reflect.rs,1021,src/storage,warn,reflection.decorrelation.advisory
+src/storage/reflect.rs,1136,src/storage,warn,signed_events
+src/storage/reflect.rs,1155,src/storage,warn,signed_events
+src/storage/schema_guard.rs,203,src/storage,warn,schema_guard
+src/storage/schema_guard.rs,393,src/storage,warn,schema_guard
+src/storage/schema_guard.rs,412,src/storage,warn,schema_guard
+src/storage/schema_guard.rs,638,src/storage,warn,schema_guard
+src/storage/schema_integrity.rs,262,src/storage,warn,ai_memory::storage::schema_integrity
+src/storage/schema_integrity.rs,352,src/storage,warn,ai_memory::storage::schema_integrity
+src/storage/schema_integrity.rs,613,src/storage,warn,ai_memory::storage::schema_integrity
+src/store/mod.rs,5668,src/store,warn,(module default)
+src/store/mod.rs,5684,src/store,warn,(module default)
+src/store/mod.rs,5696,src/store,warn,(module default)
+src/store/mod.rs,5714,src/store,warn,(module default)
+src/store/mod.rs,5723,src/store,info,(module default)
+src/store/mod.rs,5730,src/store,warn,(module default)
+src/store/postgres.rs,511,src/store,debug,store::postgres
+src/store/postgres.rs,2171,src/store,info,store::postgres
+src/store/postgres.rs,2198,src/store,warn,store::postgres
+src/store/postgres.rs,2846,src/store,debug,store::postgres
+src/store/postgres.rs,2856,src/store,error,store::postgres
+src/store/postgres.rs,2869,src/store,warn,store::postgres
+src/store/postgres.rs,2881,src/store,warn,store::postgres
+src/store/postgres.rs,2923,src/store,debug,store::postgres
+src/store/postgres.rs,2942,src/store,warn,store::postgres
+src/store/postgres.rs,3016,src/store,warn,store::postgres
+src/store/postgres.rs,3046,src/store,warn,store::postgres
+src/store/postgres.rs,3061,src/store,info,store::postgres
+src/store/postgres.rs,3083,src/store,warn,store::postgres
+src/store/postgres.rs,3110,src/store,warn,store::postgres
+src/store/postgres.rs,3274,src/store,warn,store::postgres
+src/store/postgres.rs,3289,src/store,warn,store::postgres
+src/store/postgres.rs,3399,src/store,warn,(module default)
+src/store/postgres.rs,3438,src/store,warn,(module default)
+src/store/postgres.rs,3445,src/store,info,(module default)
+src/store/postgres.rs,3502,src/store,info,(module default)
+src/store/postgres.rs,3514,src/store,warn,(module default)
+src/store/postgres.rs,3542,src/store,warn,(module default)
+src/store/postgres.rs,3558,src/store,warn,(module default)
+src/store/postgres.rs,3619,src/store,warn,store::postgres
+src/store/postgres.rs,3785,src/store,warn,store::postgres
+src/store/postgres.rs,3801,src/store,error,store::postgres
+src/store/postgres.rs,4207,src/store,info,store::postgres
+src/store/postgres.rs,4254,src/store,info,store::postgres
+src/store/postgres.rs,4336,src/store,info,store::postgres
+src/store/postgres.rs,4376,src/store,info,store::postgres
+src/store/postgres.rs,4414,src/store,info,store::postgres
+src/store/postgres.rs,4520,src/store,info,store::postgres
+src/store/postgres.rs,4564,src/store,info,store::postgres
+src/store/postgres.rs,4609,src/store,info,store::postgres
+src/store/postgres.rs,4643,src/store,info,store::postgres
+src/store/postgres.rs,4679,src/store,info,store::postgres
+src/store/postgres.rs,4715,src/store,info,store::postgres
+src/store/postgres.rs,4747,src/store,info,store::postgres
+src/store/postgres.rs,4782,src/store,info,store::postgres
+src/store/postgres.rs,4821,src/store,info,store::postgres
+src/store/postgres.rs,4848,src/store,info,store::postgres
+src/store/postgres.rs,4877,src/store,info,store::postgres
+src/store/postgres.rs,4904,src/store,info,store::postgres
+src/store/postgres.rs,4931,src/store,info,store::postgres
+src/store/postgres.rs,4958,src/store,info,store::postgres
+src/store/postgres.rs,4988,src/store,info,store::postgres
+src/store/postgres.rs,5022,src/store,info,store::postgres
+src/store/postgres.rs,5068,src/store,info,store::postgres
+src/store/postgres.rs,5155,src/store,info,store::postgres
+src/store/postgres.rs,5189,src/store,info,store::postgres
+src/store/postgres.rs,5266,src/store,info,store::postgres
+src/store/postgres.rs,5313,src/store,info,store::postgres
+src/store/postgres.rs,5361,src/store,info,store::postgres
+src/store/postgres.rs,5405,src/store,info,store::postgres
+src/store/postgres.rs,5441,src/store,info,store::postgres
+src/store/postgres.rs,5514,src/store,info,store::postgres
+src/store/postgres.rs,5569,src/store,info,store::postgres
+src/store/postgres.rs,5637,src/store,info,store::postgres
+src/store/postgres.rs,5696,src/store,info,store::postgres
+src/store/postgres.rs,5749,src/store,info,store::postgres
+src/store/postgres.rs,5820,src/store,info,store::postgres
+src/store/postgres.rs,5875,src/store,info,store::postgres
+src/store/postgres.rs,5917,src/store,info,store::postgres
+src/store/postgres.rs,5950,src/store,info,store::postgres
+src/store/postgres.rs,5980,src/store,info,store::postgres
+src/store/postgres.rs,6029,src/store,info,store::postgres
+src/store/postgres.rs,6075,src/store,info,store::postgres
+src/store/postgres.rs,6133,src/store,info,store::postgres
+src/store/postgres.rs,6215,src/store,info,store::postgres
+src/store/postgres.rs,6263,src/store,info,store::postgres
+src/store/postgres.rs,6298,src/store,info,store::postgres
+src/store/postgres.rs,6330,src/store,info,store::postgres
+src/store/postgres.rs,6384,src/store,info,store::postgres
+src/store/postgres.rs,6419,src/store,info,store::postgres
+src/store/postgres.rs,6454,src/store,info,store::postgres
+src/store/postgres.rs,6509,src/store,info,store::postgres
+src/store/postgres.rs,6545,src/store,info,store::postgres
+src/store/postgres.rs,6584,src/store,info,store::postgres
+src/store/postgres.rs,6617,src/store,info,store::postgres
+src/store/postgres.rs,6652,src/store,info,store::postgres
+src/store/postgres.rs,6685,src/store,info,store::postgres
+src/store/postgres.rs,6732,src/store,info,store::postgres
+src/store/postgres.rs,6762,src/store,info,store::postgres
+src/store/postgres.rs,6794,src/store,info,store::postgres
+src/store/postgres.rs,6858,src/store,info,store::postgres
+src/store/postgres.rs,6886,src/store,info,store::postgres
+src/store/postgres.rs,6937,src/store,info,store::postgres
+src/store/postgres.rs,7032,src/store,info,store::postgres
+src/store/postgres.rs,7091,src/store,info,store::postgres
+src/store/postgres.rs,7130,src/store,info,store::postgres
+src/store/postgres.rs,7177,src/store,info,store::postgres
+src/store/postgres.rs,7227,src/store,info,store::postgres
+src/store/postgres.rs,7268,src/store,info,store::postgres
+src/store/postgres.rs,7300,src/store,info,store::postgres
+src/store/postgres.rs,7341,src/store,info,store::postgres
+src/store/postgres.rs,7377,src/store,debug,store::postgres
+src/store/postgres.rs,7389,src/store,info,store::postgres
+src/store/postgres.rs,7538,src/store,info,store::postgres
+src/store/postgres.rs,7572,src/store,warn,store::postgres
+src/store/postgres.rs,7678,src/store,warn,store::postgres
+src/store/postgres.rs,7698,src/store,warn,store::postgres
+src/store/postgres.rs,7719,src/store,warn,store::postgres
+src/store/postgres.rs,7739,src/store,warn,store::postgres
+src/store/postgres.rs,7746,src/store,warn,store::postgres
+src/store/postgres.rs,7761,src/store,info,store::postgres
+src/store/postgres.rs,7770,src/store,warn,store::postgres
+src/store/postgres.rs,8620,src/store,warn,(module default)
+src/store/postgres.rs,8872,src/store,warn,(module default)
+src/store/postgres.rs,9606,src/store,warn,store::postgres
+src/store/postgres.rs,9691,src/store,warn,store::postgres
+src/store/postgres.rs,9830,src/store,info,store::postgres
+src/store/postgres.rs,9915,src/store,info,store::postgres
+src/store/postgres.rs,9950,src/store,warn,store::postgres
+src/store/postgres.rs,10082,src/store,warn,store::postgres
+src/store/postgres.rs,10124,src/store,warn,store::postgres
+src/store/postgres.rs,10142,src/store,warn,store::postgres
+src/store/postgres.rs,10201,src/store,info,store::postgres
+src/store/postgres.rs,10342,src/store,info,store::postgres
+src/store/postgres.rs,10400,src/store,info,store::postgres
+src/store/postgres.rs,10516,src/store,info,store::postgres
+src/store/postgres.rs,10556,src/store,info,store::postgres
+src/store/postgres.rs,10614,src/store,info,store::postgres
+src/store/postgres.rs,10662,src/store,info,store::postgres
+src/store/postgres.rs,10710,src/store,info,store::postgres
+src/store/postgres.rs,10751,src/store,info,store::postgres
+src/store/postgres.rs,10810,src/store,info,store::postgres
+src/store/postgres.rs,10910,src/store,info,store::postgres
+src/store/postgres.rs,10963,src/store,info,store::postgres
+src/store/postgres.rs,11108,src/store,info,store::postgres
+src/store/postgres.rs,12644,src/store,warn,(module default)
+src/store/postgres.rs,13122,src/store,warn,ai_memory::authz
+src/store/postgres.rs,13610,src/store,warn,store::postgres::kg
+src/store/postgres.rs,13814,src/store,warn,store::postgres::kg
+src/store/postgres.rs,13828,src/store,error,store::postgres::kg
+src/store/postgres.rs,13844,src/store,warn,store::postgres::kg
+src/store/postgres.rs,13894,src/store,warn,store::postgres::kg
+src/store/postgres.rs,13907,src/store,warn,store::postgres::kg
+src/store/postgres.rs,13917,src/store,warn,store::postgres::kg
+src/store/postgres.rs,13985,src/store,warn,store::postgres::kg
+src/store/postgres.rs,13995,src/store,error,store::postgres::kg
+src/store/postgres.rs,14034,src/store,warn,store::postgres::kg
+src/store/postgres.rs,14048,src/store,debug,store::postgres::kg
+src/store/postgres.rs,14054,src/store,warn,store::postgres::kg
+src/store/postgres.rs,14199,src/store,warn,(module default)
+src/store/postgres.rs,14214,src/store,warn,(module default)
+src/store/postgres.rs,14235,src/store,warn,(module default)
+src/store/postgres.rs,14315,src/store,warn,encryption.undecryptable_row_skipped
+src/store/postgres.rs,14509,src/store,warn,federation::reflection_bookkeeping
+src/store/postgres.rs,14978,src/store,warn,signed_events
+src/store/postgres.rs,15016,src/store,warn,signed_events
+src/store/postgres.rs,15115,src/store,warn,reflection.decorrelation.advisory
+src/store/postgres.rs,15190,src/store,warn,signed_events
+src/store/postgres.rs,15211,src/store,warn,signed_events
+src/store/postgres.rs,15247,src/store,warn,signed_events
+src/store/postgres.rs,15289,src/store,warn,signed_events
+src/store/postgres.rs,15632,src/store,warn,signed_events
+src/store/postgres.rs,16486,src/store,warn,ai_memory::governance::standard_severed
+src/store/postgres.rs,17314,src/store,warn,encryption.envelope_owner_reconciled
+src/store/postgres.rs,18147,src/store,warn,store::postgres::kg::adapter_defect
+src/store/postgres.rs,18163,src/store,warn,store::postgres::kg
+src/store/postgres.rs,18180,src/store,warn,store::postgres::kg::adapter_defect
+src/store/postgres.rs,18198,src/store,warn,store::postgres::kg
+src/store/postgres.rs,18367,src/store,warn,ai_memory::governance::chain_graft
+src/store/postgres.rs,19350,src/store,warn,store::postgres
+src/store/postgres.rs,19372,src/store,info,store::postgres
+src/store/postgres.rs,19488,src/store,debug,store::postgres::kg
+src/store/postgres.rs,19702,src/store,warn,store::postgres::kg
+src/store/postgres.rs,19911,src/store,debug,store::postgres
+src/store/postgres.rs,20340,src/store,warn,signed_events
+src/store/postgres.rs,20430,src/store,warn,(module default)
+src/store/postgres.rs,20570,src/store,warn,signed_events
+src/store/postgres.rs,20589,src/store,warn,signed_events
+src/store/postgres.rs,20786,src/store,warn,ai_memory::quarantine
+src/store/postgres.rs,22934,src/store,warn,(module default)
+src/store/postgres.rs,23588,src/store,warn,(module default)
+src/store/postgres.rs,24396,src/store,warn,store::postgres::kg
+src/store/postgres.rs,24567,src/store,info,forget.tombstone
+src/store/postgres.rs,25069,src/store,info,forget.tombstone
+src/store/postgres.rs,25850,src/store,warn,(module default)
+src/store/postgres.rs,27360,src/store,warn,store::postgres
+src/store/postgres.rs,29436,src/store,info,lease.sweep
+src/store/postgres.rs,30345,src/store,warn,store::postgres
+src/store/postgres.rs,30360,src/store,warn,store::postgres
+src/store/postgres.rs,30930,src/store,warn,store::postgres::kg
+src/store/postgres.rs,31761,src/store,warn,signed_events
+src/store/postgres.rs,31861,src/store,warn,signed_events
+src/store/postgres.rs,31996,src/store,warn,ai_memory::governance
+src/store/postgres/chain_append.rs,282,src/store,warn,store::postgres::chain_append
+src/store/postgres/federation_3075.rs,129,src/store,info,forget.tombstone
+src/store/postgres/parity_3064.rs,178,src/store,info,confidence.calibrate
+src/store/postgres/parity_3064.rs,422,src/store,warn,confidence.calibrate
+src/store/postgres/parity_3064.rs,437,src/store,warn,confidence.shadow
+src/store/postgres/parity_3064.rs,464,src/store,info,confidence.calibrate
+src/store/postgres/tx_retry.rs,248,src/store,warn,store::postgres::tx_retry
+src/store/postgres/tx_retry.rs,260,src/store,warn,store::postgres::tx_retry
+src/store/postgres_parity.rs,78,src/store,warn,(module default)
+src/store/postgres_parity.rs,184,src/store,warn,(module default)
+src/store/sqlite.rs,119,src/store,warn,(module default)
+src/store/sqlite.rs,1871,src/store,warn,(module default)
+src/store/sqlite.rs,1897,src/store,warn,(module default)
+src/store/sqlite.rs,1917,src/store,warn,(module default)
+src/store/sqlite.rs,1921,src/store,warn,(module default)
+src/store/sqlite.rs,1928,src/store,warn,(module default)
+src/store_url.rs,86,src/store_url.rs,warn,(module default)
+src/store_url.rs,145,src/store_url.rs,warn,(module default)
+src/subscriptions.rs,341,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,598,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,905,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1022,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1054,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1085,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1118,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1155,src/subscriptions.rs,error,(module default)
+src/subscriptions.rs,1198,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1241,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1266,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1282,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1325,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1331,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1346,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1451,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1521,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1540,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1582,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1601,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,1690,src/subscriptions.rs,warn,ai_memory::subscriptions
+src/subscriptions.rs,1920,src/subscriptions.rs,warn,ai_memory::subscriptions
+src/subscriptions.rs,1939,src/subscriptions.rs,warn,ai_memory::subscriptions
+src/subscriptions.rs,2312,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,2367,src/subscriptions.rs,warn,(module default)
+src/subscriptions.rs,2401,src/subscriptions.rs,warn,(module default)
+src/tls.rs,216,src/tls.rs,warn,federation
+src/tls.rs,274,src/tls.rs,warn,ai_memory::tls
+src/tls.rs,517,src/tls.rs,error,(module default)
+src/transcripts/replay.rs,174,src/transcripts,warn,transcripts.replay
+src/transcripts/storage.rs,424,src/transcripts,warn,transcripts.lifecycle
+src/transcripts/storage.rs,435,src/transcripts,warn,transcripts.lifecycle
+src/transcripts/storage.rs,480,src/transcripts,warn,transcripts.lifecycle
+src/transcripts/storage.rs,495,src/transcripts,warn,transcripts.lifecycle
+src/transcripts/storage.rs,592,src/transcripts,warn,transcripts.bomb
+src/vectorlite.rs,161,src/vectorlite.rs,info,(module default)
+src/vectorlite.rs,170,src/vectorlite.rs,error,(module default)
+src/vectorlite.rs,313,src/vectorlite.rs,error,(module default)
+src/vectorlite.rs,370,src/vectorlite.rs,error,(module default)
+src/vectorlite.rs,383,src/vectorlite.rs,error,(module default)
+src/vectorlite.rs,406,src/vectorlite.rs,error,(module default)
+src/vectorlite.rs,445,src/vectorlite.rs,warn,(module default)
+src/vectorlite.rs,491,src/vectorlite.rs,warn,(module default)
+src/visibility.rs,227,src/visibility.rs,warn,visibility.unknown_scope
+src/wake_client/mod.rs,354,src/wake_client,info,(module default)
+src/wake_client/mod.rs,425,src/wake_client,info,(module default)
+src/wake_client/mod.rs,435,src/wake_client,warn,(module default)
+src/wake_client/mod.rs,470,src/wake_client,info,(module default)
+src/wake_client/mod.rs,516,src/wake_client,debug,(module default)
+src/wake_client/mod.rs,541,src/wake_client,debug,(module default)
+src/wake_hub/conn.rs,94,src/wake_hub,error,(module default)
+src/wake_hub/conn.rs,165,src/wake_hub,debug,(module default)
+src/wake_hub/conn.rs,181,src/wake_hub,debug,(module default)
+src/wake_hub/conn.rs,223,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,276,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,301,src/wake_hub,debug,(module default)
+src/wake_hub/conn.rs,326,src/wake_hub,debug,(module default)
+src/wake_hub/conn.rs,345,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,375,src/wake_hub,warn,(module default)
+src/wake_hub/conn.rs,399,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,433,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,442,src/wake_hub,warn,(module default)
+src/wake_hub/conn.rs,475,src/wake_hub,debug,(module default)
+src/wake_hub/conn.rs,528,src/wake_hub,debug,(module default)
+src/wake_hub/conn.rs,741,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,756,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,767,src/wake_hub,info,(module default)
+src/wake_hub/conn.rs,779,src/wake_hub,error,(module default)
+src/wake_hub/conn.rs,839,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,109,src/wake_hub,info,(module default)
+src/wake_hub/server.rs,117,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,141,src/wake_hub,info,(module default)
+src/wake_hub/server.rs,275,src/wake_hub,info,(module default)
+src/wake_hub/server.rs,287,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,294,src/wake_hub,info,(module default)
+src/wake_hub/server.rs,316,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,335,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,343,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,357,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,450,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,461,src/wake_hub,warn,(module default)
+src/wake_hub/server.rs,468,src/wake_hub,warn,(module default)
+src/wake_hub/startup.rs,254,src/wake_hub,warn,(module default)
+src/wake_hub/startup.rs,300,src/wake_hub,warn,(module default)
+src/wake_sink/boot.rs,78,src/wake_sink,info,(module default)
+src/wake_sink/boot.rs,169,src/wake_sink,debug,(module default)
+src/wake_sink/boot.rs,176,src/wake_sink,info,(module default)
+src/wake_sink/boot.rs,180,src/wake_sink,error,(module default)
+src/wake_sink/in_process.rs,116,src/wake_sink,warn,(module default)
+src/wake_sink/in_process.rs,124,src/wake_sink,debug,(module default)
+src/wake_sink/in_process.rs,135,src/wake_sink,warn,(module default)
+src/wake_sink/in_process.rs,161,src/wake_sink,info,(module default)
+src/wake_sink/mod.rs,424,src/wake_sink,warn,(module default)
+src/wake_sink/producer_identity.rs,204,src/wake_sink,error,(module default)
+src/wake_sink/uds.rs,294,src/wake_sink,warn,(module default)
+src/wake_sink/uds.rs,302,src/wake_sink,warn,(module default)
+src/wake_sink/uds.rs,312,src/wake_sink,warn,(module default)
+src/wake_sink/uds.rs,343,src/wake_sink,info,(module default)
+src/wake_sink/uds.rs,398,src/wake_sink,info,(module default)
+src/wake_sink/uds.rs,412,src/wake_sink,warn,(module default)
+src/wake_sink/uds.rs,427,src/wake_sink,info,(module default)
+src/wake_sink/uds.rs,447,src/wake_sink,info,(module default)
+src/write_events.rs,79,src/write_events.rs,warn,(module default)
+tools/auto-link-detector/src/main.rs,390,tools/auto-link-detector,eprintln,(module default)
+tools/auto-link-detector/src/main.rs,418,tools/auto-link-detector,eprintln,(module default)
+tools/post-ship-converge/src/main.rs,197,tools/post-ship-converge,eprintln,(module default)
+tools/post-ship-converge/src/main.rs,198,tools/post-ship-converge,eprintln,(module default)
+tools/post-ship-converge/src/main.rs,446,tools/post-ship-converge,eprintln,(module default)
+tools/post-ship-converge/src/main.rs,486,tools/post-ship-converge,println,(module default)
+tools/post-ship-converge/src/main.rs,491,tools/post-ship-converge,eprintln,(module default)
+tools/t0-orchestrate/src/main.rs,201,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,202,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,203,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,204,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,205,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,206,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,207,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,223,tools/t0-orchestrate,eprintln,(module default)
+tools/t0-orchestrate/src/main.rs,373,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,384,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,385,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,386,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,391,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,396,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,402,tools/t0-orchestrate,eprintln,(module default)
+tools/t0-orchestrate/src/main.rs,409,tools/t0-orchestrate,eprintln,(module default)
+tools/t0-orchestrate/src/main.rs,427,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,433,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,454,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,467,tools/t0-orchestrate,eprintln,(module default)
+tools/t0-orchestrate/src/main.rs,471,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,472,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,483,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,484,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,485,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,486,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,490,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,491,tools/t0-orchestrate,println,(module default)
+tools/t0-orchestrate/src/main.rs,492,tools/t0-orchestrate,println,(module default)
+tools/transcript-extractor/src/main.rs,442,tools/transcript-extractor,eprintln,(module default)
+tools/transcript-extractor/src/main.rs,470,tools/transcript-extractor,eprintln,(module default)
