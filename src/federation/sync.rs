@@ -805,7 +805,7 @@ pub async fn broadcast_store_quorum_with_embedding(
             .peers
             .iter()
             .filter(|p| !acked.contains(&p.id))
-            .map(|p| p.sync_push_url.clone())
+            .map(|p| crate::logging::redact_url_password(&p.sync_push_url))
             .collect();
         if !missing.is_empty() {
             missing.sort();

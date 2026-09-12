@@ -1015,6 +1015,11 @@ const REDACTED_PATH_SENTINEL: &str = "[redacted-path]";
 #[cfg(feature = "sal")]
 #[must_use]
 pub fn sanitize_store_err_message(raw: &str) -> String {
+    // #3667 — the URL-run boundary below stops at quotes, commas and
+    // semicolons, all legal inside a password; mask credentials first so
+    // the tail of a split password cannot survive the sentinel swap.
+    let masked = crate::logging::redact_urls_in_message(raw);
+    let raw = masked.as_str();
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let mut i = 0usize;
@@ -1112,6 +1117,18 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
 #[cfg(all(test, feature = "sal"))]
 mod store_err_sanitize_tests {
     use super::{REDACTED_PATH_SENTINEL, REDACTED_URL_SENTINEL, sanitize_store_err_message};
+
+    /// #3667 — a password holding the sanitizer's own boundary punctuation,
+    /// or sent as a query parameter, must not survive around the sentinel.
+    #[test]
+    fn sanitize_masks_punctuated_and_query_passwords_3667() {
+        let leak = "connect failed postgres://u:pa,ss;TAIL1@h/db?password=q,TAIL2 (timeout)";
+        let clean = sanitize_store_err_message(leak);
+        for secret in ["pa,ss", "TAIL1", "TAIL2"] {
+            assert!(!clean.contains(secret), "{secret} leaked: {clean}");
+        }
+        assert!(clean.contains(REDACTED_URL_SENTINEL), "{clean}");
+    }
 
     #[test]
     fn sanitize_redacts_postgres_url() {

@@ -1292,7 +1292,7 @@ impl OllamaClient {
             "LLM client construction via #1146 resolver — backend={}, model={}, base_url={}, key_source={}, source={}",
             resolved.backend,
             resolved.model,
-            resolved.base_url,
+            crate::logging::redact_url_password(&resolved.base_url),
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
@@ -1350,7 +1350,7 @@ impl OllamaClient {
             "LLM client construction via #1146 resolver (async, FX-D1) — backend={}, model={}, base_url={}, key_source={}, source={}",
             resolved.backend,
             resolved.model,
-            resolved.base_url,
+            crate::logging::redact_url_password(&resolved.base_url),
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
@@ -1463,7 +1463,7 @@ impl OllamaClient {
             return Err(anyhow!(
                 "Ollama is not running or not reachable at {}. \
                  Start it with: ollama serve",
-                instance.base_url
+                instance.display_base_url()
             ));
         }
 
@@ -1521,6 +1521,11 @@ impl OllamaClient {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_tests_without_probe(base_url: &str, model: &str) -> Result<Self> {
         Self::new_with_url_no_health_check(base_url, model)
+    }
+
+    /// #3667 — `base_url` with credentials masked, for every message.
+    fn display_base_url(&self) -> String {
+        crate::logging::redact_url_password(&self.base_url)
     }
 
     /// v0.7.0 F6 — observe the breaker's state without acquiring it for
@@ -1717,7 +1722,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.display_base_url(),
             ));
         }
         // v0.7.0 (issue #1237, #691 fold-1) — governance NetworkRequest gate.
@@ -1866,7 +1871,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.display_base_url(),
             ));
         }
         self.check_outbound()?;
@@ -2137,7 +2142,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.display_base_url(),
             ));
         }
         self.check_outbound()?;
@@ -2254,7 +2259,7 @@ impl OllamaClient {
         let host = url
             .as_ref()
             .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| self.base_url.clone());
+            .unwrap_or_else(|| self.display_base_url());
         let scheme = url
             .as_ref()
             .map(|u| u.scheme().to_string())
@@ -2301,7 +2306,7 @@ impl OllamaClient {
                 "Failed to send generate request: circuit breaker open \
                  (last failure within {}s); ollama at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.display_base_url(),
             ));
         }
         self.check_outbound()?;
@@ -2418,7 +2423,7 @@ impl OllamaClient {
                     "embed request exceeded the recall budget of {} ms ({}); \
                      recall degrades to keyword — raise or disable the budget with {}",
                     budget.as_millis(),
-                    self.base_url,
+                    self.display_base_url(),
                     crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS,
                 ))
             }
@@ -2443,7 +2448,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.display_base_url(),
             ));
         }
         self.check_outbound()?;
@@ -2654,7 +2659,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.display_base_url(),
             ));
         }
         self.check_outbound()?;

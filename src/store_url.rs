@@ -141,7 +141,7 @@ pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
         }
     }
     if let Some(url) = cli_arg {
-        if url_has_userinfo_password(url) {
+        if url_carries_credentials(url) {
             tracing::warn!(
                 "--store-url carries a password in argv, which is exposed via world-readable \
                  /proc/<pid>/cmdline and `ps auxww` to any local UID (#1927). Prefer \
@@ -207,21 +207,12 @@ pub fn refuse_postgres_store_url_without_feature(cli_arg: Option<&str>) -> Resul
     }
 }
 
-/// #1927 — true when a `scheme://user:pass@host/...` URL carries a non-empty
-/// userinfo password component (`user:pass@`). Best-effort structural check
-/// (no full URL parse) used only to decide whether to warn about argv exposure.
-fn url_has_userinfo_password(url: &str) -> bool {
-    let Some(after_scheme) = url.split_once("://").map(|(_, r)| r) else {
-        return false;
-    };
-    // userinfo is everything before the first '@' of the authority.
-    let Some(at) = after_scheme.find('@') else {
-        return false;
-    };
-    let userinfo = &after_scheme[..at];
-    // A password is present iff there is a ':' in the userinfo with something
-    // after it.
-    matches!(userinfo.split_once(':'), Some((_, pass)) if !pass.is_empty())
+/// #1927 / #3667 — true when the URL carries any credential the log
+/// redactor masks: a userinfo password OR a query-form one (`?password=`,
+/// which SQLx honours just the same). Used only to decide whether to warn
+/// about argv exposure, so it shares the redactor's definition exactly.
+fn url_carries_credentials(url: &str) -> bool {
+    crate::logging::redact_url_password(url) != url
 }
 
 /// Process-global lock for every test (and test-only caller) that reads or
@@ -320,14 +311,17 @@ mod tests {
     /// actually present (so a passwordless DSN does not nag the operator).
     #[test]
     fn issue_1927_userinfo_password_detection() {
-        assert!(url_has_userinfo_password(
+        assert!(url_carries_credentials(
             "postgres://user:hunter2@db.internal/mem"
         ));
-        assert!(!url_has_userinfo_password(
+        assert!(!url_carries_credentials(
             "postgres://user@db.internal/mem"
         ));
-        assert!(!url_has_userinfo_password("postgres://db.internal/mem"));
-        assert!(!url_has_userinfo_password("sqlite:///var/lib/mem.db"));
+        assert!(!url_carries_credentials("postgres://db.internal/mem"));
+        assert!(!url_carries_credentials("sqlite:///var/lib/mem.db"));
+        // #3667 — a query-form password is the same argv exposure.
+        assert!(url_carries_credentials("postgres://user@db/mem?%70assword=x"));
+        assert!(!url_carries_credentials("postgres://db/mem?sslmode=verify-full"));
     }
 
     /// #2679 — a postgres:// URL on the env channel is refused on a binary

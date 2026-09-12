@@ -199,8 +199,8 @@ pub enum EgressDecision {
     Refuse {
         /// The egress class refused.
         class: EgressClass,
-        /// The resolved target base URL (config-class, never a secret —
-        /// the api key is a separate field and is NEVER included here).
+        /// The resolved target base URL with any URL credentials masked
+        /// (#3667) — the api key is a separate field and is NEVER included.
         target: String,
         /// Human-readable refusal explanation.
         reason: String,
@@ -285,7 +285,7 @@ pub fn evaluate_inference_egress(
         InferenceEgressMode::Allow => EgressDecision::Allow,
         InferenceEgressMode::Deny => EgressDecision::Refuse {
             class,
-            target: base_url.to_string(),
+            target: crate::logging::redact_url_password(base_url),
             reason: format!(
                 "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=deny (no memory \
                  content may leave the host for {class})",
@@ -298,7 +298,7 @@ pub fn evaluate_inference_egress(
             } else {
                 EgressDecision::Refuse {
                     class,
-                    target: base_url.to_string(),
+                    target: crate::logging::redact_url_password(base_url),
                     reason: format!(
                         "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=loopback-only \
                          but target is not loopback ({class})",

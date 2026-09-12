@@ -693,9 +693,13 @@ pub async fn run_daemon(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = build_sync_client(&args).await?;
 
+    let peers: Vec<String> = args
+        .peers
+        .iter()
+        .map(|peer| crate::logging::redact_url_password(peer))
+        .collect();
     tracing::info!(
-        "sync-daemon: local_agent_id={local_agent_id} peers={peers:?} interval={interval}s",
-        peers = args.peers
+        "sync-daemon: local_agent_id={local_agent_id} peers={peers:?} interval={interval}s"
     );
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
