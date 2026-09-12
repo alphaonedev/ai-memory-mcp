@@ -758,6 +758,8 @@ pub mod cost;
 pub mod curator;
 pub mod daemon_runtime;
 pub mod durability;
+/// Durability evidence carried by write receipts (#3555).
+pub mod write_receipt;
 // v1.0.0 #2064 (TRACT-gap G16, #1830) — opt-in erasure-coded archive
 // cold-tier redundancy layer (operator-authorized reed-solomon-simd dep).
 pub mod erasure;

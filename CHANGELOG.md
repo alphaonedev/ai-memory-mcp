@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3555 — write receipts declare their durability)
+
+- HTTP create, update, bulk, capture/replay and sync-push receipts, local MCP
+  store/update/capture receipts, and CLI store/update/capture receipts declare
+  `durability_class` and `fsync`. Forwarded MCP stores retain the daemon receipt.
+- Local writes declare `local-only`; SQLite reads the live `synchronous` setting.
+  Successful quorum creates report the actual acknowledgement count and replica
+  count on SQLite and PostgreSQL. Explicit backup-posture attestation can raise
+  an acknowledged replicated write to `replicated+backup`.
+- SDK and shim wire types expose receipt evidence. The generated all-funnel
+  structural contract is deferred to #3558; no competing manifest is introduced.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`

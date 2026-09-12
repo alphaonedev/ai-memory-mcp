@@ -2213,6 +2213,24 @@ pub async fn sync_push(
     cert_peer: Option<axum::Extension<crate::tls::ClientCertPeerId>>,
     body_bytes: Bytes,
 ) -> impl IntoResponse {
+    let response = sync_push_write(State(app.clone()), headers, cert_peer, body_bytes)
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn sync_push_write(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    cert_peer: Option<axum::Extension<crate::tls::ClientCertPeerId>>,
+    body_bytes: Bytes,
+) -> impl IntoResponse {
     // v0.7.0 #791 — verify the per-message signature BEFORE
     // deserialising the body. Keeps the verifier's input identical
     // to the wire bytes (signer + verifier MUST agree byte-for-byte).
