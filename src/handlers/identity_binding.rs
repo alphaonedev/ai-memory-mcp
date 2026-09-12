@@ -130,6 +130,8 @@ pub fn api_key_sha256_hex(token: &str) -> String {
 pub struct EnrolledAgentKeys {
     inner: std::sync::RwLock<std::sync::Arc<std::collections::HashMap<String, String>>>,
     generation: std::sync::atomic::AtomicU64,
+    pub(crate) monitoring: super::monitoring::MonitoringConfig,
+    pub(crate) monitoring_tls: bool,
 }
 
 impl EnrolledAgentKeys {
@@ -139,7 +141,22 @@ impl EnrolledAgentKeys {
         Self {
             inner: std::sync::RwLock::new(std::sync::Arc::new(map)),
             generation: std::sync::atomic::AtomicU64::new(0),
+            monitoring: super::monitoring::MonitoringConfig::default(),
+            monitoring_tls: false,
         }
+    }
+
+    /// Assign health-only scopes and actual listener TLS posture before sharing.
+    /// Scope assignments remain fixed while enrolled keys refresh/revoke live.
+    #[must_use]
+    pub fn with_monitoring(
+        mut self,
+        scopes: super::monitoring::MonitoringConfig,
+        tls: bool,
+    ) -> Self {
+        self.monitoring = scopes;
+        self.monitoring_tls = tls;
+        self
     }
 
     /// An EMPTY registry — the inert posture (see [`enforce_for_request`]).

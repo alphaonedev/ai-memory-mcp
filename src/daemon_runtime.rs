@@ -6145,6 +6145,21 @@ pub async fn bootstrap_serve(
     args: &ServeArgs,
     app_config: &AppConfig,
 ) -> Result<ServeBootstrap> {
+    if let Some(scopes) = &app_config.monitoring
+        && !scopes.peer_ids.is_empty()
+    {
+        let bindings = tls::cert_peer_binding_map_from_env()?;
+        anyhow::ensure!(
+            args.tls_cert.is_some()
+                && args.tls_key.is_some()
+                && args.mtls_allowlist.is_some()
+                && bindings.as_ref().is_some_and(|map| scopes
+                    .peer_ids
+                    .iter()
+                    .all(|id| map.values().any(|v| v == id))),
+            "monitoring peer scopes require TLS, the mTLS allowlist, and an existing certificate binding for every scoped peer"
+        );
+    }
     crate::federation::peer_posture::enforce_at_boot(
         !args.quorum_peers.is_empty(),
         args.mtls_allowlist.as_deref(),
@@ -7181,6 +7196,16 @@ pub async fn bootstrap_serve(
             }
         }
     };
+
+    let enrolled_agent_keys = Arc::new(
+        crate::handlers::identity_binding::EnrolledAgentKeys::from_map(
+            enrolled_agent_keys.snapshot().as_ref().clone(),
+        )
+        .with_monitoring(
+            app_config.monitoring.clone().unwrap_or_default(),
+            args.tls_cert.is_some() && args.tls_key.is_some(),
+        ),
+    );
 
     // #3065 (Wave-2 Cluster B, cert-core) — the ADMIN_HEADER_TRUST identity
     // boot-gate. Header-asserted identity (AI_MEMORY_ADMIN_HEADER_TRUST=1 +

@@ -1609,12 +1609,12 @@ This is the write-side twin of the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail
 (#1923). The process working directory is deliberately NOT the fallback root: a
 daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 
-> **Total HTTP surface at v1.0.0: 86 unique URL paths across 100
+> **Total HTTP surface at v1.0.0: 88 unique URL paths across 102
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 86` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 100`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 88` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 102`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).
@@ -1625,7 +1625,7 @@ daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 > grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l
 > ```
 >
-> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (86): the
+> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (88): the
 > `/api/v1/*` paths plus the bare `/metrics`. Do not count `.route(`
 > occurrences in `src/lib.rs` to get the registration total — the
 > router also registers test-only routes under `#[cfg(test)]`, so a
@@ -1711,3 +1711,13 @@ The v0.8.0 net-new tools were the coordination families `memory_action_*`, `memo
 - `docs/CLI_REFERENCE.md` — corresponding CLI surface.
 - `docs/SECURITY.md` — API key + mTLS + governance.
 - `docs/TROUBLESHOOTING.md` — common error scenarios.
+
+### Authenticated health monitoring (v1)
+
+`GET /api/v1/monitoring/status` returns versioned, metadata-only JSON;
+`GET /api/v1/monitoring/metrics` returns standard Prometheus exposition. Both
+require the daemon's native TLS and existing enrolled-key or bound mTLS
+authentication (the operator key also works). `[monitoring]` assigns ordinary
+principals a health-only scope enforced before all route dispatch. See the
+[health monitoring contract](HEALTH-MONITORING.md) for enrollment, fields,
+privacy, unavailable audit signals and the storage-boundary follow-up #3672.

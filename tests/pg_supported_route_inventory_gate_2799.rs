@@ -107,6 +107,8 @@ fn all_registered_paths() -> Vec<&'static str> {
         routes::FORGET,
         routes::GC,
         routes::HEALTH,
+        routes::MONITORING_STATUS,
+        routes::MONITORING_METRICS,
         routes::IMPORT,
         routes::INBOX,
         // v1.0.0 #3465 — agent-facing inbox wake SSE stream.
@@ -356,9 +358,11 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // again. Re-derived from the ACTUAL 71 / 13 / 84 on the rebase base — the
 // pre-rebase branch read 68 / 17 / 85 against a base that has since moved,
 // and adding a delta to a moved base is how this inventory drifts.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 73;
+// #3646: +2 metadata-only health paths; live PostgreSQL dispatch is pinned by
+// monitoring_api_3646::issue_3646_postgres_routes_and_seeded_non_disclosure.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 75;
 const EXPECTED_FULLY_501_PATHS: usize = 13;
-const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 86;
+const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 88;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
 /// names the allow-list body references. A silent match-arm add/remove
@@ -388,6 +392,8 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "FORGET",
     "GC",
     "HEALTH",
+    "MONITORING_STATUS",
+    "MONITORING_METRICS",
     "IMPORT",
     "INBOX",
     // v1.0.0 #3465 — agent-facing inbox wake SSE stream.

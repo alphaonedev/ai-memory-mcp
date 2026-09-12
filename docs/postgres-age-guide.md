@@ -10,7 +10,7 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **73 of the 86** unique production HTTP paths;
+> v1.0.0 postgres serves **75 of the 88** unique production HTTP paths;
 > the other **13 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
@@ -59,7 +59,7 @@ ladder ends at `migrate_v98()`).
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**73 of the 86 unique production HTTP paths are served on postgres and
+**75 of the 88 unique production HTTP paths are served on postgres and
 13 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
 is SQLite-only**. See "The 13 fully-501 paths" below for the exact
@@ -675,10 +675,10 @@ The eight remaining sqlite-only surfaces land here.
 > on a postgres-backed daemon, with "no residual 501 envelope on
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
-> **RETRACTED**. The measured, gate-pinned inventory is **73
-> pg-supported unique paths, 13 fully-501 paths, 86 unique paths
-> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 73` /
-> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 86`,
+> **RETRACTED**. The measured, gate-pinned inventory is **75
+> pg-supported unique paths, 13 fully-501 paths, 88 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 75` /
+> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 88`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the
 > same gate freezes the allow-list membership so a silent match-arm
 > add or remove fails until the SSOT is updated in a reviewed edit. The

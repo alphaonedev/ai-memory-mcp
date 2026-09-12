@@ -126,3 +126,8 @@ pub const SYNC_SINCE: &str = "/api/v1/sync/since";
 pub const TAXONOMY: &str = "/api/v1/taxonomy";
 pub const TOOLS_LIST: &str = "/api/v1/tools/list";
 pub const METRICS_BARE: &str = "/metrics";
+
+/// Authenticated metadata-only health document (#3646).
+pub const MONITORING_STATUS: &str = "/api/v1/monitoring/status";
+/// Authenticated metadata-only Prometheus exposition (#3646).
+pub const MONITORING_METRICS: &str = "/api/v1/monitoring/metrics";

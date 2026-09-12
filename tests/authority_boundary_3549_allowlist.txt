@@ -58,3 +58,6 @@ read	memory_namespace_get_standard	the bound standard row is gated by is_readabl
 # (d) UNGATED memory-row reads surfaced BY this inventory — ALL CLOSED (#3596–#3601):
 #     every read-only tool that reads memory rows now calls is_readable_on_query; a
 #     future ungated tool fails the structural guard and must be tracked here to closure.
+
+http	/api/v1/monitoring/status	metadata-only; enrolled-key/mTLS authentication and scope enforced by outer monitoring::access (#3646)
+http	/api/v1/monitoring/metrics	metadata-only; enrolled-key/mTLS authentication and scope enforced by outer monitoring::access (#3646)

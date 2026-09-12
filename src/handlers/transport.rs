@@ -986,7 +986,9 @@ pub async fn api_key_auth(
     };
 
     // Exempt health endpoint
-    if req.uri().path() == super::routes::HEALTH {
+    if req.uri().path() == super::routes::HEALTH
+        || super::monitoring::is_health_path(req.uri().path())
+    {
         return next.run(req).await.into_response();
     }
 
@@ -1286,7 +1288,7 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
 
 /// The sqlite half of [`health`]: one blocking-pool hop, two fixed
 /// statements, no write lock.
-async fn sqlite_liveness(app: &AppState) -> (bool, &'static str) {
+pub(super) async fn sqlite_liveness(app: &AppState) -> (bool, &'static str) {
     // #3164 — a dispatch failure IS a liveness failure: the writer connection
     // could not be reached (or is wedged inside a transaction it will not
     // leave), which is exactly what `/health` exists to report.

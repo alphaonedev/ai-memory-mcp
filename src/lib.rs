@@ -437,7 +437,7 @@ pub const META_KEY_FAMILY: &str = "family";
 // Re-derived from the ACTUAL count on the rebase base rather than carried
 // forward: the pre-rebase branch read 99/85 against a 97/83 base, and adding
 // its own delta to a moved base is exactly how a route-count SSOT drifts.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 100;
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 102;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -477,7 +477,8 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // 2026-09-06 (#3474) — bumped 84 → 86: the two new unique paths
 // `/api/v1/agents/{id}/api-key` (admin mint/bind) and
 // `/api/v1/agents/{id}/api-key/revoke` (admin revoke, approval-gated).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 86;
+// #3646 adds authenticated monitoring status and numeric exposition.
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 88;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -1170,6 +1171,7 @@ pub fn build_router_with_timeout(
     app_state: handlers::AppState,
     request_timeout: std::time::Duration,
 ) -> axum::Router {
+    let monitoring_state = handlers::monitoring::AccessState::new(api_key_state.clone());
     use axum::{
         extract::DefaultBodyLimit,
         routing::{delete, get, post, put},
@@ -1202,6 +1204,14 @@ pub fn build_router_with_timeout(
 
     let router = axum::Router::new()
         .route(handlers::routes::HEALTH, get(handlers::health))
+        .route(
+            handlers::routes::MONITORING_STATUS,
+            get(handlers::monitoring::status),
+        )
+        .route(
+            handlers::routes::MONITORING_METRICS,
+            get(handlers::monitoring::metrics),
+        )
         // v0.6.0.0: Prometheus scrape endpoint. Exposed at both /metrics
         // (the community convention) and /api/v1/metrics (consistent with
         // the rest of the REST surface).
@@ -1635,7 +1645,9 @@ pub fn build_router_with_timeout(
     // (after `.with_state`, so it is the very first layer a request hits).
     // Reads the process-wide cap seeded at boot; `0` = disabled (no layer
     // composed, byte-identical to a build without admission control).
-    compose_admission_control(router, max_inflight_requests())
+    compose_admission_control(router, max_inflight_requests()).layer(
+        axum::middleware::from_fn_with_state(monitoring_state, handlers::monitoring::access),
+    )
 }
 
 /// #1733 (Pillar-4 4.A) — wrap `router` with the HTTP admission-control
@@ -1673,7 +1685,8 @@ fn compose_admission_control(router: axum::Router, cap: usize) -> axum::Router {
                 // Liveness/readiness + metrics scrape bypass the cap so an
                 // overloaded node still answers its orchestrator + scraper.
                 let path = req.uri().path();
-                if path == handlers::routes::HEALTH
+                if handlers::monitoring::is_health_path(path)
+                    || path == handlers::routes::HEALTH
                     || path == handlers::routes::METRICS
                     || path == handlers::routes::METRICS_BARE
                 {

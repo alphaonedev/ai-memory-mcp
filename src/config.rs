@@ -3458,6 +3458,9 @@ pub struct AppConfig {
     /// `pm-v3`. See [`AdminConfig`] for the full role-gate semantics.
     pub admin: Option<AdminConfig>,
 
+    /// Health-only scope assignments for ordinary enrolled identities (#3646).
+    pub monitoring: Option<crate::handlers::monitoring::MonitoringConfig>,
+
     // ------------------------------------------------------------------
     // v0.7.x enterprise configuration sections (issue #1146).
     //
@@ -3614,6 +3617,7 @@ impl std::fmt::Debug for AppConfig {
             .field("governance", &self.governance)
             .field("confidence", &self.confidence)
             .field("admin", &self.admin)
+            .field("monitoring", &self.monitoring)
             .field("schema_version", &self.schema_version)
             .field("llm", &self.llm)
             .field(config_keys::SECTION_EMBEDDINGS, &self.embeddings)
@@ -8635,6 +8639,7 @@ impl AppConfig {
             "governance",
             "confidence",
             "admin",
+            "monitoring",
             // v0.7.x (#1146) — enterprise configuration sections.
             "schema_version",
             "llm",
@@ -12473,6 +12478,7 @@ legacy_scoring = false
             governance: Some(GovernanceConfig::default()),
             confidence: Some(ConfidenceConfig::default()),
             admin: Some(AdminConfig::default()),
+            monitoring: Some(crate::handlers::monitoring::MonitoringConfig::default()),
             // v0.7.x (#1146) — enterprise configuration sections.
             schema_version: Some(2),
             llm: Some(LlmSection::default()),
@@ -12533,6 +12539,7 @@ legacy_scoring = false
             "governance",
             "confidence",
             "admin",
+            "monitoring",
             // v0.7.x (#1146) — enterprise configuration sections.
             "schema_version",
             "llm",
