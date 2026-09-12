@@ -360,20 +360,19 @@ fn test_require_agent_attestation_env_parsing() {
         drop(guard);
     }
 
-    // ---- Any unrecognized value → surface-scoped compiled default: a typo
-    // fails CLOSED on the network surface, permissive on operator surfaces. ----
+    // ---- #3200: an unrecognized value fails CLOSED on EVERY surface (this
+    // knob is a mandate: truthy tightens). Pre-#3200 a typo fell through to
+    // the surface-scoped default, which left MCP and CLI permissive. ----
     let _guard = EnvVarGuard::set(
         "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
         "yes-please".to_string(),
     );
-    assert!(
-        require_agent_attestation_for(http),
-        "an unrecognized value MUST fall through to the HTTP-direct required default (fail-closed)",
-    );
-    assert!(
-        !require_agent_attestation_for(mcp),
-        "an unrecognized value MUST fall through to the MCP permissive default",
-    );
+    for surface in [http, mcp, cli] {
+        assert!(
+            require_agent_attestation_for(surface),
+            "an unrecognized value MUST fail closed to strict on {surface:?}",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,13 +1618,21 @@ mod strict_decrypt_reads_2383 {
                 "{truthy:?} must enable the fail-closed read posture"
             );
         }
-        // Anything else falls through to the default (a typo must never
-        // silently change the posture in either direction).
-        for falsy in ["0", "false", "no", "off", "", "  ", "strict", "maybe"] {
+        // Falsy and empty tokens keep the split posture.
+        for falsy in ["0", "false", "no", "off", "", "  "] {
             let _off = EnvVarGuard::set(ENV_STRICT_DECRYPT_READS, falsy.to_string());
             assert!(
                 !strict_decrypt_reads_enabled(),
-                "{falsy:?} must fall through to the split posture"
+                "{falsy:?} must resolve to the split posture"
+            );
+        }
+        // #3200: a token outside the grammar fails CLOSED on this mandate
+        // (truthy tightens), so a typo engages the strict posture.
+        for typo in ["strict", "maybe"] {
+            let _on = EnvVarGuard::set(ENV_STRICT_DECRYPT_READS, typo.to_string());
+            assert!(
+                strict_decrypt_reads_enabled(),
+                "{typo:?} must fail closed to the strict read posture"
             );
         }
     }

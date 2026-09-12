@@ -86,10 +86,15 @@ fn require_why_trace_enabled_respects_truthy_grammar() {
         unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, v) };
         assert!(require_why_trace_enabled(), "{v:?} must be truthy");
     }
-    for v in ["0", "false", "no", "off", "garbage"] {
+    for v in ["0", "false", "no", "off"] {
         unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, v) };
         assert!(!require_why_trace_enabled(), "{v:?} must be falsy");
     }
+    // #3200: a token outside the grammar fails CLOSED on this mandate.
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "garbage") };
+    let typo_engages = require_why_trace_enabled();
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+    assert!(typo_engages, "\"garbage\" must fail closed (gate ON)");
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
@@ -169,13 +174,18 @@ fn require_immutable_authorship_enabled_respects_truthy_grammar() {
             "{v:?} must be truthy"
         );
     }
-    for v in ["0", "false", "no", "off", "garbage"] {
+    for v in ["0", "false", "no", "off"] {
         unsafe { std::env::set_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, v) };
         assert!(
             !require_immutable_authorship_enabled(),
             "{v:?} must be falsy"
         );
     }
+    // #3200: a token outside the grammar fails CLOSED on this mandate.
+    unsafe { std::env::set_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, "garbage") };
+    let typo_engages = require_immutable_authorship_enabled();
+    unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
+    assert!(typo_engages, "\"garbage\" must fail closed (gate ON)");
     unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
 }
 

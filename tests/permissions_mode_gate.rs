@@ -300,11 +300,20 @@ fn require_governed_namespace_uses_shared_truthy_grammar() {
             "truthy token {truthy:?} must engage the strict posture"
         );
     }
-    for falsy in ["0", "false", "enable", "enabled", "", "2"] {
+    for falsy in ["0", "false", "no", "off", ""] {
         unsafe { std::env::set_var(env, falsy) };
         assert!(
             !ai_memory::governance::require_governed_namespace(),
-            "non-truthy token {falsy:?} must NOT engage the strict posture"
+            "falsy or empty token {falsy:?} must NOT engage the strict posture"
+        );
+    }
+    // #3200: a token outside the grammar fails CLOSED on this mandate, so a
+    // typo engages the strict posture rather than silently staying open.
+    for typo in ["enable", "enabled", "2"] {
+        unsafe { std::env::set_var(env, typo) };
+        assert!(
+            ai_memory::governance::require_governed_namespace(),
+            "unrecognised token {typo:?} must fail closed to the strict posture"
         );
     }
     unsafe { std::env::remove_var(env) };

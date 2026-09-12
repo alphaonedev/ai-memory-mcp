@@ -183,7 +183,13 @@ fn stock_serve_console_renders_the_boot_posture_banner_2908() {
 /// loopback, and the refusal names the knob so the operator knows the fix.
 #[test]
 fn asi_hard_serve_refuses_a_keyless_bind_3200() {
-    let lines = serve_boot_lines("AI_MEMORY_REQUIRE_API_KEY", Duration::from_secs(90));
+    // The needle is the refusal text, NOT the knob name: the asi-hard pin
+    // report logs `knob="AI_MEMORY_REQUIRE_API_KEY"` first and would stop
+    // the reader before the refusal is emitted.
+    let lines = serve_boot_lines(
+        "refusing to start without an API key",
+        Duration::from_secs(90),
+    );
     assert!(
         lines
             .iter()
