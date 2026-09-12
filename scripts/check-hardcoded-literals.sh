@@ -105,6 +105,7 @@ export LC_ALL=C
 AWK="${AWK_BIN:-awk}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT}/scripts/lib/production-lines.sh"
 BASELINE="${ROOT}/scripts/qc-allowlists/hardcoded-literals-baseline.txt"
 
 # Minimum literal length to consider (chars between the quotes). 10 keeps
@@ -114,51 +115,13 @@ MIN_LEN=10
 # Distinct production sites at/above which a literal is "duplicated".
 DUP_THRESHOLD=3
 
-# find_test_boundary <file> — first `mod tests {` line OR first
-# `#[cfg(test)]` attribute that introduces a MODULE (attr line whose
-# next line starts a `mod`), whichever comes first; huge sentinel when
-# neither exists. The attr+mod pairing catches test modules with
-# non-standard names (e.g. `#[cfg(test)] mod l2_2_audit_tests` in
-# src/storage/reflect.rs) that leaked test literals into the baseline
-# (#1561), while a `#[cfg(test)]` on a single mid-file item does NOT
-# truncate the production region below it.
-find_test_boundary () {
-    local f="$1" line_mod line_cfg
-    # #1564 — a file-level `#![cfg(test)]` inner attribute makes the
-    # WHOLE file test code (e.g. src/mcp/tools/d1_4_985_helpers.rs);
-    # boundary 0 excludes every line.
-    if grep -qE '^[[:space:]]*#!\[cfg\(test\)\]' "$f" 2>/dev/null; then
-        echo 0
-        return
-    fi
-    line_mod=$(grep -nE '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests?[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
-    # #1577 — the attr+mod pairing must only fire on an INLINE module
-    # body (`mod x {`), never a `mod x;` declaration whose body lives
-    # in another file (e.g. mcp/mod.rs's `#[cfg(test)] pub(super) mod
-    # parity_test_helpers;` made the gate skip 13.9k production lines).
-    # Attr pattern also widened to catch `#[cfg(all(test, ...))]`.
-    line_cfg=$("$AWK" '/^[[:space:]]*#\[cfg\((all\()?test[,)]/{attr=NR; next}
-                    attr && /^[[:space:]]*(pub([(][^)]*[)])?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\{/{print attr; exit}
-                    {attr=0}' "$f" 2>/dev/null)
-    [[ -z "$line_mod" ]] && line_mod=999999999
-    [[ -z "$line_cfg" ]] && line_cfg=999999999
-    if (( line_cfg < line_mod )); then echo "$line_cfg"; else echo "$line_mod"; fi
-}
-
 # emit_literals <file> — print one `<literal>` per production occurrence
 # site (a site = one literal on one production line; multiple distinct
 # literals on a line each count). Skips test region + comment/use/attr/
 # const-def lines. Literals are emitted raw (no surrounding quotes).
 emit_literals () {
-    local f="$1" bn
-    bn="$(basename "$f")"
-    case "$bn" in
-        *test*.rs|tests.rs) return 0 ;;
-    esac
-    local boundary
-    boundary=$(find_test_boundary "$f")
-    "$AWK" -v boundary="$boundary" -v minlen="$MIN_LEN" '
-        NR >= boundary { exit }
+    local f="$1"
+    production_lines "$f" | "$AWK" -v minlen="$MIN_LEN" '
         {
             line = $0
             # strip leading whitespace for the prefix tests
@@ -186,7 +149,7 @@ emit_literals () {
                 print lit
             }
         }
-    ' "$f"
+    '
 }
 
 # compute_current_counts — emit sorted `COUNT<TAB>LITERAL` for every
@@ -228,6 +191,7 @@ fi
 # Every awk must produce a BYTE-IDENTICAL violation set, or the gate is not
 # portable and the shared baseline cannot be trusted.
 if [[ "${1:-}" == "--self-test" ]]; then
+    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     echo "Hardcoded-literal gate: self-test (planted probes A/B/C, once per awk on this host; #3537)"
 
     probe_dup="${ROOT}/src/.hardcoded_literal_gate_probe.rs"
