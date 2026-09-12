@@ -13,6 +13,18 @@ use serde_json::Value;
 /// attestation, not evidence that an asynchronous backup contains this write.
 pub const BACKUP_ATTESTATION_ENV: &str = "AI_MEMORY_BACKUP_POSTURE_ATTESTATION";
 
+/// Receipt/response field carrying the W-of-N acknowledgement count actually
+/// observed for a write (#3555). ONE spelling for every funnel — pm-v3.1
+/// literal gate.
+pub const QUORUM_ACKS_FIELD: &str = "quorum_acks";
+
+/// Receipt/response field carrying the configured replica count `N` (#3555).
+pub const QUORUM_N_FIELD: &str = "quorum_n";
+
+/// Receipt/response field carrying the configured required-ack count `W`
+/// (#3555).
+pub const QUORUM_REQUIRED_FIELD: &str = "quorum_required";
+
 /// Evidence declared in a write response. Never persisted on a memory row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WriteDurability {

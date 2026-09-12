@@ -1042,9 +1042,9 @@ async fn fanout_and_assemble_create_response(
         {
             Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
                 Ok(got) => {
-                    response["quorum_acks"] = json!(got);
-                    response["quorum_n"] = json!(fed.policy.n);
-                    response["quorum_required"] = json!(fed.policy.w);
+                    response[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
+                    response[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
+                    response[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
                     return (StatusCode::CREATED, Json(response)).into_response();
                 }
                 Err(err) => {
@@ -1567,9 +1567,9 @@ async fn create_memory_postgres(
         Err(resp) => return resp,
     };
     if let (Some(got), Some(fed)) = (receipt_quorum, app.federation.as_ref()) {
-        payload["quorum_acks"] = json!(got);
-        payload["quorum_n"] = json!(fed.policy.n);
-        payload["quorum_required"] = json!(fed.policy.w);
+        payload[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
+        payload[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
+        payload[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
     }
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id));

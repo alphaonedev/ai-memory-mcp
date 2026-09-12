@@ -832,9 +832,9 @@ async fn update_memory_write(
             {
                 match crate::federation::finalise_quorum(&tracker) {
                     Ok(got) => {
-                        receipt["quorum_acks"] = json!(got);
-                        receipt["quorum_n"] = json!(fed.policy.n);
-                        receipt["quorum_required"] = json!(fed.policy.w);
+                        receipt[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
+                        receipt[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
+                        receipt[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
