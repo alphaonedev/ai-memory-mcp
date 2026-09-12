@@ -1,4 +1,4 @@
-# posture-legs transcript — recorded exit codes (2026-09-11 #3607 re-issue recapture (22 checks) @ b04831159)
+# posture-legs transcript — recorded exit codes (2026-09-11 #3607 re-issue recapture (22 checks) @ ab6f21750)
 # each leg: the doctor invocation shape, then the observed shell exit status.
 
 ## leg 1: bare (env -i, AI_MEMORY_NO_CONFIG=1 only)

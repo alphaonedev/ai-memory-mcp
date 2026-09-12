@@ -66,6 +66,6 @@ ai-memory doctor --posture enterprise-federation
          actual:   FULL (resolved from env AI_MEMORY_DB_SYNCHRONOUS; applied to every connection this binary opens; live PRAGMA synchronous on this process's own read-only connection agrees) — durability_class=local-only, fsync per-commit, RPO on power loss: none (each acknowledged commit is fsync'd)
   [PASS] backup manifest signing
          required: operator public key resolves AND any local operator signing key matches it
-         actual:   operator public key sha256:50582e2c2ccc8514; the local signing key matches it
+         actual:   operator public key sha256:744ac505e2a9b042; the local signing key matches it
 
 overall: PASS

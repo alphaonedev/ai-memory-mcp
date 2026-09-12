@@ -76,6 +76,6 @@ ai-memory doctor --posture enterprise-federation
          fix:      set AI_MEMORY_DB_SYNCHRONOUS=FULL (the asi-hard profile pins it); see PERFORMANCE.md §"Power-loss durability" — a NORMAL node is inside the envelope only as durability_class=local-only with its RPO declared (standard §0.1)
   [PASS] backup manifest signing
          required: operator public key resolves AND any local operator signing key matches it
-         actual:   operator public key sha256:50582e2c2ccc8514; the local signing key matches it
+         actual:   operator public key sha256:744ac505e2a9b042; the local signing key matches it
 
 overall: FAIL

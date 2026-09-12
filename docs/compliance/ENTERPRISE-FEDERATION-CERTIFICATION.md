@@ -12,19 +12,21 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `b048311595caa94db435c3dd9b59b02ea4b765f2` (`origin/release/v1.0.0`,
-published 2026-09-11T19:58Z — the tip carrying #3549, #3553 and #3199; re-issued
-by [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)). The
+**Binds to:** `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` (the chain-10 candidate tip gated by push gate v3 on
+2026-09-12, published to `origin/release/v1.0.0` in the same push as this re-bind; carries #3204
+inside the §5 watch set on top of the 2026-09-11 tip `b0483115`; re-bound by
+[#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)). The 2026-09-11 re-issue at `b0483115`, the
 2026-09-11 #3595 re-issue at `ad60bead` and the The original
 2026-08-12 mint remains `e22bc93c` as a historical record. Any change to the
 federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-11** (re-issued after #3549 / #3553 / #3199 at 22 checks)
+> ## STATUS — **LIVE as of 2026-09-12** (re-bound after #3204 at 22 checks; re-issued 2026-09-11 after #3549 / #3553 / #3199)
 >
-> Re-validated and re-issued against `b048311595caa94db435c3dd9b59b02ea4b765f2`
+> Re-validated and re-bound against `ab6f2175077afd47e0a0ac65d5121db97e1d22d5`
 > by [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)
-> (posture legs re-measured at 22 checks, §7 battery on both backends);
+> (posture legs re-measured at 22 checks and the §7 battery re-run on both backends at that exact tip on 2026-09-12;
+> the 2026-09-11 re-issue at `b0483115` is superseded and kept in §7);
 > the earlier same-day re-issue by [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595)
 > at `ad60bead` is superseded and kept as history in §7.
 > [#3582](https://github.com/alphaonedev/ai-memory-mcp/issues/3582) changed
@@ -585,9 +587,9 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > posture-leg evidence of record after this recapture. Bind stays
 > `e22bc93c` (this recapture does not re-mint).
 >
-> **Evidence note (#3607, 2026-09-11):** the four-leg captures were
-> **re-measured at 22 checks** on release-built binaries of the published tip
-> `b0483115` (`docs/compliance/evidence/cert-3607/`, `SANITIZATION.md` +
+> **Evidence note (#3607, re-bind 2026-09-12; first recapture 2026-09-11 at `b0483115`):** the four-leg captures were
+> **re-measured at 22 checks** on release-built binaries of the bound tip
+> `ab6f2175` (`docs/compliance/evidence/cert-3607/`, `SANITIZATION.md` +
 > `MANIFEST.sha256`): bare 12 PASS / 10 FAIL (exit 2); hardened
 > non-sqlcipher 20 / 2 (exit 2, the same two remaining); boot gate armed →
 > refuses to boot (exit 1); sqlcipher + `ENCRYPT_AT_REST=1` + boot gate →
@@ -1499,13 +1501,65 @@ boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
 reproducible with `scripts/recapture-cert-3607-posture.sh`.
 
+**Re-cert trigger — FIRED by #3204 (`src/handlers/federation_receive.rs`,
+`src/handlers/federation_signing_check.rs`, `src/identity/sign.rs` — the far-endpoint
+filter, signal/resolution domain tags and knob-free wire notes, all inside the standard §5
+watch set) and by the test-only `LLVM_PROFILE_FILE` forward in `src/federation/mod.rs`
+(`db7181f8`), and DISCHARGED by re-bind (#3607, 2026-09-12).** Both landed on the chain-10
+candidate after the 2026-09-11 re-issue bound this document to `b0483115`; the cert-expiry
+ancestor check (#3556) correctly reported that bind as drifted for the candidate. Rather than
+publish a tip whose certificate would be VOID at the moment of publish, the Conductor re-ran the
+§7 acceptance on **both** backends at the exact candidate tip
+`ab6f2175077afd47e0a0ac65d5121db97e1d22d5` (fresh throwaway live-pg database), re-measured the §5.4(2)
+four-leg posture bundle at **22 checks** on release builds of that tip (`cert-3607/`,
+regenerated; see the §2 evidence note), and re-binds this document to that SHA **before** the
+push. The top STATUS banner is **LIVE**; the #3502, #3582, #3595 and the 2026-09-11 #3607
+records above stay as the firing ledger.
+
+*Evidence (exact `test result:` lines; zero `skip:`; zero `FAILED`).* Captured 2026-09-12 on the
+Linux gate host immediately after push gate v3 on the same tip reported reds=0; throwaway live
+pg database created for the run; raw named-test listing and the posture captures in
+`docs/compliance/evidence/cert-3607/`. Cargo `--no-fail-fast`.
+
+| Invocation | Exact `test result:` line |
+|---|---|
+| default `--test boot_fail_closed_config_3166` | `ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s` |
+| default `--test doctor_posture_exit_code_3003` | `ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s` |
+| default `--test doctor_synchronous_posture_3553` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s` |
+| default `--test federation_catchup_posture_3582` | `ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.66s` |
+| default `--test federation_namespace_gate_3582` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s` |
+| default `--test federation_peer_posture_3582` | `ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s` |
+| default `--test federation_write_ns_scope_2447` | `ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.14s` |
+| default `--test posture_control15_pg_resolution_3106` | `ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s` |
+| default `--lib enterprise_federation_posture federation::peer_posture cli::backup::tests` | `ok. 124 passed; 0 failed; 0 ignored; 0 measured; 8261 filtered out; finished in 39.32s` |
+| sal,sal-postgres (live pg) — the same eight suites | `15 / 2 / 3 / 2 / 3 / 10 / 6 / 4 passed; 0 failed` (catchup 2 = sqlite + postgres) |
+| sal,sal-postgres `--lib` slices | `ok. 124 passed; 0 failed; 0 ignored; 0 measured; 8874 filtered out; finished in 39.45s` |
+
+*Posture legs (22 checks, release builds of `ab6f2175`).* Bare: exit 2,
+12 PASS / 10 FAIL. Hardened non-sqlcipher: exit 2, 20 / 2. Boot gate armed:
+exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
+boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
+22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
+reproducible with `scripts/recapture-cert-3607-posture.sh`.
+
 ---
 
 ## 8. Current determination
 
+**Status at `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` (2026-09-12
+re-bind, [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607);
+#3204 federation receive/signing-check hardening now certified; supersedes the 2026-09-11
+status at `b0483115` below).** The seven §5.4 falsifiability requirements hold on this SHA —
+§5.4(1) canonical doc = this document (LIVE banner); §5.4(2) machine-checked posture =
+CLOSED at **22 checks** (`cert-3607/`, four legs re-measured on release builds of this tip);
+§5.4(7) disconfirmation = §7, discharged for the #3204 watched-path change by this re-bind's
+both-backend acceptance battery (`docs/compliance/evidence/cert-3607/`). The 2026-09-11
+re-issue at `b0483115`, the #3595 re-issue at `ad60bead` and the 2026-08-12 mint at
+`e22bc93c` remain historical ratification records (next paragraphs).
+
 **Status at `b048311595caa94db435c3dd9b59b02ea4b765f2` (2026-09-11
 re-issue, [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607);
-#3549 authority resolver, #3553 check #21 and #3199 check #22 now certified).**
+#3549 authority resolver, #3553 check #21 and #3199 check #22 certified; superseded by the re-bind above).**
 The seven §5.4 falsifiability requirements hold on this SHA — §5.4(1)
 canonical doc = this document (LIVE banner); §5.4(2) machine-checked posture =
 CLOSED at **22 checks** (`cert-3607/`, four legs re-measured on release
