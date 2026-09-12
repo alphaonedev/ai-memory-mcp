@@ -7176,7 +7176,10 @@ pub struct LoggingConfig {
 /// trail emitted from every memory mutation call site.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuditConfig {
-    /// Master toggle for flat audit and forensic governance JSONL. Default `false`.
+    /// Master toggle for the flat audit trail and for the forensic log's
+    /// governance decision rows (#3647). Default `false`. The forensic log's
+    /// integrity rows (truncation watermark, rollback / restore evidence) are
+    /// written regardless.
     pub enabled: Option<bool>,
     /// Audit log path. Either a directory (in which case `audit.log`
     /// is appended) or an explicit file path. Default
@@ -7192,9 +7195,9 @@ pub struct AuditConfig {
     /// Whether to redact `memory.content` from emitted events. **The
     /// only supported value in v1 is `true`** — the audit schema does
     /// not expose a content field at all; this flag is reserved for a
-    /// future per-namespace exception API. Forensic action payloads and decision
-    /// reasons are always hash-only before signing (#3647); explicit `false`
-    /// disables the forensic sink with a diagnostic.
+    /// future per-namespace exception API. Forensic decision rows never carry
+    /// request content or free text, only keyed commitments (#3647); explicit
+    /// `false` turns decision rows off with a boot diagnostic.
     pub redact_content: Option<bool>,
     /// Whether to compute and verify the per-line hash chain. The
     /// cross-row hash chain is MANDATORY (the load-bearing tamper-evidence)
@@ -10334,9 +10337,10 @@ impl AppConfig {
 # When enabled, every memory mutation emits one hash-chained JSON
 # line per event suitable for SOC2 / HIPAA / GDPR / FedRAMP evidence.
 # `ai-memory audit verify` walks the chain; `ai-memory logs tail`
-# streams events. This toggle also controls forensic governance JSONL;
-# action content and decision reasons are always hashed before signing.
-# Explicit redact_content=false disables the forensic sink.
+# streams events. This toggle also turns on the forensic log's governance
+# decision rows, which carry keyed commitments, never request content. The
+# forensic integrity rows (truncation watermark) are written regardless.
+# Explicit redact_content=false turns decision rows off.
 # [audit]
 # enabled = false
 # path = "~/.local/state/ai-memory/audit/"

@@ -83,24 +83,55 @@ ai-memory audit verify                  # exits 0 on intact chain
 
 ## Forensic governance JSONL
 
-`audit.enabled` also controls the daily `forensic-YYYY-MM-DD.jsonl` sink.
-It is disabled when the setting is absent or false. With audit enabled,
-agent-action rows retain timestamp, actor identity, action kind, rule ID,
-outcome, chain link, and signature. The payload contains only
-`content_hash` (hex SHA-256 of the JSON object containing `action` and
-`decision_detail`) and `sensitive_fields: "hash_only"`.
-Commands, paths, hosts, process arguments, custom payloads, read queries,
-and decision reasons are excluded before signing, for allow, refuse, warn,
-and escalate outcomes alike. This policy is mandatory: explicitly setting
-`audit.redact_content = false` disables the forensic sink with a diagnostic.
-Actor and rule identifiers remain visible; use identifiers rather than
-sensitive content in those fields. Other forensic event types retain their
-caller-defined metadata envelopes.
+The daily `forensic-YYYY-MM-DD.jsonl` files sit next to the flat audit log.
+They hold one Ed25519-signed, hash-chained stream carrying two classes of
+row (#3647).
 
-This changes newly emitted action rows. Existing signed logs are not rewritten.
-Consumers that previously read action details from `payload` must use the
-identity/outcome fields and content commitment instead. Hashes permit
-correlation and comparison with known content; they are not encryption.
+**Integrity rows are always written.** The sink starts on every boot. It
+writes the content-free evidence that `verify-audit-trail` and restore
+forensics depend on:
+
+- the #1850 truncation watermark (a `signed_events` head sequence and hash);
+- #1946 open-time rollback evidence (head counts);
+- the #3199 unverified-restore record (outcome, a fixed reason, and the
+  snapshot and target paths, with any credential-shaped span masked).
+
+**Governance decision rows are opt-in.** They are written only with
+`audit.enabled = true`. They cover agent-action verdicts, admin operations,
+approvals, archive/purge, namespace standards and capability grants. Every
+row keeps its timestamp, actor, outcome, action kind, rule ID, chain link and
+signature. The payload is built through a closed type, and no emitter can
+put free-form text or request content into it:
+
+- An agent action (command, working directory, path, host, process
+  arguments, custom payload, read query) and the rule's reason reach the row
+  only as `content_mac`. That is an HMAC-SHA256 over the same
+  `{action, decision}` object `signed_events` hashes for `governance.check`,
+  keyed with an HKDF derivation of the daemon's signing key.
+  `sensitive_fields: "hash_only"` marks those rows. This holds for allow,
+  refuse, warn and escalate alike.
+- Other free text (reasons, error messages, memory titles) is written as the
+  same kind of commitment.
+- Identifiers (ids, namespaces, agent ids, public keys) are written as-is
+  only when they are identifier-shaped and carry no credential. The same
+  check runs on `actor`, `decision` and `rule_id` at the sink. Anything else
+  becomes a commitment.
+- With no daemon signing key there is no secret to key the commitment, so it
+  is written as `withheld:unsigned`. An unkeyed hash of a short command could
+  be confirmed by guessing.
+
+A commitment lets whoever holds the daemon key confirm a row against content
+they already have (`governance::audit::forensic_commitment`). Anyone without
+the key cannot test guesses against it. It is not encryption, and it proves
+nothing to someone who does not hold the content.
+
+Setting `audit.redact_content = false` asks for plaintext retention, which is
+not supported. It turns decision rows off with a boot diagnostic; integrity
+rows are unaffected.
+
+Existing signed logs are not rewritten and still verify. Consumers that read
+action details or free-text reasons from `payload` must switch to the
+identity and outcome fields and the commitment.
 
 ## What gets audited
 

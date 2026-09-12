@@ -2078,7 +2078,7 @@ fn note_unverified_restore(
     snapshot: &Path,
     target: &Path,
     outcome: ManifestVerification,
-    detail: &str,
+    detail: &'static str,
 ) -> Result<()> {
     writeln!(
         out.stderr,
@@ -2089,17 +2089,17 @@ fn note_unverified_restore(
     )?;
     let caller = crate::identity::resolve_agent_id(None, None)
         .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
-    crate::governance::audit::record_decision(
-        &caller,
-        "allow",
-        RESTORE_UNVERIFIED_AUDIT_KIND,
-        "",
-        serde_json::json!({
-            "outcome": outcome.as_str(),
-            "detail": detail,
-            "snapshot": snapshot.to_string_lossy(),
-            "target": target.to_string_lossy(),
-        }),
+    // #3647 — restore evidence is an integrity row: written whenever the
+    // forensic sink is up, independent of the governance decision-row gate.
+    crate::governance::audit::record_integrity(
+        crate::governance::audit::IntegrityRow::RestoreUnverified {
+            actor: &caller,
+            kind: RESTORE_UNVERIFIED_AUDIT_KIND,
+            outcome: outcome.as_str(),
+            detail,
+            snapshot,
+            target,
+        },
     );
     Ok(())
 }

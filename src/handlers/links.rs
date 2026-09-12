@@ -977,11 +977,10 @@ pub async fn delete_link(
         "allow",
         "link_delete",
         "",
-        json!({
-            "source_id": source_id,
-            "target_id": target_id,
-            "relation": relation,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("source_id", &source_id)
+            .ident("target_id", &target_id)
+            .ident("relation", &relation),
     );
 
     // FBL-08 (v1.0.0 pre-ship 3x7) — route the destructive link delete
