@@ -82,15 +82,31 @@ pub enum WrapStrategy {
 /// `AI_MEMORY_LLM_BACKEND` wire-shape selector — overlap is
 /// coincidental (e.g. `ollama` is both a CLI binary AND a backend
 /// selector, but the two columns are independent).
+/// CLI binary names whose default wrap strategy is the Codex `--system`
+/// mapping. Keep in lockstep with the `"codex" | "codex-cli"` arm of
+/// [`default_strategy`].
+///
+/// `ai-memory wrap` version-gates these binaries (#3545): Codex CLI
+/// `>= 0.153.0` rejects `--system`. The mapping itself is unchanged;
+/// the gate lives in [`crate::cli::wrap`].
+#[must_use]
+pub fn is_codex_cli_binary(agent: &str) -> bool {
+    matches!(agent, "codex" | "codex-cli")
+}
+
 #[must_use]
 pub fn default_strategy(agent: &str) -> WrapStrategy {
     match agent {
         // OpenAI Codex CLI. The flag name varies between Codex variants
         // (`--system`, `--system-prompt`, `OPENAI_CLI_SYSTEM`) but
         // `--system` is the documented form on the upstream codex-cli
-        // crate (PR-1 recipe + Codex CLI README). Users running a
-        // variant that exposes a different flag can override with
-        // `--system-flag <flag>`.
+        // crate (PR-1 recipe + Codex CLI README) for versions *below*
+        // 0.153.0. Codex CLI >= 0.153.0 rejects `--system` (clap);
+        // `ai-memory wrap` refuses those versions unless the caller
+        // supplies `--system-flag` / `--system-env` (#3545). Users
+        // running a variant that exposes a different flag can override
+        // with `--system-flag <flag>`. Keep the arm literals in
+        // lockstep with [`is_codex_cli_binary`].
         "codex" | "codex-cli" => WrapStrategy::SystemFlag {
             flag: "--system".into(),
         },
@@ -240,5 +256,9 @@ mod tests {
                 flag: "--system".into()
             }
         );
+        assert!(is_codex_cli_binary("codex"));
+        assert!(is_codex_cli_binary("codex-cli"));
+        assert!(!is_codex_cli_binary("claude"));
+        assert!(!is_codex_cli_binary("true"));
     }
 }

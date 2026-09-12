@@ -115,7 +115,7 @@ macOS / Linux / Docker / Kubernetes — no shell required.
 
    | Agent | Strategy | Argv shape |
    |---|---|---|
-   | `codex` / `codex-cli` | `SystemFlag` | `codex --system "<msg>" <args>` |
+   | `codex` / `codex-cli` | `SystemFlag` | `codex --system "<msg>" <args>` — **tested `< 0.153.0`; known-broken `>= 0.153.0`** (#3545). Outside the range wrap refuses and names `--system-flag` unless you override. Native MCP is the supported path on known-broken versions. |
    | `gemini` | `SystemFlag` | `gemini --system "<msg>" <args>` |
    | `aider` | `MessageFile` | `aider --message-file <tempfile> <args>` |
    | `ollama` | `SystemEnv` | `OLLAMA_SYSTEM=<msg> ollama <args>` |
@@ -125,7 +125,9 @@ macOS / Linux / Docker / Kubernetes — no shell required.
 
 Override the strategy with `--system-flag <flag>`, `--system-env <name>`,
 or `--message-file-flag <flag>` if your agent uses a different
-contract. See `ai-memory wrap --help` for the full surface.
+contract. See `ai-memory wrap --help` for the full surface. The Codex
+row is version-gated: a default `wrap codex` on Codex CLI `>= 0.153.0`
+is a refusal, not a launch.
 
 The category-3 recipes ([`codex-cli.md`](codex-cli.md),
 [`claude-agent-sdk.md`](claude-agent-sdk.md),

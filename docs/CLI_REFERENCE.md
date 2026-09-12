@@ -967,7 +967,7 @@ strategy.
 
 | Strategy | Behaviour | Default for |
 |----------|-----------|-------------|
-| `SystemFlag` | `--system <msg>` (or whatever the target accepts) | `codex` / `codex-cli`, `gemini` |
+| `SystemFlag` | `--system <msg>` (or whatever the target accepts) | `codex` / `codex-cli` **only** `< 0.153.0` (#3545), `gemini` |
 | `SystemEnv` | env-var injection | `ollama` |
 | `MessageFile` | tempfile + `--message-file <path>` | `aider` |
 | `Auto` | per-agent lookup table | (selector) |
@@ -985,7 +985,15 @@ strategy.
 Fall-through is `--system`. Same binary on macOS / Linux /
 Docker / Kubernetes. Exit code is propagated.
 
+`wrap codex` / `wrap codex-cli` probes `codex --version` against a
+checked-in table (#3545): tested `< 0.153.0`; known-broken
+`>= 0.153.0` (upstream rejects `--system`). Outside the range wrap
+refuses and names `--system-flag`, unless you pass `--system-flag` /
+`--system-env` / `--message-file-flag`. Native MCP is the supported
+path on known-broken versions. See `docs/integrations/codex-cli.md`.
+
 ```bash
+# In-range Codex CLI only (`< 0.153.0`); refuses on `>= 0.153.0`.
 ai-memory wrap codex -- "draft a release note"
 ai-memory wrap aider -- src/main.rs
 ```

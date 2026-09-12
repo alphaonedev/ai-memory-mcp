@@ -58,8 +58,8 @@
 
 use crate::cli::CliOutput;
 use crate::cli::boot::{self, BootArgs};
-use crate::llm_cli_wrap::{WrapStrategy, default_strategy};
-use anyhow::{Context, Result};
+use crate::llm_cli_wrap::{WrapStrategy, default_strategy, is_codex_cli_binary};
+use anyhow::{Context, Result, bail};
 use clap::Args;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -98,6 +98,29 @@ const WRAP_BOOT_REFUSED_PREFIX: &str = "ai-memory wrap: memory boot refused (";
 /// #3586 — operator-facing suffix closing the refusal notice (see
 /// [`WRAP_BOOT_REFUSED_PREFIX`]).
 const WRAP_BOOT_REFUSED_SUFFIX: &str = "); running agent without boot context";
+
+/// #3545 — exclusive upper bound of Codex CLI versions whose default
+/// `--system` mapping is tested. `0.153.0` is the first known-broken
+/// (upstream clap rejects `--system`). Tuple comparison is
+/// lexicographic and matches three-component semver without
+/// pre-release tags.
+pub const CODEX_WRAP_TESTED_MAX_EXCLUSIVE: (u32, u32, u32) = (0, 153, 0);
+
+/// #3545 — display form of the tested range. SSOT for the probe, the
+/// refusal message, and operator docs (`docs/integrations/codex-cli.md`,
+/// `docs/CLI_REFERENCE.md`, `docs/integrations/README.md`).
+pub const CODEX_WRAP_TESTED_RANGE: &str = "< 0.153.0";
+
+/// #3545 — display form of the known-broken range. SSOT twin of
+/// [`CODEX_WRAP_TESTED_RANGE`].
+pub const CODEX_WRAP_KNOWN_BROKEN: &str = ">= 0.153.0";
+
+/// #3545 — override flag named in the fail-closed refusal. Keep this
+/// the one production spelling so docs and the error cannot drift.
+const WRAP_OVERRIDE_HINT_SYSTEM_FLAG: &str = "--system-flag";
+
+/// #3545 — env-var override named alongside [`WRAP_OVERRIDE_HINT_SYSTEM_FLAG`].
+const WRAP_OVERRIDE_HINT_SYSTEM_ENV: &str = "--system-env";
 
 /// #1575 — resolve (and secure) the staging directory for the
 /// `MessageFile` boot-context file: `~/.ai-memory/wrap/`, mode 0700.
@@ -202,6 +225,107 @@ fn resolve_strategy(args: &WrapArgs) -> WrapStrategy {
         return WrapStrategy::SystemFlag { flag: flag.into() };
     }
     default_strategy(&args.agent)
+}
+
+/// True when the caller supplied a strategy override, so they have
+/// taken responsibility for the wrapped CLI's system-message ABI.
+#[must_use]
+fn has_strategy_override(args: &WrapArgs) -> bool {
+    args.system_flag.is_some() || args.system_env.is_some() || args.message_file_flag.is_some()
+}
+
+/// Parse the first `X.Y` or `X.Y.Z` triplet in `text`. A two-component
+/// value is treated as patch `0` so `0.153` compares equal to the
+/// exclusive bound. Unparseable input is `None` (fail closed).
+#[must_use]
+fn parse_semver_triplet(text: &str) -> Option<(u32, u32, u32)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            if let Some(parsed) = parse_dotted_triplet(&text[start..i]) {
+                return Some(parsed);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Split `major.minor` or `major.minor.patch` into a triplet.
+fn parse_dotted_triplet(candidate: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = candidate.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = match parts.next() {
+        Some(p) if !p.is_empty() => p.parse::<u32>().ok()?,
+        Some(_) | None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+#[must_use]
+fn version_in_tested_range(version: (u32, u32, u32)) -> bool {
+    version < CODEX_WRAP_TESTED_MAX_EXCLUSIVE
+}
+
+fn format_version(version: (u32, u32, u32)) -> String {
+    format!("{}.{}.{}", version.0, version.1, version.2)
+}
+
+/// Probe `{agent} --version` and parse a semver triplet. Stdio is
+/// captured (never inherited) so the probe cannot leak into the
+/// wrapped session.
+fn probe_cli_version(agent: &str) -> Result<(u32, u32, u32)> {
+    let output = Command::new(agent)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "ai-memory wrap: failed to run `{agent} --version` (is `{agent}` on $PATH?). \
+                 Pass {WRAP_OVERRIDE_HINT_SYSTEM_FLAG} <flag> (or {WRAP_OVERRIDE_HINT_SYSTEM_ENV} \
+                 <name>) to override."
+            )
+        })?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    parse_semver_triplet(&text).with_context(|| {
+        format!(
+            "ai-memory wrap: could not parse a version from `{agent} --version` \
+             (refusing the default --system mapping). Pass {WRAP_OVERRIDE_HINT_SYSTEM_FLAG} \
+             <flag> (or {WRAP_OVERRIDE_HINT_SYSTEM_ENV} <name>) to override."
+        )
+    })
+}
+
+/// #3545 — fail closed when the default Codex `--system` mapping is
+/// known-broken for the installed CLI, unless the caller overrode the
+/// strategy. Runs *before* boot so a doomed wrap does not pay DB/LLM
+/// cost.
+fn enforce_codex_wrap_version_gate(agent: &str) -> Result<()> {
+    let version = probe_cli_version(agent)?;
+    if version_in_tested_range(version) {
+        return Ok(());
+    }
+    bail!(
+        "ai-memory wrap: Codex CLI {} is outside the tested range for the default \
+         --system mapping ({CODEX_WRAP_TESTED_RANGE}; known-broken {CODEX_WRAP_KNOWN_BROKEN}). \
+         Pass {WRAP_OVERRIDE_HINT_SYSTEM_FLAG} <flag> (or {WRAP_OVERRIDE_HINT_SYSTEM_ENV} <name>) \
+         to override, or use native MCP. See docs/integrations/codex-cli.md.",
+        format_version(version)
+    );
 }
 
 /// Run `cli::boot::run` in-process, capturing its stdout into a
@@ -418,12 +542,21 @@ fn build_command_for_strategy(
 ///   surfaces the OS-level error).
 /// - `tempfile::NamedTempFile::new()` fails when the strategy is
 ///   `MessageFile` (very rare; `/tmp` full or unwritable).
+/// - #3545: wrapping `codex` / `codex-cli` without a strategy override
+///   when `{agent} --version` is outside [`CODEX_WRAP_TESTED_RANGE`].
 pub fn run(
     db_path: &Path,
     args: &WrapArgs,
     app_config: &crate::config::AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // Fail closed *before* boot: Codex CLI >= 0.153.0 rejects the
+    // default `--system` mapping. An explicit strategy override is the
+    // operator's acknowledgement that they own the ABI.
+    if is_codex_cli_binary(&args.agent) && !has_strategy_override(args) {
+        enforce_codex_wrap_version_gate(&args.agent)?;
+    }
+
     let strategy = resolve_strategy(args);
 
     // Boot context. `--no-boot` skips it so the agent runs unwrapped
@@ -1041,5 +1174,204 @@ mod tests {
             probe_boot_refusal(&bad, &cfg).is_none(),
             "a disabled boot is not a refusal"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #3545 — Codex CLI version gate (fail closed outside the tested
+    // range unless `--system-flag` / `--system-env` is given).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_semver_triplet_picks_first_x_y_z() {
+        assert_eq!(parse_semver_triplet("codex-cli 0.153.3"), Some((0, 153, 3)));
+        assert_eq!(parse_semver_triplet("0.152.0\n"), Some((0, 152, 0)));
+        assert_eq!(
+            parse_semver_triplet("codex-cli 0.153"),
+            Some((0, 153, 0)),
+            "two-component form is patch 0 so 0.153 compares at the bound"
+        );
+        assert_eq!(parse_semver_triplet("not a version"), None);
+        assert_eq!(parse_semver_triplet(""), None);
+    }
+
+    #[test]
+    fn version_in_tested_range_is_strictly_below_0_153_0() {
+        assert!(version_in_tested_range((0, 152, 99)));
+        assert!(version_in_tested_range((0, 1, 0)));
+        assert!(!version_in_tested_range((0, 153, 0)));
+        assert!(!version_in_tested_range((0, 153, 3)));
+        assert!(!version_in_tested_range((1, 0, 0)));
+    }
+
+    #[test]
+    fn wrap_codex_docs_cite_tested_range_ssot_3545() {
+        // The tested-range table is the single source for docs and the
+        // probe (issue #3545 acceptance). Frozen review trees are out
+        // of scope; these three operator-facing pages must cite the
+        // consts by value.
+        for (path, body) in [
+            (
+                "docs/integrations/codex-cli.md",
+                include_str!("../../docs/integrations/codex-cli.md"),
+            ),
+            (
+                "docs/CLI_REFERENCE.md",
+                include_str!("../../docs/CLI_REFERENCE.md"),
+            ),
+            (
+                "docs/integrations/README.md",
+                include_str!("../../docs/integrations/README.md"),
+            ),
+        ] {
+            assert!(
+                body.contains(CODEX_WRAP_TESTED_RANGE),
+                "{path} must cite CODEX_WRAP_TESTED_RANGE ({CODEX_WRAP_TESTED_RANGE})"
+            );
+            assert!(
+                body.contains(CODEX_WRAP_KNOWN_BROKEN),
+                "{path} must cite CODEX_WRAP_KNOWN_BROKEN ({CODEX_WRAP_KNOWN_BROKEN})"
+            );
+            assert!(
+                body.contains(WRAP_OVERRIDE_HINT_SYSTEM_FLAG),
+                "{path} must name {WRAP_OVERRIDE_HINT_SYSTEM_FLAG}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_fake_codex(dir: &Path, version_line: &str) {
+        let bin = dir.join("codex");
+        let safe = version_line.replace('\'', "");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{safe}'\n  exit 0\nfi\nexit 0\n"
+        );
+        std::fs::write(&bin, script).expect("write fake codex");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake codex");
+    }
+
+    #[cfg(unix)]
+    fn with_fake_codex_on_path<R>(version_line: &str, f: impl FnOnce() -> R) -> R {
+        let env = TestEnv::fresh();
+        let bin_dir = env.db_path.parent().expect("tempdir parent").to_path_buf();
+        install_fake_codex(&bin_dir, version_line);
+        let _lock = crate::test_support::env_lock();
+        let path_g = crate::test_support::EnvGuard::capture("PATH");
+        let mut new_path = bin_dir.into_os_string();
+        new_path.push(":");
+        if let Some(rest) = std::env::var_os("PATH") {
+            new_path.push(rest);
+        }
+        let new_path = new_path.to_string_lossy();
+        path_g.set(&new_path);
+        f()
+    }
+
+    /// Fake `codex` reporting 0.153.3: non-zero (Err) and the message
+    /// names `--system-flag`.
+    #[test]
+    #[cfg(unix)]
+    fn wrap_codex_0_153_3_refuses_naming_system_flag_3545() {
+        with_fake_codex_on_path("codex-cli 0.153.3", || {
+            let mut env = TestEnv::fresh();
+            let db_path = env.db_path.clone();
+            let mut out = env.output();
+            let mut args = default_args("codex");
+            args.no_boot = true;
+            let err = run(
+                &db_path,
+                &args,
+                &crate::config::AppConfig::default(),
+                &mut out,
+            )
+            .expect_err("0.153.3 must refuse the default --system mapping");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(WRAP_OVERRIDE_HINT_SYSTEM_FLAG),
+                "refusal must name {WRAP_OVERRIDE_HINT_SYSTEM_FLAG}: {msg}"
+            );
+            assert!(
+                msg.contains(CODEX_WRAP_KNOWN_BROKEN),
+                "refusal must cite the known-broken range: {msg}"
+            );
+            assert!(
+                msg.contains("0.153.3"),
+                "refusal must name the probed version: {msg}"
+            );
+        });
+    }
+
+    /// Fake `codex` reporting an in-range version: wrap proceeds.
+    #[test]
+    #[cfg(unix)]
+    fn wrap_codex_in_range_version_passes_3545() {
+        with_fake_codex_on_path("codex-cli 0.152.0", || {
+            let mut env = TestEnv::fresh();
+            let db_path = env.db_path.clone();
+            let mut out = env.output();
+            let mut args = default_args("codex");
+            args.no_boot = true;
+            let code = run(
+                &db_path,
+                &args,
+                &crate::config::AppConfig::default(),
+                &mut out,
+            )
+            .expect("in-range Codex CLI must be allowed");
+            assert_eq!(code, 0);
+        });
+    }
+
+    /// `--system-flag` given: 0.153.3 is allowed (operator owns the ABI).
+    #[test]
+    #[cfg(unix)]
+    fn wrap_codex_0_153_3_with_system_flag_passes_3545() {
+        with_fake_codex_on_path("codex-cli 0.153.3", || {
+            let mut env = TestEnv::fresh();
+            let db_path = env.db_path.clone();
+            let mut out = env.output();
+            let mut args = default_args("codex");
+            args.no_boot = true;
+            args.system_flag = Some("--system-prompt".into());
+            let code = run(
+                &db_path,
+                &args,
+                &crate::config::AppConfig::default(),
+                &mut out,
+            )
+            .expect("--system-flag must skip the version gate");
+            assert_eq!(code, 0);
+        });
+    }
+
+    #[test]
+    fn unparseable_codex_version_refuses_closed_3545() {
+        // Pure parser pin: garbage `--version` output is not in-range.
+        assert!(parse_semver_triplet("codex (devel)").is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wrap_codex_unparseable_version_refuses_naming_system_flag_3545() {
+        with_fake_codex_on_path("codex (devel)", || {
+            let mut env = TestEnv::fresh();
+            let db_path = env.db_path.clone();
+            let mut out = env.output();
+            let mut args = default_args("codex");
+            args.no_boot = true;
+            let err = run(
+                &db_path,
+                &args,
+                &crate::config::AppConfig::default(),
+                &mut out,
+            )
+            .expect_err("unparseable --version must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(WRAP_OVERRIDE_HINT_SYSTEM_FLAG),
+                "unparseable refusal must name {WRAP_OVERRIDE_HINT_SYSTEM_FLAG}: {msg}"
+            );
+        });
     }
 }
