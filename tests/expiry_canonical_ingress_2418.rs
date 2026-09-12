@@ -19,11 +19,12 @@
 //! / `update_with_expected_version` funnels. Three ingresses stayed open and
 //! re-accrue the drift on every write:
 //!
-//! 1. **`touch`** — binds `(now + extend).to_rfc3339()` into
-//!    `expires_at = MAX(expires_at, ?N)`. `to_rfc3339()` renders
-//!    `+00:00` with an `AutoSi` fraction (0/3/6/9 digits), NOT the
-//!    canonical fixed `.ffffffZ`.
-//! 2. **`touch_many`** — same bind, same statement shape.
+//! 1. **`touch`** — binds `(now + extend).to_rfc3339()` as the floor of
+//!    the TTL extension. `to_rfc3339()` renders `+00:00` with an `AutoSi`
+//!    fraction (0/3/6/9 digits), NOT the canonical fixed `.ffffffZ`.
+//!    (#2463 replaced the sqlite `MAX()` with an instant compare; this
+//!    file still pins that the *floor* itself is canonical.)
+//! 2. **`touch_many`** — same floor bind, same statement shape.
 //! 3. **`fold_recall_accesses`** — same, off the recall-observation ledger's
 //!    `t_max`.
 //! 4. **`restore_archived` / `restore_archived_for_caller`** — copy

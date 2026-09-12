@@ -2602,10 +2602,10 @@ mod tests {
 
     #[test]
     fn effective_expires_at_output_is_rfc3339_for_lexical_gc_compare() {
-        // gc() compares `expires_at < now` as rfc3339 STRINGS, so the
-        // backfill must emit the same `...THH:MM:SS+00:00` shape
-        // `Utc::now().to_rfc3339()` produces — never a space-separated
-        // SQLite datetime() form (which would sort wrong).
+        // gc() compares `expires_at < now` as rfc3339 STRINGS. This helper
+        // feeds the store funnel, which canonicalizes to micros+`Z` (#2332 /
+        // #2462). The helper itself must still emit parseable RFC3339 with a
+        // 'T' separator — never a space-separated sqlite datetime() form.
         let mut m = Memory::default();
         m.tier = Tier::Mid;
         m.created_at = "2026-01-01T00:00:00+00:00".to_string();

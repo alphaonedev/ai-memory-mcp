@@ -5337,6 +5337,11 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin v54 tx", e))?;
 
+        // #2462 — postgres `expires_at` is TIMESTAMPTZ. Interval arithmetic
+        // on `created_at` is already instant-correct; the sqlite TEXT
+        // backfill is the arm that had to switch to
+        // `validate::render_canonical_utc`. Do not introduce a TEXT
+        // `strftime`/`+00:00` rendering here.
         for tier in [Tier::Mid, Tier::Short, Tier::Long] {
             if let Some(ttl_secs) = tier.default_ttl_secs() {
                 sqlx::query(

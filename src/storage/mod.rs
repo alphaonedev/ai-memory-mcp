@@ -66,6 +66,14 @@ const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
 const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
 const SQL_MEMORY_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)";
 const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1";
+/// #2463 — TTL-extension inputs for the Rust-side instant MAX (sqlite
+/// `MAX()` is bytes and cannot self-heal a legacy offset rendering).
+const SQL_SELECT_TIER_EXPIRES_BY_ID: &str = "SELECT tier, expires_at FROM memories WHERE id = ?1";
+const SQL_TOUCH_ACCESS_AND_EXPIRY: &str = "UPDATE memories SET
+                access_count = MIN(access_count + 1, 1000000),
+                last_accessed_at = ?1,
+                expires_at = ?2
+             WHERE id = ?3";
 /// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
 /// shared across the append-only revision sites (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = ?1";
@@ -3260,8 +3268,29 @@ pub fn resolve_id(conn: &Connection, id: &str) -> Result<Option<Memory>> {
     get_by_prefix(conn, id)
 }
 
+/// #2463 — later of (canonicalized stored expiry, per-tier floor).
+///
+/// Long / unknown-tier / NULL-expiry rows keep their stored value.
+/// Short/mid rows with a stored expiry compare instants, not sqlite
+/// TEXT bytes, so a legacy `+09:00` rendering cannot void the floor.
+fn ttl_floor_extended_expiry(
+    tier: &str,
+    stored: Option<&str>,
+    short_floor: &str,
+    mid_floor: &str,
+) -> Option<String> {
+    match (Tier::from_str(tier), stored) {
+        (Some(Tier::Short), Some(_)) => {
+            crate::validate::later_expiry_canonical(stored, short_floor)
+        }
+        (Some(Tier::Mid), Some(_)) => crate::validate::later_expiry_canonical(stored, mid_floor),
+        _ => stored.map(str::to_string),
+    }
+}
+
 /// Bump access count, extend TTL, auto-promote — atomic via transaction.
 pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) -> Result<()> {
+    use rusqlite::OptionalExtension as _;
     let now = Utc::now();
     let now_str = now.to_rfc3339();
     // v1.0.0 #2418 (L-EXPIRY-CANON) — the extension floors are WRITES into
@@ -3279,26 +3308,18 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 
     let result = (|| -> Result<()> {
         // #1596 — the per-access TTL window is an extension FLOOR, not a
-        // replacement. `MAX(expires_at, ?N)` keeps whichever expiry is
-        // later, so a fresh mid-tier row carrying its create-time +7d
-        // backstop is no longer pulled IN to now+1d on first recall
-        // (lived evidence: row 4c7e7cc1 went 2026-06-18 → 2026-06-12).
-        // Both operands are UTC RFC3339 strings, so SQLite's scalar
-        // MAX() lexicographic comparison is chronological. Long-tier
-        // (NULL expiry) rows stay NULL via the first CASE arm.
-        conn.execute(
-            "UPDATE memories SET
-                access_count = MIN(access_count + 1, 1000000),
-                last_accessed_at = ?1,
-                expires_at = CASE
-                    WHEN tier = 'long' THEN expires_at
-                    WHEN tier = 'short' AND expires_at IS NOT NULL THEN MAX(expires_at, ?2)
-                    WHEN tier = 'mid' AND expires_at IS NOT NULL THEN MAX(expires_at, ?3)
-                    ELSE expires_at
-                END
-             WHERE id = ?4",
-            params![now_str, short_expires, mid_expires, id],
-        )?;
+        // replacement. #2463 — compare instants in Rust: sqlite `MAX()`
+        // is bytes and a legacy offset rendering can sort above a strictly
+        // later canonical floor, silently voiding the extension.
+        let (tier, stored): (String, Option<String>) = conn
+            .query_row(SQL_SELECT_TIER_EXPIRES_BY_ID, params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?
+            .unwrap_or_else(|| (String::new(), None));
+        let new_exp =
+            ttl_floor_extended_expiry(&tier, stored.as_deref(), &short_expires, &mid_expires);
+        conn.execute(SQL_TOUCH_ACCESS_AND_EXPIRY, params![now_str, new_exp, id])?;
 
         conn.execute(
             "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
@@ -3360,6 +3381,7 @@ pub fn touch_many(
     short_extend: i64,
     mid_extend: i64,
 ) -> Result<usize> {
+    use rusqlite::OptionalExtension as _;
     if ids.is_empty() {
         return Ok(0);
     }
@@ -3390,25 +3412,10 @@ pub fn touch_many(
     let write_txn = connection::WriteTxn::begin(conn)?;
 
     let result = (|| -> Result<()> {
-        // Cache the three prepared statements once for the whole
-        // batch; each `execute` reuses the cached query plan instead
-        // of re-parsing per row.
-        // #1596 — extension-floor semantics, mirroring [`touch`]: the
-        // per-access window only ever EXTENDS expiry (MAX over the
-        // existing column), never shortens it. One batched UPDATE per
-        // row is preserved.
-        let mut bump_stmt = conn.prepare_cached(
-            "UPDATE memories SET
-                access_count = MIN(access_count + 1, 1000000),
-                last_accessed_at = ?1,
-                expires_at = CASE
-                    WHEN tier = 'long' THEN expires_at
-                    WHEN tier = 'short' AND expires_at IS NOT NULL THEN MAX(expires_at, ?2)
-                    WHEN tier = 'mid' AND expires_at IS NOT NULL THEN MAX(expires_at, ?3)
-                    ELSE expires_at
-                END
-             WHERE id = ?4",
-        )?;
+        // Cache the prepared statements once for the whole batch.
+        // #1596 / #2463 — extension-floor via Rust instant MAX (see [`touch`]).
+        let mut sel_stmt = conn.prepare_cached(SQL_SELECT_TIER_EXPIRES_BY_ID)?;
+        let mut bump_stmt = conn.prepare_cached(SQL_TOUCH_ACCESS_AND_EXPIRY)?;
         let mut promote_stmt = conn.prepare_cached(
             "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
              WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
@@ -3420,7 +3427,13 @@ pub fn touch_many(
              WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
         )?;
         for id in ids {
-            bump_stmt.execute(params![now_str, short_expires, mid_expires, id])?;
+            let (tier, stored): (String, Option<String>) = sel_stmt
+                .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
+                .unwrap_or_else(|| (String::new(), None));
+            let new_exp =
+                ttl_floor_extended_expiry(&tier, stored.as_deref(), &short_expires, &mid_expires);
+            bump_stmt.execute(params![now_str, new_exp, id])?;
             promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
             priority_stmt.execute(params![id, crate::models::ACCESS_PRIORITY_CEILING])?;
         }
@@ -3450,10 +3463,8 @@ pub fn touch_many(
 ///
 /// * `access_count' = MIN(access_count + n, 1_000_000)`
 /// * `last_accessed_at = MAX(last_accessed_at, t_max)`
-/// * `expires_at = MAX(expires_at, t_max + window)` per tier (floor
-///   extension anchored on the LAST observation, which is what the
-///   legacy per-recall MAX chain converged to; `long` / NULL-expiry
-///   rows untouched)
+/// * `expires_at` = later of (canonicalized stored, `t_max + window`)
+///   per tier (#2463 instant MAX; `long` / NULL-expiry rows untouched)
 /// * mid→long promotion at `access_count' >= PROMOTION_THRESHOLD`
 ///   (`expires_at = NULL`, `updated_at = now`)
 /// * `priority = MIN(priority + (ac'/10 − ac/10), 10)` — decade
@@ -3521,17 +3532,20 @@ pub fn fold_recall_accesses(
         let write_txn = connection::WriteTxn::begin(conn)?;
         let chunk = (|| -> Result<usize> {
             // ≤ FOLD_CHUNK_MEMORIES distinct memories per transaction.
-            let agg: Vec<(String, i64, String)> = conn
+            // #2463 — LEFT JOIN memories so the instant-MAX has the stored
+            // expiry in THIS statement (no extra per-row round-trip).
+            let agg: Vec<(String, i64, String, Option<String>, Option<String>)> = conn
                 .prepare_cached(
-                    "SELECT memory_id, COUNT(*), MAX(observed_at)
-                       FROM recall_observations
-                      WHERE folded = 0
-                      GROUP BY memory_id
-                      ORDER BY memory_id
+                    "SELECT o.memory_id, COUNT(*), MAX(o.observed_at), m.tier, m.expires_at
+                       FROM recall_observations o
+                       LEFT JOIN memories m ON m.id = o.memory_id
+                      WHERE o.folded = 0
+                      GROUP BY o.memory_id, m.tier, m.expires_at
+                      ORDER BY o.memory_id
                       LIMIT ?1",
                 )?
                 .query_map(params![FOLD_CHUNK_MEMORIES], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             if agg.is_empty() {
@@ -3558,13 +3572,8 @@ pub fn fold_recall_accesses(
                         WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
                         ELSE last_accessed_at
                     END,
-                    expires_at = CASE
-                        WHEN tier = 'long' THEN expires_at
-                        WHEN tier = 'short' AND expires_at IS NOT NULL THEN MAX(expires_at, ?3)
-                        WHEN tier = 'mid' AND expires_at IS NOT NULL THEN MAX(expires_at, ?4)
-                        ELSE expires_at
-                    END
-                 WHERE id = ?5",
+                    expires_at = ?3
+                 WHERE id = ?4",
                 ceiling = crate::models::ACCESS_PRIORITY_CEILING,
             ))?;
             let mut promote_stmt = conn.prepare_cached(
@@ -3575,7 +3584,7 @@ pub fn fold_recall_accesses(
                 "UPDATE recall_observations SET folded = 1
                  WHERE folded = 0 AND memory_id = ?1",
             )?;
-            for (id, n, t_max_raw) in &agg {
+            for (id, n, t_max_raw, tier, stored) in &agg {
                 // Normalize the ledger's `observed_at` stamp into a
                 // `DateTime<Utc>` so the SQL text comparisons against
                 // `expires_at` / `last_accessed_at` stay format-consistent.
@@ -3583,17 +3592,21 @@ pub fn fold_recall_accesses(
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 let t_max_str = t_max.to_rfc3339();
-                // v1.0.0 #2418 — the fold's `MAX(expires_at, ?N)` floors are
-                // WRITES into `expires_at`; render the canonical fixed-UTC
-                // form so a fold never re-injects a `+00:00` / AutoSi-fraction
-                // rendering into the lexicographically-compared column.
+                // v1.0.0 #2418 / #2463 — floors are WRITES; compare instants
+                // in Rust so a legacy offset rendering cannot void the floor.
                 let short_exp = crate::validate::render_canonical_utc(
                     t_max + chrono::Duration::seconds(short_extend),
                 );
                 let mid_exp = crate::validate::render_canonical_utc(
                     t_max + chrono::Duration::seconds(mid_extend),
                 );
-                bump_stmt.execute(params![n, t_max_str, short_exp, mid_exp, id])?;
+                let new_exp = ttl_floor_extended_expiry(
+                    tier.as_deref().unwrap_or(""),
+                    stored.as_deref(),
+                    &short_exp,
+                    &mid_exp,
+                );
+                bump_stmt.execute(params![n, t_max_str, new_exp, id])?;
                 promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
                 if decay {
                     // #1572 parity — the decay stamp moves off the

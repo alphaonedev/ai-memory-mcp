@@ -1063,8 +1063,8 @@ pub fn canonicalize_valid_time(ts: &str) -> Option<String> {
 /// the sqlite `expires_at` / `valid_from` / `valid_until` columns are TEXT
 /// compared LEXICOGRAPHICALLY, so the rendering IS the ordering contract. The
 /// #1596 TTL-extension floors (`touch` / `touch_many` / `fold_recall_accesses`)
-/// bind a Rust-side `now + extend` straight into
-/// `expires_at = MAX(expires_at, ?N)` — a WRITE, not a read — and
+/// bind a Rust-side `now + extend` as the floor of an instant-MAX write
+/// (`later_expiry_canonical`) — a WRITE, not a read — and
 /// `chrono`'s bare `to_rfc3339()` renders `+00:00` with an `AutoSi` fraction
 /// (0/3/6/9 digits), so those funnels were re-introducing a non-canonical
 /// rendering on every recall fold even after the v87 heal + the #2332
@@ -1095,6 +1095,38 @@ pub fn canonical_valid_time_opt(v: Option<&str>) -> Option<String> {
 #[must_use]
 pub fn canonical_rfc3339(ts: &str) -> String {
     canonicalize_valid_time(ts).unwrap_or_else(|| ts.to_string())
+}
+
+/// v1.0.0 #2463 — later of (`stored` as an instant, `floor` as an instant).
+///
+/// sqlite `expires_at` is TEXT and `MAX(expires_at, floor)` is a **byte**
+/// comparison. That is chronological only when both operands are the ONE
+/// canonical micros+`Z` rendering. A legacy offset spelling such as
+/// `2027-01-01T09:00:00+09:00` (= `2027-01-01T00:00:00Z`) sorts ABOVE a
+/// strictly later canonical floor `2027-01-01T05:00:00.000000Z` because
+/// the hour-tens digit is `9` vs `0`, so the SQL `MAX()` silently keeps
+/// the stale rendering and the TTL extension is voided.
+///
+/// This helper canonicalizes both sides, compares instants, and returns
+/// the later value already in canonical form — so the first touch/fold
+/// of a legacy row heals it. `None` stored stays `None` (NULL expiry is
+/// not stamped). Unparseable stored bytes are preserved (fail-safe —
+/// never destroy a value the gates admitted).
+#[must_use]
+pub fn later_expiry_canonical(stored: Option<&str>, floor: &str) -> Option<String> {
+    let stored = stored?;
+    match (
+        canonicalize_valid_time(stored),
+        canonicalize_valid_time(floor),
+    ) {
+        (Some(stored_c), Some(floor_c)) => Some(if stored_c >= floor_c {
+            stored_c
+        } else {
+            floor_c
+        }),
+        (None, _) => Some(stored.to_string()),
+        (Some(stored_c), None) => Some(stored_c),
+    }
 }
 
 /// v0.7.0 Form 4 (issue #757) — validate a [`SourceSpan`] byte-range.
@@ -1796,6 +1828,43 @@ mod tests {
         let offset = canonicalize_valid_time("2026-03-01T05:00:00+05:00").expect("offset");
         assert_eq!(utc, offset);
         assert_eq!(utc, "2026-03-01T00:00:00.000000Z");
+    }
+
+    #[test]
+    fn later_expiry_canonical_self_heals_offset_that_would_win_byte_max_2463() {
+        // The #2463 failure shape: stored `+09:00` is 00:00Z; the floor is
+        // five hours later. sqlite `MAX()` keeps the stored bytes (`9` > `0`
+        // at the hour-tens digit). Instant-MAX must take the floor, already
+        // canonical.
+        let stored = "2027-01-01T09:00:00+09:00";
+        let floor = "2027-01-01T05:00:00.000000Z";
+        assert!(
+            stored > floor,
+            "precondition: stored bytes must sort above the floor (the SQL MAX trap)"
+        );
+        let got = later_expiry_canonical(Some(stored), floor).expect("some");
+        assert_eq!(got, floor);
+        assert_eq!(canonicalize_valid_time(&got).as_deref(), Some(got.as_str()));
+    }
+
+    #[test]
+    fn later_expiry_canonical_keeps_later_stored_instant_2463() {
+        let stored = "2027-01-01T12:00:00+00:00";
+        let floor = "2027-01-01T05:00:00.000000Z";
+        assert_eq!(
+            later_expiry_canonical(Some(stored), floor).as_deref(),
+            Some("2027-01-01T12:00:00.000000Z")
+        );
+    }
+
+    #[test]
+    fn later_expiry_canonical_preserves_unparseable_and_none_2463() {
+        assert_eq!(
+            later_expiry_canonical(Some("not-a-timestamp"), "2027-01-01T05:00:00.000000Z")
+                .as_deref(),
+            Some("not-a-timestamp")
+        );
+        assert!(later_expiry_canonical(None, "2027-01-01T05:00:00.000000Z").is_none());
     }
 
     #[test]

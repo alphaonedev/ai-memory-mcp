@@ -3189,38 +3189,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         }
 
         if version < 54 {
-            // v0.7.0 #1466 — one-shot backfill of tier-default expiry on
-            // legacy immortal rows. Before the write-path chokepoint fix,
-            // every internally-minted mid/short memory built with
-            // `expires_at: None` landed with a NULL expiry, which GC
-            // (`expires_at IS NOT NULL AND expires_at < now`) can never
-            // reap. Stamp those rows with `created_at + tier-default TTL`
-            // so they age out on the next sweep.
+            // v0.7.0 #1466 / v1.0.0 #2462 — one-shot backfill of
+            // tier-default expiry on legacy immortal rows. Before the
+            // write-path chokepoint fix, every internally-minted mid/short
+            // memory built with `expires_at: None` landed with a NULL
+            // expiry, which GC (`expires_at IS NOT NULL AND expires_at <
+            // now`) can never reap. Stamp those rows with `created_at +
+            // tier-default TTL` so they age out on the next sweep.
             //
-            // The interval is derived from `Tier::default_ttl_secs()` — the
-            // SAME SSOT the write path uses — and bound as a parameter, so
-            // the backfill can never drift from the canonical per-tier TTL
-            // and carries no hardcoded interval literal. `long` rows have no
-            // TTL (`default_ttl_secs() == None`) and are left NULL.
-            //
-            // `strftime` emits `YYYY-MM-DDTHH:MM:SS+00:00` — the same
-            // RFC3339 shape `Utc::now().to_rfc3339()` produces — so the
-            // lexical comparison in `gc()` stays monotonic. Idempotent:
-            // only NULL-expiry rows are touched, so a re-run finds none.
-            for tier in [
-                crate::models::Tier::Mid,
-                crate::models::Tier::Short,
-                crate::models::Tier::Long,
-            ] {
-                if let Some(ttl_secs) = tier.default_ttl_secs() {
-                    conn.execute(
-                        "UPDATE memories \
-                            SET expires_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', created_at, ?1) \
-                          WHERE expires_at IS NULL AND tier = ?2",
-                        params![format!("+{ttl_secs} seconds"), tier.as_str()],
-                    )?;
-                }
-            }
+            // Pre-#2462 this arm used sqlite `strftime(...+00:00)` with no
+            // fractional-seconds field — two axes off the canonical
+            // micros+`Z` rendering. It was "correct" only because v87's
+            // `normalize_expiry_rows` ran later. Emit the canonical form
+            // here so the arm is independent of that heal.
+            backfill_v54_tier_default_expiry(conn)?;
         }
         if version < 55 {
             // v0.7.0 #1476 — federation-catchup `updated_at` index.
@@ -4625,6 +4607,50 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 /// idempotent (canonical values are skipped), fail-safe (unparseable
 /// values keep their exact bytes — never destroy), and probe-tolerant
 /// (a missing column/table makes the SELECT prepare fail → no-op).
+/// v54 (#1466, #2462) — stamp NULL-expiry mid/short rows with
+/// `created_at + tier-default TTL` in the ONE canonical micros+`Z`
+/// rendering (`validate::render_canonical_utc`). Independent of the
+/// later v87 `normalize_expiry_rows` heal: a ladder reorder or a
+/// partial replay of this arm cannot re-introduce `+00:00` / no-fraction
+/// bytes into the lexicographically-compared column.
+///
+/// The interval is derived from `Tier::default_ttl_secs()` — the SAME
+/// SSOT the write path uses — so the backfill can never drift from the
+/// canonical per-tier TTL. `long` rows have no TTL and are left NULL.
+/// Idempotent: only NULL-expiry rows are touched. Unparseable
+/// `created_at` is skipped (fail-safe — never stamp garbage).
+pub(crate) fn backfill_v54_tier_default_expiry(conn: &Connection) -> Result<()> {
+    for tier in [
+        crate::models::Tier::Mid,
+        crate::models::Tier::Short,
+        crate::models::Tier::Long,
+    ] {
+        let Some(ttl_secs) = tier.default_ttl_secs() else {
+            continue;
+        };
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at FROM memories WHERE expires_at IS NULL AND tier = ?1",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![tier.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let ttl = chrono::Duration::seconds(ttl_secs);
+        for (id, created) in rows {
+            let Ok(created_dt) = chrono::DateTime::parse_from_rfc3339(created.trim()) else {
+                continue;
+            };
+            let exp =
+                crate::validate::render_canonical_utc(created_dt.with_timezone(&chrono::Utc) + ttl);
+            conn.execute(
+                "UPDATE memories SET expires_at = ?1 WHERE id = ?2 AND expires_at IS NULL",
+                params![exp, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn normalize_expiry_rows(conn: &Connection, select_sql: &str, update_sql: &str) -> Result<()> {
     let Ok(mut stmt) = conn.prepare(select_sql) else {
         return Ok(());
@@ -5475,6 +5501,49 @@ mod tests {
             "short backfill = +6h"
         );
         assert!(expiry("long1").is_none(), "long has no TTL — stays NULL");
+        // #2462 — the backfill itself emits canonical micros+Z, not
+        // `strftime(...+00:00)`. The full ladder also runs v87, so this
+        // pin is necessary but not sufficient; the independent pin below
+        // calls the backfill with no later heal.
+        assert_eq!(
+            expiry("mid1").as_deref(),
+            Some("2026-01-08T00:00:00.000000Z")
+        );
+        assert_eq!(
+            expiry("short1").as_deref(),
+            Some("2026-01-01T06:00:00.000000Z")
+        );
+    }
+
+    #[test]
+    fn v54_backfill_emits_canonical_z_independent_of_v87() {
+        // #2462 — call the backfill WITHOUT the rest of the ladder so a
+        // missing v87 heal cannot launder a `+00:00` rendering.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        let created = "2026-01-01T00:00:00+00:00";
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, expires_at) \
+             VALUES ('mid1', 'mid', 'ns', 't', 'c', ?1, ?1, NULL)",
+            params![created],
+        )
+        .unwrap();
+        super::backfill_v54_tier_default_expiry(&conn).expect("v54 backfill");
+        let exp: String = conn
+            .query_row("SELECT expires_at FROM memories WHERE id='mid1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(exp, "2026-01-08T00:00:00.000000Z");
+        assert!(
+            !exp.contains("+00:00"),
+            "#2462: v54 must not emit the pre-fix +00:00 rendering"
+        );
+        assert_eq!(
+            crate::validate::canonicalize_valid_time(&exp).as_deref(),
+            Some(exp.as_str()),
+            "#2462: v54 output must be a canonicalization fixpoint"
+        );
     }
 
     #[test]
