@@ -366,7 +366,11 @@ fn frame_fields(ev: &InboxEvent) -> (&str, &str, &str) {
         content_digest,
         ..
     } = ev;
-    (inbox_row_id, sender_agent_id, content_digest)
+    (
+        inbox_row_id.as_str(),
+        sender_agent_id.as_str(),
+        content_digest.as_str(),
+    )
 }
 
 /// Assert the bus frame names `row_id`, attributes it to `AUTHOR`, and
