@@ -106,7 +106,9 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
     use axum::http::Method;
 
     // Health and metadata always pass through — they don't touch user data.
-    if path == super::routes::HEALTH
+    if path == super::routes::MONITORING_STATUS
+        || path == super::routes::MONITORING_METRICS
+        || path == super::routes::HEALTH
         || path == super::routes::CAPABILITIES
         || path == super::routes::METRICS_BARE
         || path == super::routes::METRICS
@@ -553,6 +555,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
     let fixed_match = match (method.as_str(), path) {
         // Core health + metadata.
         ("GET", super::routes::HEALTH) => true,
+        ("GET", super::routes::MONITORING_STATUS) => true,
+        ("GET", super::routes::MONITORING_METRICS) => true,
         ("GET", super::routes::METRICS_BARE) => true,
         ("GET", super::routes::METRICS) => true,
         ("GET", super::routes::CAPABILITIES) => true,
