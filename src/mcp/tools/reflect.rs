@@ -38,65 +38,28 @@ use std::path::Path;
 /// inject) but the wire-string discipline they enforce must still
 /// stay pinned by the test suite.
 ///
-/// Stability contract — each branch maps to a stable string prefix:
-/// * `Validation(m)` → raw `m` (substrate sets the operator-readable
-///   reason; the MCP layer surfaces it verbatim).
-/// * `SourceNotFound(id)` → `"source memory not found: <id>"`.
-/// * `DepthExceeded { attempted, cap, namespace }` →
-///   `"REFLECTION_DEPTH_EXCEEDED: reflection depth N would exceed
-///    namespace max_reflection_depth M (namespace='ns')"` — Task 5/8
-///   audit emission keys off this prefix.
-/// * `HookVeto { reason, code }` →
-///   `"REFLECTION_HOOK_VETO (code=C): <reason>"`. Currently
-///   unreachable from the MCP dispatch path (no in-substrate hook
-///   registered) but pinned so the wire-shape can't drift under a
-///   future MCP-side hook wire-in.
-/// * `Database(m)` → raw `m`.
+/// #3638 confidentiality contract: policy and corpus diagnostics are for
+/// operator logs only. Stable refusal prefixes remain public, but values
+/// read through internal governance authority must never enter the wire text.
+/// Validation describes caller input; source-not-found names a requested ID.
+/// Hook and database failures can wrap private governance details, so they
+/// receive fixed messages too. The typed error and its Display stay intact
+/// for internal diagnostics and audit consumers.
 pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
+    tracing::warn!(target: "mcp.reflect", error = %err, "reflection refused");
     match err {
         db::ReflectError::Validation(m) => m,
         db::ReflectError::SourceNotFound(id) => format!("source memory not found: {id}"),
-        db::ReflectError::DepthExceeded {
-            attempted,
-            cap,
-            namespace,
-        } => {
-            // Stable error string shape — Task 5/8 will key its audit
-            // emission off this refusal. Keep the structured triple
-            // visible (attempted=N, cap=M, namespace='...') so the
-            // log analyser doesn't need a regex.
-            format!(
-                "REFLECTION_DEPTH_EXCEEDED: reflection depth {attempted} would exceed \
-                 namespace max_reflection_depth {cap} (namespace='{namespace}')"
-            )
+        db::ReflectError::DepthExceeded { .. } => {
+            "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded".into()
         }
-        db::ReflectError::HookVeto { reason, code } => {
-            // v0.7.0 Task 6/8 — a pre_reflect hook callback returned
-            // Deny, vetoing the reflection. The MCP handler today
-            // does NOT register any in-substrate hooks (the MCP-side
-            // hook chain wiring is G7+'s problem), so this arm is
-            // currently unreachable on the MCP path. We surface a
-            // stable error-string shape anyway so a future MCP-side
-            // hook wire-in lands without churning this arm.
-            format!("REFLECTION_HOOK_VETO (code={code}): {reason}")
+        db::ReflectError::HookVeto { .. } => "REFLECTION_HOOK_VETO: reflection refused".into(),
+        db::ReflectError::DecorrelationRefused { .. } => {
+            "REFLECTION_DECORRELATION_REFUSED: reflection decorrelation requirement not met".into()
         }
-        db::ReflectError::DecorrelationRefused {
-            distinct_attested_families,
-            attested_rows,
-            quorum_n,
-            namespace,
-        } => {
-            // v0.9.0 §25.3 S2 (D3-021, #1767) — enforce-mode refusal on an
-            // evidence-backed attested monoculture. Stable string shape
-            // keyed off `REFLECTION_DECORRELATION_REFUSED` (matches the
-            // signed audit event slug) with the structured counts visible.
-            format!(
-                "REFLECTION_DECORRELATION_REFUSED: attested model-family decorrelation quorum not \
-                 met ({distinct_attested_families} distinct attested families across \
-                 {attested_rows} attested rows < required {quorum_n}, namespace='{namespace}')"
-            )
+        db::ReflectError::Database(_) => {
+            "REFLECTION_FAILED: reflection could not be completed".into()
         }
-        db::ReflectError::Database(m) => m,
     }
 }
 
@@ -591,8 +554,17 @@ pub fn handle_reflect_caller(
                         &input.agent_id,
                         &payload,
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| {
+                        map_reflect_error_to_wire_string(db::ReflectError::Database(e.to_string()))
+                    })?;
                     crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
+                    tracing::info!(
+                        target: "mcp.reflect",
+                        namespace = %ns,
+                        proposed_depth = new_depth_u32,
+                        require_approval_above_depth = threshold,
+                        "reflection requires approval"
+                    );
                     return Ok(json!({
                         "status": "pending",
                         (field_names::PENDING_ID): pending_id,
@@ -600,7 +572,6 @@ pub fn handle_reflect_caller(
                         "action": "reflect",
                         "namespace": ns,
                         "proposed_depth": new_depth_u32,
-                        "require_approval_above_depth": threshold,
                     }));
                 }
             }
@@ -846,6 +817,83 @@ mod tests {
     //! - happy path without embedder (no-op for embedding side effect)
 
     use super::*;
+
+    // #3638: policy/corpus values are privileged even when the refusal is public.
+    #[test]
+    fn issue_3638_privileged_refusal_values_never_reach_wire() {
+        for (cap, namespace) in [(0, "victim/private"), (918_273, "secret/policy")] {
+            let err = db::ReflectError::DepthExceeded {
+                attempted: 918_274,
+                cap,
+                namespace: namespace.into(),
+            };
+            assert!(err.to_string().contains(&cap.to_string()));
+            assert_eq!(
+                map_reflect_error_to_wire_string(err),
+                "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded"
+            );
+        }
+        assert_eq!(
+            map_reflect_error_to_wire_string(db::ReflectError::DecorrelationRefused {
+                distinct_attested_families: 918_271,
+                attested_rows: 918_272,
+                quorum_n: 918_273,
+                namespace: "victim/private".into(),
+            }),
+            "REFLECTION_DECORRELATION_REFUSED: reflection decorrelation requirement not met"
+        );
+        assert_eq!(
+            map_reflect_error_to_wire_string(db::ReflectError::HookVeto {
+                reason: "private governance rule 918273".into(),
+                code: 403,
+            }),
+            "REFLECTION_HOOK_VETO: reflection refused"
+        );
+        assert_eq!(
+            map_reflect_error_to_wire_string(db::ReflectError::Database(
+                "private governance rule 918273".into(),
+            )),
+            "REFLECTION_FAILED: reflection could not be completed"
+        );
+    }
+
+    #[test]
+    fn issue_3638_operator_log_retains_private_depth_details() {
+        #[derive(Clone)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log mutex").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log(std::sync::Arc::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let wire = map_reflect_error_to_wire_string(db::ReflectError::DepthExceeded {
+                attempted: 918_274,
+                cap: 918_273,
+                namespace: "victim/private".into(),
+            });
+            assert_eq!(
+                wire,
+                "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded"
+            );
+        });
+        let bytes = log.0.lock().expect("log mutex");
+        let text = std::str::from_utf8(&bytes).expect("UTF-8 log");
+        assert!(text.contains("918274"), "{text}");
+        assert!(text.contains("918273"), "{text}");
+        assert!(text.contains("victim/private"), "{text}");
+    }
 
     // ── #3423 — the shared reflection-OWNER rule ────────────────────────
     //
@@ -1725,29 +1773,29 @@ mod tests {
     /// on. Exercising the mapper directly closes the coverage gap
     /// without contorting `handle_reflect`'s production signature.
     #[test]
-    fn map_reflect_error_hook_veto_shape() {
+    fn issue_3638_map_reflect_error_hook_veto_redacted() {
         let err = db::ReflectError::HookVeto {
             reason: "operator denied".to_string(),
             code: 451,
         };
         let wire = map_reflect_error_to_wire_string(err);
-        assert_eq!(wire, "REFLECTION_HOOK_VETO (code=451): operator denied");
+        assert_eq!(wire, "REFLECTION_HOOK_VETO: reflection refused");
         assert!(
             wire.starts_with("REFLECTION_HOOK_VETO"),
             "HookVeto wire shape must lead with the stable slug"
         );
     }
 
-    /// Test 7 — `Database` arm: pin the raw-string passthrough. Also
+    /// #3638 — `Database` details belong only in operator logs. Also
     /// structurally unreachable from `handle_reflect` today (a SQL
     /// fault inside the atomic reflect transaction implies a corrupt
     /// DB the test harness can't fabricate cleanly); exercising the
     /// mapper covers the production line.
     #[test]
-    fn map_reflect_error_database_passthrough() {
+    fn issue_3638_map_reflect_error_database_redacted() {
         let err = db::ReflectError::Database("disk I/O error: device busy".to_string());
         let wire = map_reflect_error_to_wire_string(err);
-        assert_eq!(wire, "disk I/O error: device busy");
+        assert_eq!(wire, "REFLECTION_FAILED: reflection could not be completed");
     }
 
     /// Test 8 — `Validation` arm passthrough through the helper. The
@@ -1772,7 +1820,7 @@ mod tests {
     /// Test 10 — `DepthExceeded` arm formatting. Stable error string
     /// shape; Task 5/8 audit emission keys off this prefix.
     #[test]
-    fn map_reflect_error_depth_exceeded_format() {
+    fn issue_3638_map_reflect_error_depth_exceeded_redacted() {
         let err = db::ReflectError::DepthExceeded {
             attempted: 6,
             cap: 5,
@@ -1781,8 +1829,7 @@ mod tests {
         let wire = map_reflect_error_to_wire_string(err);
         assert_eq!(
             wire,
-            "REFLECTION_DEPTH_EXCEEDED: reflection depth 6 would exceed namespace \
-             max_reflection_depth 5 (namespace='research')"
+            "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded"
         );
         assert!(wire.starts_with("REFLECTION_DEPTH_EXCEEDED"));
     }
