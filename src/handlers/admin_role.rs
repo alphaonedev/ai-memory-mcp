@@ -365,11 +365,11 @@ pub fn require_admin(
                 "deny",
                 "admin_role",
                 "",
-                json!({
-                    "endpoint": endpoint,
-                    "outcome": "agent_id_resolve_failed",
-                    "reason": e.to_string(),
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .label("endpoint", endpoint)
+                    .label("outcome", "agent_id_resolve_failed")
+                    // The error text can echo the hostile header value.
+                    .commit("reason", &e.to_string()),
             );
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -411,10 +411,9 @@ pub fn require_admin(
         if admitted { "allow" } else { "deny" },
         "admin_role",
         "",
-        json!({
-            "endpoint": endpoint,
-            "outcome": outcome,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .label("endpoint", endpoint)
+            .label("outcome", outcome),
     );
 
     if admitted {

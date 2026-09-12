@@ -703,12 +703,14 @@ fn audit(
         decision,
         endpoint,
         "",
-        json!({
-            "issue": "#3474",
-            (crate::models::field_names::TARGET_AGENT_ID): target_agent_id,
-            "outcome": outcome,
-            (FIELD_KEY_FINGERPRINT): token_sha256.map(key_fingerprint),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .label("issue", "#3474")
+            .ident(crate::models::field_names::TARGET_AGENT_ID, target_agent_id)
+            .ident("outcome", outcome)
+            .opt_ident(
+                FIELD_KEY_FINGERPRINT,
+                token_sha256.map(key_fingerprint).as_deref(),
+            ),
     );
 }
 

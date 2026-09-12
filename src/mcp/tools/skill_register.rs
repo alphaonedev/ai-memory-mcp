@@ -503,12 +503,11 @@ pub fn handle_skill_register(
         "allow",
         "skill_register",
         "",
-        json!({
-            "namespace": manifest.namespace,
-            "name": manifest.name,
-            "resource_count": resource_files.len(),
-            "signed": active_keypair.is_some(),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("namespace", &manifest.namespace)
+            .ident("name", &manifest.name)
+            .number("resource_count", resource_files.len())
+            .flag("signed", active_keypair.is_some()),
     );
 
     let body_bytes = manifest.body.as_bytes();

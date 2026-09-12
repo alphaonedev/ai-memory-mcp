@@ -243,7 +243,7 @@ fn audit_decide_verdict(
         verdict,
         kind,
         "",
-        json!({ (field_names::PENDING_ID): id }),
+        crate::governance::audit::ForensicPayload::new().ident(field_names::PENDING_ID, id),
     );
 }
 
