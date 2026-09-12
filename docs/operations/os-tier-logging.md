@@ -182,13 +182,46 @@ path to a remote host, because `tls` requires the CA file.
   unrecognized value, because the operator explicitly opted into off-host
   shipping and a silent fallback to a local file would be a confidentiality
   surprise.
-- *Collector unreachable at runtime:* **lossy, never blocking** — the sink shares
-  the file/stdout non-blocking worker, connects with a bounded timeout, and on
-  failure drops the record and reconnects on the next event. A down / slow /
-  attacker-reachable collector can never stall a `memory_store` / recall path or
-  daemon shutdown.
+- *Collector unreachable at runtime:* **lossy, never blocking, never silent** —
+  the sink shares the file/stdout non-blocking worker. Name resolution, connect,
+  write and flush are each bounded (5 s); after a failure the sink backs off
+  (1 s doubling to 60 s) and drops records immediately instead of making each
+  one wait on a dead collector. Every lost record is counted (see *Delivery
+  visibility* below). A down / slow / attacker-reachable collector can never
+  stall a `memory_store` / recall path or daemon shutdown.
 - *Zero-cost when off:* the entire syslog writer is `#[cfg(feature = "syslog")]`,
   so default / mobile / `sal` builds are byte-identical to a build without it.
+
+**Boot posture for every sink (#3651).** When `[logging].enabled = true` and the
+selected sink cannot be initialised — an unusable log directory, a syslog sink
+that is misconfigured or not compiled in, or another tracing subscriber already
+installed — every `ai-memory` command **refuses to start** with exit code 78 and
+a message naming the sink, the error and the remedies (fix the sink, select
+another sink, or set `[logging].enabled = false`). `ai-memory doctor` is the one
+exception: it still runs and reports the failure as a Critical
+"Logging pipeline (#3651)" section. Before v1.0.0 these failures printed
+"continuing without" and the process ran with no log pipeline at all.
+
+**Delivery visibility (#3651).** The worker counts what it does. A running
+daemon exposes, on `/metrics`:
+
+| Metric | Meaning |
+|---|---|
+| `ai_memory_log_pipeline_active` | 1 when the configured sink is installed and receiving events |
+| `ai_memory_log_records_delivered_total` | records written to the sink without error |
+| `ai_memory_log_write_failures_total` | failed writes and flushes; each lost at least one record |
+| `ai_memory_log_queue_dropped_total` | records dropped because the worker queue was full |
+| `ai_memory_log_last_delivery_seconds` | UNIX time of the last successful delivery; absent until the first one |
+
+The counters are present only while a pipeline is active, and the
+last-delivery gauge only once something has been delivered; absence means
+unmeasured, not zero. A fresh node therefore has no last-delivery series, so
+an alert on its age cannot fire before the first delivery. Alert on a rising `ai_memory_log_write_failures_total` or
+`ai_memory_log_queue_dropped_total`, and on
+`time() - ai_memory_log_last_delivery_seconds` growing while the daemon is
+serving traffic. Delivery failures are also reported on stderr — a channel
+independent of every sink — at most once per minute, with the number of
+failures folded into each report.
 
 **vs Tier 1 (`stdout` → init system).** Tier 1 is zero-config, zero-dep, and lets
 each OS own rotation / retention / forwarding. Reach for Tier 2 when you want
