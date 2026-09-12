@@ -81,6 +81,27 @@ ai-memory audit verify                  # exits 0 on intact chain
 
 ---
 
+## Forensic governance JSONL
+
+`audit.enabled` also controls the daily `forensic-YYYY-MM-DD.jsonl` sink.
+It is disabled when the setting is absent or false. With audit enabled,
+agent-action rows retain timestamp, actor identity, action kind, rule ID,
+outcome, chain link, and signature. The payload contains only
+`content_hash` (hex SHA-256 of the JSON object containing `action` and
+`decision_detail`) and `sensitive_fields: "hash_only"`.
+Commands, paths, hosts, process arguments, custom payloads, read queries,
+and decision reasons are excluded before signing, for allow, refuse, warn,
+and escalate outcomes alike. This policy is mandatory: explicitly setting
+`audit.redact_content = false` disables the forensic sink with a diagnostic.
+Actor and rule identifiers remain visible; use identifiers rather than
+sensitive content in those fields. Other forensic event types retain their
+caller-defined metadata envelopes.
+
+This changes newly emitted action rows. Existing signed logs are not rewritten.
+Consumers that previously read action details from `payload` must use the
+identity/outcome fields and content commitment instead. Hashes permit
+correlation and comparison with known content; they are not encryption.
+
 ## What gets audited
 
 The wire `action` vocabulary is the `AuditAction` enum in `src/audit.rs` —

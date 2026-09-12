@@ -7176,7 +7176,7 @@ pub struct LoggingConfig {
 /// trail emitted from every memory mutation call site.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuditConfig {
-    /// Master toggle. Default `false`.
+    /// Master toggle for flat audit and forensic governance JSONL. Default `false`.
     pub enabled: Option<bool>,
     /// Audit log path. Either a directory (in which case `audit.log`
     /// is appended) or an explicit file path. Default
@@ -7192,7 +7192,9 @@ pub struct AuditConfig {
     /// Whether to redact `memory.content` from emitted events. **The
     /// only supported value in v1 is `true`** — the audit schema does
     /// not expose a content field at all; this flag is reserved for a
-    /// future per-namespace exception API.
+    /// future per-namespace exception API. Forensic action payloads and decision
+    /// reasons are always hash-only before signing (#3647); explicit `false`
+    /// disables the forensic sink with a diagnostic.
     pub redact_content: Option<bool>,
     /// Whether to compute and verify the per-line hash chain. The
     /// cross-row hash chain is MANDATORY (the load-bearing tamper-evidence)
@@ -10332,7 +10334,9 @@ impl AppConfig {
 # When enabled, every memory mutation emits one hash-chained JSON
 # line per event suitable for SOC2 / HIPAA / GDPR / FedRAMP evidence.
 # `ai-memory audit verify` walks the chain; `ai-memory logs tail`
-# streams events.
+# streams events. This toggle also controls forensic governance JSONL;
+# action content and decision reasons are always hashed before signing.
+# Explicit redact_content=false disables the forensic sink.
 # [audit]
 # enabled = false
 # path = "~/.local/state/ai-memory/audit/"

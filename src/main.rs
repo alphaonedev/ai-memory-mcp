@@ -327,24 +327,38 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
-/// v0.7.0 #697 — best-effort init for the forensic governance log.
-/// Resolves the directory parallel to the flat audit log, loads the
-/// daemon's signing key (when present), and brings up the sink. A
-/// missing key results in unsigned rows — never a fatal error.
+/// Best-effort audit signer setup and opt-in forensic governance log.
+/// With `audit.enabled`, resolves the directory parallel to the flat audit
+/// log and brings up the sink. Database signers are installed independently.
+/// A missing key results in unsigned rows — never a fatal error.
 fn init_forensic_audit(app_config: &config::AppConfig) {
     let audit_cfg = app_config.effective_audit();
-    // Reuse the flat audit log path resolver — same directory pattern.
+    // Database audit signatures must remain available even when forensic
+    // file retention is disabled (#3647).
+    let agent_id = ai_memory::identity::resolve_agent_id(None, None)
+        .unwrap_or_else(|_| "ai-memory".to_string());
+    let signing_key =
+        ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None);
+    ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
+
+    // The master toggle covers both file sinks; default boot must not resolve
+    // the forensic directory or create logs.
+    if !audit_cfg.enabled.unwrap_or(false) {
+        ai_memory::governance::audit::shutdown();
+        return;
+    }
+    // Sensitive action fields are always hash-only; never silently honor an
+    // unsupported request for plaintext forensic retention.
+    if audit_cfg.redact_content == Some(false) {
+        ai_memory::governance::audit::shutdown();
+        eprintln!("ai-memory: forensic audit disabled: audit.redact_content=false is unsupported");
+        return;
+    }
     let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
     let Some(dir) = log_path.parent() else {
         eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
         return;
     };
-    // Resolve the daemon's agent_id with the standard precedence
-    // chain and try to load its keypair. Unsigned rows are accepted.
-    let agent_id = ai_memory::identity::resolve_agent_id(None, None)
-        .unwrap_or_else(|_| "ai-memory".to_string());
-    let signing_key =
-        ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None);
     if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
         eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
     }
@@ -353,6 +367,94 @@ fn init_forensic_audit(app_config: &config::AppConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn forensic_boot_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[test]
+    fn issue_3647_default_boot_keeps_forensic_sink_disabled() {
+        let _guard = forensic_boot_lock();
+        let _ = ai_memory::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch audit directory");
+        for enabled in [None, Some(false)] {
+            let app_config = config::AppConfig {
+                audit: Some(config::AuditConfig {
+                    path: Some(tmp.path().join("audit.log").to_string_lossy().into_owned()),
+                    enabled,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            ai_memory::governance::audit::shutdown();
+            init_forensic_audit(&app_config);
+            ai_memory::governance::audit::record_decision(
+                "agent:3647",
+                "refuse",
+                "bash",
+                "R3647",
+                serde_json::json!({"secret": "ISSUE_3647_DEFAULT_BOOT_SECRET"}),
+            );
+            ai_memory::governance::audit::flush_blocking();
+            assert!(!ai_memory::governance::audit::is_enabled());
+            assert_eq!(std::fs::read_dir(tmp.path()).expect("directory").count(), 0);
+        }
+    }
+
+    #[test]
+    fn issue_3647_explicit_audit_enablement_emits_jsonl() {
+        let _guard = forensic_boot_lock();
+        let _ = ai_memory::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch audit directory");
+        let app_config = config::AppConfig {
+            audit: Some(config::AuditConfig {
+                enabled: Some(true),
+                path: Some(tmp.path().join("audit.log").to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ai_memory::governance::audit::shutdown();
+        init_forensic_audit(&app_config);
+        assert!(ai_memory::governance::audit::is_enabled());
+        ai_memory::governance::audit::record_decision(
+            "agent:3647",
+            "allow",
+            "bootstrap",
+            "",
+            serde_json::json!({}),
+        );
+        ai_memory::governance::audit::shutdown();
+        let entries: Vec<_> = std::fs::read_dir(tmp.path()).expect("directory").collect();
+        assert_eq!(entries.len(), 1);
+        let body =
+            std::fs::read_to_string(entries[0].as_ref().expect("entry").path()).expect("JSONL");
+        let row: ai_memory::governance::audit::ForensicDecision =
+            serde_json::from_str(body.trim()).expect("row");
+        assert_eq!(row.actor, "agent:3647");
+        assert_eq!(row.decision, "allow");
+    }
+
+    #[test]
+    fn issue_3647_boot_rejects_plaintext_forensic_policy() {
+        let _guard = forensic_boot_lock();
+        let _ = ai_memory::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch audit directory");
+        let app_config = config::AppConfig {
+            audit: Some(config::AuditConfig {
+                enabled: Some(true),
+                redact_content: Some(false),
+                path: Some(tmp.path().join("audit.log").to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ai_memory::governance::audit::shutdown();
+        init_forensic_audit(&app_config);
+        assert!(!ai_memory::governance::audit::is_enabled());
+        assert_eq!(std::fs::read_dir(tmp.path()).expect("directory").count(), 0);
+    }
 
     #[test]
     fn id_short_truncates() {
@@ -438,6 +540,7 @@ mod tests {
     /// `governance::audit::init`.
     #[test]
     fn init_forensic_audit_with_temp_dir_does_not_panic() {
+        let _guard = forensic_boot_lock();
         let _ = ai_memory::identity::test_key_dir::install();
         // Scratch under the repo's gitignored .local-runs/ per the
         // project no-/tmp HARD RULE.
@@ -451,7 +554,13 @@ mod tests {
         // SAFETY: single-threaded test process; env set/restore is local.
         unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", tmp.path()) };
 
-        let app_config = config::AppConfig::default();
+        let app_config = config::AppConfig {
+            audit: Some(config::AuditConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         // Must not panic and must leave the process bootable (unsigned).
         init_forensic_audit(&app_config);
 
