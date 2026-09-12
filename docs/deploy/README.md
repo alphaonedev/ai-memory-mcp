@@ -88,10 +88,14 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
 - `AI_MEMORY_FED_CERT_PEER_BINDING=enforce` (#3201 — mTLS cert↔`X-Peer-Id`
   cross-check ENFORCES; `off`/`warn` refuse boot. The documented
   `standard` unset default stays `warn`)
+- `AI_MEMORY_UNSTAMPED_MUTATION=refuse` (#3124 — a caller-scoped mutation
+  of an UNSTAMPED, legacy-unowned row is refused on every funnel of both
+  backends; `warn` refuses boot. The documented `standard` default stays
+  `warn`)
 - plus `[governance].require_operator_pubkey=true` (bridged at the
   governance boot check).
 
-(That list is all **27** `KNOBS` entries. It has drifted from its own
+(That list is all **28** `KNOBS` entries. It has drifted from its own
 declared SSOT twice: it enumerated only 15 of the then-17 through v1.0.0,
 silently omitting the two permissive-shaped pins above — the ones whose
 violation REFUSES BOOT — and it then sat at 17 after #3033 raised the table

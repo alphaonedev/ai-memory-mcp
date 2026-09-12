@@ -1426,40 +1426,54 @@ Pair with `ai-memory doctor` (section "Embeddings Reachability
 (#1598)") to verify the target backend is reachable and authenticated
 *before* a long re-embed run.
 
-### `reown` — re-stamp `metadata.agent_id` ownership (#1720 B2)
+### `reown` — re-stamp `metadata.agent_id` ownership (#1720 B2, #3124)
 
-Rewrites the `metadata.agent_id` owner stamp on every memory in a
-namespace to `<agent_id>`. This is the operational tool to establish
-**durable ownership** before turning on enforced-multi-agent
-`scope=private` reads (#1720): the owner-keyed visibility filter (A)
-drops rows owned by a different agent, so an operator who enables it
-against a namespace of legacy / foreign-owned rows would lock
-themselves out of their own data. `reown` claims the namespace first.
+Rewrites the `metadata.agent_id` owner stamp on memories in a namespace
+(or every namespace) to `<agent_id>`. This is the operational tool to
+establish **durable ownership** before turning on enforced-multi-agent
+`scope=private` reads (#1720) or `AI_MEMORY_UNSTAMPED_MUTATION=refuse`
+(#3124): the owner-keyed visibility filter drops rows owned by a different
+agent, and the `refuse` posture refuses a caller-scoped mutation of a row
+with no owner, so an operator who enables either against legacy rows would
+lock themselves out of their own data. `reown` claims the rows first;
+`ai-memory doctor` (section `Unstamped owners (#3124)`) counts the rows
+that carry no owner.
 
 ```bash
-ai-memory reown --namespace prod --to alice --dry-run   # count, no writes
-ai-memory reown --namespace prod --to alice             # re-own owned rows
-ai-memory reown --namespace prod --to alice --claim-unowned --json
+ai-memory reown --namespace prod --to alice --only-unowned --dry-run   # count first
+ai-memory reown --namespace prod --to alice --only-unowned             # adopt unowned rows only
+ai-memory reown --all-namespaces --to alice --only-unowned --dry-run   # every namespace
+ai-memory reown --namespace prod --to alice                            # re-own OWNED rows
 ```
 
 | Flag | Notes |
 |---|---|
-| `--namespace <ns>` | The namespace whose memories are re-owned. **EXACT** match — the subtree is NOT included. |
+| `--namespace <ns>` | The namespace whose memories are re-owned. **EXACT** match — the subtree is NOT included. Required unless `--all-namespaces`. |
+| `--all-namespaces` | Sweep every namespace (conflicts with `--namespace`). |
 | `--to <agent_id>` | The new owner stamped onto `metadata.agent_id`. Validated against the wire agent_id shape; a malformed value is rejected before any write. |
-| `--dry-run` | Count the matched rows and print the plan WITHOUT writing. |
-| `--claim-unowned` | ALSO re-own rows with an absent / empty `metadata.agent_id` (the legacy "owned by nobody" class). Without it, only rows with an existing owner are rewritten. |
-| `--json` | Emit the machine-readable `{matched, rewritten, dry_run}` report instead of the human summary. |
+| `--dry-run` | Count the matched rows and print the plan WITHOUT writing. Run it first. |
+| `--only-unowned` | Re-own ONLY rows with no ownership stamp (missing / null / empty `metadata.agent_id`); a row that has an owner is never touched. The remedy for the doctor census. |
+| `--claim-unowned` | Re-own **every** row in scope, **owned rows included** (claim-all) — rows are taken from their current owners. Conflicts with `--only-unowned`; to adopt only legacy rows use `--only-unowned`. |
+| (default) | Without `--only-unowned` / `--claim-unowned`, only rows that already have an owner are rewritten. |
+| `--store-url <postgres://…>` | Re-own on a Postgres store. The `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL` channels are honoured with the same precedence as `curator` / `serve`. |
+| `--json` | Emit the machine-readable `{matched, rewritten, dry_run, select}` report instead of the human summary. |
 
-Only `metadata.agent_id` is touched (a single-key `json_set`); every
-other metadata key is preserved and the `agent_id_idx` generated column
-auto-reprojects the new owner. **The `ai-memory reown` CLI verb operates
-on the local SQLite `--db` only. On a Postgres-served deployment
-(`AI_MEMORY_STORE_URL=postgres://…`, the `AI_MEMORY_STORE_URL_FILE`
-channel, or `--store-url`) it REFUSES rather than phantom-write to a
-throwaway SQLite file the served store never reads — re-own via the HTTP
-daemon (`ai-memory serve`) instead ([#2572](https://github.com/alphaonedev/ai-memory-mcp/issues/2572)).**
-See the §"Agent Identity" durable-stamp posture in `CLAUDE.md` for why
-this precedes enabling enforced reads.
+Only `metadata.agent_id` is touched (a single-key `json_set` /
+`jsonb_set`); every other metadata key is preserved and the
+`agent_id_idx` generated column re-projects the new owner. Every
+rewritten row gets `version + 1` and a fresh `updated_at`, and each live
+run appends ONE `memory.reowned` signed-chain row (scope, new owner,
+selection, count — never content) naming the operator, in the same
+transaction; the write is refused under record-stop. **Operator-only:**
+there is no MCP or HTTP surface, and the audit actor is the resolved
+principal (`--agent-id` / `AI_MEMORY_AGENT_ID` / the durable synthesised
+default) — an anonymous principal is refused. **Both backends:** on a
+`sal` build a `postgres://` store routes through the SAL; the local SQLite
+leg keeps the [#2572](https://github.com/alphaonedev/ai-memory-mcp/issues/2572)
+funnel, so a build without `sal` still REFUSES a Postgres store rather
+than phantom-write to a throwaway SQLite file. See the §"Agent Identity"
+durable-stamp posture in `CLAUDE.md` for why this precedes enabling
+enforced reads.
 
 ### `identity` — Ed25519 keypair management (H-track)
 

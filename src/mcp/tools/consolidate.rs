@@ -42,7 +42,14 @@ fn resolve_consolidate_sources(
             return Err(crate::errors::msg::memory_not_found(id));
         }
         if let Some(c) = caller
-            && !crate::visibility::caller_owns_for_mutation(&row, c, false)
+            && !crate::visibility::caller_owns_for_mutation(
+                &row,
+                c,
+                false,
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::CONSOLIDATE,
+                ),
+            )
         {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }

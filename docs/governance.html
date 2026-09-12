@@ -580,7 +580,7 @@ footer a{color:var(--text-muted)}
       </div>
       <div class="act">
         <div class="name delete">Delete</div>
-        <div class="desc">Hard-deleting a memory. Picks <code>policy.delete</code>. Default <code>Owner</code> — unowned memories can be deleted by anyone unless the namespace is opted into stricter rules.</div>
+        <div class="desc">Hard-deleting a memory. Picks <code>policy.delete</code>. Default <code>Owner</code>. A memory with no ownership stamp (legacy, no <code>metadata.agent_id</code>) is governed by one cross-backend knob, <code>AI_MEMORY_UNSTAMPED_MUTATION</code> (#3124): under the default <code>warn</code> a backend keeps its existing behaviour (SQLite lets any caller mutate the row and logs a warning; Postgres refuses delete / update / archive) and under <code>refuse</code> both backends refuse every caller-scoped mutation of that row. Re-own legacy rows with <code>ai-memory reown</code>; <code>ai-memory doctor</code> counts them.</div>
         <div class="ws">discriminator: "delete"</div>
       </div>
       <div class="act">

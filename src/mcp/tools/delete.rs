@@ -267,7 +267,14 @@ pub(super) fn handle_delete(
     // self-owned / daemon / inbox-target pass); `allow_inbox = true` mirrors the
     // HTTP delete-side gate.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
-        if !crate::visibility::caller_owns_for_mutation(&target, &caller, true) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &target,
+            &caller,
+            true,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::DELETE,
+            ),
+        ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
     }

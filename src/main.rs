@@ -147,6 +147,14 @@ fn main() -> Result<()> {
     // `security_profile::runtime_boot_report`.
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
+    // v1.0.0 #3124 — the unstamped-row mutation posture is a mandate-class
+    // knob: an unrecognised token refuses boot (naming the knob, the token and
+    // the grammar) instead of being guessed. `doctor` stays runnable so it can
+    // report the bad value.
+    if !is_doctor {
+        ai_memory::identity::owner_stamp::validate_boot_token()?;
+    }
+
     // #3582: evaluate the argv peer lists even with quorum_writes=0, before
     // workers or stores start. Doctor must remain able to diagnose refusal.
     match &cli.command {
