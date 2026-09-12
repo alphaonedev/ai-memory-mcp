@@ -20653,6 +20653,17 @@ impl PostgresStore {
 
 #[async_trait]
 impl MemoryStore for PostgresStore {
+    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
+        let (fsync, synchronous_commit): (String, String) = sqlx::query_as(
+            "SELECT current_setting('fsync'), current_setting('synchronous_commit')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| to_store_err("read PostgreSQL commit durability", error))?;
+        crate::write_receipt::WriteDurability::postgres(&fsync, &synchronous_commit)
+            .map_err(|error| StoreError::Backend(super::BoxBackendError::new(error.to_string())))
+    }
+
     /// #1955 R45 — engage/release the record-stop on postgres.
     async fn record_stop(
         &self,

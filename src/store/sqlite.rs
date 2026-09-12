@@ -318,6 +318,11 @@ fn assert_caller_owns_for_mutation(
 
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
+    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
+        let conn = self.state.lock().await;
+        crate::write_receipt::WriteDurability::sqlite(&conn).map_err(box_err)
+    }
+
     fn capabilities(&self) -> Capabilities {
         // #1670 — the two transaction-related bits mean DIFFERENT things;
         // sqlite honestly holds one but not the other:

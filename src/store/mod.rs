@@ -1230,6 +1230,16 @@ pub trait MemoryStore: Send + Sync {
     /// process lifetime.
     fn capabilities(&self) -> Capabilities;
 
+    /// Observe the active writer's commit durability for a receipt (#3555).
+    ///
+    /// # Errors
+    /// Unsupported adapters fail closed; concrete adapters propagate observation errors.
+    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "write_durability".to_owned(),
+        })
+    }
+
     /// v0.7.0.1 S75 — return the highest applied DB schema-migration
     /// version (the integer recorded in `schema_version.MAX(version)`)
     /// from the underlying store. Surfaced through

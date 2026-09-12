@@ -17,11 +17,12 @@ non-wedging: a capture failure never disturbs your LLM call.
 """
 from __future__ import annotations
 
-from ._capture import capture_turn
+from ._capture import CaptureTurnReceipt, capture_turn
 from ._extract import extract_last_request_turn, extract_response_text
 from .shim import wrap
 
 __all__ = [
+    "CaptureTurnReceipt",
     "wrap",
     "capture_turn",
     "extract_last_request_turn",

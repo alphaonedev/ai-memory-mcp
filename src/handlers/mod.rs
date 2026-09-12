@@ -157,6 +157,7 @@ pub mod skills;
 pub mod subscriptions;
 pub mod system;
 pub mod transport;
+mod write_receipt;
 // #1579 B4 — HTTP response-format negotiation (json | toon |
 // toon_compact) for the recall/search surfaces.
 pub mod wire_format;

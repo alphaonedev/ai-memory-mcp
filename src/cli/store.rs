@@ -603,6 +603,7 @@ pub(crate) fn run_with_curator(
         // DB's truth. Unconditional: an unverified write never reaches here.
         let mut j = serde_json::to_value(&persisted)?;
         j["id"] = serde_json::json!(actual_id);
+        crate::write_receipt::WriteDurability::sqlite(&conn)?.attach(&mut j)?;
         let filtered: Vec<&String> = contradictions
             .iter()
             .filter(|c| c.id != actual_id)
@@ -620,7 +621,11 @@ pub(crate) fn run_with_curator(
         // #3025 — echo the PERSISTED tier/namespace, not the requested ones.
         let tier = &persisted.tier;
         let namespace = persisted.namespace.as_str();
-        writeln!(out.stdout, "stored: {actual_id} [{tier}] (ns={namespace})")?;
+        let durability = crate::write_receipt::WriteDurability::sqlite(&conn)?;
+        writeln!(
+            out.stdout,
+            "stored: {actual_id} [{tier}] (ns={namespace}) {durability}"
+        )?;
         // #3402 — an operator whose namespace standard asked for
         // atomisation is told what actually happened. Silent only when
         // the namespace never opted in, so no existing output changes.

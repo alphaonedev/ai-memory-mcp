@@ -809,6 +809,23 @@ pub async fn bulk_create(
     headers: HeaderMap,
     Json(bodies): Json<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
+    let response = bulk_create_write(State(app.clone()), headers, Json(bodies))
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn bulk_create_write(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(bodies): Json<Vec<CreateMemory>>,
+) -> impl IntoResponse {
     if bodies.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,

@@ -129,6 +129,7 @@ pub fn enforce(
             // function and its many callers — out of scope for K4.
             // Tracked for a follow-up; the K10 surface remains correct
             // because HTTP/MCP rows DO fire the event.
+            let durability = crate::write_receipt::WriteDurability::sqlite(conn)?;
             if json_out {
                 let mut payload_obj = serde_json::json!({
                     "status": "pending",
@@ -145,17 +146,18 @@ pub fn enforce(
                         serde_json::Value::String(mid.to_string()),
                     );
                 }
+                durability.attach(&mut payload_obj)?;
                 writeln!(out.stdout, "{payload_obj}")?;
             } else if let Some(mid) = memory_id {
                 writeln!(
                     out.stdout,
-                    "{} queued for approval: pending_id={pending_id} id={mid}",
+                    "{} queued for approval: pending_id={pending_id} id={mid} {durability}",
                     action.as_str()
                 )?;
             } else {
                 writeln!(
                     out.stdout,
-                    "{} queued for approval: pending_id={pending_id} ns={namespace}",
+                    "{} queued for approval: pending_id={pending_id} ns={namespace} {durability}",
                     action.as_str()
                 )?;
             }

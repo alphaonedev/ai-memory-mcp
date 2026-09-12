@@ -311,7 +311,16 @@ fn run_capture_turn(
         .get("dedup_hit")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    writeln!(out.stdout, "capture-turn: memory_id={id} dedup_hit={dedup}")?;
+    let class = envelope["durability_class"]
+        .as_str()
+        .ok_or_else(|| anyhow!("capture receipt missing durability_class"))?;
+    let fsync = envelope["fsync"]
+        .as_str()
+        .ok_or_else(|| anyhow!("capture receipt missing fsync"))?;
+    writeln!(
+        out.stdout,
+        "capture-turn: memory_id={id} dedup_hit={dedup} durability_class={class} fsync={fsync}"
+    )?;
     Ok(())
 }
 

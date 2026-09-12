@@ -344,6 +344,18 @@ fn handle_capture_turn_inner(
     caller_agent_id: Option<&str>,
     auto_index: bool,
 ) -> anyhow::Result<Value> {
+    let mut receipt = capture_turn_write(conn, params, caller_agent_id, auto_index)?;
+    crate::write_receipt::WriteDurability::sqlite(conn)?.attach(&mut receipt)?;
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_lines)]
+fn capture_turn_write(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller_agent_id: Option<&str>,
+    auto_index: bool,
+) -> anyhow::Result<Value> {
     let start = Instant::now();
     let req: MemoryCaptureTurnRequest = serde_json::from_value(params.clone())
         .map_err(|e| anyhow::anyhow!("INVALID_INPUT: {e}"))?;

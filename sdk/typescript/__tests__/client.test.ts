@@ -340,6 +340,8 @@ describe("AiMemoryClient.storeBulk wire shape (#2646)", () => {
 
   test("sends a BARE ARRAY body, never an object wrapper", async () => {
     const envelope = {
+      durability_class: "local-only",
+      fsync: "per-checkpoint",
       sent: 2,
       created: 2,
       updated: 0,
@@ -369,6 +371,8 @@ describe("AiMemoryClient.storeBulk wire shape (#2646)", () => {
 
   test("parses the ledger envelope including a rejected row (207)", async () => {
     const envelope = {
+      durability_class: "local-only",
+      fsync: "per-checkpoint",
       sent: 4,
       created: 1,
       updated: 1,

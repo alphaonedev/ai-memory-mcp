@@ -7,6 +7,18 @@
  * with `src/models.rs` in the main repo.
  */
 
+/** #3555: operation-level durability, independent of a stored memory row. */
+export interface WriteReceipt {
+  durability_class: "local-only" | `quorum ${number}-of-${number}` | "replicated+backup";
+  fsync: string;
+  quorum_acks?: number;
+  quorum_n?: number;
+  quorum_required?: number;
+}
+
+/** A successful store/update response. */
+export type MemoryWriteReceipt = Memory & WriteReceipt;
+
 /** Memory tier — mirrors human memory systems (short: 6h TTL, mid: 7d, long: permanent). */
 export type Tier = "short" | "mid" | "long";
 
@@ -270,7 +282,7 @@ export interface BulkUpdatedRow {
  * `warnings`, `embed_status`, and `embed_status_reason` are emitted only
  * when non-empty / degraded, so they are optional.
  */
-export interface BulkCreateResponse {
+export interface BulkCreateResponse extends WriteReceipt {
   sent: number;
   created: number;
   updated: number;
