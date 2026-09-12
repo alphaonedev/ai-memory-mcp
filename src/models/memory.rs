@@ -582,6 +582,23 @@ pub fn lifecycle_visible_clause(table_alias: &str) -> String {
     format!("AND ({col} IS NULL OR {col} IN ({list}))")
 }
 
+/// Exclude quarantined rows from invalidation review queues (#3614).
+///
+/// These queues must retain contaminated dependents for curator review (#3324),
+/// so they cannot use [`lifecycle_visible_clause`]. Other lifecycle states,
+/// including lineage tombstones, retain their existing listing behavior.
+/// `table_alias` must be a trusted SQL alias, or empty for an unqualified column.
+#[must_use]
+pub fn quarantine_hidden_clause(table_alias: &str) -> String {
+    let col = if table_alias.is_empty() {
+        super::field_names::LIFECYCLE_STATE.to_string()
+    } else {
+        format!("{table_alias}.{}", super::field_names::LIFECYCLE_STATE)
+    };
+    let quarantined = LifecycleState::Quarantined.as_str();
+    format!("AND ({col} IS NULL OR {col} <> '{quarantined}')")
+}
+
 /// v0.7.0 Form 5 (issue #758) — typed discriminator for the provenance
 /// of a memory's `confidence` value.
 ///
