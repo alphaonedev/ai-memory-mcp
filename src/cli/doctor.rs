@@ -121,6 +121,9 @@ const PEER_FACT_DATA_AGE: &str = "data_age_secs";
 const NOT_OBSERVED: &str = "not_observed";
 /// The one spelling for a peer whose last answered pull is inside the window.
 const REACHABLE: &str = "reachable";
+/// A contact-only peer: it has answered pulls but never delivered data, so
+/// it has no `sync_state` row and no data cursors (v3 review).
+const PEER_NEVER_PULLED: &str = "never_pulled";
 const PEER_FACT_PUSHED_AGE: &str = "pushed_age_secs";
 const PEER_FACT_CLOCK_LEAD: &str = "clock_lead_secs";
 const PEER_FACT_INVALID: &str = "invalid";
@@ -2935,9 +2938,14 @@ fn section_sync_at(
         ));
         facts.push((
             key(PEER_FACT_ADVANCED_AGE),
-            peer.advanced_age_secs.to_string(),
+            peer.advanced_age_secs
+                .map_or_else(|| PEER_NEVER_PULLED.to_string(), |a| a.to_string()),
         ));
-        facts.push((key(PEER_FACT_DATA_AGE), peer.data_age_secs.to_string()));
+        facts.push((
+            key(PEER_FACT_DATA_AGE),
+            peer.data_age_secs
+                .map_or_else(|| PEER_NEVER_PULLED.to_string(), |a| a.to_string()),
+        ));
         match reach.verdict {
             ReachVerdict::Reachable => {}
             ReachVerdict::Stale { window_secs } => {
@@ -2980,23 +2988,32 @@ fn section_sync_at(
             peer.pushed_age_secs
                 .map_or_else(|| PEER_NEVER_PUSHED.to_string(), |a| a.to_string()),
         ));
-        facts.push((key(PEER_FACT_CLOCK_LEAD), peer.clock_lead_secs.to_string()));
-        max_advanced =
-            Some(max_advanced.map_or(peer.advanced_age_secs, |m| m.max(peer.advanced_age_secs)));
-        max_data = Some(max_data.map_or(peer.data_age_secs, |m| m.max(peer.data_age_secs)));
-        let lead_abs = peer.clock_lead_secs.saturating_abs();
-        max_lead_abs = Some(max_lead_abs.map_or(lead_abs, |m| m.max(lead_abs)));
-
-        if peer.clock_lead_secs > PULL_CURSOR_FUTURE_SKEW_SECS {
-            severity = Severity::Critical;
-            append_note(
-                &mut note,
-                &format!(
-                    "peer {} stamps data {}s ahead of this clock (>{PULL_CURSOR_FUTURE_SKEW_SECS}s \
-                     pull-cursor bound) — clocks disagree and its cursors will be refused",
-                    peer.peer_id, peer.clock_lead_secs
-                ),
-            );
+        facts.push((
+            key(PEER_FACT_CLOCK_LEAD),
+            peer.clock_lead_secs
+                .map_or_else(|| PEER_NEVER_PULLED.to_string(), |a| a.to_string()),
+        ));
+        if let Some(adv) = peer.advanced_age_secs {
+            max_advanced = Some(max_advanced.map_or(adv, |m| m.max(adv)));
+        }
+        if let Some(dat) = peer.data_age_secs {
+            max_data = Some(max_data.map_or(dat, |m| m.max(dat)));
+        }
+        if let Some(lead) = peer.clock_lead_secs {
+            let lead_abs = lead.saturating_abs();
+            max_lead_abs = Some(max_lead_abs.map_or(lead_abs, |m| m.max(lead_abs)));
+            if lead > PULL_CURSOR_FUTURE_SKEW_SECS {
+                severity = Severity::Critical;
+                append_note(
+                    &mut note,
+                    &format!(
+                        "peer {} stamps data {lead}s ahead of this clock \
+                         (>{PULL_CURSOR_FUTURE_SKEW_SECS}s pull-cursor bound) — clocks disagree \
+                         and its cursors will be refused",
+                        peer.peer_id
+                    ),
+                );
+            }
         }
     }
     facts.push((FACT_STALE_PEERS.into(), stale_peers.to_string()));
@@ -6573,6 +6590,46 @@ enabled = true
             assert_eq!(fact(&section, FACT_UNKNOWN_PEERS), "0");
             assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), "5");
             assert!(section.note.is_none(), "{section:?}");
+        }
+    }
+
+    /// #3655 v3 review — a peer that has only ever answered EMPTY windows has
+    /// a contact row and NO `sync_state` row. It must be VISIBLE (enumerated
+    /// from the union), reachable, with its data cursors reported as
+    /// never-pulled — never as an age of 0 and never as invalid. A URL-shaped
+    /// peer id with embedded credentials is redacted in every fact.
+    #[test]
+    fn sync_section_contact_only_peer_is_visible_and_redacted_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let contact = (now - chrono::Duration::seconds(4)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+                 catchup_interval_secs) VALUES ('me', 'https://alice:hunter2@peer.example/api', ?1, 30)",
+                params![contact],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Info, "{section:?}");
+            assert_eq!(fact(&section, FACT_PEER_COUNT), "1");
+            assert_eq!(fact(&section, FACT_INVALID_ROWS), "0");
+            let redacted =
+                crate::logging::redact_url_password("https://alice:hunter2@peer.example/api");
+            assert!(!redacted.contains("hunter2"), "{redacted}");
+            let key = |suffix: &str| format!("peer::me/{redacted}::{suffix}");
+            assert_eq!(fact(&section, &key("reachability")), REACHABLE);
+            assert_eq!(fact(&section, &key("contact_age_secs")), "4");
+            assert_eq!(fact(&section, &key("advanced_age_secs")), PEER_NEVER_PULLED);
+            assert_eq!(fact(&section, &key("data_age_secs")), PEER_NEVER_PULLED);
+            assert_eq!(fact(&section, &key("clock_lead_secs")), PEER_NEVER_PULLED);
+            assert_eq!(fact(&section, FACT_MAX_ADVANCED_AGE_SECS), NOT_OBSERVED);
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), "4");
+            assert!(
+                !format!("{section:?}").contains("hunter2"),
+                "the credential must not appear anywhere in the section"
+            );
         }
     }
 

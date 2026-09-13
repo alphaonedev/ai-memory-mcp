@@ -116,7 +116,13 @@ sections.
 ### Sync
 
 - `probed_at` — the RFC 3339 instant every age below is measured against.
-- `peer_count` — physical rows in `sync_state` (valid + invalid);
+- Rows are enumerated from the UNION of `sync_state` and `sync_peer_contact`
+  (#3655 v3): a peer that has only ever answered empty windows has a contact
+  row and no `sync_state` row, and is still listed — its data cursors read
+  `never_pulled`, never `0`. Contact without data is normal; data without
+  contact cannot happen. Peer ids of URL shape are redacted (credentials
+  never reach a fact or note).
+- `peer_count` — physical rows in that union (valid + invalid);
   `invalid_rows` — rows whose cursors are NULL or not RFC 3339, each named
   as `peer::<agent>/<peer>::invalid = <column and reason>`. **Warning** when
   > 0: an invalid row is neither healthy nor absent (#3655).

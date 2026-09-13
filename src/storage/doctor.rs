@@ -434,25 +434,36 @@ pub fn doctor_webhook_delivery_totals(conn: &Connection) -> Result<(u64, u64)> {
 ///   cadences). `None` = the writer did not know its cadence.
 /// - `advanced_age_secs` — seconds since the data watermark last ADVANCED
 ///   (`last_pulled_at`, this node's clock). Old is legitimate for a quiet
-///   peer; it is NOT a liveness signal.
+///   peer; it is NOT a liveness signal. `None` = this peer has never
+///   delivered data (it has only ever answered empty windows): there is no
+///   `sync_state` row, and that is reported as never-pulled, not as 0.
 /// - `data_age_secs` — seconds since the newest peer data this node has seen
 ///   (`last_seen_at`, the peer's own `updated_at`, i.e. the PEER's clock).
+///   `None` for the same reason.
 /// - `pushed_age_secs` — seconds since the last local watermark the peer
 ///   accepted (`last_pushed_at`); `None` when this node never pushed.
 /// - `clock_lead_secs` — signed `last_seen_at - last_pulled_at`. Positive
 ///   means the peer stamped data in this node's future: a clock disagreement,
 ///   which the pre-#3655 probe folded into an unsigned "skew" together with
-///   the harmless quiet-peer case.
+///   the harmless quiet-peer case. `None` without a data watermark.
+///
+/// Rows are enumerated from the UNION of `sync_state` and
+/// `sync_peer_contact` (v3 review): contact is the more fundamental fact — a
+/// peer can be contacted without ever delivering data, never the reverse —
+/// so a peer that has only ever answered empty windows is visible here.
+/// `peer_id` is REDACTED at construction (`logging::redact_url_password`):
+/// a legacy peer id may be a URL and a URL may embed credentials, and this
+/// struct feeds every doctor fact and note.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPeerWatermark {
     pub agent_id: String,
     pub peer_id: String,
     pub contact_age_secs: Option<i64>,
     pub catchup_interval_secs: Option<u64>,
-    pub advanced_age_secs: i64,
-    pub data_age_secs: i64,
+    pub advanced_age_secs: Option<i64>,
+    pub data_age_secs: Option<i64>,
     pub pushed_age_secs: Option<i64>,
-    pub clock_lead_secs: i64,
+    pub clock_lead_secs: Option<i64>,
 }
 
 /// v1.0.0 #3655 — every `sync_state` row, split into the rows whose
@@ -521,12 +532,18 @@ pub fn doctor_sync_peer_watermarks(
         [],
         |r| r.get(0),
     )?;
+    // v3 review — enumerate the UNION of both tables so a peer that has only
+    // ever answered EMPTY windows (a contact row, no `sync_state` row) is
+    // visible: contact without data is normal; data without contact is not
+    // possible.
     let sql = if contact_table {
-        "SELECT s.agent_id, s.peer_id, s.last_seen_at, s.last_pulled_at, s.last_pushed_at, \
+        "SELECT k.agent_id, k.peer_id, s.last_seen_at, s.last_pulled_at, s.last_pushed_at, \
                 c.last_contact_at, c.catchup_interval_secs \
-         FROM sync_state s \
-         LEFT JOIN sync_peer_contact c ON c.agent_id = s.agent_id AND c.peer_id = s.peer_id \
-         ORDER BY s.agent_id, s.peer_id"
+         FROM (SELECT agent_id, peer_id FROM sync_state \
+               UNION SELECT agent_id, peer_id FROM sync_peer_contact) k \
+         LEFT JOIN sync_state s ON s.agent_id = k.agent_id AND s.peer_id = k.peer_id \
+         LEFT JOIN sync_peer_contact c ON c.agent_id = k.agent_id AND c.peer_id = k.peer_id \
+         ORDER BY k.agent_id, k.peer_id"
     } else {
         "SELECT agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at, \
                 NULL, NULL \
@@ -558,13 +575,24 @@ pub fn doctor_sync_peer_watermarks(
                 continue;
             }
         };
+        // Redact at construction: a peer id of URL shape may carry
+        // credentials, and every fact / note downstream renders this string.
+        let peer_id = peer_id.map(|p| crate::logging::redact_url_password(&p));
         let label = format!(
             "{}/{}",
             agent_id.as_deref().unwrap_or(SYNC_ROW_UNLABELLED),
             peer_id.as_deref().unwrap_or(SYNC_ROW_UNLABELLED)
         );
-        let advanced = cursor_age_secs(now, "last_pulled_at", pulled.as_deref());
-        let data = cursor_age_secs(now, "last_seen_at", seen.as_deref());
+        // `sync_state` columns are NOT NULL, so a NULL here means the row is
+        // ABSENT (contact-only peer): never pulled, which is not an error.
+        let advanced = match pulled.as_deref() {
+            None => Ok(None),
+            Some(p) => cursor_age_secs(now, "last_pulled_at", Some(p)).map(Some),
+        };
+        let data = match seen.as_deref() {
+            None => Ok(None),
+            Some(s) => cursor_age_secs(now, "last_seen_at", Some(s)).map(Some),
+        };
         let pushed_age = match pushed.as_deref() {
             None => Ok(None),
             Some(p) => cursor_age_secs(now, "last_pushed_at", Some(p)).map(Some),
@@ -593,8 +621,12 @@ pub fn doctor_sync_peer_watermarks(
                     advanced_age_secs,
                     data_age_secs,
                     pushed_age_secs,
-                    // seen - pulled == (now - pulled) - (now - seen)
-                    clock_lead_secs: advanced_age_secs.saturating_sub(data_age_secs),
+                    // seen - pulled == (now - pulled) - (now - seen); only
+                    // meaningful when both cursors exist.
+                    clock_lead_secs: match (advanced_age_secs, data_age_secs) {
+                        (Some(adv), Some(dat)) => Some(adv.saturating_sub(dat)),
+                        _ => None,
+                    },
                 });
             }
             (advanced, data, pushed_age, contact_age, _, _) => {
