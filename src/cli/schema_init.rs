@@ -166,8 +166,9 @@ pub struct SchemaInitArgs {
 /// regression test that pins that contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaInitReport {
-    /// The `--store-url` value, with any Postgres userinfo password
-    /// masked via [`crate::logging::redact_url_password`]. Useful when
+    /// The `--store-url` value rendered from the allowlist
+    /// ([`crate::url_display::store_url_display`]: scheme / host / port /
+    /// database — never userinfo or the query string, #3711). Useful when
     /// the operator pipes JSON output into downstream tooling.
     ///
     /// #1893 — this field used to echo `--store-url` verbatim on the
@@ -309,7 +310,7 @@ pub async fn run(
             .with_context(|| {
                 format!(
                     "open store at {}",
-                    crate::logging::redact_url_password(&args.store_url)
+                    crate::url_display::store_url_display(&args.store_url)
                 )
             })?;
         let mut r = enumerate_sqlite(&args.store_url)?;
@@ -334,7 +335,7 @@ pub async fn run(
         // credentials in the userinfo; redact before echoing.
         anyhow::bail!(
             "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-            crate::logging::redact_url_password(&args.store_url)
+            crate::url_display::store_url_display(&args.store_url)
         );
     };
 
@@ -369,7 +370,7 @@ fn is_postgres_url(url: &str) -> bool {
 /// masking, and so the masking is unit-testable without a live DB
 /// connection (the enumeration functions themselves require one).
 fn masked_report_url(url: &str) -> String {
-    crate::logging::redact_url_password(url)
+    crate::url_display::store_url_display(url)
 }
 
 /// Strip the `sqlite://` prefix and the optional third slash so the
@@ -523,7 +524,7 @@ async fn init_and_enumerate_postgres(
         .with_context(|| {
             format!(
                 "open store at {} with embedding dim {dim}",
-                crate::logging::redact_url_password(url)
+                crate::url_display::store_url_display(url)
             )
         })?;
 
@@ -569,7 +570,7 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
         .with_context(|| {
             format!(
                 "connect postgres for enumeration: {}",
-                crate::logging::redact_url_password(url)
+                crate::url_display::store_url_display(url)
             )
         })?;
 
@@ -853,25 +854,24 @@ mod tests {
     }
 
     #[test]
-    fn masked_report_url_redacts_postgres_password() {
+    fn masked_report_url_renders_the_allowlist_only() {
         // #1893 — before the fix, `SchemaInitReport::url` echoed
         // `--store-url` verbatim, so a `--json` success payload (or the
         // human "schema initialized at ..." line) leaked the raw
         // Postgres password into CI logs / log aggregators / tickets.
-        let url = "postgres://svc_acct:hunter2@db.internal:5432/prod";
+        // #3711 — the userinfo-only masker that replaced it still passed a
+        // query-form password and the user name through; the report now
+        // carries scheme / host / port / database and nothing else.
+        let url =
+            "postgres://svc_acct:hunter2@db.internal:5432/prod?password=hunter3&sslkey=/etc/pg/k";
         let masked = masked_report_url(url);
-        assert!(
-            !masked.contains("hunter2"),
-            "password leaked into report url: {masked}"
-        );
-        assert!(
-            masked.contains("svc_acct"),
-            "username should still identify the credential: {masked}"
-        );
-        assert!(
-            masked.contains("db.internal:5432/prod"),
-            "host/db should still surface for diagnostics: {masked}"
-        );
+        for secret in ["hunter2", "hunter3", "svc_acct", "/etc/pg/k"] {
+            assert!(
+                !masked.contains(secret),
+                "{secret:?} leaked into report url: {masked}"
+            );
+        }
+        assert_eq!(masked, "postgres://db.internal:5432/prod");
     }
 
     #[test]

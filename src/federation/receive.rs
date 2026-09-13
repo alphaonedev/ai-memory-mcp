@@ -24,8 +24,12 @@ fn log_catchup_http_skip(peer_id: &str, status: impl std::fmt::Display) {
     tracing::debug!("catchup: peer {peer_id} returned HTTP {status} — skipping this tick");
 }
 
-fn log_catchup_unreachable(peer_id: &str, e: impl std::fmt::Display) {
-    tracing::debug!("catchup: peer {peer_id} unreachable: {e}");
+/// #3710 — takes the `reqwest::Error` itself and logs its CLASS: the
+/// error's Display names the full request URL (`for url (…)`), and a peer
+/// URL may carry a credential.
+fn log_catchup_unreachable(peer_id: &str, e: &reqwest::Error) {
+    let class = crate::url_display::TransportFailure::classify(e);
+    tracing::debug!("catchup: peer {peer_id} unreachable: {class}");
 }
 
 fn log_catchup_unparseable_body(peer_id: &str, e: impl std::fmt::Display) {
@@ -432,7 +436,7 @@ pub(super) async fn catchup_once_with_store(
                 continue;
             }
             Err(e) => {
-                log_catchup_unreachable(&peer.id, e);
+                log_catchup_unreachable(&peer.id, &e);
                 continue;
             }
         };
@@ -785,7 +789,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 continue;
             }
             Err(e) => {
-                log_catchup_unreachable(&peer.id, e);
+                log_catchup_unreachable(&peer.id, &e);
                 continue;
             }
         };
@@ -981,7 +985,7 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
                 continue;
             }
             Err(e) => {
-                log_catchup_unreachable(&peer.id, e);
+                log_catchup_unreachable(&peer.id, &e);
                 continue;
             }
         };
