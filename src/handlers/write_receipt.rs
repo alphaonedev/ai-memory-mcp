@@ -33,7 +33,15 @@ pub(super) async fn complete(
     match decorate(app, response, writer).await {
         Ok(response) => response,
         Err(error) => {
-            tracing::error!(%error, "write receipt durability observation failed");
+            // #3670 — the write ALREADY SUCCEEDED; only our observation of its
+            // durability failed. Faulting here turned a designed degrade path
+            // into a 500 (a refusing backend must degrade the push, not fault
+            // it — `cov_sal_refusal_arms_3521`), and a client retrying on 5xx
+            // would duplicate a write that landed. Report what is true: the
+            // write is fine, the durability class is UNKNOWN. The operator gets
+            // the cause in the log; the caller gets an honest receipt rather
+            // than a number we did not measure.
+            tracing::error!(%error, "write receipt durability envelope failed");
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "durability receipt unavailable; write may have completed"})),
@@ -52,7 +60,16 @@ async fn decorate(
     // These are handler-produced finite JSON bodies, not request streams.
     let bytes = axum::body::to_bytes(body, usize::MAX).await?;
     let mut receipt: Value = serde_json::from_slice(&bytes)?;
-    let mut durability = local(app, writer).await?;
+    // #3670 — an observation failure must DEGRADE, not fault: the write has
+    // already committed. Report `unknown` rather than asserting a class we did
+    // not measure, and keep the cause in the operator's log.
+    let mut durability = match local(app, writer).await {
+        Ok(durability) => durability,
+        Err(error) => {
+            tracing::error!(%error, "write durability could not be observed; reporting unknown");
+            crate::write_receipt::WriteDurability::unknown()
+        }
+    };
     if let (Some(acks), Some(n), Some(required)) = (
         receipt
             .get(crate::write_receipt::QUORUM_ACKS_FIELD)

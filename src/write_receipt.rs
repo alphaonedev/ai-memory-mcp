@@ -56,6 +56,19 @@ impl WriteDurability {
         Ok(Self::local(level.fsync_cadence()))
     }
 
+    /// #3670 — the write committed but its durability could not be observed
+    /// (a refusing or unreachable backend). Report that honestly instead of
+    /// faulting a successful write or asserting a class nobody measured.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            durability_class: "unknown".to_owned(),
+            fsync: "unknown".to_owned(),
+            quorum_acks: None,
+            quorum_n: None,
+        }
+    }
+
     fn local(fsync: &str) -> Self {
         Self {
             durability_class: crate::storage::DURABILITY_CLASS_LOCAL_ONLY.to_owned(),

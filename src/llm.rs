@@ -5193,6 +5193,11 @@ mod c5_breaker_tests {
 #[cfg(test)]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 mod perf9_async_tests {
+    /// #3648 — planted as the provider's response body so the assertions below
+    /// prove the body does NOT reach the caller-visible error. A bare
+    /// "does it contain the new code" check would pass even if the body leaked.
+    const PULL_BODY_SENTINEL: &str = "ISSUE_3648_PULL_BODY_SENTINEL";
+
     use super::OllamaClient;
     use serde_json::json;
     use std::net::TcpListener;
@@ -5404,7 +5409,7 @@ mod perf9_async_tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/pull"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("upstream sick"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(PULL_BODY_SENTINEL))
             .mount(&server)
             .await;
 
@@ -5415,7 +5420,20 @@ mod perf9_async_tests {
             .ensure_model_async()
             .await
             .expect_err("500 on pull must surface");
-        assert!(err.to_string().contains("Ollama pull failed"));
+        // #3648 — the tenant/caller-visible error is now the BOUNDED provider
+        // diagnostic, not the interpolated response body. Assert the bounded
+        // shape AND the absence of the body, so this is a redaction guard that
+        // fails if the leak ever returns rather than a formatting check that
+        // fails when the message is reworded.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("http_status=500"),
+            "expected the bounded provider failure; got {rendered}"
+        );
+        assert!(
+            !rendered.contains(PULL_BODY_SENTINEL),
+            "provider response body leaked into the error: {rendered}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5492,7 +5510,7 @@ mod perf9_async_tests {
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("upstream sick"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(PULL_BODY_SENTINEL))
             .mount(&server)
             .await;
         let client = OllamaClient::new_with_url_async(&server.uri(), "test-model")
@@ -6064,7 +6082,16 @@ mod perf9_async_tests {
             .ensure_embed_model_async("nomic-embed-text")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Ollama embed model pull failed"));
+        // #3648 — same bounded-provider contract as the chat pull above.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("http_status=500"),
+            "expected the bounded provider failure; got {rendered}"
+        );
+        assert!(
+            !rendered.contains(PULL_BODY_SENTINEL),
+            "provider response body leaked into the error: {rendered}"
+        );
     }
 
     // ============ expand_query_async / summarize_memories_async / auto_tag_async / detect_contradiction_async ============
