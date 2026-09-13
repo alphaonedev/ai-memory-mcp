@@ -202,7 +202,7 @@ pub fn refuse_postgres_store_url_without_feature(cli_arg: Option<&str>) -> Resul
              --db path (would write agent memory to the wrong store while looking \
              healthy) (#2679). rebuild with `--features sal-postgres`, or unset \
              AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE / --store-url",
-            crate::logging::redact_url_password(&url),
+            crate::url_display::store_url_display(&url),
         );
     }
 }

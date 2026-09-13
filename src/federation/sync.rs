@@ -305,9 +305,14 @@ pub(super) async fn post_once(
         // #2672 — a transport failure carries no HTTP status; class it
         // structurally as `network` rather than letting the reqwest error's
         // text (which can embed a port number like `:4001`) be substring-read
-        // as a `400`-class permanent failure.
+        // as a `400`-class permanent failure. #3710 — the reqwest error is
+        // CLASSIFIED at this origin (`timeout` / `connect` / `http_<n>` / …)
+        // and never rendered: its Display names the full request URL, and
+        // this string reaches 28 log lines and the stored
+        // `federation_push_dlq.last_error`.
         Err(e) => AckOutcome::Fail(
-            super::dlq_class::DlqErrorClass::Network.stamp(&crate::errors::msg::network(e)),
+            super::dlq_class::DlqErrorClass::Network
+                .stamp(&crate::url_display::network_failure(&e)),
         ),
     }
 }
@@ -2524,7 +2529,9 @@ pub async fn bulk_catchup_push(
                     // rather than re-inlining the literal (pm-v3.1).
                     Err(http_status_reason(status))
                 }
-                Err(e) => Err(crate::errors::msg::network(e)),
+                // #3710 — classified at the origin; the reqwest Display
+                // would name the peer URL in the bulk_create warning.
+                Err(e) => Err(crate::url_display::network_failure(&e)),
             };
             (id, outcome)
         });
