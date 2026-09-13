@@ -18,12 +18,15 @@
 //!   configured, the mTLS `/sync/*` bypass, a `403` identity mismatch (the
 //!   key was valid) and handler-level refusals carry no stamp.
 //! * The source is the TCP peer address (`ConnectInfo<SocketAddr>`), IPv6
-//!   collapsed to its /64. A non-loopback peer's `X-Forwarded-For` is never
-//!   read: the client writes it, so trusting it would let a guesser name a
-//!   fresh source per request. A LOOPBACK peer is the same-host proxy
-//!   `docs/ADMIN_GUIDE.md` recommends; keying on it would put every client
-//!   behind it in one bucket, so its RIGHTMOST `X-Forwarded-For` hop (the
-//!   one the proxy appended, which a client cannot replace) names the source.
+//!   collapsed to its /48 (one customer allocation, so an attacker cannot
+//!   mint a fresh source per address). `X-Forwarded-For` is read ONLY when
+//!   the peer is in the operator-declared set
+//!   [`ENV_AUTH_BACKOFF_TRUSTED_PROXIES`] (empty by default): the client
+//!   writes that header, and "the peer is loopback" is not "the peer is our
+//!   proxy" on a host other local processes share, so trusting it anywhere
+//!   else would let a guesser name a fresh source per request, or name
+//!   another client's address to lock it out. From a declared proxy the
+//!   source is the rightmost hop that is not itself a declared proxy.
 //! * After [`FREE_FAILURES`] rejections, each further rejection puts the
 //!   source in backoff for `1 s * 2^(k-1)`, capped at [`MAX_BACKOFF`]. A
 //!   source in backoff gets `429` + `Retry-After` BEFORE its key is looked
@@ -31,19 +34,23 @@
 //!   tell the guesser which key was right, and the guessing would not slow.
 //! * A successful authentication does NOT clear the source: otherwise a
 //!   caller holding one valid key could interleave valid requests with
-//!   guesses at another key and never reach backoff. A source with no
-//!   rejection for [`IDLE_RESET`] starts over. The table is bounded at
-//!   [`MAX_TRACKED_SOURCES`]; the oldest-tracked source is dropped first, so
-//!   the table cannot itself exhaust memory.
+//!   guesses at another key and never reach backoff. The count decays by
+//!   time only: a source with no rejection for [`IDLE_RESET`] starts over.
+//! * The table is bounded at [`MAX_TRACKED_SOURCES`], so it cannot itself
+//!   exhaust memory. At capacity the least-recently-failed source is dropped,
+//!   but never one in backoff: dropping it would let a guesser clear its own
+//!   backoff by failing from other addresses. When every candidate is in
+//!   backoff the new source is not counted (one WARN per process).
 //! * A request with no peer address (a router driven without a TCP listener)
 //!   passes untouched; a poisoned lock is recovered. The layer degrades to
 //!   "no backoff", never to "deny".
 //!
-//! `AI_MEMORY_AUTH_FAILURE_BACKOFF` (default ON) switches the layer off with
-//! a falsy token. Known trade-off: behind a proxy on ANOTHER host (or a same-
-//! host proxy that does not append its hop) every client shares one source,
-//! so one client presenting wrong keys puts all of them in backoff for at
-//! most [`MAX_BACKOFF`].
+//! `AI_MEMORY_AUTH_FAILURE_BACKOFF` (default ON; pinned by `asi-hard`)
+//! switches the layer off with a falsy token. Known trade-off: behind a proxy
+//! that is not declared (or one that does not append its hop) every client
+//! shares the proxy's source, so one client presenting wrong keys puts all of
+//! them in backoff for at most [`MAX_BACKOFF`]; the WARN names that source.
+//! The guessing bound is [`FREE_FAILURES`] per source, not a global total.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -60,6 +67,11 @@ use serde_json::json;
 
 /// The env knob. Registered in [`crate::env_flag::knobs::AUTH_FAILURE_BACKOFF`].
 pub const ENV_AUTH_FAILURE_BACKOFF: &str = "AI_MEMORY_AUTH_FAILURE_BACKOFF";
+
+/// Comma-separated IP addresses of the reverse proxies whose
+/// `X-Forwarded-For` is read. Unset or empty: none, every peer is its own
+/// source.
+pub const ENV_AUTH_BACKOFF_TRUSTED_PROXIES: &str = "AI_MEMORY_AUTH_BACKOFF_TRUSTED_PROXIES";
 
 /// Rejections a source may accumulate before backoff starts.
 pub const FREE_FAILURES: u32 = 10;
@@ -88,8 +100,19 @@ const MAX_DOUBLINGS: u32 = 16;
 
 const TRACE_TARGET: &str = "http::auth";
 
-/// Header a same-host proxy appends the client address to.
+/// Header a reverse proxy appends the client address to.
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
+
+/// `X-Forwarded-For` hops examined from the right before giving up and
+/// keying on the last declared proxy seen.
+const MAX_FORWARDED_HOPS: usize = 32;
+
+/// Live records examined per eviction before the new source is left
+/// untracked; bounds the work done under the lock.
+const EVICTION_SCAN: usize = 64;
+
+/// Leading bytes of an IPv6 address that form one source (/48).
+const V6_SOURCE_PREFIX_BYTES: usize = 6;
 
 /// Response extension `api_key_auth` puts on its `401`s: the credential was
 /// missing or unknown. The backoff layer counts exactly these.
@@ -105,14 +128,14 @@ impl AuthRejected {
     }
 }
 
-/// One source: an IPv4 address, or an IPv6 /64 (an IPv4-mapped IPv6 address
+/// One source: an IPv4 address, or an IPv6 /48 (an IPv4-mapped IPv6 address
 /// counts as its IPv4 address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKey {
     /// An IPv4 peer.
     V4(Ipv4Addr),
-    /// The upper 64 bits of an IPv6 peer.
-    V6Net(u64),
+    /// The first 48 bits of an IPv6 peer.
+    V6Net([u8; V6_SOURCE_PREFIX_BYTES]),
 }
 
 impl SourceKey {
@@ -124,36 +147,116 @@ impl SourceKey {
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                 Some(v4) => Self::V4(v4),
                 None => {
-                    let mut net = [0_u8; 8];
-                    net.copy_from_slice(&v6.octets()[..8]);
-                    Self::V6Net(u64::from_be_bytes(net))
+                    let mut net = [0_u8; V6_SOURCE_PREFIX_BYTES];
+                    net.copy_from_slice(&v6.octets()[..V6_SOURCE_PREFIX_BYTES]);
+                    Self::V6Net(net)
                 }
             },
         }
     }
 }
 
-/// The source a request belongs to: the peer, or, for a loopback peer (a
-/// same-host proxy), the rightmost `X-Forwarded-For` hop when it parses.
-#[must_use]
-pub fn source_for(peer: SocketAddr, headers: &HeaderMap) -> SourceKey {
-    let ip = peer.ip().to_canonical();
-    let forwarded = if ip.is_loopback() {
-        rightmost_forwarded_hop(headers)
-    } else {
-        None
-    };
-    SourceKey::from_ip(forwarded.unwrap_or(ip))
+/// The reverse proxies whose `X-Forwarded-For` the layer reads
+/// ([`ENV_AUTH_BACKOFF_TRUSTED_PROXIES`]). A trust boundary is something an
+/// operator declares, never something inferred from an address class.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedProxies(Arc<[IpAddr]>);
+
+impl TrustedProxies {
+    /// Parse a comma-separated address list. Returns the set and the entries
+    /// that did not parse; a rejected entry is simply not trusted, so a typo
+    /// can only narrow what is trusted, never widen it.
+    #[must_use]
+    pub fn parse(raw: &str) -> (Self, Vec<String>) {
+        let mut trusted = Vec::new();
+        let mut rejected = Vec::new();
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            match entry.parse::<IpAddr>() {
+                Ok(ip) => trusted.push(ip.to_canonical()),
+                Err(_) => rejected.push(entry.to_owned()),
+            }
+        }
+        (Self(trusted.into()), rejected)
+    }
+
+    /// The set from [`ENV_AUTH_BACKOFF_TRUSTED_PROXIES`]; each rejected entry
+    /// is logged at WARN.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let raw = match std::env::var(ENV_AUTH_BACKOFF_TRUSTED_PROXIES) {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Self::default(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    "{ENV_AUTH_BACKOFF_TRUSTED_PROXIES} is not UTF-8; no proxy is trusted (#2502)"
+                );
+                return Self::default();
+            }
+        };
+        let (trusted, rejected) = Self::parse(&raw);
+        for entry in rejected {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                entry = %entry,
+                "{ENV_AUTH_BACKOFF_TRUSTED_PROXIES} entry is not an IP address; it is \
+                 not trusted (#2502)"
+            );
+        }
+        trusted
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.0.contains(&ip)
+    }
+
+    /// No proxy is declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
-/// The last hop of the last `X-Forwarded-For` line (several lines form one
-/// list in order), as an address. `None` when absent or unparseable.
-fn rightmost_forwarded_hop(headers: &HeaderMap) -> Option<IpAddr> {
-    let line = headers.get_all(X_FORWARDED_FOR).iter().next_back()?;
-    let hop = line.to_str().ok()?.rsplit(',').next()?.trim();
+/// The source a request belongs to. The peer, unless the peer is a declared
+/// proxy: then the rightmost `X-Forwarded-For` hop that is not itself a
+/// declared proxy. An absent or unparseable hop stops the walk and the last
+/// declared proxy seen is the source, which only ever widens a bucket.
+#[must_use]
+pub fn source_for(peer: SocketAddr, headers: &HeaderMap, trusted: &TrustedProxies) -> SourceKey {
+    let mut candidate = peer.ip().to_canonical();
+    if !trusted.contains(candidate) {
+        return SourceKey::from_ip(candidate);
+    }
+    let mut seen = 0_usize;
+    // Several header lines form one list in order, so walk the last line
+    // first and each line from its right end.
+    for line in headers.get_all(X_FORWARDED_FOR).iter().rev() {
+        let Ok(line) = line.to_str() else {
+            return SourceKey::from_ip(candidate);
+        };
+        for hop in line.rsplit(',') {
+            seen += 1;
+            if seen > MAX_FORWARDED_HOPS {
+                return SourceKey::from_ip(candidate);
+            }
+            let Some(ip) = parse_hop(hop.trim()) else {
+                return SourceKey::from_ip(candidate);
+            };
+            if !trusted.contains(ip) {
+                return SourceKey::from_ip(ip);
+            }
+            candidate = ip;
+        }
+    }
+    SourceKey::from_ip(candidate)
+}
+
+/// One `X-Forwarded-For` hop as an address: a bare IP, or `host:port`.
+fn parse_hop(hop: &str) -> Option<IpAddr> {
     hop.parse::<IpAddr>()
         .ok()
         .or_else(|| hop.parse::<SocketAddr>().ok().map(|s| s.ip()))
+        .map(|ip| ip.to_canonical())
 }
 
 impl fmt::Display for SourceKey {
@@ -161,8 +264,8 @@ impl fmt::Display for SourceKey {
         match self {
             Self::V4(v4) => write!(f, "{v4}"),
             Self::V6Net(net) => {
-                let [a, b, c, d] = [net >> 48, net >> 32, net >> 16, *net].map(|w| w & 0xffff);
-                write!(f, "{a:x}:{b:x}:{c:x}:{d:x}::/64")
+                let word = |i: usize| u16::from_be_bytes([net[i], net[i + 1]]);
+                write!(f, "{:x}:{:x}:{:x}::/48", word(0), word(2), word(4))
             }
         }
     }
@@ -183,6 +286,9 @@ pub enum FailureEffect {
         /// This rejection crossed the threshold.
         first: bool,
     },
+    /// Not counted: the table is full and every eviction candidate is in
+    /// backoff.
+    Untracked,
 }
 
 #[derive(Debug)]
@@ -193,11 +299,18 @@ struct Record {
     seq: u64,
 }
 
+impl Record {
+    fn is_blocked(&self, now: Instant) -> bool {
+        self.blocked_until.is_some_and(|until| until > now)
+    }
+}
+
 #[derive(Debug)]
 struct Table {
     records: HashMap<SourceKey, Record>,
-    /// Insertion order for eviction; entries whose `seq` no longer matches
-    /// the live record are stale and skipped.
+    /// Least-recently-failed first: every rejection re-queues its source
+    /// with a fresh `seq`, and entries whose `seq` no longer matches the live
+    /// record are stale and skipped.
     order: VecDeque<(SourceKey, u64)>,
     next_seq: u64,
     capacity: usize,
@@ -266,24 +379,42 @@ impl AuthBackoff {
             table.records.remove(&source);
         }
         if !table.records.contains_key(&source) {
-            table.insert_new(source, now);
+            if !table.make_room(now) {
+                return FailureEffect::Untracked;
+            }
+            table.records.insert(
+                source,
+                Record {
+                    failures: 0,
+                    last_failure: now,
+                    blocked_until: None,
+                    seq: 0,
+                },
+            );
         }
+        let seq = table.next_seq;
+        table.next_seq = table.next_seq.wrapping_add(1);
         let Some(record) = table.records.get_mut(&source) else {
-            return FailureEffect::Counted;
+            return FailureEffect::Untracked;
         };
+        record.seq = seq;
         record.failures = record.failures.saturating_add(1);
         record.last_failure = now;
         let past = record.failures.saturating_sub(FREE_FAILURES);
-        if past == 0 {
-            return FailureEffect::Counted;
-        }
-        let backoff = backoff_for(past);
-        record.blocked_until = now.checked_add(backoff);
-        FailureEffect::Backoff {
-            failures: record.failures,
-            backoff,
-            first: past == 1,
-        }
+        let effect = if past == 0 {
+            FailureEffect::Counted
+        } else {
+            let backoff = backoff_for(past);
+            record.blocked_until = now.checked_add(backoff);
+            FailureEffect::Backoff {
+                failures: record.failures,
+                backoff,
+                first: past == 1,
+            }
+        };
+        table.order.push_back((source, seq));
+        table.compact();
+        effect
     }
 
     /// Sources currently tracked.
@@ -294,28 +425,31 @@ impl AuthBackoff {
 }
 
 impl Table {
-    fn insert_new(&mut self, source: SourceKey, now: Instant) {
+    /// Make room for one more record by dropping the least-recently-failed
+    /// source that is not in backoff at `now`. A source in backoff is kept
+    /// and re-queued: dropping it would clear its backoff. Returns `false`
+    /// when [`EVICTION_SCAN`] live candidates were all in backoff.
+    fn make_room(&mut self, now: Instant) -> bool {
+        let mut scanned = 0_usize;
         while self.records.len() >= self.capacity {
+            if scanned == EVICTION_SCAN {
+                return false;
+            }
             let Some((key, seq)) = self.order.pop_front() else {
-                break;
+                return false;
             };
-            if self.records.get(&key).is_some_and(|r| r.seq == seq) {
+            let blocked = match self.records.get(&key) {
+                Some(record) if record.seq == seq => record.is_blocked(now),
+                _ => continue,
+            };
+            scanned += 1;
+            if blocked {
+                self.order.push_back((key, seq));
+            } else {
                 self.records.remove(&key);
             }
         }
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.records.insert(
-            source,
-            Record {
-                failures: 0,
-                last_failure: now,
-                blocked_until: None,
-                seq,
-            },
-        );
-        self.order.push_back((source, seq));
-        self.compact();
+        true
     }
 
     /// Drop stale order entries once they outnumber the live records, so the
@@ -336,29 +470,41 @@ impl Table {
 pub struct AuthBackoffState {
     table: Option<Arc<AuthBackoff>>,
     mtls_enforced: bool,
+    trusted: TrustedProxies,
 }
 
 impl AuthBackoffState {
-    /// State from `AI_MEMORY_AUTH_FAILURE_BACKOFF` (default ON): a fresh table
-    /// per router, so each daemon (and each test router) counts on its own.
+    /// State from `AI_MEMORY_AUTH_FAILURE_BACKOFF` (default ON) and
+    /// [`ENV_AUTH_BACKOFF_TRUSTED_PROXIES`]: a fresh table per router, so each
+    /// daemon (and each test router) counts on its own.
     #[must_use]
     pub fn from_env(mtls_enforced: bool) -> Self {
-        let table = crate::env_flag::knobs::AUTH_FAILURE_BACKOFF
-            .enabled()
-            .then(|| Arc::new(AuthBackoff::default()));
+        let enabled = crate::env_flag::knobs::AUTH_FAILURE_BACKOFF.enabled();
         Self {
-            table,
+            table: enabled.then(|| Arc::new(AuthBackoff::default())),
             mtls_enforced,
+            trusted: if enabled {
+                TrustedProxies::from_env()
+            } else {
+                TrustedProxies::default()
+            },
         }
     }
 
-    /// State over an explicit table.
+    /// State over an explicit table, trusting no proxy.
     #[must_use]
     pub fn with_table(table: Arc<AuthBackoff>, mtls_enforced: bool) -> Self {
         Self {
             table: Some(table),
             mtls_enforced,
+            trusted: TrustedProxies::default(),
         }
+    }
+
+    /// The same state, reading `X-Forwarded-For` from `trusted` proxies.
+    #[must_use]
+    pub fn trusting(self, trusted: TrustedProxies) -> Self {
+        Self { trusted, ..self }
     }
 }
 
@@ -398,7 +544,7 @@ pub async fn auth_backoff_layer(
     let Some(source) = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| source_for(*addr, req.headers()))
+        .map(|ConnectInfo(addr)| source_for(*addr, req.headers(), &state.trusted))
     else {
         static NO_PEER_ONCE: std::sync::Once = std::sync::Once::new();
         NO_PEER_ONCE.call_once(|| {
@@ -417,21 +563,35 @@ pub async fn auth_backoff_layer(
     let response = next.run(req).await;
     if response.extensions().get::<AuthRejected>().is_some() {
         crate::metrics::registry().auth_failures_total.inc();
-        if let FailureEffect::Backoff {
-            failures,
-            backoff,
-            first: true,
-        } = table.record_failure(source, Instant::now())
-        {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                %source,
+        match table.record_failure(source, Instant::now()) {
+            FailureEffect::Backoff {
                 failures,
-                backoff_secs = backoff.as_secs(),
-                "source exceeded {FREE_FAILURES} failed authentication attempts; \
-                 refusing it with 429 for a doubling interval (#2502). Set \
-                 {ENV_AUTH_FAILURE_BACKOFF}=0 to disable"
-            );
+                backoff,
+                first: true,
+            } => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    %source,
+                    failures,
+                    backoff_secs = backoff.as_secs(),
+                    "source exceeded {FREE_FAILURES} failed authentication attempts; \
+                     refusing it with 429 for a doubling interval (#2502). Set \
+                     {ENV_AUTH_FAILURE_BACKOFF}=0 to disable"
+                );
+            }
+            FailureEffect::Untracked => {
+                static FULL_ONCE: std::sync::Once = std::sync::Once::new();
+                FULL_ONCE.call_once(|| {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        %source,
+                        capacity = MAX_TRACKED_SOURCES,
+                        "auth-failure table is full of sources in backoff; new \
+                         sources are not counted until one expires (#2502)"
+                    );
+                });
+            }
+            FailureEffect::Counted | FailureEffect::Backoff { .. } => {}
         }
     }
     response
@@ -519,20 +679,23 @@ mod tests {
         assert_eq!(t.blocked_for(v4(5), now), None);
     }
 
+    fn failures(t: &AuthBackoff, s: SourceKey) -> Option<u32> {
+        t.lock().records.get(&s).map(|r| r.failures)
+    }
+
     #[test]
-    fn table_is_bounded_oldest_dropped_first_2502() {
+    fn table_drops_the_least_recently_failed_source_2502() {
         let t = AuthBackoff::with_capacity(3);
         let now = Instant::now();
-        fail_n(&t, v4(0), FREE_FAILURES, now);
-        for i in 1..=3 {
+        for i in 0..3 {
             t.record_failure(v4(i), now);
         }
-        assert_eq!(t.tracked(), 3, "the fourth source evicted the oldest");
-        assert_eq!(
-            t.record_failure(v4(0), now),
-            FailureEffect::Counted,
-            "an evicted source starts over"
-        );
+        // v4(0) fails again, so v4(1) is now the least recently failed.
+        t.record_failure(v4(0), now);
+        t.record_failure(v4(3), now);
+        assert_eq!(t.tracked(), 3);
+        assert_eq!(failures(&t, v4(0)), Some(2), "a recent failure is kept");
+        assert_eq!(failures(&t, v4(1)), None, "the least recent is dropped");
         for i in 10..60 {
             t.record_failure(v4(i), now + IDLE_RESET);
         }
@@ -541,14 +704,47 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_collapses_to_64_and_mapped_v4_is_v4_2502() {
+    fn a_source_in_backoff_is_never_evicted_2502() {
+        let t = AuthBackoff::with_capacity(2);
+        let now = Instant::now();
+        fail_n(&t, v4(0), FREE_FAILURES + 1, now);
+        // Pre-fix, one cheap failure each from other addresses flushed the
+        // blocked source and handed it a fresh free budget.
+        for i in 10..60 {
+            t.record_failure(v4(i), now);
+        }
+        assert_eq!(t.blocked_for(v4(0), now), Some(BASE_BACKOFF));
+        assert_eq!(failures(&t, v4(0)), Some(FREE_FAILURES + 1));
+        assert_eq!(t.tracked(), 2);
+    }
+
+    #[test]
+    fn a_table_full_of_blocked_sources_leaves_new_ones_untracked_2502() {
+        let t = AuthBackoff::with_capacity(2);
+        let now = Instant::now();
+        fail_n(&t, v4(0), FREE_FAILURES + 1, now);
+        fail_n(&t, v4(1), FREE_FAILURES + 1, now);
+        assert_eq!(t.record_failure(v4(2), now), FailureEffect::Untracked);
+        assert_eq!(t.tracked(), 2);
+        assert!(t.blocked_for(v4(0), now).is_some());
+        assert!(t.blocked_for(v4(1), now).is_some());
+        let later = now + BASE_BACKOFF;
+        assert_eq!(
+            t.record_failure(v4(2), later),
+            FailureEffect::Counted,
+            "once a backoff ends that source may be dropped"
+        );
+    }
+
+    #[test]
+    fn ipv6_collapses_to_48_and_mapped_v4_is_v4_2502() {
         let a = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 1);
-        let b = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0xffff, 1, 2, 3);
-        let c = Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1);
+        let b = Ipv6Addr::new(0x2001, 0xdb8, 1, 0xffff, 0xffff, 1, 2, 3);
+        let c = Ipv6Addr::new(0x2001, 0xdb8, 2, 2, 0, 0, 0, 1);
         let ka = SourceKey::from_ip(IpAddr::V6(a));
-        assert_eq!(ka, SourceKey::from_ip(IpAddr::V6(b)));
+        assert_eq!(ka, SourceKey::from_ip(IpAddr::V6(b)), "same /48");
         assert_ne!(ka, SourceKey::from_ip(IpAddr::V6(c)));
-        assert_eq!(ka.to_string(), "2001:db8:1:2::/64");
+        assert_eq!(ka.to_string(), "2001:db8:1::/48");
         let mapped = Ipv4Addr::new(198, 51, 100, 7).to_ipv6_mapped();
         assert_eq!(
             SourceKey::from_ip(IpAddr::V6(mapped)),
@@ -557,7 +753,20 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_for_is_read_only_from_a_loopback_peer_2502() {
+    fn trusted_proxies_parse_and_reject_2502() {
+        let (t, rejected) = TrustedProxies::parse(" 127.0.0.1, ::1, bogus, , ::ffff:10.0.0.6 ");
+        assert_eq!(rejected, vec!["bogus".to_owned()]);
+        assert!(t.contains(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(t.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(
+            t.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6))),
+            "a mapped address is stored as its IPv4 form"
+        );
+        assert!(TrustedProxies::parse("").0.is_empty());
+    }
+
+    #[test]
+    fn forwarded_for_is_read_only_from_a_declared_proxy_2502() {
         let mut h = HeaderMap::new();
         h.insert(
             X_FORWARDED_FOR,
@@ -566,26 +775,44 @@ mod tests {
         let remote: SocketAddr = "192.0.2.50:4000".parse().expect("addr");
         let local: SocketAddr = "127.0.0.1:4000".parse().expect("addr");
         let mapped: SocketAddr = "[::ffff:127.0.0.1]:4000".parse().expect("addr");
+        let loopback = SourceKey::V4(Ipv4Addr::LOCALHOST);
+        let none = TrustedProxies::default();
         assert_eq!(
-            source_for(remote, &h),
+            source_for(local, &h, &none),
+            loopback,
+            "a loopback peer is not a proxy unless declared"
+        );
+        let (proxy, _) = TrustedProxies::parse("127.0.0.1");
+        assert_eq!(
+            source_for(remote, &h, &proxy),
             SourceKey::V4(Ipv4Addr::new(192, 0, 2, 50)),
-            "a remote peer's header is client-written and ignored"
+            "an undeclared peer's header is client-written and ignored"
         );
         let hop = SourceKey::V4(Ipv4Addr::new(198, 51, 100, 2));
-        assert_eq!(source_for(local, &h), hop, "rightmost hop, not the first");
         assert_eq!(
-            source_for(mapped, &h),
+            source_for(local, &h, &proxy),
             hop,
-            "an IPv4-mapped loopback peer too"
+            "rightmost hop, not the first"
+        );
+        assert_eq!(
+            source_for(mapped, &h, &proxy),
+            hop,
+            "an IPv4-mapped peer matches its IPv4 declaration"
+        );
+        let (chain, _) = TrustedProxies::parse("127.0.0.1, 198.51.100.2");
+        assert_eq!(
+            source_for(local, &h, &chain),
+            SourceKey::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            "a declared proxy hop is skipped"
         );
         h.append(
             X_FORWARDED_FOR,
             HeaderValue::from_static("[2001:db8:9::1]:443"),
         );
         assert_eq!(
-            source_for(local, &h),
+            source_for(local, &h, &proxy),
             SourceKey::from_ip("2001:db8:9::1".parse().expect("ip")),
-            "the last line wins; a bracketed host:port parses"
+            "the last line is the right end; a bracketed host:port parses"
         );
         let mut junk = HeaderMap::new();
         junk.insert(
@@ -593,13 +820,30 @@ mod tests {
             HeaderValue::from_static("198.51.100.2, unknown"),
         );
         assert_eq!(
-            source_for(local, &junk),
-            SourceKey::V4(Ipv4Addr::LOCALHOST),
-            "an unparseable hop falls back to the peer"
+            source_for(local, &junk, &proxy),
+            loopback,
+            "an unparseable hop falls back to the proxy"
+        );
+        let mut all_proxies = HeaderMap::new();
+        all_proxies.insert(X_FORWARDED_FOR, HeaderValue::from_static("198.51.100.2"));
+        assert_eq!(
+            source_for(local, &all_proxies, &chain),
+            hop,
+            "only proxies: the last proxy seen is the source"
+        );
+        assert_eq!(source_for(local, &HeaderMap::new(), &proxy), loopback);
+        let long = std::iter::repeat_n("127.0.0.1", MAX_FORWARDED_HOPS + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut deep = HeaderMap::new();
+        deep.insert(
+            X_FORWARDED_FOR,
+            HeaderValue::from_str(&format!("203.0.113.9, {long}")).expect("header"),
         );
         assert_eq!(
-            source_for(local, &HeaderMap::new()),
-            SourceKey::V4(Ipv4Addr::LOCALHOST)
+            source_for(local, &deep, &proxy),
+            loopback,
+            "the walk stops after MAX_FORWARDED_HOPS"
         );
     }
 

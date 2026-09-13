@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory::handlers::auth_backoff::{
-    ENV_AUTH_FAILURE_BACKOFF, ERROR_AUTH_BACKOFF, FREE_FAILURES,
+    ENV_AUTH_BACKOFF_TRUSTED_PROXIES, ENV_AUTH_FAILURE_BACKOFF, ERROR_AUTH_BACKOFF, FREE_FAILURES,
 };
 use tempfile::TempDir;
 
@@ -39,7 +39,7 @@ impl Drop for Daemon {
     }
 }
 
-fn spawn_daemon(backoff: Option<&str>) -> Daemon {
+fn spawn_daemon(backoff: Option<&str>, trusted_proxies: Option<&str>) -> Daemon {
     let home = TempDir::new().expect("tempdir");
     let xdg = home.path().join(".config");
     let cfg_dir = xdg.join("ai-memory");
@@ -64,6 +64,10 @@ fn spawn_daemon(backoff: Option<&str>) -> Daemon {
     match backoff {
         Some(v) => cmd.env(ENV_AUTH_FAILURE_BACKOFF, v),
         None => cmd.env_remove(ENV_AUTH_FAILURE_BACKOFF),
+    };
+    match trusted_proxies {
+        Some(v) => cmd.env(ENV_AUTH_BACKOFF_TRUSTED_PROXIES, v),
+        None => cmd.env_remove(ENV_AUTH_BACKOFF_TRUSTED_PROXIES),
     };
     let mut child = cmd.spawn().expect("spawn ai-memory serve");
     let stderr = Arc::new(Mutex::new(String::new()));
@@ -116,12 +120,24 @@ fn wait_ready(d: &mut Daemon, c: &reqwest::blocking::Client) {
     );
 }
 
-fn stats(d: &Daemon, c: &reqwest::blocking::Client, key: &str) -> reqwest::blocking::Response {
-    c.get(format!("{}/api/v1/stats", d.url))
+fn forwarded(
+    d: &Daemon,
+    c: &reqwest::blocking::Client,
+    key: &str,
+    xff: Option<&str>,
+) -> reqwest::blocking::Response {
+    let mut req = c
+        .get(format!("{}/api/v1/stats", d.url))
         .header("x-api-key", key)
-        .header("x-agent-id", ADMIN)
-        .send()
-        .expect("request")
+        .header("x-agent-id", ADMIN);
+    if let Some(xff) = xff {
+        req = req.header("x-forwarded-for", xff);
+    }
+    req.send().expect("request")
+}
+
+fn stats(d: &Daemon, c: &reqwest::blocking::Client, key: &str) -> reqwest::blocking::Response {
+    forwarded(d, c, key, None)
 }
 
 /// The eleventh wrong key puts the source in backoff; while it lasts the
@@ -130,7 +146,7 @@ fn stats(d: &Daemon, c: &reqwest::blocking::Client, key: &str) -> reqwest::block
 #[test]
 fn repeated_wrong_keys_back_off_the_source_even_for_the_right_key_2502() {
     let c = client();
-    let mut d = spawn_daemon(None);
+    let mut d = spawn_daemon(None, None);
     wait_ready(&mut d, &c);
     assert!(
         stats(&d, &c, API_KEY).status().is_success(),
@@ -156,19 +172,14 @@ fn repeated_wrong_keys_back_off_the_source_even_for_the_right_key_2502() {
         .send()
         .expect("health");
     assert!(health.status().is_success(), "health is never refused");
-    // The test client is a loopback peer, i.e. what a same-host proxy looks
-    // like: the hop it appends names a different client, which is its own
-    // source and is not refused.
-    let proxied = c
-        .get(format!("{}/api/v1/stats", d.url))
-        .header("x-api-key", API_KEY)
-        .header("x-agent-id", ADMIN)
-        .header("x-forwarded-for", "198.51.100.10")
-        .send()
-        .expect("request");
-    assert!(
-        proxied.status().is_success(),
-        "another client behind the proxy"
+    // No proxy is declared, so a client-written X-Forwarded-For naming some
+    // other address does not move the request out of its own (loopback)
+    // source: the header cannot mint a fresh budget.
+    let forged = forwarded(&d, &c, API_KEY, Some("198.51.100.10"));
+    assert_eq!(
+        forged.status().as_u16(),
+        429,
+        "X-Forwarded-For from an undeclared peer is ignored"
     );
 
     std::thread::sleep(Duration::from_millis(retry * 1_000 + 300));
@@ -187,11 +198,41 @@ fn repeated_wrong_keys_back_off_the_source_even_for_the_right_key_2502() {
     );
 }
 
+/// With the loopback peer declared a proxy, the rightmost `X-Forwarded-For`
+/// hop is the source: one client behind the proxy backs off without taking
+/// the others (or the proxy's own source) with it.
+#[test]
+fn a_declared_proxy_keys_on_the_forwarded_client_2502() {
+    let c = client();
+    let mut d = spawn_daemon(None, Some("127.0.0.1"));
+    wait_ready(&mut d, &c);
+    let guesser = Some("203.0.113.5, 198.51.100.20");
+    for i in 0..=FREE_FAILURES {
+        let status = forwarded(&d, &c, WRONG_KEY, guesser).status().as_u16();
+        assert_eq!(status, 401, "wrong key #{i} is a plain 401");
+    }
+    assert_eq!(
+        forwarded(&d, &c, API_KEY, guesser).status().as_u16(),
+        429,
+        "the forwarded client is in backoff"
+    );
+    assert!(
+        forwarded(&d, &c, API_KEY, Some("198.51.100.21"))
+            .status()
+            .is_success(),
+        "another client behind the proxy is not"
+    );
+    assert!(
+        forwarded(&d, &c, API_KEY, None).status().is_success(),
+        "the proxy's own source is not"
+    );
+}
+
 /// A falsy token switches the control off: wrong keys stay plain 401s.
 #[test]
 fn falsy_knob_disables_the_backoff_2502() {
     let c = client();
-    let mut d = spawn_daemon(Some("off"));
+    let mut d = spawn_daemon(Some("off"), None);
     wait_ready(&mut d, &c);
     for _ in 0..FREE_FAILURES * 2 {
         assert_eq!(stats(&d, &c, WRONG_KEY).status().as_u16(), 401);
@@ -203,7 +244,7 @@ fn falsy_knob_disables_the_backoff_2502() {
 /// names the knob (the #3200 grammar sweep).
 #[test]
 fn unrecognised_knob_token_refuses_boot_2502() {
-    let mut d = spawn_daemon(Some("maybe"));
+    let mut d = spawn_daemon(Some("maybe"), None);
     let deadline = Instant::now() + EXIT_TIMEOUT;
     let status = loop {
         if let Some(status) = d.child.try_wait().expect("try_wait") {

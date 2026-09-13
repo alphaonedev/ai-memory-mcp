@@ -82,6 +82,7 @@
 //! | `AI_MEMORY_REQUIRE_API_KEY` | `1` | a keyless `serve` bind is refused on EVERY host, loopback included — a same-host proxy presents loopback while exposing the daemon (#1458, #3200) |
 //! | `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` | *(unset)* | PERMISSIVE-shaped: the plaintext acknowledgement hatch is NOT in force; a non-loopback plaintext bind is refused under `asi-hard` regardless (#3200) |
 //! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`. The documented `standard` unset default stays `warn` (#3201 / #3289) |
+//! | `AI_MEMORY_AUTH_FAILURE_BACKOFF` | `1` | repeated HTTP authentication failures back the source off with `429` before its key is examined; a falsy value refuses boot (#2502) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -494,6 +495,14 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: "",
         floor: Floor::Off(&crate::env_flag::knobs::ALLOW_PLAINTEXT_NONLOOPBACK),
     },
+    // #2502 — per-source backoff after repeated HTTP auth failures. Default
+    // ON; its off state is the finding (unlimited online key guessing), so the
+    // posture refuses to boot with it disabled.
+    KnobSpec {
+        env: crate::env_flag::knobs::AUTH_FAILURE_BACKOFF.env,
+        hard_value: "1",
+        floor: Floor::On(&crate::env_flag::knobs::AUTH_FAILURE_BACKOFF),
+    },
 ];
 
 /// The number of env knobs `asi-hard` pins — ONE named SSOT for a count that
@@ -545,7 +554,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 29
+/// enterprise-federation`, which reuses this as ONE SSOT for the 30
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -1574,7 +1583,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 29-knob asi-hard set
+        // reuses this accessor as the SSOT for the 30-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it

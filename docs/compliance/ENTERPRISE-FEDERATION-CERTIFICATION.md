@@ -618,7 +618,7 @@ code.)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
    a `standard` profile** (`profile=standard — asi-hard pins not in
    force; the N-knob hard floor was not evaluated`, where N is
-   `pinned_knobs().len()` — **29** post-#3200, 17 in the captured
+   `pinned_knobs().len()` — **30** post-#2502 (29 post-#3200), 17 in the captured
    evidence below) instead of the pre-#2927 vacuous
    `N/N at floor` PASS (#2923). **Evidence note (#3033, #3113, #3168, #3201):** the
    `cert-54/` `.out` captures in §2 predate all three and render the
@@ -640,7 +640,9 @@ code.)
    `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` (pinned closed) were pinned
    (#3200 — `asi-hard` also REFUSES a non-loopback plaintext `serve` bind
    outright, keeping the loopback exemption for a same-host TLS-terminating
-   proxy; `AI_MEMORY_REQUIRE_TLS` is deliberately not pinned), and the
+   proxy; `AI_MEMORY_REQUIRE_TLS` is deliberately not pinned), and to 30
+   when `AI_MEMORY_AUTH_FAILURE_BACKOFF` was pinned `1` (#2502 — per-source
+   backoff after repeated HTTP authentication failures), and the
    doctor render is `pinned_knobs().len()`-driven. The
    `cert-55/` recapture **measures** `27/27 at floor` on the hardened
    non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the

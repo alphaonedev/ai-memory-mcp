@@ -96,10 +96,13 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
   TLS-terminating proxy or pass `--tls-cert` / `--tls-key`.
   `AI_MEMORY_REQUIRE_TLS` is deliberately not pinned (it would also refuse
   loopback plaintext)
+- `AI_MEMORY_AUTH_FAILURE_BACKOFF=1` (#2502 — repeated HTTP authentication
+  failures back the source off with `429` before its key is examined; a
+  falsy value refuses boot)
 - plus `[governance].require_operator_pubkey=true` (bridged at the
   governance boot check).
 
-(That list is all **29** `KNOBS` entries. It has drifted from its own
+(That list is all **30** `KNOBS` entries. It has drifted from its own
 declared SSOT twice: it enumerated only 15 of the then-17 through v1.0.0,
 silently omitting the two permissive-shaped pins above — the ones whose
 violation REFUSES BOOT — and it then sat at 17 after #3033 raised the table
