@@ -175,9 +175,14 @@ pub struct Metrics {
     /// #3654 — unix seconds of the oldest pending push-DLQ failure per peer.
     /// Absent when the peer's backlog is empty.
     pub federation_peer_push_dlq_oldest_failed_timestamp_seconds: IntGaugeVec,
-    /// #3654 — the configured catch-up interval in seconds. Absent when the
-    /// catch-up loop is not running.
-    pub federation_catchup_interval_seconds: IntGauge,
+    /// #3654 — the configured catch-up interval in seconds. A label-less
+    /// vector, not a scalar gauge: a vector exports nothing until a child
+    /// exists, so the series is ABSENT on a node that runs no catch-up loop
+    /// (a registered scalar would export `0`, which reads as "the interval is
+    /// zero seconds" and silently disarms the stall alert built on it). The
+    /// child exists exactly while a loop holds a
+    /// [`crate::federation::freshness::CatchupIntervalGuard`].
+    pub federation_catchup_interval_seconds: IntGaugeVec,
     /// Cluster-A COR-3 (v0.7.0): count of memory rows whose Form 4
     /// fact-provenance JSON columns (`citations`, `source_span`,
     /// `confidence_signals`, or pre-Form-4 `metadata`) failed to parse
@@ -774,10 +779,13 @@ impl Metrics {
         registry.register(Box::new(
             federation_peer_push_dlq_oldest_failed_timestamp_seconds.clone(),
         ))?;
-        let federation_catchup_interval_seconds = IntGauge::new(
-            "ai_memory_federation_catchup_interval_seconds",
-            "Configured federation catch-up interval in seconds; absent when the \
-             catch-up loop is not running (#3654).",
+        let federation_catchup_interval_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_catchup_interval_seconds",
+                "Configured federation catch-up interval in seconds; absent when the \
+                 catch-up loop is not running (#3654).",
+            ),
+            &[],
         )?;
         registry.register(Box::new(federation_catchup_interval_seconds.clone()))?;
 
@@ -1856,6 +1864,38 @@ mod tests {
         enc.encode(&b.registry.gather(), &mut buf_b).unwrap();
         assert!(String::from_utf8_lossy(&buf_a).contains("ai_memory_store_total"));
         assert!(String::from_utf8_lossy(&buf_b).contains("ai_memory_store_total"));
+    }
+
+    /// #3654 D1 — the catch-up cadence series must not exist on a node that
+    /// runs no catch-up loop. A fresh registry (a process that never spawned
+    /// one) renders no sample at all; the series appears only while a child
+    /// exists and disappears again when the child is removed.
+    #[test]
+    fn catchup_interval_series_is_absent_until_a_loop_owns_it_3654() {
+        const NAME: &str = "ai_memory_federation_catchup_interval_seconds";
+        fn rendered(m: &super::Metrics) -> String {
+            let mut buf = Vec::new();
+            TextEncoder::new()
+                .encode(&m.registry.gather(), &mut buf)
+                .expect("encode");
+            String::from_utf8(buf).expect("utf8")
+        }
+        let m = super::Metrics::try_new().expect("fresh registry");
+        assert!(
+            !rendered(&m).contains(NAME),
+            "a node with no catch-up loop must not export the cadence (not even 0)"
+        );
+        m.federation_catchup_interval_seconds
+            .with_label_values(&[])
+            .set(47);
+        let sample = rendered(&m)
+            .lines()
+            .find_map(|l| l.strip_prefix(NAME).map(str::trim).map(str::to_owned));
+        assert_eq!(sample.as_deref(), Some("47"));
+        m.federation_catchup_interval_seconds
+            .remove_label_values(&[])
+            .expect("the child exists");
+        assert!(!rendered(&m).contains(NAME));
     }
 
     #[test]

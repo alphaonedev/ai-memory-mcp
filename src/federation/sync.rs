@@ -223,9 +223,12 @@ fn build_governed_peer_post(
 ///
 /// #3654 — takes the whole [`PeerEndpoint`] rather than its URL so every
 /// attempt is recorded against the peer's push freshness
-/// (`super::freshness`). Every outbound push — the thirteen fan-out lanes via
-/// [`post_and_classify`] and the DLQ replayer — goes through here, so a push
-/// that is not observed cannot be written without changing this signature.
+/// (`super::freshness`). Every outbound push of the `serve` daemon's
+/// federation client — the thirteen fan-out lanes via [`post_and_classify`]
+/// and the DLQ replayer — goes through here, so a push that is not observed
+/// cannot be written without changing this signature. Not covered: the
+/// `ai-memory sync-daemon` lane (`daemon_runtime::sync_cycle_once`) posts
+/// with its own client and records no freshness yet (#3682).
 pub(super) async fn post_once(
     client: &reqwest::Client,
     peer: &PeerEndpoint,

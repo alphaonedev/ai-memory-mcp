@@ -34,8 +34,16 @@ pub(super) struct PeerJoinError {
 }
 
 impl std::fmt::Display for PeerJoinError {
+    /// Renders the peer's [`super::freshness::peer_label`], never the raw id:
+    /// legacy and test configurations have used the peer URL as the id, and a
+    /// URL can carry credentials. `peer_id` stays on the struct for routing.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "peer {}: {}", self.peer_id, self.error)
+        write!(
+            f,
+            "peer {}: {}",
+            super::freshness::peer_label(&self.peer_id),
+            self.error
+        )
     }
 }
 
@@ -105,7 +113,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_panicked_task_is_attributed_to_its_peer() {
-        let peer = format!("test-3654-join-{}", uuid::Uuid::new_v4());
+        // A URL-shaped id with credentials: the Display must not render it.
+        let peer = format!(
+            "https://operator:hunter2@join-{}.example:9077",
+            uuid::Uuid::new_v4()
+        );
         let mut tasks: PeerTasks<u8> = PeerTasks::new();
         tasks.spawn("healthy".to_string(), async { 7 });
         tasks.spawn(peer.clone(), async { panic!("fan-out task blew up") });
@@ -121,7 +133,11 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].peer_id, peer);
         assert!(failed[0].error.is_panic());
-        assert!(failed[0].to_string().starts_with(&format!("peer {peer}: ")));
+        let rendered = failed[0].to_string();
+        let label = super::super::freshness::peer_label(&peer);
+        assert!(rendered.starts_with(&format!("peer {label}: ")), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains(".example"), "{rendered}");
         let fresh = super::super::freshness::snapshot_for(&peer).expect("failure recorded");
         assert_eq!(fresh.push.consecutive_failures, 1);
         assert_eq!(fresh.push.last_failure_class, Some("task_failed"));

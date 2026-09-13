@@ -29,7 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catch-up envelope with no `memories` array is now recorded as a
   malformed response instead of being skipped silently. The `peer`
   label is the minted `peer-h1…` id; an id of any other shape is hashed
-  first, since a legacy id can be a credential-bearing URL.
+  first, since a legacy id can be a credential-bearing URL. The catch-up
+  cadence series exists only while a catch-up loop runs (a node without
+  one exports no sample, never a `0`). The per-peer block of
+  `/api/v1/monitoring/status` (#3646) is now populated from the registry:
+  `reachability` is derived from pulls only and is `unknown` (with a
+  reason) when there is no fresh pull, never healthy from silence, and
+  `last_successful_push_age_seconds` is the age of the last push the
+  peer applied, or an explicit not-observed object. Not measured by this
+  change: per-peer replication lag and catch-up progress (#3681), and
+  the `ai-memory sync-daemon` lane (#3682).
 
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 

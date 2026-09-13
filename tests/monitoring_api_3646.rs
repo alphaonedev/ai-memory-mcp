@@ -20,6 +20,8 @@ const TOKEN: &str = "SECRET_KEY_MATERIAL_3646";
 const CONTENT: &str = "TENANT_CONTENT_CANARY_3646";
 const POLICY: &str = "PRIVATE_POLICY_CANARY_3646";
 const DSN: &str = "postgres://user:DSN_PASSWORD_CANARY_3646@invalid/db";
+/// A legacy positional id, so the registry keys it verbatim (#3654).
+const PUSHED_PEER: &str = "peer-3654";
 #[cfg_attr(
     not(feature = "sal"),
     expect(
@@ -320,16 +322,27 @@ async fn assert_no_disclosure(mut app: AppState) {
             std::time::Duration::from_secs(1),
         )
         .unwrap(),
-        peers: vec![ai_memory::federation::PeerEndpoint {
-            id: DSN.to_owned(),
-            sync_push_url: DSN.to_owned(),
-        }],
+        peers: vec![
+            ai_memory::federation::PeerEndpoint {
+                id: DSN.to_owned(),
+                sync_push_url: DSN.to_owned(),
+            },
+            // #3654 D3: a peer this node has pushed to (and never pulled).
+            ai_memory::federation::PeerEndpoint {
+                id: PUSHED_PEER.to_owned(),
+                sync_push_url: "https://peer-pushed.invalid:9077".to_owned(),
+            },
+        ],
         client: reqwest::Client::new(),
         sender_agent_id: DSN.to_owned(),
         api_key: Some(TOKEN.to_owned()),
         signing_key: None,
         dlq_sink: None,
     }));
+    {
+        use ai_memory::federation::freshness::{Direction, Observation, record};
+        record(PUSHED_PEER, Direction::Push, Observation::Success);
+    }
     // Pollute a label-bearing global collector: health must not forward it.
     ai_memory::metrics::registry()
         .store_total
@@ -342,9 +355,22 @@ async fn assert_no_disclosure(mut app: AppState) {
         if path == STATUS_PATH {
             let value: Value = serde_json::from_str(&body).unwrap();
             let peer = &value["federation"]["peers"][0];
-            assert_eq!(peer["last_successful_push_age_seconds"]["issue"], 3654);
-            assert_eq!(peer["reachability"]["state"], "unavailable");
+            // #3654 D3: instrumented but never observed for this peer, so an
+            // explicit not-observed object, and silence is never reachable.
+            assert_eq!(
+                peer["last_successful_push_age_seconds"]["reason"],
+                "no_push_success_observed"
+            );
+            assert_eq!(peer["reachability"]["state"], "unknown");
             assert_eq!(peer["identity_ref"], api_key_sha256_hex(DSN));
+            let pushed = &value["federation"]["peers"][1];
+            let age = pushed["last_successful_push_age_seconds"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("an observed push age is a number: {pushed}"));
+            assert!((0..=60).contains(&age), "{pushed}");
+            assert!(pushed["last_accepted_push_at_seconds"].is_i64(), "{pushed}");
+            // Pushes are not a liveness probe: no pull, so still unknown.
+            assert_eq!(pushed["reachability"]["state"], "unknown", "{pushed}");
         }
         for canary in [CONTENT, POLICY, TOKEN, DSN, "DSN_PASSWORD_CANARY_3646"] {
             assert!(!body.contains(canary), "{path} leaked {canary}");
