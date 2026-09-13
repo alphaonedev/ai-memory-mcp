@@ -1129,6 +1129,26 @@ caller id and whether a signing key for THAT id is enrolled.
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
 
+**`Deployment shape detector (#3700)` section** — right after the
+declared-shape section (#3714) in the default local report, before the
+database open, so a node configured like a fleet but declared `singleton`
+is reported unprompted at the top. Facts: `declared_shape`,
+`observed_floor` (`singleton` / `team` / `federated`, the least demanding
+shape the present signals allow), `signals_present`,
+`signals_unobservable` (argv signals are unobservable from doctor; the
+store is unobservable until it opens), `registered_agents` (folded in from
+the store once the read-only connection is open), `undeclared_promotion`,
+`promotion_line` (the exact `[deployment] shape = "…"` line to declare, or
+`none`), `posture`, `posture_origin` (`explicit` / `shape_floor` /
+`compiled_default`), `protections_off` + `protections_off_list` (the
+pinned knobs not in force), and `boot_verdict` (`boots`, `boots — signals
+exceed the declared shape …`, `boots UNPROTECTED …`, or `REFUSES …`).
+Critical when the node is an undeclared fleet running `standard` or a
+hardened declared shape has a knob below its floor; Warning for an
+undeclared promotion under an explicit hardened posture; Info otherwise.
+Detection never re-postures — promotion is an operator act. This is the
+pre-upgrade detector: run it before upgrading to learn what will refuse.
+
 ```bash
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'

@@ -54,6 +54,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::security_profile::SecurityPosture;
 
+/// #3700 — the deployment-shape DETECTOR: observed signals held against the
+/// declared shape (WARN and record, never re-posture; a hardened declared
+/// shape with knobs below the floor refuses naming every knob).
+pub mod detector;
+
 /// `[deployment]` block of `config.toml` — the only top-level setting
 /// the #3714 programme adds.
 ///

@@ -137,6 +137,57 @@ Per the adjudication these carry design-level mitigation for v1.0.0 (no
 dedicated build lane); each is split into its own tracking issue if it
 grows one.
 
+### The deployment-shape detector (#3700)
+
+The posture floor comes from the DECLARED shape — `[deployment] shape`
+(#3714; `ai-memory config show` renders the derivation table, and
+`production` / `federated` / `hive` pin `asi-hard` as a floor). What #3700
+adds is the detector that keeps that declaration honest
+([`src/config/shape/detector.rs`](../src/config/shape/detector.rs)): the machinery
+that stops one agent's wrong conclusion from becoming a swarm's shared
+truth must not sit OFF on a node whose configuration is plainly a fleet
+while its declaration still says `singleton`.
+
+At boot the node observes content-free signals and derives the least
+demanding shape consistent with them (the *observed floor*):
+
+| signal | class | source | present when |
+|---|---|---|---|
+| `outbound_peers` | federation | argv | `serve --quorum-peers` / `sync-daemon --peers` |
+| `inbound_bindings` | federation | env | peer fingerprints, cert↔peer-id bindings or a trust bundle |
+| `listener_mtls` | federation | argv | `serve --mtls-allowlist` |
+| `peer_allowlist` | federation | env | `AI_MEMORY_FED_PEER_ATTESTATION` is set (even `{}`, even invalid) |
+| `mcp_federation_forward_url` | federation | config | MCP writes fan out to a federation daemon |
+| `wake_hub` | multi-agent | config | `[wake_hub]` — the multi-agent wake plane |
+| `agent_registry` | multi-agent | store | 2 or more registered agents (read from the real store once open) |
+
+No signal → `singleton`; multi-agent signals only → `team`; any federation
+signal → `federated`. A signal a process cannot see (argv from `doctor`,
+the store before it opens) is `unobservable`, never `absent`.
+
+- **Undeclared promotion** (observed floor above the declared shape): the
+  boot WARNS once and RECORDS it (forensic audit kind
+  `deployment_shape.undeclared_signals`; the `deployment_shape` field of
+  capabilities), naming the exact line to declare —
+  `[deployment] shape = "<observed>"`. Promotion is an operator act:
+  detection never re-postures and never pins. With the posture at
+  `standard` the warning says so in as many words: every anti-cascade
+  protection is OFF.
+- **Hardened declared shape with knobs below the floor** (`production` /
+  `federated` / `hive` and any pinned knob set below `asi-hard`): the boot
+  is REFUSED, naming every such knob and both ways out (raise or unset each
+  knob, or declare a shape whose posture is a default).
+- **Singleton with no signals**: byte-identical boot. Zero-config local-CA
+  minting (#3709) is singleton-only — a node whose signals show a fleet
+  must declare its shape and enrol real peer identities.
+
+**Migration honesty.** The detector shipped with the refusal, so run
+`ai-memory doctor` BEFORE upgrading: its default report carries
+"Deployment shape detector (#3700)" right after the declared shape and
+states the declared shape, the observed floor and its signals, the
+promotion line, the posture and its origin, the protections that are off,
+and the boot verdict the next boot will reach. Doctor never refuses.
+
 ## Trust boundaries
 
 ```
