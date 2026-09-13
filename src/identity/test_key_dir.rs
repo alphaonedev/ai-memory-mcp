@@ -113,6 +113,19 @@ pub fn install() -> &'static Path {
                 .canonicalize()
                 .expect("#3355 resolve temporary root");
             let dir = tempfile::tempdir_in(root).expect("#3355 allocate isolated key directory");
+            // #3705 review — `tempdir_in` inherits the AMBIENT UMASK (0002 on
+            // this host's default, 0022 on most CI runners): under 0002 the
+            // sandbox comes out 0775 and the #3198 chain check correctly
+            // refuses it, so a test passes for whoever has a strict umask and
+            // fails everywhere else. The sandbox must not depend on ambient
+            // process state: pin 0700 explicitly. The product check is
+            // untouched — it is the control this makes testable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("#3705 chmod 0700 the isolated key directory");
+            }
             assert_isolated(dir.path());
             bind_key_dir_env(dir.path());
             dir

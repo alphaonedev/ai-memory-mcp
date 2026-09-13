@@ -28,8 +28,9 @@
 //! ciphertext_with_tag (variable — AEAD ciphertext + 16-byte tag)
 //! ```
 //!
-//! The recipient's static X25519 secret key (per-agent, generated and
-//! cached via [`get_or_create_keypair`]) plus the envelope's ephemeral
+//! The recipient's static X25519 secret key (per-agent, generated once by
+//! the seal path via [`get_or_create_keypair`], loaded read-only by
+//! [`load_keypair`]) plus the envelope's ephemeral
 //! pubkey produce the shared secret. That secret is **not** used directly
 //! as the symmetric key — H3 runs it through HKDF-SHA256 (domain-separated
 //! by [`HKDF_INFO`]) to derive the ChaCha20-Poly1305 key, and binds the
@@ -43,12 +44,26 @@
 //! resolved key directory ([`crate::identity::keypair::default_key_dir`],
 //! honoring `AI_MEMORY_KEY_DIR`) as `<agent_id>.x25519.pub` (mode 0644)
 //! and `<agent_id>.x25519.priv` (mode 0600), mirroring the Ed25519
-//! signing keystore. [`get_or_create_keypair`] is therefore
-//! cache → load-from-disk → generate-and-save: the in-memory cache is a
-//! hot path, NOT the source of truth. This is load-bearing for at-rest
-//! encryption — without on-disk persistence a daemon restart would clear
-//! the cache and mint a fresh key, leaving every previously-encrypted
-//! `encrypted_envelope` permanently undecryptable (silent data loss).
+//! signing keystore. The accessor is SPLIT (#3718):
+//!
+//! * [`load_keypair`] — cache → load-from-disk, **never mints**. Both
+//!   decrypt arms of [`open_content`] use it; a missing `.priv` is the
+//!   typed [`KeyAbsent`] error, DISTINCT from an AEAD failure ("your key is
+//!   missing, here is where it should be" is actionable; "wrong recipient"
+//!   sends the operator hunting the wrong problem).
+//! * [`get_or_create_keypair`] — the SEAL path only: create-on-miss is
+//!   legitimate exactly once, on the first write for an agent that has never
+//!   had a key. It refuses to mint over ARCHIVED material
+//!   ([`KeyGenerationGap`]): a prior generation in the key directory means
+//!   the live key was lost, not that the agent is new.
+//!
+//! The in-memory cache is a hot path, NOT the source of truth. On-disk
+//! persistence is load-bearing for at-rest encryption — without it a daemon
+//! restart would clear the cache and mint a fresh key, leaving every
+//! previously-encrypted `encrypted_envelope` permanently undecryptable
+//! (silent data loss). Before #3718 a READ with the key file missing did
+//! exactly that mint, masking the loss as "wrong key" and forking the key
+//! generation so no single restore could heal the corpus.
 //! On Unix the `.priv` is refused at load time if its mode grants any
 //! group/other access (`mode & 0o077 != 0`), matching the keystore's
 //! S4-LOW1 guard.
@@ -421,15 +436,273 @@ fn peek_public_key_bytes(agent_id: &str) -> Option<[u8; X25519_KEY_LEN]> {
         .map(|kp| *kp.public.as_bytes())
 }
 
-/// Look up the per-agent X25519 [`Keypair`], resolving it from (in order)
-/// the in-memory cache, the on-disk keystore, or a freshly-generated and
-/// persisted pair. See the module-level "Key lifecycle" note: disk
-/// persistence is load-bearing so encrypted rows survive a restart.
+/// #3718 — issue tag of the read-never-mints rule.
+pub const ISSUE_TAG: &str = "#3718";
+/// #3718 — tracing target for every key-lifecycle event this module emits
+/// (absent key on read, generation gap on seal). The OPERATOR log is the
+/// only audience that sees key-directory paths.
+pub const TRACING_TARGET: &str = "security.encryption.keys";
+
+/// #3718 — a READ needed `agent_id`'s at-rest key and it is not on disk.
+///
+/// Distinct from an AEAD failure on purpose: the row is intact and sealed,
+/// nothing was minted, and the fix is to restore the key file. `Display`
+/// (what a CALLER sees) carries the class and the agent — never the path;
+/// [`KeyAbsent::operator_line`] carries the expected path for the operator
+/// log (same audience split as #3696/#3698/#3707/#3708).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyAbsent {
+    /// The agent whose rows are sealed to the missing key.
+    pub agent_id: String,
+    /// Where the `.x25519.priv` is expected. Operator-log only.
+    pub expected_path: PathBuf,
+}
+
+impl KeyAbsent {
+    /// The caller-facing failure class.
+    pub const CLASS: &'static str = "key_absent";
+
+    /// The operator-log line: names the expected path and the remedy.
+    #[must_use]
+    pub fn operator_line(&self) -> String {
+        format!(
+            "{ISSUE_TAG}: at-rest key ABSENT for agent {:?} — expected {} — the sealed rows are \
+             untouched and NOTHING was minted; restore that file from backup (or the #3717 \
+             escrow) before any write for this agent, then reads succeed again",
+            self.agent_id,
+            self.expected_path.display()
+        )
+    }
+}
+
+impl std::fmt::Display for KeyAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{ISSUE_TAG}: at-rest key absent for agent {:?} (class: {}) — the row is intact and \
+             cannot be opened until the operator restores the key; the operator log names the \
+             expected path",
+            self.agent_id,
+            Self::CLASS
+        )
+    }
+}
+
+impl std::error::Error for KeyAbsent {}
+
+/// #3718 sibling — a SEAL for `agent_id` found no live key but the key
+/// directory holds ARCHIVED material of a prior generation: the live key
+/// was lost or rotated away, so minting generation N+1 would fork the
+/// corpus. Refused; `Display` carries the class, the operator line the
+/// archived paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyGenerationGap {
+    /// The agent that would have been minted a new generation.
+    pub agent_id: String,
+    /// The archived key files that prove a prior generation existed.
+    pub archived: Vec<PathBuf>,
+}
+
+impl KeyGenerationGap {
+    /// The caller-facing failure class.
+    pub const CLASS: &'static str = "key_generation_gap";
+
+    /// The operator-log line: names every archived file and the remedy.
+    #[must_use]
+    pub fn operator_line(&self) -> String {
+        let listed: Vec<String> = self
+            .archived
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        format!(
+            "{ISSUE_TAG}: refusing to mint a NEW at-rest key for agent {:?}: the key directory \
+             holds archived material of a prior generation ({}) and no live .x25519.priv — a \
+             new generation would fork the corpus. Restore the live key from backup (or the \
+             #3717 escrow); nothing was written",
+            self.agent_id,
+            listed.join(", ")
+        )
+    }
+}
+
+impl std::fmt::Display for KeyGenerationGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{ISSUE_TAG}: at-rest key generation gap for agent {:?} (class: {}) — a prior key \
+             generation is archived and the live key is missing; nothing was minted; the \
+             operator log names the archived files",
+            self.agent_id,
+            Self::CLASS
+        )
+    }
+}
+
+impl std::error::Error for KeyGenerationGap {}
+
+/// #3718 — `Some` when `err` is (or wraps) a [`KeyAbsent`].
+#[must_use]
+pub fn key_absent(err: &anyhow::Error) -> Option<&KeyAbsent> {
+    err.downcast_ref::<KeyAbsent>()
+}
+
+/// #3718 — `Some` when `err` is (or wraps) a [`KeyGenerationGap`].
+#[must_use]
+pub fn key_generation_gap(err: &anyhow::Error) -> Option<&KeyGenerationGap> {
+    err.downcast_ref::<KeyGenerationGap>()
+}
+
+/// #3718 — the CALLER-facing detail for a failed at-rest read: the class
+/// first, so a missing key is never reported as "decrypt failed" (which
+/// reads as a wrong recipient), and never a key-directory path. Used by
+/// both store backends' row mappers.
+#[must_use]
+pub fn read_failure_detail(err: &anyhow::Error) -> String {
+    if let Some(absent) = key_absent(err) {
+        format!("{}: {absent}", KeyAbsent::CLASS)
+    } else if let Some(gap) = key_generation_gap(err) {
+        format!("{}: {gap}", KeyGenerationGap::CLASS)
+    } else {
+        format!("decrypt failed: {err}")
+    }
+}
+
+/// #3718 — the archived key files of a prior generation for `agent_id`
+/// under `dir`: anything named `<agent_id>.x25519.pub.<suffix>` or
+/// `<agent_id>.x25519.priv.<suffix>` next to where the live pair lives.
+/// A missing directory is an empty list (a first boot), not an error.
+///
+/// # Errors
+/// The directory exists but cannot be listed.
+fn archived_key_material(agent_id: &str, dir: &Path) -> Result<Vec<PathBuf>> {
+    let (pub_path, priv_path) = x25519_key_paths(agent_id, dir);
+    let Some(parent) = priv_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let prefixes: Vec<String> = [&pub_path, &priv_path]
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| format!("{}.", n.to_string_lossy())))
+        .collect();
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow!(e)).with_context(|| {
+                format!(
+                    "listing key directory {} for archived material",
+                    parent.display()
+                )
+            });
+        }
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading key directory {}", parent.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Cache-then-disk lookup under an already-held cache lock. Never mints.
+fn cached_or_persisted(
+    guard: &mut HashMap<String, Keypair>,
+    agent_id: &str,
+    dir: &Path,
+) -> Result<Option<Keypair>> {
+    if let Some(kp) = guard.get(agent_id) {
+        return Ok(Some(kp.clone()));
+    }
+    if let Some(kp) = load_keypair_from_disk(agent_id, dir)? {
+        guard.insert(agent_id.to_string(), kp.clone());
+        return Ok(Some(kp));
+    }
+    Ok(None)
+}
+
+/// #3718 — READ-ONLY lookup of the per-agent X25519 [`Keypair`]: the
+/// in-memory cache, then the on-disk keystore. `Ok(None)` when no
+/// `.x25519.priv` exists — this function NEVER mints. Both decrypt arms
+/// of [`open_content`] use it; the seal path uses
+/// [`get_or_create_keypair`].
+///
+/// # Errors
+/// * The keypair cache mutex is poisoned (process-fatal).
+/// * The key directory cannot be resolved, or the `.priv` exists but is
+///   unreadable / insecurely moded (fail-closed: never silently used).
+pub fn load_keypair(agent_id: &str) -> Result<Option<Keypair>> {
+    let dir =
+        keypair_persist_dir().context("resolving the key directory for x25519 keypair storage")?;
+    load_keypair_in(agent_id, &dir)
+}
+
+/// Directory-explicit core of [`load_keypair`].
+pub(crate) fn load_keypair_in(agent_id: &str, dir: &Path) -> Result<Option<Keypair>> {
+    let mut guard = keypair_cache()
+        .lock()
+        .map_err(|e| anyhow!("encryption keypair cache mutex poisoned: {e}"))?;
+    cached_or_persisted(&mut guard, agent_id, dir)
+}
+
+/// #3718 — where `agent_id`'s `.x25519.priv` is expected (for the typed
+/// [`KeyAbsent`]); when the key directory itself cannot be resolved the
+/// path names that fact instead of inventing a location.
+fn expected_priv_path(agent_id: &str) -> PathBuf {
+    match keypair_persist_dir() {
+        Ok(dir) => x25519_key_paths(agent_id, &dir).1,
+        Err(_) => PathBuf::from(format!(
+            "<unresolvable key dir>/{agent_id}{X25519_PRIV_SUFFIX}"
+        )),
+    }
+}
+
+/// #3718 — build the typed absent-key error for a READ and put the
+/// operator line (with the path) on the operator log. The returned error
+/// renders without the path.
+fn key_absent_error(agent_id: &str) -> anyhow::Error {
+    let absent = KeyAbsent {
+        agent_id: agent_id.to_string(),
+        expected_path: expected_priv_path(agent_id),
+    };
+    tracing::error!(
+        target: TRACING_TARGET,
+        agent_id = %absent.agent_id,
+        expected_path = %absent.expected_path.display(),
+        class = KeyAbsent::CLASS,
+        "{}",
+        absent.operator_line()
+    );
+    anyhow::Error::new(absent)
+}
+
+/// #3718 — drop `agent_id`'s keypair from the in-memory cache so the next
+/// lookup goes to disk. What a process restart does implicitly; used by
+/// the key-restore flow (and its tests) so a restored `.priv` is picked up
+/// without a restart. Touches nothing on disk.
+pub fn evict_cached_keypair(agent_id: &str) {
+    if let Ok(mut guard) = keypair_cache().lock() {
+        guard.remove(agent_id);
+    }
+}
+
+/// Look up the per-agent X25519 [`Keypair`] for the SEAL path, resolving
+/// it from (in order) the in-memory cache, the on-disk keystore, or a
+/// freshly-generated and persisted pair. Create-on-miss is legitimate
+/// exactly once — the first write for an agent that has never had a key —
+/// and is REFUSED when the key directory holds archived material of a
+/// prior generation ([`KeyGenerationGap`], #3718). Reads use
+/// [`load_keypair`], which never mints.
 ///
 /// # Errors
 /// * The keypair cache mutex is poisoned (process-fatal).
 /// * The key directory cannot be resolved, or a disk read/write fails
 ///   (fail-closed: the caller must NOT fall back to an unpersisted key).
+/// * [`KeyGenerationGap`]: archived key material exists and the live key
+///   does not.
 pub fn get_or_create_keypair(agent_id: &str) -> Result<Keypair> {
     let dir =
         keypair_persist_dir().context("resolving the key directory for x25519 keypair storage")?;
@@ -444,14 +717,28 @@ pub(crate) fn get_or_create_keypair_in(agent_id: &str, dir: &Path) -> Result<Key
     let mut guard = cache
         .lock()
         .map_err(|e| anyhow!("encryption keypair cache mutex poisoned: {e}"))?;
-    if let Some(kp) = guard.get(agent_id) {
-        return Ok(kp.clone());
-    }
     // Cache miss — prefer a persisted keypair so ciphertext written before
     // a restart stays decryptable. Only mint + persist when none exists.
-    if let Some(kp) = load_keypair_from_disk(agent_id, dir)? {
-        guard.insert(agent_id.to_string(), kp.clone());
+    if let Some(kp) = cached_or_persisted(&mut guard, agent_id, dir)? {
         return Ok(kp);
+    }
+    // #3718 sibling — no live key, but a prior generation is archived here:
+    // that is a LOST key, not a new agent. Minting would fork the corpus.
+    let archived = archived_key_material(agent_id, dir)?;
+    if !archived.is_empty() {
+        let gap = KeyGenerationGap {
+            agent_id: agent_id.to_string(),
+            archived,
+        };
+        tracing::error!(
+            target: TRACING_TARGET,
+            agent_id = %gap.agent_id,
+            archived = gap.archived.len(),
+            class = KeyGenerationGap::CLASS,
+            "{}",
+            gap.operator_line()
+        );
+        return Err(anyhow::Error::new(gap));
     }
     let secret = StaticSecret::random_from_rng(OsRng);
     let public = PublicKey::from(&secret);
@@ -791,9 +1078,12 @@ pub fn envelope_is_erased(envelope_bytes: &[u8]) -> bool {
 /// # Errors
 /// * Returns `Err` when the envelope bytes don't parse (truncated /
 ///   unknown version), or when AEAD authentication / decryption fails
-///   (tampered ciphertext, wrong recipient key, missing keypair). The
-///   caller maps this to a fail-closed read error — never substitutes
-///   the placeholder for the plaintext.
+///   (tampered ciphertext, wrong recipient key). The caller maps this to
+///   a fail-closed read error — never substitutes the placeholder for the
+///   plaintext.
+/// * Returns the typed [`KeyAbsent`] (#3718) when `agent_id` has no key on
+///   disk: DISTINCT from an AEAD failure, and nothing is minted — a read
+///   never creates key material.
 pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<String> {
     // #1956 [R56] — dispatch on the leading scheme-version byte.
     match envelope_bytes.first() {
@@ -805,7 +1095,8 @@ pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<Stri
         // rejects unknown versions with a typed error).
         _ => {
             let env = Envelope::from_bytes(envelope_bytes)?;
-            let kp = get_or_create_keypair(agent_id)?;
+            // #3718 — a READ never mints: absent key => typed KeyAbsent.
+            let kp = load_keypair(agent_id)?.ok_or_else(|| key_absent_error(agent_id))?;
             decrypt(&env, &kp.secret)
         }
     }
@@ -833,8 +1124,9 @@ fn open_content_per_record(envelope_bytes: &[u8], agent_id: &str) -> Result<Stri
     let inner_nonce = &envelope_bytes[wrapped_end..nonce_end];
     let inner_ct = &envelope_bytes[nonce_end..];
 
-    // Unwrap the DEK under the per-agent master KEK.
-    let kp = get_or_create_keypair(agent_id)?;
+    // Unwrap the DEK under the per-agent master KEK. #3718 — a READ never
+    // mints: an absent key is the typed KeyAbsent, not an AEAD failure.
+    let kp = load_keypair(agent_id)?.ok_or_else(|| key_absent_error(agent_id))?;
     let mut dek = unwrap_record_key(wrapped, &kp.secret)?;
     if dek.len() != RECORD_DEK_LEN {
         dek.zeroize();
@@ -1245,5 +1537,126 @@ mod tests {
         assert_eq!(placeholder, "");
         assert_eq!(bytes[0], RECORD_ENVELOPE_VERSION);
         assert!(envelope_is_crypto_erasable(&bytes));
+    }
+
+    // ----- #3718 — a read never mints ---------------------------------
+
+    fn secure_tmp_key_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("scratch key dir under TMPDIR");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700");
+        }
+        dir
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `load_keypair_in` is read-only: a missing key is `Ok(None)` and the
+    /// directory stays empty; the seal path mints once and the read-only
+    /// path then finds it.
+    #[test]
+    fn load_keypair_in_never_mints_3718() {
+        let dir = secure_tmp_key_dir();
+        let agent = format!("unit-3718-load-{}", uuid::Uuid::new_v4().simple());
+        assert!(
+            load_keypair_in(&agent, dir.path())
+                .expect("read-only")
+                .is_none()
+        );
+        assert!(
+            names(dir.path()).is_empty(),
+            "a read-only lookup wrote nothing"
+        );
+        let minted = get_or_create_keypair_in(&agent, dir.path()).expect("seal path mints once");
+        assert_eq!(names(dir.path()).len(), 2, "pub + priv");
+        let found = load_keypair_in(&agent, dir.path())
+            .expect("read-only")
+            .expect("now present");
+        assert_eq!(found.public.as_bytes(), minted.public.as_bytes());
+        // Evicting the cache sends the next lookup to disk — still no mint.
+        evict_cached_keypair(&agent);
+        std::fs::remove_file(dir.path().join(format!("{agent}{X25519_PRIV_SUFFIX}")))
+            .expect("delete priv");
+        assert!(
+            load_keypair_in(&agent, dir.path())
+                .expect("read-only")
+                .is_none()
+        );
+        assert_eq!(
+            names(dir.path()),
+            vec![format!("{agent}{X25519_PUB_SUFFIX}")]
+        );
+    }
+
+    /// The seal path refuses to mint over archived material of a prior
+    /// generation; the caller-facing rendering carries the class and never
+    /// a path, the operator line carries every archived path.
+    #[test]
+    fn get_or_create_refuses_over_archived_material_3718() {
+        let dir = secure_tmp_key_dir();
+        let agent = format!("unit-3718-gap-{}", uuid::Uuid::new_v4().simple());
+        let archived = dir
+            .path()
+            .join(format!("{agent}{X25519_PUB_SUFFIX}.1757000000"));
+        std::fs::write(&archived, [1u8; 32]).expect("plant archive");
+        let err = get_or_create_keypair_in(&agent, dir.path())
+            .expect_err("archived material + no live key refuses the mint");
+        let gap = key_generation_gap(&err).expect("typed KeyGenerationGap");
+        assert_eq!(gap.archived, vec![archived.clone()]);
+        let caller = format!("{err}");
+        assert!(caller.contains(KeyGenerationGap::CLASS) && caller.contains(&agent));
+        assert!(!caller.contains(&dir.path().display().to_string()));
+        assert!(
+            gap.operator_line()
+                .contains(&archived.display().to_string())
+        );
+        assert_eq!(
+            names(dir.path()),
+            vec![archived.file_name().unwrap().to_string_lossy().into_owned()],
+            "nothing minted"
+        );
+        assert!(
+            load_keypair_in(&agent, dir.path())
+                .expect("read-only")
+                .is_none()
+        );
+    }
+
+    /// `KeyAbsent` renders the class to a caller and the path only in the
+    /// operator line; `read_failure_detail` never says "decrypt failed" for
+    /// it.
+    #[test]
+    fn key_absent_renders_class_to_caller_and_path_to_operator_3718() {
+        let absent = KeyAbsent {
+            agent_id: "unit-3718-agent".to_string(),
+            expected_path: PathBuf::from("/keys/unit-3718-agent.x25519.priv"),
+        };
+        let caller = absent.to_string();
+        assert!(caller.contains(KeyAbsent::CLASS) && caller.contains("unit-3718-agent"));
+        assert!(caller.contains(ISSUE_TAG));
+        assert!(
+            !caller.contains("/keys/"),
+            "no path to the caller: {caller}"
+        );
+        let op = absent.operator_line();
+        assert!(
+            op.contains("/keys/unit-3718-agent.x25519.priv") && op.contains("NOTHING was minted")
+        );
+        let err = anyhow::Error::new(absent.clone());
+        assert_eq!(key_absent(&err), Some(&absent));
+        let detail = read_failure_detail(&err);
+        assert!(detail.starts_with(KeyAbsent::CLASS) && !detail.contains("decrypt failed"));
+        let aead = anyhow!("per-record content decrypt failed (authentication): aead::Error");
+        assert!(read_failure_detail(&aead).starts_with("decrypt failed: "));
     }
 }

@@ -254,6 +254,32 @@ spawned children. Operators who need the env channel may set
 Defaults (page size, cipher, KDF iterations) match SQLCipher 4.x. To
 open the DB manually: `sqlcipher ai-memory.db` + `PRAGMA key='…';`.
 
+### Per-agent content keys never mint on a read (#3718)
+
+Content sealed at rest (`AI_MEMORY_ENCRYPT_AT_REST` / `[encryption].at_rest`)
+is keyed to a per-agent X25519 pair under the key directory
+(`<agent_id>.x25519.priv`, mode 0600). The accessor is split:
+
+- **Reads** (`encryption::load_keypair`, both decrypt arms of
+  `open_content`) NEVER create key material. A missing `.priv` is the
+  typed `KeyAbsent` error — distinct from an AEAD failure, because "your
+  key is missing" is actionable and "wrong recipient" sends the operator
+  hunting the wrong problem. The caller sees the class (`key_absent`) and
+  the agent, never a path; the operator log (`security.encryption.keys`)
+  names the expected file and the remedy (restore it from backup or the
+  #3717 escrow). The row is untouched; it reads again the moment the key
+  is back.
+- **Writes** (`encryption::get_or_create_keypair`, the seal path only)
+  mint exactly once, on the first write for an agent that has never had a
+  key. A key directory that holds ARCHIVED material of a prior generation
+  (`<agent_id>.x25519.{pub,priv}.<suffix>`) and no live key is a LOST key,
+  not a new agent: the write is refused (`key_generation_gap`) rather than
+  minting generation N+1 over it.
+
+Before #3718 a read with the key file missing minted a fresh pair before
+failing, masking the loss as "wrong key" and forking the key generation so
+no single restore could heal the corpus.
+
 ### File permissions
 
 The daemon expects the DB file + WAL/SHM companions to be writable
