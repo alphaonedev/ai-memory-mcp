@@ -285,11 +285,12 @@ fn doctor_remote_queries_capabilities_endpoint() {
     assert_eq!(v["mode"].as_str().unwrap(), "remote");
 }
 
-/// v1.0.0 #3655 — end-to-end through the binary: a peer whose two cursors
-/// are EQUAL but hours old is a stale peer (Critical, exit 2), not a healthy
-/// one; and an unreadable `sync_state` is Critical, never "single-node".
-/// Pre-fix the first case rendered Info (|seen - pulled| = 0) and the second
-/// rendered N/A with the single-node note.
+/// v1.0.0 #3655 — end-to-end through the binary: a peer whose last ANSWERED
+/// pull (`sync_peer_contact`, review rework) is hours old is a stale peer
+/// (Critical, exit 2) — its equal-but-old data cursors are the symptom, not
+/// the signal; and an unreadable `sync_state` is Critical, never
+/// "single-node". Pre-fix the first case rendered Info (|seen - pulled| = 0)
+/// and the second rendered N/A with the single-node note.
 #[test]
 fn doctor_sync_flags_stale_peer_and_unreadable_table_3655() {
     let tmp = TempDir::new().unwrap();
@@ -301,6 +302,12 @@ fn doctor_sync_flags_stale_peer_and_unreadable_table_3655() {
         conn.execute(
             "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
              VALUES ('me', 'peer-1', ?1, ?1)",
+            params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+             catchup_interval_secs) VALUES ('me', 'peer-1', ?1, 60)",
             params![old],
         )
         .unwrap();
@@ -338,8 +345,12 @@ fn doctor_sync_flags_stale_peer_and_unreadable_table_3655() {
     assert_eq!(stale["severity"], "critical", "{stale}");
     assert_eq!(fact(&stale, "stale_peers"), "1");
     assert_eq!(fact(&stale, "peer::me/peer-1::clock_lead_secs"), "0");
+    assert_eq!(
+        fact(&stale, "peer::me/peer-1::reachability"),
+        "unknown:pull_observation_stale"
+    );
     assert!(
-        fact(&stale, "peer::me/peer-1::observed_age_secs")
+        fact(&stale, "peer::me/peer-1::contact_age_secs")
             .parse::<i64>()
             .unwrap()
             >= 7_000

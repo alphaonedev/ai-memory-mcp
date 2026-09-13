@@ -18,8 +18,10 @@
 //! ## Severity rules (initial)
 //!
 //! - **Critical:** dim_violations > 0; pending_actions older than 24h;
-//!   a sync peer not observed for > 600s, a peer clock leading this one
-//!   beyond the pull-cursor bound, or an unreadable `sync_state` (#3655);
+//!   a sync peer whose last answered pull is older than the shared #3654
+//!   reachability window (3 × its catch-up cadence), a peer clock leading
+//!   this one beyond the pull-cursor bound, or an unreadable `sync_state`
+//!   (#3655);
 //!   HNSW evictions > 0.
 //! - **Warning:** silent-degrade flag from Capabilities v2
 //!   (recall_mode != "hybrid" on capable tiers); subscription delivery
@@ -39,9 +41,12 @@
 //!   for the *active* mode at this instant and reports it as the only
 //!   data point.
 //! - **Sync mesh** (T3+, #3655): every `sync_state` row is aged against the
-//!   probe time (`observed` = `last_pulled_at`, `data` = `last_seen_at`,
-//!   `pushed` = `last_pushed_at`); an empty table is NOT_AVAILABLE, an
-//!   unreadable one is Critical, a malformed row is Warning.
+//!   probe time (`contact` = `sync_peer_contact.last_contact_at`, the
+//!   reachability signal; `advanced` = `last_pulled_at`, the data-watermark
+//!   stamp; `data` = `last_seen_at`; `pushed` = `last_pushed_at`); an empty
+//!   table is NOT_AVAILABLE, an unreadable one is Critical, a malformed row
+//!   is Warning, a row with no recorded contact is Warning (unknown), and a
+//!   row whose contact is older than the #3654 window is Critical.
 //!
 //! ## Anti-goals (per spec)
 //!
@@ -92,22 +97,30 @@ const FACT_RPO_ON_POWER_LOSS: &str = "rpo_on_power_loss";
 /// exact confusion #3385 was filed over.
 const FACT_ARCHIVE_ON_GC_SOURCE: &str = "archive_on_gc_source";
 const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
-/// #3655 — a peer this node has not OBSERVED (`last_pulled_at`) for longer
-/// than this is stale: **Critical**. The documented 600 s ceiling, kept —
-/// the sync daemon's default cycle is 2 s, so this is hundreds of missed
-/// cycles, not one slow one.
-const SYNC_PEER_STALE_SECS: i64 = 10 * crate::SECS_PER_MINUTE;
 /// #3655 — the Sync section's fact keys. Per-peer facts are
 /// `peer::<agent>/<peer>::<suffix>`.
 const FACT_PEER_COUNT: &str = "peer_count";
 const FACT_PROBED_AT: &str = "probed_at";
 const FACT_INVALID_ROWS: &str = "invalid_rows";
+/// Peers whose last answered pull is older than the #3654 reachability window.
 const FACT_STALE_PEERS: &str = "stale_peers";
-const FACT_MAX_OBSERVED_AGE_SECS: &str = "max_observed_age_secs";
+/// Peers with no recorded contact (or no recorded cadence): reachability
+/// unknown, which is neither healthy nor stale.
+const FACT_UNKNOWN_PEERS: &str = "unknown_peers";
+const FACT_MAX_CONTACT_AGE_SECS: &str = "max_contact_age_secs";
+const FACT_MAX_ADVANCED_AGE_SECS: &str = "max_advanced_age_secs";
 const FACT_MAX_DATA_AGE_SECS: &str = "max_data_age_secs";
 const PEER_FACT_PREFIX: &str = "peer::";
-const PEER_FACT_OBSERVED_AGE: &str = "observed_age_secs";
+/// `reachable`, or `unknown:<reason>` with a #3654 reason.
+const PEER_FACT_REACHABILITY: &str = "reachability";
+const PEER_FACT_CONTACT_AGE: &str = "contact_age_secs";
+const PEER_FACT_CATCHUP_INTERVAL: &str = "catchup_interval_secs";
+const PEER_FACT_ADVANCED_AGE: &str = "advanced_age_secs";
 const PEER_FACT_DATA_AGE: &str = "data_age_secs";
+/// The one spelling for "this was not measured" in the Sync section.
+const NOT_OBSERVED: &str = "not_observed";
+/// The one spelling for a peer whose last answered pull is inside the window.
+const REACHABLE: &str = "reachable";
 const PEER_FACT_PUSHED_AGE: &str = "pushed_age_secs";
 const PEER_FACT_CLOCK_LEAD: &str = "clock_lead_secs";
 const PEER_FACT_INVALID: &str = "invalid";
@@ -2751,6 +2764,65 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
     section_sync_at(conn, chrono::Utc::now())
 }
 
+/// #3655 — what the doctor concluded about one peer's reachability.
+enum ReachVerdict {
+    /// The last answered pull is inside the #3654 window.
+    Reachable,
+    /// The last answered pull is older than the window (seconds given).
+    Stale { window_secs: i64 },
+    /// No contact or no cadence was recorded: nothing can be concluded.
+    Unknown,
+}
+
+/// #3655 — a peer's reachability verdict plus its rendered label
+/// (`reachable` or `unknown:<#3654 reason>`).
+struct PeerReach {
+    label: String,
+    verdict: ReachVerdict,
+}
+
+/// #3655 — apply the ONE reachability definition the live daemon uses
+/// (`federation::freshness::reachability`, #3654) to the durable contact
+/// stamp: a pull observation older than
+/// `REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS` × the recorded cadence no
+/// longer says anything about the peer. The offline doctor has the stamp and
+/// the cadence, not the in-process failure streak, so its "stale" is the
+/// registry's `pull_observation_stale` and its "no contact" is the
+/// registry's `no_pull_observation` — same reason strings, same window.
+fn peer_reachability(peer: &db::SyncPeerWatermark) -> PeerReach {
+    use crate::federation::freshness::{
+        REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS, UNKNOWN_NO_CATCHUP_LOOP,
+        UNKNOWN_NO_PULL_OBSERVATION, UNKNOWN_PULL_OBSERVATION_STALE,
+    };
+    let Some(contact_age) = peer.contact_age_secs else {
+        return PeerReach {
+            label: format!("unknown:{UNKNOWN_NO_PULL_OBSERVATION}"),
+            verdict: ReachVerdict::Unknown,
+        };
+    };
+    let Some(cadence) = peer.catchup_interval_secs else {
+        return PeerReach {
+            label: format!("unknown:{UNKNOWN_NO_CATCHUP_LOOP}"),
+            verdict: ReachVerdict::Unknown,
+        };
+    };
+    let window_secs = i64::try_from(
+        cadence.saturating_mul(u64::from(REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS)),
+    )
+    .unwrap_or(i64::MAX);
+    if contact_age > window_secs {
+        PeerReach {
+            label: format!("unknown:{UNKNOWN_PULL_OBSERVATION_STALE}"),
+            verdict: ReachVerdict::Stale { window_secs },
+        }
+    } else {
+        PeerReach {
+            label: REACHABLE.to_string(),
+            verdict: ReachVerdict::Reachable,
+        }
+    }
+}
+
 /// v1.0.0 #3655 — the Sync section, aged against an explicit probe time.
 ///
 /// Four states, kept distinct because each is a different operator action:
@@ -2760,12 +2832,18 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
 /// - **empty** (no rows) → **N/A**, the single-node case.
 /// - **invalid** rows (NULL / non-RFC 3339 cursors) → **Warning**, counted
 ///   and named; never silently skipped.
-/// - **valid** rows → each cursor is aged against `now`. A peer not observed
-///   for > [`SYNC_PEER_STALE_SECS`] is **Critical** (the "equal but old"
-///   case the old `|seen - pulled|` skew could never see); a peer whose
+/// - **valid** rows → each cursor is aged against `now`. Reachability uses
+///   the ONE definition the live daemon uses (#3654): a peer whose last
+///   ANSWERED pull (`sync_peer_contact`, stamped even on an empty window) is
+///   older than `REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS` × its recorded
+///   catch-up cadence is `unknown:pull_observation_stale` → **Critical** (the
+///   "equal but old" case the old `|seen - pulled|` skew could never see); a
+///   row with no recorded contact or cadence is `unknown:<reason>` →
+///   **Warning** (absent is not zero, and not stale either); a peer whose
 ///   data is stamped further into this node's future than the daemon's own
 ///   pull-cursor bound is **Critical** (clocks disagree; its cursors will be
-///   refused). A quiet peer — old data, recent observation — is **Info**.
+///   refused). A quiet peer — old data watermark, recent contact — is
+///   **Info**: that is what an empty window looks like.
 fn section_sync_at(
     conn: &rusqlite::Connection,
     now: chrono::DateTime<chrono::Utc>,
@@ -2798,7 +2876,7 @@ fn section_sync_at(
     if watermarks.row_count() == 0 {
         facts.push((
             FACT_MAX_SKEW_SECS.into(),
-            "not_observed (no peers registered)".into(),
+            format!("{NOT_OBSERVED} (no peers registered)"),
         ));
         return ReportSection {
             name: "Sync".into(),
@@ -2831,7 +2909,9 @@ fn section_sync_at(
     }
 
     let mut stale_peers = 0usize;
-    let mut max_observed: Option<i64> = None;
+    let mut unknown_peers = 0usize;
+    let mut max_contact: Option<i64> = None;
+    let mut max_advanced: Option<i64> = None;
     let mut max_data: Option<i64> = None;
     let mut max_lead_abs: Option<i64> = None;
     for peer in &watermarks.peers {
@@ -2841,35 +2921,72 @@ fn section_sync_at(
                 peer.agent_id, peer.peer_id
             )
         };
+        let reach = peer_reachability(peer);
+        facts.push((key(PEER_FACT_REACHABILITY), reach.label.clone()));
         facts.push((
-            key(PEER_FACT_OBSERVED_AGE),
-            peer.observed_age_secs.to_string(),
+            key(PEER_FACT_CONTACT_AGE),
+            peer.contact_age_secs
+                .map_or_else(|| NOT_OBSERVED.to_string(), |a| a.to_string()),
+        ));
+        facts.push((
+            key(PEER_FACT_CATCHUP_INTERVAL),
+            peer.catchup_interval_secs
+                .map_or_else(|| NOT_OBSERVED.to_string(), |a| a.to_string()),
+        ));
+        facts.push((
+            key(PEER_FACT_ADVANCED_AGE),
+            peer.advanced_age_secs.to_string(),
         ));
         facts.push((key(PEER_FACT_DATA_AGE), peer.data_age_secs.to_string()));
+        match reach.verdict {
+            ReachVerdict::Reachable => {}
+            ReachVerdict::Stale { window_secs } => {
+                stale_peers = stale_peers.saturating_add(1);
+                severity = Severity::Critical;
+                append_note(
+                    &mut note,
+                    &format!(
+                        "peer {} last answered a pull {}s ago, beyond the {window_secs}s \
+                         reachability window (3 × its {}s catch-up cadence, the same rule the \
+                         live daemon applies) — reachability unknown; the mesh is not \
+                         converging through this node",
+                        peer.peer_id,
+                        peer.contact_age_secs.unwrap_or_default(),
+                        peer.catchup_interval_secs.unwrap_or_default(),
+                    ),
+                );
+            }
+            ReachVerdict::Unknown => {
+                unknown_peers = unknown_peers.saturating_add(1);
+                if severity != Severity::Critical {
+                    severity = Severity::Warning;
+                }
+                append_note(
+                    &mut note,
+                    &format!(
+                        "peer {} has no recorded contact ({}) — it is neither healthy nor \
+                         stale: the sync daemon has not answered a pull for it since this \
+                         database gained contact tracking, or is not running",
+                        peer.peer_id, reach.label
+                    ),
+                );
+            }
+        }
+        if let Some(c) = peer.contact_age_secs {
+            max_contact = Some(max_contact.map_or(c, |m| m.max(c)));
+        }
         facts.push((
             key(PEER_FACT_PUSHED_AGE),
             peer.pushed_age_secs
                 .map_or_else(|| PEER_NEVER_PUSHED.to_string(), |a| a.to_string()),
         ));
         facts.push((key(PEER_FACT_CLOCK_LEAD), peer.clock_lead_secs.to_string()));
-        max_observed =
-            Some(max_observed.map_or(peer.observed_age_secs, |m| m.max(peer.observed_age_secs)));
+        max_advanced =
+            Some(max_advanced.map_or(peer.advanced_age_secs, |m| m.max(peer.advanced_age_secs)));
         max_data = Some(max_data.map_or(peer.data_age_secs, |m| m.max(peer.data_age_secs)));
         let lead_abs = peer.clock_lead_secs.saturating_abs();
         max_lead_abs = Some(max_lead_abs.map_or(lead_abs, |m| m.max(lead_abs)));
 
-        if peer.observed_age_secs > SYNC_PEER_STALE_SECS {
-            stale_peers = stale_peers.saturating_add(1);
-            severity = Severity::Critical;
-            append_note(
-                &mut note,
-                &format!(
-                    "peer {} last observed {}s ago (>{SYNC_PEER_STALE_SECS}s threshold) — the \
-                     mesh is not converging through this node",
-                    peer.peer_id, peer.observed_age_secs
-                ),
-            );
-        }
         if peer.clock_lead_secs > PULL_CURSOR_FUTURE_SKEW_SECS {
             severity = Severity::Critical;
             append_note(
@@ -2883,11 +3000,13 @@ fn section_sync_at(
         }
     }
     facts.push((FACT_STALE_PEERS.into(), stale_peers.to_string()));
+    facts.push((FACT_UNKNOWN_PEERS.into(), unknown_peers.to_string()));
     // Summary ages are MEASURED maxima over valid rows; with no valid row
-    // there is nothing to summarise and the facts say so.
-    let render_max =
-        |m: Option<i64>| m.map_or_else(|| "not_observed".to_string(), |v| v.to_string());
-    facts.push((FACT_MAX_OBSERVED_AGE_SECS.into(), render_max(max_observed)));
+    // (or no recorded contact) there is nothing to summarise and the facts
+    // say so.
+    let render_max = |m: Option<i64>| m.map_or_else(|| NOT_OBSERVED.to_string(), |v| v.to_string());
+    facts.push((FACT_MAX_CONTACT_AGE_SECS.into(), render_max(max_contact)));
+    facts.push((FACT_MAX_ADVANCED_AGE_SECS.into(), render_max(max_advanced)));
     facts.push((FACT_MAX_DATA_AGE_SECS.into(), render_max(max_data)));
     // Kept for existing consumers: the largest |seen - pulled| over valid
     // rows. It no longer drives severity — see `clock_lead_secs`.
@@ -4657,6 +4776,12 @@ mod tests {
         assert_eq!(report.overall, Severity::Critical);
     }
 
+    /// #3655 review rework RE-PIN: fresh data cursors with NO recorded contact
+    /// are no longer `Info`. `last_pulled_at` is a data-watermark stamp, not a
+    /// contact time, so this row's reachability is UNKNOWN
+    /// (`unknown:no_pull_observation`) — a Warning, per the #3646/#3654
+    /// standard that a missing observation is never a healthy claim. The
+    /// numeric-skew rendering this test originally pinned still holds.
     #[test]
     fn sync_section_info_when_skew_under_threshold() {
         let env = TestEnv::fresh();
@@ -4674,7 +4799,14 @@ mod tests {
         }
         let report = run_local_collect(&env.db_path);
         let sync = find(&report, "Sync");
-        assert_eq!(sync.severity, Severity::Info);
+        assert_eq!(sync.severity, Severity::Warning, "{sync:?}");
+        assert_eq!(
+            fact(sync, "peer::me/peer-1::reachability"),
+            format!(
+                "unknown:{}",
+                crate::federation::freshness::UNKNOWN_NO_PULL_OBSERVATION
+            )
+        );
         // peer_count=1, skew column rendered as a numeric string.
         assert_eq!(fact(sync, "peer_count"), "1");
         let skew = fact(sync, "max_skew_secs");
@@ -6363,14 +6495,31 @@ enabled = true
                 params![old],
             )
             .unwrap();
+            // Review rework: the finding is about CONTACT, not the data
+            // watermark — the last answered pull is also two hours old, far
+            // beyond 3 × a 60 s cadence.
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+                 catchup_interval_secs) VALUES ('me', 'peer-1', ?1, 60)",
+                params![old],
+            )
+            .unwrap();
         }
         let report = run_local_collect(&env.db_path);
         let sync = find(&report, "Sync");
         assert_eq!(sync.severity, Severity::Critical, "{sync:?}");
         assert_eq!(fact(sync, FACT_STALE_PEERS), "1");
+        assert_eq!(fact(sync, FACT_UNKNOWN_PEERS), "0");
         assert_eq!(fact(sync, "peer::me/peer-1::clock_lead_secs"), "0");
+        assert_eq!(
+            fact(sync, "peer::me/peer-1::reachability"),
+            format!(
+                "unknown:{}",
+                crate::federation::freshness::UNKNOWN_PULL_OBSERVATION_STALE
+            )
+        );
         assert!(
-            fact(sync, "peer::me/peer-1::observed_age_secs")
+            fact(sync, "peer::me/peer-1::contact_age_secs")
                 .parse::<i64>()
                 .unwrap()
                 >= 2 * crate::SECS_PER_HOUR
@@ -6379,8 +6528,104 @@ enabled = true
             sync.note
                 .as_deref()
                 .unwrap_or_default()
-                .contains("last observed")
+                .contains("last answered a pull")
         );
+    }
+
+    /// #3655 (review rework) — the EMPTY-WINDOW case: both data cursors are
+    /// hours old because nothing new has replicated, but the peer answered a
+    /// pull seconds ago. That peer is reachable and healthy; the data
+    /// watermark is not a liveness signal. Pre-rework this rendered Critical
+    /// ("last observed 7200s ago") from `last_pulled_at` alone.
+    #[test]
+    fn sync_section_fresh_contact_with_old_cursors_is_reachable_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let old = (now - chrono::Duration::seconds(2 * crate::SECS_PER_HOUR)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'quiet', ?1, ?1)",
+                params![old],
+            )
+            .unwrap();
+            let contact = (now - chrono::Duration::seconds(5)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+                 catchup_interval_secs) VALUES ('me', 'quiet', ?1, 60)",
+                params![contact],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Info, "{section:?}");
+            assert_eq!(fact(&section, "peer::me/quiet::reachability"), REACHABLE);
+            assert_eq!(fact(&section, "peer::me/quiet::contact_age_secs"), "5");
+            assert_eq!(
+                fact(&section, "peer::me/quiet::catchup_interval_secs"),
+                "60"
+            );
+            assert_eq!(
+                fact(&section, "peer::me/quiet::advanced_age_secs"),
+                (2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(fact(&section, FACT_UNKNOWN_PEERS), "0");
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), "5");
+            assert!(section.note.is_none(), "{section:?}");
+        }
+    }
+
+    /// #3655 (review rework) — a row with NO recorded contact is UNKNOWN:
+    /// Warning, named with the #3654 reason, and counted apart from stale.
+    /// Absent is not zero, and it is not "stale" either.
+    #[test]
+    fn sync_section_no_recorded_contact_is_unknown_not_stale_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Warning, "{section:?}");
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::reachability"),
+                format!(
+                    "unknown:{}",
+                    crate::federation::freshness::UNKNOWN_NO_PULL_OBSERVATION
+                )
+            );
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::contact_age_secs"),
+                NOT_OBSERVED
+            );
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(fact(&section, FACT_UNKNOWN_PEERS), "1");
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), NOT_OBSERVED);
+            // A contact WITHOUT a cadence is also unknown (the window cannot be
+            // computed), with the registry's other reason.
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at) \
+                 VALUES ('me', 'peer-1', ?1)",
+                params![now.to_rfc3339()],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Warning, "{section:?}");
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::reachability"),
+                format!(
+                    "unknown:{}",
+                    crate::federation::freshness::UNKNOWN_NO_CATCHUP_LOOP
+                )
+            );
+            assert_eq!(fact(&section, "peer::me/peer-1::contact_age_secs"), "0");
+        }
     }
 
     /// #3655 — per-peer ages against a pinned probe time, the probe time
@@ -6397,12 +6642,17 @@ enabled = true
             conn.execute_batch(&format!(
                 "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at) VALUES \
                  ('me', 'quiet', '{}', '{}', NULL), \
-                 ('me', 'fresh', '{}', '{}', '{}');",
+                 ('me', 'fresh', '{}', '{}', '{}'); \
+                 INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, catchup_interval_secs) VALUES \
+                 ('me', 'quiet', '{}', 2), \
+                 ('me', 'fresh', '{}', 2);",
                 t(2 * crate::SECS_PER_HOUR),
                 t(30),
                 t(10),
                 t(10),
                 t(5),
+                t(3),
+                t(1),
             ))
             .unwrap();
             let section = section_sync_at(&conn, now);
@@ -6411,7 +6661,12 @@ enabled = true
             assert_eq!(fact(&section, FACT_PEER_COUNT), "2");
             assert_eq!(fact(&section, FACT_INVALID_ROWS), "0");
             assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
-            assert_eq!(fact(&section, "peer::me/quiet::observed_age_secs"), "30");
+            assert_eq!(fact(&section, FACT_UNKNOWN_PEERS), "0");
+            assert_eq!(fact(&section, "peer::me/quiet::reachability"), REACHABLE);
+            assert_eq!(fact(&section, "peer::me/quiet::contact_age_secs"), "3");
+            assert_eq!(fact(&section, "peer::me/fresh::contact_age_secs"), "1");
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), "3");
+            assert_eq!(fact(&section, "peer::me/quiet::advanced_age_secs"), "30");
             assert_eq!(
                 fact(&section, "peer::me/quiet::data_age_secs"),
                 (2 * crate::SECS_PER_HOUR).to_string()
@@ -6426,7 +6681,7 @@ enabled = true
                 (30 - 2 * crate::SECS_PER_HOUR).to_string()
             );
             assert_eq!(fact(&section, "peer::me/fresh::pushed_age_secs"), "5");
-            assert_eq!(fact(&section, FACT_MAX_OBSERVED_AGE_SECS), "30");
+            assert_eq!(fact(&section, FACT_MAX_ADVANCED_AGE_SECS), "30");
             assert_eq!(
                 fact(&section, FACT_MAX_DATA_AGE_SECS),
                 (2 * crate::SECS_PER_HOUR).to_string()

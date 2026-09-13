@@ -417,17 +417,26 @@ pub fn doctor_webhook_delivery_totals(conn: &Connection) -> Result<(u64, u64)> {
     ))
 }
 
-/// v1.0.0 #3655 — one `sync_state` row aged against the probe time.
+/// v1.0.0 #3655 — one `sync_state` row aged against the probe time, joined
+/// with the peer's durable CONTACT stamp (`sync_peer_contact`, v99).
 ///
-/// The three cursors mean three different things, and the doctor renders
-/// each against `now` rather than against each other:
-/// - `observed_age_secs` — seconds since this node last OBSERVED the peer
-///   (`last_pulled_at`, stamped by THIS node's clock at observation time).
-///   This is the freshness signal: a peer nobody has heard from is stale no
-///   matter what its data watermark says.
+/// The cursors mean different things, and the doctor renders each against
+/// `now` rather than against each other:
+/// - `contact_age_secs` — seconds since the peer last ANSWERED a pull
+///   (`sync_peer_contact.last_contact_at`, this node's clock), stamped on
+///   every answered pull — empty window included. `None` = no contact has
+///   been recorded for this row, which is reported as unknown, never as 0.
+///   This is the reachability signal (review rework: `last_pulled_at` is a
+///   DATA watermark stamp, not a contact time).
+/// - `catchup_interval_secs` — the cadence of the loop that made that
+///   contact, so the reachability window is the same one the live daemon
+///   uses (#3654: stale after `REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS`
+///   cadences). `None` = the writer did not know its cadence.
+/// - `advanced_age_secs` — seconds since the data watermark last ADVANCED
+///   (`last_pulled_at`, this node's clock). Old is legitimate for a quiet
+///   peer; it is NOT a liveness signal.
 /// - `data_age_secs` — seconds since the newest peer data this node has seen
 ///   (`last_seen_at`, the peer's own `updated_at`, i.e. the PEER's clock).
-///   Old is legitimate for a quiet peer.
 /// - `pushed_age_secs` — seconds since the last local watermark the peer
 ///   accepted (`last_pushed_at`); `None` when this node never pushed.
 /// - `clock_lead_secs` — signed `last_seen_at - last_pulled_at`. Positive
@@ -438,7 +447,9 @@ pub fn doctor_webhook_delivery_totals(conn: &Connection) -> Result<(u64, u64)> {
 pub struct SyncPeerWatermark {
     pub agent_id: String,
     pub peer_id: String,
-    pub observed_age_secs: i64,
+    pub contact_age_secs: Option<i64>,
+    pub catchup_interval_secs: Option<u64>,
+    pub advanced_age_secs: i64,
     pub data_age_secs: i64,
     pub pushed_age_secs: Option<i64>,
     pub clock_lead_secs: i64,
@@ -500,10 +511,28 @@ pub fn doctor_sync_peer_watermarks(
     conn: &Connection,
     now: chrono::DateTime<Utc>,
 ) -> Result<SyncWatermarks> {
-    let mut stmt = conn.prepare(
-        "SELECT agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at \
-         FROM sync_state ORDER BY agent_id, peer_id",
+    // #3655 (review rework) — contact lives in its own table (v99). A database
+    // this doctor opened is migrated, so the table exists; a read-only or
+    // foreign file may predate it, and then contact is UNKNOWN for every row
+    // (reported as such), not a query failure that hides the cursors.
+    let contact_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
+         AND name = 'sync_peer_contact')",
+        [],
+        |r| r.get(0),
     )?;
+    let sql = if contact_table {
+        "SELECT s.agent_id, s.peer_id, s.last_seen_at, s.last_pulled_at, s.last_pushed_at, \
+                c.last_contact_at, c.catchup_interval_secs \
+         FROM sync_state s \
+         LEFT JOIN sync_peer_contact c ON c.agent_id = s.agent_id AND c.peer_id = s.peer_id \
+         ORDER BY s.agent_id, s.peer_id"
+    } else {
+        "SELECT agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at, \
+                NULL, NULL \
+         FROM sync_state ORDER BY agent_id, peer_id"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, Option<String>>(0)?,
@@ -511,11 +540,13 @@ pub fn doctor_sync_peer_watermarks(
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<String>>(3)?,
             r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
         ))
     })?;
     let mut out = SyncWatermarks::default();
     for row in rows {
-        let (agent_id, peer_id, seen, pulled, pushed) = match row {
+        let (agent_id, peer_id, seen, pulled, pushed, contact, cadence) = match row {
             Ok(r) => r,
             Err(e) => {
                 // A row the driver could not decode is an invalid row, not a
@@ -532,30 +563,51 @@ pub fn doctor_sync_peer_watermarks(
             agent_id.as_deref().unwrap_or(SYNC_ROW_UNLABELLED),
             peer_id.as_deref().unwrap_or(SYNC_ROW_UNLABELLED)
         );
-        let observed = cursor_age_secs(now, "last_pulled_at", pulled.as_deref());
+        let advanced = cursor_age_secs(now, "last_pulled_at", pulled.as_deref());
         let data = cursor_age_secs(now, "last_seen_at", seen.as_deref());
         let pushed_age = match pushed.as_deref() {
             None => Ok(None),
             Some(p) => cursor_age_secs(now, "last_pushed_at", Some(p)).map(Some),
         };
-        match (observed, data, pushed_age, agent_id, peer_id) {
-            (Ok(observed_age_secs), Ok(data_age_secs), Ok(pushed_age_secs), Some(a), Some(p)) => {
+        let contact_age = match contact.as_deref() {
+            None => Ok(None),
+            Some(c) => cursor_age_secs(now, "last_contact_at", Some(c)).map(Some),
+        };
+        // A negative cadence cannot have been written by this crate; treat it
+        // as unknown rather than as a window of zero.
+        let catchup_interval_secs = cadence.and_then(|c| u64::try_from(c).ok());
+        match (advanced, data, pushed_age, contact_age, agent_id, peer_id) {
+            (
+                Ok(advanced_age_secs),
+                Ok(data_age_secs),
+                Ok(pushed_age_secs),
+                Ok(contact_age_secs),
+                Some(a),
+                Some(p),
+            ) => {
                 out.peers.push(SyncPeerWatermark {
                     agent_id: a,
                     peer_id: p,
-                    observed_age_secs,
+                    contact_age_secs,
+                    catchup_interval_secs,
+                    advanced_age_secs,
                     data_age_secs,
                     pushed_age_secs,
                     // seen - pulled == (now - pulled) - (now - seen)
-                    clock_lead_secs: observed_age_secs.saturating_sub(data_age_secs),
+                    clock_lead_secs: advanced_age_secs.saturating_sub(data_age_secs),
                 });
             }
-            (observed, data, pushed_age, _, _) => {
-                let reason = [observed.err(), data.err(), pushed_age.err()]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("; ");
+            (advanced, data, pushed_age, contact_age, _, _) => {
+                let reason = [
+                    advanced.err(),
+                    data.err(),
+                    pushed_age.err(),
+                    contact_age.err(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
                 let reason = if reason.is_empty() {
                     "agent_id or peer_id is NULL".to_string()
                 } else {

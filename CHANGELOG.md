@@ -47,16 +47,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreadable` + `sync_query_error`), never `peer_count = 0` / "single-node";
   rows with NULL or non-RFC 3339 cursors are counted and named
   (`invalid_rows`, `peer::<agent>/<peer>::invalid`) as a **Warning** instead
-  of being skipped; each valid peer renders `observed_age_secs`
-  (`last_pulled_at` vs now — **Critical** > 600s, which catches cursors that
-  are equal but hours old), `data_age_secs`, `pushed_age_secs` /
-  `never_pushed`, and signed `clock_lead_secs` (**Critical** beyond the sync
-  daemon's 300s pull-cursor future bound; a quiet peer's negative lead is no
-  longer a false Critical). `probed_at`, `stale_peers`, `max_observed_age_secs`
-  and `max_data_age_secs` are new; `max_skew_secs` is kept for consumers but
-  no longer drives severity. `storage::doctor_max_sync_skew_secs` (which
-  turned a failed `prepare` into "not observed") is replaced by
+  of being skipped; each valid peer renders `reachability`,
+  `contact_age_secs`, `catchup_interval_secs`, `advanced_age_secs`,
+  `data_age_secs`, `pushed_age_secs` / `never_pushed`, and signed
+  `clock_lead_secs` (**Critical** beyond the sync daemon's 300s pull-cursor
+  future bound; a quiet peer's negative lead is no longer a false Critical).
+  `probed_at`, `stale_peers`, `unknown_peers` and the `max_*_age_secs`
+  facts are new; `max_skew_secs` is kept for consumers but no longer drives
+  severity. `storage::doctor_max_sync_skew_secs` (which turned a failed
+  `prepare` into "not observed") is replaced by
   `doctor_sync_peer_watermarks`, which propagates the failure.
+- **#3655 review rework — contact is recorded apart from the data
+  watermark, and reachability uses #3654's one definition.**
+  `sync_state.last_pulled_at` moves only when a pull ADVANCED the watermark
+  (`sync_state_observe`), so a quiet peer answering every pull with an
+  empty window never touched it and the first cut called it stale. Schema
+  **v99** adds `sync_peer_contact` (`last_contact_at`,
+  `catchup_interval_secs`; postgres twin is a version stamp only): both pull
+  paths (`sync_cycle_once` and the `serve` catch-up loop) stamp it on every
+  2xx pull, empty window included, with the cadence the #3654 registry
+  published. The doctor classifies each peer with the registry's rule and
+  reason strings — `reachable` inside 3 × the recorded cadence,
+  `unknown:pull_observation_stale` (**Critical**) beyond it,
+  `unknown:no_pull_observation` / `unknown:no_catchup_loop` (**Warning**)
+  when no contact or cadence was recorded — and never renders an absent
+  contact as an age of 0. Tests: an empty-window `sync_cycle_once` stamps
+  contact and leaves `sync_state` untouched; old cursors + fresh contact is
+  Info; old contact is Critical; no contact is Warning.
 
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
