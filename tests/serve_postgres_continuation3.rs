@@ -439,14 +439,20 @@ async fn export_returns_full_envelope_via_sal() {
     let client = pg_test_client("ai:cont3-test");
     let ns = format!("export-{}", uuid::Uuid::new_v4());
     store_memory(&client, &base, &ns, "exportable-1").await;
+    // #3288 — the pg suite shares one database, so this corpus can exceed the
+    // unpaged ceiling (`max_page_size`), where the unpaged export is now
+    // REFUSED (413) instead of materialised whole. Ask for one bounded page:
+    // the envelope contract this test pins is the same on every page.
     let resp = client
-        .get(format!("{base}/api/v1/export"))
+        .get(format!("{base}/api/v1/export?limit=10"))
         .send()
         .await
         .expect("export");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let v: Value = resp.json().await.expect("body");
     assert!(v["memories"].is_array());
+    assert!(v["memories"].as_array().is_some_and(|m| m.len() <= 10));
+    assert!(v.get("next_cursor").is_some(), "paged body carries next_cursor");
     assert!(v["links"].is_array());
     assert!(v["exported_at"].is_string());
     assert_eq!(v["storage_backend"], "postgres");

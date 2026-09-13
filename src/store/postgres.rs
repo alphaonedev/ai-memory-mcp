@@ -16978,7 +16978,7 @@ async fn pg_emit_consolidate_leaf_if_enabled(
 // threshold).
 // ---------------------------------------------------------------------------
 const READ_NAMESPACE: &str = "read namespace";
-const READ_RELATION: &str = "read relation";
+pub(crate) const READ_RELATION: &str = "read relation";
 /// v0.9.0 G13-mem (#1859) — shared `relation` column name for the lineage
 /// row decodes.
 const READ_RELATION_COL: &str = "relation";
@@ -16995,14 +16995,14 @@ const AGE_COL_PATH_EDGES: &str = "path_edges";
 const AGE_COL_PATH_NODES: &str = "path_nodes";
 /// #2511 — decode-context label for the [`AGE_COL_PATH_EDGES`] cell.
 const READ_PATH_EDGES: &str = "read path_edges";
-const READ_TARGET_ID: &str = "read target_id";
-const READ_VALID_FROM: &str = "read valid_from";
-const READ_VALID_UNTIL: &str = "read valid_until";
-const READ_OBSERVED_BY: &str = "read observed_by";
-const READ_CREATED_AT: &str = "read created_at";
+pub(crate) const READ_TARGET_ID: &str = "read target_id";
+pub(crate) const READ_VALID_FROM: &str = "read valid_from";
+pub(crate) const READ_VALID_UNTIL: &str = "read valid_until";
+pub(crate) const READ_OBSERVED_BY: &str = "read observed_by";
+pub(crate) const READ_CREATED_AT: &str = "read created_at";
 const READ_TITLE: &str = "read title";
-const READ_SOURCE_ID: &str = "read source_id";
-const READ_ATTEST_LEVEL: &str = "read attest_level";
+pub(crate) const READ_SOURCE_ID: &str = "read source_id";
+pub(crate) const READ_ATTEST_LEVEL: &str = "read attest_level";
 const READ_RETURNED_ID: &str = "read returned id";
 
 /// #1558 batch 5 wave 2 — JSON-column field names shared by the
@@ -24092,55 +24092,7 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("list_links", e))?;
 
         rows.iter()
-            .map(|r| {
-                let created_at: DateTime<Utc> = r
-                    .try_get::<DateTime<Utc>, _>(field_names::CREATED_AT)
-                    .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
-                let valid_from: Option<DateTime<Utc>> = r
-                    .try_get::<Option<DateTime<Utc>>, _>(field_names::VALID_FROM)
-                    .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
-                let valid_until: Option<DateTime<Utc>> = r
-                    .try_get::<Option<DateTime<Utc>>, _>(field_names::VALID_UNTIL)
-                    .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
-                let observed_by: Option<String> = r
-                    .try_get::<Option<String>, _>(field_names::OBSERVED_BY)
-                    .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
-                let signature: Option<Vec<u8>> = r
-                    .try_get::<Option<Vec<u8>>, _>("signature")
-                    .map_err(|e| to_store_err("read signature", e))?;
-                let relation_str: String = r
-                    .try_get::<String, _>("relation")
-                    .map_err(|e| to_store_err(READ_RELATION, e))?;
-                let attest_level: Option<String> = r
-                    .try_get::<Option<String>, _>(field_names::ATTEST_LEVEL)
-                    .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
-                Ok(MemoryLink {
-                    source_id: r
-                        .try_get::<String, _>("source_id")
-                        .map_err(|e| to_store_err(READ_SOURCE_ID, e))?,
-                    target_id: r
-                        .try_get::<String, _>("target_id")
-                        .map_err(|e| to_store_err(READ_TARGET_ID, e))?,
-                    // v0.7.0 fix campaign R1-M4 — parse closed-set
-                    // relation. Unknown values fall back to default so
-                    // the read path never errors; the SQL CHECK on the
-                    // write side keeps new rows in the closed set.
-                    relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
-                        .unwrap_or_default(),
-                    created_at: created_at.to_rfc3339(),
-                    signature,
-                    observed_by,
-                    valid_from: valid_from.map(|t| t.to_rfc3339()),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
-                    // v0.7.0 issue #860 — surface attest_level on the
-                    // Postgres SAL `list_links` read path so the
-                    // adapter matches the `memory_get_links` MCP
-                    // tool's docstring promise.
-                    attest_level,
-                    source_cid: None,
-                    target_cid: None,
-                })
-            })
+            .map(crate::store::postgres_export_page::pg_export_link_from_row)
             .collect()
     }
 
@@ -31324,6 +31276,29 @@ impl MemoryStore for PostgresStore {
         // Delegate to the existing `list_links` trait method (no
         // namespace filter ⇒ full graph).
         self.list_links(None).await
+    }
+
+    async fn export_memories_page(
+        &self,
+        cursor: Option<&crate::export_paging::ExportCursor>,
+        limit: usize,
+        as_of: DateTime<Utc>,
+    ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
+        crate::store::postgres_export_page::export_memories_page(
+            &self.pool, cursor, limit, as_of, Self::row_to_memory_scan,
+        )
+        .await
+    }
+
+    async fn export_links_page(
+        &self,
+        scope: &crate::export_paging::ExportPageScope,
+        survivors: &std::collections::HashSet<String>,
+    ) -> StoreResult<crate::export_paging::ExportLinksPage> {
+        crate::store::postgres_export_page::export_links_page(
+            &self.pool, scope, survivors, Self::row_to_memory_scan,
+        )
+        .await
     }
 
     async fn notify(

@@ -2942,6 +2942,25 @@ impl MemoryStore for SqliteStore {
         db::export_links(&conn).map_err(box_err)
     }
 
+    async fn export_memories_page(
+        &self,
+        cursor: Option<&crate::export_paging::ExportCursor>,
+        limit: usize,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
+        let conn = self.state.lock().await;
+        db::export_page::memories_page(&conn, cursor, limit, as_of).map_err(box_err)
+    }
+
+    async fn export_links_page(
+        &self,
+        scope: &crate::export_paging::ExportPageScope,
+        survivors: &std::collections::HashSet<String>,
+    ) -> StoreResult<crate::export_paging::ExportLinksPage> {
+        let conn = self.state.lock().await;
+        db::export_page::links_page(&conn, scope, survivors).map_err(box_err)
+    }
+
     async fn build_namespace_chain(&self, namespace: &str) -> StoreResult<Vec<String>> {
         let conn = self.state.lock().await;
         Ok(db::build_namespace_chain(&conn, namespace))
