@@ -364,11 +364,17 @@ async fn assert_no_disclosure(mut app: AppState) {
             assert_eq!(peer["reachability"]["state"], "unknown");
             assert_eq!(peer["identity_ref"], api_key_sha256_hex(DSN));
             let pushed = &value["federation"]["peers"][1];
-            let age = pushed["last_successful_push_age_seconds"]
+            // Observed: an available signal object carrying the value, never
+            // a bare number (the v1 contract keeps the field's JSON type).
+            let age = &pushed["last_successful_push_age_seconds"];
+            assert_eq!(age["state"], "available", "{pushed}");
+            let age = age["value"]
                 .as_i64()
-                .unwrap_or_else(|| panic!("an observed push age is a number: {pushed}"));
+                .unwrap_or_else(|| panic!("an observed push age carries a value: {pushed}"));
             assert!((0..=60).contains(&age), "{pushed}");
-            assert!(pushed["last_accepted_push_at_seconds"].is_i64(), "{pushed}");
+            let accepted = &pushed["last_accepted_push_at_seconds"];
+            assert_eq!(accepted["state"], "available", "{pushed}");
+            assert!(accepted["value"].is_i64(), "{pushed}");
             // Pushes are not a liveness probe: no pull, so still unknown.
             assert_eq!(pushed["reachability"]["state"], "unknown", "{pushed}");
         }

@@ -101,9 +101,9 @@ have broader privileges on other routes.
 Legacy peer IDs may contain credential URLs, so neither raw peer IDs nor endpoints
 are returned. Operators correlate a peer by hashing its configured ID locally
 (SHA-256 over its UTF-8 bytes, lowercase hex). These references describe configured
-membership, not successful remote identity verification. Peers in inbound-only or
-catch-up-only configurations are not enumerated here; #3654 owns complete observed
-membership. An empty peer array must not be read as proof that a fleet is healthy.
+membership, not successful remote identity verification. Only configured outbound
+peers are enumerated; a peer that only pushes to this node is not listed (tracked
+in #3686). An empty peer array must not be read as proof that a fleet is healthy.
 
 At this release head, required operation and wake observations are unavailable,
 so a responding, readable node reports `degraded` with
@@ -118,12 +118,12 @@ by-design degradation.
 Unavailable fields have exactly this shape (no fabricated numeric value):
 
 ```json
-{"state":"unavailable","reason":"not_yet_instrumented","issue":3654}
+{"state":"unavailable","reason":"not_yet_instrumented","issue":3657}
 ```
 
 | Fields | Owning audit issue |
 |---|---|
-| Per-peer `reachability`, `last_successful_push_age_seconds`, `last_push_attempt_at_seconds`, `last_accepted_push_at_seconds`, `replication_lag`, `dlq_depth`, `dlq_oldest_age_seconds`, `catch_up_progress`, `clock_skew_seconds` | #3654 |
+| Per-peer `replication_lag`, `catch_up_progress` | #3681 |
 | `singleton.embedder_operation_health`, `singleton.operation_rates_and_latency`, `federation.quorum_outcomes` | #3653 |
 | `singleton.disk_wal_backup` (remote diagnostic coverage) | #3656 |
 | `federation.nonce_cache` | #3662 |
@@ -137,6 +137,17 @@ carry freshness where appropriate, and preserve the v1 absence semantics.
 An instrumented field remains a signal object, with an available state and
 additive `value`/freshness fields; it must not replace an unavailable object
 with a bare number.
+
+The per-peer fields #3654 instruments follow that rule. An observed value is
+`{"state":"available","value":<integer>}`; a field this node has not observed
+for that peer is `{"state":"unavailable","reason":"<why>"}` with no `issue`,
+because it is instrumented and simply has no observation yet. The reasons are
+`no_push_success_observed`, `no_push_attempt_observed`, `dlq_not_measured`,
+`backlog_empty` (`dlq_oldest_age_seconds` when the measured depth is 0),
+`oldest_failure_unparseable` and `no_catchup_response_date_observed`.
+`reachability` is its own tagged object (`reachable`, `failing` or `unknown`
+with a reason); see [federation.md](federation.md) for how each field is
+measured.
 
 ## Numeric signals and privacy
 
