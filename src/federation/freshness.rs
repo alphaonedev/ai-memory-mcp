@@ -27,9 +27,14 @@
 //!
 //! ## Telling the failure modes apart
 //!
-//! - quiet but healthy: pull attempts and successes keep advancing every
-//!   catch-up interval; push attempts only advance when there is something to
-//!   push, and every attempt succeeds.
+//! - silence is UNKNOWN, never healthy. A push attempt only happens when there
+//!   is something to push, so an old `last_success{direction="push"}` with no
+//!   newer attempt says nothing about whether the peer would accept the next
+//!   one. The only periodic liveness probe is the pull direction (the catch-up
+//!   loop); a node that runs no catch-up loop has none, and the health surface
+//!   reports such a peer's reachability as `unknown`.
+//! - responding: pull attempts and successes keep advancing every catch-up
+//!   interval and each push attempt succeeds.
 //! - stopped accepting pushes: `last_attempt{direction="push"}` is newer than
 //!   `last_success{direction="push"}` and `consecutive_failures` climbs.
 //! - unreachable / partitioned: the same shape on `pull`, class `unreachable`.
@@ -323,12 +328,179 @@ pub fn note_configured(peers: &[PeerEndpoint]) {
     }
 }
 
+/// Running catch-up loops and the cadence the most recent one published.
+#[derive(Debug, Default)]
+struct CatchupLoops {
+    running: usize,
+    interval: Option<Duration>,
+}
+
+fn catchup_loops() -> MutexGuard<'static, CatchupLoops> {
+    static LOOPS: OnceLock<Mutex<CatchupLoops>> = OnceLock::new();
+    // Same recovery rationale as `table()`: the state is a counter and a
+    // cadence, never durable data (CONCURRENCY-18).
+    LOOPS
+        .get_or_init(|| Mutex::new(CatchupLoops::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keeps `ai_memory_federation_catchup_interval_seconds` present for exactly
+/// as long as a catch-up loop is alive. Move it into the loop's task: when
+/// the task ends or is aborted the future is dropped, the guard with it, and
+/// once the last loop is gone the series is removed. A node that never runs a
+/// catch-up loop therefore exports no cadence at all, never a `0`.
+#[must_use = "the cadence series is removed as soon as the guard drops"]
+#[derive(Debug)]
+pub struct CatchupIntervalGuard {
+    _owned: (),
+}
+
+impl Drop for CatchupIntervalGuard {
+    fn drop(&mut self) {
+        let mut loops = catchup_loops();
+        loops.running = loops.running.saturating_sub(1);
+        if loops.running == 0 {
+            loops.interval = None;
+            // `Err` only means the child is already gone; nothing to undo,
+            // and a destructor must not panic (OWNERSHIP-25).
+            let _ = crate::metrics::registry()
+                .federation_catchup_interval_seconds
+                .remove_label_values(&[]);
+        }
+    }
+}
+
 /// Publish the catch-up cadence so a stalled catch-up worker is alertable
-/// (`time() - last_attempt{direction="pull"}` against a multiple of it).
-pub fn note_catchup_interval(interval: Duration) {
+/// (`time() - last_attempt{direction="pull"}` against a multiple of it). The
+/// series lives until the returned guard drops.
+pub fn publish_catchup_interval(interval: Duration) -> CatchupIntervalGuard {
+    let mut loops = catchup_loops();
+    loops.running = loops.running.saturating_add(1);
+    loops.interval = Some(interval);
+    // The gauge is written under the same lock as the count, so a guard
+    // dropping concurrently cannot remove the series after this publish.
     crate::metrics::registry()
         .federation_catchup_interval_seconds
+        .with_label_values(&[])
         .set(i64::try_from(interval.as_secs()).unwrap_or(i64::MAX));
+    CatchupIntervalGuard { _owned: () }
+}
+
+/// The cadence of the running catch-up loop, or `None` when no loop runs (and
+/// the pull direction therefore carries no liveness signal).
+#[must_use]
+pub fn catchup_interval() -> Option<Duration> {
+    catchup_loops().interval
+}
+
+/// A pull observation older than this many catch-up intervals no longer says
+/// anything about the peer: the loop that should have refreshed it is stalled
+/// or gone, so reachability degrades to [`Reachability::Unknown`].
+pub const REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS: u32 = 3;
+
+/// Why reachability is [`Reachability::Unknown`]: no catch-up loop runs.
+pub const UNKNOWN_NO_CATCHUP_LOOP: &str = "no_catchup_loop";
+/// Why reachability is [`Reachability::Unknown`]: no pull was ever observed.
+pub const UNKNOWN_NO_PULL_OBSERVATION: &str = "no_pull_observation";
+/// Why reachability is [`Reachability::Unknown`]: the last pull is stale.
+pub const UNKNOWN_PULL_OBSERVATION_STALE: &str = "pull_observation_stale";
+
+/// Pull-derived reachability of one peer, for the health surface (#3646).
+///
+/// Only the pull direction is a periodic probe; a push happens only when there
+/// is something to push, so push silence carries no liveness signal. Silence
+/// is never resolved in favour of the peer: without a recent pull observation
+/// the answer is [`Reachability::Unknown`] with the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Reachability {
+    /// The last catch-up pull, within the staleness window, succeeded.
+    Reachable {
+        /// Unix seconds (local clock) of that pull.
+        last_pull_success_at_seconds: i64,
+    },
+    /// The latest catch-up pulls, within the staleness window, failed.
+    Failing {
+        /// Class of the most recent failure.
+        failure_class: Option<&'static str>,
+        /// Failed pulls since the last success.
+        consecutive_failures: u64,
+        /// Unix seconds (local clock) of the first failure of the streak.
+        failing_since_seconds: Option<i64>,
+    },
+    /// No liveness signal for this peer.
+    Unknown {
+        /// One of the `UNKNOWN_*` reasons.
+        reason: &'static str,
+    },
+}
+
+/// Derive [`Reachability`] from a peer's pull observations. `catchup` is the
+/// running catch-up loop's cadence ([`catchup_interval`]); `now` is unix
+/// seconds on the local clock.
+#[must_use]
+pub fn reachability(
+    peer: Option<&PeerFreshness>,
+    catchup: Option<Duration>,
+    now: i64,
+) -> Reachability {
+    let Some(interval) = catchup else {
+        return Reachability::Unknown {
+            reason: UNKNOWN_NO_CATCHUP_LOOP,
+        };
+    };
+    let Some(pull) = peer.map(|p| &p.pull) else {
+        return Reachability::Unknown {
+            reason: UNKNOWN_NO_PULL_OBSERVATION,
+        };
+    };
+    let Some(last_attempt) = pull.last_attempt_unix else {
+        return Reachability::Unknown {
+            reason: UNKNOWN_NO_PULL_OBSERVATION,
+        };
+    };
+    let window = i64::try_from(
+        interval
+            .saturating_mul(REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS)
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX);
+    if now.saturating_sub(last_attempt) > window {
+        return Reachability::Unknown {
+            reason: UNKNOWN_PULL_OBSERVATION_STALE,
+        };
+    }
+    match (pull.consecutive_failures, pull.last_success_unix) {
+        (0, Some(at)) => Reachability::Reachable {
+            last_pull_success_at_seconds: at,
+        },
+        // An attempt is always a success or a failure, so zero failures with
+        // no success cannot be recorded; if it ever were, say so honestly.
+        (0, None) => Reachability::Unknown {
+            reason: UNKNOWN_NO_PULL_OBSERVATION,
+        },
+        (failures, _) => Reachability::Failing {
+            failure_class: pull.last_failure_class,
+            consecutive_failures: failures,
+            failing_since_seconds: pull.failing_since_unix,
+        },
+    }
+}
+
+/// Clause appended to an escalation WARN whose last failure was on THIS node.
+///
+/// A panicked or cancelled fan-out task still counts toward the peer's push
+/// streak on purpose: the write it carried did not reach the peer, so
+/// replication with that peer really did not converge for it. The WARN says
+/// the cause was local so nobody goes looking for a fault on the peer.
+const fn local_failure_note(class: FailureClass) -> &'static str {
+    match class {
+        FailureClass::TaskFailed => {
+            ", a panicked or cancelled fan-out task on this node, not a peer response"
+        }
+        _ => "",
+    }
 }
 
 /// Record one outcome of an exchange with `peer_id`.
@@ -413,11 +585,12 @@ fn record_at(peer_id: &str, direction: Direction, observation: Observation, now:
                     class = class.as_label(),
                     failing_for_seconds = failing_for,
                     "federation: peer {label} {dir} has failed {n} consecutive attempts over \
-                     {failing_for}s (last: {cls}); replication with this peer is not converging \
-                     (#3654)",
+                     {failing_for}s (last: {cls}{local}); replication with this peer is not \
+                     converging (#3654)",
                     dir = direction.as_label(),
                     n = after.consecutive_failures,
                     cls = class.as_label(),
+                    local = local_failure_note(class),
                 );
             }
         }
@@ -692,5 +865,94 @@ mod tests {
         let busy_after = snapshot_for(&busy).unwrap();
         assert_eq!(busy_after.push_dlq_depth, Some(4));
         assert_eq!(busy_after.push_dlq_oldest_failed_unix, Some(1_000));
+    }
+
+    fn pulled(last_attempt: i64, last_success: Option<i64>, failures: u64) -> PeerFreshness {
+        PeerFreshness {
+            pull: DirectionFreshness {
+                last_attempt_unix: Some(last_attempt),
+                last_success_unix: last_success,
+                consecutive_failures: failures,
+                last_failure_class: (failures > 0).then_some("unreachable"),
+                failing_since_unix: (failures > 0).then_some(last_attempt - 60),
+            },
+            ..PeerFreshness::default()
+        }
+    }
+
+    /// D2: silence is unknown, never healthy — and only the pull direction
+    /// (the periodic probe) decides reachability.
+    #[test]
+    fn reachability_is_unknown_without_a_fresh_pull_observation() {
+        let every_30s = Some(Duration::from_secs(30));
+        let now = 10_000;
+        // No catch-up loop: even a perfect old pull says nothing now.
+        assert_eq!(
+            reachability(Some(&pulled(now - 5, Some(now - 5), 0)), None, now),
+            Reachability::Unknown {
+                reason: UNKNOWN_NO_CATCHUP_LOOP
+            }
+        );
+        // A peer the registry has never seen, and one with pushes only.
+        assert_eq!(
+            reachability(None, every_30s, now),
+            Reachability::Unknown {
+                reason: UNKNOWN_NO_PULL_OBSERVATION
+            }
+        );
+        let push_only = PeerFreshness {
+            push: DirectionFreshness {
+                last_attempt_unix: Some(now - 1),
+                last_success_unix: Some(now - 1),
+                ..DirectionFreshness::default()
+            },
+            ..PeerFreshness::default()
+        };
+        assert_eq!(
+            reachability(Some(&push_only), every_30s, now),
+            Reachability::Unknown {
+                reason: UNKNOWN_NO_PULL_OBSERVATION
+            }
+        );
+        // Exactly at the window (3 x 30 s) the observation still counts; one
+        // second past it, the stalled loop's last word is no longer believed.
+        assert_eq!(
+            reachability(Some(&pulled(now - 90, Some(now - 90), 0)), every_30s, now),
+            Reachability::Reachable {
+                last_pull_success_at_seconds: now - 90
+            }
+        );
+        assert_eq!(
+            reachability(Some(&pulled(now - 91, Some(now - 91), 0)), every_30s, now),
+            Reachability::Unknown {
+                reason: UNKNOWN_PULL_OBSERVATION_STALE
+            }
+        );
+    }
+
+    #[test]
+    fn reachability_reports_a_failing_pull_streak_with_its_class() {
+        let now = 10_000;
+        let r = reachability(
+            Some(&pulled(now - 10, Some(now - 500), 4)),
+            Some(Duration::from_secs(30)),
+            now,
+        );
+        assert_eq!(
+            r,
+            Reachability::Failing {
+                failure_class: Some("unreachable"),
+                consecutive_failures: 4,
+                failing_since_seconds: Some(now - 70),
+            }
+        );
+        let json = serde_json::to_value(r).expect("serialize");
+        assert_eq!(json["state"], "failing");
+        assert_eq!(json["consecutive_failures"], 4);
+        let unknown = serde_json::to_value(reachability(None, None, now)).expect("serialize");
+        assert_eq!(
+            unknown,
+            serde_json::json!({"state": "unknown", "reason": "no_catchup_loop"})
+        );
     }
 }

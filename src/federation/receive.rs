@@ -368,9 +368,11 @@ pub fn spawn_catchup_loop(
     }
     #[cfg(not(feature = "sal"))]
     {
-        // #3654 — publish the cadence so a stalled worker is alertable.
-        super::freshness::note_catchup_interval(interval);
+        // #3654 — publish the cadence so a stalled worker is alertable; the
+        // guard lives in the task, so the series dies with the loop.
+        let cadence = super::freshness::publish_catchup_interval(interval);
         tokio::spawn(async move {
+            let _cadence = cadence;
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
                 catchup_once(&config, &db).await;
@@ -397,9 +399,11 @@ pub fn spawn_catchup_loop_with_store(
     store: Option<Arc<dyn crate::store::MemoryStore>>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    // #3654 — publish the cadence so a stalled worker is alertable.
-    super::freshness::note_catchup_interval(interval);
+    // #3654 — publish the cadence so a stalled worker is alertable; the
+    // guard lives in the task, so the series dies with the loop.
+    let cadence = super::freshness::publish_catchup_interval(interval);
     tokio::spawn(async move {
+        let _cadence = cadence;
         // Small upfront delay so the first catchup doesn't fire before the
         // HTTP server has bound — avoids spurious "connection refused" on
         // node-1 during rolling start of a fresh cluster.

@@ -136,6 +136,9 @@ fn health_state(failing: bool, degraded: bool) -> HealthState {
     }
 }
 
+/// `state` of every field this surface cannot report a number for.
+const UNAVAILABLE_STATE: &str = "unavailable";
+
 #[derive(Serialize)]
 struct Unavailable {
     state: &'static str,
@@ -145,10 +148,79 @@ struct Unavailable {
 
 const fn unavailable(issue: u32) -> Unavailable {
     Unavailable {
-        state: "unavailable",
+        state: UNAVAILABLE_STATE,
         reason: "not_yet_instrumented",
         issue,
     }
+}
+
+/// A per-peer field that IS instrumented (#3654) but that this node has not
+/// observed for the peer. Reporting a number here, a zero included, would be
+/// a claim the node never measured.
+#[derive(Serialize)]
+struct NotObserved {
+    state: &'static str,
+    reason: &'static str,
+}
+
+/// Issue that owns the per-peer fields #3654 does not measure.
+const PEER_LAG_ISSUE: u32 = 3681;
+const NO_PUSH_SUCCESS: &str = "no_push_success_observed";
+const NO_PUSH_ATTEMPT: &str = "no_push_attempt_observed";
+const DLQ_NOT_MEASURED: &str = "dlq_not_measured";
+const DLQ_BACKLOG_EMPTY: &str = "backlog_empty";
+const DLQ_OLDEST_UNPARSEABLE: &str = "oldest_failure_unparseable";
+const NO_PEER_DATE_HEADER: &str = "no_catchup_response_date_observed";
+
+/// `value` when observed, otherwise the explicit not-observed object.
+fn observed(value: Option<i64>, reason: &'static str) -> serde_json::Value {
+    value.map_or_else(
+        || {
+            json!(NotObserved {
+                state: UNAVAILABLE_STATE,
+                reason
+            })
+        },
+        |v| json!(v),
+    )
+}
+
+/// The per-peer block of the status payload, from the freshness registry.
+///
+/// Every timestamp is this node's own observation (`freshness` never takes a
+/// peer-supplied instant as freshness). `last_accepted_push_at_seconds` is the
+/// last push THIS peer applied (#2341: a 200 that skipped the items is not
+/// acceptance), and `last_successful_push_age_seconds` is its age.
+/// Reachability comes from pulls only, and is `unknown` without a fresh one.
+fn peer_status(
+    id: &str,
+    fresh: Option<&crate::federation::freshness::PeerFreshness>,
+    catchup: Option<std::time::Duration>,
+    now: i64,
+) -> serde_json::Value {
+    use crate::federation::freshness;
+    let accepted = fresh.and_then(|f| f.push.last_success_unix);
+    let depth = fresh.and_then(|f| f.push_dlq_depth);
+    let oldest_age = match (depth, fresh.and_then(|f| f.push_dlq_oldest_failed_unix)) {
+        (None, _) => observed(None, DLQ_NOT_MEASURED),
+        (Some(0), _) => observed(None, DLQ_BACKLOG_EMPTY),
+        (Some(_), None) => observed(None, DLQ_OLDEST_UNPARSEABLE),
+        (Some(_), Some(ts)) => json!(now.saturating_sub(ts).max(0)),
+    };
+    json!({
+        "identity_ref": identity_ref(id),
+        "reachability": freshness::reachability(fresh, catchup, now),
+        "last_successful_push_age_seconds":
+            observed(accepted.map(|ts| now.saturating_sub(ts).max(0)), NO_PUSH_SUCCESS),
+        "last_push_attempt_at_seconds":
+            observed(fresh.and_then(|f| f.push.last_attempt_unix), NO_PUSH_ATTEMPT),
+        "last_accepted_push_at_seconds": observed(accepted, NO_PUSH_SUCCESS),
+        "replication_lag": unavailable(PEER_LAG_ISSUE),
+        "dlq_depth": observed(depth, DLQ_NOT_MEASURED),
+        "dlq_oldest_age_seconds": oldest_age,
+        "catch_up_progress": unavailable(PEER_LAG_ISSUE),
+        "clock_skew_seconds": observed(fresh.and_then(|f| f.clock_skew_seconds), NO_PEER_DATE_HEADER)
+    })
 }
 
 /// Hash identifiers because legacy peer IDs may themselves be credential URLs.
@@ -194,6 +266,7 @@ pub(crate) async fn status(State(app): State<AppState>) -> Response {
         || (fts_state != PROBE_NOT_APPLICABLE && verdict.is_unhealthy());
     // Missing critical observations must not become a fleet-wide healthy claim.
     let state = health_state(failing, true);
+    let catchup = crate::federation::freshness::catchup_interval();
     let peers: Vec<_> = app
         .federation
         .as_ref()
@@ -202,18 +275,8 @@ pub(crate) async fn status(State(app): State<AppState>) -> Response {
             f.peers
                 .iter()
                 .map(|p| {
-                    json!({
-                        "identity_ref": identity_ref(&p.id),
-                        "reachability": unavailable(3654),
-                        "last_successful_push_age_seconds": unavailable(3654),
-                        "last_push_attempt_at_seconds": unavailable(3654),
-                        "last_accepted_push_at_seconds": unavailable(3654),
-                        "replication_lag": unavailable(3654),
-                        "dlq_depth": unavailable(3654),
-                        "dlq_oldest_age_seconds": unavailable(3654),
-                        "catch_up_progress": unavailable(3654),
-                        "clock_skew_seconds": unavailable(3654)
-                    })
+                    let fresh = crate::federation::freshness::snapshot_for(&p.id);
+                    peer_status(&p.id, fresh.as_ref(), catchup, now)
                 })
                 .collect()
         })
@@ -321,5 +384,83 @@ mod tests {
             serde_json::to_value(unavailable(3657)).unwrap()["reason"],
             "not_yet_instrumented"
         );
+    }
+
+    /// #3654 D3: the per-peer fields report what the freshness registry
+    /// observed, and an explicit not-observed object otherwise — never a zero
+    /// and never `healthy` from silence.
+    #[test]
+    fn issue_3654_peer_fields_report_only_what_was_observed() {
+        use crate::federation::freshness::{DirectionFreshness, PeerFreshness};
+        let now = 50_000;
+        let every_30s = Some(std::time::Duration::from_secs(30));
+
+        // Quiet peer: pulls fine, never pushed to, backlog never measured.
+        let quiet = PeerFreshness {
+            pull: DirectionFreshness {
+                last_attempt_unix: Some(now - 10),
+                last_success_unix: Some(now - 10),
+                ..DirectionFreshness::default()
+            },
+            ..PeerFreshness::default()
+        };
+        let v = peer_status("peer-0", Some(&quiet), every_30s, now);
+        assert_eq!(v["reachability"]["state"], "reachable");
+        for field in [
+            "last_successful_push_age_seconds",
+            "last_accepted_push_at_seconds",
+        ] {
+            assert_eq!(v[field]["state"], "unavailable", "{field}");
+            assert_eq!(v[field]["reason"], "no_push_success_observed", "{field}");
+        }
+        assert_eq!(v["last_push_attempt_at_seconds"]["reason"], "no_push_attempt_observed");
+        assert_eq!(v["dlq_depth"]["reason"], "dlq_not_measured");
+        assert_eq!(v["replication_lag"]["issue"], 3681);
+        assert_eq!(v["catch_up_progress"]["issue"], 3681);
+
+        // Same peer on a node that runs no catch-up loop: reachability is
+        // unknown, not reachable, however good the old pull looked.
+        let v = peer_status("peer-0", Some(&quiet), None, now);
+        assert_eq!(v["reachability"]["state"], "unknown");
+        assert_eq!(v["reachability"]["reason"], "no_catchup_loop");
+
+        // A peer that stopped accepting pushes: the last attempt is newer than
+        // the last acceptance, the age keeps growing, the backlog is measured.
+        let rejecting = PeerFreshness {
+            push: DirectionFreshness {
+                last_attempt_unix: Some(now - 5),
+                last_success_unix: Some(now - 3_600),
+                consecutive_failures: 7,
+                last_failure_class: Some("not_applied"),
+                failing_since_unix: Some(now - 3_500),
+            },
+            clock_skew_seconds: Some(-2),
+            push_dlq_depth: Some(4),
+            push_dlq_oldest_failed_unix: Some(now - 3_500),
+            ..PeerFreshness::default()
+        };
+        let v = peer_status("peer-1", Some(&rejecting), every_30s, now);
+        assert_eq!(v["last_successful_push_age_seconds"], 3_600);
+        assert_eq!(v["last_accepted_push_at_seconds"], now - 3_600);
+        assert_eq!(v["last_push_attempt_at_seconds"], now - 5);
+        assert_eq!(v["dlq_depth"], 4);
+        assert_eq!(v["dlq_oldest_age_seconds"], 3_500);
+        assert_eq!(v["clock_skew_seconds"], -2);
+        assert_eq!(v["reachability"]["reason"], "no_pull_observation");
+
+        // Measured empty backlog: depth 0 is a measurement, the oldest age is
+        // not a number because there is no oldest row.
+        let drained = PeerFreshness {
+            push_dlq_depth: Some(0),
+            ..PeerFreshness::default()
+        };
+        let v = peer_status("peer-2", Some(&drained), every_30s, now);
+        assert_eq!(v["dlq_depth"], 0);
+        assert_eq!(v["dlq_oldest_age_seconds"]["reason"], "backlog_empty");
+
+        // A peer the registry has never seen.
+        let v = peer_status("peer-3", None, every_30s, now);
+        assert_eq!(v["reachability"]["reason"], "no_pull_observation");
+        assert_eq!(v["clock_skew_seconds"]["reason"], "no_catchup_response_date_observed");
     }
 }

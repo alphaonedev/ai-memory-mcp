@@ -322,7 +322,11 @@ async fn unauthorized_and_server_error_peers_are_told_apart() {
     for (status, class) in [
         (401, "unauthorized"),
         (403, "unauthorized"),
+        (429, "throttled"),
         (500, "server_error"),
+        // A 2xx whose envelope has no `memories` array: before #3654 the
+        // catch-up skipped it silently; now it is a malformed response.
+        (200, "bad_response"),
     ] {
         let id = peer_id();
         let cfg = config(&spawn_peer(Answer::Status(status)).await, &id);
@@ -414,6 +418,14 @@ async fn pushes_distinguish_accepting_rejecting_and_not_applying_peers() {
     assert!(fresh.push.consecutive_failures >= 1);
     assert_eq!(fresh.push.last_failure_class, Some("server_error"));
 
+    // A peer throttling us is told apart from one that is broken.
+    let throttling = peer_id();
+    let cfg = config(&spawn_peer(Answer::Status(429)).await, &throttling);
+    let _ = ai_memory::federation::broadcast_store_quorum(&cfg, &memory()).await;
+    let fresh = freshness::snapshot_for(&throttling).expect("push recorded");
+    assert_eq!(fresh.push.last_success_unix, None);
+    assert_eq!(fresh.push.last_failure_class, Some("throttled"));
+
     // A 2xx whose own report says the item was skipped is NOT a success
     // (#2341), so a peer that answers 200 and drops everything is visible.
     let dropping = peer_id();
@@ -474,7 +486,7 @@ async fn url_shaped_peer_ids_never_reach_the_exposition() {
 }
 
 #[tokio::test]
-async fn catchup_worker_publishes_its_cadence_so_a_stall_is_alertable() {
+async fn catchup_worker_publishes_its_cadence_only_while_it_runs() {
     let id = peer_id();
     let cfg = config(&spawn_peer(Answer::Ok).await, &id);
     let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
@@ -483,15 +495,25 @@ async fn catchup_worker_publishes_its_cadence_so_a_stall_is_alertable() {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    let published = || {
+        ai_memory::metrics::render()
+            .lines()
+            .find_map(|l| l.strip_prefix("ai_memory_federation_catchup_interval_seconds "))
+            .map(|v| v.trim().to_string())
+    };
     let interval = Duration::from_secs(47);
     let handle = ai_memory::federation::spawn_catchup_loop(cfg, db, interval);
+    // While the loop is alive the cadence is published and readable in-process.
+    assert_eq!(published().as_deref(), Some("47"));
+    assert_eq!(freshness::catchup_interval(), Some(interval));
     handle.abort();
+    // `abort` + `await` returns only after the task's future is dropped, and
+    // the cadence guard with it.
     let _ = handle.await;
-    let published = ai_memory::metrics::render()
-        .lines()
-        .find_map(|l| l.strip_prefix("ai_memory_federation_catchup_interval_seconds "))
-        .map(|v| v.trim().to_string());
-    assert_eq!(published.as_deref(), Some("47"));
+    // D1: once no catch-up loop runs, the series is ABSENT, not a `0` that
+    // would read as "the interval is zero seconds" and disarm the stall alert.
+    assert_eq!(published(), None);
+    assert_eq!(freshness::catchup_interval(), None);
     // The worker never got to run: the peer has NO attempt series, which is
     // exactly what `time() - last_attempt > k * interval` alerts on — never a
     // zero that would read as "attempted in 1970".
