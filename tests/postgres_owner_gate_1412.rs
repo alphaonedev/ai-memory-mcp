@@ -156,13 +156,22 @@ async fn postgres_update_owner_mismatch_returns_permission_denied() {
         } => {
             assert_eq!(action, "update", "action carries op name; got: {action:?}");
             assert_eq!(target, inserted_id, "target is the row id");
-            assert!(
-                reason.contains(bob),
-                "reason names the rejected caller, got: {reason:?}"
+            // #3426 — INVERTED. This pin previously required the refusal
+            // reason to NAME the rightful owner; that reason is rendered
+            // straight into the 403 body by `store_err_to_response` (its
+            // sanitizer redacts URLs and filesystem paths, not principals),
+            // so it disclosed WHO holds a row to a caller not entitled to
+            // it. The reason is now the bare SSOT message, byte-identical
+            // on both backends; the caller/owner attribution moved to the
+            // server-side `ai_memory::authz` trace line.
+            assert_eq!(
+                reason,
+                ai_memory::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+                "reason is the bare SSOT message, got: {reason:?}"
             );
             assert!(
-                reason.contains(alice),
-                "reason names the rightful owner, got: {reason:?}"
+                !reason.contains(alice) && !reason.contains(bob),
+                "reason must name neither principal (#3426), got: {reason:?}"
             );
         }
         other => panic!("expected PermissionDenied, got: {other:?}"),
