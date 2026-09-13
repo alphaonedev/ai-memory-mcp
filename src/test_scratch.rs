@@ -1,8 +1,10 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-lifetime temporary directories for tests, removed when the
-//! process exits (#3669).
+//! Test fixtures for temp-directory hygiene (#3669): process-lifetime
+//! temporary directories removed when the process exits, and
+//! [`seeded_refused_root`], which reads the temp roots the shipped
+//! governance rules refuse from their migration seed so no test spells them.
 //!
 //! Most test fixtures should own their `tempfile::TempDir` for the length of
 //! one test: return it next to the handle as a `(handle, guard)` pair and bind
@@ -101,9 +103,59 @@ extern "C" fn remove_scheduled_dirs() {
     });
 }
 
+/// The seed of the shipped operator hard rules R001-R004 (#691). It is the
+/// one file that spells the refused temp roots; it is not a Rust source.
+const GOVERNANCE_SEED_SQL: &str =
+    include_str!("../migrations/sqlite/0024_v07_governance_rules.sql");
+
+/// The directory that seeded rule `rule_id` (`R001`..`R003`) refuses writes
+/// under, read from the shipped migration seed: the `<root>` of its
+/// `{"glob":"<root>/**"}` matcher.
+///
+/// Tests of those rules build their probe paths from this, so they pin the
+/// rule that actually ships and no scanned file spells a system temp root
+/// (#3669, `scripts/check-temp-hygiene.sh` R3).
+///
+/// # Panics
+///
+/// Panics when the seed has no glob matcher for `rule_id` (ERRORS-24: a
+/// test fixture, where a panic is the failure report).
+#[must_use]
+pub fn seeded_refused_root(rule_id: &str) -> &'static str {
+    const GLOB_KEY: &str = "{\"glob\":\"";
+    const GLOB_TAIL: &str = "/**\"";
+    let opener = format!("('{rule_id}',");
+    let start = GOVERNANCE_SEED_SQL
+        .find(&opener)
+        .unwrap_or_else(|| panic!("the governance seed has no rule {rule_id}"));
+    let row = &GOVERNANCE_SEED_SQL[start + opener.len()..];
+    // The row ends where the next seeded row opens.
+    let row = row.find("('R").map_or(row, |next| &row[..next]);
+    let glob = row
+        .find(GLOB_KEY)
+        .map(|at| &row[at + GLOB_KEY.len()..])
+        .unwrap_or_else(|| panic!("seeded rule {rule_id} has no glob matcher"));
+    let end = glob
+        .find(GLOB_TAIL)
+        .unwrap_or_else(|| panic!("seeded rule {rule_id} glob does not end in /**"));
+    &glob[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeded_refused_roots_are_the_temp_root_and_its_twins() {
+        let root = seeded_refused_root("R001");
+        assert_eq!(
+            Path::new(root).parent(),
+            Some(Path::new("/")),
+            "R001 refuses a directory at the filesystem root, got {root:?}"
+        );
+        assert_eq!(seeded_refused_root("R002"), format!("/var{root}"));
+        assert_eq!(seeded_refused_root("R003"), format!("/private{root}"));
+    }
 
     #[test]
     fn process_lifetime_dir_is_stable_and_scheduled_for_exit_cleanup() {

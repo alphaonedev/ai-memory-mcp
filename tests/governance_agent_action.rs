@@ -129,11 +129,11 @@ fn filesystem_write_glob_match_refuses() {
         &signing,
         "R001",
         "filesystem_write",
-        r#"{"glob":"/tmp/**"}"#,
+        r#"{"glob":"/example-root/**"}"#,
         "refuse",
     );
     let action = AgentAction::FilesystemWrite {
-        path: "/tmp/foo/bar.log".into(),
+        path: "/example-root/foo/bar.log".into(),
         byte_estimate: Some(1024),
     };
     let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
@@ -286,11 +286,11 @@ fn refusal_path_still_emits_signed_event() {
         &signing,
         "R001",
         "filesystem_write",
-        r#"{"glob":"/tmp/**"}"#,
+        r#"{"glob":"/example-root/**"}"#,
         "refuse",
     );
     let action = AgentAction::FilesystemWrite {
-        path: "/tmp/x".into(),
+        path: "/example-root/x".into(),
         byte_estimate: None,
     };
     let _ = check_agent_action(&conn, "agent:t", &action).unwrap();
@@ -324,11 +324,11 @@ fn escalate_verdict_lands_in_signed_events_chain_and_verifies_pe5_pe8_1709() {
         &signing,
         "R-esc-1709",
         "filesystem_write",
-        r#"{"glob":"/tmp/**"}"#,
+        r#"{"glob":"/example-root/**"}"#,
         "escalate",
     );
     let action = AgentAction::FilesystemWrite {
-        path: "/tmp/escalate-me".into(),
+        path: "/example-root/escalate-me".into(),
         byte_estimate: None,
     };
     let decision = check_agent_action(&conn, "agent:esc", &action).unwrap();

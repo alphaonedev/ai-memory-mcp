@@ -51,7 +51,7 @@ fn flag_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn ensure_audit_key() {
-    AUDIT_DIR.get_or_init(|| {
+    ai_memory::test_scratch::process_lifetime_dir(&AUDIT_DIR, || {
         let dir = tempfile::Builder::new()
             .prefix("ai-memory-2948-")
             .tempdir()

@@ -32,11 +32,11 @@
 #       paths and an obviously fake root such as `/example/...` for
 #       strings that are only compared.
 #
-# R3 has exactly one sanctioned site: the shipped default governance rules
-# R001-R003 in src/cli/governance_install_defaults.rs, which exist to
-# REFUSE writes to those roots. Only the three `pub const` lines that
-# define the refused roots may spell them; every other file, including
-# the tests of those rules, reads the consts.
+# R3 has no exception. The shipped governance rules R001-R003 refuse
+# writes under these roots, and their only spelling is the migration seed
+# (migrations/sqlite/0024_v07_governance_rules.sql, outside the scanned
+# trees). Tests of those rules read the roots from that seed through
+# `ai_memory::test_scratch::seeded_refused_root`.
 #
 # Usage:
 #   scripts/check-temp-hygiene.sh              gate the working tree
@@ -55,11 +55,6 @@ export LC_ALL=C
 T="tmp"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# The one file allowed to spell a temp root, and the exact line shape
-# allowed there.
-SANCTIONED_FILE="src/cli/governance_install_defaults.rs"
-SANCTIONED_LINE_RE="^pub const R00[123]_REFUSED_ROOT: &str = \"(/${T}|/var/${T}|/private/${T})\";\$"
 
 # A temp root at the START of a path: not preceded by a path character,
 # and followed by a separator or the end. Android's `/data/local/...`,
@@ -104,19 +99,9 @@ scan() {
     # R3 — literal temp roots.
     hits="$(cd "$root" && find src tests scripts -type f 2>/dev/null | sort \
         | xargs grep -nE "$TEMP_ROOT_RE" 2>/dev/null || true)"
-    local line file text bad=""
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        file="${line%%:*}"
-        text="${line#*:}"; text="${text#*:}"
-        if [[ "$file" == "$SANCTIONED_FILE" ]] && [[ "$text" =~ $SANCTIONED_LINE_RE ]]; then
-            continue
-        fi
-        bad+="  $line"$'\n'
-    done <<< "$hits"
-    if [[ -n "$bad" ]]; then
+    if [[ -n "$hits" ]]; then
         echo "R3 FAIL: literal system temp root; use the process temp dir for real paths, /example/... for compared strings:"
-        printf '%s' "$bad"
+        echo "$hits" | sed 's/^/  /'
         fail=1
     fi
 
@@ -132,12 +117,8 @@ self_test() {
     make_tree() {
         local t="$1"
         rm -rf "$t"
-        mkdir -p "$t/src/cli" "$t/tests" "$t/scripts"
-        cat > "$t/src/cli/governance_install_defaults.rs" <<EOF
-pub const R001_REFUSED_ROOT: &str = "/${T}";
-pub const R002_REFUSED_ROOT: &str = "/var/${T}";
-pub const R003_REFUSED_ROOT: &str = "/private/${T}";
-EOF
+        mkdir -p "$t/src" "$t/tests" "$t/scripts"
+        printf '// the roots live in the migration seed\n' > "$t/src/lib.rs"
         cat > "$t/tests/clean.rs" <<EOF
 // Near misses that must pass: android temp, tmpfs, a relative tmp dir,
 // a registered process-lifetime dir and a returned guard.
@@ -171,7 +152,8 @@ EOF
         "root-var|tests/p.rs|// a /var/${T} backup would be reaped|R3 FAIL"
         "root-url|tests/p.rs|const U: &str = \"sqlite:///${T}/x.db\";|R3 FAIL"
         "root-script|scripts/p.sh|out=/${T}/report.json|R3 FAIL"
-        "sanctioned-elsewhere|tests/p.rs|pub const R001_REFUSED_ROOT: &str = \"/${T}\";|R3 FAIL"
+        "root-governance-test|tests/p.rs|json!({\"path\": \"/${T}/foo\"})|R3 FAIL"
+        "root-doc|src/p.rs|/// R001 refuses \`/${T}\` writes|R3 FAIL"
     )
     local p name file content want out
     for p in "${probes[@]}"; do
@@ -188,17 +170,8 @@ EOF
         fi
     done
 
-    # A sanctioned line with any extra content is no longer sanctioned.
-    make_tree "$t"
-    printf 'pub const R001_REFUSED_ROOT: &str = "/%s"; // plus a /%s note\n' "$T" "$T" \
-        > "$t/src/cli/governance_install_defaults.rs"
-    if scan "$t" >/dev/null 2>&1; then
-        echo "SELF-TEST FAIL: a widened sanctioned line was accepted"
-        ok=0
-    fi
-
     if [[ "$ok" -eq 1 ]]; then
-        echo "check-temp-hygiene.sh --self-test: PASS (clean control + ${#probes[@]} planted violations + widened-sanction probe)"
+        echo "check-temp-hygiene.sh --self-test: PASS (clean control + ${#probes[@]} planted violations)"
         return 0
     fi
     return 1

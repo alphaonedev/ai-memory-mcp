@@ -611,8 +611,8 @@ mod tests {
             params![
                 "R001",
                 "filesystem_write",
-                r#"{"glob":"/tmp/**"}"#,
-                "no /tmp writes",
+                r#"{"glob":"/example-root/**"}"#,
+                "no /example-root writes",
             ],
         )
         .unwrap();
@@ -640,7 +640,7 @@ mod tests {
         let args = CheckActionArgs {
             kind: Some("filesystem_write".into()),
             command: None,
-            path: Some("/tmp/foo.txt".into()),
+            path: Some("/example-root/foo.txt".into()),
             host: None,
             binary: None,
             custom_kind: None,
@@ -673,7 +673,7 @@ mod tests {
             "#1103: refuse envelope echoes the action kind"
         );
         assert!(
-            v["reason"].as_str().unwrap_or("").contains("/tmp"),
+            v["reason"].as_str().unwrap_or("").contains("/example-root"),
             "#1103: refuse envelope carries the substrate `reason` string"
         );
     }
@@ -693,7 +693,7 @@ mod tests {
         let args = CheckActionArgs {
             kind: Some("filesystem_write".into()),
             command: None,
-            // Path outside /tmp — substrate rule allows.
+            // Path outside the refused root — substrate rule allows.
             path: Some("/home/user/ok.txt".into()),
             host: None,
             binary: None,
@@ -783,11 +783,11 @@ mod tests {
         let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let tmp = seed_rules_db();
         let conn = open_seeded_conn(&tmp);
-        // Synthetic Claude Code PreToolUse event for an Edit into /tmp.
+        // Synthetic Claude Code PreToolUse event for an Edit into the refused root.
         let event = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Edit",
-            "tool_input": { "file_path": "/tmp/foo.txt", "old_string": "a", "new_string": "b" },
+            "tool_input": { "file_path": "/example-root/foo.txt", "old_string": "a", "new_string": "b" },
         });
         let decision = decide_pretool_event(&conn, "anonymous:mcp", &event)
             .expect("rule check ok")
@@ -797,7 +797,7 @@ mod tests {
             "#1811: a substrate Refuse must translate to a Claude Code `deny` so the tool BLOCKS"
         );
         assert!(
-            decision.reason.contains("/tmp"),
+            decision.reason.contains("/example-root"),
             "deny reason must carry the substrate rule reason, got: {}",
             decision.reason
         );
@@ -849,7 +849,7 @@ mod tests {
         // it is ungoverned → allow without ever touching the rules engine.
         let event = serde_json::json!({
             "tool_name": "Read",
-            "tool_input": { "file_path": "/tmp/whatever" },
+            "tool_input": { "file_path": "/example-root/whatever" },
         });
         let decision = decide_pretool_event(&conn, "anonymous:mcp", &event).expect("ok");
         assert!(decision.is_none(), "ungoverned tool allows");

@@ -9,7 +9,7 @@
 //! execution, filesystem writes outside the substrate, network
 //! requests, or process spawns. Issue #691 RCA: every operator hard
 //! rule that has ever been violated in the v0.7.0 campaign (5-6
-//! occurrences of `/tmp` writes, low-disk `cargo` runs) lived OUTSIDE
+//! occurrences of system-temp writes, low-disk `cargo` runs) lived OUTSIDE
 //! the K9 surface.
 //!
 //! This module adds a second engine — [`check_agent_action`] — that
@@ -355,7 +355,7 @@ impl Severity {
 /// | AgentAction          | Matcher JSON shape                                                      |
 /// |----------------------|-------------------------------------------------------------------------|
 /// | `Bash`               | `{"command_substring":"..."}` — literal substring match on `command`    |
-/// | `FilesystemWrite`    | `{"glob":"/tmp/**"}` — tiny glob over `path`                            |
+/// | `FilesystemWrite`    | `{"glob":"/srv/scratch/**"}` — tiny glob over `path`                      |
 /// | `NetworkRequest`     | `{"host":"*.evil.example.com"}` — glob host match (plain host = exact)   |
 /// | `ProcessSpawn`       | `{"binary":"cargo","disk_free_min_gib":20,"args_contain":"..."}` — binary + disk + optional argv substring |
 /// | `Custom`             | `{"kind":"<kind>","namespace_glob":"secure/**","tier":"long","title_contains":"..."}` — kind + optional payload predicates (ANDed) |
@@ -1231,7 +1231,7 @@ impl RuleEngine {
 /// # use rusqlite::Connection;
 /// let conn: Connection = todo!();
 /// let action = AgentAction::FilesystemWrite {
-///     path: "/tmp/foo".into(),
+///     path: "/srv/scratch/foo".into(),
 ///     byte_estimate: None,
 /// };
 /// let decision = check_agent_action(&conn, "agent:test", &action)?;
@@ -2106,12 +2106,12 @@ mod tests {
             &conn,
             "R001",
             "filesystem_write",
-            r#"{"glob":"/tmp/**"}"#,
+            r#"{"glob":"/example-root/**"}"#,
             "refuse",
             true,
         );
         let action = AgentAction::FilesystemWrite {
-            path: "/tmp/foo.txt".into(),
+            path: "/example-root/foo.txt".into(),
             byte_estimate: None,
         };
         let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
@@ -2130,7 +2130,7 @@ mod tests {
             &conn,
             "R001",
             "filesystem_write",
-            r#"{"glob":"/tmp/**"}"#,
+            r#"{"glob":"/example-root/**"}"#,
             "refuse",
             true,
         );
@@ -2150,12 +2150,12 @@ mod tests {
             &conn,
             "R001",
             "filesystem_write",
-            r#"{"glob":"/tmp/**"}"#,
+            r#"{"glob":"/example-root/**"}"#,
             "refuse",
             false, // disabled
         );
         let action = AgentAction::FilesystemWrite {
-            path: "/tmp/foo".into(),
+            path: "/example-root/foo".into(),
             byte_estimate: None,
         };
         let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
@@ -2604,12 +2604,12 @@ mod tests {
             &conn,
             "R001",
             "filesystem_write",
-            r#"{"glob":"/tmp/**"}"#,
+            r#"{"glob":"/example-root/**"}"#,
             "refuse",
             true,
         );
         let action = AgentAction::FilesystemWrite {
-            path: "/tmp/x".into(),
+            path: "/example-root/x".into(),
             byte_estimate: None,
         };
         let _ = check_agent_action(&conn, "agent:t", &action).unwrap();
@@ -3103,7 +3103,7 @@ mod tests {
                 cwd: None,
             },
             AgentAction::FilesystemWrite {
-                path: "/tmp/x".into(),
+                path: "/example-root/x".into(),
                 byte_estimate: Some(1024),
             },
             AgentAction::NetworkRequest {
@@ -3187,7 +3187,7 @@ mod tests {
         let decision = engine.evaluate(
             "agent:t",
             &AgentAction::Bash {
-                command: "rm -rf /tmp/x".into(),
+                command: "rm -rf /example-root/x".into(),
                 cwd: None,
             },
         );
@@ -3216,7 +3216,7 @@ mod tests {
         let decision = engine.evaluate(
             "agent:t",
             &AgentAction::Bash {
-                command: "rm /tmp/x".into(),
+                command: "rm /example-root/x".into(),
                 cwd: None,
             },
         );
@@ -3265,12 +3265,12 @@ mod tests {
             &conn,
             "R-engine",
             "filesystem_write",
-            r#"{"glob":"/tmp/**"}"#,
+            r#"{"glob":"/example-root/**"}"#,
             "refuse",
             true,
         );
         let action = AgentAction::FilesystemWrite {
-            path: "/tmp/engine.txt".into(),
+            path: "/example-root/engine.txt".into(),
             byte_estimate: None,
         };
         let engine = RuleEngine::load_for_action(&conn, &action).unwrap();

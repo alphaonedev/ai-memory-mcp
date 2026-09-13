@@ -26,7 +26,7 @@
 //!   1. Forensic bundle build → verify round-trip on a depth-2
 //!      reflection chain (L2-5).
 //!   2. Substrate-rule R001-R004 enforcement when operator-signed AND
-//!      enabled — `/tmp/**` write refuses with rule id surfaced (L1-6
+//!      enabled — `/example-root/**` write refuses with rule id surfaced (L1-6
 //!      A–D bypass-impossibility surface).
 //!
 //! Phase 2 (FEDERATION)
@@ -277,18 +277,18 @@ fn sg_co_2_substrate_rule_r001_enforces_when_signed_and_enabled() {
     let conn = fresh_rules_conn();
 
     // Land R001 in the canonical seed shape: filesystem_write covering
-    // /tmp/**, enabled = 1, unsigned. With the pubkey configured the
+    // /example-root/**, enabled = 1, unsigned. With the pubkey configured the
     // engine SKIPS this row (no signature) → Allow.
-    insert_seed_rule(&conn, "R001", "/tmp/**", true);
+    insert_seed_rule(&conn, "R001", "/example-root/**", true);
     assert_eq!(
-        probe_write(&conn, "/tmp/leak"),
+        probe_write(&conn, "/example-root/leak"),
         Decision::Allow,
         "unsigned+enabled rule must be skipped when L1-6 pubkey is configured"
     );
 
     // Sign every row. Now enabled+signed → refuse.
     sign_all_rules(&conn, &signing);
-    let refuse = probe_write(&conn, "/tmp/leak");
+    let refuse = probe_write(&conn, "/example-root/leak");
     match refuse {
         Decision::Refuse { rule_id, .. } => assert_eq!(rule_id, "R001"),
         other => panic!("expected Refuse after sign, got {other:?}"),
@@ -311,12 +311,12 @@ fn sg_co_2_substrate_rule_r001_enforces_when_signed_and_enabled() {
     .unwrap();
     sign_all_rules(&conn, &signing);
     assert_eq!(
-        probe_write(&conn, "/tmp/leak"),
+        probe_write(&conn, "/example-root/leak"),
         Decision::Allow,
         "signed-but-disabled rule must not enforce"
     );
 
-    // Sanity: a path outside /tmp is allowed even when rule is enabled.
+    // Sanity: a path outside /example-root is allowed even when rule is enabled.
     conn.execute(
         "UPDATE governance_rules SET enabled = 1 WHERE id = 'R001'",
         [],
@@ -327,14 +327,15 @@ fn sg_co_2_substrate_rule_r001_enforces_when_signed_and_enabled() {
     assert_eq!(
         outside_tmp,
         Decision::Allow,
-        "path outside /tmp glob must pass even when R001 is signed+enabled"
+        "path outside /example-root glob must pass even when R001 is signed+enabled"
     );
 
     uninstall_operator_pubkey();
 }
 
-/// **SG-CO-3 (Phase 1):** The seed rules R002 (/var/tmp/**) and R003
-/// (/private/tmp/**) cover the macOS realpath family. With all four
+/// **SG-CO-3 (Phase 1):** The seed rules R002 (the `/var` twin of the temp
+/// root) and R003 (its macOS `/private` realpath) cover the realpath family;
+/// this test models them with the stand-in root `/example-root` (#3669). With all four
 /// seed rules signed and enabled the operator's three forbidden
 /// scratch families refuse simultaneously — the ship-gate
 /// "no agent-created files under any tmpfs" contract.
@@ -348,15 +349,15 @@ fn sg_co_3_substrate_rules_r001_r002_r003_refuse_all_three_tmp_families() {
     install_operator_pubkey(&signing);
 
     let conn = fresh_rules_conn();
-    insert_seed_rule(&conn, "R001", "/tmp/**", true);
-    insert_seed_rule(&conn, "R002", "/var/tmp/**", true);
-    insert_seed_rule(&conn, "R003", "/private/tmp/**", true);
+    insert_seed_rule(&conn, "R001", "/example-root/**", true);
+    insert_seed_rule(&conn, "R002", "/var/example-root/**", true);
+    insert_seed_rule(&conn, "R003", "/private/example-root/**", true);
     sign_all_rules(&conn, &signing);
 
     for (path, expected_rule) in [
-        ("/tmp/x", "R001"),
-        ("/var/tmp/y", "R002"),
-        ("/private/tmp/z", "R003"),
+        ("/example-root/x", "R001"),
+        ("/var/example-root/y", "R002"),
+        ("/private/example-root/z", "R003"),
     ] {
         match probe_write(&conn, path) {
             Decision::Refuse { rule_id, .. } => assert_eq!(
@@ -391,7 +392,7 @@ fn sg_co_4_substrate_rule_signed_at_a_replicates_and_enforces_at_b() {
     let peer_b = fresh_rules_conn();
 
     // Operator on A: seed + sign R001.
-    insert_seed_rule(&peer_a, "R001", "/tmp/**", true);
+    insert_seed_rule(&peer_a, "R001", "/example-root/**", true);
     sign_all_rules(&peer_a, &signing);
 
     let rule_a = rules_store::get(&peer_a, "R001")
@@ -413,7 +414,7 @@ fn sg_co_4_substrate_rule_signed_at_a_replicates_and_enforces_at_b() {
     assert_eq!(rule_b.matcher, rule_a.matcher);
 
     // B enforces the inherited rule.
-    let refuse = probe_write(&peer_b, "/tmp/replicated");
+    let refuse = probe_write(&peer_b, "/example-root/replicated");
     match refuse {
         Decision::Refuse { rule_id, .. } => assert_eq!(rule_id, "R001"),
         other => panic!("expected Refuse on B after replication, got {other:?}"),
@@ -596,7 +597,7 @@ fn sg_co_7_check_agent_action_emits_audit_row_on_every_call() {
     uninstall_operator_pubkey();
 
     let conn = fresh_rules_conn();
-    insert_seed_rule(&conn, "R001", "/tmp/**", true);
+    insert_seed_rule(&conn, "R001", "/example-root/**", true);
 
     let baseline: i64 = conn
         .query_row(
@@ -608,11 +609,11 @@ fn sg_co_7_check_agent_action_emits_audit_row_on_every_call() {
 
     // Call the engine 5 times in mixed-match modes.
     for path in [
-        "/tmp/a",
-        "/tmp/b",
+        "/example-root/a",
+        "/example-root/b",
         "/Users/fate/v07/.local-runs/c.txt", // miss
-        "/var/tmp/d",                        // no rule
-        "/tmp/e",
+        "/var/example-root/d",                        // no rule
+        "/example-root/e",
     ] {
         let _ = probe_write(&conn, path);
     }

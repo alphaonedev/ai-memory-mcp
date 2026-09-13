@@ -7,7 +7,7 @@
 //! The vote's content finding (refuter a0f92306): the shipped template must be
 //! ILLUSTRATIVE (fake matchers) + DISABLED + UNSIGNED — never a prescriptive
 //! "blessed" policy, and never one whose matchers refuse real common operations
-//! (`refuse process_spawn cargo` / `refuse /tmp` would break the substrate's own
+//! (`refuse process_spawn cargo` / refusing the system temp root would break the substrate's own
 //! build). This test pins those properties so the template can't silently drift
 //! into a dangerous or auto-active state.
 
@@ -90,9 +90,17 @@ fn template_matchers_are_illustrative_never_real_operations() {
     // The load-bearing safety property: copying the template verbatim must
     // refuse NOTHING real. Every matcher value is a deliberately-fake token, and
     // must NOT collide with operations the substrate itself performs (writing
-    // /tmp, spawning cargo) — those would be a false-positive footgun.
-    // Tokens that would indicate a REAL (dangerous-to-bless) matcher.
-    const FORBIDDEN_REAL: &[&str] = &["/tmp", "/var/tmp", "cargo", "/usr", "/etc", "/home"];
+    // the system temp root, spawning cargo) — those would be a false-positive
+    // footgun. Tokens that would indicate a REAL (dangerous-to-bless) matcher;
+    // the temp roots come from the shipped seed (#3669).
+    let forbidden_real: [&str; 6] = [
+        ai_memory::test_scratch::seeded_refused_root("R001"),
+        ai_memory::test_scratch::seeded_refused_root("R002"),
+        "cargo",
+        "/usr",
+        "/etc",
+        "/home",
+    ];
     // Tokens that mark a value as deliberately illustrative/fake.
     const ILLUSTRATIVE: &[&str] = &["example", "invalid", "forbidden"];
 
@@ -104,7 +112,7 @@ fn template_matchers_are_illustrative_never_real_operations() {
         let matcher = r.get("matcher").expect("matcher");
         let matcher_str = serde_json::to_string(matcher).unwrap();
 
-        for real in FORBIDDEN_REAL {
+        for real in forbidden_real {
             assert!(
                 !matcher_str.contains(real),
                 "rule {id}: matcher {matcher_str} names a REAL path/binary ({real}) — the \

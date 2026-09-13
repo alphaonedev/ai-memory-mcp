@@ -15,8 +15,9 @@
 //!
 //! This suite pins the control end-to-end:
 //!
-//! * DENIED path — after `sign-seed` → `install-defaults`, a `/tmp`
-//!   write is REFUSED (the seeded R001 rule fires).
+//! * DENIED path — after `sign-seed` → `install-defaults`, a write under
+//!   the root the seeded R001 rule refuses is REFUSED (R001 fires). The root
+//!   is read from the shipped seed (`test_scratch::seeded_refused_root`).
 //! * ALLOWED path — a write outside every seed glob still passes, so
 //!   the fix did not turn the gate into a blanket refusal.
 //! * REFUSAL path — with signed seed rows and no loadable operator key,
@@ -168,6 +169,15 @@ fn install_defaults(db_path: &Path, key_dir: Option<&Path>) -> anyhow::Result<St
     Ok(String::from_utf8(so).expect("utf8 stdout"))
 }
 
+/// A path under the root the shipped R001 rule refuses (read from the
+/// migration seed, so this file never spells a system temp root; #3669).
+fn r001_probe_path() -> String {
+    format!(
+        "{}/leak.txt",
+        ai_memory::test_scratch::seeded_refused_root("R001")
+    )
+}
+
 fn probe_tmp_write(db_path: &Path, path: &str) -> Decision {
     let conn = rusqlite::Connection::open(db_path).expect("open db");
     let action = AgentAction::FilesystemWrite {
@@ -228,9 +238,9 @@ fn seed_ceremony_produces_enforcing_rules_3430() {
     // DENIED path — this is the regression. Pre-#3430 this returned
     // Decision::Allow because every signature had been invalidated by
     // the raw `UPDATE ... SET enabled = 1`.
-    match probe_tmp_write(&db_path, "/tmp/leak.txt") {
+    match probe_tmp_write(&db_path, &r001_probe_path()) {
         Decision::Refuse { rule_id, .. } => assert_eq!(rule_id, "R001"),
-        other => panic!("#3430: /tmp write must be REFUSED after the ceremony, got {other:?}"),
+        other => panic!("#3430: a write under R001's root must be REFUSED after the ceremony, got {other:?}"),
     }
 
     // ALLOWED path — the fix must not turn the gate into a blanket
@@ -288,7 +298,7 @@ fn install_defaults_refuses_signed_rows_without_operator_key_3430() {
         );
     }
     assert_eq!(
-        probe_tmp_write(&db_path, "/tmp/leak.txt"),
+        probe_tmp_write(&db_path, &r001_probe_path()),
         Decision::Allow,
         "rules stayed disabled, so nothing enforces (and nothing lies about it)"
     );
@@ -315,7 +325,7 @@ fn install_defaults_repairs_rows_left_inert_by_a_raw_enable_3430() {
             .expect("raw enable");
     }
     assert_eq!(
-        probe_tmp_write(&db_path, "/tmp/leak.txt"),
+        probe_tmp_write(&db_path, &r001_probe_path()),
         Decision::Allow,
         "pre-condition: the poisoned store enforces nothing (this IS the bug)"
     );
@@ -331,7 +341,7 @@ fn install_defaults_repairs_rows_left_inert_by_a_raw_enable_3430() {
     assert_eq!(result["enforced"].as_array().unwrap().len(), 4);
     assert!(result["not_enforced"].as_array().unwrap().is_empty());
 
-    match probe_tmp_write(&db_path, "/tmp/leak.txt") {
+    match probe_tmp_write(&db_path, &r001_probe_path()) {
         Decision::Refuse { rule_id, .. } => assert_eq!(rule_id, "R001"),
         other => panic!("#3430: repaired rule must fire, got {other:?}"),
     }

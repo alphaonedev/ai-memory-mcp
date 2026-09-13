@@ -5219,8 +5219,8 @@ mod tests {
             "INSERT INTO governance_rules \
              (id, kind, matcher, severity, reason, namespace, created_by, created_at, \
               enabled, signature, attest_level) \
-             VALUES ('R001', 'filesystem_write', '{\"glob\":\"/tmp/**\"}', 'refuse', \
-                     'no /tmp', 'secure', 'operator', 42, 1, ?1, 'operator_signed')",
+             VALUES ('R001', 'filesystem_write', '{\"glob\":\"/example-root/**\"}', 'refuse', \
+                     'no /example-root', 'secure', 'operator', 42, 1, ?1, 'operator_signed')",
             params![sig],
         )
         .expect("seed signed pre-v66 rule");
@@ -5266,9 +5266,9 @@ mod tests {
             )
             .expect("signed rule must survive the v66 rebuild");
         assert_eq!(kind, "filesystem_write");
-        assert_eq!(matcher, "{\"glob\":\"/tmp/**\"}");
+        assert_eq!(matcher, "{\"glob\":\"/example-root/**\"}");
         assert_eq!(severity, "refuse");
-        assert_eq!(reason, "no /tmp");
+        assert_eq!(reason, "no /example-root");
         assert_eq!(namespace, "secure");
         assert_eq!(created_by, "operator");
         assert_eq!(created_at, 42);

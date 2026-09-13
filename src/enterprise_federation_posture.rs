@@ -1022,7 +1022,7 @@ mod tests {
         // install, isolated per env-isolated child
         // (`run_env_isolated_child_or_spawn`), kept alive for the test in a
         // module-static tempdir (first-install-wins, like the flag-on suite).
-        POSTURE_AUDIT_DIR.get_or_init(|| {
+        crate::test_scratch::process_lifetime_dir(&POSTURE_AUDIT_DIR, || {
             let dir = tempfile::Builder::new()
                 .prefix("ef-posture-audit-")
                 .tempdir()

@@ -484,7 +484,7 @@ fn a2a_3_scoped_recall_collective_visible_private_isolated() {
 // ─────────────────────────────────────────────────────────────────────
 // A2A-4 — Governance rule cross-agent enforcement
 //
-// Add a refuse rule for filesystem_write under `/tmp/**`. Verify
+// Add a refuse rule for filesystem_write under `/example-root/**`. Verify
 // `check_agent_action` returns Refuse for any agent, and verify the
 // forensic signed_events table sees a row per check (best-effort
 // log emit).
@@ -563,9 +563,9 @@ fn a2a_4_governance_rule_refuses_cross_agent() {
     let mut rule = Rule {
         id: "A2A4-NO-TMP".into(),
         kind: "filesystem_write".into(),
-        matcher: r#"{"glob":"/tmp/**"}"#.into(),
+        matcher: r#"{"glob":"/example-root/**"}"#.into(),
         severity: "refuse".into(),
-        reason: "no /tmp writes per A2A-4".into(),
+        reason: "no /example-root writes per A2A-4".into(),
         namespace: "_global".into(),
         created_by: "operator".into(),
         created_at: 0,
@@ -581,7 +581,7 @@ fn a2a_4_governance_rule_refuses_cross_agent() {
 
     // Adversary attempt: refused.
     let action = AgentAction::FilesystemWrite {
-        path: "/tmp/foo".into(),
+        path: "/example-root/foo".into(),
         byte_estimate: None,
     };
     let decision = check_agent_action(&conn, "ai:adversary", &action).unwrap();
@@ -591,8 +591,8 @@ fn a2a_4_governance_rule_refuses_cross_agent() {
         decision
     );
 
-    // Operator attempting outside `/tmp` (e.g. `/Users/operator/x`):
-    // allowed (the matcher only refuses `/tmp/**`).
+    // Operator attempting outside `/example-root` (e.g. `/Users/operator/x`):
+    // allowed (the matcher only refuses `/example-root/**`).
     let action_safe = AgentAction::FilesystemWrite {
         path: "/Users/operator/safe.txt".into(),
         byte_estimate: None,
@@ -609,7 +609,7 @@ fn a2a_4_governance_rule_refuses_cross_agent() {
     let decision_alice = check_agent_action(&conn, "ai:alice", &action).unwrap();
     assert!(
         matches!(decision_alice, Decision::Refuse { .. }),
-        "alice refused for /tmp: {:?}",
+        "alice refused for /example-root: {:?}",
         decision_alice
     );
 }

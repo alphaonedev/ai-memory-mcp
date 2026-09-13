@@ -5,7 +5,7 @@
 //! subcommand parity with the MCP tool `memory_check_agent_action`.
 //!
 //! Pins:
-//!   1. `--kind filesystem_write --path /tmp/foo.txt` matches the
+//!   1. `--kind filesystem_write --path /example-root/foo.txt` matches the
 //!      seeded R001 hard rule and surfaces a `refuse` verdict with
 //!      `rule_id = R001`.
 //!   2. `--kind process_spawn --binary forbidden-bin` matches a
@@ -16,14 +16,14 @@
 //!      threshold so the refusal fires deterministically on any
 //!      runner.
 //!   3. `--kind filesystem_write --path $HOME/.local-runs/ok.txt`
-//!      does NOT match R001 (glob is `/tmp/**` only) so the verdict
+//!      does NOT match R001 (glob is `/example-root/**` only) so the verdict
 //!      is `allow`.
 //!
 //! The test drives the real built binary through `assert_cmd` so the
 //! clap arg parser + dispatch arm + shared `run_check` core all
 //! exercise end-to-end. Each test gets a fresh sqlite file seeded
-//! with the exact rules it asserts on; no /tmp paths are CREATED
-//! (the `/tmp/foo.txt` argument is a *string* fed to the rule
+//! with the exact rules it asserts on; no /example-root paths are CREATED
+//! (the `/example-root/foo.txt` argument is a *string* fed to the rule
 //! engine, not a touch).
 
 #![allow(clippy::zombie_processes)]
@@ -46,7 +46,7 @@ fn ai_memory(db: &Path) -> Command {
 
 /// Create a fresh sqlite DB with the minimum schema `check_agent_action`
 /// needs (`governance_rules` + `signed_events`) and seed two rules:
-///   * `R001` — `filesystem_write` glob `/tmp/**`, refuse.
+///   * `R001` — `filesystem_write` glob `/example-root/**`, refuse.
 ///   * `R004F` — `process_spawn` binary `forbidden-bin`, refuse, NO
 ///     `disk_free_min_gib` so it fires deterministically.
 fn seed_rules_db(path: &Path) {
@@ -82,8 +82,8 @@ fn seed_rules_db(path: &Path) {
         (
             "R001",
             "filesystem_write",
-            r#"{"glob":"/tmp/**"}"#,
-            "Operator hard rule (#691): no /tmp writes.",
+            r#"{"glob":"/example-root/**"}"#,
+            "Operator hard rule (#691): no /example-root writes.",
         ),
         (
             "R004F",
@@ -140,7 +140,7 @@ fn cli_refuses_filesystem_write_to_tmp() {
             "--kind",
             "filesystem_write",
             "--path",
-            "/tmp/foo.txt",
+            "/example-root/foo.txt",
             "--json",
         ])
         .assert()
@@ -157,7 +157,7 @@ fn cli_refuses_filesystem_write_to_tmp() {
     // The allow path stays nested by design (see cli_allows_*).
     assert_eq!(
         v["decision"], "deny",
-        "expected deny for /tmp/** path; got: {v}"
+        "expected deny for /example-root/** path; got: {v}"
     );
     assert_eq!(
         v["error"], "GOVERNANCE_REFUSED",
@@ -216,7 +216,7 @@ fn cli_allows_filesystem_write_under_local_runs() {
     seed_rules_db(&db);
 
     // Use $HOME/.local-runs/ok.txt as the candidate path. The R001
-    // glob is `/tmp/**` only, so this path does NOT match and the
+    // glob is `/example-root/**` only, so this path does NOT match and the
     // verdict must be allow. We do NOT actually create the file —
     // the substrate rule engine works on the path string alone.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/test".to_string());
@@ -293,7 +293,7 @@ fn cli_human_output_prints_refuse_with_rule_id() {
             "--kind",
             "filesystem_write",
             "--path",
-            "/tmp/some-file",
+            "/example-root/some-file",
         ])
         .assert()
         .success()

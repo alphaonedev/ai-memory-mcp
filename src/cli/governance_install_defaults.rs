@@ -9,9 +9,9 @@
 //!
 //! | Rule | Kind             | Matcher                                       | Reason                                              |
 //! |------|------------------|-----------------------------------------------|-----------------------------------------------------|
-//! | R001 | filesystem_write | `{"glob":"/tmp/**"}`                          | No `/tmp` writes (project hard rule, #691).         |
-//! | R002 | filesystem_write | `{"glob":"/var/tmp/**"}`                      | No `/var/tmp` writes.                                |
-//! | R003 | filesystem_write | `{"glob":"/private/tmp/**"}`                  | No `/private/tmp` writes (macOS realpath of `/tmp`).|
+//! | R001 | filesystem_write | `{"glob":"<system temp root>/**"}`             | No writes under the system temp root (#691).        |
+//! | R002 | filesystem_write | `{"glob":"/var<system temp root>/**"}`         | The same under `/var`.                              |
+//! | R003 | filesystem_write | `{"glob":"/private<system temp root>/**"}`     | The same under macOS `/private` (its realpath).     |
 //! | R004 | process_spawn    | `{"binary":"cargo","disk_free_min_gib":20}`   | Refuse `cargo` on low-disk (<20 GiB) host.          |
 //!
 //! ## Operator flow
@@ -19,9 +19,9 @@
 //! ```text
 //!   $ ai-memory governance install-defaults
 //!   The following seed rules will be enabled (R001-R004):
-//!     R001  filesystem_write  /tmp/**           refuse
-//!     R002  filesystem_write  /var/tmp/**       refuse
-//!     R003  filesystem_write  /private/tmp/**   refuse
+//!     R001  filesystem_write  <system temp root>/**           refuse
+//!     R002  filesystem_write  /var<system temp root>/**       refuse
+//!     R003  filesystem_write  /private<system temp root>/**   refuse
 //!     R004  process_spawn     cargo (<20 GiB)   refuse
 //!   Proceed? [y/N]: y
 //!   Activated 4 rule(s).
@@ -517,9 +517,9 @@ mod tests {
         )
         .unwrap();
         for (id, kind, matcher) in [
-            ("R001", "filesystem_write", r#"{"glob":"/tmp/**"}"#),
-            ("R002", "filesystem_write", r#"{"glob":"/var/tmp/**"}"#),
-            ("R003", "filesystem_write", r#"{"glob":"/private/tmp/**"}"#),
+            ("R001", "filesystem_write", r#"{"glob":"/example-root/**"}"#),
+            ("R002", "filesystem_write", r#"{"glob":"/var/example-root/**"}"#),
+            ("R003", "filesystem_write", r#"{"glob":"/private/example-root/**"}"#),
             (
                 "R004",
                 "process_spawn",
@@ -778,7 +778,7 @@ mod tests {
 
         // Sign R001 while disabled, then flip `enabled` beneath the
         // signature — the exact pre-#3430 corruption.
-        let mut row = preview_rule("R001", r#"{"glob":"/tmp/**"}"#, false);
+        let mut row = preview_rule("R001", r#"{"glob":"/example-root/**"}"#, false);
         row.attest_level = "operator_signed".into();
         let canonical = rules_store::canonical_bytes_for_signing(&row).unwrap();
         row.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
@@ -895,8 +895,8 @@ mod tests {
     #[test]
     fn render_preview_emits_one_row_per_seeded_rule() {
         let preview = vec![
-            preview_rule("R001", r#"{"glob":"/tmp/**"}"#, false),
-            preview_rule("R002", r#"{"glob":"/var/tmp/**"}"#, true),
+            preview_rule("R001", r#"{"glob":"/example-root/**"}"#, false),
+            preview_rule("R002", r#"{"glob":"/var/example-root/**"}"#, true),
         ];
         let missing: Vec<String> = vec![];
 

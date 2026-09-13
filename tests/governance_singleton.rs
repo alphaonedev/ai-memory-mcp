@@ -67,9 +67,9 @@ fn hundred_concurrent_checks_against_same_rule_return_consistent_decisions() {
         let mut rule = Rule {
             id: "R001".into(),
             kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/tmp/**"}"#.into(),
+            matcher: r#"{"glob":"/example-root/**"}"#.into(),
             severity: "refuse".into(),
-            reason: "no /tmp".into(),
+            reason: "no /example-root".into(),
             namespace: "_global".into(),
             created_by: "test".into(),
             created_at: 0,
@@ -88,7 +88,7 @@ fn hundred_concurrent_checks_against_same_rule_return_consistent_decisions() {
         let conn_clone = Arc::clone(&conn);
         let h = thread::spawn(move || {
             let action = AgentAction::FilesystemWrite {
-                path: "/tmp/foo".into(),
+                path: "/example-root/foo".into(),
                 byte_estimate: None,
             };
             let c = conn_clone.lock().unwrap();

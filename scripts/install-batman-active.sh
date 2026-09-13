@@ -178,20 +178,33 @@ fi
 
 step "Step 4 — Smoke-test Form 7 enforcement"
 if [[ $DRY_RUN -eq 1 ]]; then
-    info "[dry-run] ai-memory --db ... rules check --kind filesystem_write --payload '{\"path\":\"/tmp/x\"}' --agent-id install-batman"
+    info "[dry-run] ai-memory --db ... rules check --kind filesystem_write --payload '{\"path\":\"<R001 root>/x\"}' --agent-id install-batman"
     info "[dry-run] (every rules-check emits a signed_events audit row, so this is gated under dry-run too)"
 else
+    # The probe path is read from R001's own matcher (#3669).
+    R001_ROOT=$(ai-memory --db "$DB" rules list --json 2>/dev/null | tail -1 \
+        | python3 -c "
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+    rules = data.get('result', data)
+    m = next(r for r in rules if r['id'] == 'R001')['matcher']
+    g = (json.loads(m) if isinstance(m, str) else m)['glob']
+    print(g[:-3] if g.endswith('/**') else '')
+except Exception:
+    print('')
+")
     DENY=$(ai-memory --db "$DB" rules check --kind filesystem_write \
-        --payload '{"path":"/tmp/install-batman-test.txt"}' \
+        --payload "{\"path\":\"${R001_ROOT}/install-batman-test.txt\"}" \
         --agent-id install-batman 2>&1 | grep -vE '^ai-memory: loaded config' \
         | python3 -c "import sys,json;
 try:
     d=json.loads(sys.stdin.read());print(f\"{d.get('decision')} {d.get('rule_id','-')}\")
 except:print('PARSE_ERROR')")
-    if [[ "$DENY" == "refuse R001" ]]; then
-        ok "/tmp write refused under R001 ✓"
+    if [[ -n "$R001_ROOT" && "$DENY" == "refuse R001" ]]; then
+        ok "R001 root write refused ✓"
     else
-        err "/tmp write NOT refused — Form 7 not active. Got: $DENY"
+        err "R001 root write NOT refused (root=${R001_ROOT:-unreadable}) — Form 7 not active. Got: $DENY"
     fi
 fi
 

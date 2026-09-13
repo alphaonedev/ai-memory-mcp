@@ -377,11 +377,26 @@ else
     record "F7.2" fail "Form 7 R001-R004 not all enabled + operator_signed" "$rules_state"
 fi
 
-# F7.3 — enforcement smoke test: /tmp/x refused under R001
+# F7.3 — enforcement smoke test: a write under R001's root is refused.
+# The root is read from R001's own matcher, so this script never spells a
+# system temp root (#3669).
+r001_root=$(ai_memory rules list --json 2>/dev/null \
+    | tail -1 \
+    | python3 -c "
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+    rules = data.get('result', data)
+    m = next(r for r in rules if r['id'] == 'R001')['matcher']
+    g = (json.loads(m) if isinstance(m, str) else m)['glob']
+    print(g[:-3] if g.endswith('/**') else '')
+except Exception:
+    print('')
+")
 # `rules check` emits multi-line JSON; capture the full block and parse with python.
 deny_check=$(ai_memory rules check \
     --kind filesystem_write \
-    --payload '{"path":"/tmp/acceptance-test.txt"}' \
+    --payload "{\"path\":\"${r001_root}/acceptance-test.txt\"}" \
     --agent-id batman-acceptance 2>/dev/null \
     | grep -vE '^ai-memory: loaded config' \
     | python3 -c "
@@ -392,10 +407,10 @@ try:
 except Exception as e:
     print(f'PARSE_ERROR:{e}')
 ")
-if [[ "$deny_check" == *"decision=refuse"* && "$deny_check" == *"rule_id=R001"* ]]; then
-    record "F7.3" pass "Form 7 enforcement: /tmp write refused under R001" "$deny_check"
+if [[ -n "$r001_root" && "$deny_check" == *"decision=refuse"* && "$deny_check" == *"rule_id=R001"* ]]; then
+    record "F7.3" pass "Form 7 enforcement: write under R001 root refused" "$deny_check"
 else
-    record "F7.3" fail "Form 7 enforcement: /tmp write NOT refused under R001" "$deny_check"
+    record "F7.3" fail "Form 7 enforcement: write under R001 root NOT refused (root=${r001_root:-unreadable})" "$deny_check"
 fi
 
 # F7.4 — enforcement smoke test: allow path returns allow

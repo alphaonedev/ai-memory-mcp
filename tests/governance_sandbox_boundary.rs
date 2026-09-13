@@ -104,10 +104,10 @@ fn filesystem_write_variant_can_be_refused() {
         &signing,
         "F1",
         "filesystem_write",
-        r#"{"glob":"/tmp/**"}"#,
+        r#"{"glob":"/example-root/**"}"#,
     );
     let a = AgentAction::FilesystemWrite {
-        path: "/tmp/x".into(),
+        path: "/example-root/x".into(),
         byte_estimate: None,
     };
     let d = check_agent_action(&conn, "a", &a).unwrap();
@@ -178,10 +178,10 @@ fn filesystem_write_double_star_glob_matches_subdir() {
         &signing,
         "F1",
         "filesystem_write",
-        r#"{"glob":"/tmp/**"}"#,
+        r#"{"glob":"/example-root/**"}"#,
     );
     let a = AgentAction::FilesystemWrite {
-        path: "/tmp/deep/nested/file.log".into(),
+        path: "/example-root/deep/nested/file.log".into(),
         byte_estimate: None,
     };
     let d = check_agent_action(&conn, "a", &a).unwrap();
@@ -198,7 +198,7 @@ fn filesystem_write_outside_glob_allowed() {
         &signing,
         "F1",
         "filesystem_write",
-        r#"{"glob":"/tmp/**"}"#,
+        r#"{"glob":"/example-root/**"}"#,
     );
     let a = AgentAction::FilesystemWrite {
         path: "/Users/me/safe.txt".into(),

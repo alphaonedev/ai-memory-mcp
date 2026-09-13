@@ -127,7 +127,7 @@ INSTALL_RC=$?
 assert "install exited 0"                              "[[ $INSTALL_RC -eq 0 ]]"
 assert "install output contains 'Step 1' success"      "grep -q 'operator key' '$RUN_ROOT/install.out'"
 assert "install output reports R001 enabled"           "grep -qE 'R001.*enabled' '$RUN_ROOT/install.out'"
-assert "install output reports Form 7 smoke pass"      "grep -q '/tmp write refused' '$RUN_ROOT/install.out'"
+assert "install output reports Form 7 smoke pass"      "grep -q 'R001 root write refused' '$RUN_ROOT/install.out'"
 assert "rules in DB: R001-R004 all enabled + signed"   "[[ \$(sqlite3 '$LIVE_DB' \"SELECT COUNT(*) FROM governance_rules WHERE id IN ('R001','R002','R003','R004') AND enabled=1 AND attest_level='operator_signed'\") -eq 4 ]]"
 assert "namespace 'test' bound to a standard"          "[[ \$(sqlite3 '$LIVE_DB' \"SELECT COUNT(*) FROM namespace_meta WHERE namespace='test' AND standard_id IS NOT NULL\") -ge 1 ]]"
 

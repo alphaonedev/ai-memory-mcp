@@ -124,7 +124,7 @@ pub enum RulesAction {
         #[arg(long)]
         kind: String,
         /// Action payload JSON. For Bash: `{"command":"ls"}`.
-        /// For `FilesystemWrite`: `{"path":"/tmp/x"}`. Etc.
+        /// For `FilesystemWrite`: `{"path":"/srv/scratch/x"}`. Etc.
         #[arg(long)]
         payload: String,
         /// Optional agent id; defaults to the resolved NHI id for
@@ -1303,10 +1303,10 @@ mod tests {
 
     #[test]
     fn build_action_filesystem_write_parses() {
-        let a = build_action("filesystem_write", r#"{"path":"/tmp/x"}"#).unwrap();
+        let a = build_action("filesystem_write", r#"{"path":"/example-root/x"}"#).unwrap();
         match a {
             AgentAction::FilesystemWrite { path, .. } => {
-                assert_eq!(path, PathBuf::from("/tmp/x"));
+                assert_eq!(path, PathBuf::from("/example-root/x"));
             }
             _ => panic!("expected filesystem_write"),
         }
@@ -1648,7 +1648,7 @@ mod tests {
                 &Rule {
                     id: id.to_string(),
                     kind: "filesystem_write".into(),
-                    matcher: r#"{"glob":"/tmp/**"}"#.into(),
+                    matcher: r#"{"glob":"/example-root/**"}"#.into(),
                     severity: "refuse".into(),
                     reason: "test".into(),
                     namespace: "_global".into(),
@@ -1860,7 +1860,7 @@ mod tests {
             action: RulesAction::Add {
                 id: "R-dis".into(),
                 kind: "filesystem_write".into(),
-                matcher: r#"{"glob":"/tmp/**"}"#.into(),
+                matcher: r#"{"glob":"/example-root/**"}"#.into(),
                 severity: "warn".into(),
                 reason: "noisy".into(),
                 namespace: "_global".into(),
@@ -2660,7 +2660,7 @@ mod tests {
             &Rule {
                 id: "R001".into(),
                 kind: "filesystem_write".into(),
-                matcher: r#"{"glob":"/tmp/**"}"#.into(),
+                matcher: r#"{"glob":"/example-root/**"}"#.into(),
                 severity: "refuse".into(),
                 reason: "t".into(),
                 namespace: "_global".into(),

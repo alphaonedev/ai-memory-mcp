@@ -199,7 +199,7 @@ fn per_kind_matcher_schema_validation_3031() {
 
     ok(action_kinds::BASH, r#"{"command_substring":"rm -rf"}"#);
     ok(action_kinds::BASH, r#"{"command_regex":"rm -rf"}"#);
-    ok(action_kinds::FILESYSTEM_WRITE, r#"{"glob":"/tmp/**"}"#);
+    ok(action_kinds::FILESYSTEM_WRITE, r#"{"glob":"/example-root/**"}"#);
     ok(action_kinds::NETWORK_REQUEST, r#"{"host":"*.evil.test"}"#);
     ok(
         action_kinds::PROCESS_SPAWN,
@@ -220,7 +220,7 @@ fn per_kind_matcher_schema_validation_3031() {
     );
     assert!(bad(action_kinds::BASH, r#"{"totally_bogus_key":123}"#).contains("unrecognised key"));
     assert!(bad(action_kinds::BASH, "{}").contains("required key"));
-    assert!(bad(action_kinds::FILESYSTEM_WRITE, r#"{"path":"/tmp"}"#).contains("unrecognised key"));
+    assert!(bad(action_kinds::FILESYSTEM_WRITE, r#"{"path":"/example-root"}"#).contains("unrecognised key"));
     assert!(
         bad(action_kinds::PROCESS_SPAWN, r#"{"args_contain":"build"}"#).contains("required key")
     );

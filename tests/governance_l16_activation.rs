@@ -102,7 +102,7 @@ fn fresh_conn() -> rusqlite::Connection {
 }
 
 /// Insert an unsigned, enabled `filesystem_write` rule covering
-/// `/tmp/**` — same shape as the L1-6 seed R001 in
+/// `/example-root/**` — same shape as the L1-6 seed R001 in
 /// `migrations/sqlite/0024_v07_governance_rules.sql`.
 fn insert_seed_rule(conn: &rusqlite::Connection, id: &str, enabled: bool) {
     rules_store::insert(
@@ -110,9 +110,9 @@ fn insert_seed_rule(conn: &rusqlite::Connection, id: &str, enabled: bool) {
         &Rule {
             id: id.to_string(),
             kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/tmp/**"}"#.into(),
+            matcher: r#"{"glob":"/example-root/**"}"#.into(),
             severity: "refuse".into(),
-            reason: format!("{id}: no /tmp writes"),
+            reason: format!("{id}: no /example-root writes"),
             namespace: "_global".into(),
             created_by: "system:seed".into(),
             created_at: 0,
@@ -154,12 +154,12 @@ fn uninstall_operator_pubkey() {
     unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
 }
 
-/// Run `check_agent_action` against a `/tmp/x` filesystem write — the
+/// Run `check_agent_action` against a `/example-root/x` filesystem write — the
 /// canonical "would the substrate refuse this?" probe used by every
 /// bypass-impossibility test.
 fn probe_tmp_write(conn: &rusqlite::Connection) -> Decision {
     let action = AgentAction::FilesystemWrite {
-        path: "/tmp/x".into(),
+        path: "/example-root/x".into(),
         byte_estimate: None,
     };
     check_agent_action(conn, "agent:l16-test", &action).unwrap()
@@ -182,7 +182,7 @@ fn enforced_rule_must_be_operator_signed() {
     let conn = fresh_conn();
     // Seed unsigned + enabled rule. The L1-6 verifier sees the
     // pubkey is configured AND the row is `unsigned` → SKIP. The
-    // `/tmp/x` write must Allow because no rule is enforced.
+    // `/example-root/x` write must Allow because no rule is enforced.
     insert_seed_rule(&conn, "R001", true);
     let decision_before = probe_tmp_write(&conn);
     assert_eq!(
@@ -193,7 +193,7 @@ fn enforced_rule_must_be_operator_signed() {
 
     // Sign every row. Now the rule has `attest_level=operator_signed`
     // and `signature` over (id,kind,matcher,severity,reason,
-    // namespace,created_by,enabled). The same `/tmp/x` action must
+    // namespace,created_by,enabled). The same `/example-root/x` action must
     // refuse.
     sign_all_rules(&conn, &signing);
     let decision_after = probe_tmp_write(&conn);
@@ -222,22 +222,22 @@ fn tampered_signature_rejects_at_load() {
     let conn = fresh_conn();
     insert_seed_rule(&conn, "R001", true);
     sign_all_rules(&conn, &signing);
-    // Signed enabled rule → refuse on /tmp.
+    // Signed enabled rule → refuse on /example-root.
     assert!(matches!(probe_tmp_write(&conn), Decision::Refuse { .. }));
 
-    // Direct SQL tampering: change the matcher to point at /var/tmp.
+    // Direct SQL tampering: change the matcher to point at /var/example-root.
     // The signature was computed over the original matcher; the row
     // no longer verifies.
     conn.execute(
         "UPDATE governance_rules SET matcher = ?1 WHERE id = ?2",
-        rusqlite::params![r#"{"glob":"/var/tmp/**"}"#, "R001"],
+        rusqlite::params![r#"{"glob":"/var/example-root/**"}"#, "R001"],
     )
     .unwrap();
     let decision = probe_tmp_write(&conn);
     assert_eq!(
         decision,
         Decision::Allow,
-        "tampered row must be skipped; /tmp/x is no longer covered by anything"
+        "tampered row must be skipped; /example-root/x is no longer covered by anything"
     );
 
     uninstall_operator_pubkey();
@@ -265,7 +265,7 @@ fn direct_enabled_flip_bypass_attempt_fails() {
     // Direct SQL flip: enabled = 1. The signature was computed over
     // canonical_bytes_for_signing which INCLUDES `enabled`; flipping
     // it changes the canonical bytes, so verify fails, so the rule
-    // is skipped, so `/tmp/x` is allowed.
+    // is skipped, so `/example-root/x` is allowed.
     conn.execute(
         "UPDATE governance_rules SET enabled = 1 WHERE id = ?1",
         rusqlite::params!["R001"],
@@ -422,7 +422,7 @@ fn rotated_operator_key_invalidates_prior_signatures() {
     assert!(matches!(probe_tmp_write(&conn), Decision::Refuse { .. }));
 
     // Operator rotates the pubkey (without re-signing). All prior
-    // signatures become invalid; the rule is skipped; /tmp/x is
+    // signatures become invalid; the rule is skipped; /example-root/x is
     // allowed. This is the same property `keygen --force` warns
     // about.
     install_operator_pubkey(&rotated);

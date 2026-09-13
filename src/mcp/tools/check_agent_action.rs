@@ -475,9 +475,9 @@ mod tests {
             &Rule {
                 id: "R001".into(),
                 kind: "filesystem_write".into(),
-                matcher: r#"{"glob":"/tmp/**"}"#.into(),
+                matcher: r#"{"glob":"/example-root/**"}"#.into(),
                 severity: "refuse".into(),
-                reason: "no /tmp".into(),
+                reason: "no /example-root".into(),
                 namespace: "_global".into(),
                 created_by: "test".into(),
                 created_at: 0,
@@ -488,7 +488,7 @@ mod tests {
         )
         .unwrap();
         let r =
-            handle_check_agent_action(&conn, &json!({"kind":"filesystem_write","path":"/tmp/foo"}))
+            handle_check_agent_action(&conn, &json!({"kind":"filesystem_write","path":"/example-root/foo"}))
                 .unwrap();
         assert_eq!(r["decision"]["decision"], "refuse");
         assert_eq!(r["decision"]["rule_id"], "R001");
@@ -663,7 +663,7 @@ mod tests {
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
-            &json!({"kind": "bash", "command": "pwd", "cwd": "/tmp"}),
+            &json!({"kind": "bash", "command": "pwd", "cwd": "/example-root"}),
         )
         .expect("ok");
         assert_eq!(resp["decision"]["decision"], "allow");
@@ -839,16 +839,16 @@ mod tests {
     fn build_action_refuses_negative_byte_estimate_3171() {
         let e = build_action(
             "filesystem_write",
-            &json!({ "path": "/tmp/x", "byte_estimate": -1 }),
+            &json!({ "path": "/example-root/x", "byte_estimate": -1 }),
         )
         .expect_err("negative refused");
         assert_eq!(e, "byte_estimate must be a non-negative integer");
         // CONTROL: absent and non-negative both still work.
-        assert!(build_action("filesystem_write", &json!({ "path": "/tmp/x" })).is_ok());
+        assert!(build_action("filesystem_write", &json!({ "path": "/example-root/x" })).is_ok());
         assert!(
             build_action(
                 "filesystem_write",
-                &json!({ "path": "/tmp/x", "byte_estimate": 4096 })
+                &json!({ "path": "/example-root/x", "byte_estimate": 4096 })
             )
             .is_ok()
         );

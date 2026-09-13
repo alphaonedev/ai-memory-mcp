@@ -389,7 +389,7 @@ fn rules_enable_signed_signature_verifies_against_operator_pubkey() {
     let rule = rules_store::Rule {
         id: "R-test".into(),
         kind: "filesystem_write".into(),
-        matcher: r#"{"glob":"/tmp/**"}"#.into(),
+        matcher: r#"{"glob":"/example-root/**"}"#.into(),
         severity: "refuse".into(),
         reason: "test rule".into(),
         namespace: "_global".into(),
@@ -831,7 +831,7 @@ fn rules_disable_signed_signature_verifies_against_operator_pubkey() {
     let rule = rules_store::Rule {
         id: "R-dis".into(),
         kind: "filesystem_write".into(),
-        matcher: r#"{"glob":"/var/tmp/**"}"#.into(),
+        matcher: r#"{"glob":"/var/example-root/**"}"#.into(),
         severity: "refuse".into(),
         reason: "disable test".into(),
         namespace: "_global".into(),
@@ -900,7 +900,7 @@ fn rules_add_signed_signature_verifies_against_operator_pubkey() {
             action: rules_cli::RulesAction::Add {
                 id: "R-add-test".into(),
                 kind: "filesystem_write".into(),
-                matcher: r#"{"glob":"/tmp/add-test/**"}"#.into(),
+                matcher: r#"{"glob":"/example-root/add-test/**"}"#.into(),
                 severity: "refuse".into(),
                 reason: "add path canonical-bytes round-trip".into(),
                 namespace: "_global".into(),
@@ -977,7 +977,7 @@ fn rules_enable_with_operator_key_at_parent_dir_falls_back() {
         &rules_store::Rule {
             id: "R-fallback".into(),
             kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/tmp/fallback/**"}"#.into(),
+            matcher: r#"{"glob":"/example-root/fallback/**"}"#.into(),
             severity: "refuse".into(),
             reason: "path-fallback test".into(),
             namespace: "_global".into(),
@@ -1036,7 +1036,7 @@ fn rules_enable_with_no_operator_key_anywhere_errors_with_both_paths() {
         &rules_store::Rule {
             id: "R-no-key".into(),
             kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/tmp/no-key/**"}"#.into(),
+            matcher: r#"{"glob":"/example-root/no-key/**"}"#.into(),
             severity: "refuse".into(),
             reason: "no-key test".into(),
             namespace: "_global".into(),
@@ -1099,9 +1099,9 @@ fn rules_enable_then_check_agent_action_refuses_matching_path() {
         &rules_store::Rule {
             id: "R-test-tmp".into(),
             kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/tmp/**"}"#.into(),
+            matcher: r#"{"glob":"/example-root/**"}"#.into(),
             severity: "refuse".into(),
-            reason: "no /tmp writes".into(),
+            reason: "no /example-root writes".into(),
             namespace: "_global".into(),
             created_by: "seed".into(),
             created_at: 0,
@@ -1150,7 +1150,7 @@ fn rules_enable_then_check_agent_action_refuses_matching_path() {
         &conn2,
         "test-agent",
         &AgentAction::FilesystemWrite {
-            path: PathBuf::from("/tmp/foo.txt"),
+            path: PathBuf::from("/example-root/foo.txt"),
             byte_estimate: None,
         },
     )
@@ -1166,7 +1166,8 @@ fn rules_enable_then_check_agent_action_refuses_matching_path() {
 
     match decision {
         Decision::Refuse { rule_id, .. } => {
-            // R001 OR R-test-tmp both match /tmp/**; the seeded R001
+            // R-test-tmp matches /example-root/**; a seeded R001 would also
+            // refuse its own root. The first refusing rule wins
             // wins first (alphabetical). The point of the test is
             // that *some* signed rule fires — not that our specific
             // id wins. Pre-fix this returned Allow entirely.

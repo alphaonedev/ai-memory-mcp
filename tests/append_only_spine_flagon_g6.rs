@@ -90,7 +90,7 @@ fn flag_guard() -> std::sync::MutexGuard<'static, ()> {
 /// signed leaves carry a real Ed25519 signature `resolve_daemon_verifying_key`
 /// can check. Idempotent (the `OnceLock` swallows later installs).
 fn ensure_audit_key() {
-    AUDIT_DIR.get_or_init(|| {
+    ai_memory::test_scratch::process_lifetime_dir(&AUDIT_DIR, || {
         let dir = tempfile::Builder::new()
             .prefix("ai-memory-g6-flagon-")
             .tempdir()

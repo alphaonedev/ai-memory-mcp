@@ -302,9 +302,9 @@ fn governance_install_defaults_activates_seed_rules() {
         )
         .unwrap();
         for (id, kind, matcher) in [
-            ("R001", "filesystem_write", r#"{"glob":"/tmp/**"}"#),
-            ("R002", "filesystem_write", r#"{"glob":"/var/tmp/**"}"#),
-            ("R003", "filesystem_write", r#"{"glob":"/private/tmp/**"}"#),
+            ("R001", "filesystem_write", r#"{"glob":"/example-root/**"}"#),
+            ("R002", "filesystem_write", r#"{"glob":"/var/example-root/**"}"#),
+            ("R003", "filesystem_write", r#"{"glob":"/private/example-root/**"}"#),
             (
                 "R004",
                 "process_spawn",

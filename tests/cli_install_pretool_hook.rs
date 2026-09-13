@@ -19,7 +19,7 @@
 //!    succeeds.
 //! 6. `installed_hook_smoke_test_invokes_check_action` — drives
 //!    `memory_check_agent_action` directly with a synthesised
-//!    `PreToolUse` payload (Bash `rm -rf /tmp/foo`) against a fresh DB;
+//!    `PreToolUse` payload (Bash `rm -rf /example-root/foo`) against a fresh DB;
 //!    proves Allow when no rule, Refuse when R001-shaped rule
 //!    enabled.
 //!
@@ -307,7 +307,7 @@ fn install_rejects_hook_flag_on_non_claude_code() {
 }
 
 /// Smoke test: a synthesised `PreToolUse` payload (Bash command
-/// attempting `rm -rf /tmp/foo`) routed through the actual
+/// attempting `rm -rf /example-root/foo`) routed through the actual
 /// `memory_check_agent_action` MCP tool returns `allow` when no rule
 /// is enabled, and `refuse` after the R001-shaped rule is seeded +
 /// enabled. This is the end-to-end proof that what the installer
@@ -366,11 +366,11 @@ fn installed_hook_smoke_test_invokes_check_action() {
     .unwrap();
 
     // Synthesise the Claude Code PreToolUse payload shape (Bash tool
-    // proposing `rm -rf /tmp/foo`) and translate to the
+    // proposing `rm -rf /example-root/foo`) and translate to the
     // memory_check_agent_action call shape.
     let bash_payload = json!({
         "kind": "bash",
-        "command": "rm -rf /tmp/foo",
+        "command": "rm -rf /example-root/foo",
         "cwd": "/Users/operator/proj",
         "agent_id": "ai:claude-code@host:pid-1234",
     });
@@ -382,7 +382,7 @@ fn installed_hook_smoke_test_invokes_check_action() {
         "with no rule enabled, the substrate engine permits the action"
     );
 
-    // Phase 2: install the R001-shaped rule that refuses /tmp writes,
+    // Phase 2: install the R001-shaped rule that refuses /example-root writes,
     // but applied to the bash kind so the rm dispatch is caught.
     // For `bash` kind the matcher uses `command_regex` (treated as a
     // literal substring, see `match_bash` in agent_action.rs).
@@ -411,9 +411,9 @@ fn installed_hook_smoke_test_invokes_check_action() {
     let mut rule = Rule {
         id: "R001-test".into(),
         kind: "bash".into(),
-        matcher: r#"{"command_regex":"rm -rf /tmp"}"#.into(),
+        matcher: r#"{"command_regex":"rm -rf /example-root"}"#.into(),
         severity: "refuse".into(),
-        reason: "no /tmp destruction".into(),
+        reason: "no /example-root destruction".into(),
         namespace: "_global".into(),
         created_by: "test-operator".into(),
         created_at: 0,

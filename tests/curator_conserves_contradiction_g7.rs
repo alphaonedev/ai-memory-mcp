@@ -67,7 +67,7 @@ fn flag_guard() -> std::sync::MutexGuard<'static, ()> {
 /// Install a process-wide daemon audit signing key exactly once so the
 /// flag-ON SUPERSEDE leaves carry a real signature.
 fn ensure_audit_key() {
-    AUDIT_DIR.get_or_init(|| {
+    ai_memory::test_scratch::process_lifetime_dir(&AUDIT_DIR, || {
         let dir = tempfile::Builder::new()
             .prefix("ai-memory-g7-conserve-")
             .tempdir()

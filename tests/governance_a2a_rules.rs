@@ -70,16 +70,16 @@ fn rule_authored_at_peer_a_replicated_to_peer_b_enforces_at_b() {
     let peer_a = fresh_conn();
     let peer_b = fresh_conn();
 
-    // Peer A: operator adds R001 (no /tmp). Signed with the in-test
+    // Peer A: operator adds R001 (no /example-root). Signed with the in-test
     // operator key so the production `enforced_rule_passes` filter
     // accepts it under L1-6 (pubkey resolved → signed rules required).
     let r001 = sign_rule(
         Rule {
             id: "R001".into(),
             kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/tmp/**"}"#.into(),
+            matcher: r#"{"glob":"/example-root/**"}"#.into(),
             severity: "refuse".into(),
-            reason: "no /tmp".into(),
+            reason: "no /example-root".into(),
             namespace: "_global".into(),
             created_by: "operator".into(),
             created_at: 0,
@@ -104,9 +104,9 @@ fn rule_authored_at_peer_a_replicated_to_peer_b_enforces_at_b() {
     assert_eq!(on_b.signature, Some(expected_sig));
     assert_eq!(on_b.attest_level, "operator_signed");
 
-    // Peer B enforces: a /tmp write is refused.
+    // Peer B enforces: a /example-root write is refused.
     let action = AgentAction::FilesystemWrite {
-        path: "/tmp/foo".into(),
+        path: "/example-root/foo".into(),
         byte_estimate: None,
     };
     let decision = check_agent_action(&peer_b, "agent:b", &action).unwrap();
@@ -129,9 +129,9 @@ fn disabled_rule_at_peer_b_does_not_enforce_even_if_enabled_at_a() {
         Rule {
             id: "R002".into(),
             kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/tmp/**"}"#.into(),
+            matcher: r#"{"glob":"/example-root/**"}"#.into(),
             severity: "refuse".into(),
-            reason: "no /tmp".into(),
+            reason: "no /example-root".into(),
             namespace: "_global".into(),
             created_by: "operator".into(),
             created_at: 0,
@@ -161,7 +161,7 @@ fn disabled_rule_at_peer_b_does_not_enforce_even_if_enabled_at_a() {
 
     // Peer B: disabled rule, write allowed.
     let action = AgentAction::FilesystemWrite {
-        path: "/tmp/foo".into(),
+        path: "/example-root/foo".into(),
         byte_estimate: None,
     };
     let decision = check_agent_action(&peer_b, "agent:b", &action).unwrap();
