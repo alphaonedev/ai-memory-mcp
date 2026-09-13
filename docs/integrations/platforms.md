@@ -605,10 +605,11 @@ distributions of the same arch.
 
 - **Flash storage wear.** Embedded devices typically run from NAND or
   eMMC flash with limited write cycles. The audit log (PR-5) is the
-  most write-heavy component. **Recommendation: set `max_size_mb = 50` under `[logging]` in
-  `config.toml`** to cap rotation size and avoid premature
-  wear-leveling exhaustion. On very small devices (≤16 MB user
-  storage) consider disabling the audit log entirely.
+  most write-heavy component. **Recommendation: set `rotation = "hourly"`
+  and a small `max_files` under `[logging]` in `config.toml`.** The file
+  sink rotates by time only, so its bound is `max_files` × one hour's
+  volume; `max_size_mb` is not enforced (#3652). On very small devices
+  (≤16 MB user storage) consider disabling the audit log entirely.
 - **DB path.** `/var/lib/ai-memory.db` for systems with a writable
   `/var/lib`, or `/etc/ai-memory.db` on OpenWRT where `/etc` is the
   conventional persistent overlay.

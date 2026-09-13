@@ -2075,8 +2075,12 @@ ai-memory sync /mnt/shared/ai-memory.db --direction merge
 
 ```bash
 # Sync every 15 minutes (bidirectional merge)
-*/15 * * * * /usr/local/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db sync /mnt/shared/remote-memory.db --direction merge --json >> /var/log/ai-memory-sync.log 2>&1
+*/15 * * * * /usr/local/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db sync /mnt/shared/remote-memory.db --direction merge --json 2>&1 | logger -t ai-memory-sync
 ```
+
+`logger` hands the output to the system log (the journal on systemd, the
+unified log on macOS), which rotates and retains it. Appending to a file
+with `>>` would grow it without limit (#3652).
 
 Sync uses the same dedup-safe upsert as regular stores:
 - Title+namespace conflicts are resolved by keeping the higher priority

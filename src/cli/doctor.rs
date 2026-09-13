@@ -1097,6 +1097,9 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     sections.push(section_logging_pipeline_3651(
         &crate::logging::log_pipeline_status(),
     ));
+    sections.push(section_log_retention_3652(
+        &crate::config::AppConfig::load().effective_logging(),
+    ));
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -1688,6 +1691,74 @@ fn section_logging_pipeline_3651(status: &crate::logging::LogPipelineStatus) -> 
                     .into(),
             ),
         },
+    }
+}
+
+/// #3652 — who bounds the operational log on disk. ai-memory bounds the file
+/// sink only on a rotation period; `rotation = "external"` is reported as the
+/// operator's bound, which ai-memory cannot verify, never as a bounded sink.
+fn section_log_retention_3652(cfg: &crate::config::LoggingConfig) -> ReportSection {
+    use crate::config::LogSink;
+    use crate::logging::{DEFAULT_MAX_FILES, FileRotationPolicy, file_rotation_policy};
+    const NAME: &str = "Log retention (#3652)";
+    if !cfg.enabled.unwrap_or(false) {
+        return ReportSection {
+            name: NAME.into(),
+            severity: Severity::Info,
+            facts: vec![(
+                "state".into(),
+                "not configured ([logging].enabled is off)".into(),
+            )],
+            note: None,
+        };
+    }
+    let sink = crate::config::resolve_log_sink(cfg);
+    let mut severity = Severity::Info;
+    let mut notes = Vec::new();
+    let bound = match sink {
+        LogSink::Stdout => "the supervisor that captures stdout (journald retention on \
+                            systemd; see docs/operations/os-tier-logging.md for launchd)"
+            .to_string(),
+        LogSink::Syslog => "the remote syslog collector".to_string(),
+        LogSink::File => match file_rotation_policy(cfg) {
+            Ok(FileRotationPolicy::Period(period)) => format!(
+                "ai-memory: at most {} files of one {} period each; the oldest is deleted",
+                cfg.max_files.unwrap_or(DEFAULT_MAX_FILES),
+                period.as_str()
+            ),
+            Ok(FileRotationPolicy::External) => {
+                notes.push(
+                    "rotation = \"external\": ai-memory neither rotates nor deletes the \
+                     file and cannot verify that an external rotator runs"
+                        .to_string(),
+                );
+                "EXTERNAL (declared): the operator's rotator, not ai-memory".to_string()
+            }
+            Err(e) => {
+                severity = Severity::Critical;
+                notes.push(format!("{e:#}"));
+                "NONE: the file sink is refused at boot".to_string()
+            }
+        },
+    };
+    let mut facts = vec![
+        ("sink".into(), sink.as_str().into()),
+        ("bound".into(), bound),
+    ];
+    if let Some(mb) = crate::logging::unenforced_max_size_mb(cfg) {
+        severity = severity_max(severity, Severity::Warning);
+        facts.push(("max_size_mb".into(), format!("{mb} (NOT ENFORCED)")));
+        notes.push(
+            "[logging].max_size_mb is parsed but no appender reads it; use a shorter \
+             rotation period for a tighter bound"
+                .to_string(),
+        );
+    }
+    ReportSection {
+        name: NAME.into(),
+        severity,
+        facts,
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
     }
 }
 
@@ -4043,7 +4114,8 @@ mod tests {
         // now 16; #3471 appended "Wake hub (#3471)"; #3582 added
         // "Federation peer authorization" before the database open and
         // Identity — total is now 18; #3651 added "Logging pipeline (#3651)"
-        // right after Configuration — total is now 19.
+        // right after Configuration — total is now 19; #3652 added
+        // "Log retention (#3652)" right after it — total is now 20.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -4059,13 +4131,14 @@ mod tests {
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 19);
+        assert_eq!(report.sections.len(), 20);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Configuration",
                 "Logging pipeline (#3651)",
+                "Log retention (#3652)",
                 "Federation peer authorization",
                 "Identity",
                 "Storage",
@@ -5194,13 +5267,15 @@ mod tests {
         // renders (the keystore is independent of the database); #3582
         // peer authorization renders before the database open and Identity.
         // Storage is the Critical failure. #3651 — the logging pipeline
-        // is independent of the database too, so it renders here as well.
-        assert_eq!(report.sections.len(), 5);
+        // is independent of the database too, so it renders here as well,
+        // and so does #3652's log retention section.
+        assert_eq!(report.sections.len(), 6);
         assert_eq!(report.sections[0].name, "Configuration");
         assert_eq!(report.sections[1].name, "Logging pipeline (#3651)");
-        assert_eq!(report.sections[2].name, "Federation peer authorization");
-        assert_eq!(report.sections[3].name, SECTION_IDENTITY);
-        let storage = &report.sections[4];
+        assert_eq!(report.sections[2].name, "Log retention (#3652)");
+        assert_eq!(report.sections[3].name, "Federation peer authorization");
+        assert_eq!(report.sections[4].name, SECTION_IDENTITY);
+        let storage = &report.sections[5];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.

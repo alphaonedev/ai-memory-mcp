@@ -87,7 +87,11 @@ journalctl -u ai-memory -o json-pretty     # structured fields
 ```
 
 Rotation/retention is configured once, globally, in `journald.conf`
-(`SystemMaxUse=`, `MaxRetentionSec=`) — not per-service.
+(`SystemMaxUse=`, `MaxRetentionSec=`) — not per-service. At the bound,
+journald deletes the oldest journal files to make room. ai-memory's request
+paths never wait on journald: the write to stdout happens on the same lossy
+non-blocking worker the file sink uses, so a slow or full journal costs
+dropped log lines (counted, #3651), never a stalled store or recall.
 
 ### Syslog / SIEM forwarding
 
@@ -117,7 +121,10 @@ file sink (`sink = "file"`, the default): it rotates by `rotation` and deletes
 files beyond `max_files` (see [Logging policy](#logging-policy--archival-guidance)).
 Keep the pinned launchd path only for stderr. A running ai-memory writes
 little there: start-up refusals, and at most one sink-failure diagnostic per
-minute.
+minute. That file is bounded in **rate** by the #3651 limiter, not in
+**size**, and launchd opens it once and never reopens it. It can't be rotated
+in place: truncate or remove it only while the job is stopped
+(`launchctl unload …`, then `launchctl load …`).
 
 `~/.config/ai-memory/config.toml`:
 
@@ -263,13 +270,37 @@ targets with no syslog daemon.
   rolling appender owns it. It starts a new file each `rotation` period and
   deletes the oldest beyond `max_files`, so the bound on disk is `max_files`
   × one period's volume.
-- **The file sink's contract (#3652).** Don't point `logrotate` or
-  `newsyslog` at these files: the appender holds the current file open and
-  never reopens it, so a rename leaves it writing into the renamed file.
-  There is no size cap. `max_size_mb` is parsed but not enforced; use
+- **The file sink's contract (#3652).** `rotation` says who bounds the file,
+  and there are exactly three answers:
+  - `minutely` | `hourly` | `daily` (default): **ai-memory** bounds it. It
+    keeps at most `max_files` files and deletes the oldest. Don't also point
+    `logrotate` or `newsyslog` at these files: the appender holds the current
+    file open and never reopens it, so a rename leaves it writing into the
+    renamed file.
+  - `external`: **you** bound it. ai-memory writes one file and never rotates
+    or deletes it; your rotator must use copy-and-truncate or restart the
+    process, because ai-memory will not reopen a renamed file. `doctor`
+    reports this as an externally-bounded sink, since ai-memory can't check
+    that a rotator actually runs.
+  - `never`: **nobody** bounds it, so the file sink refuses to start
+    (exit 78). Pick one of the two above.
+
+  There is no size cap. `max_size_mb` is parsed but not enforced: setting it
+  logs a WARN at start-up and shows as `NOT ENFORCED` in `doctor`. Use
   `rotation = "hourly"` for a tighter bound. `retention_days` deletes
   nothing. It only sets the age at which `ai-memory logs archive` compresses
   a rotated file, and only when an operator runs that command.
+- **Evidence files are never rotated from outside (#3652).** The flat audit
+  chain (`audit.log`) and the forensic files (`forensic-<date>.jsonl`) are
+  hash chains that ai-memory writes and names itself; the forensic chain
+  starts a new file each UTC day and carries `prev_hash` across. Don't point
+  `logrotate`, `newsyslog` or copy-and-truncate at them. A writer holds its
+  file open, so an external rename or truncate breaks the chain, and
+  `ai-memory audit verify` (flat chain) or `ai-memory audit verify --since
+  <date>` (forensic chain) reports the break and where it happened.
+  ai-memory deliberately doesn't detect the rename and carry on: a chain
+  that verifies after losing rows would hide the interruption. Recovery
+  after an external rotation is a new chain, not a resumed one.
 - **Operational logs are not the audit trail.** The tamper-evident signed
   audit chain (`[audit]`, `AI_MEMORY_AUDIT_DIR`) remains the source of truth for
   security/forensic events; OS-tier sinks carry *operational* info/warn/error

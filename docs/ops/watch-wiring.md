@@ -106,8 +106,9 @@ Human `--once` report fields (also on the JSON `WatchReport`):
 
 systemd user unit: `journalctl --user -u ai-memory-watch.service -f`
 
-launchd: `<home>/Library/Logs/ai-memory-watch.out` and
-`<home>/Library/Logs/ai-memory-watch.err`
+launchd: `<home>/Library/Logs/ai-memory-watch.err` (stderr only; stdout is
+discarded). launchd never rotates or reopens that file, so truncate or remove
+it only while the job is stopped (#3652).
 
 ## Verification checklist (before enable)
 

@@ -16,7 +16,7 @@
 //! [logging]
 //! enabled = true
 //! path = "~/.local/state/ai-memory/logs/"
-//! max_size_mb = 100
+//! rotation = "daily"
 //! max_files = 30
 //! retention_days = 90
 //! structured = false
@@ -43,6 +43,9 @@ use crate::log_paths;
 /// Default file prefix written by the rolling appender. Concrete
 /// rotated filenames look like `ai-memory.log.2026-04-30`.
 const DEFAULT_PREFIX: &str = "ai-memory.log";
+
+/// Rotated files the file sink keeps when `[logging].max_files` is unset.
+pub const DEFAULT_MAX_FILES: usize = 30;
 
 /// Default `tracing` EnvFilter directive applied when `RUST_LOG` is
 /// unset — INFO-level for the substrate's own crate only. One spelling
@@ -509,6 +512,20 @@ pub fn build_log_pipeline(cfg: &LoggingConfig) -> Result<Option<LogPipeline>> {
             (fmt_dispatch(cfg, writer), guard, dropped)
         }
     };
+    // #3652 — `max_size_mb` is parsed but no appender reads it. Tell the
+    // operator in the sink they will actually read, rather than let a size
+    // cap they configured look enforced.
+    if let Some(mb) = unenforced_max_size_mb(cfg) {
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::warn!(
+                target: "logging",
+                max_size_mb = mb,
+                "[logging].max_size_mb is not enforced: the file sink rotates by time \
+                 only, so its bound is max_files x one rotation period's volume. Use \
+                 a shorter rotation period for a tighter bound (#3652)"
+            );
+        });
+    }
     // A configured but unrecognised sink value falls back to `file`. Say so
     // in the sink the operator will actually read.
     if let Some(bad) = unrecognized_sink_value(cfg) {
@@ -1416,12 +1433,108 @@ pub fn resolve_log_dir_with_override(
     log_paths::resolve_log_dir(cli_override, cfg.path.as_deref())
 }
 
-/// Build the rolling file appender with the rotation policy from
-/// `cfg`. Defaults to daily rotation with `max_files` retained on
-/// disk.
+/// #3652 — `[logging].rotation` value that hands the file's bound to the
+/// operator's own rotator (logrotate, newsyslog, …). ai-memory then keeps a
+/// single file and neither rotates nor deletes it.
+pub const ROTATION_EXTERNAL: &str = "external";
+
+/// #3652 — `[logging].rotation` value that leaves the file sink with no
+/// bound at all. Refused at boot for the file sink.
+pub const ROTATION_NEVER: &str = "never";
+
+/// #3652 — who bounds the file sink on disk, resolved from
+/// `[logging].rotation`.
+///
+/// There are exactly two honest answers. ai-memory rotates on a time period
+/// and deletes the oldest files past `max_files`, or the operator declared
+/// that an external rotator owns the file. `rotation = "never"` is neither,
+/// so [`file_rotation_policy`] refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileRotationPolicy {
+    /// ai-memory rotates once per period and keeps at most `max_files`.
+    Period(RotationPeriod),
+    /// The operator's rotator bounds the file; ai-memory writes one file and
+    /// never rotates or deletes it.
+    External,
+}
+
+/// #3652 — the time periods the file sink can rotate on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationPeriod {
+    Minutely,
+    Hourly,
+    Daily,
+}
+
+impl RotationPeriod {
+    /// The `[logging].rotation` spelling of this period.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minutely => "minutely",
+            Self::Hourly => "hourly",
+            Self::Daily => "daily",
+        }
+    }
+
+    fn rotation(self) -> Rotation {
+        match self {
+            Self::Minutely => Rotation::MINUTELY,
+            Self::Hourly => Rotation::HOURLY,
+            Self::Daily => Rotation::DAILY,
+        }
+    }
+}
+
+/// #3652 — resolve `[logging].rotation` for the file sink.
+///
+/// Unset means `daily`. An unrecognised value keeps the long-standing
+/// fallback to `daily`, which is still a bounded policy.
+///
+/// # Errors
+/// `rotation = "never"`: nothing would bound the file, so the sink cannot
+/// meet its retention contract. Through [`init_file_logging`] this refuses
+/// boot (exit 78, #3651).
+pub fn file_rotation_policy(cfg: &LoggingConfig) -> Result<FileRotationPolicy> {
+    Ok(match cfg.rotation.as_deref().unwrap_or("daily") {
+        "minutely" => FileRotationPolicy::Period(RotationPeriod::Minutely),
+        "hourly" => FileRotationPolicy::Period(RotationPeriod::Hourly),
+        ROTATION_EXTERNAL => FileRotationPolicy::External,
+        ROTATION_NEVER => anyhow::bail!(
+            "[logging].rotation = \"{ROTATION_NEVER}\" leaves the log file with no size \
+             or retention bound, so the file sink is refused (#3652). Set a rotation \
+             period (minutely | hourly | daily) to have ai-memory keep at most \
+             max_files files, or set rotation = \"{ROTATION_EXTERNAL}\" if logrotate \
+             or another rotator owns the file."
+        ),
+        _ => FileRotationPolicy::Period(RotationPeriod::Daily),
+    })
+}
+
+/// #3652 — `Some(max_size_mb)` when the file sink is selected and the
+/// operator set `[logging].max_size_mb`, which nothing enforces. Feeds the
+/// boot WARN and the `doctor` retention section.
+#[must_use]
+pub fn unenforced_max_size_mb(cfg: &LoggingConfig) -> Option<u64> {
+    (crate::config::resolve_log_sink(cfg) == LogSink::File)
+        .then_some(cfg.max_size_mb)
+        .flatten()
+}
+
+/// Build the rolling file appender for the file sink. A rotation period
+/// keeps at most `max_files` files and deletes the oldest (#3652);
+/// `rotation = "external"` writes one file that ai-memory never rotates
+/// or deletes.
+///
+/// # Errors
+/// - `rotation = "never"` (see [`file_rotation_policy`]).
+/// - The appender cannot be created in `dir`.
 pub fn build_appender(dir: &Path, cfg: &LoggingConfig) -> Result<RollingFileAppender> {
-    let rotation = rotation_for(cfg);
-    let max_files = cfg.max_files.unwrap_or(30);
+    let rotation = match file_rotation_policy(cfg)? {
+        FileRotationPolicy::Period(period) => period.rotation(),
+        FileRotationPolicy::External => Rotation::NEVER,
+    };
+    let max_files = cfg.max_files.unwrap_or(DEFAULT_MAX_FILES);
     let prefix = cfg
         .filename_prefix
         .clone()
@@ -1433,15 +1546,6 @@ pub fn build_appender(dir: &Path, cfg: &LoggingConfig) -> Result<RollingFileAppe
         .max_log_files(max_files)
         .build(dir)
         .with_context(|| format!("building rolling appender at {}", dir.display()))
-}
-
-fn rotation_for(cfg: &LoggingConfig) -> Rotation {
-    match cfg.rotation.as_deref().unwrap_or("daily") {
-        "minutely" => Rotation::MINUTELY,
-        "hourly" => Rotation::HOURLY,
-        "never" => Rotation::NEVER,
-        _ => Rotation::DAILY,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,22 +1652,23 @@ pub fn redact_urls_in_message(msg: &str) -> String {
 mod tests {
     use super::*;
 
+    fn rotation_cfg(value: &str) -> LoggingConfig {
+        LoggingConfig {
+            rotation: Some(value.to_string()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn rotation_for_default_is_daily() {
-        let cfg = LoggingConfig::default();
-        // Rotation enum doesn't impl PartialEq, so format-compare.
-        let r = rotation_for(&cfg);
-        assert!(format!("{r:?}").to_lowercase().contains("daily"));
+        let policy = file_rotation_policy(&LoggingConfig::default()).unwrap();
+        assert_eq!(policy, FileRotationPolicy::Period(RotationPeriod::Daily));
     }
 
     #[test]
     fn rotation_for_hourly() {
-        let cfg = LoggingConfig {
-            rotation: Some("hourly".to_string()),
-            ..Default::default()
-        };
-        let r = rotation_for(&cfg);
-        assert!(format!("{r:?}").to_lowercase().contains("hourly"));
+        let policy = file_rotation_policy(&rotation_cfg("hourly")).unwrap();
+        assert_eq!(policy, FileRotationPolicy::Period(RotationPeriod::Hourly));
     }
 
     #[test]
@@ -1581,7 +1686,7 @@ mod tests {
         let cfg = LoggingConfig {
             enabled: Some(true),
             path: Some(tmp.path().to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
+            rotation: Some(ROTATION_EXTERNAL.to_string()),
             ..Default::default()
         };
         let _appender = build_appender(tmp.path(), &cfg).unwrap();
@@ -1645,7 +1750,7 @@ mod tests {
         let cfg = LoggingConfig {
             enabled: Some(true),
             path: Some(tmp.path().to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
+            rotation: Some(ROTATION_EXTERNAL.to_string()),
             level: Some("info".to_string()),
             structured: Some(false),
             ..Default::default()
@@ -1721,7 +1826,7 @@ mod tests {
         let cfg = LoggingConfig {
             enabled: Some(true),
             path: Some(tmp.path().to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
+            rotation: Some(ROTATION_EXTERNAL.to_string()),
             level: Some("info".to_string()),
             structured: Some(true),
             ..Default::default()
@@ -1785,32 +1890,56 @@ mod tests {
 
     #[test]
     fn rotation_for_minutely() {
-        let cfg = LoggingConfig {
-            rotation: Some("minutely".to_string()),
-            ..Default::default()
-        };
-        let r = rotation_for(&cfg);
-        assert!(format!("{r:?}").to_lowercase().contains("minutely"));
+        let policy = file_rotation_policy(&rotation_cfg("minutely")).unwrap();
+        assert_eq!(policy, FileRotationPolicy::Period(RotationPeriod::Minutely));
     }
 
+    /// #3652 — `never` leaves the file unbounded, so the file sink refuses
+    /// it, and the refusal names both bounded alternatives.
     #[test]
-    fn rotation_for_never() {
-        let cfg = LoggingConfig {
-            rotation: Some("never".to_string()),
-            ..Default::default()
-        };
-        let r = rotation_for(&cfg);
-        assert!(format!("{r:?}").to_lowercase().contains("never"));
+    fn rotation_never_is_refused_3652() {
+        let err = file_rotation_policy(&rotation_cfg(ROTATION_NEVER))
+            .expect_err("rotation = never must not resolve to a policy");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no size or retention bound"), "{msg}");
+        assert!(msg.contains(ROTATION_EXTERNAL), "{msg}");
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            build_appender(tmp.path(), &rotation_cfg(ROTATION_NEVER)).is_err(),
+            "the file sink must not be built on rotation = never"
+        );
+    }
+
+    /// #3652 — `external` is the declared hand-off to the operator's
+    /// rotator: accepted, and resolved to its own policy rather than to a
+    /// period ai-memory would enforce.
+    #[test]
+    fn rotation_external_is_accepted_3652() {
+        let policy = file_rotation_policy(&rotation_cfg(ROTATION_EXTERNAL)).unwrap();
+        assert_eq!(policy, FileRotationPolicy::External);
+        let tmp = tempfile::tempdir().unwrap();
+        build_appender(tmp.path(), &rotation_cfg(ROTATION_EXTERNAL)).unwrap();
     }
 
     #[test]
     fn rotation_for_unknown_falls_back_to_daily() {
-        let cfg = LoggingConfig {
-            rotation: Some("garbage".to_string()),
+        let policy = file_rotation_policy(&rotation_cfg("garbage")).unwrap();
+        assert_eq!(policy, FileRotationPolicy::Period(RotationPeriod::Daily));
+    }
+
+    /// #3652 — `max_size_mb` is reported as unenforced only where it could
+    /// have mattered: the file sink with the knob set.
+    #[test]
+    fn unenforced_max_size_mb_only_for_the_file_sink_3652() {
+        let _env = crate::test_support::env_lock();
+        let with = |sink: &str, mb: Option<u64>| LoggingConfig {
+            sink: Some(sink.to_string()),
+            max_size_mb: mb,
             ..Default::default()
         };
-        let r = rotation_for(&cfg);
-        assert!(format!("{r:?}").to_lowercase().contains("daily"));
+        assert_eq!(unenforced_max_size_mb(&with("file", Some(100))), Some(100));
+        assert_eq!(unenforced_max_size_mb(&with("file", None)), None);
+        assert_eq!(unenforced_max_size_mb(&with("stdout", Some(100))), None);
     }
 
     #[test]
@@ -1819,7 +1948,7 @@ mod tests {
         let cfg = LoggingConfig {
             enabled: Some(true),
             path: Some(tmp.path().to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
+            rotation: Some(ROTATION_EXTERNAL.to_string()),
             filename_prefix: Some("custom-prefix".to_string()),
             ..Default::default()
         };
@@ -2044,7 +2173,7 @@ mod tests {
         let cfg = LoggingConfig {
             enabled: Some(true),
             path: Some(blocker.join("sub").to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
+            rotation: Some(ROTATION_EXTERNAL.to_string()),
             ..Default::default()
         };
         let err = build_log_pipeline(&cfg).expect_err("create_dir failure must propagate");
@@ -2088,7 +2217,7 @@ mod tests {
         let not_a_dir = tmp.path().join("not_a_dir_file");
         std::fs::write(&not_a_dir, b"hello").unwrap();
         let cfg = LoggingConfig {
-            rotation: Some("never".to_string()),
+            rotation: Some(ROTATION_EXTERNAL.to_string()),
             ..Default::default()
         };
         let res = build_appender(&not_a_dir, &cfg);

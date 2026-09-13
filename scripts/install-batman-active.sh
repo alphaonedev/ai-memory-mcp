@@ -245,8 +245,14 @@ if [[ "$PLATFORM" == "Darwin" ]]; then
         <key>Crashed</key><true/>
     </dict>
     <key>ThrottleInterval</key><integer>30</integer>
-    <key>StandardOutPath</key>
-    <string>$HOME/Library/Logs/ai-memory/curator.log</string>
+    <!-- #3652: stderr only; stdout is discarded. launchd opens this file
+       once and never reopens or rotates it, so it can't be rotated in place:
+       truncate or remove it only while the job is stopped. With [logging]
+       enabled on the file sink (the bounded owner on macOS, see
+       docs/operations/os-tier-logging.md) this file gets only start-up
+       refusals and at most one sink-failure diagnostic per minute (#3651):
+       bounded in rate, not in size. With [logging] off, console logs land
+       here and nothing bounds them. -->
     <key>StandardErrorPath</key>
     <string>$HOME/Library/Logs/ai-memory/curator.log</string>
     <key>ProcessType</key><string>Background</string>

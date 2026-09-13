@@ -7142,7 +7142,11 @@ pub struct LoggingConfig {
     pub structured: Option<bool>,
     /// Tracing level / `EnvFilter` directive. Default `"info"`.
     pub level: Option<String>,
-    /// Rotation policy: `minutely | hourly | daily | never`. Default `"daily"`.
+    /// Who bounds the file sink (#3652). `minutely | hourly | daily`:
+    /// ai-memory rotates on that period and keeps `max_files`. `external`:
+    /// the operator's rotator owns the file and ai-memory never rotates or
+    /// deletes it. `never` bounds nothing and refuses boot. Default
+    /// `"daily"`.
     pub rotation: Option<String>,
     /// Override the rotated-file prefix. Default `"ai-memory.log"`.
     pub filename_prefix: Option<String>,
@@ -10326,12 +10330,11 @@ impl AppConfig {
 # [logging]
 # enabled = false
 # path = "~/.local/state/ai-memory/logs/"
-# max_size_mb = 100
 # max_files = 30
 # retention_days = 90
 # structured = false              # true = emit JSON lines for SIEM ingest
 # level = "info"                  # tracing EnvFilter directive
-# rotation = "daily"              # minutely | hourly | daily | never
+# rotation = "daily"              # minutely | hourly | daily | external
 
 # v0.6.3.1 (PR-5 / issue #487) — security audit trail. Default-OFF.
 # When enabled, every memory mutation emits one hash-chained JSON

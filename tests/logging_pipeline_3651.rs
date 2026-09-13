@@ -84,7 +84,7 @@ fn unusable_log_directory_refuses_boot_3651() {
     let out = run_with_logging(
         home.path(),
         &format!(
-            "enabled = true\nsink = \"file\"\nrotation = \"never\"\npath = \"{}\"\n",
+            "enabled = true\nsink = \"file\"\nrotation = \"external\"\npath = \"{}\"\n",
             blocker.join("sub").display()
         ),
         &["stats"],
@@ -132,7 +132,7 @@ fn a_working_file_sink_still_boots_3651() {
     let out = run_with_logging(
         home.path(),
         &format!(
-            "enabled = true\nsink = \"file\"\nrotation = \"never\"\npath = \"{}\"\n",
+            "enabled = true\nsink = \"file\"\nrotation = \"external\"\npath = \"{}\"\n",
             logs.display()
         ),
         &["stats"],

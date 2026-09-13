@@ -597,8 +597,22 @@ evidence package, not the whole thing.
 
 The rolling appender writes one file per `rotation` cadence (default
 daily). `max_files` retained on disk; older files are removed by the
-appender. `ai-memory logs archive` zstd-compresses files past
-`retention_days` for cold-storage handoff to the SIEM.
+appender. `rotation = "external"` hands the bound to your own rotator
+instead (ai-memory then writes one file and never rotates or deletes it),
+and `rotation = "never"` refuses to start because nothing would bound the
+file (#3652). `ai-memory logs archive` zstd-compresses files past
+`retention_days` for cold-storage handoff to the SIEM. The full contract,
+including journald and launchd, is in
+[OS-tier logging](../operations/os-tier-logging.html#logging-policy--archival-guidance).
+
+The evidence files are different: never rotate `audit.log` or the
+`forensic-<date>.jsonl` files with `logrotate`, `newsyslog` or
+copy-and-truncate. ai-memory names them itself (the forensic chain starts a
+new file each UTC day and carries `prev_hash` across). An external rename or
+truncate breaks the hash chain, and `ai-memory audit verify` reports where.
+That is deliberate: a writer that detected the rename and continued would
+produce a chain that verifies while having lost rows. Recovery after an
+external rotation is a new chain, not a resumed one (#3652).
 
 ### Verification cadence
 
