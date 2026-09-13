@@ -37,14 +37,15 @@ while [ $# -gt 0 ]; do case "$1" in
   --range) RANGE=$2; shift 2;; --staged) STAGED=1; shift;; --self-test) SELF_TEST=1; shift;;
   *) echo "usage: $0 [--range A..B | --staged | --self-test]" >&2; exit 2;; esac; done
 
-run_check() { # $1 = revision whose tree to read (or WORKTREE); unified diff on stdin
+run_check() { # $1 = END revision (tests read there; or WORKTREE); $2 = START revision (old-side regions); diff on stdin
   # The diff goes through a project-local scratch file: `python3 -` takes its
   # SCRIPT from stdin, so the heredoc would otherwise swallow the piped diff.
   mkdir -p .local-runs; local df=.local-runs/stale-contract-diff.$$; cat > "$df"
-  python3 - "$1" "$df" <<'PY'
+  python3 - "$1" "$df" "$2" <<'PY'
 import re, sys, subprocess
 endrev = sys.argv[1]
 diff = open(sys.argv[2], encoding='utf-8', errors='replace').read()
+MOD_TESTS = re.compile(r'^\s*(pub )?mod tests\b', re.M)
 _batch = None
 def read_at(path):
     """File text at endrev. One `git cat-file --batch` process serves every read."""
@@ -65,7 +66,6 @@ def listing():
     return subprocess.run(['git','ls-tree','-r','--name-only',endrev,'--','tests','src'], capture_output=True, text=True).stdout.split()
 def is_test_path(p):
     return p.startswith('tests/') or '/tests/' in p or p.endswith(('/tests.rs','_test.rs','_tests.rs'))
-MOD_TESTS = re.compile(r'^\s*(pub )?mod tests\b', re.M)
 def split_regions(path, text):
     """(production_text, test_text) for a file at endrev."""
     if is_test_path(path): return '', text
@@ -79,11 +79,31 @@ def fragments(lit):
         if len(part) >= 8: out.append(part)
     return out
 # 1. literals on REMOVED production lines of src/ in the diff
-cur = None; removed = {}
+startrev = sys.argv[3]
+def old_test_start(path):
+    """Line where the OLD file's `mod tests` begins (None = no in-file test region)."""
+    if startrev == 'WORKTREE': r = subprocess.run(['git','show',f'HEAD:{path}'], capture_output=True, text=True)
+    else: r = subprocess.run(['git','show',f'{startrev}:{path}'], capture_output=True, text=True)
+    if r.returncode != 0: return None
+    for i, l in enumerate(r.stdout.splitlines(), 1):
+        if MOD_TESTS.match(l): return i
+    return None
+cur = None; removed = {}; oldno = 0; test_from = None
+HUNK = re.compile(r'^@@ -(\d+)(?:,\d+)? ')
 for ln in diff.splitlines():
-    if ln.startswith('+++ b/'): cur = ln[6:]; continue
-    if cur and ln.startswith('-') and not ln.startswith('---'):
-        removed.setdefault(cur, []).append(ln[1:])
+    if ln.startswith('+++ b/'): cur = ln[6:]; test_from = old_test_start(cur); continue
+    m = HUNK.match(ln)
+    if m: oldno = int(m.group(1)); continue
+    if cur is None or ln.startswith('---'): continue
+    if ln.startswith('-'):
+        # a removed line at OLD line `oldno`: skip it if it sat in the old file's test region
+        if not (test_from and oldno >= test_from):
+            removed.setdefault(cur, []).append(ln[1:])
+        oldno += 1
+    elif ln.startswith('+'):
+        pass
+    else:
+        oldno += 1
 frags = {}
 for f, lines in removed.items():
     if not (f.startswith('src/') and f.endswith('.rs')) or is_test_path(f): continue
@@ -131,7 +151,8 @@ gone_idents = {}
 for fr, src in gone.items():
     for t in rare_idents(fr):
         if prose(t, fr) and not prose(t, prod_code): gone_idents[t] = (fr, src)
-ASSERT = re.compile(r'assert|contains\(|expect\(|starts_with\(|ends_with\(|==|matches!')
+# `.expect("…")` is the test's OWN failure message, never a pin on production text.
+ASSERT = re.compile(r'assert|contains\(|starts_with\(|ends_with\(|==|matches!')
 def glue_lines(text):
     out = []
     for ln in text.splitlines():
@@ -208,17 +229,17 @@ if [ "$SELF_TEST" -eq 1 ]; then
   # into a bounded ProviderError, while an untouched test still asserted the
   # old text. The gate must flag that range. Positive control: a range whose
   # literal change touched every asserting test must pass.
-  neg=$(git diff 1fd7e29d5~1..1fd7e29d5 2>/dev/null | run_check 1fd7e29d5); nrc=$?
+  neg=$(git diff 1fd7e29d5~1..1fd7e29d5 2>/dev/null | run_check 1fd7e29d5 1fd7e29d5~1); nrc=$?
   if [ $nrc -ne 1 ] || ! printf '%s' "$neg" | grep -q 'Ollama pull failed'; then
     echo "stale-contract-assertions self-test: FAIL — did not flag the #3648 range (rc=$nrc): $neg"; exit 1
   fi
-  pos=$(git diff 74c87d599~1..74c87d599 2>/dev/null | run_check 74c87d599); prc=$?
+  pos=$(git diff 74c87d599~1..74c87d599 2>/dev/null | run_check 74c87d599 74c87d599~1); prc=$?
   if [ $prc -ne 0 ]; then echo "stale-contract-assertions self-test: FAIL — flagged the repair commit 74c87d599: $pos"; exit 1; fi
   echo "stale-contract-assertions self-test: PASS (flags the #3648 stale pin; passes its repair)"; exit 0
 fi
 
-if [ "$STAGED" -eq 1 ]; then out=$(git diff --cached | run_check WORKTREE); rc=$?
-else out=$(git diff "$RANGE" | run_check "${RANGE##*..}"); rc=$?; fi
+if [ "$STAGED" -eq 1 ]; then out=$(git diff --cached | run_check WORKTREE WORKTREE); rc=$?
+else out=$(git diff "$RANGE" | run_check "${RANGE##*..}" "${RANGE%%..*}"); rc=$?; fi
 if [ $rc -ne 0 ]; then
   printf '%s\n' "$out"
   cat <<MSG
