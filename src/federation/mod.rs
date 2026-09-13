@@ -2464,9 +2464,16 @@ mod tests {
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
         let target = format!("{url}/api/v1/sync/push");
 
-        let outcome =
-            post_and_classify(&client, &test_peer(&target), &body, "mem-x", Some("mem-x"), None, None)
-                .await;
+        let outcome = post_and_classify(
+            &client,
+            &test_peer(&target),
+            &body,
+            "mem-x",
+            Some("mem-x"),
+            None,
+            None,
+        )
+        .await;
         match outcome {
             AckOutcome::Fail(reason) => {
                 assert!(
@@ -2523,9 +2530,16 @@ mod tests {
             .build()
             .unwrap();
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
-        let outcome =
-            post_and_classify(&client, &test_peer(&url), &body, "mem-x", Some("mem-x"), None, None)
-                .await;
+        let outcome = post_and_classify(
+            &client,
+            &test_peer(&url),
+            &body,
+            "mem-x",
+            Some("mem-x"),
+            None,
+            None,
+        )
+        .await;
         assert!(
             matches!(outcome, AckOutcome::IdDrift),
             "expected IdDrift, got {outcome:?}"
@@ -2563,8 +2577,16 @@ mod tests {
             .build()
             .unwrap();
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
-        super::sync::post_once(&client, &test_peer(&url), &body, "mem-x", Some("mem-x"), None, None)
-            .await
+        super::sync::post_once(
+            &client,
+            &test_peer(&url),
+            &body,
+            "mem-x",
+            Some("mem-x"),
+            None,
+            None,
+        )
+        .await
     }
 
     /// #2341 — a postgres receiver's 200 carrying `unsupported_on_postgres`

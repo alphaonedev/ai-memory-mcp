@@ -176,9 +176,9 @@ impl FailureClass {
             DlqErrorClass::UnenrolledPeer => FailureClass::Unauthorized,
             DlqErrorClass::Throttle => FailureClass::Throttled,
             DlqErrorClass::Permanent => FailureClass::Rejected,
-            DlqErrorClass::PeerRefused | DlqErrorClass::PeerUnsupported | DlqErrorClass::IdDrift => {
-                FailureClass::NotApplied
-            }
+            DlqErrorClass::PeerRefused
+            | DlqErrorClass::PeerUnsupported
+            | DlqErrorClass::IdDrift => FailureClass::NotApplied,
             DlqErrorClass::PeerRemoved | DlqErrorClass::Queued | DlqErrorClass::Other => {
                 if super::dlq_class::detail_of(reason).starts_with("http 5") {
                     FailureClass::ServerError
@@ -290,7 +290,8 @@ pub fn peer_label(peer_id: &str) -> String {
     hasher.update(HASHED_PEER_LABEL_DOMAIN);
     hasher.update(peer_id.as_bytes());
     let digest = hex::encode(hasher.finalize());
-    let mut label = String::with_capacity(HASHED_PEER_LABEL_PREFIX.len() + HASHED_PEER_LABEL_NIBBLES);
+    let mut label =
+        String::with_capacity(HASHED_PEER_LABEL_PREFIX.len() + HASHED_PEER_LABEL_NIBBLES);
     label.push_str(HASHED_PEER_LABEL_PREFIX);
     label.push_str(&digest[..HASHED_PEER_LABEL_NIBBLES]);
     label
@@ -381,7 +382,8 @@ fn record_at(peer_id: &str, direction: Direction, observation: Observation, now:
                 .with_label_values(&labels)
                 .set(now);
             if previous_failures >= ESCALATE_AFTER_CONSECUTIVE_FAILURES {
-                let failing_for = previous_failing_since.map_or(0, |since| now.saturating_sub(since));
+                let failing_for =
+                    previous_failing_since.map_or(0, |since| now.saturating_sub(since));
                 tracing::info!(
                     target: FRESHNESS_TRACE_TARGET,
                     peer = %label,
@@ -554,7 +556,10 @@ mod tests {
         let id = "peer-0:https://admin:hunter2@peer.example:9077";
         let label = peer_label(id);
         assert!(label.starts_with(HASHED_PEER_LABEL_PREFIX), "{label}");
-        assert_eq!(label.len(), HASHED_PEER_LABEL_PREFIX.len() + HASHED_PEER_LABEL_NIBBLES);
+        assert_eq!(
+            label.len(),
+            HASHED_PEER_LABEL_PREFIX.len() + HASHED_PEER_LABEL_NIBBLES
+        );
         assert!(!label.contains("hunter2") && !label.contains("peer.example"));
         assert_eq!(peer_label(id), label, "label must be stable");
     }
@@ -562,13 +567,26 @@ mod tests {
     #[test]
     fn failure_streak_resets_on_success_and_keeps_local_timestamps() {
         let peer = unique("streak");
-        record_at(&peer, Direction::Pull, Observation::Failure(FailureClass::Unreachable), 100);
-        record_at(&peer, Direction::Pull, Observation::Failure(FailureClass::ServerError), 160);
+        record_at(
+            &peer,
+            Direction::Pull,
+            Observation::Failure(FailureClass::Unreachable),
+            100,
+        );
+        record_at(
+            &peer,
+            Direction::Pull,
+            Observation::Failure(FailureClass::ServerError),
+            160,
+        );
         let mid = snapshot_for(&peer).expect("peer recorded");
         assert_eq!(mid.pull.consecutive_failures, 2);
         assert_eq!(mid.pull.failing_since_unix, Some(100));
         assert_eq!(mid.pull.last_attempt_unix, Some(160));
-        assert_eq!(mid.pull.last_success_unix, None, "never succeeded: no number");
+        assert_eq!(
+            mid.pull.last_success_unix, None,
+            "never succeeded: no number"
+        );
         assert_eq!(mid.pull.last_failure_class, Some("server_error"));
         assert_eq!(mid.push, DirectionFreshness::default(), "push untouched");
 
@@ -582,12 +600,24 @@ mod tests {
 
     #[test]
     fn http_status_classes_are_distinct() {
-        assert_eq!(FailureClass::from_http_status(401), FailureClass::Unauthorized);
-        assert_eq!(FailureClass::from_http_status(403), FailureClass::Unauthorized);
+        assert_eq!(
+            FailureClass::from_http_status(401),
+            FailureClass::Unauthorized
+        );
+        assert_eq!(
+            FailureClass::from_http_status(403),
+            FailureClass::Unauthorized
+        );
         assert_eq!(FailureClass::from_http_status(429), FailureClass::Throttled);
         assert_eq!(FailureClass::from_http_status(404), FailureClass::Rejected);
-        assert_eq!(FailureClass::from_http_status(500), FailureClass::ServerError);
-        assert_eq!(FailureClass::from_http_status(503), FailureClass::ServerError);
+        assert_eq!(
+            FailureClass::from_http_status(500),
+            FailureClass::ServerError
+        );
+        assert_eq!(
+            FailureClass::from_http_status(503),
+            FailureClass::ServerError
+        );
         assert_eq!(FailureClass::from_http_status(302), FailureClass::Other);
     }
 
@@ -595,15 +625,30 @@ mod tests {
     fn push_reasons_map_from_the_typed_tag() {
         use super::super::dlq_class::DlqErrorClass;
         let network = DlqErrorClass::Network.stamp("connection refused");
-        assert_eq!(FailureClass::from_push_reason(&network), FailureClass::Unreachable);
+        assert_eq!(
+            FailureClass::from_push_reason(&network),
+            FailureClass::Unreachable
+        );
         let server = DlqErrorClass::from_http_status(500).stamp("http 500 Internal Server Error");
-        assert_eq!(FailureClass::from_push_reason(&server), FailureClass::ServerError);
+        assert_eq!(
+            FailureClass::from_push_reason(&server),
+            FailureClass::ServerError
+        );
         let unauthorized = DlqErrorClass::from_http_status(401).stamp("http 401 Unauthorized");
-        assert_eq!(FailureClass::from_push_reason(&unauthorized), FailureClass::Unauthorized);
+        assert_eq!(
+            FailureClass::from_push_reason(&unauthorized),
+            FailureClass::Unauthorized
+        );
         let refused = DlqErrorClass::PeerRefused.stamp("peer skipped 1 item(s)");
-        assert_eq!(FailureClass::from_push_reason(&refused), FailureClass::NotApplied);
+        assert_eq!(
+            FailureClass::from_push_reason(&refused),
+            FailureClass::NotApplied
+        );
         // An untagged reason whose prose mentions a 5xx is NOT trusted.
-        assert_eq!(FailureClass::from_push_reason("peer said http 500"), FailureClass::Other);
+        assert_eq!(
+            FailureClass::from_push_reason("peer said http 500"),
+            FailureClass::Other
+        );
     }
 
     #[test]
@@ -624,8 +669,16 @@ mod tests {
         let idle = unique("dlq-idle");
         record_at(&idle, Direction::Push, Observation::Success, 10);
         record_push_dlq_backlog(&[
-            PeerDlqBacklog { peer_id: busy.clone(), pending: 4, oldest_failed_unix: Some(1_000) },
-            PeerDlqBacklog { peer_id: idle.clone(), pending: 1, oldest_failed_unix: Some(2_000) },
+            PeerDlqBacklog {
+                peer_id: busy.clone(),
+                pending: 4,
+                oldest_failed_unix: Some(1_000),
+            },
+            PeerDlqBacklog {
+                peer_id: idle.clone(),
+                pending: 1,
+                oldest_failed_unix: Some(2_000),
+            },
         ]);
         assert_eq!(snapshot_for(&idle).unwrap().push_dlq_depth, Some(1));
         record_push_dlq_backlog(&[PeerDlqBacklog {
