@@ -74,6 +74,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contact as an age of 0. Tests: an empty-window `sync_cycle_once` stamps
   contact and leaves `sync_state` untouched; old cursors + fresh contact is
   Info; old contact is Critical; no contact is Warning.
+- **#3655 v3 review — the reader enumerates the UNION of `sync_state` and
+  `sync_peer_contact`.** A peer that has only ever answered empty windows
+  (contact row, no `sync_state` row) was invisible to the section; it is
+  now listed, reachable, with `advanced_age_secs` / `data_age_secs` /
+  `clock_lead_secs` = `never_pulled` (never 0, never invalid). Peer ids are
+  redacted at watermark construction (`logging::redact_url_password`) so a
+  credential-bearing legacy URL never reaches a fact or note. A non-2xx
+  pull is never stamped as contact (tested with a peer answering 500).
 
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 

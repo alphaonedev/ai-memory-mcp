@@ -31431,14 +31431,22 @@ mod tests {
         assert!(w.invalid[0].1.contains("last_seen_at"), "{:?}", w.invalid);
         let by_peer = |id: &str| w.peers.iter().find(|p| p.peer_id == id).unwrap();
         let quiet = by_peer("quiet-old");
-        assert!(quiet.advanced_age_secs >= 2 * crate::SECS_PER_HOUR);
-        assert_eq!(quiet.clock_lead_secs, 0, "equal cursors are not skew");
+        assert!(
+            quiet
+                .advanced_age_secs
+                .is_some_and(|a| a >= 2 * crate::SECS_PER_HOUR)
+        );
+        assert_eq!(quiet.clock_lead_secs, Some(0), "equal cursors are not skew");
         assert_eq!(quiet.pushed_age_secs, None);
         // Review rework: no contact row → contact is UNKNOWN (None), never 0.
         assert_eq!(quiet.contact_age_secs, None);
         assert_eq!(quiet.catchup_interval_secs, None);
         let fresh_peer = by_peer("fresh");
-        assert!((30..60).contains(&fresh_peer.advanced_age_secs));
+        assert!(
+            fresh_peer
+                .advanced_age_secs
+                .is_some_and(|a| (30..60).contains(&a))
+        );
         assert!(fresh_peer.pushed_age_secs.is_some());
         // A contact row joins in, aged against `now`, with its cadence; a
         // contact without a cadence stays `None` for the cadence.
@@ -31451,19 +31459,50 @@ mod tests {
         let w2 = doctor_sync_peer_watermarks(&conn, now).unwrap();
         let by_peer2 = |id: &str| w2.peers.iter().find(|p| p.peer_id == id).unwrap();
         let quiet2 = by_peer2("quiet-old");
-        assert!((30..60).contains(&quiet2.contact_age_secs.unwrap()));
+        assert!(
+            quiet2
+                .contact_age_secs
+                .is_some_and(|c| (30..60).contains(&c))
+        );
         assert_eq!(quiet2.catchup_interval_secs, Some(60));
         assert!(
-            quiet2.advanced_age_secs >= 2 * crate::SECS_PER_HOUR,
+            quiet2
+                .advanced_age_secs
+                .is_some_and(|a| a >= 2 * crate::SECS_PER_HOUR),
             "data stamp unchanged"
         );
         let fresh2 = by_peer2("fresh");
         assert!(fresh2.contact_age_secs.is_some());
         assert_eq!(fresh2.catchup_interval_secs, None);
+        // v3 review: a contact-only peer (empty windows only, no sync_state
+        // row) is enumerated from the union with its data cursors None, and
+        // a URL-shaped peer id is redacted at construction.
+        conn.execute_batch(&format!(
+            "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, catchup_interval_secs) VALUES \
+             ('me', 'https://bob:s3cret@quiet.example/api/v1/sync/push', '{fresh}', 60);"
+        ))
+        .unwrap();
+        let w3 = doctor_sync_peer_watermarks(&conn, now).unwrap();
+        assert_eq!(w3.row_count(), 5, "the contact-only peer is a row");
+        let only = w3
+            .peers
+            .iter()
+            .find(|p| p.peer_id.contains("quiet.example"))
+            .expect("contact-only peer must be enumerated");
+        assert!(!only.peer_id.contains("s3cret"), "{}", only.peer_id);
+        assert!(only.contact_age_secs.is_some());
+        assert_eq!(only.advanced_age_secs, None);
+        assert_eq!(only.data_age_secs, None);
+        assert_eq!(only.clock_lead_secs, None);
+        assert_eq!(only.pushed_age_secs, None);
         let ahead_peer = by_peer("ahead");
-        assert!(ahead_peer.clock_lead_secs >= crate::SECS_PER_HOUR - 1);
         assert!(
-            ahead_peer.data_age_secs < 0,
+            ahead_peer
+                .clock_lead_secs
+                .is_some_and(|l| l >= crate::SECS_PER_HOUR - 1)
+        );
+        assert!(
+            ahead_peer.data_age_secs.is_some_and(|d| d < 0),
             "data stamped in the future ages negative"
         );
     }
