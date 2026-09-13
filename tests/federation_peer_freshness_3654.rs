@@ -74,13 +74,17 @@ fn respond(state: &PeerState, ok_body: serde_json::Value) -> Response {
                 .expect("valid timestamp")
                 .format("%a, %d %b %Y %H:%M:%S GMT")
                 .to_string();
-            resp.headers_mut()
-                .insert(header::DATE, HeaderValue::from_str(&date).expect("date header"));
+            resp.headers_mut().insert(
+                header::DATE,
+                HeaderValue::from_str(&date).expect("date header"),
+            );
             resp
         }
-        Answer::PushSkipped => {
-            (StatusCode::OK, axum::Json(json!({"applied": 0, "skipped": 1}))).into_response()
-        }
+        Answer::PushSkipped => (
+            StatusCode::OK,
+            axum::Json(json!({"applied": 0, "skipped": 1})),
+        )
+            .into_response(),
         Answer::FailThenOk(failures) => {
             if n < failures {
                 (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({}))).into_response()
@@ -99,15 +103,19 @@ async fn spawn_peer(answer: Answer) -> String {
     let app = Router::new()
         .route(
             "/api/v1/sync/since",
-            get(|axum::extract::State(s): axum::extract::State<PeerState>| async move {
-                respond(&s, json!({"memories": [], "count": 0}))
-            }),
+            get(
+                |axum::extract::State(s): axum::extract::State<PeerState>| async move {
+                    respond(&s, json!({"memories": [], "count": 0}))
+                },
+            ),
         )
         .route(
             "/api/v1/sync/push",
-            post(|axum::extract::State(s): axum::extract::State<PeerState>| async move {
-                respond(&s, json!({"applied": 1, "skipped": 0}))
-            }),
+            post(
+                |axum::extract::State(s): axum::extract::State<PeerState>| async move {
+                    respond(&s, json!({"applied": 1, "skipped": 0}))
+                },
+            ),
         )
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -231,14 +239,20 @@ async fn idle_healthy_peer_is_fresh_on_pull_and_has_no_push_numbers() {
     let fresh = freshness::snapshot_for(&id).expect("pull recorded");
     assert_eq!(fresh.pull.consecutive_failures, 0);
     let success = fresh.pull.last_success_unix.expect("pull succeeded");
-    assert!(success >= before && success <= now_unix(), "local-clock timestamp");
+    assert!(
+        success >= before && success <= now_unix(),
+        "local-clock timestamp"
+    );
     assert_eq!(fresh.pull.last_attempt_unix, Some(success));
     // A quiet peer we never pushed to has NO push numbers, never a zero.
     assert_eq!(fresh.push.last_attempt_unix, None);
     assert_eq!(fresh.push.last_success_unix, None);
     let labels = [("peer", id.as_str()), ("direction", "push")];
     assert_eq!(
-        sample("ai_memory_federation_peer_last_success_timestamp_seconds", &labels),
+        sample(
+            "ai_memory_federation_peer_last_success_timestamp_seconds",
+            &labels
+        ),
         None,
         "no push series before the first push"
     );
@@ -293,7 +307,11 @@ async fn unreachable_peer_escalates_at_the_threshold_and_not_before() {
     assert_eq!(
         sample(
             "ai_memory_federation_peer_failures_total",
-            &[("peer", id.as_str()), ("direction", "pull"), ("class", "unreachable")]
+            &[
+                ("peer", id.as_str()),
+                ("direction", "pull"),
+                ("class", "unreachable")
+            ]
         ),
         Some(i64::try_from(ESCALATE_AFTER_CONSECUTIVE_FAILURES + 1).expect("fits"))
     );
@@ -301,13 +319,21 @@ async fn unreachable_peer_escalates_at_the_threshold_and_not_before() {
 
 #[tokio::test]
 async fn unauthorized_and_server_error_peers_are_told_apart() {
-    for (status, class) in [(401, "unauthorized"), (403, "unauthorized"), (500, "server_error")] {
+    for (status, class) in [
+        (401, "unauthorized"),
+        (403, "unauthorized"),
+        (500, "server_error"),
+    ] {
         let id = peer_id();
         let cfg = config(&spawn_peer(Answer::Status(status)).await, &id);
         catchup_once_for_tests(&cfg).await;
         let fresh = freshness::snapshot_for(&id).expect("recorded");
         assert_eq!(fresh.pull.consecutive_failures, 1, "status {status}");
-        assert_eq!(fresh.pull.last_failure_class, Some(class), "status {status}");
+        assert_eq!(
+            fresh.pull.last_failure_class,
+            Some(class),
+            "status {status}"
+        );
         assert!(fresh.pull.last_attempt_unix.is_some());
         assert_eq!(fresh.pull.last_success_unix, None);
     }
@@ -359,7 +385,10 @@ async fn skewed_peer_clock_is_measured_but_never_used_as_freshness() {
         "freshness must come from the LOCAL clock, not the peer's Date ({success} not in {before}..={after})"
     );
     assert_eq!(
-        sample("ai_memory_federation_peer_clock_skew_seconds", &[("peer", id.as_str())]),
+        sample(
+            "ai_memory_federation_peer_clock_skew_seconds",
+            &[("peer", id.as_str())]
+        ),
         Some(measured)
     );
 }
@@ -399,8 +428,18 @@ async fn pushes_distinguish_accepting_rejecting_and_not_applying_peers() {
 async fn bulk_catchup_push_records_the_peer_and_its_report() {
     let ok = peer_id();
     let cfg = config(&spawn_peer(Answer::Ok).await, &ok);
-    assert!(ai_memory::federation::bulk_catchup_push(&cfg, &[memory()]).await.is_empty());
-    assert!(freshness::snapshot_for(&ok).expect("recorded").push.last_success_unix.is_some());
+    assert!(
+        ai_memory::federation::bulk_catchup_push(&cfg, &[memory()])
+            .await
+            .is_empty()
+    );
+    assert!(
+        freshness::snapshot_for(&ok)
+            .expect("recorded")
+            .push
+            .last_success_unix
+            .is_some()
+    );
 
     let skipped = peer_id();
     let cfg = config(&spawn_peer(Answer::PushSkipped).await, &skipped);
@@ -416,8 +455,14 @@ async fn url_shaped_peer_ids_never_reach_the_exposition() {
     let cfg = config(&dead_peer().await, secret_id);
     catchup_once_for_tests(&cfg).await;
     let exposition = ai_memory::metrics::render();
-    assert!(!exposition.contains("hunter2"), "credential leaked into /metrics");
-    assert!(!exposition.contains("peer.example"), "peer URL leaked into /metrics");
+    assert!(
+        !exposition.contains("hunter2"),
+        "credential leaked into /metrics"
+    );
+    assert!(
+        !exposition.contains("peer.example"),
+        "peer URL leaked into /metrics"
+    );
     let label = freshness::peer_label(secret_id);
     assert_eq!(
         sample(

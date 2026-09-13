@@ -1755,11 +1755,13 @@ impl FederationDlqSink for PostgresDlqSink {
         .map_err(|e| format!("postgres pending_dlq_backlog_by_peer: {e}"))?;
         Ok(rows
             .into_iter()
-            .map(|(peer_id, pending, oldest_failed_unix)| super::freshness::PeerDlqBacklog {
-                peer_id,
-                pending,
-                oldest_failed_unix,
-            })
+            .map(
+                |(peer_id, pending, oldest_failed_unix)| super::freshness::PeerDlqBacklog {
+                    peer_id,
+                    pending,
+                    oldest_failed_unix,
+                },
+            )
             .collect())
     }
 
