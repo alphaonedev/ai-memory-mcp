@@ -27,8 +27,14 @@ fn keyword_config() -> AppConfig {
     config
 }
 
+/// #3705/#3709 — with no `--tls-cert`/`--tls-key` the listener is STILL TLS:
+/// the daemon issues its own local-CA certificate into the (armed, sandboxed)
+/// key directory, so the occupied-port bind failure below is a TLS bind
+/// failure on the zero-config path and must drain the writers exactly like
+/// the operator-material twin. There is no plaintext listener to fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_bind_failure_drains_writers_before_returning_fatal_status() {
+    let _sandbox = crate::identity::test_key_dir::install();
     let directory = tempfile::tempdir().expect("create bind-failure test directory");
     let db_path = directory.path().join("ai-memory.db");
     let mut args = bind_failure_args();

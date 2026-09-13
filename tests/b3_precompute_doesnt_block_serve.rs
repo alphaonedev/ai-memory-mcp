@@ -54,7 +54,11 @@ fn scratch_db(infix: &str) -> std::path::PathBuf {
 
 /// Poll `GET /api/v1/health` until it returns `200` or `budget`
 /// elapses. Returns `Some(elapsed)` on success, `None` on timeout.
-fn wait_for_health_within(port: u16, budget: Duration) -> Option<Duration> {
+fn wait_for_health_within(
+    port: u16,
+    budget: Duration,
+    tls: &common::tls::TestTls,
+) -> Option<Duration> {
     let started = Instant::now();
     while started.elapsed() < budget {
         let out = Command::new("curl")
@@ -66,7 +70,9 @@ fn wait_for_health_within(port: u16, budget: Duration) -> Option<Duration> {
                 "%{http_code}",
                 "--max-time",
                 "1",
-                &format!("http://127.0.0.1:{port}/api/v1/health"),
+                "--cacert",
+                tls.cert_path.to_str().unwrap(),
+                &format!("https://127.0.0.1:{port}/api/v1/health"),
             ])
             .output();
         if let Ok(out) = out
@@ -83,6 +89,8 @@ fn wait_for_health_within(port: u16, budget: Duration) -> Option<Duration> {
 fn b3_precompute_does_not_block_serve_health() {
     let db = scratch_db("ai-memory-b3-precompute-block");
     let port = free_port();
+    // #3705 — the daemon refuses every plaintext bind.
+    let tls = common::tls::TestTls::generate(&db.with_extension("tls3705"));
 
     // `AI_MEMORY_NO_CONFIG=1` mirrors the project's standard test env
     // (see CLAUDE.md): prevents loading user config that could
@@ -111,6 +119,7 @@ fn b3_precompute_does_not_block_serve_health() {
             "--port",
             &port.to_string(),
         ])
+        .args(tls.serve_arg_strs())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -148,7 +157,7 @@ fn b3_precompute_does_not_block_serve_health() {
     // property intact and removes a knife-edge that could only fail on a
     // slow runner, never on a defect.
     let budget = Duration::from_mins(1);
-    let result = wait_for_health_within(port, budget);
+    let result = wait_for_health_within(port, budget, &tls);
 
     // Always reap the child before asserting so a failed assertion
     // doesn't leave a zombie daemon holding the port.

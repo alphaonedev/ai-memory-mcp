@@ -1046,7 +1046,7 @@ fn federation_forward_url_branch_takes_http_path() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"), // unreachable,
+        Some("https://127.0.0.1:1"), // unreachable,
         None,
     )
     .unwrap_err();
@@ -1077,7 +1077,7 @@ fn federation_forward_url_uses_metadata_agent_id_when_top_level_absent() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"), // unreachable — we just want to exercise the agent_id path,
+        Some("https://127.0.0.1:1"), // unreachable — we just want to exercise the agent_id path,
         None,
     );
     // Unreachable URL means a federation_forward error; the
@@ -1105,7 +1105,7 @@ fn federation_forward_url_rejects_malformed_agent_id() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"),
+        Some("https://127.0.0.1:1"),
         None,
     )
     .unwrap_err();

@@ -470,7 +470,7 @@ fn forward_to_http_connection_failure_surfaces_send_error() {
 
     // Localhost on a vanishingly unlikely-to-be-bound high port. The
     // test does NOT need to bind anything — we want the send() to fail.
-    let forward_url = "http://127.0.0.1:1";
+    let forward_url = "https://127.0.0.1:1";
 
     let err = run_store_with_forward(
         &conn,

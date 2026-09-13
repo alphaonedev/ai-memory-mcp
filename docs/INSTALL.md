@@ -556,7 +556,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 client.toolgroups.register(
     provider_id="model-context-protocol",
     toolgroup_id="mcp::memory",
-    mcp_endpoint={"uri": "http://localhost:9077/sse"}
+    mcp_endpoint={"uri": "https://localhost:9077/sse"}
 )
 ```
 
@@ -573,7 +573,7 @@ tool_groups:
   - toolgroup_id: mcp::memory
     provider_id: model-context-protocol
     mcp_endpoint:
-      uri: "http://localhost:9077/sse"
+      uri: "https://localhost:9077/sse"
 ```
 
 > **Notes for Llama Stack:** Supports `${env.VARIABLE_NAME}` syntax for environment variable interpolation in run.yaml. Transport is migrating from SSE to Streamable HTTP as the primary protocol. See [Llama Stack Tools docs](https://llama-stack.readthedocs.io/en/latest/building_applications/tools.html).
@@ -634,7 +634,7 @@ mcp_servers:
 ```yaml
 mcp_servers:
   memory:
-    url: "http://localhost:9077/mcp"
+    url: "https://localhost:9077/mcp"
 ```
 
 **With tool filtering (restrict to core tools):**
@@ -781,7 +781,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | ai-memory mc
 # Expected: JSON-RPC response with serverInfo
 
 # If running as HTTP daemon, check health:
-curl http://127.0.0.1:9077/api/v1/health
+curl https://127.0.0.1:9077/api/v1/health
 # Expected: {"status":"ok","service":"ai-memory"}
 
 # Store a test memory via CLI

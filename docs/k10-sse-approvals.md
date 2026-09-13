@@ -32,7 +32,7 @@ is consumed single-use to defeat replay within that window.
 ```bash
 curl -N -H "X-API-Key: $API_KEY" \
      -H "X-Agent-Id: ai:dashboard@host" \
-     http://127.0.0.1:9077/api/v1/approvals/stream
+     https://127.0.0.1:9077/api/v1/approvals/stream
 ```
 
 The stream emits one named event per state change. Frame names
@@ -182,7 +182,7 @@ curl -X POST \
   -H "X-AI-Memory-Signature: sha256=$SIG" \
   -H "Content-Type: application/json" \
   --data-binary "$BODY" \
-  "http://127.0.0.1:9077/api/v1/approvals/${PENDING_ID}"
+  "https://127.0.0.1:9077/api/v1/approvals/${PENDING_ID}"
 ```
 
 Step 5. Verify with the SSE consumer — within one round-trip the
@@ -251,7 +251,7 @@ with httpx.Client(timeout=None) as client:
         "X-Agent-Id": "ai:dashboard@host",   # NOT host:-prefixed
     }
     with connect_sse(client, "GET",
-                     "http://127.0.0.1:9077/api/v1/approvals/stream",
+                     "https://127.0.0.1:9077/api/v1/approvals/stream",
                      headers=headers) as event_source:
         for sse in event_source.iter_sse():
             if sse.event == "approval_requested":

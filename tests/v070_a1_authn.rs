@@ -32,6 +32,8 @@ use serde_json::json;
 use std::sync::Mutex;
 use tower::ServiceExt as _;
 
+mod common;
+
 /// Cross-test serialiser for the process-wide HMAC secret. The K10
 /// approval HTTP tests use the same pattern under
 /// `tests/k10_approval_http.rs::K10_HTTP_LOCK`.
@@ -444,12 +446,14 @@ async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
+    let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
     let args = ai_memory::daemon_runtime::ServeArgs {
         host: "0.0.0.0".to_string(),
         port: 0,
-        tls_cert: None,
-        tls_key: None,
+        // #3705 — bootstrap refuses a plaintext bind; a per-test leaf.
+        tls_cert: Some(tls.cert_path.clone()),
+        tls_key: Some(tls.key_path.clone()),
         mtls_allowlist: None,
         shutdown_grace_secs: 30,
         quorum_writes: 0,
@@ -490,12 +494,14 @@ async fn s5c1_pattern_a_loopback_bind_without_api_key_succeeds_with_warn() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
+    let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
     let args = ai_memory::daemon_runtime::ServeArgs {
         host: "127.0.0.1".to_string(),
         port: 0,
-        tls_cert: None,
-        tls_key: None,
+        // #3705 — bootstrap refuses a plaintext bind; a per-test leaf.
+        tls_cert: Some(tls.cert_path.clone()),
+        tls_key: Some(tls.key_path.clone()),
         mtls_allowlist: None,
         shutdown_grace_secs: 30,
         quorum_writes: 0,
