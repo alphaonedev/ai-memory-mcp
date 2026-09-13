@@ -872,6 +872,10 @@ pub mod index_coverage;
 /// classifies which one a candidate is under (mirrors the live gc / size_gc
 /// / consolidation triggers; changes no eviction behaviour).
 pub mod lifecycle;
+/// v1.0.0 (#3435) — the ORDER-INDEPENDENT acyclicity verdict a bulk lineage
+/// import (`migrate` / `sync`) asserts ONCE over the complete final graph,
+/// in place of the per-write wall-clock guard those imports bypass.
+pub mod lineage_import;
 pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;

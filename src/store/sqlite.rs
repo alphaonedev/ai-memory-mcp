@@ -103,6 +103,40 @@ impl SqliteStore {
         })
     }
 
+    /// v1.0.0 #3435 — open an EXISTING database read-only, for the source
+    /// side of `ai-memory migrate` (and any other verb that only READS a
+    /// store the operator named).
+    ///
+    /// Delegates to [`crate::db::open_existing_read_only`], which is the
+    /// funnel that CANNOT create: a missing path is the typed
+    /// [`crate::db::MISSING_DATABASE_REFUSAL`] instead of `Connection::open`'s
+    /// create-then-migrate, and the connection is `SQLITE_OPEN_READ_ONLY` +
+    /// `PRAGMA query_only = ON`, so no bootstrap DDL, no migration ladder and
+    /// no stray write can touch the source. A source whose schema stamp is
+    /// BEHIND this binary is refused with the typed `SchemaBehindReadOnly`
+    /// (the writer funnel would silently migrate it in place — a migration
+    /// tool must never mutate what it is copying FROM).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`crate::db::open_existing_read_only`] can produce.
+    pub fn open_existing_read_only(path: impl Into<PathBuf>) -> StoreResult<Self> {
+        let path = path.into();
+        let conn = db::open_existing_read_only(&path).map_err(box_err)?;
+        let _ = crate::store::record_stop::seed_from_conn(&conn);
+        let record_stop_key = crate::storage::record_stop::conn_key(&conn);
+        let state = Arc::new(Mutex::new(conn));
+        Ok(Self {
+            // ONE read-only connection serves both roles: there is no writer
+            // to de-stall a traversal from, so a second reader buys nothing.
+            read_state: Arc::clone(&state),
+            state,
+            path,
+            record_stop_key,
+            embed_skip_amort: Arc::new(crate::storage::embed_skip::EmbedSkipAmortisation::new()),
+        })
+    }
+
     /// #3196 — try to open a dedicated read-only connection for
     /// [`Self::find_paths`]. Returns `None` (caller shares the writer) when
     /// the database is in-memory — a second open would attach a FRESH empty

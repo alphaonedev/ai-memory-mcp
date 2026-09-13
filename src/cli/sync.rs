@@ -332,18 +332,36 @@ pub fn run(
     // is unaffected.
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "sync", out)?;
     let db_path = db_path.as_path();
+    // v1.0.0 #3435 — validate the direction BEFORE either database is
+    // opened, so a typo cannot leave a freshly-created store behind.
+    if !matches!(args.direction.as_str(), "pull" | "push" | "merge") {
+        anyhow::bail!(
+            "invalid direction: {} (use pull, push, merge)",
+            args.direction
+        );
+    }
+    // v1.0.0 #3435 — the remote is a store the OPERATOR NAMED and must
+    // already exist. `db::open` `Connection::open`s (CREATES) a missing
+    // path and replays the schema ladder over it, so a mistyped remote used
+    // to be silently minted empty and the sync "succeeded" against it.
+    ensure_remote_exists(&args.remote_db)?;
+    if args.dry_run {
+        // A dry run READS both stores and must not create, migrate or
+        // otherwise touch either: the read-only funnel refuses a missing
+        // local path too, instead of creating it.
+        let local_conn = db::open_existing_read_only(db_path)?;
+        let remote_conn = db::open_existing_read_only(&args.remote_db)?;
+        return cmd_sync_dry_run(&local_conn, &remote_conn, &args.direction, json_out, out);
+    }
     let local_conn = db::open(db_path)?;
     let remote_conn = db::open(&args.remote_db)?;
     let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;
-
-    if args.dry_run {
-        return cmd_sync_dry_run(&local_conn, &remote_conn, &args.direction, json_out, out);
-    }
 
     match args.direction.as_str() {
         "pull" => {
             let mems = db::export_all(&remote_conn)?;
             let links = db::export_links(&remote_conn)?;
+            validate_final_lineage_graph(&local_conn, &links)?;
             let mut n = 0;
             let mut tally = InboundAttestTally::default();
             for mem in &mems {
@@ -387,19 +405,7 @@ pub fn run(
                     n += 1;
                 }
             }
-            for link in &links {
-                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-                    .is_err()
-                {
-                    continue;
-                }
-                let _ = db::create_link(
-                    &local_conn,
-                    &link.source_id,
-                    &link.target_id,
-                    link.relation.as_str(),
-                );
-            }
+            import_sync_links(&local_conn, &links)?;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -423,6 +429,7 @@ pub fn run(
         "push" => {
             let mems = db::export_all(&local_conn)?;
             let links = db::export_links(&local_conn)?;
+            validate_final_lineage_graph(&remote_conn, &links)?;
             let mut n = 0;
             let mut pubkey_bindings_stripped = 0usize;
             for mem in &mems {
@@ -436,19 +443,7 @@ pub fn run(
                     n += 1;
                 }
             }
-            for link in &links {
-                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-                    .is_err()
-                {
-                    continue;
-                }
-                let _ = db::create_link(
-                    &remote_conn,
-                    &link.source_id,
-                    &link.target_id,
-                    link.relation.as_str(),
-                );
-            }
+            import_sync_links(&remote_conn, &links)?;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -474,6 +469,9 @@ pub fn run(
             let r_links = db::export_links(&remote_conn)?;
             let l_mems = db::export_all(&local_conn)?;
             let l_links = db::export_links(&local_conn)?;
+            // Both legs leave the SAME final graph (the union), so one
+            // verdict covers both directions.
+            validate_final_lineage_graph(&local_conn, &r_links)?;
             let (mut pulled, mut pushed) = (0, 0);
             let mut tally = InboundAttestTally::default();
             for mem in &r_mems {
@@ -514,19 +512,6 @@ pub fn run(
                     pulled += 1;
                 }
             }
-            for link in &r_links {
-                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-                    .is_err()
-                {
-                    continue;
-                }
-                let _ = db::create_link(
-                    &local_conn,
-                    &link.source_id,
-                    &link.target_id,
-                    link.relation.as_str(),
-                );
-            }
             for mem in &l_mems {
                 let mut owned = mem.clone();
                 strip_sync_pubkey_binding(&mut owned, &mut tally.pubkey_bindings_stripped);
@@ -537,19 +522,10 @@ pub fn run(
                     pushed += 1;
                 }
             }
-            for link in &l_links {
-                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-                    .is_err()
-                {
-                    continue;
-                }
-                let _ = db::create_link(
-                    &remote_conn,
-                    &link.source_id,
-                    &link.target_id,
-                    link.relation.as_str(),
-                );
-            }
+            // Every node of BOTH legs exists on both sides before either edge
+            // set is imported (v1.0.0 #3435 — edges after nodes).
+            import_sync_links(&local_conn, &r_links)?;
+            import_sync_links(&remote_conn, &l_links)?;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -570,10 +546,77 @@ pub fn run(
                 write_attestation_tally(out, &tally)?;
             }
         }
-        _ => anyhow::bail!(
-            "invalid direction: {} (use pull, push, merge)",
-            args.direction
-        ),
+        _ => unreachable!("direction validated before either database was opened"),
+    }
+    Ok(())
+}
+
+/// v1.0.0 #3435 — refusal slug for a `sync` remote that does not exist.
+pub const SYNC_REMOTE_MISSING_REFUSAL: &str =
+    "sync remote database does not exist; refusing to create it";
+
+/// v1.0.0 #3435 — the remote must be an EXISTING file. A missing path is a
+/// typed refusal naming the path; it is never created.
+fn ensure_remote_exists(remote: &Path) -> Result<()> {
+    match remote.try_exists() {
+        Ok(true) => Ok(()),
+        Ok(false) => anyhow::bail!("{SYNC_REMOTE_MISSING_REFUSAL}: {}", remote.display()),
+        Err(e) => anyhow::bail!("cannot stat sync remote {}: {e}", remote.display()),
+    }
+}
+
+/// v1.0.0 #3435 — assert ONCE, before any write, that the lineage graph a
+/// leg leaves on `destination` (its existing edges plus `incoming`) is a
+/// DAG. See [`crate::storage::lineage_import`]: the per-write wall-clock
+/// guard is bypassed by the inbound funnel [`import_sync_links`] uses, and
+/// this structural verdict is what makes that bypass safe and the import
+/// independent of edge order. A genuine cycle fails the WHOLE sync.
+fn validate_final_lineage_graph(
+    destination: &rusqlite::Connection,
+    incoming: &[models::MemoryLink],
+) -> Result<()> {
+    let existing = db::export_links(destination)?;
+    crate::storage::lineage_import::validate_complete_lineage_dag(
+        existing.iter().chain(incoming.iter()),
+    )
+    .map_err(|cycle| anyhow::anyhow!("sync refused: {cycle}"))
+}
+
+/// v1.0.0 #3435 — replay `links` onto `conn` AFTER every node landed.
+///
+/// Writes go through `db::create_link_inbound`, the federation funnel:
+/// it bypasses ONLY the per-write Pass-0 wall-clock lineage heuristic
+/// (already covered by [`validate_final_lineage_graph`]), keeps the
+/// `reflects_on` structural cycle check, and persists the source row's
+/// `(signature, observed_by, valid_from, valid_until)` verbatim at the
+/// `unsigned` attestation floor — the CLI verifies no link signatures, so
+/// it claims none. Pre-fix the loop was `let _ = db::create_link(..)`, which
+/// swallowed the wall-clock refusal and every other failure SILENTLY; a
+/// write failure is now an error naming the edge. A structurally invalid
+/// row (`validate_link` — self-link / bad id shape, a legacy-DB defence the
+/// R1-M2 CHECK trigger already covers on the write side) is still skipped,
+/// with a WARN rather than in silence.
+fn import_sync_links(conn: &rusqlite::Connection, links: &[models::MemoryLink]) -> Result<()> {
+    use anyhow::Context as _;
+    let unsigned = models::AttestLevel::Unsigned.as_str();
+    for link in links {
+        if let Err(e) =
+            validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
+        {
+            tracing::warn!(
+                "sync: skipping structurally invalid link {}->{}/{}: {e}",
+                link.source_id,
+                link.target_id,
+                link.relation
+            );
+            continue;
+        }
+        db::create_link_inbound(conn, link, unsigned).with_context(|| {
+            format!(
+                "sync: import link {}->{}/{}",
+                link.source_id, link.target_id, link.relation
+            )
+        })?;
     }
     Ok(())
 }
@@ -589,6 +632,13 @@ fn cmd_sync_dry_run(
     let r_mems = db::export_all(remote_conn)?;
     let l_links = db::export_links(local_conn)?;
     let r_links = db::export_links(remote_conn)?;
+    // v1.0.0 #3435 — the preview reports the same verdict the live run
+    // would refuse on, so an operator sizing a sync learns about a cycle
+    // BEFORE committing to it.
+    crate::storage::lineage_import::validate_complete_lineage_dag(
+        l_links.iter().chain(r_links.iter()),
+    )
+    .map_err(|cycle| anyhow::anyhow!("sync refused: {cycle}"))?;
 
     let local_by_id: std::collections::HashMap<&str, &models::Memory> =
         l_mems.iter().map(|m| (m.id.as_str(), m)).collect();
@@ -824,7 +874,7 @@ pub async fn build_sync_client(args: &SyncDaemonArgs) -> Result<reqwest::Client>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_utils::{TestEnv, seed_memory};
+    use crate::cli::test_utils::{TestEnv, materialize_empty_schema, seed_memory};
 
     fn args_for(remote_db: PathBuf, direction: &str) -> SyncArgs {
         SyncArgs {
@@ -876,12 +926,84 @@ mod tests {
         let remote_env = TestEnv::fresh();
         let remote = remote_env.db_path.clone();
         seed_memory(&local, "ns", "to-remote", "data");
+        // #3435 — a sync remote must already exist; it is never created.
+        materialize_empty_schema(&remote);
         let args = args_for(remote, "push");
         {
             let mut out = env.output();
             run(&local, &args, false, Some("test-agent"), &mut out).unwrap();
         }
         assert!(env.stdout_str().contains("pushed"));
+    }
+
+    /// v1.0.0 #3435 — `sync <nonexistent-remote>` used to `db::open`
+    /// (CREATE + migrate) the remote and report `pushed 1 memories`. It
+    /// must refuse with a typed error and leave NO file behind.
+    #[test]
+    fn sync_refuses_missing_remote_without_creating_it_3435() {
+        let mut env = TestEnv::fresh();
+        let local = env.db_path.clone();
+        seed_memory(&local, "ns", "to-remote", "data");
+        let remote_env = TestEnv::fresh();
+        let missing = remote_env.db_path.clone();
+        assert!(!missing.exists(), "fixture: the remote path starts absent");
+        for direction in ["push", "pull", "merge"] {
+            let args = args_for(missing.clone(), direction);
+            let err = {
+                let mut out = env.output();
+                run(&local, &args, false, Some("test-agent"), &mut out)
+                    .expect_err("a missing remote must be refused")
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(SYNC_REMOTE_MISSING_REFUSAL),
+                "{direction}: refusal must name the slug: {msg}"
+            );
+            assert!(
+                msg.contains(&missing.display().to_string()),
+                "{direction}: refusal must name the path: {msg}"
+            );
+            assert!(
+                !missing.exists(),
+                "{direction}: sync must not create a missing remote"
+            );
+        }
+        // The dry-run preview must not create it either.
+        let mut args = args_for(missing.clone(), "merge");
+        args.dry_run = true;
+        let err = {
+            let mut out = env.output();
+            run(&local, &args, true, Some("test-agent"), &mut out)
+                .expect_err("a missing remote must be refused under --dry-run")
+        };
+        assert!(err.to_string().contains(SYNC_REMOTE_MISSING_REFUSAL));
+        assert!(
+            !missing.exists(),
+            "dry-run must not create a missing remote"
+        );
+    }
+
+    /// v1.0.0 #3435 — a dry run opens BOTH stores read-only: a missing
+    /// LOCAL path is refused (never created) rather than materialised.
+    #[test]
+    fn sync_dry_run_refuses_missing_local_without_creating_it_3435() {
+        let mut env = TestEnv::fresh();
+        let local = env.db_path.clone();
+        let remote_env = TestEnv::fresh();
+        let remote = remote_env.db_path.clone();
+        seed_memory(&remote, "ns", "remote", "x");
+        let mut args = args_for(remote, "pull");
+        args.dry_run = true;
+        let err = {
+            let mut out = env.output();
+            run(&local, &args, true, Some("test-agent"), &mut out)
+                .expect_err("dry-run against a missing local must be refused")
+        };
+        assert!(
+            err.to_string().contains(db::MISSING_DATABASE_REFUSAL),
+            "{err:#}"
+        );
+        assert!(!local.exists(), "dry-run must not create the local store");
     }
 
     #[test]
@@ -906,10 +1028,13 @@ mod tests {
         let local = env.db_path.clone();
         let remote_env = TestEnv::fresh();
         let remote = remote_env.db_path.clone();
-        let args = args_for(remote, "sideways");
+        let args = args_for(remote.clone(), "sideways");
         let mut out = env.output();
         let res = run(&local, &args, false, Some("test-agent"), &mut out);
         assert!(res.is_err());
+        // #3435 — the direction is validated before either store is
+        // opened, so a typo leaves no freshly-created database behind.
+        assert!(!local.exists() && !remote.exists());
     }
 
     #[test]
@@ -919,6 +1044,8 @@ mod tests {
         let remote_env = TestEnv::fresh();
         let remote = remote_env.db_path.clone();
         seed_memory(&remote, "ns", "remote", "x");
+        // #3435 — a dry run opens the local store read-only; it must exist.
+        materialize_empty_schema(&local);
         let mut args = args_for(remote, "pull");
         args.dry_run = true;
         {
@@ -1164,6 +1291,7 @@ mod tests {
             let conn = db::open(&local).unwrap();
             db::create_link(&conn, &id1, &id2, "supersedes").unwrap();
         }
+        materialize_empty_schema(&remote); // #3435 — never created by sync
         let args = args_for(remote.clone(), "push");
         {
             let mut out = env.output();
@@ -1250,6 +1378,7 @@ mod tests {
         let remote_env = TestEnv::fresh();
         let remote = remote_env.db_path.clone();
         seed_memory(&remote, "ns", "remote-only", "rr");
+        materialize_empty_schema(&local); // #3435 — dry run opens it read-only
         let mut args = args_for(remote, "pull");
         args.dry_run = true;
         {
@@ -1269,6 +1398,7 @@ mod tests {
         let remote_env = TestEnv::fresh();
         let remote = remote_env.db_path.clone();
         seed_memory(&local, "ns", "local-only", "ll");
+        materialize_empty_schema(&remote); // #3435 — never created by sync
         let mut args = args_for(remote, "push");
         args.dry_run = true;
         {
