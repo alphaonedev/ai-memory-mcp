@@ -134,6 +134,8 @@ pub mod kg;
 pub mod links;
 pub mod memories;
 pub mod memories_query;
+/// Authenticated health-only API and transport scope boundary (#3646).
+pub mod monitoring;
 pub mod parity;
 pub mod postgres_gate;
 pub mod power;
@@ -157,6 +159,7 @@ pub mod skills;
 pub mod subscriptions;
 pub mod system;
 pub mod transport;
+mod write_receipt;
 // #1579 B4 — HTTP response-format negotiation (json | toon |
 // toon_compact) for the recall/search surfaces.
 pub mod wire_format;

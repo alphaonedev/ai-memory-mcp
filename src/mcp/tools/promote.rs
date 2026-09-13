@@ -123,7 +123,14 @@ pub(super) fn handle_promote(
     // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); single-operator
     // trust-all default byte-unchanged. `allow_inbox = false`.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
-        if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &target,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::PROMOTE,
+            ),
+        ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
     }

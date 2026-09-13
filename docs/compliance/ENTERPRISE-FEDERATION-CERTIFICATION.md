@@ -21,7 +21,35 @@ inside the §5 watch set on top of the 2026-09-11 tip `b0483115`; re-bound by
 federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-12** (re-bound after #3204 at 22 checks; re-issued 2026-09-11 after #3549 / #3553 / #3199)
+> ## STATUS — **VOID as of 2026-09-13** (expiry trigger FIRED: the certified surface drifted past the bound commit)
+>
+> **FIRED 2026-09-13 — §7 expiry trigger, path-based arm.** Ten files in the
+> §5/§7 watch set changed between the bound commit
+> `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` and the chain-12 tip
+> `8b4f65a2261477850461b615a1fd282a4f27d430`:
+> `src/federation/applied_wake.rs`, `src/federation/mod.rs`,
+> `src/federation/receive.rs`, `src/handlers/federation_receive.rs`,
+> `src/handlers/federation_signing_check.rs`, `src/identity/mod.rs`,
+> `src/identity/owner_stamp.rs`, `src/identity/sign.rs`,
+> `src/store/postgres.rs`, `src/store/postgres/reown_3124.rs`.
+>
+> `identity/sign.rs` and the two federation receive paths **are** the certified
+> surface, so this certificate no longer describes the code in this tree. It is
+> VOID until the §5.4(2)-(5) evidence is re-run and re-bound.
+>
+> **This is a deliberate VOID, not a lapse.** The Conductor ruled
+> ([#3556](https://github.com/alphaonedev/ai-memory-mcp/issues/3556)) that a
+> re-issue means RE-RUNNING THE EVIDENCE, never editing the bind SHA: re-binding
+> to a tip whose signing and federation code was never re-verified would produce
+> exactly the forged artifact this document's expiry trigger exists to catch.
+> A VOID certificate costs a procurement conversation; a false LIVE one costs the
+> customer. The re-issue binds to the chain-13 tip, not this one, because the
+> approved merge queue changes fourteen further watched files — binding here
+> would buy a certificate honest for one merge and VOID again the same day.
+>
+> The prior LIVE record is preserved verbatim below as history.
+>
+> ## SUPERSEDED — LIVE as of 2026-09-12 (re-bound after #3204 at 22 checks; re-issued 2026-09-11 after #3549 / #3553 / #3199)
 >
 > Re-validated and re-bound against `ab6f2175077afd47e0a0ac65d5121db97e1d22d5`
 > by [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)
@@ -602,7 +630,7 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 | Environment | Exit | Result |
 |---|---|---|
 | Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 10 `[FAIL]` rows of 22** (named below; `cert-3607/posture-bare-env.out`) |
-| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor. |
+| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor at the bound tip (pre-#3124; a post-#3124 re-bind measures 28/28). |
 | Same hardened non-sqlcipher env **with the boot gate ARMED** | **1** | the binary **refuses to boot**, naming the below-floor control (`posture-hardened-boot-refusal.out`) — #2911 item 1's enforcement demonstrated, not merely reported |
 | Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`cert-3607/posture-sqlcipher-pass.out`; 22 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
 
@@ -618,7 +646,7 @@ code.)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
    a `standard` profile** (`profile=standard — asi-hard pins not in
    force; the N-knob hard floor was not evaluated`, where N is
-   `pinned_knobs().len()` — **27** post-#3201, 17 in the captured
+   `pinned_knobs().len()` — **28** post-#3124, 17 in the captured
    evidence below) instead of the pre-#2927 vacuous
    `N/N at floor` PASS (#2923). **Evidence note (#3033, #3113, #3168, #3201):** the
    `cert-54/` `.out` captures in §2 predate all three and render the
@@ -636,9 +664,12 @@ code.)
    `AI_MEMORY_FED_CERT_PEER_BINDING` were pinned (#3201 — the unenrolled
    hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT`, plus cert↔peer-id
    binding Enforce; the documented `standard` unset default stays Warn),
-   and the doctor render is `pinned_knobs().len()`-driven. The
-   `cert-55/` recapture **measures** `27/27 at floor` on the hardened
-   non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the
+   and to 28 when `AI_MEMORY_UNSTAMPED_MUTATION` was pinned to `refuse`
+   (#3124 — a caller-scoped mutation of an UNSTAMPED, legacy-unowned row
+   is refused on every funnel of both backends; the documented `standard`
+   default stays `warn`), and the doctor render is
+   `pinned_knobs().len()`-driven. The `cert-55/` and `cert-3607/` recaptures (both pre-#3124)
+   **measure** `27/27 at floor` on the hardened non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the
    row is one check regardless of the knob count).
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
 4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)

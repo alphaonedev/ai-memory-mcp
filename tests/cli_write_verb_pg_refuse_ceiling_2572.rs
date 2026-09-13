@@ -89,7 +89,13 @@ const GUARDED: &[(&str, usize, &str)] = &[
     (
         "src/cli/reown.rs",
         1,
-        "`reown` re-ownership write (the CLI_REFERENCE overclaim fix).",
+        "`reown` re-ownership write — the LOCAL SQLite leg only. #3124 R4 \
+         (Conductor ruling condition 4) LIFTED the #2572 refusal for this ONE \
+         verb on a `sal` build: a `postgres://` store (flag or the #1927 env \
+         channels) is routed by `daemon_runtime`'s `Command::Reown` arm through \
+         the SAL `MemoryStore::reown` (audited, operator-only, record-stop \
+         refused) BEFORE this guard runs; the guard still refuses a Postgres \
+         store on a build that cannot route it.",
     ),
     ("src/cli/share.rs", 1, "`share` write."),
     (

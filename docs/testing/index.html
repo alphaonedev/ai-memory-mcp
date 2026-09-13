@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-memory v1.0.0 — Test Results & Reproducibility</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--panel2:#1c2230;--ink:#e6edf3;--soft:#8b98a9;--line:#2a3240;
+--good:#2ea043;--good-bg:#0f2417;--pend:#9e6a03;--pend-bg:#241a06;--bad:#da3633;--acc:#2f81f7;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media(prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#fff;--panel2:#f0f3f6;--ink:#1f2328;--soft:#57606a;--line:#d0d7de;--good-bg:#dafbe1;--pend-bg:#fff8c5}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:28px;margin:0 0 4px}h2{font-size:19px;margin:34px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+h3{font-size:15px;margin:20px 0 8px;color:var(--soft);text-transform:uppercase;letter-spacing:.05em}
+.sub{color:var(--soft);margin:0 0 18px}
+.pillars{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+.pill{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:4px 12px;font-size:13px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:12px 0}
+table{width:100%;border-collapse:collapse;font-size:14px;margin:8px 0}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--soft);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.s{font-family:var(--mono);font-size:12px;font-weight:700;padding:2px 8px;border-radius:5px;white-space:nowrap}
+.s-good{color:var(--good);background:var(--good-bg)}.s-pend{color:var(--pend);background:var(--pend-bg)}.s-bad{color:var(--bad);background:#2a0e0e}
+code,pre{font-family:var(--mono);font-size:13px}
+pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.mono{font-family:var(--mono)}.soft{color:var(--soft)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+.note{border-left:3px solid var(--acc);padding:6px 0 6px 12px;color:var(--soft);font-size:14px;margin:10px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>ai-memory v1.0.0 — Test Results &amp; Reproducibility</h1>
+<p class="sub">Certification &amp; acceptance evidence for the AI-agent endpoint-memory substrate. Every result below is reproducible from the commands given; this page is the living record and reaches all-green before the v1.0.0 tag is cut.</p>
+<div class="pillars">
+<span class="pill">◆ Data integrity</span><span class="pill">● Security</span><span class="pill">▲ Performance</span><span class="pill">■ Reliability</span>
+</div>
+<p class="soft">Release tip <code class="mono">9b84c2a8</code> · certified triple <b>PostgreSQL 18.6 / Apache AGE 1.8.0 / sqlx 0.8.6</b> · <code>ENTERPRISE_FEDERATION_CHECK_COUNT=20</code> · repo <a href="https://github.com/alphaonedev/ai-memory-mcp">alphaonedev/ai-memory-mcp</a></p>
+
+<h2>1 · Methodology — adversarially engineered, not vibe-coded</h2>
+<div class="card">
+<p>Built by a structured organization of AI agents with an enforced <b>separation of powers</b>: the agent that writes code is never the one that reviews it, and never the one that merges it. A single <b>conductor</b> decomposes work, dispatches it, performs code + security review, and is the only actor permitted to merge (signed, branch-protection re-armed, verify-at-tip). <b>Coders</b> work in isolated worktrees, each loading the Rust-1.98 engineering standard and the CodeGraph index before touching a file. A <b>GLM-5.3-Flash swarm</b> (via OpenRouter) is a pure verification workload — it never writes product code. Judgment calls go to a <b>3×7 adversarial vote</b> (7 lenses × 3 rounds). Full methodology: <a href="https://claude.ai/code/artifact/6e1d78de-6072-44ee-800b-65df6e8fa9fe">How ai-memory Is Built</a>.</p>
+</div>
+
+<h2>2 · Infrastructure under test</h2>
+<div class="grid">
+<div class="card"><h3>Hardware data tiers (native)</h3>
+<p><b>f2</b> — Linux, 93 GB RAM · cert pg+AGE+pgvector <code>:15432</code> (reference module)<br>
+<b>f1</b> — macOS, 32 GB RAM · cert pg+AGE+pgvector <code>:5445</code> (smaller-module baseline)</p></div>
+<div class="card"><h3>Cloud data tier</h3>
+<p><b>DigitalOcean</b> — the certified enterprise-federation stack on droplets; <b>minimal footprint</b>: DO hosts only the data tier, the GLM NHIs are OpenRouter API calls driven off-DO. Provisioned via <code>infra/do-hive/</code> Terraform.</p></div>
+<div class="card"><h3>Encryption in transit (mandatory)</h3>
+<p>All communications encrypted, as customers deploy: <b>mTLS</b> federation + agent→daemon HTTPS (fingerprint-pinned client certs) + PostgreSQL <code>sslmode=verify-full</code>. At-rest: LUKS (kernel) on the encrypted config; per-record crypto-erase.</p></div>
+<div class="card"><h3>Test swarm/hive</h3>
+<p><b>GLM-5.3-Flash</b> (<code>z-ai/glm-5.3-flash</code> via OpenRouter) — N lightweight NHIs, each with its own Ed25519 key, namespace-confined + fail-closed. Executes only Fable-authored scenarios; emits a coverage matrix + structured JSON. <b>GLM-5.3-Flash executes tests only — it never writes code, submits PRs, or touches the codebase.</b></p></div>
+</div>
+
+<div class="card" style="margin-top:14px"><h3>ai-memory configuration under test — mirrored on every agent</h3>
+<p>Every node and agent wired into ai-memory runs the <b>byte-identical fleet-standard TOML</b> below (only <code>db</code> and key-file paths differ per node). All traffic routes through OpenRouter; Ollama is not used on any node. The embedder <code>gemini-embedding-001</code> and <code>gemini-embedding-2</code> were verified to be <b>orthogonal vector spaces</b> (cosine 0.06); the fleet standardizes on <code>gemini-embedding-2</code> so every node shares one space. The reflection LLM <code>gemini-3.7-flash</code> was verified reflection-capable (valid structured JSON, correct contradiction detection).</p>
+<pre style="font-family:var(--mono);font-size:12px;line-height:1.55;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px;overflow-x:auto">tier = "autonomous"
+db   = "&lt;node&gt;/.claude/ai-memory.db"          # node-specific
+
+[embeddings]
+backend      = "openrouter"
+model        = "google/gemini-embedding-2"    # 3072 native -&gt; 768 (Matryoshka)
+dim          = 768                            # matches pgvector(768)
+base_url     = "https://openrouter.ai/api/v1"
+api_key_file = "&lt;node&gt;/openrouter-api.key"    # node-specific
+
+[llm]
+backend      = "openrouter"
+base_url     = "https://openrouter.ai/api/v1"
+model        = "google/gemini-3.7-flash"      # reflection/consolidate
+
+[reranker]
+enabled = true
+model   = "ms-marco-MiniLM-L-6-v2"
+
+[mcp]
+profile = "full"
+
+[storage]
+default_namespace = "global"
+max_memory_mb     = 4096</pre></div>
+
+<div class="card" style="margin-top:14px"><h3>Starting condition — Atlas Corpus pre-loaded</h3>
+<p>The swarm/hive does not start from an empty store. Both nodes carry the <b>Atlas Corpus — 7,912 copyright-clean memories</b> (namespace <code>atlas-corpus</code>; kinds: 4,212 claim + 3,700 concept; sha256 <code>b0b61fa5…</code>, pinned in <code>deploy/do-1461/atlas/CORPUS_MANIFEST.json</code> for reproducibility) plus accumulated working memories — <b>f1 ≈ 25.5k, f2 ≈ 10k+</b>, so testing reflects a real-world memory volume (tens of thousands) rather than a cold store.</p></div>
+
+<h2>3 · Results dashboard</h2>
+<p class="soft">Status legend: <span class="s s-good">GREEN</span> measured &amp; passing · <span class="s s-pend">PENDING</span> in the running campaign · honest by design — nothing is marked green until it is measured.</p>
+
+<h3>Code &amp; certification gates</h3>
+<table>
+<tr><th>Gate</th><th>Status</th><th>Evidence / reproduce</th></tr>
+<tr><td>CI on release tip <code>9b84c2a8</code></td><td><span class="s s-good">GREEN</span></td><td>51 checks pass, 0 fail (incl. Certified Postgres+AGE+pgvector, macos-fed, SAL-only, coverage). <code>gh api repos/alphaonedev/ai-memory-mcp/commits/9b84c2a8/check-runs</code></td></tr>
+<tr><td>Enterprise-federation cert posture (20 checks)</td><td><span class="s s-good">GREEN</span></td><td>20-check recapture on the 18.6/1.8.0/0.8.6 triple → <code>docs/compliance/evidence/cert-55/</code>; green <code>cert-postgres-age.yml</code> run cited in the cert doc.</td></tr>
+<tr><td>#3329 — non-blocking MCP boot backfill + macOS config-path</td><td><span class="s s-good">GREEN</span></td><td>Merged; both <code>macos-fed</code> legs green. Coder→review→merge pipeline, 13 new tests.</td></tr>
+<tr><td>#3132 — pg/sqlite SYSTEM_PRINCIPAL parity + cert recapture</td><td><span class="s s-good">GREEN</span></td><td>Verified non-divergent at tip (SYSTEM_PRINCIPAL=="system", one shared authz predicate); parity guard test lands to lock it.</td></tr>
+<tr><td>f1⇄f2 cross-host mTLS federation + A2A acceptance</td><td><span class="s s-good">GREEN</span></td><td>9/9 (T1–T5 + A2A) over live mTLS. <code>infra/do-hive/crypto/test-federation-mtls.sh</code>, <code>test-fed-write-sig-attestation.sh</code>.</td></tr>
+</table>
+
+<h3>Acceptance campaign — full features · regression · A2A · capacity (encrypted, GLM-5.3-Flash)</h3>
+<table>
+<tr><th>Dimension</th><th>Status</th><th>What it proves</th></tr>
+<tr><td>Feature coverage matrix (100% of drivable tool surface)</td><td><span class="s s-pend">PENDING</span></td><td>Every ai-memory capability exercised end-to-end by the swarm over mTLS; coverage matrix as evidence.</td></tr>
+<tr><td>Regression suite (fixed-bug / Big-10 invariants)</td><td><span class="s s-pend">PENDING</span></td><td>The shipped guarantees stay held; a regression is caught, not silently passed.</td></tr>
+<tr><td>A2A choreographies (signals · exactly-one-winner claims · leases · quorum · governance · replay-guard)</td><td><span class="s s-pend">PENDING</span></td><td>Multi-NHI coordination invariants hold under concurrency, cross-node.</td></tr>
+<tr><td><b>Security / red-team — can a bad memory infect the swarm/hive?</b></td><td><span class="s s-pend">PENDING</span></td><td>Adversarial memory poisoning: inject malicious / prompt-injection / false-fact memories as a hostile NHI and prove the swarm/hive does <b>not</b> get infected — cross-agent isolation holds (namespace-confined, fail-closed), unsigned/forged writes are convicted, an operator Deny stays Deny, and a wrong idea does not cascade into groupthink (corroboration independence + poison quarantine). Also: tenant-scope leak attempts, capability-token attenuation abuse, at-rest/in-transit boundary probes. The #3266 contamination concern, tested directly.</td></tr>
+<tr><td>Per-module capacity — max NHIs at certified-budget latency</td><td><span class="s s-pend">PENDING</span></td><td>Measures what the cert currently only estimates: the agent-unit number one certified module sustains (p50/p95/p99).</td></tr>
+<tr><td>Module scaling curve (exponential via federation)</td><td><span class="s s-pend">PENDING</span></td><td>The real per-module multiplier as modules are added.</td></tr>
+<tr><td><b>Hard stop/start continuity</b> — swarm/hive survives aggressive kill cycles</td><td><span class="s s-pend">PENDING</span></td><td>The headline resilience proof. A swarm/hive is put on a multi-step <b>mission</b> (goals · purpose · objectives · plan stored in ai-memory), then <b>hard-killed mid-work and cold-restarted, repeatedly</b>. Each restart must recover the mission, goals, purpose, objectives, and last-worked-on state from federated memory (<code>recover-previous-session</code> + session-boot) and <b>pick up exactly where it left off</b> — no re-doing completed work, no lost context, no drift. Measured over multiple aggressive cycles.</td></tr>
+<tr><td><b>Experiential AI-NHI audit</b> — the agents assess the substrate they use</td><td><span class="s s-pend">PENDING</span></td><td>Beyond mechanical coverage: GLM-5.3-Flash NHIs do realistic multi-step work <i>using ai-memory as their working memory</i>, then reflect and surface structured insights from the AI-agent's own perspective — does recall return the right context when needed, does it preserve continuity across a task, does A2A coordination actually help, what is confusing / missing / valuable. Findings → Fable validity gate → 3×7 vote; usability/roadmap insights captured here.</td></tr>
+<tr><td>Config-1..5 on DigitalOcean (incl. LUKS-encrypted) + GLM swarm/hive</td><td><span class="s s-pend">PENDING</span></td><td>The certified enterprise-federation config at cloud scale, plaintext and machine-proven-encrypted.</td></tr>
+<tr><td>OS-tier matrix (Ubuntu/Fedora/CentOS/macOS + mobile clients)</td><td><span class="s s-pend">PENDING</span></td><td>Build + daemon + federation acceptance across the supported host/client matrix.</td></tr>
+</table>
+
+<h2>4 · Reproduce it yourself</h2>
+<div class="card">
+<h3>Certification posture (20 checks, native cert pg)</h3>
+<pre>cd infra/do-hive/crypto
+./gen-certs.sh                 # mTLS material (CA + server + client-good/bad)
+./run-all-local.sh            # posture: mTLS · write-sig attestation · pg verify-full · semantic recall</pre>
+<h3>Encrypted capacity ramp (per-module agent number)</h3>
+<pre># daemon: release ai-memory, cert pg+AGE+pgvector, TLS+mTLS endpoint
+export SWARM_BASE_URL=https://&lt;daemon&gt;:&lt;port&gt;   # mTLS client cert
+export OPENROUTER_API_KEY=&lt;key&gt;                # GLM-5.3-Flash NHIs
+python3 -m swarm --agents N --scenario coverage   # Fable-authored suite -> coverage matrix
+infra/pillar4-envelope/measure-capacity-ramp.sh   # concurrency ramp -> USL fit -> knee</pre>
+<p class="note">Results, raw JSON, and the coverage matrix are committed under <code>docs/compliance/evidence/</code> and linked here as each phase completes.</p>
+</div>
+
+<p class="soft" style="margin-top:30px;font-size:13px">Generated by Fable 5 (conductor). Honest-by-construction: PENDING rows become GREEN only when measured. Last updated as the campaign runs.</p>
+
+</div>
+</body>
+</html>

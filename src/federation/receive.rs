@@ -588,10 +588,23 @@ pub(super) async fn catchup_once_with_store(
                 // never moves past an un-persisted row (which would silently
                 // drop it from every future delta). Idempotent upserts make
                 // re-fetching post-failure rows next cycle harmless.
+                // #3631 — pre-apply inbox probe; see `applied_wake`.
+                let inbox_wake_pre =
+                    crate::federation::applied_wake::probe_store(&**store, &ctx, &mem).await;
                 match store.apply_remote_memory(&ctx, &mem).await {
-                    Ok(_) => {
+                    Ok(applied_id) => {
                         applied += 1;
                         advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                        // #3631 — wake the local recipient of a delivered
+                        // inbox message (the catch-up half of the hop).
+                        crate::federation::applied_wake::fire_store(
+                            &**store,
+                            &ctx,
+                            inbox_wake_pre,
+                            &mem,
+                            &applied_id,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         catchup_halted = true;
@@ -678,10 +691,20 @@ pub(super) async fn catchup_once_with_store(
                 }
                 // #1687/#2714 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
+                // #3631 — pre-apply inbox probe; see `applied_wake`.
+                let inbox_wake_pre = crate::federation::applied_wake::probe_sqlite(&lock.0, &mem);
                 match crate::db::insert_if_newer(&lock.0, &mem) {
-                    Ok(_) => {
+                    Ok(applied_id) => {
                         applied += 1;
                         advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                        // #3631 — wake the local recipient of a delivered
+                        // inbox message (the catch-up half of the hop).
+                        crate::federation::applied_wake::fire_sqlite(
+                            &lock.0,
+                            inbox_wake_pre,
+                            &mem,
+                            &applied_id,
+                        );
                     }
                     Err(_) => catchup_halted = true,
                 }
@@ -869,10 +892,20 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 }
                 // #1687/#2714 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
+                // #3631 — pre-apply inbox probe; see `applied_wake`.
+                let inbox_wake_pre = crate::federation::applied_wake::probe_sqlite(&lock.0, &mem);
                 match crate::db::insert_if_newer(&lock.0, &mem) {
-                    Ok(_) => {
+                    Ok(applied_id) => {
                         applied += 1;
                         advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                        // #3631 — wake the local recipient of a delivered
+                        // inbox message (the catch-up half of the hop).
+                        crate::federation::applied_wake::fire_sqlite(
+                            &lock.0,
+                            inbox_wake_pre,
+                            &mem,
+                            &applied_id,
+                        );
                     }
                     Err(_) => catchup_halted = true,
                 }

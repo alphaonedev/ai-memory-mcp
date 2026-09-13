@@ -170,6 +170,21 @@ pub(super) fn handle_update(
     vector_index: Option<&dyn VectorSearchIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    let mut receipt = handle_update_inner(conn, params, embedder, vector_index, mcp_client)?;
+    crate::write_receipt::WriteDurability::sqlite(conn)
+        .and_then(|durability| durability.attach(&mut receipt))
+        .map_err(|error| error.to_string())?;
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_update_inner(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&dyn VectorSearchIndex>,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
     let id = params["id"]
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
@@ -285,7 +300,14 @@ pub(super) fn handle_update(
         let target = db::get(conn, &resolved_id)
             .map_err(|e| e.to_string())?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
-        if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &target,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::UPDATE,
+            ),
+        ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
     }

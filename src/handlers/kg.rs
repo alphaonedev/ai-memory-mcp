@@ -940,12 +940,17 @@ pub async fn kg_invalidate(
     // returned 404 here (the scratch `db::get` found nothing), 404ing before
     // the `app.store.invalidate_link` postgres branch below could run — the
     // exact class #1134 fixed for the sibling `kg_timeline` handler.
-    let extract_owner_target = |mem: &Memory| -> (String, String) {
-        let owner = mem
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
+    // #3124 — the ownership verdict is the ONE cross-backend mutation
+    // predicate (unstamped rows decided by `AI_MEMORY_UNSTAMPED_MUTATION`),
+    // taken here while the row is in hand; `owner` / `target` are kept only
+    // for the 403 envelope.
+    let site = crate::identity::owner_stamp::MutationSite::new(
+        app.storage_backend.as_str(),
+        crate::identity::owner_stamp::funnel::KG_INVALIDATE,
+    );
+    let extract_owner_target = |mem: &Memory| -> (String, String, bool) {
+        let owner = crate::identity::owner_stamp::OwnerStamp::of(&mem.metadata)
+            .owner_for_display()
             .to_string();
         let target = mem
             .metadata
@@ -953,9 +958,17 @@ pub async fn kg_invalidate(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        (owner, target)
+        let admitted = caller == sentinels::DAEMON_PRINCIPAL
+            || crate::identity::owner_stamp::metadata_admits_mutation(
+                &mem.metadata,
+                &mem.id,
+                &caller,
+                true,
+                site,
+            );
+        (owner, target, admitted)
     };
-    let source_owner: Option<(String, String)> = {
+    let source_owner: Option<(String, String, bool)> = {
         #[cfg(feature = "sal")]
         if matches!(app.storage_backend, StorageBackend::Postgres) {
             let ctx = crate::store::CallerContext::for_agent(caller.clone());
@@ -1007,7 +1020,7 @@ pub async fn kg_invalidate(
             }
         }
     };
-    let Some((owner, target)) = source_owner else {
+    let Some((owner, _target, admitted)) = source_owner else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -1020,12 +1033,7 @@ pub async fn kg_invalidate(
         )
             .into_response();
     };
-    let is_unowned_legacy = owner.is_empty();
-    if !is_unowned_legacy
-        && owner != caller
-        && target != caller
-        && caller != sentinels::DAEMON_PRINCIPAL
-    {
+    if !admitted {
         tracing::warn!(
             target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/kg/invalidate 403: caller {caller} != owner {owner} (source_id={})",

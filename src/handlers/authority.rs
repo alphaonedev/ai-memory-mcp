@@ -48,6 +48,8 @@ use crate::identity::authority::{Authority, HttpAuthorityInputs};
 /// that loses liveness on a header quirk kills a healthy node.
 pub const AUTHORITY_EXEMPT_EXACT: &[&str] = &[
     super::routes::HEALTH,
+    super::routes::MONITORING_STATUS,
+    super::routes::MONITORING_METRICS,
     super::routes::METRICS_BARE,
     super::routes::METRICS,
 ];
