@@ -2947,9 +2947,10 @@ impl MemoryStore for SqliteStore {
         cursor: Option<&crate::export_paging::ExportCursor>,
         limit: usize,
         as_of: chrono::DateTime<chrono::Utc>,
+        namespace: Option<&str>,
     ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
         let conn = self.state.lock().await;
-        db::export_page::memories_page(&conn, cursor, limit, as_of).map_err(box_err)
+        db::export_page::memories_page(&conn, cursor, limit, as_of, namespace).map_err(box_err)
     }
 
     async fn export_links_page(

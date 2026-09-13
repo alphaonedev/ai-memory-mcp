@@ -31283,9 +31283,15 @@ impl MemoryStore for PostgresStore {
         cursor: Option<&crate::export_paging::ExportCursor>,
         limit: usize,
         as_of: DateTime<Utc>,
+        namespace: Option<&str>,
     ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
         crate::store::postgres_export_page::export_memories_page(
-            &self.pool, cursor, limit, as_of, Self::row_to_memory_scan,
+            &self.pool,
+            cursor,
+            limit,
+            as_of,
+            namespace,
+            Self::row_to_memory_scan,
         )
         .await
     }
@@ -31296,7 +31302,10 @@ impl MemoryStore for PostgresStore {
         survivors: &std::collections::HashSet<String>,
     ) -> StoreResult<crate::export_paging::ExportLinksPage> {
         crate::store::postgres_export_page::export_links_page(
-            &self.pool, scope, survivors, Self::row_to_memory_scan,
+            &self.pool,
+            scope,
+            survivors,
+            Self::row_to_memory_scan,
         )
         .await
     }

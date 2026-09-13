@@ -4309,6 +4309,7 @@ pub trait MemoryStore: Send + Sync {
         _cursor: Option<&crate::export_paging::ExportCursor>,
         _limit: usize,
         _as_of: chrono::DateTime<chrono::Utc>,
+        _namespace: Option<&str>,
     ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
         Err(StoreError::UnsupportedCapability {
             capability: "EXPORT_PAGE".to_string(),

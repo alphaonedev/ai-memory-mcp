@@ -96,6 +96,7 @@ async fn walk(store: &PostgresStore, limit: usize) -> Vec<ExportMemoriesPage> {
             id: String::new(),
         },
         as_of,
+        namespace: None,
     });
     let mut pages = Vec::new();
     for _ in 0..1_000_000 {
@@ -261,4 +262,57 @@ async fn pg_export_links_page_never_dangles_in_import_order_3288() {
         .execute(store.pool())
         .await
         .expect("cleanup");
+}
+
+/// #3427 (pg) — the namespace scope is a WHERE predicate on the page query:
+/// a foreign-namespace row is absent from every page, the excluded counts
+/// are scoped, and a cross-namespace edge is withheld (its counterpart is
+/// not carried by the export).
+#[tokio::test]
+async fn pg_export_namespace_scope_is_honoured_on_every_page_3427() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let alice = format!("alice-3427-{run}");
+    let bob = format!("bob-3427-{run}");
+    let alice_ids = seed(&store, &alice, 5).await;
+    let bob_ids = seed(&store, &bob, 2).await;
+
+    let mut cursor: Option<ExportCursor> = None;
+    let mut seen = Vec::new();
+    for _ in 0..10 {
+        let page = store
+            .export_memories_page(cursor.as_ref(), 2, Utc::now(), Some(alice.as_str()))
+            .await
+            .expect("scoped page");
+        assert_eq!(page.scope.namespace.as_deref(), Some(alice.as_str()));
+        for m in &page.memories {
+            assert_eq!(
+                m.namespace, alice,
+                "a foreign-namespace row leaked: {}",
+                m.id
+            );
+            assert!(!bob_ids.contains(&m.id));
+        }
+        seen.extend(page.memories.iter().map(|m| m.id.clone()));
+        match page.next_cursor {
+            Some(c) => {
+                assert_eq!(
+                    c.namespace.as_deref(),
+                    Some(alice.as_str()),
+                    "pinned in the cursor"
+                );
+                cursor = Some(c);
+            }
+            None => break,
+        }
+    }
+    seen.sort();
+    let mut expected = alice_ids.clone();
+    expected.sort();
+    assert_eq!(seen, expected, "every scoped row exactly once");
 }

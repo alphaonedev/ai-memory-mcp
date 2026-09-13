@@ -358,12 +358,14 @@ class AsyncAiMemoryClient:
         """
         return await self._request("GET", "/api/v1/export")
 
-    async def export_pages(self, limit: int | None = None) -> AsyncIterator[dict[str, Any]]:
+    async def export_pages(
+        self, limit: int | None = None, *, namespace: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
         """Async twin of :meth:`AiMemoryClient.export_pages`: yield every
         export page in order, following ``next_cursor``."""
         cursor: str | None = None
         while True:
-            params: dict[str, Any] = {"limit": limit, "cursor": cursor}
+            params: dict[str, Any] = {"limit": limit, "cursor": cursor, "namespace": namespace}
             if limit is None and cursor is None:
                 params["limit"] = DEFAULT_EXPORT_PAGE_ROWS
             try:

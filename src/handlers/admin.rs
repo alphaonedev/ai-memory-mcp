@@ -997,11 +997,20 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
 /// the legacy one-shot body (bounded by the page ceiling); either present is
 /// paged mode. See [`crate::export_paging`].
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportQuery {
     /// Rows per page, `1..=max_page_size`.
     pub limit: Option<usize>,
     /// Opaque resume token from a previous page's `next_cursor`.
     pub cursor: Option<String>,
+    /// #3427 — restrict the export to ONE namespace. Honoured on both
+    /// backends, on the legacy body and on every page (pinned in the cursor);
+    /// echoed back as `namespace` so the operator holding the file can see
+    /// the scope that was applied. Unknown query parameters are refused
+    /// (`deny_unknown_fields`): a parameter that claims to bound an egress
+    /// and does not is worse than no parameter, so silence is never an
+    /// option here.
+    pub namespace: Option<String>,
 }
 
 /// v1.0.0 #3288 — a 400 for paging parameters the export cannot serve.
@@ -1097,6 +1106,14 @@ fn export_body(
         (field_names::WITHHELD): withheld,
         (field_names::PARTIAL): partial,
         (field_names::NEXT_CURSOR): next_cursor,
+        // #3427 — the scope that was APPLIED (null = whole corpus), so the
+        // operator holding the file can see it without trusting the request.
+        (field_names::NAMESPACE): page.scope.namespace,
+        // #3288 (amended acceptance 1/3) — a multi-page walk is a LIVE keyset
+        // scan, not a snapshot: declared in-band. See API_REFERENCE for what
+        // a live walk can miss (a row inserted with a backdated `created_at`
+        // that sorts before the cursor).
+        (field_names::SNAPSHOT): false,
     });
     if let (Some(backend), Some(obj)) = (storage_backend, body.as_object_mut()) {
         obj.insert(field_names::STORAGE_BACKEND.to_string(), json!(backend));
@@ -1145,11 +1162,31 @@ pub async fn export_memories(
     // ceiling, else refused with 413 rather than truncated. Pre-#3288 both
     // backends materialised the whole corpus and the whole link table into
     // one body, which OOM-kills the daemon on a large tenant.
+    // #3427 — the namespace scope is validated and threaded to the store on
+    // BOTH backends; the handler never post-filters (a post-filter would
+    // still read the whole corpus and break the page bound).
+    let namespace = match q.namespace.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(ns) => match crate::validate::validate_namespace(ns) {
+            Ok(()) => Some(ns.to_owned()),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("export namespace: {e}"),
+                        "code": crate::errors::error_codes::VALIDATION_FAILED,
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
     let mode = match crate::export_paging::resolve_mode(
         q.limit,
         q.cursor.as_deref(),
         app.max_page_size,
         Utc::now(),
+        namespace.as_deref(),
     ) {
         Ok(m) => m,
         Err(e) => return export_mode_error_response(&e),
@@ -1176,7 +1213,7 @@ pub async fn export_memories(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let mut page = match app
             .store
-            .export_memories_page(cursor.as_ref(), fetch_limit, as_of)
+            .export_memories_page(cursor.as_ref(), fetch_limit, as_of, namespace.as_deref())
             .await
         {
             Ok(p) => p,
@@ -1209,24 +1246,29 @@ pub async fn export_memories(
     }
 
     let lock = app.db.lock().await;
-    let read = db::export_page::memories_page(&lock.0, cursor.as_ref(), fetch_limit, as_of)
-        .and_then(|mut page| {
-            if let Some(ceiling) = legacy_ceiling
-                && page.raw_rows() > ceiling
-            {
-                return Ok(Err(ceiling));
-            }
-            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed);
-            // the sqlite path holds the audit connection so a drop emits a
-            // signed `export.forbidden_class_refused` row.
-            let (memories, ledger) = crate::export_taxonomy::screen_memories_for_export_audited(
-                std::mem::take(&mut page.memories),
-                Some(&lock.0),
-            );
-            let links =
-                db::export_page::links_page(&lock.0, &page.scope, &survivor_ids(&memories))?;
-            Ok(Ok((memories, ledger, links, page)))
-        });
+    let read = db::export_page::memories_page(
+        &lock.0,
+        cursor.as_ref(),
+        fetch_limit,
+        as_of,
+        namespace.as_deref(),
+    )
+    .and_then(|mut page| {
+        if let Some(ceiling) = legacy_ceiling
+            && page.raw_rows() > ceiling
+        {
+            return Ok(Err(ceiling));
+        }
+        // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed);
+        // the sqlite path holds the audit connection so a drop emits a
+        // signed `export.forbidden_class_refused` row.
+        let (memories, ledger) = crate::export_taxonomy::screen_memories_for_export_audited(
+            std::mem::take(&mut page.memories),
+            Some(&lock.0),
+        );
+        let links = db::export_page::links_page(&lock.0, &page.scope, &survivor_ids(&memories))?;
+        Ok(Ok((memories, ledger, links, page)))
+    });
     match read {
         Ok(Ok((memories, ledger, links, page))) => {
             export_body(&memories, &links, ledger, &page, None)

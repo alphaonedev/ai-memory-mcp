@@ -452,7 +452,10 @@ async fn export_returns_full_envelope_via_sal() {
     let v: Value = resp.json().await.expect("body");
     assert!(v["memories"].is_array());
     assert!(v["memories"].as_array().is_some_and(|m| m.len() <= 10));
-    assert!(v.get("next_cursor").is_some(), "paged body carries next_cursor");
+    assert!(
+        v.get("next_cursor").is_some(),
+        "paged body carries next_cursor"
+    );
     assert!(v["links"].is_array());
     assert!(v["exported_at"].is_string());
     assert_eq!(v["storage_backend"], "postgres");
