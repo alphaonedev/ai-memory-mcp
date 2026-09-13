@@ -76,6 +76,58 @@ Five approaches exist. Only one is a fix rather than a workaround, and it is not
 
 Practical answer today: 3 plus 5, with the discipline of writing state down — and, from v1.0.0, the wake plane making 5 fast enough to use routinely on a host. Eventual answer: 4, probably on top of 2.
 
+### 5.1 A concrete example of approach 2, and what reading it changed
+
+**Recurrent Looped Transformer (RLT)**, Yifan Zhang, 12 September 2026 —
+<https://github.com/yifanzhang-pro/recurrent-looped-tranformer> (note the repository name
+contains a typo; the spelling above is correct). A causal encoder builds global key–value
+memory while a recurrent decoder carries a complete state `H_t = (s_t, C_t^D)` across every
+prompt and response token. The state explicitly does **not** reset at the prompt–response
+boundary, so the reasoning path deepens as the sequence grows rather than being capped by the
+layer count.
+
+It is cited here because it is the sharpest current statement of row 2, and because reading it
+sharpens row 3 — but its status must be stated plainly first. It is a 16-page technical report
+by a single author, it **reports no measured results at all**, and it says so itself:
+*"realized reasoning quality, hardware efficiency, and scaling behavior require future
+validation."* The repository carries **no license**. Nothing here is adoptable, and nothing
+here is yet demonstrated.
+
+**Latent continuity is not memory, and this paper is the clearest place to see why.** RLT
+carries state further than a conventional transformer, and it still begins every independent
+sequence at `H_0 = (s_*, ∅)`. The state is a vector and a set of caches: it cannot be read,
+corrected, attributed, governed, or shown to anyone, and it cannot be shared between two
+agents. It makes an agent *think* for longer. It does not make an agent *remember*. Those two
+are constantly conflated, and an architecture this explicit is a useful place to separate them.
+
+**The part that matters most for a memory substrate is §6, "Multi-turn Serving and Cache
+Semantics" — which is really a set of requirements aimed at systems like this one.** An exact
+prefix snapshot must carry the encoder cache, the cross-attention memory, the complete decoder
+state, position metadata, the window convention **and the model version**. Weight updates
+invalidate reuse of an old state. Deleting, editing or truncating a prefix changes the
+conditioning history, and the prescribed recovery is to *recompute from a valid earlier
+checkpoint*. And the load-bearing sentence:
+
+> Text-only restoration requires replay to rebuild hidden state.
+
+That places a durable, editable, replayable record **underneath** the latent state, as the
+thing you fall back to when the latent state is invalidated. That is exactly the slot this
+project occupies. A more capable recurrent model does not make an external substrate
+redundant; by the paper's own account it makes the substrate the only recoverable ground truth,
+because the latent state is declared non-durable across weight updates and is not editable at
+all.
+
+**One forward-looking consequence, recorded rather than acted on.** Under those semantics,
+several operations ai-memory already ships are *cache-invalidating*: `memory_forget` and
+tombstoning, supersession, curator consolidation and rollback, and TTL expiry. Each deletes or
+rewrites history that a recurrent-state agent may already have conditioned on. Today this is
+harmless, because the models we serve hold no state between calls. If agents move to
+RLT-class models, a memory layer that silently rewrites history underneath one would corrupt
+it, and the existing `memory_checkpoint_*` primitives are the natural place to signal
+invalidation instead. This is **not** v1.0.0 scope: it is foresight about an unvalidated
+architecture with no license and no numbers, and it is written down here so it is not
+rediscovered later rather than turned into release-blocking work now.
+
 ## 6. Position
 
 When approach 4 arrives, the operators this project is built for — the ones who have to answer for what their agents did — will still need memory that is externalised, signed and auditable, because weights cannot be audited. That is the same conclusion the project has reached elsewhere about its commercial position: the durable value is the audit trail, not the remembering. ai-memory should keep describing itself accordingly: it makes context loss survivable and accountable, and with the wake plane it makes a team of short-lived agents fast enough to replace one long-lived agent that would otherwise "get old"; it does not make context infinite.
