@@ -13384,7 +13384,7 @@ async fn insert_test_memory_with_metadata(
 #[tokio::test]
 async fn http_export_memories_screens_forbidden_class_row() {
     // v1.0.0 G28 (#1838) — the sqlite `export_memories` branch must run the
-    // corpus through `screen_exported_memories`: a producer-tagged biometric
+    // corpus through the export confidentiality screen: a producer-tagged biometric
     // embedding row is DROPPED from the export artifact, a signed
     // `export.forbidden_class_refused` row is emitted (sqlite path holds the
     // audit connection), and the clean rows still export.

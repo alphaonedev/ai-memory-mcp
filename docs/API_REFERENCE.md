@@ -1407,8 +1407,31 @@ Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
 
 ### `GET /api/v1/export`
 
-**Admin-gated.** Returns
-`{"memories":[…],"links":[…],"count":N,"exported_at":"…"}`.
+**Admin-gated, bounded (v1.0.0 #3288).** Two modes:
+
+- **Unpaged** (no query parameters): returns
+  `{"memories":[…],"links":[…],"count":N,"exported_at":"…"}` for the whole
+  corpus, but only while the corpus fits the page ceiling
+  (`AI_MEMORY_MAX_PAGE_SIZE`, default 1000). A larger corpus is **refused**
+  with `413 {"code":"EXPORT_PAGING_REQUIRED","max_rows":N}`. It is never
+  truncated, because a client written before paging would keep a partial
+  body as a complete backup.
+- **Paged** (`?limit=N`, then `?limit=N&cursor=<next_cursor>`): each response
+  carries at most `N` memories (`1 <= N <= AI_MEMORY_MAX_PAGE_SIZE`) and the
+  graph edges that page owns, plus `next_cursor` (`null` on the last page).
+  The cursor is opaque. An edge appears exactly once, on the page carrying
+  the later of its two endpoints, so importing the pages in order through
+  `POST /api/v1/import` (1000 memories per call) never references a memory
+  that is not yet imported.
+
+Every body also carries `withheld` (the counts of live rows it does not
+carry: `withheld` forbidden-class drops with `withheld_by_class`,
+`quarantined`, `undecryptable`, plus the reported `tombstoned`, `expired`,
+`redacted` and `dangling_links_withheld`) and `partial` (`true` when a
+forbidden-class, quarantined or undecryptable row was withheld). In paged mode
+the counts are per page: sum them, and OR `partial`, across the walk. Refusals:
+`400 EXPORT_LIMIT_OUT_OF_RANGE` (with `max`) and `400 EXPORT_CURSOR_INVALID`.
+The Python SDK's `export_pages()` performs the walk.
 
 ### `POST /api/v1/import`
 

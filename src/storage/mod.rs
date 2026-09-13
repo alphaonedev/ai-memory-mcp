@@ -866,6 +866,8 @@ mod doctor;
 /// reconciles what the FTS5 + ANN recall indexes cover against the
 /// `memories` table so recall can report its coverage honestly.
 pub mod embed_skip;
+/// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
+pub mod export_page;
 pub mod index_coverage;
 /// #1965 [P1] — corpus-lifecycle EXPIRE / EVICT / DISTILL contract: the
 /// spec + scoring layer that names the three bounded-growth transitions and
@@ -17396,34 +17398,40 @@ pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
          JOIN memories ms ON ms.id = ml.source_id AND (ms.expires_at IS NULL OR ms.expires_at > ?1)
          JOIN memories mt ON mt.id = ml.target_id AND (mt.expires_at IS NULL OR mt.expires_at > ?1)",
     )?;
-    let rows = stmt.query_map(params![now], |row| {
-        let relation_str: String = row.get(2)?;
-        Ok(MemoryLink {
-            source_id: row.get(0)?,
-            target_id: row.get(1)?,
-            // v0.7.0 fix campaign R1-M4 — see `get_links` for rationale.
-            relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
-                .unwrap_or_default(),
-            created_at: row.get(3)?,
-            signature: row.get::<_, Option<Vec<u8>>>(4)?,
-            observed_by: row.get::<_, Option<String>>(5)?,
-            valid_from: row.get::<_, Option<String>>(6)?,
-            valid_until: row.get::<_, Option<String>>(7)?,
-            // v0.7.0 #860 — `export_links` is the federation outbound
-            // path; the wire shape stays without `attest_level` so
-            // pre-v0.7 receivers do not see an unknown field. Leaving
-            // this `None` keeps `skip_serializing_if` from emitting it.
-            attest_level: None,
-            // v1.0.0 #2215 — carry the schema-v75 lineage-DAG cid mirror
-            // (`source_cid` / `target_cid`) so the Portability-v2 envelope
-            // round-trips it losslessly. NULL mirror rows stay `None` →
-            // `skip_serializing_if` keeps the federation wire byte-identical.
-            source_cid: row.get::<_, Option<String>>(8)?,
-            target_cid: row.get::<_, Option<String>>(9)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![now], export_link_from_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// Map one `export_links`-shaped row (`source_id, target_id, relation,
+/// created_at, signature, observed_by, valid_from, valid_until, source_cid,
+/// target_cid`, in that column order) into a [`MemoryLink`]. Shared by
+/// [`export_links`] and the #3288 paged export so the two cannot drift.
+pub(crate) fn export_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryLink> {
+    let relation_str: String = row.get(2)?;
+    Ok(MemoryLink {
+        source_id: row.get(0)?,
+        target_id: row.get(1)?,
+        // v0.7.0 fix campaign R1-M4 — see `get_links` for rationale.
+        relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
+            .unwrap_or_default(),
+        created_at: row.get(3)?,
+        signature: row.get::<_, Option<Vec<u8>>>(4)?,
+        observed_by: row.get::<_, Option<String>>(5)?,
+        valid_from: row.get::<_, Option<String>>(6)?,
+        valid_until: row.get::<_, Option<String>>(7)?,
+        // v0.7.0 #860 — `export_links` is the federation outbound
+        // path; the wire shape stays without `attest_level` so
+        // pre-v0.7 receivers do not see an unknown field. Leaving
+        // this `None` keeps `skip_serializing_if` from emitting it.
+        attest_level: None,
+        // v1.0.0 #2215 — carry the schema-v75 lineage-DAG cid mirror
+        // (`source_cid` / `target_cid`) so the Portability-v2 envelope
+        // round-trips it losslessly. NULL mirror rows stay `None` →
+        // `skip_serializing_if` keeps the federation wire byte-identical.
+        source_cid: row.get::<_, Option<String>>(8)?,
+        target_cid: row.get::<_, Option<String>>(9)?,
+    })
 }
 
 /// Insert with timestamp-aware conflict resolution for sync.

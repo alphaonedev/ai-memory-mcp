@@ -842,6 +842,9 @@ pub mod export_taxonomy;
 // markers (stderr WARN + additive in-payload `export_scope` / `excludes`
 // fields) so the CLI + HTTP export surfaces cannot drift.
 pub mod export_scope;
+// v1.0.0 #3288 — bounded, keyset-paged admin export: opaque cursor, page
+// ranges, and the pure edge-ownership decision shared by both backends.
+pub mod export_paging;
 pub mod hooks;
 pub mod identity;
 // v1.0.0 #3465 — the in-process agent WAKE bus for `memory_notify`.

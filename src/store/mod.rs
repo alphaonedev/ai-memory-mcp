@@ -62,6 +62,11 @@ pub mod postgres;
 #[cfg(feature = "sal-postgres")]
 pub(crate) mod postgres_parity;
 
+/// v1.0.0 #3288 — postgres half of the bounded, keyset-paged admin export,
+/// hosted beside `postgres` for the same QUAL-10 reason as `postgres_parity`.
+#[cfg(feature = "sal-postgres")]
+pub(crate) mod postgres_export_page;
+
 /// v1.0.0 #3525 — the probe ladder for the migration advisory lock, hosted
 /// beside `postgres` (which is at its QUAL-10 size ceiling) so the wait
 /// schedule #3519 introduced is testable as data rather than as literals
@@ -4288,6 +4293,41 @@ pub trait MemoryStore: Send + Sync {
     async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
         Err(StoreError::UnsupportedCapability {
             capability: "EXPORT_LINKS".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3288 — one BOUNDED page of the admin export walk: at most
+    /// `limit` memory rows strictly after `cursor` in `(created_at, id)`
+    /// order, under the expiry cutoff `as_of`, plus the page's range, raw ids,
+    /// excluded counts and next cursor. The contract is
+    /// [`crate::export_paging`]; unlike [`Self::export_memories`] this never
+    /// materialises more than one page.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_memories_page(
+        &self,
+        _cursor: Option<&crate::export_paging::ExportCursor>,
+        _limit: usize,
+        _as_of: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT_PAGE".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3288 — the graph edges one export page OWNS (see
+    /// [`crate::export_paging::plan_edge`]), emitted only when both endpoints
+    /// are carried by the export. `survivors` is the set of the page's rows
+    /// that passed the export confidentiality screen.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_links_page(
+        &self,
+        _scope: &crate::export_paging::ExportPageScope,
+        _survivors: &std::collections::HashSet<String>,
+    ) -> StoreResult<crate::export_paging::ExportLinksPage> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT_LINKS_PAGE".to_string(),
         })
     }
 
