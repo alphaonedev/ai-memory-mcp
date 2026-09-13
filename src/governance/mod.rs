@@ -354,7 +354,7 @@ pub struct PermissionContext {
 /// whose `namespace_pattern` has the longest non-glob prefix takes
 /// precedence. Within equal namespace specificity, an exact
 /// `agent_pattern` (no `*`) beats a wildcard.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct PermissionRule {
     pub namespace_pattern: String,
     pub op: String,
@@ -372,7 +372,7 @@ fn default_agent_pattern() -> String {
 /// Wire-level rule outcome. Narrower than [`Decision`] because rules
 /// can't return `Modify` — only hook chains can. The `Ask` variant
 /// uses the rule's `reason` field as the prompt text.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleDecision {
     Allow,

@@ -1094,6 +1094,9 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // `ai-memory.db` in `$PWD`, so the very next step ("could not open
     // database") is a SYMPTOM whose cause would otherwise never be printed.
     sections.push(section_config_health_3166());
+    if let Some(section) = section_deployment_shape_3714() {
+        sections.push(section);
+    }
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -1741,6 +1744,76 @@ fn section_config_health_3166() -> ReportSection {
                     .into(),
             ),
         },
+    }
+}
+
+/// #3714 — the deployment shape and the two floors v1.0.0 enforces from
+/// it (posture, at-rest), rendered with their markers so an operator sees
+/// what the shape requires versus suggests. `None` when the config could
+/// not be loaded (the Configuration section above already reports that)
+/// or when config loading is skipped.
+fn section_deployment_shape_3714() -> Option<ReportSection> {
+    const NAME: &str = "Deployment shape (#3714)";
+    if crate::config::skip_config() {
+        return None;
+    }
+    let config = crate::config::AppConfig::load_for_boot().ok()?;
+    let shape = config.effective_shape();
+    let derived = shape.derive();
+    let mut facts: Vec<(String, String)> = vec![(
+        crate::models::field_names::SHAPE.into(),
+        shape.as_str().into(),
+    )];
+    for row in derived.rows() {
+        let [setting, marker, value, _enforced_by] = row;
+        facts.push((setting, format!("{value} ({marker})")));
+    }
+    let env = std::env::var(crate::security_profile::ENV_SECURITY_PROFILE).ok();
+    match crate::config::shape::evaluate_boot(&config, env.as_deref()) {
+        Ok((report, pin)) => {
+            let mut severity = Severity::Info;
+            let mut notes = Vec::new();
+            if let Some(value) = pin {
+                facts.push((
+                    "security_posture_at_boot".into(),
+                    format!("pinned to {value} by the shape (env unset)"),
+                ));
+            }
+            if report.at_rest_pending_escrow {
+                severity = severity_max(severity, Severity::Warning);
+                facts.push((
+                    "at_rest_status".into(),
+                    "required, NOT enabled (no recovery escrow)".into(),
+                ));
+                notes.push(crate::config::shape::at_rest_pending_escrow_warning(shape));
+            }
+            if report.at_rest_on_without_escrow {
+                severity = severity_max(severity, Severity::Warning);
+                facts.push((
+                    "at_rest_status".into(),
+                    "enabled WITHOUT a recovery escrow".into(),
+                ));
+                notes.push(
+                    "a lost `<key-dir>/<agent>.x25519.priv` loses `content`; the escrow is #3717"
+                        .into(),
+                );
+            }
+            Some(ReportSection {
+                name: NAME.into(),
+                severity,
+                facts,
+                note: (!notes.is_empty()).then(|| notes.join(" ")),
+            })
+        }
+        Err(e) => {
+            facts.push(("boot".into(), "REFUSED".into()));
+            Some(ReportSection {
+                name: NAME.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some(format!("{e:#}")),
+            })
+        }
     }
 }
 
