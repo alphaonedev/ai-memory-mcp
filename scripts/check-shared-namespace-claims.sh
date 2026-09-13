@@ -144,11 +144,31 @@ for p, items in sorted(by_file.items()):
     pairs_identical = [(a, b, va) for (a, va), (b, vb) in itertools.combinations(items, 2) if va == vb]
     verdicts = ', '.join(f'{v:,}'.replace(',', '_') + (' PASSES' if v >= size_all else ' WOULD RED') for v in values)
     passes_all = all(v >= size_all for v in values)
-    key = f'ceiling:{p}=' 
-    acked = any(a.startswith(key) for a in allow)
-    sev = 'INFO' if acked else ('FAIL' if pairs_identical else 'WARN')
+    key = f'ceiling:{p}='
+    # An acknowledgement names the DECIDED value, so it settles the collision --
+    # it does not bless a branch that claims some other number. Checking only
+    # that *something* was acknowledged let #3655-v3 claim 7_400 against a
+    # decided 7_440 and grade INFO, which is precisely the value the chain-13
+    # rehearsal watched land SILENTLY before a later branch forced the conflict.
+    _dec = [a[len(key):].strip() for a in allow if a.startswith(key)]
+    decided = None
+    if _dec:
+        try: decided = int(_dec[0].replace('_', ''))
+        except ValueError: decided = None
+    acked = bool(_dec)
+    mismatched = [(c, v) for c, v in items if decided is not None and v != decided]
+    if decided is not None and mismatched:
+        sev = 'FAIL'
+    elif _dec:
+        sev = 'INFO'
+    else:
+        sev = 'FAIL' if pairs_identical else 'WARN'
     who = ', '.join(f'{c}={v:,}'.replace(',', '_') for c, v in items)
     ptxt = ''
+    if decided is not None and mismatched:
+        ptxt += (' DECIDED VALUE IS ' + f'{decided:,}'.replace(',', '_') + ' (allowlist) but ' +
+                 '; '.join(f'{c} claims {v:,}'.replace(',', '_') for c, v in mismatched) +
+                 ' — that branch will land the wrong number and the merge need not conflict.')
     if pairs_identical:
         ptxt = ' IDENTICAL PAIR ' + '; '.join(f'{a} + {b} both write {va:,}'.replace(',', '_') for a, b, va in pairs_identical) + ' — git merges that in SILENCE, no conflict.'
     note(sev, f'ceiling:{p}', f'{p} ceiling is claimed by {len(items)} branches: {who}.{ptxt} Projected merge-result size {size_all} lines (base {wc(base,p)} + queue deltas); candidates: {verdicts}.' + (' EVERY candidate passes, so the ceiling gate cannot tell you which one landed — decide it explicitly' if passes_all and len(values) > 1 else '') + (' (acknowledged in allowlist)' if acked else ''))
