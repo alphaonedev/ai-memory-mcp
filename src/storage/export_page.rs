@@ -85,7 +85,10 @@ pub fn memories_page(
     );
     let as_of_s = as_of_text(as_of);
     let lim = i64::try_from(limit).context("export page limit exceeds i64")?;
-    let mut binds: Vec<(&str, &dyn ToSql)> = vec![(":as_of", &as_of_s), (":lim", &lim)];
+    let mut binds: Vec<(&str, &dyn ToSql)> = vec![
+        (":as_of", &as_of_s as &dyn ToSql),
+        (":lim", &lim as &dyn ToSql),
+    ];
     if let Some(c) = cursor {
         binds.push((":lc", &c.after.created_at));
         binds.push((":li", &c.after.id));
@@ -124,7 +127,11 @@ fn excluded_in_range(
     let as_of_s = as_of_text(as_of);
     let q = LifecycleState::Quarantined.as_str();
     let t = LifecycleState::Tombstoned.as_str();
-    let mut binds: Vec<(&str, &dyn ToSql)> = vec![(":as_of", &as_of_s), (":q", &q), (":t", &t)];
+    let mut binds: Vec<(&str, &dyn ToSql)> = vec![
+        (":as_of", &as_of_s as &dyn ToSql),
+        (":q", &q as &dyn ToSql),
+        (":t", &t as &dyn ToSql),
+    ];
     if let Some(l) = &range.lower {
         preds.push("(created_at > :lc OR (created_at = :lc AND id > :li))".to_string());
         binds.push((":lc", &l.created_at));
@@ -177,7 +184,10 @@ pub fn links_page(
     }
     let ids_json = serde_json::to_string(&scope.raw_ids)?;
     let as_of_s = as_of_text(scope.as_of);
-    let mut binds: Vec<(&str, &dyn ToSql)> = vec![(":ids", &ids_json), (":as_of", &as_of_s)];
+    let mut binds: Vec<(&str, &dyn ToSql)> = vec![
+        (":ids", &ids_json as &dyn ToSql),
+        (":as_of", &as_of_s as &dyn ToSql),
+    ];
     let (s_before, t_before) = match &scope.range.lower {
         Some(l) => {
             binds.push((":lc", &l.created_at));
