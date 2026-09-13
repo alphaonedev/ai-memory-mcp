@@ -21,9 +21,12 @@ up. The **developer** schema reference lives in
 |---|---|---|
 | Operational logs (`tracing::*` → file) | OFF | Capture every `tracing::info!` / `tracing::warn!` / `tracing::error!` to a rotating on-disk file. Suitable for Splunk / Datadog / Elastic / Loki ingestion. |
 | Security audit trail | OFF | One hash-chained, tamper-evident JSON line per memory mutation. SIEM-grade evidence for SOC2 / HIPAA / GDPR / FedRAMP. |
+| Forensic governance log | ON | Signed, hash-chained integrity rows and screened governance decision rows (keyed commitments, never request content). See [Forensic governance JSONL](#forensic-governance-jsonl). |
 
-Both are **default-OFF for privacy.** No log lines hit the disk
-without a deliberate config opt-in.
+The first two are **default-OFF for privacy** and write nothing to disk
+without a deliberate config opt-in. The forensic governance log is always
+on: it is the record of what agents were allowed and refused, and it
+carries identities, outcomes and commitments rather than content (#3647).
 
 ---
 
@@ -87,17 +90,19 @@ The daily `forensic-YYYY-MM-DD.jsonl` files sit next to the flat audit log.
 They hold one Ed25519-signed, hash-chained stream carrying two classes of
 row (#3647).
 
-**Integrity rows are always written.** The sink starts on every boot. It
-writes the content-free evidence that `verify-audit-trail` and restore
-forensics depend on:
+**Both row classes are written whenever the sink is up, and the sink starts
+on every boot.** `audit.enabled` governs the flat audit trail, not this log.
+Integrity rows are the content-free evidence that `verify-audit-trail` and
+restore forensics depend on:
 
 - the #1850 truncation watermark (a `signed_events` head sequence and hash);
 - #1946 open-time rollback evidence (head counts);
 - the #3199 unverified-restore record (outcome, a fixed reason, and the
   snapshot and target paths, with any credential-shaped span masked).
 
-**Governance decision rows are opt-in.** They are written only with
-`audit.enabled = true`. They cover agent-action verdicts, admin operations,
+**Governance decision rows are written by default, screened.** A decision
+nobody wrote down cannot be investigated, so the content is screened and the
+record is kept. They cover agent-action verdicts, admin operations,
 approvals, archive/purge, namespace standards and capability grants. Every
 row keeps its timestamp, actor, outcome, action kind, rule ID, chain link and
 signature. The payload is built through a closed type, and no emitter can
@@ -125,9 +130,14 @@ they already have (`governance::audit::forensic_commitment`). Anyone without
 the key cannot test guesses against it. It is not encryption, and it proves
 nothing to someone who does not hold the content.
 
+Commitments are **deterministic** under one daemon key: identical content
+gives an identical `content_mac`. An operator can therefore see that the same
+command was refused twice, or by two agents, without learning what it was.
+That is intended; do not "fix" it by salting the commitment.
+
 Setting `audit.redact_content = false` asks for plaintext retention, which is
-not supported. It turns decision rows off with a boot diagnostic; integrity
-rows are unaffected.
+not supported. It is ignored with a boot diagnostic; decision rows are still
+written, as commitments.
 
 Existing signed logs are not rewritten and still verify. Consumers that read
 action details or free-text reasons from `payload` must switch to the

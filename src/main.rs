@@ -331,8 +331,8 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
 /// directory parallel to the flat audit log. The sink comes up on every boot,
 /// so its content-free integrity rows (the #1850 truncation watermark the
 /// `verify-audit-trail` lanes read, the #3199 unverified-restore record) are
-/// written by default. Governance decision rows follow
-/// [`forensic_decision_rows`]. A missing key gives unsigned rows and withheld
+/// written by default, and so are the screened governance decision rows
+/// (Conductor ruling on #3647). A missing key gives unsigned rows and withheld
 /// commitments — never a fatal error.
 fn init_forensic_audit(app_config: &config::AppConfig) {
     let audit_cfg = app_config.effective_audit();
@@ -348,32 +348,26 @@ fn init_forensic_audit(app_config: &config::AppConfig) {
         eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
         return;
     };
-    if let Err(e) = ai_memory::governance::audit::init_with_decision_rows(
-        dir,
-        signing_key,
-        forensic_decision_rows(&audit_cfg),
-    ) {
+    warn_if_plaintext_retention_requested(&audit_cfg);
+    if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
         eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
     }
 }
 
-/// #3647 — whether the boot sink writes governance decision rows: only with
-/// `audit.enabled = true`. `audit.redact_content = false` asks for plaintext
-/// retention, which is unsupported, so it turns decision rows off with a
-/// diagnostic rather than being silently ignored. Integrity rows are
-/// unaffected either way.
-fn forensic_decision_rows(audit_cfg: &config::AuditConfig) -> bool {
-    if !audit_cfg.enabled.unwrap_or(false) {
+/// #3647 — `audit.redact_content = false` asks for plaintext retention, which
+/// is unsupported. It is ignored with a diagnostic rather than silently: the
+/// forensic decision rows stay written and stay screened (keyed commitments
+/// only). Removing the operator's evidence is never the answer to a
+/// disclosure concern (Conductor ruling on #3647). Returns whether the
+/// diagnostic fired.
+fn warn_if_plaintext_retention_requested(audit_cfg: &config::AuditConfig) -> bool {
+    if audit_cfg.redact_content != Some(false) {
         return false;
     }
-    if audit_cfg.redact_content == Some(false) {
-        eprintln!(
-            "ai-memory: forensic governance decision rows disabled: \
-             audit.redact_content=false (plaintext retention) is unsupported; \
-             integrity rows are still written"
-        );
-        return false;
-    }
+    eprintln!(
+        "ai-memory: audit.redact_content=false (plaintext retention) is unsupported and \
+         ignored: forensic governance decision rows record keyed commitments only (#3647)"
+    );
     true
 }
 
@@ -440,26 +434,39 @@ mod tests {
         (rows, body)
     }
 
+    /// Conductor ruling on #3647: every boot, whatever `audit.enabled` says,
+    /// writes the screened decision row next to the integrity row.
     #[test]
-    fn issue_3647_default_boot_writes_integrity_rows_but_no_decision_rows() {
+    fn issue_3647_every_boot_writes_screened_decision_rows_and_integrity_rows() {
         let _guard = forensic_boot_lock();
-        for enabled in [None, Some(false)] {
+        for enabled in [None, Some(false), Some(true)] {
             let (rows, body) = boot_and_emit_3647(enabled, None);
-            assert!(!body.contains(ISSUE_3647_BOOT_SECRET));
-            assert_eq!(rows.len(), 1, "only the watermark: {rows:?}");
-            assert_eq!(
-                rows[0].kind,
-                ai_memory::governance::audit::AUDIT_WATERMARK_KIND
-            );
-            assert_eq!(rows[0].payload["head_sequence"], 64);
-            assert_eq!(rows[0].payload["db_id"], "db3647");
+            assert_screened_decision_then_watermark(&rows, &body);
         }
     }
 
+    /// `redact_content = false` is ignored with a diagnostic; the decision row
+    /// is still written, and still screened.
     #[test]
-    fn issue_3647_explicit_audit_enablement_writes_decision_rows() {
+    fn issue_3647_plaintext_request_is_ignored_and_rows_stay_screened() {
         let _guard = forensic_boot_lock();
-        let (rows, body) = boot_and_emit_3647(Some(true), None);
+        assert!(warn_if_plaintext_retention_requested(
+            &config::AuditConfig {
+                redact_content: Some(false),
+                ..Default::default()
+            }
+        ));
+        assert!(!warn_if_plaintext_retention_requested(
+            &config::AuditConfig::default()
+        ));
+        let (rows, body) = boot_and_emit_3647(Some(true), Some(false));
+        assert_screened_decision_then_watermark(&rows, &body);
+    }
+
+    fn assert_screened_decision_then_watermark(
+        rows: &[ai_memory::governance::audit::ForensicDecision],
+        body: &str,
+    ) {
         assert!(!body.contains(ISSUE_3647_BOOT_SECRET));
         assert_eq!(rows.len(), 2, "decision + watermark: {rows:?}");
         assert_eq!(rows[0].actor, "agent:3647");
@@ -476,18 +483,8 @@ mod tests {
             rows[1].kind,
             ai_memory::governance::audit::AUDIT_WATERMARK_KIND
         );
-    }
-
-    #[test]
-    fn issue_3647_plaintext_policy_disables_decision_rows_not_integrity_rows() {
-        let _guard = forensic_boot_lock();
-        let (rows, body) = boot_and_emit_3647(Some(true), Some(false));
-        assert!(!body.contains(ISSUE_3647_BOOT_SECRET));
-        assert_eq!(rows.len(), 1, "only the watermark: {rows:?}");
-        assert_eq!(
-            rows[0].kind,
-            ai_memory::governance::audit::AUDIT_WATERMARK_KIND
-        );
+        assert_eq!(rows[1].payload["head_sequence"], 64);
+        assert_eq!(rows[1].payload["db_id"], "db3647");
     }
 
     #[test]

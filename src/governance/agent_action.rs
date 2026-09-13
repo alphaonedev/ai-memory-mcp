@@ -1289,10 +1289,10 @@ struct ForensicActionContent<'a> {
 }
 
 /// v0.7.0 #697 — translate a `(action, decision)` into the forensic
-/// log shape and emit. No-op unless the sink is up with governance decision
-/// rows enabled (`audit.enabled`).
+/// log shape and emit. No-op unless the sink is up (#3647: decision rows are
+/// written whenever it is, screened, like integrity rows).
 fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decision) {
-    if !crate::governance::audit::decision_rows_enabled() {
+    if !crate::governance::audit::is_enabled() {
         return;
     }
     let (decision_str, rule_id) = match decision {
