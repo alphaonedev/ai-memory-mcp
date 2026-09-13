@@ -84,7 +84,14 @@ async fn pg_dsn_without_verify_full_is_refused_before_connect_3705() {
             err.contains("sslmode=verify-full&sslrootcert"),
             "the refusal must carry the remedy: {err}"
         );
-        assert!(err.contains("`ai-memory db check-tls`"), "{err}");
+        assert!(
+            err.contains("sslmode=verify-full&sslrootcert=<ca.crt>"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("check-tls"),
+            "no fictional verb in a remedy: {err}"
+        );
         assert!(
             !err.contains("postgres://"),
             "the refusal must never echo the DSN: {err}"
@@ -109,6 +116,56 @@ async fn pg_dsn_with_verify_full_connects_3705() {
     let store = PostgresStore::connect(&url)
         .await
         .expect("a verify-full DSN connects");
+    // The PERMITTED path, proven end to end (#3705 review: a fail-closed
+    // control tested only on its refusal is half-tested): the session the
+    // pool opened is TLS according to the server itself, and the store
+    // works over it.
+    let ssl: bool = sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+        .fetch_one(store.pool())
+        .await
+        .expect("pg_stat_ssl row for this backend");
+    assert!(
+        ssl,
+        "the verify-full session must be TLS on the server side (pg_stat_ssl.ssl)"
+    );
+    let ctx = ai_memory::store::CallerContext::for_admin("test-3705");
+    let now = chrono::Utc::now().to_rfc3339();
+    let mem = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: "global".to_string(),
+        title: format!("verify-full round trip {}", uuid::Uuid::new_v4().simple()),
+        content: "stored over a verify-full session (#3705)".to_string(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "api".to_string(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: serde_json::json!({ "agent_id": "test-3705" }),
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: vec![],
+        source_uri: None,
+        source_span: None,
+        confidence_source: ai_memory::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..ai_memory::models::Memory::default()
+    };
+    let id = ai_memory::store::MemoryStore::store(&store, &ctx, &mem)
+        .await
+        .expect("store over TLS");
+    let back = ai_memory::store::MemoryStore::get(&store, &ctx, &id)
+        .await
+        .expect("get over TLS");
+    assert_eq!(back.content, mem.content);
     drop(store);
 }
 

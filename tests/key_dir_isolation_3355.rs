@@ -29,6 +29,14 @@ fn resolver_probe() {
 fn resolver_panics_under_temporary_home_and_accepts_isolated_override() {
     let home = tempfile::tempdir().unwrap();
     let keys = tempfile::tempdir().unwrap();
+    // #3705 review — the ALLOWED key dir must not inherit the ambient umask
+    // (0002 on this host yields 0775, which the #3198 check refuses — the
+    // refusal is the product being right; the fixture is what was wrong).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(keys.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     for (path, allowed) in [
         (home.path().join("keys"), false),
         (keys.path().to_path_buf(), true),

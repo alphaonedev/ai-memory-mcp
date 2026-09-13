@@ -61,22 +61,27 @@ pub const REMOVED_DOWNGRADE_ENVS: &[&str] = &[
 /// The only accepted `sslmode` for a PostgreSQL store DSN.
 pub const PG_SSLMODE_FLOOR: &str = "verify-full";
 
-/// #3709 item 5 — every fail-closed refusal names the command that resolves
-/// it. These are the SEAM with the `ai-memory tls` subcommands (#3709 items
-/// 2-4/6): the commands must satisfy the refusals exactly as spelled here.
-pub const REMEDY_TLS_INIT: &str = "run `ai-memory tls init` (or let first boot generate the local certificate), or supply \
-     --tls-cert/--tls-key";
-pub const REMEDY_TLS_IMPORT: &str = "run `ai-memory tls import --cert <p> --key <p>`";
-pub const REMEDY_TLS_RENEW: &str = "run `ai-memory tls renew`";
-pub const REMEDY_PG_SSLMODE: &str = "append `?sslmode=verify-full&sslrootcert=<ca.crt>` to AI_MEMORY_STORE_URL, then run \
-     `ai-memory db check-tls`";
+/// #3709 item 5 — every fail-closed refusal names what resolves it, worded
+/// as what EXISTS in this commit (the `--tls-cert/--tls-key` flags, the
+/// literal DSN parameters, the files under `<key_dir>/tls`). A refusal whose
+/// remedy is a fiction is worse than one with no remedy: the operator does
+/// what we told them, gets "unrecognized subcommand", and distrusts the
+/// message. The `ai-memory tls …` / `db check-tls` verbs (#3709 items 2-4,
+/// v1.0.1) re-point these constants when they ship — nothing else changes.
+pub const REMEDY_SUPPLY_TLS: &str = "supply --tls-cert <fullchain.pem> --tls-key <key.pem> (on the \
+     singleton shape leave both unset and first boot mints the local certificate under \
+     <key_dir>/tls/)";
+pub const REMEDY_TLS_RENEW: &str = "replace <key_dir>/tls/server.pem and server.key with fresh material \
+     (operator-supplied files are re-read by the daily reload; a locally minted leaf is \
+     re-issued at the next boot)";
+pub const REMEDY_PG_SSLMODE: &str = "add `sslmode=verify-full&sslrootcert=<ca.crt>` to the store URL's \
+     query (`?…` or `&…` after an existing query; AI_MEMORY_STORE_URL / --store-url)";
 pub const REMEDY_USE_HTTPS: &str = "change the URL to https://";
 /// #3709 (3x7 audit ruling): a deployment whose DECLARED shape is not
 /// `singleton` takes ENTERPRISE PKI — bring your own certificate; the
 /// product never mints an unmanaged CA into an estate.
-pub const REMEDY_ENTERPRISE_PKI: &str = "supply a certificate issued by your PKI: --tls-cert <fullchain.pem> --tls-key <key.pem> \
-     (or `ai-memory tls import --cert <p> --key <p>`); see docs/SECURITY.md \
-     \"Bring your own certificate\"";
+pub const REMEDY_ENTERPRISE_PKI: &str = "supply a certificate issued by your PKI: --tls-cert <fullchain.pem> --tls-key <key.pem>; \
+     see docs/SECURITY.md \"Bring your own certificate\"";
 
 /// Canonical falsy tokens (the substrate-wide grammar's negative half).
 fn is_falsy(v: &str) -> bool {
@@ -125,7 +130,7 @@ pub fn enforce_require_tls_token() -> Result<()> {
             "{ISSUE_TAG}: {ENV_REQUIRE_TLS}={v:?} requests a plaintext listener, which the \
              mandate ({MANDATE}) makes impossible to select by configuration. Transit \
              encryption is a floor, not a knob — fix: `unset {ENV_REQUIRE_TLS}` (or set a \
-             canonical truthy token); the listener then serves TLS ({REMEDY_TLS_INIT})."
+             canonical truthy token); the listener then serves TLS ({REMEDY_SUPPLY_TLS})."
         ),
         RequireTls::Unrecognised(v) => bail!(
             "{ISSUE_TAG}: {ENV_REQUIRE_TLS}={v:?} is not a recognised token (canonical truthy: \
@@ -164,7 +169,7 @@ pub fn enforce_no_downgrade_paths() -> Result<()> {
         "{ISSUE_TAG}: {} would select plaintext transit, a downgrade path the mandate \
          ({MANDATE}) removed: a reachable downgrade path is a defect even when never taken, \
          because an attacker chooses when it is taken — fix: `unset {}`; every listener and \
-         peer carries TLS ({REMEDY_TLS_INIT}).",
+         peer carries TLS ({REMEDY_SUPPLY_TLS}).",
         armed.join(", "),
         armed.join(" "),
     );
@@ -178,18 +183,46 @@ pub fn plaintext_listener_refusal(host: &str, port: u16) -> String {
         "{ISSUE_TAG}: refusing to bind http://{host}:{port}: TLS required and no certificate \
          configured — every client request, every MCP call, every response body and /metrics \
          would cross the wire unencrypted, loopback included ({MANDATE}). Fix: \
-         {REMEDY_TLS_INIT}. There is no plaintext posture to select."
+         {REMEDY_SUPPLY_TLS}. There is no plaintext posture to select."
     )
+}
+
+/// Render a URL for a refusal as `scheme://host[:port]` and NOTHING else —
+/// never the path, the query or the userinfo. A webhook target or peer URL
+/// routinely carries a token in its query or a password in its userinfo,
+/// and a refusal that echoes the credential it refuses to transmit is the
+/// credential-to-sink class (#3697/#3698, gate 7) — self-defeating. An
+/// unparseable value renders as its scheme (if any) plus a marker, never
+/// the raw bytes.
+#[must_use]
+pub fn url_origin_for_refusal(url: &str) -> String {
+    let trimmed = url.trim();
+    match reqwest::Url::parse(trimmed) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("<no host>");
+            match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+                None => format!("{}://{host}", parsed.scheme()),
+            }
+        }
+        Err(_) => match trimmed.split_once("://") {
+            Some((scheme, _)) => format!("{scheme}://<unparseable>"),
+            None => "<unparseable URL, no scheme>".to_string(),
+        },
+    }
 }
 
 /// The refusal for a plaintext URL on an outbound surface (`what` names the
 /// surface: "federation peer", "webhook target", "MCP forward URL", …).
+/// The URL is rendered by [`url_origin_for_refusal`] — origin only.
 #[must_use]
 pub fn plaintext_url_refusal(what: &str, url: &str) -> String {
     format!(
-        "{ISSUE_TAG}: refusing {what} {url:?}: plaintext http:// would carry data in the clear \
+        "{ISSUE_TAG}: refusing {what} {}: plaintext http:// would carry data in the clear \
          (loopback included — loopback is shared by every local process, and \"peer is \
-         loopback\" is not \"peer is trusted\"; {MANDATE}). Fix: {REMEDY_USE_HTTPS}."
+         loopback\" is not \"peer is trusted\"; {MANDATE}). Fix: {REMEDY_USE_HTTPS}. (URL \
+         shown as scheme://host:port only.)",
+        url_origin_for_refusal(url)
     )
 }
 
@@ -323,11 +356,55 @@ mod tests {
     /// #3709 item 5 — every refusal prints the command that resolves it.
     #[test]
     fn every_refusal_names_its_fix_3709() {
-        assert!(plaintext_listener_refusal("127.0.0.1", 9077).contains(REMEDY_TLS_INIT));
+        assert!(plaintext_listener_refusal("127.0.0.1", 9077).contains(REMEDY_SUPPLY_TLS));
         assert!(plaintext_url_refusal("webhook target", "http://x").contains(REMEDY_USE_HTTPS));
         assert!(pg_sslmode_refusal().contains(REMEDY_PG_SSLMODE));
-        assert!(REMEDY_TLS_INIT.contains("`ai-memory tls init`"));
-        assert!(REMEDY_TLS_INIT.contains("--tls-cert/--tls-key"));
+        // #3705 review: every remedy names what EXISTS in this commit — no
+        // `ai-memory tls …` / `db check-tls` verb (v1.0.1) is promised.
+        for remedy in [
+            REMEDY_SUPPLY_TLS,
+            REMEDY_TLS_RENEW,
+            REMEDY_PG_SSLMODE,
+            REMEDY_USE_HTTPS,
+            REMEDY_ENTERPRISE_PKI,
+        ] {
+            assert!(!remedy.contains("ai-memory tls"), "{remedy}");
+            assert!(!remedy.contains("check-tls"), "{remedy}");
+        }
+        assert!(REMEDY_SUPPLY_TLS.contains("--tls-cert <fullchain.pem> --tls-key <key.pem>"));
+        assert!(REMEDY_PG_SSLMODE.contains("sslmode=verify-full&sslrootcert=<ca.crt>"));
+    }
+
+    /// #3705 review — a refusal never echoes path, query or userinfo: the
+    /// URL it refuses to transmit routinely carries the credential.
+    #[test]
+    fn url_refusals_render_origin_only_never_credentials_3705() {
+        let url =
+            "http://svc-user:hunter2@hooks.example.net:8443/deliver/abc?token=SECRET-TOKEN#frag";
+        let origin = url_origin_for_refusal(url);
+        assert_eq!(origin, "http://hooks.example.net:8443");
+        let msg = plaintext_url_refusal("webhook target", url);
+        for leaked in [
+            "hunter2",
+            "svc-user",
+            "SECRET-TOKEN",
+            "/deliver",
+            "abc",
+            "frag",
+        ] {
+            assert!(!msg.contains(leaked), "leaked {leaked:?}: {msg}");
+        }
+        assert!(msg.contains("http://hooks.example.net:8443"), "{msg}");
+        assert_eq!(
+            url_origin_for_refusal("http://[::1]:9077/x?k=v"),
+            "http://[::1]:9077"
+        );
+        assert_eq!(url_origin_for_refusal("https://h/p?token=t"), "https://h");
+        assert_eq!(
+            url_origin_for_refusal("nonsense://///?token=t"),
+            "nonsense://<unparseable>"
+        );
+        assert!(!url_origin_for_refusal("user:pw@host?token=t").contains("pw"));
     }
 
     #[test]

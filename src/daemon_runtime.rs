@@ -6146,7 +6146,7 @@ pub fn resolve_tls_material(
                     "{}: no --tls-cert/--tls-key given and the key directory for the local \
                      certificate is unusable. Fix: {}",
                     crate::transit_encryption::ISSUE_TAG,
-                    crate::transit_encryption::REMEDY_TLS_INIT
+                    crate::transit_encryption::REMEDY_SUPPLY_TLS
                 )
             })?;
             let local =
@@ -6156,7 +6156,7 @@ pub fn resolve_tls_material(
                          refusing to bind rather than serve plaintext. Fix: {}",
                         crate::transit_encryption::ISSUE_TAG,
                         key_dir.join(crate::tls_bootstrap::TLS_SUBDIR).display(),
-                        crate::transit_encryption::REMEDY_TLS_INIT
+                        crate::transit_encryption::REMEDY_SUPPLY_TLS
                     )
                 })?;
             match &local.outcome {
@@ -6192,7 +6192,7 @@ pub fn resolve_tls_material(
             "{}: refusing to bind on {bind_host}: only one of --tls-cert/--tls-key was given \
              (both are needed). Fix: {}",
             crate::transit_encryption::ISSUE_TAG,
-            crate::transit_encryption::REMEDY_TLS_INIT
+            crate::transit_encryption::REMEDY_SUPPLY_TLS
         ),
     }
 }
@@ -12685,6 +12685,12 @@ mod tests {
         let env = TestEnv::fresh();
         let key_dir = env.db_path.parent().unwrap().join("keys");
         std::fs::create_dir_all(&key_dir).unwrap();
+        // #3705 review — a key dir never inherits the ambient umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from([
             "ai-memory",
@@ -12744,6 +12750,12 @@ mod tests {
         drop(crate::db::open(&env.db_path).expect("db::open"));
         let key_dir = env.db_path.parent().unwrap().join("keys");
         std::fs::create_dir_all(&key_dir).unwrap();
+        // #3705 review — a key dir never inherits the ambient umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from([
             "ai-memory",
