@@ -1,0 +1,28 @@
+# #3688/3 baseline — sites that existed when the gate landed (2026-09-13).
+#
+# The gate's job is to stop NEW instances. These are triaged by DIRECTION,
+# which is what actually determines severity:
+#
+#   HARDENING knob (setting it STRENGTHENS security): a narrow grammar means
+#   `=yes` is not parsed, the hardening DOES NOT APPLY, and the operator
+#   believes it did. That is a silent fail-OPEN and a real vulnerability.
+#
+#   FAIL-OPEN knob (setting it WEAKENS security): a narrow grammar means `=yes`
+#   is not parsed, the weakening does not apply, and the node stays secure.
+#   Wrong, but it fails in the safe direction.
+#
+# CRITICAL — hardening knobs, tracked for immediate fix under #3200:
+#   src/daemon_runtime.rs:AI_MEMORY_REQUIRE_TLS   <-- NOT allowlisted, must fail
+#
+# Allowlisted below: fail-open-direction knobs and non-security toggles. Each
+# still wants the shared helper eventually; none is a live vulnerability.
+src/daemon_runtime.rs:AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS
+src/daemon_runtime.rs:AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK
+src/daemon_runtime.rs:AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR
+src/store_url.rs:AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS
+src/subscriptions.rs:AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL
+src/confidence/decay.rs:AI_MEMORY_CONFIDENCE_DECAY
+src/confidence/mod.rs:AI_MEMORY_AUTO_CONFIDENCE
+src/confidence/shadow.rs:AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE
+src/handlers/admin_role.rs:AI_MEMORY_ADMIN_HEADER_TRUST
+src/mcp/registry.rs:AI_MEMORY_TOOLS_VERBOSE
