@@ -50,7 +50,7 @@ const TEST_SECRET: &str = "k10-pg-dispatch-1618-secret";
 /// store's backing file is therefore reachable ONLY through the trait
 /// dispatch path — the load-bearing property this regression test
 /// pins.
-fn build_disjoint_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
+fn build_disjoint_fake_pg_router() -> (axum::Router, std::path::PathBuf, tempfile::TempDir) {
     let scratch = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         scratch,
@@ -58,9 +58,8 @@ fn build_disjoint_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-    let store_path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
+    let store_path = tmp.path().join("test.db");
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
     );
@@ -113,6 +112,7 @@ fn build_disjoint_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
     (
         ai_memory::build_router(api_key_state, app_state),
         store_path,
+        tmp,
     )
 }
 
@@ -177,7 +177,7 @@ async fn approve_dispatches_to_sal_store_on_postgres_backend_1618() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, store_path) = build_disjoint_fake_pg_router();
+    let (router, store_path, _tmp_guard) = build_disjoint_fake_pg_router();
     let pending_id = seed_pending_row_in_store(&store_path, "alice");
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -221,7 +221,7 @@ async fn deny_dispatches_to_sal_store_on_postgres_backend_1618() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, store_path) = build_disjoint_fake_pg_router();
+    let (router, store_path, _tmp_guard) = build_disjoint_fake_pg_router();
     let pending_id = seed_pending_row_in_store(&store_path, "alice");
 
     let body = json!({"decision": "deny", "remember": "once"}).to_string();
@@ -260,7 +260,7 @@ async fn approve_forever_is_refused_on_postgres_backend_3394() {
         .unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
     ai_memory::approvals::clear_synthetic_rules_for_test();
-    let (router, store_path) = build_disjoint_fake_pg_router();
+    let (router, store_path, _tmp_guard) = build_disjoint_fake_pg_router();
     let pending_id = seed_pending_row_in_store(&store_path, "alice");
 
     let body = json!({"decision": "approve", "remember": "forever"}).to_string();
@@ -296,7 +296,7 @@ async fn approve_session_records_rule_on_postgres_backend_3394() {
         .unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
     ai_memory::approvals::clear_synthetic_rules_for_test();
-    let (router, store_path) = build_disjoint_fake_pg_router();
+    let (router, store_path, _tmp_guard) = build_disjoint_fake_pg_router();
     let pending_id = seed_pending_row_in_store(&store_path, "alice");
 
     let body = json!({"decision": "approve", "remember": "session"}).to_string();
@@ -529,11 +529,9 @@ async fn pending_approve_missing_id_returns_404_on_sqlite_1620() {
         // Reuse the harness builder but point the gate at a SQLITE
         // backend: build a plain sqlite router the same way the
         // attestation integration tests do.
-        let f = tempfile::NamedTempFile::new().expect("tempfile");
-        let db_path = f.path().to_path_buf();
+        let f = tempfile::TempDir::new().expect("tempfile");
+        let db_path = f.path().join("test.db");
         let _ = ai_memory::db::open(&db_path).expect("db::open");
-        // Leak the tempfile guard so the DB outlives this block.
-        std::mem::forget(f);
         let conn = ai_memory::db::open(&db_path).expect("reopen");
         let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
             conn,

@@ -63,7 +63,7 @@ fn durable_memory() -> Memory {
     }
 }
 
-fn fresh_db(tag: &str) -> Connection {
+fn fresh_db(tag: &str) -> (Connection, tempfile::TempDir) {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".local-runs")
@@ -75,8 +75,7 @@ fn fresh_db(tag: &str) -> Connection {
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     drop(ai_memory::db::open(&path).expect("init db"));
-    std::mem::forget(dir); // keep the file alive for the connection's lifetime
-    ai_memory::db::open(&path).expect("open db")
+    (ai_memory::db::open(&path).expect("open db"), dir)
 }
 
 /// Populate `conn` with a row in every signed class the exporter carries.
@@ -145,7 +144,7 @@ fn seed_all_classes(conn: &Connection) {
 
 #[test]
 fn full_envelope_round_trips_every_signed_class_byte_exact() {
-    let src = fresh_db("src-");
+    let (src, _tmp_guard) = fresh_db("src-");
     seed_all_classes(&src);
 
     // Export → serialize through JSON (the real wire form) → deserialize.
@@ -154,7 +153,7 @@ fn full_envelope_round_trips_every_signed_class_byte_exact() {
     let parsed: emit::ExportEnvelope = serde_json::from_str(&json).expect("deserialize envelope");
 
     // Import into a FRESH destination.
-    let dst = fresh_db("dst-");
+    let (dst, _tmp_guard) = fresh_db("dst-");
     // `trust_source: true` is the explicit
     // operator-trusted-backup posture (#2211): the byte-exact identity
     // round-trip below (`agent_id` preserved verbatim) is EARNED by the
@@ -256,7 +255,7 @@ fn full_envelope_round_trips_every_signed_class_byte_exact() {
 
 #[test]
 fn tampering_a_source_signed_event_downgrades_conformance() {
-    let src = fresh_db("tamper-");
+    let (src, _tmp_guard) = fresh_db("tamper-");
     seed_all_classes(&src);
     // A clean chain re-verifies → at least L2.
     let clean = emit::build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").unwrap();

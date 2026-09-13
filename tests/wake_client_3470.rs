@@ -62,12 +62,11 @@ fn uid(prefix: &str) -> String {
     format!("ai:{prefix}-{}", uuid::Uuid::new_v4())
 }
 
-fn temp_db() -> PathBuf {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+fn temp_db() -> (PathBuf, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
-    db_path
+    (db_path, f)
 }
 
 /// Everything `ai-memory identity delegate --scope a2a-hub` leaves on disk,
@@ -251,7 +250,7 @@ async fn a_real_notify_wakes_a_real_listener_and_it_reads_the_durable_row_3470()
     stream.note_read();
 
     // A REAL notify on a REAL store.
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let conn = ai_memory::db::open(&db_path).expect("open");
     let secret = "SUPER-SECRET-NOTIFY-BODY-3470";
     let envelope = ai_memory::mcp::handle_notify(

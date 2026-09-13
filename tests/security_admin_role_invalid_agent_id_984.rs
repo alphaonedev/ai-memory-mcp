@@ -44,7 +44,7 @@ use tower::ServiceExt as _;
 mod common_admin {
     use std::sync::Arc;
 
-    pub fn build_router_with_admin_allowlist() -> axum::Router {
+    pub fn build_router_with_admin_allowlist() -> (axum::Router, tempfile::TempDir) {
         // #1570 — these tests model an AUTHENTICATED deployment (api_key
         // configured at boot), the pre-#1570 implicit posture, so the admin
         // header role-claims they assert keep working. The #1570 secure
@@ -59,11 +59,12 @@ mod common_admin {
             ai_memory::config::ResolvedTtl::default(),
             true,
         )));
+        // #3669: the store file lives in a TempDir the caller owns, so the
+        // database and its -wal/-shm siblings are removed when the test ends.
+        let tmp = tempfile::TempDir::new().expect("tempfile");
         #[cfg(feature = "sal")]
         let store: Arc<dyn ai_memory::store::MemoryStore> = {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-            let p = tmp.path().to_path_buf();
-            std::mem::forget(tmp);
+            let p = tmp.path().join("store.db");
             Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
         };
         let app_state = ai_memory::handlers::AppState {
@@ -116,13 +117,13 @@ mod common_admin {
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
         };
-        ai_memory::build_router(api_key_state, app_state)
+        (ai_memory::build_router(api_key_state, app_state), tmp)
     }
 }
 
 #[tokio::test]
 async fn admin_endpoint_returns_400_on_invalid_char_class_agent_id_984() {
-    let router = common_admin::build_router_with_admin_allowlist();
+    let (router, _tmp_guard) = common_admin::build_router_with_admin_allowlist();
     // `bad;rm` fails validate_agent_id_shape — `;` is not in the
     // allowed char class.
     let req = Request::builder()
@@ -155,7 +156,7 @@ async fn admin_endpoint_returns_400_on_reserved_name_spoof_984() {
     // it returns 400 with the reserved-name reason, so the audit
     // chain captures the spoof attempt + the operator sees the
     // actionable validator diagnostic.
-    let router = common_admin::build_router_with_admin_allowlist();
+    let (router, _tmp_guard) = common_admin::build_router_with_admin_allowlist();
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/stats")
@@ -181,7 +182,7 @@ async fn admin_endpoint_returns_400_on_reserved_name_spoof_984() {
 async fn admin_endpoint_returns_403_on_non_admin_caller_984() {
     // Pin the non-regression: a LEGITIMATE non-admin caller still
     // gets 403 (not 400). Only invalid-shape inputs go to 400.
-    let router = common_admin::build_router_with_admin_allowlist();
+    let (router, _tmp_guard) = common_admin::build_router_with_admin_allowlist();
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/stats")

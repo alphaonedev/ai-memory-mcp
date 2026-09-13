@@ -479,7 +479,7 @@ mod tests {
     use super::*;
     use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
 
-    fn fresh_conn() -> Connection {
+    fn fresh_conn() -> (Connection, tempfile::TempDir) {
         let root = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join(".local-runs")
@@ -491,8 +491,7 @@ mod tests {
             .expect("tempdir");
         let path = dir.path().join("emit.db");
         drop(crate::db::open(&path).expect("init"));
-        std::mem::forget(dir);
-        crate::db::open(&path).expect("open")
+        (crate::db::open(&path).expect("open"), dir)
     }
 
     fn append_row(conn: &Connection, i: usize) {
@@ -510,7 +509,7 @@ mod tests {
 
     #[test]
     fn envelope_stamps_spec_version_and_schema() {
-        let conn = fresh_conn();
+        let (conn, _tmp_guard) = fresh_conn();
         let env = build_full_envelope(&conn, "test", "2026-07-14T00:00:00Z").expect("build");
         assert_eq!(env.spec_version, "2");
         assert!(
@@ -534,7 +533,7 @@ mod tests {
 
     #[test]
     fn broken_source_chain_downgrades_conformance_to_l1() {
-        let conn = fresh_conn();
+        let (conn, _tmp_guard) = fresh_conn();
         for i in 0..5 {
             append_row(&conn, i);
         }
@@ -578,7 +577,7 @@ mod tests {
 
     #[test]
     fn signed_events_cross_as_hex_not_number_arrays() {
-        let conn = fresh_conn();
+        let (conn, _tmp_guard) = fresh_conn();
         append_row(&conn, 0);
         let env = build_full_envelope(&conn, "t", "2026-07-14T00:00:00Z").expect("build");
         let json = serde_json::to_string(&env.signed_events).expect("ser");

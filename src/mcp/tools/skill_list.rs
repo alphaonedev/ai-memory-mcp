@@ -217,12 +217,11 @@ mod tests {
     use super::*;
     use rusqlite::params;
 
-    fn open_db() -> rusqlite::Connection {
+    fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
         let conn = crate::db::open(&path).expect("db::open");
-        std::mem::forget(dir);
-        conn
+        (conn, dir)
     }
 
     fn insert_skill(
@@ -245,7 +244,7 @@ mod tests {
 
     #[test]
     fn empty_db_returns_empty_list() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let v = handle_skill_list(&conn, &json!({})).unwrap();
         assert_eq!(v["count"], json!(0));
         assert_eq!(v["skills"], json!([]));
@@ -253,7 +252,7 @@ mod tests {
 
     #[test]
     fn returns_only_current_non_superseded() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "id-old", "ns", "name", "old", 0);
         insert_skill(&conn, "id-new", "ns", "name", "new", 1);
         conn.execute(
@@ -270,7 +269,7 @@ mod tests {
 
     #[test]
     fn filters_by_namespace() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
@@ -281,7 +280,7 @@ mod tests {
 
     #[test]
     fn wildcard_namespace_returns_all() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
@@ -291,7 +290,7 @@ mod tests {
 
     #[test]
     fn no_namespace_defaults_to_wildcard() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
@@ -301,7 +300,7 @@ mod tests {
 
     #[test]
     fn filter_matches_name() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns", "deploy-canary", "k8s canary deploy", 0);
         insert_skill(&conn, "b", "ns", "audit-logs", "fetch audit logs", 1);
 
@@ -312,7 +311,7 @@ mod tests {
 
     #[test]
     fn filter_matches_description() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns", "x", "kubernetes deploy notes", 0);
         insert_skill(&conn, "b", "ns", "y", "totally different", 1);
 
@@ -322,7 +321,7 @@ mod tests {
 
     #[test]
     fn filter_no_match_returns_empty() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns", "x", "k8s", 0);
 
         let v = handle_skill_list(&conn, &json!({"filter": "no-such-text"})).unwrap();
@@ -331,7 +330,7 @@ mod tests {
 
     #[test]
     fn includes_optional_columns_when_present() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0xab_u8; 32];
         let allowed_tools = serde_json::to_string(&vec!["tool1"]).unwrap();
@@ -359,7 +358,7 @@ mod tests {
 
     #[test]
     fn omits_empty_metadata_object() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns", "x", "d", 0);
         let v = handle_skill_list(&conn, &json!({})).unwrap();
         let entry = &v["skills"][0];
@@ -369,7 +368,7 @@ mod tests {
 
     #[test]
     fn ignores_malformed_allowed_tools_json() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
         conn.execute(
@@ -386,7 +385,7 @@ mod tests {
 
     #[test]
     fn empty_filter_string_is_no_filter() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_skill(&conn, "a", "ns", "x", "d", 0);
         insert_skill(&conn, "b", "ns", "y", "e", 1);
         let v = handle_skill_list(&conn, &json!({"filter": ""})).unwrap();

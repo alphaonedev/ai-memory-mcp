@@ -56,7 +56,7 @@ static K10_SECURITY_LOCK: Mutex<()> = Mutex::new(());
 // blocker tests can be read in isolation.
 // ---------------------------------------------------------------------------
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -65,11 +65,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -123,7 +124,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 async fn seed_pending_delete_row(
@@ -304,7 +305,7 @@ fn sign(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
 async fn hmac_replay_rejected() {
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-replay-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_delete_row(&db, "scratch", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -338,7 +339,7 @@ async fn hmac_replay_rejected() {
 async fn hmac_in_window_replay_rejected() {
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-nonce-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_delete_row(&db, "scratch", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -381,7 +382,7 @@ async fn hmac_in_window_replay_rejected() {
 async fn hmac_fresh_timestamp_accepted() {
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-replay-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_delete_row(&db, "scratch", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -540,7 +541,7 @@ async fn sse_http_two_subscribers_isolated() {
     use http_body_util::BodyExt as _;
 
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let (router, _db) = build_router_with_db();
+    let (router, _db, _tmp_guard) = build_router_with_db();
 
     // Open both SSE streams BEFORE publishing — broadcast channels
     // never replay, and the SSE handler attaches its bus subscriber
@@ -762,7 +763,7 @@ async fn evaluate_without_synthetic_rule_does_not_auto_allow() {
 async fn hmac_cross_method_binding_rejected() {
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-cross-method-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_delete_row(&db, "scratch", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -805,7 +806,7 @@ async fn hmac_cross_method_binding_rejected() {
 async fn hmac_cross_pending_id_binding_rejected() {
     let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-cross-pid-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // Two distinct pending rows. We sign against id_a but POST to id_b.
     let pending_id_a = seed_pending_delete_row(&db, "scratch", "alice").await;
     let pending_id_b = seed_pending_delete_row(&db, "scratch", "bob").await;

@@ -427,7 +427,7 @@ pub fn read_all_archived_memory_links(conn: &Connection) -> Result<Vec<ArchivedM
 mod tests {
     use super::*;
 
-    fn empty_db() -> Connection {
+    fn empty_db() -> (Connection, tempfile::TempDir) {
         let dir = tempfile::Builder::new()
             .prefix("issue-2006-read-")
             .tempdir_in({
@@ -441,10 +441,9 @@ mod tests {
             .expect("tempdir under .local-runs");
         let path = dir.path().join("read.db");
         drop(crate::db::open(&path).expect("init db"));
-        // Keep the tempdir alive for the connection's lifetime by leaking it —
-        // the .local-runs root is the project scratch space.
-        std::mem::forget(dir);
-        crate::db::open(&path).expect("open db")
+        // The caller keeps `dir` for the rest of the test; dropping it removes
+        // the database and its -wal/-shm siblings (#3669).
+        (crate::db::open(&path).expect("open db"), dir)
     }
 
     #[test]
@@ -452,7 +451,7 @@ mod tests {
         // A migrated-but-empty DB: the read-alls must return empty vecs (the
         // tables exist post-migration; lineage tolerates absence too), never
         // error — the exporter emits empty arrays for empty classes.
-        let conn = empty_db();
+        let (conn, _tmp_guard) = empty_db();
         assert!(
             read_all_forget_tombstones(&conn)
                 .expect("tombstones")
@@ -490,7 +489,7 @@ mod tests {
     /// which is exactly why archive→restore had to re-mint the address).
     #[test]
     fn read_all_archived_memories_round_trips_the_archive_shape() {
-        let conn = empty_db();
+        let (conn, _tmp_guard) = empty_db();
         crate::storage::insert(
             &conn,
             &Memory {
@@ -531,7 +530,7 @@ mod tests {
     /// seeded row with every column intact.
     #[test]
     fn read_all_namespace_meta_and_archived_links_surface_seeded_rows() {
-        let conn = empty_db();
+        let (conn, _tmp_guard) = empty_db();
         crate::storage::insert(
             &conn,
             &Memory {

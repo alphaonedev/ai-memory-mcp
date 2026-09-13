@@ -31,7 +31,7 @@ use tower::ServiceExt as _;
 
 /// Build the router from a fresh in-memory DB so each test starts
 /// clean and there's no inter-test leakage on the `memory_links` table.
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -40,11 +40,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -98,7 +99,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 /// Insert two memories so a link can reference them. Returns
@@ -192,7 +193,7 @@ async fn post_links(
 
 #[tokio::test]
 async fn unknown_field_link_type_rejected_with_structured_400() {
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let (src, tgt) = seed_two_memories(&db).await;
     let (status, body) = post_links(
         router,
@@ -218,7 +219,7 @@ async fn unknown_field_link_type_rejected_with_structured_400() {
 
 #[tokio::test]
 async fn unknown_field_rejected_lists_multiple_unknown_fields_sorted() {
-    let (router, _db) = build_router_with_db();
+    let (router, _db, _tmp_guard) = build_router_with_db();
     // Empty body avoids needing seeded memories — the unknown-field
     // gate runs first.
     let (status, body) = post_links(
@@ -243,7 +244,7 @@ async fn unknown_field_rejected_lists_multiple_unknown_fields_sorted() {
 
 #[tokio::test]
 async fn invalid_relation_rejected_with_structured_400() {
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let (src, tgt) = seed_two_memories(&db).await;
     let (status, body) = post_links(
         router,
@@ -276,7 +277,7 @@ async fn invalid_relation_rejected_with_structured_400() {
 
 #[tokio::test]
 async fn canonical_relation_still_accepted_post_fix() {
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let (src, tgt) = seed_two_memories(&db).await;
     let (status, body) = post_links(
         router,
@@ -293,7 +294,7 @@ async fn canonical_relation_still_accepted_post_fix() {
 
 #[tokio::test]
 async fn s82_aliases_still_accepted_post_fix() {
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let (src, tgt) = seed_two_memories(&db).await;
     let (status, body) = post_links(
         router,

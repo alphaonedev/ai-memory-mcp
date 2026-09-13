@@ -95,13 +95,11 @@ fn owned_private(owner: &str, ns: &str, title: &str) -> Memory {
     }
 }
 
-fn build_pg_router(url_store: Arc<dyn MemoryStore>) -> axum::Router {
+fn build_pg_router(url_store: Arc<dyn MemoryStore>) -> (axum::Router, tempfile::TempDir) {
     // A throwaway sqlite handle satisfies the `Db` field; the postgres
     // branch of every touched handler dispatches through `app.store`.
     let sqlite_dir = tempfile::tempdir().expect("tempdir");
     let sqlite_path = sqlite_dir.path().join("reflect-2857-http.db");
-    // Keep the dir alive for the process lifetime (leak is fine in a test).
-    std::mem::forget(sqlite_dir);
     let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
         ai_memory::db::open(&sqlite_path).expect("sqlite open"),
         sqlite_path.clone(),
@@ -146,7 +144,7 @@ fn build_pg_router(url_store: Arc<dyn MemoryStore>) -> axum::Router {
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(
+    let built = ai_memory::build_router(
         ai_memory::handlers::ApiKeyState {
             key: None,
             mtls_enforced: false,
@@ -156,7 +154,8 @@ fn build_pg_router(url_store: Arc<dyn MemoryStore>) -> axum::Router {
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
         },
         app_state,
-    )
+    );
+    (built, sqlite_dir)
 }
 
 /// GET `/api/v1/memories/{id}` as `agent_id`; returns (status, body).
@@ -230,7 +229,7 @@ async fn reflect_finds_get_visible_pg_source_2857() {
             .await
             .expect("connect http store"),
     );
-    let router = build_pg_router(store_arc);
+    let (router, _tmp_guard) = build_pg_router(store_arc);
 
     // (1) The source demonstrably EXISTS + is visible to alice via GET.
     let (get_status, get_body) = get_as(&router, &source_id, "alice").await;

@@ -143,7 +143,7 @@ fn scratch_root() -> PathBuf {
         .join("issue-2030-conformance")
 }
 
-fn fresh_db(tag: &str) -> Connection {
+fn fresh_db(tag: &str) -> (Connection, tempfile::TempDir) {
     let root = scratch_root();
     std::fs::create_dir_all(&root).ok();
     let dir = tempfile::Builder::new()
@@ -152,8 +152,7 @@ fn fresh_db(tag: &str) -> Connection {
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     drop(ai_memory::db::open(&path).expect("init db"));
-    std::mem::forget(dir); // keep the file alive for the connection's lifetime
-    ai_memory::db::open(&path).expect("open db")
+    (ai_memory::db::open(&path).expect("open db"), dir)
 }
 
 /// A fully-populated durable memory — the L1 source-of-truth TEXT lane. Fixed
@@ -280,7 +279,7 @@ fn seed_all_classes(conn: &Connection) {
 /// point at an empty temp dir — so the emitted bytes reproduce identically on
 /// any host/CI environment regardless of ambient key enrolment.
 fn build_fixture_envelope() -> emit::ExportEnvelope {
-    let src = fresh_db("src-");
+    let (src, _tmp_guard) = fresh_db("src-");
     seed_all_classes(&src);
 
     let empty = scratch_root().join("empty-keys");
@@ -385,7 +384,7 @@ fn committed_fixture_round_trips_through_production_importer() {
     // Round-trip through the FAIL-CLOSED, ALL-OR-NOTHING production importer.
     // `trust_source: true` is the operator-trusted-backup posture (#2211) that
     // preserves `metadata.agent_id` verbatim so the identity round-trip is exact.
-    let dst = fresh_db("dst-");
+    let (dst, _tmp_guard) = fresh_db("dst-");
     let report = import::import_full_envelope(
         &dst,
         &fixture,

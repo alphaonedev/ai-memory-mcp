@@ -57,12 +57,11 @@ fn uid(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
-fn temp_db() -> PathBuf {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+fn temp_db() -> (PathBuf, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
-    db_path
+    (db_path, f)
 }
 
 /// A live router with one registered recipient whose writer queue this test
@@ -138,7 +137,7 @@ async fn notify_reaches_a_cohosted_hub_through_the_installed_sink_3469() {
     let metrics = install_in_process(Arc::clone(&probe.router))
         .expect("this binary installs exactly one wake sink");
 
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let conn = ai_memory::db::open(&db_path).expect("open");
     let envelope = ai_memory::mcp::handle_notify(
         &conn,
@@ -441,7 +440,7 @@ async fn the_sqlite_sal_notify_funnel_reaches_the_hub_3469() {
     let sink = InProcessWakeSink::for_router(Arc::clone(&probe.router));
     let mut rx = ai_memory::inbox_wake::subscribe();
 
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let store = ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("SqliteStore");
     let ctx = ai_memory::store::CallerContext::for_agent("ai:alice");
     let row_id = store
@@ -556,10 +555,9 @@ fn publish_allowlist(
     out: &std::path::Path,
     rows: &[ai_memory::wake_hub::delegation_verifier::AllowlistEntry],
 ) {
-    let db = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = db.path().to_path_buf();
+    let db = tempfile::TempDir::new().expect("tempfile");
+    let db_path = db.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(db);
     let snapshot = ai_memory::cli::identity_hub_cache::derive_with_extra(
         &db_path,
         None,

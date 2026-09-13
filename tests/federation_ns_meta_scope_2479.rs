@@ -129,7 +129,7 @@ impl Drop for PostureGuard {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -138,11 +138,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -192,7 +193,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 /// Seed the peer-attestation posture. `allowlist == None` = ZERO-CONFIG.
@@ -383,7 +384,7 @@ async fn exploit_set_rebinds_out_of_scope_victim_standard_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let victim_standard = seed_standard_memory(&router, VICTIM_NS, "victim standard", None).await;
     let evil_standard = seed_standard_memory(&router, IN_SCOPE_NS, "evil standard", None).await;
@@ -421,7 +422,7 @@ async fn control_same_body_in_scope_applies_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_WITH_VICTIM), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let victim_standard = seed_standard_memory(&router, VICTIM_NS, "victim standard", None).await;
     let evil_standard = seed_standard_memory(&router, IN_SCOPE_NS, "evil standard", None).await;
@@ -455,7 +456,7 @@ async fn exploit_clear_disarms_out_of_scope_victim_standard_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let victim_standard = seed_standard_memory(
         &router,
@@ -494,7 +495,7 @@ async fn control_clear_in_scope_still_clears_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_WITH_VICTIM), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let victim_standard = seed_standard_memory(&router, VICTIM_NS, "victim standard", None).await;
     bind_standard_locally(&db, VICTIM_NS, &victim_standard, None).await;
@@ -526,7 +527,7 @@ async fn exploit_parent_reparents_root_under_out_of_scope_namespace_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_ROOT), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // The restrictive substrate-wide default the peer wants out of its way.
     let global_standard = seed_standard_memory(
@@ -589,7 +590,7 @@ async fn control_parent_in_scope_applies_and_takes_effect_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_ROOT_AND_PARENT), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let global_standard = seed_standard_memory(
         &router,
@@ -645,7 +646,7 @@ async fn exploit_global_standard_refused_under_single_segment_scope_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_SINGLE_STAR), Some("0"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let global_standard = seed_standard_memory(
         &router,
@@ -695,7 +696,7 @@ async fn control_global_standard_allowed_under_double_star_scope_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_DOUBLE_STAR), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let evil_standard = seed_standard_memory(&router, "alpha", "evil standard", None).await;
 
@@ -732,7 +733,7 @@ async fn no_allowlist_namespace_meta_posture_matrix_3582() {
             r#"{"ai:evil":{"allowed_namespaces":["**"],"allowed_sender_agent_ids":["ai:evil"]}}"#,
         );
         set_posture(allowlist, require);
-        let (router, db) = build_router_with_db();
+        let (router, db, _tmp_guard) = build_router_with_db();
 
         let victim_standard =
             seed_standard_memory(&router, VICTIM_NS, "victim standard", None).await;
@@ -821,7 +822,7 @@ async fn enrolled_unscoped_peer_honours_knob_147_2479() {
         let _lock = ENV_LOCK.lock().await;
         let _guard = PostureGuard;
         set_posture(Some(ENROLLED_UNSCOPED_ALLOWLIST), Some(knob));
-        let (router, db) = build_router_with_db();
+        let (router, db, _tmp_guard) = build_router_with_db();
 
         let evil_standard = seed_standard_memory(&router, IN_SCOPE_NS, "evil standard", None).await;
         let (status, report) = push_namespace_meta(
@@ -852,7 +853,7 @@ async fn refusal_is_per_entry_and_batch_survives_2479() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), Some("1"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let evil_standard = seed_standard_memory(&router, IN_SCOPE_NS, "evil standard", None).await;
 

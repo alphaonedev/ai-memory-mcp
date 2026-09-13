@@ -41,10 +41,9 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn setup_router() -> axum::Router {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
-    let db_path = db_tmp.path().to_path_buf();
-    std::mem::forget(db_tmp);
+fn setup_router() -> (axum::Router, tempfile::TempDir) {
+    let db_tmp = tempfile::TempDir::new().expect("db tempfile");
+    let db_path = db_tmp.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((
@@ -102,7 +101,7 @@ fn setup_router() -> axum::Router {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(api_key_state, app_state)
+    (ai_memory::build_router(api_key_state, app_state), db_tmp)
 }
 
 /// POST `/api/v1/sync/push` with an optional `X-Peer-Id` header and an
@@ -176,7 +175,7 @@ async fn mismatched_peer_id_refused_under_enforce() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "enforce");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     // Cert is operator-bound to "peer-a"; the request asserts "peer-b".
     let (status, body) = post_sync_push(&router, Some("peer-b"), Some(Some("peer-a"))).await;
     clear_env();
@@ -200,7 +199,7 @@ async fn matching_peer_id_accepted_under_enforce() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "enforce");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     // Cert bound to "peer-a", request asserts "peer-a" — passes the gate.
     let (status, body) = post_sync_push(&router, Some("peer-a"), Some(Some("peer-a"))).await;
     clear_env();
@@ -222,7 +221,7 @@ async fn mismatched_peer_id_allowed_under_warn() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "warn");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     let (status, body) = post_sync_push(&router, Some("peer-b"), Some(Some("peer-a"))).await;
     clear_env();
     assert_ne!(
@@ -253,7 +252,7 @@ async fn legacy_cert_without_binding_is_refused_under_enforce() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "enforce");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     // The presenting cert's fingerprint carries NO binding.
     let (status, body) = post_sync_push(&router, Some("peer-b"), Some(None)).await;
     clear_env();
@@ -291,7 +290,7 @@ async fn legacy_cert_without_binding_still_proceeds_under_warn() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "warn");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     let (status, body) = post_sync_push(&router, Some("peer-b"), Some(None)).await;
     clear_env();
     assert_ne!(
@@ -314,7 +313,7 @@ async fn bound_cert_without_asserted_peer_id_is_refused_under_enforce() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "enforce");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     // Cert IS bound to peer-a; the request asserts no X-Peer-Id at all.
     let (status, body) = post_sync_push(&router, None, Some(Some("peer-a"))).await;
     clear_env();
@@ -339,7 +338,7 @@ async fn bound_cert_without_asserted_peer_id_proceeds_under_warn() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "warn");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     let (status, body) = post_sync_push(&router, None, Some(Some("peer-a"))).await;
     clear_env();
     assert_ne!(status, StatusCode::UNAUTHORIZED, "body={body}");
@@ -352,7 +351,7 @@ async fn no_cert_extension_skips_check_under_enforce() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "enforce");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     // No `ClientCertPeerId` extension at all (plain-HTTP / no binding map):
     // the cross-check is skipped — cannot bind what did not arrive over the
     // peer-binding acceptor.
@@ -368,7 +367,7 @@ async fn mismatch_ignored_when_posture_off() {
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "off");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     let (status, body) = post_sync_push(&router, Some("peer-b"), Some(Some("peer-a"))).await;
     clear_env();
     assert_ne!(

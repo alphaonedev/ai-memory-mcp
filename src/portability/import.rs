@@ -1992,7 +1992,7 @@ mod tests {
             .push(statement.to_string());
     }
 
-    fn fresh_conn(tag: &str) -> Connection {
+    fn fresh_conn(tag: &str) -> (Connection, tempfile::TempDir) {
         let root = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join(".local-runs")
@@ -2004,13 +2004,12 @@ mod tests {
             .expect("tempdir");
         let path = dir.path().join("db.sqlite");
         drop(crate::db::open(&path).expect("init"));
-        std::mem::forget(dir);
-        crate::db::open(&path).expect("open")
+        (crate::db::open(&path).expect("open"), dir)
     }
 
     #[test]
     fn atomic_import_reserves_the_writer_up_front_2250() {
-        let conn = fresh_conn("begin-immediate-2250");
+        let (conn, _tmp_guard) = fresh_conn("begin-immediate-2250");
         conn.execute_batch("CREATE TABLE import_lock_probe (value INTEGER NOT NULL)")
             .unwrap();
         let db_path = conn
@@ -2055,9 +2054,9 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
 
-        let src = fresh_conn("entrypoint-order-src-2250-");
+        let (src, _tmp_guard) = fresh_conn("entrypoint-order-src-2250-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
-        let mut dst = fresh_conn("entrypoint-order-dst-2250-");
+        let (mut dst, _tmp_guard) = fresh_conn("entrypoint-order-dst-2250-");
         let signer = crate::identity::keypair::generate("ai:source-2250").expect("keygen");
         crate::storage::register_agent(&dst, "ai:source-2250", "ai:generic", &[])
             .expect("register signer");
@@ -2164,7 +2163,7 @@ mod tests {
 
     #[test]
     fn signed_events_round_trip_byte_exact_and_reverify() {
-        let src = fresh_conn("src-");
+        let (src, _tmp_guard) = fresh_conn("src-");
         for i in 0..5 {
             append_row(&src, i);
         }
@@ -2172,7 +2171,7 @@ mod tests {
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         assert_eq!(env.signed_events.len(), 5);
 
-        let dst = fresh_conn("dst-");
+        let (dst, _tmp_guard) = fresh_conn("dst-");
         let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
         assert_eq!(report.signed_events, 5);
         assert!(report.committed, "the fail-closed import committed");
@@ -2195,12 +2194,12 @@ mod tests {
 
     #[test]
     fn import_is_idempotent() {
-        let src = fresh_conn("idem-src-");
+        let (src, _tmp_guard) = fresh_conn("idem-src-");
         for i in 0..3 {
             append_row(&src, i);
         }
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
-        let dst = fresh_conn("idem-dst-");
+        let (dst, _tmp_guard) = fresh_conn("idem-dst-");
         let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("import 1");
         let second = import_full_envelope(&dst, &env, &opts_trusted()).expect("import 2");
         assert_eq!(first.signed_events, 3);
@@ -2215,7 +2214,7 @@ mod tests {
     /// bytes were altered) is REJECTED and applies ZERO rows — no partial apply.
     #[test]
     fn tampered_bundle_is_rejected_with_zero_rows_applied() {
-        let src = fresh_conn("tamper-src-");
+        let (src, _tmp_guard) = fresh_conn("tamper-src-");
         for i in 0..5 {
             append_row(&src, i);
         }
@@ -2225,7 +2224,7 @@ mod tests {
         env.signed_events[1].payload_hash =
             crate::portability::hex_bytes::HexBytes(vec![0xba, 0xad]);
 
-        let dst = fresh_conn("tamper-dst-");
+        let (dst, _tmp_guard) = fresh_conn("tamper-dst-");
         let err = import_full_envelope(&dst, &env, &opts_trusted())
             .expect_err("tampered bundle must be rejected");
         assert!(
@@ -2245,7 +2244,7 @@ mod tests {
     /// opening a sequence gap) is REJECTED and applies ZERO rows.
     #[test]
     fn truncated_bundle_is_rejected_with_zero_rows_applied() {
-        let src = fresh_conn("trunc-src-");
+        let (src, _tmp_guard) = fresh_conn("trunc-src-");
         for i in 0..5 {
             append_row(&src, i);
         }
@@ -2254,7 +2253,7 @@ mod tests {
         // broken hash link.
         env.signed_events.remove(2);
 
-        let dst = fresh_conn("trunc-dst-");
+        let (dst, _tmp_guard) = fresh_conn("trunc-dst-");
         let err = import_full_envelope(&dst, &env, &opts_trusted())
             .expect_err("truncated bundle must be rejected");
         assert!(err.to_string().contains("REJECTED"), "got: {err}");
@@ -2272,12 +2271,12 @@ mod tests {
     /// tombstones were consulted; `storage::insert` re-admitted the row).
     #[test]
     fn dest_forgotten_memory_is_not_resurrected_2208() {
-        let src = fresh_conn("forget-src-");
+        let (src, _tmp_guard) = fresh_conn("forget-src-");
         let mem = memory_fixture("mem-forget-2208", "forgettable", "alice");
         crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("forget-dst-");
+        let (dst, _tmp_guard) = fresh_conn("forget-dst-");
         import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
         assert!(
             crate::storage::get(&dst, "mem-forget-2208")
@@ -2314,12 +2313,12 @@ mod tests {
     /// re-admitted LIVE (dual residency in `memories` + `archived_memories`).
     #[test]
     fn dest_archived_memory_is_not_readmitted_live_2208() {
-        let src = fresh_conn("arch-src-");
+        let (src, _tmp_guard) = fresh_conn("arch-src-");
         let mem = memory_fixture("mem-arch-2208", "archivable", "alice");
         crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("arch-dst-");
+        let (dst, _tmp_guard) = fresh_conn("arch-dst-");
         import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
         assert!(
             crate::storage::archive_memory(&dst, "mem-arch-2208", Some("test")).expect("archive"),
@@ -2346,7 +2345,7 @@ mod tests {
     #[test]
     fn tampered_revision_chain_is_rejected_with_zero_rows_2209() {
         use crate::revisions::{RecordKind, RevisionLeaf, append_revision_leaf};
-        let src = fresh_conn("rev-tamper-src-");
+        let (src, _tmp_guard) = fresh_conn("rev-tamper-src-");
         for i in 0..3 {
             let leaf = RevisionLeaf::new(
                 format!("rev-{i}"),
@@ -2365,7 +2364,7 @@ mod tests {
         // was computed over the ORIGINAL bytes, so the replay must break.
         env.memory_revisions[1].namespace = "tampered-ns".into();
 
-        let dst = fresh_conn("rev-tamper-dst-");
+        let (dst, _tmp_guard) = fresh_conn("rev-tamper-dst-");
         let err = import_full_envelope(&dst, &env, &opts_trusted())
             .expect_err("tampered revision chain must be rejected");
         assert!(
@@ -2386,7 +2385,7 @@ mod tests {
     #[test]
     fn diverging_dest_revision_chain_refuses_merge_2209() {
         use crate::revisions::{RecordKind, RevisionLeaf, append_revision_leaf};
-        let src = fresh_conn("rev-fork-src-");
+        let (src, _tmp_guard) = fresh_conn("rev-fork-src-");
         append_revision_leaf(
             &src,
             &RevisionLeaf::new(
@@ -2402,7 +2401,7 @@ mod tests {
         .expect("src leaf");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("rev-fork-dst-");
+        let (dst, _tmp_guard) = fresh_conn("rev-fork-dst-");
         append_revision_leaf(
             &dst,
             &RevisionLeaf::new(
@@ -2436,7 +2435,7 @@ mod tests {
     #[test]
     fn forged_agent_lineage_is_rejected_with_zero_rows_2209() {
         use base64::Engine as _;
-        let src = fresh_conn("lin-forge-src-");
+        let (src, _tmp_guard) = fresh_conn("lin-forge-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         let pk_b64 =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x42_u8; 32].as_slice());
@@ -2456,7 +2455,7 @@ mod tests {
             signature: crate::portability::hex_bytes::HexBytes(vec![0xab_u8; 64]),
         });
 
-        let dst = fresh_conn("lin-forge-dst-");
+        let (dst, _tmp_guard) = fresh_conn("lin-forge-dst-");
         let err = import_full_envelope(&dst, &env, &opts_trusted())
             .expect_err("a forged lineage record must be rejected");
         assert!(
@@ -2476,7 +2475,7 @@ mod tests {
     /// preservation with zero verification).
     #[test]
     fn spine_less_bundle_restamps_identity_by_default_2211() {
-        let src = fresh_conn("restamp-src-");
+        let (src, _tmp_guard) = fresh_conn("restamp-src-");
         let mem = memory_fixture("mem-restamp-2211", "claimed", "forged-agent");
         crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
@@ -2485,7 +2484,7 @@ mod tests {
             "fixture: the bundle is spine-less"
         );
 
-        let dst = fresh_conn("restamp-dst-");
+        let (dst, _tmp_guard) = fresh_conn("restamp-dst-");
         let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
         assert_eq!(report.restamped, 1, "the restamp is counted: {report:?}");
         let got = crate::storage::get(&dst, "mem-restamp-2211")
@@ -2505,7 +2504,7 @@ mod tests {
         );
 
         // The explicit operator flag restores the verbatim posture.
-        let dst2 = fresh_conn("restamp-dst2-");
+        let (dst2, _tmp_guard) = fresh_conn("restamp-dst2-");
         import_full_envelope(&dst2, &env, &opts_trusted()).expect("trusted import");
         let got2 = crate::storage::get(&dst2, "mem-restamp-2211")
             .expect("get")
@@ -2523,7 +2522,7 @@ mod tests {
     #[test]
     fn imported_rows_do_not_bump_local_vector_clock_2211() {
         use crate::models::field_names;
-        let src = fresh_conn("clock-src-");
+        let (src, _tmp_guard) = fresh_conn("clock-src-");
         // Seed WITHOUT the local-authorship stamp so the exported metadata
         // carries NO version vector at all.
         crate::storage::insert_imported(
@@ -2533,7 +2532,7 @@ mod tests {
         .expect("seed src");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("clock-dst-");
+        let (dst, _tmp_guard) = fresh_conn("clock-dst-");
         import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
         let got = crate::storage::get(&dst, "mem-clock-2211")
             .expect("get")
@@ -2552,13 +2551,13 @@ mod tests {
     /// the destination row's content).
     #[test]
     fn title_collision_does_not_clobber_dest_row_2211() {
-        let src = fresh_conn("clobber-src-");
+        let (src, _tmp_guard) = fresh_conn("clobber-src-");
         let mut incoming = memory_fixture("mem-incoming-2211", "shared title", "alice");
         incoming.content = "bundle content".into();
         crate::storage::insert_imported(&src, &incoming).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("clobber-dst-");
+        let (dst, _tmp_guard) = fresh_conn("clobber-dst-");
         let mut existing = memory_fixture("mem-existing-2211", "shared title", "bob");
         existing.content = "destination content".into();
         crate::storage::insert(&dst, &existing).expect("seed dst");
@@ -2581,7 +2580,7 @@ mod tests {
         );
 
         // `--on-conflict error` refuses + skips the colliding row.
-        let dst2 = fresh_conn("clobber-dst2-");
+        let (dst2, _tmp_guard) = fresh_conn("clobber-dst2-");
         crate::storage::insert(&dst2, &existing).expect("seed dst2");
         let mut opts = opts_trusted();
         opts.on_conflict = ConflictMode::Error;
@@ -2602,7 +2601,7 @@ mod tests {
     /// Fails on pre-N2 code (the tombstone raw-inserted unconditionally).
     #[test]
     fn bundle_tombstone_for_live_dest_row_is_not_staged_n2() {
-        let src = fresh_conn("tomb-live-src-");
+        let (src, _tmp_guard) = fresh_conn("tomb-live-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.forget_tombstones
             .push(crate::portability::dto::ForgetTombstoneDto {
@@ -2613,7 +2612,7 @@ mod tests {
                 signature: None,
             });
 
-        let dst = fresh_conn("tomb-live-dst-");
+        let (dst, _tmp_guard) = fresh_conn("tomb-live-dst-");
         crate::storage::insert(&dst, &memory_fixture("mem-live-n2", "alive", "bob"))
             .expect("seed live dest row");
 
@@ -2641,7 +2640,7 @@ mod tests {
 
         // Control: a tombstone for a NOT-live id still stages (the
         // legitimate erasure-receipt transfer path is unchanged).
-        let dst2 = fresh_conn("tomb-live-dst2-");
+        let (dst2, _tmp_guard) = fresh_conn("tomb-live-dst2-");
         let report2 = import_full_envelope(&dst2, &env, &opts_trusted()).expect("import 2");
         assert_eq!(report2.forget_tombstones, 1, "not-live tombstone staged");
         assert_eq!(report2.tombstones_skipped_live, 0);
@@ -2656,10 +2655,10 @@ mod tests {
     /// ingesting. Fails on pre-#2210 code (neither value was checked).
     #[test]
     fn newer_producer_envelope_is_refused_2210() {
-        let src = fresh_conn("newer-src-");
+        let (src, _tmp_guard) = fresh_conn("newer-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.db_schema_version += 1_000;
-        let dst = fresh_conn("newer-dst-");
+        let (dst, _tmp_guard) = fresh_conn("newer-dst-");
         let err = import_full_envelope(&dst, &env, &opts_trusted())
             .expect_err("a newer-schema bundle must be refused");
         assert!(err.to_string().contains("db_schema_version"), "got: {err}");
@@ -2676,7 +2675,7 @@ mod tests {
     /// dropped). Fails on pre-#2210 code (no `deny_unknown_fields`).
     #[test]
     fn unknown_record_class_is_refused_at_parse_2210() {
-        let src = fresh_conn("unknown-src-");
+        let (src, _tmp_guard) = fresh_conn("unknown-src-");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         let mut value = serde_json::to_value(&env).expect("to_value");
         value
@@ -2703,7 +2702,7 @@ mod tests {
     #[test]
     fn forged_wire_attest_level_lands_claimed_preship_3x7() {
         use crate::models::field_names;
-        let src = fresh_conn("attest-wire-src-");
+        let (src, _tmp_guard) = fresh_conn("attest-wire-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         let mut mem = memory_fixture("mem-wire-attest-3x7", "forged attestation", "mallory");
         mem.metadata.as_object_mut().unwrap().insert(
@@ -2713,7 +2712,7 @@ mod tests {
         env.memories.push(mem);
 
         // Trusted posture (identity preserved): still re-derived, not copied.
-        let dst = fresh_conn("attest-wire-dst-");
+        let (dst, _tmp_guard) = fresh_conn("attest-wire-dst-");
         let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
         assert_eq!(report.memories, 1);
         assert_eq!(report.attestation_downgraded, 1, "the downgrade is counted");
@@ -2729,7 +2728,7 @@ mod tests {
         );
 
         // Default restamp posture: re-attributed → claimed as well.
-        let dst2 = fresh_conn("attest-wire-dst2-");
+        let (dst2, _tmp_guard) = fresh_conn("attest-wire-dst2-");
         let report2 = import_full_envelope(&dst2, &env, &opts_default()).expect("import");
         assert_eq!(report2.attestation_downgraded, 1);
         let got2 = crate::storage::get(&dst2, "mem-wire-attest-3x7")
@@ -2752,12 +2751,12 @@ mod tests {
     fn forged_write_signature_is_skipped_preship_3x7() {
         use crate::models::field_names;
         use base64::Engine as _;
-        let dst = fresh_conn("attest-forged-dst-");
+        let (dst, _tmp_guard) = fresh_conn("attest-forged-dst-");
         crate::storage::register_agent(&dst, "ai:author-3x7", "ai:generic", &[]).expect("register");
         let kp = crate::identity::keypair::generate("ai:author-3x7").expect("keygen");
         crate::storage::bind_agent_pubkey_with_keypair(&dst, "ai:author-3x7", &kp).expect("bind");
 
-        let src = fresh_conn("attest-forged-src-");
+        let (src, _tmp_guard) = fresh_conn("attest-forged-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         let mut mem = memory_fixture("mem-forged-sig-3x7", "forged signature", "ai:author-3x7");
         let obj = mem.metadata.as_object_mut().unwrap();
@@ -2815,7 +2814,7 @@ mod tests {
             ),
         ];
         for (case, wire_value) in malformed {
-            let src = fresh_conn(&format!("attest-malformed-src-{case}-"));
+            let (src, _tmp_guard) = fresh_conn(&format!("attest-malformed-src-{case}-"));
             let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
             let id = format!("mem-malformed-sig-{case}");
             let mut mem = memory_fixture(&id, "malformed signature", "ai:author-3x7");
@@ -2825,7 +2824,7 @@ mod tests {
                 .insert(field_names::WRITE_SIGNATURE.to_string(), wire_value);
             env.memories.push(mem);
 
-            let dst = fresh_conn(&format!("attest-malformed-dst-{case}-"));
+            let (dst, _tmp_guard) = fresh_conn(&format!("attest-malformed-dst-{case}-"));
             let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
             assert_eq!(report.forged_signature_skipped, 1, "case={case}");
             assert_eq!(report.memories, 0, "case={case}");
@@ -2855,11 +2854,11 @@ mod tests {
             field_names::WRITE_SIGNATURE.to_string(),
             serde_json::json!(base64::engine::general_purpose::STANDARD.encode(signature)),
         );
-        let src = fresh_conn("attest-restamp-src-2264-");
+        let (src, _tmp_guard) = fresh_conn("attest-restamp-src-2264-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.memories.push(mem);
 
-        let dst = fresh_conn("attest-restamp-dst-2264-");
+        let (dst, _tmp_guard) = fresh_conn("attest-restamp-dst-2264-");
         crate::storage::register_agent(&dst, original_agent, "ai:generic", &[])
             .expect("register original signer");
         crate::storage::bind_agent_pubkey_with_keypair(&dst, original_agent, &kp)
@@ -2895,7 +2894,7 @@ mod tests {
     fn valid_write_signature_verifies_agent_attested_preship_3x7() {
         use crate::models::field_names;
         use base64::Engine as _;
-        let dst = fresh_conn("attest-ok-dst-");
+        let (dst, _tmp_guard) = fresh_conn("attest-ok-dst-");
         crate::storage::register_agent(&dst, "ai:signer-3x7", "ai:generic", &[]).expect("register");
         let kp = crate::identity::keypair::generate("ai:signer-3x7").expect("keygen");
         crate::storage::bind_agent_pubkey_with_keypair(&dst, "ai:signer-3x7", &kp).expect("bind");
@@ -2916,7 +2915,7 @@ mod tests {
             field_names::WRITE_SIGNATURE.to_string(),
             serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&sig)),
         );
-        let src = fresh_conn("attest-ok-src-");
+        let (src, _tmp_guard) = fresh_conn("attest-ok-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.memories.push(mem);
 
@@ -2943,7 +2942,7 @@ mod tests {
     #[test]
     fn wire_agent_pubkey_is_stripped_by_default_preship_3x7() {
         use crate::models::field_names;
-        let src = fresh_conn("pubkey-strip-src-");
+        let (src, _tmp_guard) = fresh_conn("pubkey-strip-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         let mut mem = memory_fixture("mem-pubkey-3x7", "identity plant", "mallory");
         mem.metadata.as_object_mut().unwrap().insert(
@@ -2952,7 +2951,7 @@ mod tests {
         );
         env.memories.push(mem);
 
-        let dst = fresh_conn("pubkey-strip-dst-");
+        let (dst, _tmp_guard) = fresh_conn("pubkey-strip-dst-");
         import_full_envelope(&dst, &env, &opts_default()).expect("import");
         let got = crate::storage::get(&dst, "mem-pubkey-3x7")
             .expect("get")
@@ -2967,7 +2966,7 @@ mod tests {
     #[test]
     fn trust_source_cannot_bootstrap_agent_pubkey_and_reports_strip_3464() {
         use crate::models::field_names;
-        let src = fresh_conn("pubkey-trusted-strip-src-3464");
+        let (src, _tmp_guard) = fresh_conn("pubkey-trusted-strip-src-3464");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         let agent = "ai:trusted-import-cannot-bind-3464";
         let fake_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -2982,7 +2981,7 @@ mod tests {
         mem.content = serde_json::to_string(&mem.metadata).expect("registration mirror");
         env.memories.push(mem);
 
-        let dst = fresh_conn("pubkey-trusted-strip-dst-3464");
+        let (dst, _tmp_guard) = fresh_conn("pubkey-trusted-strip-dst-3464");
         let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("trusted import");
         assert_eq!(report.memories, 1);
         assert_eq!(report.pubkey_bindings_stripped, 1);
@@ -3020,7 +3019,7 @@ mod tests {
     /// Fails pre-fix (the v2 route ran ZERO input validation).
     #[test]
     fn invalid_rows_are_refused_not_persisted_preship_3x7() {
-        let src = fresh_conn("invalid-src-");
+        let (src, _tmp_guard) = fresh_conn("invalid-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         let mut oversize = memory_fixture("mem-oversize-3x7", "oversize", "alice");
@@ -3053,7 +3052,7 @@ mod tests {
             target_cid: None,
         });
 
-        let dst = fresh_conn("invalid-dst-");
+        let (dst, _tmp_guard) = fresh_conn("invalid-dst-");
         let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
         assert_eq!(report.invalid_skipped, 3, "all three invalid rows counted");
         assert_eq!(report.memories, 1, "only the good row landed");
@@ -3092,7 +3091,7 @@ mod tests {
     /// good row never lands).
     #[test]
     fn link_to_skipped_memory_does_not_fk_abort_the_import_preship_3x7_f1() {
-        let src = fresh_conn("fk-link-src-");
+        let (src, _tmp_guard) = fresh_conn("fk-link-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         // A row the HIGH-2 validation gate will SKIP (priority out of range)…
@@ -3127,7 +3126,7 @@ mod tests {
             .push(memory_fixture("mem-good2-f1", "good endpoint 2", "alice"));
         env.links.push(mk_link("mem-good-f1", "mem-good2-f1"));
 
-        let dst = fresh_conn("fk-link-dst-");
+        let (dst, _tmp_guard) = fresh_conn("fk-link-dst-");
         let report = import_full_envelope(&dst, &env, &opts_trusted())
             .expect("the import must COMMIT — a dangling link is a per-row skip, not an abort");
         assert!(report.committed);
@@ -3211,7 +3210,7 @@ mod tests {
     /// bytes.
     #[test]
     fn divergent_forget_tombstone_is_refused_3149() {
-        let src = fresh_conn("tomb-diverge-src-");
+        let (src, _tmp_guard) = fresh_conn("tomb-diverge-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.forget_tombstones.push(tombstone_dto(
             "mem-diverge-3149",
@@ -3219,7 +3218,7 @@ mod tests {
             Some(vec![2u8; 64]),
         ));
 
-        let dst = fresh_conn("tomb-diverge-dst-");
+        let (dst, _tmp_guard) = fresh_conn("tomb-diverge-dst-");
         seed_tombstone(
             &dst,
             "mem-diverge-3149",
@@ -3253,7 +3252,7 @@ mod tests {
     /// was written).
     #[test]
     fn identical_forget_tombstone_counts_idempotent_not_staged_3149() {
-        let src = fresh_conn("tomb-idem-src-");
+        let (src, _tmp_guard) = fresh_conn("tomb-idem-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.forget_tombstones.push(tombstone_dto(
             "mem-idem-3149",
@@ -3261,7 +3260,7 @@ mod tests {
             Some(vec![7u8; 64]),
         ));
 
-        let dst = fresh_conn("tomb-idem-dst-");
+        let (dst, _tmp_guard) = fresh_conn("tomb-idem-dst-");
         // First import stages it for real.
         let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
         assert_eq!(first.forget_tombstones, 1, "the receipt landed");
@@ -3325,12 +3324,12 @@ mod tests {
     /// unchanged).
     #[test]
     fn divergent_model_attestation_is_refused_3149() {
-        let src = fresh_conn("attest-diverge-src-");
+        let (src, _tmp_guard) = fresh_conn("attest-diverge-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.model_attestations
             .push(attestation_dto("attest-3149", "sha256:bundle", None));
 
-        let dst = fresh_conn("attest-diverge-dst-");
+        let (dst, _tmp_guard) = fresh_conn("attest-diverge-dst-");
         seed_attestation(&dst, "attest-3149", "sha256:destination");
 
         let err = import_full_envelope(&dst, &env, &opts_trusted())
@@ -3358,12 +3357,12 @@ mod tests {
     /// idempotent no-op, not a claimed staging.
     #[test]
     fn identical_model_attestation_counts_idempotent_not_staged_3149() {
-        let src = fresh_conn("attest-idem-src-");
+        let (src, _tmp_guard) = fresh_conn("attest-idem-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.model_attestations
             .push(attestation_dto("attest-idem-3149", "sha256:same", None));
 
-        let dst = fresh_conn("attest-idem-dst-");
+        let (dst, _tmp_guard) = fresh_conn("attest-idem-dst-");
         let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
         assert_eq!(first.model_attestations, 1, "the pin landed");
 
@@ -3417,10 +3416,10 @@ mod tests {
     /// pre-fix code: `archived_memories == 0` with no counter and no warning.
     #[test]
     fn divergent_archived_memory_is_counted_and_warned_3151() {
-        let src = fresh_conn("arch-diverge-src-");
+        let (src, _tmp_guard) = fresh_conn("arch-diverge-src-");
         let base = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("arch-diverge-dst-");
+        let (dst, _tmp_guard) = fresh_conn("arch-diverge-dst-");
         let mut first = base.clone();
         first.archived_memories.push(archived_dto(
             "mem-arch-3151",
@@ -3473,7 +3472,7 @@ mod tests {
     /// no-op — counted, not reported as staged, and never a refusal.
     #[test]
     fn identical_archived_memory_reimport_is_idempotent_3151() {
-        let src = fresh_conn("arch-idem-src-");
+        let (src, _tmp_guard) = fresh_conn("arch-idem-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.archived_memories.push(archived_dto(
             "mem-arch-idem-3151",
@@ -3481,7 +3480,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
         ));
 
-        let dst = fresh_conn("arch-idem-dst-");
+        let (dst, _tmp_guard) = fresh_conn("arch-idem-dst-");
         let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
         assert_eq!(first.archived_memories, 1);
 
@@ -3522,10 +3521,10 @@ mod tests {
     /// code (edge count 0, no counter, no signal).
     #[test]
     fn divergent_archived_memory_link_is_counted_and_warned_3151() {
-        let src = fresh_conn("archlink-diverge-src-");
+        let (src, _tmp_guard) = fresh_conn("archlink-diverge-src-");
         let base = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("archlink-diverge-dst-");
+        let (dst, _tmp_guard) = fresh_conn("archlink-diverge-dst-");
         let mut first = base.clone();
         first
             .archived_memory_links
@@ -3573,10 +3572,10 @@ mod tests {
     /// code (counter absent, `warnings` empty).
     #[test]
     fn divergent_namespace_meta_is_counted_and_warned_3151() {
-        let src = fresh_conn("nsmeta-diverge-src-");
+        let (src, _tmp_guard) = fresh_conn("nsmeta-diverge-src-");
         let base = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
-        let dst = fresh_conn("nsmeta-diverge-dst-");
+        let (dst, _tmp_guard) = fresh_conn("nsmeta-diverge-dst-");
         let mut first = base.clone();
         first
             .namespace_meta
@@ -3643,7 +3642,7 @@ mod tests {
     /// as a whole still succeeds.
     #[test]
     fn unreadable_destination_archived_row_does_not_abort_the_import_3151() {
-        let src = fresh_conn("arch-erased-src-");
+        let (src, _tmp_guard) = fresh_conn("arch-erased-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         env.archived_memories.push(archived_dto(
             "mem-arch-erased-3151",
@@ -3651,7 +3650,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
         ));
 
-        let dst = fresh_conn("arch-erased-dst-");
+        let (dst, _tmp_guard) = fresh_conn("arch-erased-dst-");
         let seeded = import_full_envelope(&dst, &env, &opts_trusted()).expect("seed import");
         assert_eq!(seeded.archived_memories, 1);
 

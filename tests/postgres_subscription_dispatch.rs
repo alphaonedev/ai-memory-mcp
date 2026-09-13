@@ -136,7 +136,7 @@ fn make_subscription_memory(
 /// row + worker dispatch) are identical regardless of the concrete
 /// `MemoryStore` impl, so the test exercises the postgres dispatch
 /// LOGIC without requiring a live postgres instance.
-fn make_test_state() -> (AppState, std::path::PathBuf) {
+fn make_test_state() -> (AppState, std::path::PathBuf, tempfile::TempDir) {
     let scratch_dir = tempfile::tempdir().expect("tempdir for scratch sqlite");
     let sqlite_path = scratch_dir.path().join("audit.db");
     // `crate::db::open` runs the full migration ladder so the audit
@@ -191,10 +191,9 @@ fn make_test_state() -> (AppState, std::path::PathBuf) {
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
 
-    // Leak the tempdir so the scratch files outlive the test (otherwise
-    // the destructor would race the worker thread's audit writes).
-    std::mem::forget(scratch_dir);
-    (state, sqlite_path)
+    // The caller keeps `scratch_dir` until the end of the test; dropping it
+    // removes both databases (#3669).
+    (state, sqlite_path, scratch_dir)
 }
 
 /// K6 ACK echo helper — mirrors the helper in
@@ -244,7 +243,7 @@ async fn dispatch_event_postgres_fires_hmac_signed_post() {
         .mount(&server)
         .await;
 
-    let (state, _audit_path) = make_test_state();
+    let (state, _audit_path, _tmp_guard) = make_test_state();
 
     // SAL-stored subscription pointing at the wiremock sink. The
     // `secret_hash` is what `handlers::subscriptions::subscribe`'s
@@ -318,7 +317,7 @@ async fn dispatch_event_postgres_respects_namespace_filter() {
         .mount(&server)
         .await;
 
-    let (state, _audit_path) = make_test_state();
+    let (state, _audit_path, _tmp_guard) = make_test_state();
 
     let url = format!("{}{}", server.uri(), path_str);
     let sub_mem = make_subscription_memory(
@@ -367,7 +366,7 @@ async fn dispatch_event_postgres_respects_namespace_filter() {
 /// `dispatch_event_postgres` MUST be a no-op (no panic, no error).
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_event_postgres_zero_subs_is_noop() {
-    let (state, _audit_path) = make_test_state();
+    let (state, _audit_path, _tmp_guard) = make_test_state();
 
     // No subscription seeded. This MUST NOT panic.
     dispatch_event_postgres(

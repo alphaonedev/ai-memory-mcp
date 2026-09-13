@@ -174,12 +174,11 @@ mod tests {
     use super::*;
     use rusqlite::params;
 
-    fn open_db() -> rusqlite::Connection {
+    fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
         let conn = crate::db::open(&path).expect("db::open");
-        std::mem::forget(dir);
-        conn
+        (conn, dir)
     }
 
     fn insert_min_skill(conn: &rusqlite::Connection, id: &str) {
@@ -213,14 +212,14 @@ mod tests {
 
     #[test]
     fn rejects_missing_skill_id() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let err = handle_skill_resource(&conn, &json!({"resource_path": "x"})).unwrap_err();
         assert!(err.contains("requires 'skill_id'"));
     }
 
     #[test]
     fn rejects_empty_skill_id() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let err = handle_skill_resource(&conn, &json!({"skill_id": "", "resource_path": "x"}))
             .unwrap_err();
         assert!(err.contains("requires 'skill_id'"));
@@ -228,14 +227,14 @@ mod tests {
 
     #[test]
     fn rejects_missing_resource_path() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let err = handle_skill_resource(&conn, &json!({"skill_id": "sk"})).unwrap_err();
         assert!(err.contains("requires 'resource_path'"));
     }
 
     #[test]
     fn rejects_empty_resource_path() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let err = handle_skill_resource(&conn, &json!({"skill_id": "sk", "resource_path": ""}))
             .unwrap_err();
         assert!(err.contains("requires 'resource_path'"));
@@ -243,7 +242,7 @@ mod tests {
 
     #[test]
     fn returns_not_found_for_missing_resource() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_min_skill(&conn, "sk1");
         let err = handle_skill_resource(
             &conn,
@@ -257,7 +256,7 @@ mod tests {
 
     #[test]
     fn rejects_resource_without_content_blob() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_min_skill(&conn, "sk1");
         // Insert resource with NULL content_blob (reference-only).
         conn.execute(
@@ -276,7 +275,7 @@ mod tests {
 
     #[test]
     fn returns_utf8_content_with_verified_digest() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_min_skill(&conn, "sk1");
         let content = b"#!/bin/bash\necho hello\n";
         let mut h = sha2::Sha256::new();
@@ -308,7 +307,7 @@ mod tests {
 
     #[test]
     fn returns_base64_for_binary_content() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_min_skill(&conn, "sk1");
         // Invalid UTF-8 bytes.
         let content: Vec<u8> = vec![0xff, 0xfe, 0xfd, 0x00, 0x01];
@@ -333,7 +332,7 @@ mod tests {
 
     #[test]
     fn detects_digest_mismatch() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_min_skill(&conn, "sk1");
         let content = b"original";
         let wrong_dig = vec![0u8; 32]; // wrong digest
@@ -349,7 +348,7 @@ mod tests {
 
     #[test]
     fn no_digest_returns_unverified() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_min_skill(&conn, "sk1");
         let content = b"unsigned content";
         insert_resource(&conn, "sk1", "u.txt", "asset", content, None);
@@ -363,7 +362,7 @@ mod tests {
 
     #[test]
     fn rejects_corrupt_content_blob() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         insert_min_skill(&conn, "sk1");
         let bogus: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff];
         conn.execute(

@@ -30,7 +30,7 @@ const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 // HTTP — the real router
 // ---------------------------------------------------------------------------
 
-fn router(api_key: Option<&str>, admins: Vec<String>) -> axum::Router {
+fn router(api_key: Option<&str>, admins: Vec<String>) -> (axum::Router, tempfile::TempDir) {
     // The #1570 authn flag is process-global; every router in this binary
     // models an AUTHENTICATED deployment (the #984 fixture's posture) so the
     // parallel test threads never race it in opposite directions.
@@ -42,11 +42,12 @@ fn router(api_key: Option<&str>, admins: Vec<String>) -> axum::Router {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile");
     #[cfg(feature = "sal")]
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
     };
     let enrolled = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
@@ -93,7 +94,7 @@ fn router(api_key: Option<&str>, admins: Vec<String>) -> axum::Router {
         enrolled_agent_keys: enrolled,
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(api_key_state, app_state)
+    (ai_memory::build_router(api_key_state, app_state), tmp)
 }
 
 fn get(path: &str, agent: Option<&str>) -> Request<Body> {
@@ -115,7 +116,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 /// list route, which historically did not validate the header itself.
 #[tokio::test]
 async fn http_malformed_principal_is_refused_before_the_handler_3549() {
-    let app = router(None, vec![]);
+    let (app, _tmp_guard) = router(None, vec![]);
     let resp = app
         .oneshot(get("/api/v1/memories", Some("bad id with spaces")))
         .await
@@ -135,7 +136,7 @@ async fn http_malformed_principal_is_refused_before_the_handler_3549() {
 /// on a route that is not an admin route.
 #[tokio::test]
 async fn http_reserved_principal_is_refused_with_the_reserved_reason_3549() {
-    let app = router(None, vec![]);
+    let (app, _tmp_guard) = router(None, vec![]);
     let resp = app
         .oneshot(get("/api/v1/memories", Some("daemon")))
         .await
@@ -153,7 +154,7 @@ async fn http_reserved_principal_is_refused_with_the_reserved_reason_3549() {
 /// ALLOWED — a valid asserted principal reaches the handler.
 #[tokio::test]
 async fn http_valid_principal_reaches_the_handler_3549() {
-    let app = router(None, vec![]);
+    let (app, _tmp_guard) = router(None, vec![]);
     let resp = app
         .oneshot(get("/api/v1/memories", Some("ai:alice")))
         .await
@@ -165,7 +166,7 @@ async fn http_valid_principal_reaches_the_handler_3549() {
 /// never a refusal.
 #[tokio::test]
 async fn http_no_principal_is_anonymous_and_allowed_3549() {
-    let app = router(None, vec![]);
+    let (app, _tmp_guard) = router(None, vec![]);
     let resp = app.oneshot(get("/api/v1/memories", None)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -173,7 +174,7 @@ async fn http_no_principal_is_anonymous_and_allowed_3549() {
 /// EXEMPT — the liveness probe is never refused on identity.
 #[tokio::test]
 async fn http_health_probe_is_exempt_from_the_authority_layer_3549() {
-    let app = router(None, vec![]);
+    let (app, _tmp_guard) = router(None, vec![]);
     let resp = app
         .oneshot(get(
             ai_memory::handlers::routes::HEALTH,
@@ -194,7 +195,7 @@ async fn http_health_probe_is_exempt_from_the_authority_layer_3549() {
 /// layer's typed 400.
 #[tokio::test]
 async fn http_federation_boundary_is_not_gated_by_the_authority_layer_3549() {
-    let app = router(None, vec![]);
+    let (app, _tmp_guard) = router(None, vec![]);
     let req = Request::builder()
         .method("POST")
         .uri(ai_memory::handlers::routes::SYNC_PUSH)
@@ -219,7 +220,7 @@ async fn http_federation_boundary_is_not_gated_by_the_authority_layer_3549() {
 /// invalid → 400 with the validator reason; a legitimate non-admin → 403.
 #[tokio::test]
 async fn http_admin_route_keeps_the_984_contract_through_the_chokepoint_3549() {
-    let app = router(Some("k"), vec!["ai:operator".to_string()]);
+    let (app, _tmp_guard) = router(Some("k"), vec!["ai:operator".to_string()]);
     let resp = app
         .clone()
         .oneshot(

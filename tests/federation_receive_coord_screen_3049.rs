@@ -63,10 +63,9 @@ fn seed_screen_mode_refuse() {
     ONCE.call_once(|| set_screen_mode(SecretScreenMode::Refuse));
 }
 
-fn setup_router() -> (axum::Router, Db) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
-    let db_path = db_tmp.path().to_path_buf();
-    std::mem::forget(db_tmp);
+fn setup_router() -> (axum::Router, Db, tempfile::TempDir) {
+    let db_tmp = tempfile::TempDir::new().expect("db tempfile");
+    let db_path = db_tmp.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((
@@ -124,7 +123,7 @@ fn setup_router() -> (axum::Router, Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, db_tmp)
 }
 
 /// Isolate the #3049 screen: disable the orthogonal federation gates so an
@@ -232,7 +231,7 @@ async fn sync_push_signal_secret_is_redacted_not_skipped_3049() {
     seed_screen_mode_refuse();
     clear_all_env();
     relax_orthogonal_gates();
-    let (router, db) = setup_router();
+    let (router, db, _tmp_guard) = setup_router();
 
     let sig = make_signal(
         "ai:peer-3049",
@@ -281,7 +280,7 @@ async fn sync_push_signal_body_secret_is_redacted_3049() {
     seed_screen_mode_refuse();
     clear_all_env();
     relax_orthogonal_gates();
-    let (router, db) = setup_router();
+    let (router, db, _tmp_guard) = setup_router();
 
     let sig = make_signal(
         "ai:peer-3049",
@@ -331,7 +330,7 @@ async fn sync_push_checkpoint_resolution_secret_is_redacted_3049() {
     seed_screen_mode_refuse();
     clear_all_env();
     relax_orthogonal_gates();
-    let (router, db) = setup_router();
+    let (router, db, _tmp_guard) = setup_router();
 
     let id = uuid::Uuid::new_v4().to_string();
     let cp = make_checkpoint(
@@ -383,7 +382,7 @@ async fn sync_push_signal_body_b64_carveout_subtree_is_redacted_3269() {
     seed_screen_mode_refuse();
     clear_all_env();
     relax_orthogonal_gates();
-    let (router, db) = setup_router();
+    let (router, db, _tmp_guard) = setup_router();
 
     // `x_b64` matches the `_b64` carve-out suffix; the credential is one level
     // deep so the pre-fix "insert the whole subtree without recursing" bug
@@ -434,7 +433,7 @@ async fn sync_push_signal_reference_ids_secret_is_redacted_3278() {
     seed_screen_mode_refuse();
     clear_all_env();
     relax_orthogonal_gates();
-    let (router, db) = setup_router();
+    let (router, db, _tmp_guard) = setup_router();
 
     let mut sig = make_signal(
         "ai:peer-3049",
@@ -485,7 +484,7 @@ async fn sync_push_pending_payload_secret_is_redacted_3278() {
     seed_screen_mode_refuse();
     clear_all_env();
     relax_orthogonal_gates();
-    let (router, db) = setup_router();
+    let (router, db, _tmp_guard) = setup_router();
 
     let id = uuid::Uuid::new_v4().to_string();
     let pa = PendingAction {
@@ -537,7 +536,7 @@ async fn sync_push_clean_signal_is_byte_identical_3049() {
     seed_screen_mode_refuse();
     clear_all_env();
     relax_orthogonal_gates();
-    let (router, db) = setup_router();
+    let (router, db, _tmp_guard) = setup_router();
 
     let sig = make_signal(
         "ai:peer-3049",

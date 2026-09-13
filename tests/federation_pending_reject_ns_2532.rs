@@ -53,7 +53,7 @@ fn set_posture(allowlist: &str) {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -62,11 +62,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -116,7 +117,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 fn store_payload(namespace: &str) -> Value {
@@ -203,7 +204,7 @@ async fn foreign_reject_cannot_veto_out_of_scope_pending_2532() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(SCOPED_ALLOWLIST);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let id = seed_local_pending(&db, VICTIM_NS).await;
     assert_eq!(pending_status(&db, &id).await, "pending");
@@ -232,7 +233,7 @@ async fn in_scope_reject_still_applies_2532() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_posture(SCOPED_ALLOWLIST_WITH_VICTIM);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let id = seed_local_pending(&db, VICTIM_NS).await;
     let (status, report) = push_reject(&router, &id).await;

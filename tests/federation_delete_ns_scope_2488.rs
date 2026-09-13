@@ -84,7 +84,7 @@ impl Drop for PostureGuard {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -93,11 +93,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -147,7 +148,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 /// Seed the peer-attestation posture. `allowlist == None` = the ZERO-CONFIG
@@ -285,7 +286,7 @@ async fn no_allowlist_deletion_posture_matrix_3582() {
     ] {
         let allowlist = scoped.then_some(r#"{"ai:evil":{"allowed_namespaces":["secure/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#);
         set_posture(allowlist, require);
-        let (router, db) = build_router_with_db();
+        let (router, db, _tmp_guard) = build_router_with_db();
         let id = seed_row(&router, VICTIM_NS, "zero-config-delete-target").await;
         assert!(row_exists(&db, &id).await, "seed row must exist");
 
@@ -312,7 +313,7 @@ async fn header_absent_federated_deletion_disposition_2491() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(None, None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_row(&router, VICTIM_NS, "header-absent-delete-target").await;
 
     // PART 1 — the disposition, asserted rather than assumed. #2491's body
@@ -371,7 +372,7 @@ async fn enrolled_unscoped_federated_deletion_refused_by_default_2488() {
     // `allowed_sender_agent_ids`, so `allowed_namespaces` silently became `[]`.
     // Its read + write scopes are empty; its delete scope must be too.
     set_posture(Some(UNSCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_row(&router, VICTIM_NS, "unscoped-refused-target").await;
 
     let (status, _report) = push_deletions(&router, Some(PEER_ID), &[&id]).await;
@@ -391,7 +392,7 @@ async fn enrolled_unscoped_federated_deletion_applies_under_knob_off_2488() {
     // Pre-fix sqlite hard-coded deny-on-empty, so the knob was structurally
     // unreachable here and an operator had no rollout window at all.
     set_posture(Some(UNSCOPED_ALLOWLIST), Some("0"));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_row(&router, VICTIM_NS, "unscoped-knob-off-target").await;
 
     let (status, report) = push_deletions(&router, Some(PEER_ID), &[&id]).await;
@@ -413,7 +414,7 @@ async fn enrolled_scoped_federated_deletion_confinement_controls_2488() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let victim_id = seed_row(&router, VICTIM_NS, "scoped-out-of-scope-target").await;
     let in_scope_id = seed_row(&router, IN_SCOPE_NS, "scoped-in-scope-target").await;
@@ -449,7 +450,7 @@ async fn undecryptable_envelope_row_is_still_federated_deleted_2488() {
     // only posture in which the probe's failure mode is observable. The target
     // is IN SCOPE, so the only thing that can refuse it is the probe itself.
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_row(&router, IN_SCOPE_NS, "undecryptable-delete-target").await;
 
     // Plant an envelope that cannot open under ANY key on this node (leading
@@ -544,7 +545,7 @@ async fn unknown_peer_federated_deletion_refused_under_enrolled_posture_2497() {
     ] {
         for knob in [None, Some("0")] {
             set_posture(Some(allowlist), knob);
-            let (router, db) = build_router_with_db();
+            let (router, db, _tmp_guard) = build_router_with_db();
             let id = seed_row(&router, VICTIM_NS, "unknown-peer-target").await;
 
             let (status, _report) = push_deletions(&router, Some(UNKNOWN_PEER_ID), &[&id]).await;
@@ -588,7 +589,7 @@ async fn header_absent_federated_deletion_refused_under_enrolled_posture_2497() 
             unsafe {
                 std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
             }
-            let (router, db) = build_router_with_db();
+            let (router, db, _tmp_guard) = build_router_with_db();
             let id = seed_row(&router, VICTIM_NS, "anonymous-delete-target").await;
 
             let (status, report) = push_deletions(&router, None, &[&id]).await;
@@ -622,7 +623,7 @@ async fn malformed_whitespace_peer_id_is_treated_as_absent_and_refused_2497() {
     unsafe {
         std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_row(&router, VICTIM_NS, "whitespace-peer-target").await;
 
     let (status, _report) = push_deletions(&router, Some("   "), &[&id]).await;

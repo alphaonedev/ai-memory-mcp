@@ -47,7 +47,7 @@ const SECRET_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 const AUTHOR: &str = "ai:archived-author-3150";
 const CALLER: &str = "ai:importer-3150";
 
-fn fresh_db(tag: &str) -> Connection {
+fn fresh_db(tag: &str) -> (Connection, tempfile::TempDir) {
     // Seed the process-global screen mode on EVERY entry point of this binary
     // so the posture is the same whichever test the harness runs first
     // (`set_screen_mode` is idempotent, first-writer-wins).
@@ -63,8 +63,7 @@ fn fresh_db(tag: &str) -> Connection {
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     drop(ai_memory::db::open(&path).expect("init db"));
-    std::mem::forget(dir); // keep the file alive for the connection's lifetime
-    ai_memory::db::open(&path).expect("open db")
+    (ai_memory::db::open(&path).expect("open db"), dir)
 }
 
 fn archived_memory(id: &str, content: &str) -> Memory {
@@ -180,7 +179,7 @@ fn archived_forged_attest_level_lands_claimed_3150() {
     let env = envelope_with_archived(vec![archived_dto(mem)]);
 
     // Trusted posture (identity preserved): still re-derived, never copied.
-    let dst = fresh_db("attest-trusted-");
+    let (dst, _tmp_guard) = fresh_db("attest-trusted-");
     let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
     assert_eq!(report.archived_memories, 1, "the row still lands");
     assert_eq!(
@@ -195,7 +194,7 @@ fn archived_forged_attest_level_lands_claimed_3150() {
     );
 
     // Default restamp posture: re-attributed ⇒ claimed as well.
-    let dst2 = fresh_db("attest-default-");
+    let (dst2, _tmp_guard) = fresh_db("attest-default-");
     let report2 = import_full_envelope(&dst2, &env, &opts_default()).expect("import");
     assert_eq!(report2.attestation_downgraded, 1);
     let meta2 = archived_metadata(&dst2, "arch-attest-3150").expect("row landed");
@@ -215,7 +214,7 @@ fn archived_forged_attest_level_lands_claimed_3150() {
 fn archived_forged_write_signature_is_skipped_3150() {
     use base64::Engine as _;
 
-    let dst = fresh_db("forged-sig-");
+    let (dst, _tmp_guard) = fresh_db("forged-sig-");
     ai_memory::db::register_agent(&dst, AUTHOR, "ai:generic", &[]).expect("register");
     let kp = ai_memory::identity::keypair::generate(AUTHOR).expect("keypair");
     ai_memory::db::bind_agent_pubkey_with_keypair(&dst, AUTHOR, &kp).expect("bind");
@@ -277,7 +276,7 @@ fn archived_secret_is_redacted_and_oversize_is_refused_3150() {
         archived_dto(good_row),
     ]);
 
-    let dst = fresh_db("validate-");
+    let (dst, _tmp_guard) = fresh_db("validate-");
     let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
 
     // Gate 2 — the oversize row is the only REFUSAL, and it is accounted for.
@@ -326,7 +325,7 @@ fn archived_identity_is_restamped_by_default_3150() {
         "durable archived text",
     ))]);
 
-    let dst = fresh_db("restamp-");
+    let (dst, _tmp_guard) = fresh_db("restamp-");
     let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
     assert_eq!(report.archived_memories, 1);
     assert_eq!(report.restamped, 1, "the archived restamp is counted");
@@ -344,7 +343,7 @@ fn archived_identity_is_restamped_by_default_3150() {
     );
 
     // Control: `--trust-source` preserves the claimed author verbatim.
-    let dst2 = fresh_db("restamp-trusted-");
+    let (dst2, _tmp_guard) = fresh_db("restamp-trusted-");
     let report2 = import_full_envelope(&dst2, &env, &opts_trusted()).expect("import");
     assert_eq!(report2.restamped, 0);
     let meta2 = archived_metadata(&dst2, "arch-restamp-3150").expect("row landed");

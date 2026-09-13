@@ -45,14 +45,14 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn setup_router() -> axum::Router {
-    setup_router_with_path().0
+fn setup_router() -> (axum::Router, tempfile::TempDir) {
+    let (router, _path, dir) = setup_router_with_path();
+    (router, dir)
 }
 
-fn setup_router_with_path() -> (axum::Router, std::path::PathBuf) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
-    let db_path = db_tmp.path().to_path_buf();
-    std::mem::forget(db_tmp);
+fn setup_router_with_path() -> (axum::Router, std::path::PathBuf, tempfile::TempDir) {
+    let db_tmp = tempfile::TempDir::new().expect("db tempfile");
+    let db_path = db_tmp.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((
@@ -110,7 +110,7 @@ fn setup_router_with_path() -> (axum::Router, std::path::PathBuf) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db_path)
+    (ai_memory::build_router(api_key_state, app_state), db_path, db_tmp)
 }
 
 /// Stable receiver identity. The HTTP `/sync/push` path resolves the
@@ -194,7 +194,7 @@ fn clear_fed_gates() {
 async fn sync_push_folds_only_sender_own_clock_key_2718() {
     let _g = env_lock();
     relax_fed_gates();
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
 
     // The sender carries a clock describing peers it has observed —
     // including a foreign peer the receiver has never talked to.
@@ -234,7 +234,7 @@ async fn sync_push_folds_only_sender_own_clock_key_2718() {
 async fn sync_push_peer_a_cannot_advance_peer_b_clock_key_2718() {
     let _g = env_lock();
     relax_fed_gates();
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
 
     // Peer B legitimately establishes its own clock entry (its OWN key).
     let b_push = json!({
@@ -284,7 +284,7 @@ async fn sync_push_peer_a_cannot_advance_peer_b_clock_key_2718() {
 async fn sync_push_older_sender_timestamp_does_not_regress_receiver_clock_1709() {
     let _g = env_lock();
     relax_fed_gates();
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
 
     // #2718 — the fold accepts only the sender's OWN key, so this
     // monotonic-non-regress regression uses `ai:sender` (the authorized
@@ -352,7 +352,7 @@ fn push_memory(id: &str, tags: &[&str], priority: i64, updated_at: &str) -> Valu
 async fn sync_push_divergent_same_id_memory_field_merges_1709() {
     let _g = env_lock();
     relax_fed_gates();
-    let (router, db_path) = setup_router_with_path();
+    let (router, db_path, _tmp_guard) = setup_router_with_path();
 
     let mem_id = "fed-merge-mem-1709";
     // First push: tags=[a], priority=3.

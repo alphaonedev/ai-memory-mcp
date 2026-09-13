@@ -29,7 +29,7 @@ const SECRET_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 
 const AUTHOR: &str = "ai:bundle-author";
 
-fn fresh_db(tag: &str) -> Connection {
+fn fresh_db(tag: &str) -> (Connection, tempfile::TempDir) {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".local-runs")
@@ -41,8 +41,7 @@ fn fresh_db(tag: &str) -> Connection {
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     drop(ai_memory::db::open(&path).expect("init db"));
-    std::mem::forget(dir); // keep the file alive for the connection's lifetime
-    ai_memory::db::open(&path).expect("open db")
+    (ai_memory::db::open(&path).expect("open db"), dir)
 }
 
 /// A bundle memory authored + SIGNED by `AUTHOR` over its CURRENT bytes,
@@ -107,12 +106,16 @@ fn envelope_with(memories: Vec<Memory>) -> ExportEnvelope {
 /// Destination with the bundle author's Ed25519 key ENROLLED, so a valid
 /// presented signature is verifiable (the precondition of the pre-fix
 /// false-`agent_attested` defect).
-fn dest_with_enrolled_author() -> (Connection, ai_memory::identity::keypair::AgentKeypair) {
-    let conn = fresh_db("dest");
+fn dest_with_enrolled_author() -> (
+    Connection,
+    ai_memory::identity::keypair::AgentKeypair,
+    tempfile::TempDir,
+) {
+    let (conn, dir) = fresh_db("dest");
     ai_memory::db::register_agent(&conn, AUTHOR, "ai:generic", &[]).expect("register");
     let kp = ai_memory::identity::keypair::generate(AUTHOR).expect("keypair");
     ai_memory::db::bind_agent_pubkey_with_keypair(&conn, AUTHOR, &kp).expect("bind");
-    (conn, kp)
+    (conn, kp, dir)
 }
 
 fn trust_source_opts() -> ImportOptions {
@@ -131,7 +134,7 @@ fn trust_source_opts() -> ImportOptions {
 #[test]
 fn import_redacts_before_attestation_so_raw_signed_secret_lands_claimed_2353() {
     set_screen_mode(SecretScreenMode::Redact);
-    let (conn, kp) = dest_with_enrolled_author();
+    let (conn, kp, _tmp_guard) = dest_with_enrolled_author();
     let mem = signed_bundle_memory(
         "mem-2353-secret",
         &format!("deploy with {SECRET_TOKEN} then restart"),
@@ -173,7 +176,7 @@ fn import_redacts_before_attestation_so_raw_signed_secret_lands_claimed_2353() {
 #[test]
 fn import_clean_signed_row_still_lands_agent_attested_2353() {
     set_screen_mode(SecretScreenMode::Redact);
-    let (conn, kp) = dest_with_enrolled_author();
+    let (conn, kp, _tmp_guard) = dest_with_enrolled_author();
     let mem = signed_bundle_memory(
         "mem-2353-clean",
         "scale the deployment to three replicas",

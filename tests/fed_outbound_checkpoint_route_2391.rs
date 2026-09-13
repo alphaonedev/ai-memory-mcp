@@ -94,11 +94,10 @@ fn federation_config(push_url: &str) -> ai_memory::federation::FederationConfig 
 /// (`CHECKPOINT_ID`) already inserted.
 fn build_router_with_pending_checkpoint(
     federation: Option<ai_memory::federation::FederationConfig>,
-) -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+) -> (axum::Router, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let conn = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
 
     let cp = ai_memory::models::Checkpoint {
         id: CHECKPOINT_ID.to_string(),
@@ -174,7 +173,7 @@ fn build_router_with_pending_checkpoint(
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(api_key_state, app_state)
+    (ai_memory::build_router(api_key_state, app_state), f)
 }
 
 fn resolve_request(path: &str, body: &Value) -> Request<Body> {
@@ -201,7 +200,7 @@ async fn body_json(resp: axum::response::Response) -> Value {
 #[tokio::test]
 async fn resolve_route_fans_the_resolution_out_to_peers() {
     let (push_url, cap) = spawn_mock_peer().await;
-    let router = build_router_with_pending_checkpoint(Some(federation_config(&push_url)));
+    let (router, _tmp_guard) = build_router_with_pending_checkpoint(Some(federation_config(&push_url)));
 
     let resp = router
         .oneshot(resolve_request(
@@ -252,7 +251,7 @@ async fn resolve_route_fans_the_resolution_out_to_peers() {
 
 #[tokio::test]
 async fn resolve_route_single_node_fast_path_has_no_quorum_field() {
-    let router = build_router_with_pending_checkpoint(None);
+    let (router, _tmp_guard) = build_router_with_pending_checkpoint(None);
 
     let resp = router
         .oneshot(resolve_request(
@@ -277,7 +276,7 @@ async fn resolve_route_single_node_fast_path_has_no_quorum_field() {
 
 #[tokio::test]
 async fn resolve_route_unknown_checkpoint_is_404() {
-    let router = build_router_with_pending_checkpoint(None);
+    let (router, _tmp_guard) = build_router_with_pending_checkpoint(None);
     let resp = router
         .oneshot(resolve_request(
             "/api/v1/checkpoints/cp-does-not-exist/resolve",
@@ -290,7 +289,7 @@ async fn resolve_route_unknown_checkpoint_is_404() {
 
 #[tokio::test]
 async fn resolve_route_non_terminal_state_is_400() {
-    let router = build_router_with_pending_checkpoint(None);
+    let (router, _tmp_guard) = build_router_with_pending_checkpoint(None);
     let resp = router
         .oneshot(resolve_request(RESOLVE_ROUTE, &json!({"state": "pending"})))
         .await

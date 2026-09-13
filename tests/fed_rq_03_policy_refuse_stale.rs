@@ -37,7 +37,7 @@ const PEER_ID_HEADER: &str = "x-peer-id";
 const SENDER: &str = "ai:fedrq03-peer";
 const NS: &str = "fedrq03";
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -46,11 +46,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -101,7 +102,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 /// Advance the local committed governance policy `n` times so
@@ -209,7 +210,7 @@ async fn post_push(router: &axum::Router, body: &Value) -> (StatusCode, Value) {
 async fn stale_policy_version_is_refused_before_apply() {
     let guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     advance_policy(&db, 5).await; // local committed policy seq = 5
 
     // Sender advertises seq 3 — strictly behind → DETECTED-stale → refuse.
@@ -270,7 +271,7 @@ async fn break_policy_read(db: &ai_memory::handlers::Db) {
 async fn policy_read_fault_refuses_503_and_does_not_apply() {
     let guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     advance_policy(&db, 5).await;
     break_policy_read(&db).await;
 
@@ -330,7 +331,7 @@ async fn policy_read_fault_still_accepts_when_gate_disabled() {
             "0",
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     advance_policy(&db, 5).await;
     break_policy_read(&db).await;
 
@@ -365,7 +366,7 @@ async fn policy_read_fault_still_accepts_when_gate_disabled() {
 async fn fresh_policy_version_is_accepted() {
     let guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     advance_policy(&db, 5).await;
 
     // Equal seq (control): not stale → accept + memory lands.
@@ -399,7 +400,7 @@ async fn fresh_policy_version_is_accepted() {
 async fn absent_policy_version_is_accepted_failopen() {
     let guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     advance_policy(&db, 5).await;
 
     // No sender_policy_seq advertised → fail-OPEN (rollout safety).
@@ -429,7 +430,7 @@ async fn opt_out_accepts_even_stale() {
             "0",
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     advance_policy(&db, 5).await;
 
     let (status, body) = post_push(

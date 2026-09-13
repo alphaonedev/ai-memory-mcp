@@ -33,7 +33,7 @@ use tower::ServiceExt as _;
 /// Process-global async lock — these tests mutate federation env vars.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn build_app() -> ai_memory::handlers::AppState {
+fn build_app() -> (ai_memory::handlers::AppState, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -42,16 +42,17 @@ fn build_app() -> ai_memory::handlers::AppState {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
     };
-    ai_memory::handlers::AppState {
+    let built = ai_memory::handlers::AppState {
         db,
         embedder: std::sync::Arc::new(None),
         vector_index: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -89,7 +90,8 @@ fn build_app() -> ai_memory::handlers::AppState {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
-    }
+    };
+    (built, tmp)
 }
 
 fn router_for(app_state: ai_memory::handlers::AppState) -> axum::Router {
@@ -104,10 +106,10 @@ fn router_for(app_state: ai_memory::handlers::AppState) -> axum::Router {
     ai_memory::build_router(api_key_state, app_state)
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
-    let app = build_app();
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
+    let (app, dir) = build_app();
     let db = std::sync::Arc::clone(&app.db);
-    (router_for(app), db)
+    (router_for(app), db, dir)
 }
 
 /// Relax the ENVELOPE-level federation gates so the per-write attestation lane
@@ -199,7 +201,7 @@ async fn rebroadcast_tombstoned_source_stays_agent_attested_2863() {
     let _g = ENV_LOCK.lock().await;
     reset_env_zero_config();
 
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let author = "ai:hive-author";
     let daemon = "ai:hive-memory-1"; // #2860 re-broadcast sender (fed identity)
 
@@ -427,7 +429,7 @@ async fn push_timestamp_matrix(
 async fn sqlite_prebinding_signature_rejected_visibly_3502() {
     let _guard = ENV_LOCK.lock().await;
     reset_env_zero_config();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let author = "ai:timestamp-sqlite";
     let kp = ai_memory::identity::keypair::generate(author).expect("keypair");
     {
@@ -462,7 +464,7 @@ async fn postgres_prebinding_signature_rejected_visibly_3502() {
     reset_env_zero_config();
     let url =
         std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");
-    let mut app = build_app();
+    let (mut app, _tmp_guard) = build_app();
     app.store = std::sync::Arc::new(
         ai_memory::store::postgres::PostgresStore::connect(&url)
             .await

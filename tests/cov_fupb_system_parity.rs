@@ -28,11 +28,10 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
-fn build_sqlite_router() -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+fn build_sqlite_router() -> (axum::Router, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
     let conn = ai_memory::db::open(&db_path).expect("reopen");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -88,7 +87,7 @@ fn build_sqlite_router() -> axum::Router {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(api_key_state, app_state)
+    (ai_memory::build_router(api_key_state, app_state), f)
 }
 
 async fn get_with_header(
@@ -121,7 +120,7 @@ async fn get_with_header(
 
 #[tokio::test]
 async fn capabilities_default_v3_on_sqlite() {
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
     let (status, v) = get_with_header(&router, "/api/v1/capabilities", None).await;
     assert_eq!(status, StatusCode::OK);
     // sqlite backend surfaced + the live db_schema_version success path.
@@ -138,7 +137,7 @@ async fn capabilities_default_v3_on_sqlite() {
 
 #[tokio::test]
 async fn capabilities_accept_v2_negotiation() {
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
     let (status, v) = get_with_header(
         &router,
         "/api/v1/capabilities",
@@ -156,7 +155,7 @@ async fn capabilities_accept_v2_negotiation() {
 
 #[tokio::test]
 async fn capabilities_accept_v1_negotiation() {
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
     let (status, v) = get_with_header(
         &router,
         "/api/v1/capabilities",
@@ -181,7 +180,7 @@ async fn capabilities_accept_v1_negotiation() {
 /// `agent_id_query_header_mismatch` arm → 403.
 #[tokio::test]
 async fn recall_post_as_agent_mismatch_returns_403() {
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
     let body = json!({"context": "anything", "as_agent": "ai:viewer-bob"}).to_string();
     let req = Request::builder()
         .method("POST")
@@ -211,7 +210,7 @@ async fn recall_post_as_agent_mismatch_returns_403() {
 /// GET twin — `?as_agent=` query param routed through the same slot.
 #[tokio::test]
 async fn recall_get_as_agent_mismatch_returns_403() {
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/recall?context=hello&as_agent=ai:viewer-bob")
@@ -234,7 +233,7 @@ async fn recall_get_as_agent_mismatch_returns_403() {
 /// Matching `as_agent` + header must NOT trip the mismatch arm (200).
 #[tokio::test]
 async fn recall_post_as_agent_matching_header_ok() {
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
     let body = json!({"context": "anything", "as_agent": "ai:operator-alice"}).to_string();
     let req = Request::builder()
         .method("POST")

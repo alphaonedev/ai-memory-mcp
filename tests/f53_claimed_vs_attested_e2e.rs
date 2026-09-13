@@ -47,7 +47,7 @@ const PEER_ID_HEADER: &str = "x-peer-id";
 // ---------------------------------------------------------------------------
 // Shared federation-receive HTTP harness (in-memory sqlite).
 // ---------------------------------------------------------------------------
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -55,11 +55,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -112,7 +113,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         },
         app_state,
     );
-    (router, db)
+    (router, db, tmp)
 }
 
 fn reset_env() {
@@ -170,7 +171,7 @@ async fn stored_attest_level(db: &ai_memory::handlers::Db, id: &str) -> Option<S
 async fn write_attestation_claimed_vs_agent_attested() {
     let guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let author = "ai:f53-author";
     let kp = ai_memory::identity::keypair::generate(author).expect("keypair");
@@ -401,7 +402,7 @@ async fn policy_refuse_stale_vs_current() {
     // Persisted E2E: stale push over HTTP is refused 409 with the typed tag.
     let guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     {
         let kp = ai_memory::identity::keypair::generate("operator").expect("op key");
         let signing = kp.private.as_ref().expect("op private");

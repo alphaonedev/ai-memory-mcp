@@ -54,15 +54,14 @@ fn scratch_root(tag: &str) -> PathBuf {
     root
 }
 
-fn fresh_db(tag: &str) -> (PathBuf, Connection) {
+fn fresh_db(tag: &str) -> (PathBuf, Connection, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
         .prefix(tag)
         .tempdir_in(scratch_root(tag))
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     let conn = ai_memory::db::open(&path).expect("init db");
-    std::mem::forget(dir); // keep the file alive for the test's connection
-    (path, conn)
+    (path, conn, dir)
 }
 
 fn opts() -> ImportOptions {
@@ -97,7 +96,7 @@ fn mem(id: &str, title: &str, ns: &str, content: &str) -> Memory {
 /// issue body, driven through the production code paths).
 #[test]
 fn archived_memories_and_namespace_meta_survive_export_full_round_trip() {
-    let (_src_path, src) = fresh_db("src-corpus");
+    let (_src_path, src, _tmp_guard) = fresh_db("src-corpus");
 
     // Seed a live memory, then archive it (a GENUINE archival, distinct
     // from #2570's `in_place_edit` live-snapshot exception) so it lands in
@@ -157,7 +156,7 @@ fn archived_memories_and_namespace_meta_survive_export_full_round_trip() {
     );
 
     // Import into a FRESH destination.
-    let (_dst_path, dst) = fresh_db("dst-corpus");
+    let (_dst_path, dst, _tmp_guard) = fresh_db("dst-corpus");
     let report = import_full_envelope(&dst, &env, &opts()).expect("import full v2 envelope");
     assert_eq!(
         report.archived_memories, 1,
@@ -198,7 +197,7 @@ fn archived_memories_and_namespace_meta_survive_export_full_round_trip() {
 /// re-attach them.
 #[test]
 fn archived_memory_links_survive_export_full_round_trip() {
-    let (_src_path, src) = fresh_db("src-links");
+    let (_src_path, src, _tmp_guard) = fresh_db("src-links");
 
     ai_memory::storage::insert(&src, &mem("m-a", "a", "ns", "content a")).expect("seed a");
     ai_memory::storage::insert(&src, &mem("m-b", "b", "ns", "content b")).expect("seed b");
@@ -215,7 +214,7 @@ fn archived_memory_links_survive_export_full_round_trip() {
     assert_eq!(env.archived_memory_links[0].source_id, "m-a");
     assert_eq!(env.archived_memory_links[0].target_id, "m-b");
 
-    let (_dst_path, dst) = fresh_db("dst-links");
+    let (_dst_path, dst, _tmp_guard) = fresh_db("dst-links");
     let report = import_full_envelope(&dst, &env, &opts()).expect("import full v2 envelope");
     assert_eq!(
         report.archived_memory_links, 1,
@@ -254,7 +253,7 @@ fn pre_2571_envelope_missing_the_new_arrays_still_imports() {
     assert!(env.namespace_meta.is_empty());
     assert!(env.archived_memory_links.is_empty());
 
-    let (_dst_path, dst) = fresh_db("dst-oldshape");
+    let (_dst_path, dst, _tmp_guard) = fresh_db("dst-oldshape");
     let report = import_full_envelope(&dst, &env, &opts()).expect("old-shape envelope imports");
     assert_eq!(report.archived_memories, 0);
     assert_eq!(report.namespace_meta, 0);
@@ -268,7 +267,7 @@ fn pre_2571_envelope_missing_the_new_arrays_still_imports() {
 /// `in_place_edit` exception).
 #[test]
 fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
-    let (_src_path, src) = fresh_db("src-dual");
+    let (_src_path, src, _tmp_guard) = fresh_db("src-dual");
     ai_memory::storage::insert(&src, &mem("m-dual", "t", "ns", "c")).expect("seed live");
     ai_memory::storage::archive_memory(&src, "m-dual", Some("manual")).expect("archive");
     let env = emit::build_full_envelope(&src, "issue-2571-dual-test", "2026-08-11T00:00:00Z")
@@ -278,7 +277,7 @@ fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
     // The DESTINATION already has the SAME id LIVE (unrelated to the
     // source's archive event) — admitting the archived row would create
     // dual residency.
-    let (_dst_path, dst) = fresh_db("dst-dual");
+    let (_dst_path, dst, _tmp_guard) = fresh_db("dst-dual");
     ai_memory::storage::insert(&dst, &mem("m-dual", "t", "ns", "c")).expect("seed dest live");
 
     let report = import_full_envelope(&dst, &env, &opts()).expect("import");
@@ -330,7 +329,7 @@ fn archived_memory_import_seals_content_at_rest_when_encryption_enabled_2571_f2(
         ("AI_MEMORY_KEY_DIR", Some(key_dir_str.as_str())),
     ]);
 
-    let (_src_path, src) = fresh_db("src-seal");
+    let (_src_path, src, _tmp_guard) = fresh_db("src-seal");
     let now = "2026-08-11T00:00:00Z".to_string();
     let seeded = Memory {
         id: "m-sealed".into(),
@@ -376,7 +375,7 @@ fn archived_memory_import_seals_content_at_rest_when_encryption_enabled_2571_f2(
         "the export boundary must decrypt content into the JSON bundle, exactly like memories[]"
     );
 
-    let (_dst_path, dst) = fresh_db("dst-seal");
+    let (_dst_path, dst, _tmp_guard) = fresh_db("dst-seal");
     let report = import_full_envelope(&dst, &env, &opts()).expect("import full v2 envelope");
     assert_eq!(report.archived_memories, 1);
 

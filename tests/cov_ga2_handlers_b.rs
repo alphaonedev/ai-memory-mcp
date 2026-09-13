@@ -167,7 +167,7 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
 /// `:memory:` legacy `app.db`. Reaches the postgres SAL-dispatch arms
 /// with no live postgres. Returns the router plus the store's backing
 /// path so a test can seed rows the SAL branch will read.
-fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
+fn fake_pg_router() -> (axum::Router, std::path::PathBuf, tempfile::TempDir) {
     permissive_attestation_for_tests();
     let scratch = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(AsyncMutex::new((
@@ -176,9 +176,8 @@ fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-    let store_path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
+    let store_path = tmp.path().join("test.db");
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
     );
@@ -194,6 +193,7 @@ fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
     (
         ai_memory::build_router(api_key_state, app_state),
         store_path,
+        tmp,
     )
 }
 
@@ -398,7 +398,7 @@ async fn inbox_postgres_branch_empty_envelope() {
     let _g = GA2_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (r, _p) = fake_pg_router();
+    let (r, _p, _tmp_guard) = fake_pg_router();
     let (status, body) = get(&r, "/api/v1/inbox").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["agent_id"], json!(AGENT));
@@ -415,7 +415,7 @@ async fn notify_inbox_wire_contract_is_backend_blind_3401() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (sqlite, _sqlite_file) = sqlite_router();
-    let (postgres_path, _postgres_file) = fake_pg_router();
+    let (postgres_path, _postgres_file, _tmp_guard) = fake_pg_router();
     assert_inbox_contract_3401(&sqlite, &postgres_path).await;
 }
 
@@ -689,7 +689,7 @@ async fn namespace_standard_postgres_set_get_clear_and_merge() {
     let _g = GA2_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (r, _p) = fake_pg_router();
+    let (r, _p, _tmp_guard) = fake_pg_router();
     let ns = "ga2-ns-pg";
 
     // First set: auto-seed a placeholder + layer the governance policy
@@ -758,7 +758,7 @@ async fn namespace_standard_postgres_clear_missing_is_404() {
     let _g = GA2_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (r, _p) = fake_pg_router();
+    let (r, _p, _tmp_guard) = fake_pg_router();
     // Clearing a namespace that has no namespace_meta row hits the
     // postgres `Ok(false)` -> 404 arm.
     let (status, _b) = delete_req(&r, "/api/v1/namespaces/ga2-never-set/standard").await;
@@ -770,7 +770,7 @@ async fn namespace_standard_postgres_get_unset_returns_null_envelope() {
     let _g = GA2_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (r, _p) = fake_pg_router();
+    let (r, _p, _tmp_guard) = fake_pg_router();
     // Non-inherit GET on a namespace with no standard -> Ok(None) ->
     // null-standard_id 200 envelope on the postgres branch.
     let (status, body) = get(&r, "/api/v1/namespaces?namespace=ga2-pg-unset").await;
@@ -1091,7 +1091,7 @@ async fn approval_decide_postgres_approve_dispatches_to_store() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     set_active_hooks_hmac_secret(Some(HMAC_SECRET.to_string()));
-    let (r, store_path) = fake_pg_router();
+    let (r, store_path, _tmp_guard) = fake_pg_router();
     let pending_id = seed_pending_row(&store_path, "scratch", "alice");
 
     let body = json!({"decision": "approve", "remember": "session"}).to_string();
@@ -1126,7 +1126,7 @@ async fn approval_decide_postgres_deny_dispatches_to_store() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     set_active_hooks_hmac_secret(Some(HMAC_SECRET.to_string()));
-    let (r, store_path) = fake_pg_router();
+    let (r, store_path, _tmp_guard) = fake_pg_router();
     let pending_id = seed_pending_row(&store_path, "scratch", "alice");
 
     let body = json!({"decision": "deny", "remember": "once"}).to_string();
@@ -1157,7 +1157,7 @@ async fn approval_decide_postgres_missing_id_is_404() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     set_active_hooks_hmac_secret(Some(HMAC_SECRET.to_string()));
-    let (r, _p) = fake_pg_router();
+    let (r, _p, _tmp_guard) = fake_pg_router();
     // No such pending row in the SAL store -> deny path's pending_decide
     // returns Ok(false) -> 404.
     let pending_id = "pa-pg-missing";
@@ -1369,7 +1369,7 @@ async fn promote_postgres_uses_visibility_retry() {
     let _g = GA2_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (r, store_path) = fake_pg_router();
+    let (r, store_path, _tmp_guard) = fake_pg_router();
     // Seed a memory directly in the SAL store so the postgres promote
     // path (which calls get_with_visibility_retry) resolves it.
     let conn = ai_memory::db::open(&store_path).expect("open store file");
@@ -1411,7 +1411,7 @@ async fn promote_postgres_unknown_id_is_404() {
     let _g = GA2_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (r, _p) = fake_pg_router();
+    let (r, _p, _tmp_guard) = fake_pg_router();
     // A well-formed id with no backing row exhausts the visibility-retry
     // budget and surfaces 404.
     let (status, _b) = post_json(

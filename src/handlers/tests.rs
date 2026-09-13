@@ -470,22 +470,19 @@ fn test_app_state_with_admin(db: Db, agent_id: &str) -> AppState {
     state
 }
 
-/// v0.7.0 Wave-3 — test-only `Arc<dyn MemoryStore>` that wraps a
-/// freshly-opened tempfile-backed SQLite database. The unit tests
-/// in this module never call into `app.store`, so the disjoint
-/// backing file is harmless — but a populated handle is required
-/// to satisfy the `AppState` field shape.
+/// v0.7.0 Wave-3 — test-only `Arc<dyn MemoryStore>` over an in-memory
+/// SQLite database. The unit tests in this module never call into
+/// `app.store`, so the disjoint store is harmless — but a populated
+/// handle is required to satisfy the `AppState` field shape. Tests that
+/// touch the trait-routed path open their own dedicated stores.
+///
+/// #3669: in-memory rather than a temp file, so the 349 `test_app_state`
+/// callers create no file at all and nothing can be left behind.
 #[cfg(feature = "sal")]
 fn test_sqlite_store_handle() -> Arc<dyn crate::store::MemoryStore> {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for test SqliteStore");
-    // Keep the tempfile alive for the lifetime of the process by
-    // leaking the path — the OS reclaims it on exit. Tests that
-    // touch the trait-routed path open their own dedicated stores.
-    let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
     Arc::new(
-        crate::store::sqlite::SqliteStore::open(&path)
-            .expect("open SqliteStore for test_app_state"),
+        crate::store::sqlite::SqliteStore::open(":memory:")
+            .expect("open in-memory SqliteStore for test_app_state"),
     )
 }
 

@@ -75,7 +75,7 @@ const IN_SCOPE_NS: &str = "public/ok";
 const SCOPED_ALLOWLIST: &str =
     r#"{"ai:puller":{"allowed_namespaces":["public/*"],"allowed_sender_agent_ids":["ai:puller"]}}"#;
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -84,11 +84,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -138,7 +139,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 /// Scoped-peer posture with NO trust bypass (the bypass would resolve
@@ -252,7 +253,7 @@ async fn drive_pull_to_convergence(
 async fn cursor_advances_when_every_row_is_out_of_scope_2441() {
     let _g = ENV_LOCK.lock().await;
     set_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     seed(&db, "a", OUT_OF_SCOPE_NS, "2026-01-01T00:00:01+00:00").await;
     seed(&db, "b", OUT_OF_SCOPE_NS, "2026-01-01T00:00:02+00:00").await;
@@ -288,7 +289,7 @@ async fn cursor_advances_when_every_row_is_out_of_scope_2441() {
 async fn pull_loop_converges_instead_of_stalling_2441() {
     let _g = ENV_LOCK.lock().await;
     set_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     for i in 1..=6 {
         seed(
@@ -322,7 +323,7 @@ async fn pull_loop_converges_instead_of_stalling_2441() {
 async fn cursor_advances_when_every_row_is_visibility_filtered_2441() {
     let _g = ENV_LOCK.lock().await;
     set_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     {
         let guard = db.lock().await;
@@ -373,7 +374,7 @@ async fn cursor_advances_when_every_row_is_visibility_filtered_2441() {
 async fn cursor_holds_rather_than_skipping_a_cut_tie_group_2441() {
     let _g = ENV_LOCK.lock().await;
     set_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // Four rows, ONE timestamp. limit=2 cuts the tie group in half.
     for i in 1..=4 {
@@ -407,7 +408,7 @@ async fn cursor_holds_rather_than_skipping_a_cut_tie_group_2441() {
 async fn full_page_drops_the_trailing_tie_group_2441() {
     let _g = ENV_LOCK.lock().await;
     set_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     seed(&db, "x1", OUT_OF_SCOPE_NS, "2026-04-01T00:00:01+00:00").await;
     seed(&db, "x2", OUT_OF_SCOPE_NS, "2026-04-01T00:00:02+00:00").await;
@@ -437,7 +438,7 @@ async fn full_page_drops_the_trailing_tie_group_2441() {
 async fn projected_page_diagnostics_are_unchanged_2441() {
     let _g = ENV_LOCK.lock().await;
     set_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     seed(&db, "in1", IN_SCOPE_NS, "2026-05-01T00:00:01+00:00").await;
     seed(&db, "out1", OUT_OF_SCOPE_NS, "2026-05-01T00:00:02+00:00").await;
@@ -470,7 +471,7 @@ async fn default_deny_arm_publishes_a_null_cursor_2441() {
             r#"{"ai:other":{"allowed_namespaces":["public/*"]}}"#,
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     seed(&db, "d1", IN_SCOPE_NS, "2026-06-01T00:00:01+00:00").await;
 
     let v = pull(&router, None, 500).await;

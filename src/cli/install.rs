@@ -647,18 +647,14 @@ fn snippet_base_dir() -> Result<PathBuf> {
 /// path so tests never write into `~/.config/ai-memory/`.
 #[cfg(test)]
 fn test_default_snippet_dir() -> PathBuf {
+    // One directory for the whole test binary, so it is not cleaned up
+    // between tests. #3669: removed at process exit.
     use std::sync::OnceLock;
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let tmp = tempfile::tempdir().expect("tempdir for snippet test default");
-        let p = tmp.path().to_path_buf();
-        // Leak the TempDir handle: we want this path to live for the
-        // entire test binary's lifetime, not be cleaned up between
-        // tests. The OS sweeps `/tmp` on reboot.
-        std::mem::forget(tmp);
-        p
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    crate::test_scratch::process_lifetime_dir(&DIR, || {
+        tempfile::tempdir().expect("tempdir for snippet test default")
     })
-    .clone()
+    .to_path_buf()
 }
 
 /// Write the system-prompt snippet for `target` to disk and return the
@@ -2720,7 +2716,7 @@ mod tests {
     /// is leaked so the snippet file remains on disk for the caller
     /// to inspect after the helper returns; the OS sweeps `/tmp` on
     /// reboot.
-    fn emit_snippet_isolated(target: Target) -> (PathBuf, String) {
+    fn emit_snippet_isolated(target: Target) -> (PathBuf, String, tempfile::TempDir) {
         // Uses the dir-parameterised helper so the test does NOT touch
         // the process-global `AI_MEMORY_SYSTEM_PROMPT_DIR` env var.
         // Eliminates the `snippet_env_lock` cross-test race that flaked
@@ -2732,8 +2728,7 @@ mod tests {
         let snippet_path =
             write_system_prompt_snippet_to(target, &tmp_path).expect("snippet write");
         let body = fs::read_to_string(&snippet_path).expect("read snippet");
-        std::mem::forget(tmp); // path must outlive caller
-        (snippet_path, body)
+        (snippet_path, body, tmp)
     }
 
     /// Every snippet must mention all four anchor strings the v0.7
@@ -2775,7 +2770,7 @@ mod tests {
 
     #[test]
     fn snippet_claude_code_has_anchors_and_under_budget() {
-        let (path, body) = emit_snippet_isolated(Target::ClaudeCode);
+        let (path, body, _tmp_guard) = emit_snippet_isolated(Target::ClaudeCode);
         assert!(path.ends_with("system-prompt-claude-code.md"));
         assert_snippet_anchors(Target::ClaudeCode, &body);
         assert_snippet_token_budget(&body);
@@ -2788,7 +2783,7 @@ mod tests {
 
     #[test]
     fn snippet_cursor_has_anchors_and_under_budget() {
-        let (path, body) = emit_snippet_isolated(Target::Cursor);
+        let (path, body, _tmp_guard) = emit_snippet_isolated(Target::Cursor);
         assert!(path.ends_with("system-prompt-cursor.md"));
         assert_snippet_anchors(Target::Cursor, &body);
         assert_snippet_token_budget(&body);
@@ -2796,7 +2791,7 @@ mod tests {
 
     #[test]
     fn snippet_codex_has_anchors_and_under_budget() {
-        let (path, body) = emit_snippet_isolated(Target::Codex);
+        let (path, body, _tmp_guard) = emit_snippet_isolated(Target::Codex);
         assert!(path.ends_with("system-prompt-codex.md"));
         assert_snippet_anchors(Target::Codex, &body);
         assert_snippet_token_budget(&body);
@@ -2804,7 +2799,7 @@ mod tests {
 
     #[test]
     fn snippet_continue_has_anchors_and_under_budget() {
-        let (path, body) = emit_snippet_isolated(Target::Continue);
+        let (path, body, _tmp_guard) = emit_snippet_isolated(Target::Continue);
         assert!(path.ends_with("system-prompt-continue.md"));
         assert_snippet_anchors(Target::Continue, &body);
         assert_snippet_token_budget(&body);
@@ -2858,7 +2853,6 @@ mod tests {
             let snippet_path =
                 write_system_prompt_snippet_to(target, &tmp_path).expect("snippet write");
             let body = fs::read_to_string(&snippet_path).expect("read snippet");
-            std::mem::forget(tmp);
             assert!(
                 snippet_path.exists(),
                 "snippet file for {} not created",

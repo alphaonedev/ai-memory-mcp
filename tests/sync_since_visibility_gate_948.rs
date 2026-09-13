@@ -67,7 +67,7 @@ use tower::ServiceExt as _;
 /// `oneshot().await` without tripping `clippy::await_holding_lock`.
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -76,11 +76,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -133,7 +134,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 async fn seed_with_metadata(db: &ai_memory::handlers::Db, ns: &str, title: &str, metadata: Value) {
@@ -240,7 +241,7 @@ async fn peer_cannot_pull_scope_private_row_owned_by_other_agent_948() {
     reset_env();
     install_allowlist_for("peer-bob");
 
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // Alice's scope=private row in an allowlisted namespace.
     seed_with_metadata(
         &db,
@@ -290,7 +291,7 @@ async fn owner_peer_can_pull_own_scope_private_row_948() {
     reset_env();
     install_allowlist_for("alice");
 
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     seed_with_metadata(
         &db,
         "shared-948/beta",
@@ -329,7 +330,7 @@ async fn inbox_target_can_pull_scope_private_row_948() {
     reset_env();
     install_allowlist_for("alice");
 
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // Carol stamped an inbox-style row addressed to alice. Sender
     // ownership is carol; alice is the target. Alice's federation
     // pull (X-Peer-Id "alice") MUST still receive the row because
@@ -374,7 +375,7 @@ async fn shared_scope_row_unaffected_948() {
     reset_env();
     install_allowlist_for("peer-bob");
 
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // Same setup as the leak case BUT scope=shared. The post-filter
     // MUST NOT touch this row — the predicate's first branch returns
     // true on `scope != "private"`.

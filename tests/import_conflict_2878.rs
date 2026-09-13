@@ -52,15 +52,14 @@ fn scratch_root(tag: &str) -> PathBuf {
 
 /// A migrated DB file that outlives the returned connection (the file is
 /// leaked, not the connection — the two-connection race re-opens it).
-fn fresh_db_path(tag: &str) -> PathBuf {
+fn fresh_db_path(tag: &str) -> (PathBuf, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
         .prefix(tag)
         .tempdir_in(scratch_root(tag))
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     drop(ai_memory::db::open(&path).expect("init db"));
-    std::mem::forget(dir); // keep the file alive for the test's connections
-    path
+    (path, dir)
 }
 
 fn mem(id: &str, title: &str, ns: &str, content: &str) -> Memory {
@@ -137,7 +136,7 @@ fn error_opts() -> ImportOptions {
 /// leaves the durable row byte-identical (winner's content, `version = 1`).
 #[test]
 fn insert_imported_no_overwrite_refuses_and_preserves_content_2878() {
-    let path = fresh_db_path("primitive");
+    let (path, _tmp_guard) = fresh_db_path("primitive");
     let conn = ai_memory::db::open(&path).expect("open");
 
     let winner = mem(
@@ -182,7 +181,7 @@ fn insert_imported_no_overwrite_refuses_and_preserves_content_2878() {
 /// non-`Merge` write, and that the assertion above is load-bearing.
 #[test]
 fn insert_imported_still_upserts_on_merge_2878() {
-    let path = fresh_db_path("merge-control");
+    let (path, _tmp_guard) = fresh_db_path("merge-control");
     let conn = ai_memory::db::open(&path).expect("open");
 
     ai_memory::db::insert_imported(&conn, &mem("id-1", "shared-title", "team/ops", "first"))
@@ -212,7 +211,7 @@ fn insert_imported_no_overwrite_two_connection_race_one_winner_2878() {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
-    let path = fresh_db_path("race");
+    let (path, _tmp_guard) = fresh_db_path("race");
     let barrier = Arc::new(Barrier::new(2));
     let mut handles = Vec::new();
     for tag in ["a", "b"] {
@@ -279,7 +278,7 @@ fn insert_imported_no_overwrite_two_connection_race_one_winner_2878() {
 /// a structural no-op on this (probe-visible) collision.
 #[test]
 fn import_version_disposition_never_clobbers_destination_2878() {
-    let path = fresh_db_path("funnel-version");
+    let (path, _tmp_guard) = fresh_db_path("funnel-version");
     let conn = Connection::open(&path).expect("open raw");
     // Re-run migrations/pragmas through the canonical opener on a fresh handle.
     drop(conn);
@@ -351,7 +350,7 @@ fn import_version_disposition_never_clobbers_destination_2878() {
 /// (content + `version = 1`), and no second row is created.
 #[test]
 fn import_error_disposition_skips_and_preserves_destination_2878() {
-    let path = fresh_db_path("funnel-error");
+    let (path, _tmp_guard) = fresh_db_path("funnel-error");
     let conn = ai_memory::db::open(&path).expect("open");
 
     import_full_envelope(

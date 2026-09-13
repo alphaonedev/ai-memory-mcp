@@ -93,7 +93,7 @@ impl Drop for PostureGuard {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -102,11 +102,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -156,7 +157,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 /// Seed the peer-attestation posture. `allowlist == None` = ZERO-CONFIG.
@@ -393,7 +394,7 @@ async fn exploit_pendings_plus_decisions_store_lands_foreign_namespace_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     let pid = uuid::Uuid::new_v4().to_string();
@@ -434,7 +435,7 @@ async fn exploit_decisions_only_against_local_pending_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     let victim_id = seed_row(&router, VICTIM_NS, "decisions-only-delete-target").await;
@@ -479,7 +480,7 @@ async fn exploit_delete_arm_by_id_escapes_declared_namespace_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     let victim_id = seed_row(&router, VICTIM_NS, "by-id-delete-target").await;
@@ -515,7 +516,7 @@ async fn exploit_promote_arm_clones_into_out_of_scope_ancestor_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_DEEP), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     let leaf_id = seed_row(&router, "public/deep/x", "promote-source").await;
@@ -552,7 +553,7 @@ async fn exploit_pendings_upsert_cannot_clobber_foreign_pending_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     let pid = seed_local_pending(
@@ -597,7 +598,7 @@ async fn control_enrolled_scoped_peer_in_scope_pair_applies_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_WITH_VICTIM), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     // Direction 1 — a STORE into a namespace the peer legitimately holds.
@@ -638,7 +639,7 @@ async fn required_scope_pending_pair_postures_3582() {
         (Some(SCOPED_ALLOWLIST_WITH_VICTIM), Some("1"), true),
     ] {
         set_posture(allowlist, require);
-        let (router, db) = build_router_with_db();
+        let (router, db, _tmp_guard) = build_router_with_db();
         register_approver(&db).await;
         let pid = uuid::Uuid::new_v4().to_string();
         let entry = pending_entry(&pid, "store", VICTIM_NS, None, &store_payload(VICTIM_NS));
@@ -685,7 +686,7 @@ async fn required_scope_local_pending_decision_postures_3582() {
     ] {
         for approved in [true, false] {
             set_posture(allowlist, require);
-            let (router, db) = build_router_with_db();
+            let (router, db, _tmp_guard) = build_router_with_db();
             register_approver(&db).await;
             let victim_id = seed_row(&router, VICTIM_NS, "3582 decision target").await;
             let pid = seed_local_pending(
@@ -759,7 +760,7 @@ async fn pending_executed_delete_is_visible_in_the_report_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST_WITH_VICTIM), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     let victim_id = seed_row(&router, VICTIM_NS, "counter-honesty-target").await;
@@ -791,7 +792,7 @@ async fn refused_pending_decision_is_reported_as_skipped_2478() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     register_approver(&db).await;
 
     let victim_id = seed_row(&router, VICTIM_NS, "refusal-visibility-target").await;

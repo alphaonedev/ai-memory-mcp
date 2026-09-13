@@ -55,7 +55,7 @@ use tower::ServiceExt as _;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -64,11 +64,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -121,7 +122,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 async fn seed_with_metadata(
@@ -215,7 +216,7 @@ async fn legacy_unauthored_row_excluded_978() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("legacy/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     seed_with_metadata(
         &db,
         "legacy/operator-seed",
@@ -250,7 +251,7 @@ async fn federation_share_opt_in_projects_legacy_row_978() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("legacy/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let mut md = ai_memory::models::default_metadata();
     if let Some(o) = md.as_object_mut() {
         o.insert(
@@ -281,7 +282,7 @@ async fn federation_share_is_strict_bool_only_978() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("legacy/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // String "true" — must NOT count as opt-in.
     let mut md_string = ai_memory::models::default_metadata();
     if let Some(o) = md_string.as_object_mut() {
@@ -321,7 +322,7 @@ async fn owner_signed_private_row_projects_to_owner_peer_978() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("ops/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let metadata = serde_json::json!({
         "scope": "private",
         "agent_id": "peer-1",
@@ -350,7 +351,7 @@ async fn inbox_target_row_projects_to_target_peer_978() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("_inbox/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let metadata = serde_json::json!({
         "scope": "private",
         "agent_id": "sender",
@@ -378,7 +379,7 @@ async fn shared_scope_row_projects_to_any_peer_978() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("shared/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let metadata = serde_json::json!({"scope": "shared"});
     seed_with_metadata(&db, "shared/announcement", "shared-row", metadata).await;
     let body = sync_since_body(router, "peer-1").await;
@@ -402,7 +403,7 @@ async fn private_row_owned_by_other_does_not_project_978() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("alice/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let metadata = serde_json::json!({
         "scope": "private",
         "agent_id": "alice",
@@ -456,7 +457,7 @@ async fn audit_1028_mtls_peer_cannot_enumerate_other_agents_private_rows() {
     // namespace allowlisted, should still NOT see private rows
     // belonging to other agents).
     set_peer1_allowlist("tenants/*");
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // Seed 10 private rows across 5 distinct agents. None carry
     // federation_share. None target peer-1. peer-1 owns none.
     for (agent_n, row_n) in (1..=5).flat_map(|a| (0..2).map(move |r| (a, r))) {

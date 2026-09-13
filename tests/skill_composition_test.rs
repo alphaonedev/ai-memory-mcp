@@ -40,15 +40,13 @@ use sha2::Digest as _;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn open_test_db() -> (rusqlite::Connection, PathBuf) {
+fn open_test_db() -> (rusqlite::Connection, PathBuf, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("l2-7-skill-composition.db");
     let conn = db::open(&db_path).expect("open db");
-    // Leak the tempdir for the lifetime of the test by retaining its
-    // path inside the returned tuple — the caller's binding extends
-    // through end-of-test scope so the file isn't deleted under us.
-    std::mem::forget(dir);
-    (conn, db_path)
+    // The guard is returned with the path; the caller's binding keeps the
+    // database until the end of the test, then removes it (#3669).
+    (conn, db_path, dir)
 }
 
 /// Insert a SKILL row directly with the metadata blob the L2-7 parser
@@ -218,7 +216,7 @@ fn parser_populates_vec_and_mirrors_metadata() {
 
 #[test]
 fn legacy_skill_md_returns_body_only() {
-    let (conn, _path) = open_test_db();
+    let (conn, _path, _tmp_guard) = open_test_db();
 
     // SKILL.md with NO composes_with_reflections — pre-L2-7 shape.
     let body = "# Legacy\n\nLegacy skill body.\n";
@@ -253,7 +251,7 @@ fn legacy_skill_md_returns_body_only() {
 
 #[test]
 fn five_reflections_ranked_by_recency_and_recall_count() {
-    let (conn, _path) = open_test_db();
+    let (conn, _path, _tmp_guard) = open_test_db();
 
     let body = "# Composer\n\nUse the declared namespaces.\n";
     // Mirror the declaration as the L2-7 parser would: a single entry
@@ -396,7 +394,7 @@ fn five_reflections_ranked_by_recency_and_recall_count() {
 
 #[test]
 fn min_depth_filters_out_shallower_reflections() {
-    let (conn, _path) = open_test_db();
+    let (conn, _path, _tmp_guard) = open_test_db();
 
     let metadata = json!({
         "composes_with_reflections": [
@@ -450,7 +448,7 @@ fn min_depth_filters_out_shallower_reflections() {
 
 #[test]
 fn max_reflection_depth_ceiling_is_authoritative() {
-    let (conn, _path) = open_test_db();
+    let (conn, _path, _tmp_guard) = open_test_db();
 
     let metadata = json!({
         "composes_with_reflections": [
@@ -500,7 +498,7 @@ fn max_reflection_depth_ceiling_is_authoritative() {
 
 #[test]
 fn budget_tokens_caps_response() {
-    let (conn, _path) = open_test_db();
+    let (conn, _path, _tmp_guard) = open_test_db();
 
     let metadata = json!({
         "composes_with_reflections": [
@@ -559,7 +557,7 @@ fn budget_tokens_caps_response() {
 
 #[test]
 fn unknown_skill_id_errors_cleanly() {
-    let (conn, _path) = open_test_db();
+    let (conn, _path, _tmp_guard) = open_test_db();
     let r = ai_memory::mcp::skill_compositional_context_for_tests(
         &conn,
         &json!({"skill_id": "00000000-0000-0000-0000-000000000000"}),

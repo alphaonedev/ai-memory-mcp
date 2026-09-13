@@ -44,11 +44,10 @@
 use ai_memory::db;
 use ai_memory::models::Memory;
 
-fn fresh_db_conn() -> rusqlite::Connection {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-    let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
-    db::open(&path).expect("open fresh DB")
+fn fresh_db_conn() -> (rusqlite::Connection, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("tempfile");
+    let path = tmp.path().join("test.db");
+    (db::open(&path).expect("open fresh DB"), tmp)
 }
 
 fn seed_memory_with_confidence(conn: &rusqlite::Connection, id: &str, conf: f64) -> Memory {
@@ -79,7 +78,7 @@ fn seed_memory_with_confidence(conn: &rusqlite::Connection, id: &str, conf: f64)
 
 #[test]
 fn confidence_decay_does_not_bump_version_1036() {
-    let conn = fresh_db_conn();
+    let (conn, _tmp_guard) = fresh_db_conn();
     let seeded = seed_memory_with_confidence(&conn, "1036-decay-stable-version", 0.9);
     // Fresh row lands at version=1 per Gap-1 contract (#884).
     assert_eq!(
@@ -129,7 +128,7 @@ fn user_update_bumps_version_pinning_the_contrast_1036() {
     // version bump — at which point optimistic concurrency would be
     // entirely broken. Pinning the contrast keeps the contract
     // load-bearing.
-    let conn = fresh_db_conn();
+    let (conn, _tmp_guard) = fresh_db_conn();
     let seeded = seed_memory_with_confidence(&conn, "1036-user-edit-bumps", 0.9);
     assert_eq!(seeded.version, 1);
 
@@ -169,7 +168,7 @@ fn upsert_merge_bumps_version_1632() {
     // counter exactly like db::update. Pre-#1632 a re-store rewrote
     // content while `version` stood still, so a concurrent caller's
     // stale `If-Match` could overwrite the merge invisibly.
-    let conn = fresh_db_conn();
+    let (conn, _tmp_guard) = fresh_db_conn();
     let mut mem = seed_memory_with_confidence(&conn, "m-1632", 0.9);
     let v1: i64 = conn
         .query_row(
@@ -203,7 +202,7 @@ fn archive_no_tx_joins_outer_transaction_1638() {
     // transaction leaves the live row intact (pre-#1638 the archive
     // committed its own tx, so a later failure could not undo it and
     // the live row was gone with an error returned).
-    let conn = fresh_db_conn();
+    let (conn, _tmp_guard) = fresh_db_conn();
     let _mem = seed_memory_with_confidence(&conn, "m-1638", 0.8);
 
     // db::archive_memory is the tx wrapper; the no-tx core is

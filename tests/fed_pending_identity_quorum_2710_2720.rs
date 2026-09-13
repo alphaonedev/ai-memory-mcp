@@ -85,7 +85,7 @@ fn set_enrolled_self_only() {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -94,11 +94,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -148,7 +149,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 async fn push(router: &axum::Router, body: Value) -> (StatusCode, Value) {
@@ -237,7 +238,7 @@ async fn federated_fresh_pending_drops_stuffed_approvals_2710() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
     set_standard_scope_opt_out();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let wire = json!({
         "id": "pa-2710-e2e",
@@ -365,7 +366,7 @@ async fn federated_reject_rebinds_forged_decider_2720() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
     set_enrolled_self_only();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // Seed a local still-pending row (the peer legitimately queued it).
     {
@@ -423,7 +424,7 @@ async fn federated_reject_converges_explicit_scope_opt_out_2720() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
     set_standard_scope_opt_out();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     {
         let guard = db.lock().await;

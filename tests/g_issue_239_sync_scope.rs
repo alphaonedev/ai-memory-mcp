@@ -48,7 +48,7 @@ use tower::ServiceExt as _;
 /// `oneshot().await` without tripping `clippy::await_holding_lock`.
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -57,11 +57,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -114,7 +115,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 async fn seed(db: &ai_memory::handlers::Db, ns: &str, title: &str) {
@@ -226,7 +227,7 @@ async fn case_1_allowlist_match_returns_in_scope_excludes_others() {
             allowlist,
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // #978 — these rows are operator-intended-to-federate ("public/*"
     // implies broadcast intent in the test fixture). Stamp the
     // explicit `federation_share=true` opt-in so the post-#978
@@ -277,7 +278,7 @@ async fn case_2_allowlist_mismatch_returns_empty() {
             allowlist,
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     seed(&db, "public/alpha", "a").await;
     seed(&db, "private/secret", "b").await;
     let body = sync_since_body(router, Some("peer-1")).await;
@@ -307,7 +308,7 @@ async fn case_3_no_allowlist_with_bypass_is_full_dump() {
             "1",
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     seed(&db, "public/alpha", "a").await;
     seed(&db, "private/secret", "b").await;
     let body = sync_since_body(router, Some("peer-1")).await;
@@ -327,7 +328,7 @@ async fn case_3_no_allowlist_with_bypass_is_full_dump() {
 async fn case_4_no_allowlist_no_bypass_default_denies() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     seed(&db, "public/alpha", "a").await;
     seed(&db, "private/secret", "b").await;
     let body = sync_since_body(router, Some("peer-1")).await;
@@ -346,7 +347,7 @@ async fn case_5_no_peer_header_default_denies() {
     // default-deny rather than the legacy full dump.
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     seed(&db, "public/alpha", "a").await;
     let body = sync_since_body(router, None).await;
     drop(env_guard);

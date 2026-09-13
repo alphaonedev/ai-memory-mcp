@@ -37,7 +37,7 @@ static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 const REQUIRE_ATTEST_ENV: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTATION";
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -46,11 +46,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -103,7 +104,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 async fn post_json(
@@ -168,7 +169,7 @@ async fn bulk_create_unsigned_rejected_under_required_attestation_1919() {
     let _g = ENV_LOCK.lock().await;
     // Exploit precondition: required-attestation is on (the v0.9 default).
     unsafe { std::env::set_var(REQUIRE_ATTEST_ENV, "1") };
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // Attacker POSTs an UNSIGNED batch with a self-asserted victim id.
     let body = json!([
@@ -209,7 +210,7 @@ async fn bulk_create_unsigned_allowed_when_attestation_opted_out_1919() {
     // Legitimate behaviour preserved: with the explicit opt-out, unsigned
     // bulk still works (we must not break the permissive deployment).
     unsafe { std::env::set_var(REQUIRE_ATTEST_ENV, "0") };
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let body = json!([
         {
@@ -245,7 +246,7 @@ async fn bulk_create_unsigned_allowed_when_attestation_opted_out_1919() {
 async fn search_rejects_spoofed_as_agent_1922() {
     let _g = ENV_LOCK.lock().await;
     unsafe { std::env::remove_var(REQUIRE_ATTEST_ENV) };
-    let (router, _db) = build_router_with_db();
+    let (router, _db, _tmp_guard) = build_router_with_db();
 
     // EXPLOIT: attacker (own id "ai:attacker") drives team/unit/org
     // visibility off a victim's namespace via ?as_agent=.
@@ -302,7 +303,7 @@ async fn federated_deletion_outside_peer_scope_refused_1934() {
         );
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // Seed a victim row in secure/ops via the normal create path.
     let create = json!({
@@ -383,7 +384,7 @@ async fn federated_forged_approval_does_not_execute_1920() {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // EXPLOIT: one push injects a Human-gated pending `store` AND a forged
     // approval for it with an attacker-chosen, unregistered decider.

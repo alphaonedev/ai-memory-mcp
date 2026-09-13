@@ -38,11 +38,10 @@ static FED_SIGNING_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 const PEER_ID: &str = "peer-fupb-signing";
 
-fn build_sqlite_router() -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+fn build_sqlite_router() -> (axum::Router, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
     let conn = ai_memory::db::open(&db_path).expect("reopen");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -98,7 +97,7 @@ fn build_sqlite_router() -> axum::Router {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(api_key_state, app_state)
+    (ai_memory::build_router(api_key_state, app_state), f)
 }
 
 /// Enrol `signer`'s public key under `PEER_ID` in a fresh temp key dir
@@ -172,7 +171,7 @@ async fn signed_push_with_enrolled_key_is_accepted() {
         .unwrap_or_else(|p| p.into_inner());
     let signer = SigningKey::from_bytes(&[7u8; 32]);
     let _dir = enrol_peer_key(&signer);
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
 
     let body = push_body();
     let sig = fed_signing::sign_body_header(&signer, &body);
@@ -198,7 +197,7 @@ async fn signed_push_with_bad_signature_is_rejected_401() {
         .unwrap_or_else(|p| p.into_inner());
     let signer = SigningKey::from_bytes(&[9u8; 32]);
     let _dir = enrol_peer_key(&signer);
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
 
     let body = push_body();
     // A correctly-shaped but wrong signature: sign a DIFFERENT body.
@@ -225,7 +224,7 @@ async fn enrolled_peer_omitting_signature_is_rejected_401() {
         .unwrap_or_else(|p| p.into_inner());
     let signer = SigningKey::from_bytes(&[11u8; 32]);
     let _dir = enrol_peer_key(&signer);
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
 
     let body = push_body();
     let resp = router
@@ -283,7 +282,7 @@ async fn signed_push_without_a_nonce_is_refused_when_the_nonce_gate_is_on() {
     let _dir = enrol_peer_key(&signer);
     // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
     unsafe { require_nonce_on() };
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
 
     let body = push_body();
     let sig = fed_signing::sign_body_header(&signer, &body);
@@ -313,7 +312,7 @@ async fn a_replayed_nonce_on_a_signed_push_is_refused() {
     let _dir = enrol_peer_key(&signer);
     // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
     unsafe { require_nonce_on() };
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
 
     let body = push_body();
     let nonce = "cov-3521-nonce-a";
@@ -361,7 +360,7 @@ async fn signed_sync_since_without_a_nonce_is_refused_when_the_nonce_gate_is_on(
     let _dir = enrol_peer_key(&signer);
     // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
     unsafe { require_nonce_on() };
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
 
     let path = "/api/v1/sync/since";
     let query = format!("peer={PEER_ID}");
@@ -398,7 +397,7 @@ async fn a_replayed_nonce_on_a_signed_sync_since_is_refused() {
     let _dir = enrol_peer_key(&signer);
     // SAFETY: FED_SIGNING_ENV_LOCK is held for the whole test.
     unsafe { require_nonce_on() };
-    let router = build_sqlite_router();
+    let (router, _tmp_guard) = build_sqlite_router();
 
     let path = "/api/v1/sync/since";
     let query = format!("peer={PEER_ID}");

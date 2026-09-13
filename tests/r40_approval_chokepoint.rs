@@ -108,11 +108,10 @@ fn open_db(db_path: &std::path::Path) -> rusqlite::Connection {
     ai_memory::db::open(db_path).expect("db::open")
 }
 
-fn build_sqlite_router() -> (axum::Router, std::path::PathBuf) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+fn build_sqlite_router() -> (axum::Router, std::path::PathBuf, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
     let conn = ai_memory::db::open(&db_path).expect("reopen");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -168,7 +167,7 @@ fn build_sqlite_router() -> (axum::Router, std::path::PathBuf) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db_path)
+    (ai_memory::build_router(api_key_state, app_state), db_path, f)
 }
 
 /// Seed a STORE-shaped, escalation-flagged pending (as the L1-6 producer would)
@@ -276,7 +275,7 @@ async fn approval_decide_sqlite_enforces_gate() {
     let operator = keypair(11);
     enroll_operator(&operator);
     ai_memory::config::set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, db_path) = build_sqlite_router();
+    let (router, db_path, _tmp_guard) = build_sqlite_router();
 
     // (a) missing signatures → fail-closed 403.
     let pid = seed_escalated_store_pending(&db_path, "dec-a", "body-a");
@@ -331,7 +330,7 @@ async fn approve_pending_sqlite_enforces_gate() {
     let operator = keypair(12);
     enroll_operator(&operator);
     ai_memory::config::set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, db_path) = build_sqlite_router();
+    let (router, db_path, _tmp_guard) = build_sqlite_router();
 
     // (a) missing signatures → fail-closed 403.
     let pid = seed_escalated_store_pending(&db_path, "app-a", "body-a");
@@ -442,7 +441,7 @@ fn mcp_funnel_enforces_gate() {
 // re-proves it against the enterprise-fed tier.
 // ---------------------------------------------------------------------------
 
-fn build_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
+fn build_fake_pg_router() -> (axum::Router, std::path::PathBuf, tempfile::TempDir) {
     let scratch = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         scratch,
@@ -450,9 +449,8 @@ fn build_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-    let store_path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
+    let store_path = tmp.path().join("test.db");
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
     );
@@ -505,6 +503,7 @@ fn build_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
     (
         ai_memory::build_router(api_key_state, app_state),
         store_path,
+        tmp,
     )
 }
 
@@ -528,7 +527,7 @@ async fn approval_decide_postgres_enforces_gate() {
     let operator = keypair(15);
     enroll_operator(&operator);
     ai_memory::config::set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, store_path) = build_fake_pg_router();
+    let (router, store_path, _tmp_guard) = build_fake_pg_router();
 
     let pid = seed_escalated_store_pending_in_store(&store_path, "pgdec-a", "body-a");
     let uri = format!("/api/v1/approvals/{pid}");
@@ -579,7 +578,7 @@ async fn approve_pending_postgres_enforces_gate() {
     let operator = keypair(16);
     enroll_operator(&operator);
     ai_memory::config::set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, store_path) = build_fake_pg_router();
+    let (router, store_path, _tmp_guard) = build_fake_pg_router();
 
     let pid = seed_escalated_store_pending_in_store(&store_path, "pgapp-a", "body-a");
     let uri = format!("/api/v1/pending/{pid}/approve");
@@ -652,7 +651,7 @@ async fn met_quorum_chains_approval_quorum_met_on_http_surface() {
     forensic::shutdown();
     forensic::init(dir.path(), None).expect("init forensic sink");
 
-    let (router, db_path) = build_sqlite_router();
+    let (router, db_path, _tmp_guard) = build_sqlite_router();
     let pid = seed_escalated_store_pending(&db_path, "audit-ns", "audit-body");
     let uri = format!("/api/v1/approvals/{pid}");
     let body = json!({ "decision": "approve", "approvals": approvals_json(&[sign_approval(&operator, &pid)]) });

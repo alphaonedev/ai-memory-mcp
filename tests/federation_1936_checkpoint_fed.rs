@@ -95,26 +95,28 @@ const RESOLVER_ENROLLED: &str = "ai:epoch-operator-1936";
 const RESOLVER_GHOST: &str = "ai:ghost-resolver-1936";
 const CHECKPOINT_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG";
 
-/// Shared key dir for the process (leaked so the path stays valid for every
-/// request). The enrolled resolver's PUBLIC key is written here once; the
-/// funnel's `lookup_peer_public_key` reads `AI_MEMORY_KEY_DIR`.
+/// Shared key dir for the process, so the path stays valid for every request.
+/// The enrolled PUBLIC key is written here once; the funnel's
+/// `lookup_peer_public_key` reads `AI_MEMORY_KEY_DIR`. #3669: the directory
+/// is removed at process exit instead of being leaked.
 fn enrolled_key_dir() -> (&'static std::path::Path, kp_mod::AgentKeypair) {
     use std::sync::OnceLock;
-    static DIR: OnceLock<(std::path::PathBuf, kp_mod::AgentKeypair)> = OnceLock::new();
-    let (p, kp) = DIR.get_or_init(|| {
-        let tmp = tempfile::TempDir::new().expect("key tempdir");
-        let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp); // leak: keep the dir for the whole test binary
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static KEYPAIR: OnceLock<kp_mod::AgentKeypair> = OnceLock::new();
+    let path = ai_memory::test_scratch::process_lifetime_dir(&DIR, || {
+        tempfile::TempDir::new().expect("key tempdir")
+    });
+    let kp = KEYPAIR.get_or_init(|| {
         let kp = kp_mod::generate(RESOLVER_ENROLLED).expect("generate resolver");
         let pub_only = kp_mod::AgentKeypair {
             agent_id: RESOLVER_ENROLLED.to_string(),
             public: kp.public,
             private: None,
         };
-        kp_mod::save_public_only(&pub_only, &path).expect("enroll resolver pubkey");
-        (path, kp)
+        kp_mod::save_public_only(&pub_only, path).expect("enroll resolver pubkey");
+        kp
     });
-    (p.as_path(), kp.clone())
+    (path, kp.clone())
 }
 
 /// Point the funnel at the enrolled key dir + reach the checkpoint loop (the
@@ -136,7 +138,7 @@ fn reset_env(require_checkpoint_sig: Option<&str>) -> NamespaceScopeGuard {
     scope
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -144,10 +146,11 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -196,7 +199,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 /// A resolved `EpochAdvance` checkpoint signed by `signer`, attributed to
@@ -277,7 +280,7 @@ async fn epoch_advance_resolution_round_trips_strict() {
     let _guard = ENV_LOCK.lock().await;
     let _scope = reset_env(None); // knob unset → default fail-closed
     let (_dir, resolver_kp) = enrolled_key_dir();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-epoch-rt", RESOLVER_ENROLLED, "deadbeef", &resolver_kp);
 
     let (status, resp) = post_push(router, &push_body(&cp)).await;
@@ -310,7 +313,7 @@ async fn strict_refuses_unenrolled_resolver() {
     let _scope = reset_env(Some("1")); // explicit fail-closed
     // A resolver with NO enrolled key on the receiver, signed by its own key.
     let ghost_kp = kp_mod::generate(RESOLVER_GHOST).unwrap();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-strict-ghost", RESOLVER_GHOST, "ghosted", &ghost_kp);
 
     let (status, resp) = post_push(router, &push_body(&cp)).await;
@@ -324,7 +327,7 @@ async fn escape_hatch_permissive_applies_unenrolled() {
     let _guard = ENV_LOCK.lock().await;
     let _scope = reset_env(Some("0")); // operator opt-out
     let ghost_kp = kp_mod::generate(RESOLVER_GHOST).unwrap();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-permissive", RESOLVER_GHOST, "allowed", &ghost_kp);
 
     let (status, resp) = post_push(router, &push_body(&cp)).await;
@@ -347,7 +350,7 @@ async fn forged_signature_rejected_even_permissive() {
     // Sign with mallory's key but attribute to the ENROLLED resolver: the
     // signature will not verify against the resolver's enrolled key.
     let mallory = kp_mod::generate("ai:mallory-1936").unwrap();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-forged", RESOLVER_ENROLLED, "forged", &mallory);
 
     let (status, resp) = post_push(router, &push_body(&cp)).await;
@@ -369,14 +372,14 @@ async fn idempotent_replay_is_noop() {
     let _guard = ENV_LOCK.lock().await;
     let _scope = reset_env(None);
     let (_dir, resolver_kp) = enrolled_key_dir();
-    let (router1, db) = build_router_with_db();
+    let (router1, db, _tmp_guard) = build_router_with_db();
     let cp = resolved_epoch_checkpoint("cp-replay", RESOLVER_ENROLLED, "once", &resolver_kp);
 
     let (_s1, r1) = post_push(router1, &push_body(&cp)).await;
     assert_eq!(r1["checkpoints_applied"], json!(1));
 
     // Byte-identical replay against the SAME substrate → Noop, no re-apply.
-    let router2 = router_sharing_db(&db);
+    let (router2, _tmp_guard) = router_sharing_db(&db);
     let (_s2, r2) = post_push(router2, &push_body(&cp)).await;
     assert_eq!(
         r2["checkpoints_applied"],
@@ -400,7 +403,7 @@ async fn divergent_resolution_conflicts_first_wins() {
     let _guard = ENV_LOCK.lock().await;
     let _scope = reset_env(None);
     let (_dir, resolver_kp) = enrolled_key_dir();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let first =
         resolved_epoch_checkpoint("cp-conflict", RESOLVER_ENROLLED, "approved", &resolver_kp);
@@ -411,7 +414,7 @@ async fn divergent_resolution_conflicts_first_wins() {
     // bound to the SAME db.
     let second =
         resolved_epoch_checkpoint("cp-conflict", RESOLVER_ENROLLED, "rejected", &resolver_kp);
-    let router2 = router_sharing_db(&db);
+    let (router2, _tmp_guard) = router_sharing_db(&db);
     let (_s2, r2) = post_push(router2, &push_body(&second)).await;
     assert_eq!(r2["checkpoints_applied"], json!(0), "resp={r2}");
     assert_eq!(r2["checkpoints_conflicted"], json!(1), "resp={r2}");
@@ -424,11 +427,12 @@ async fn divergent_resolution_conflicts_first_wins() {
 
 /// Build a second router that shares the given DB handle (so a two-push
 /// sequence lands against one substrate).
-fn router_sharing_db(db: &ai_memory::handlers::Db) -> axum::Router {
+fn router_sharing_db(db: &ai_memory::handlers::Db) -> (axum::Router, tempfile::TempDir) {
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile");
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -469,7 +473,7 @@ fn router_sharing_db(db: &ai_memory::handlers::Db) -> axum::Router {
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(
+    let built = ai_memory::build_router(
         ai_memory::handlers::ApiKeyState {
             key: None,
             mtls_enforced: false,
@@ -479,7 +483,8 @@ fn router_sharing_db(db: &ai_memory::handlers::Db) -> axum::Router {
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
         },
         app_state,
-    )
+    );
+    (built, tmp)
 }
 
 // ---------------------------------------------------------------------------

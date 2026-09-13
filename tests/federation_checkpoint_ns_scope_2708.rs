@@ -78,26 +78,28 @@ fn scoped_allowlist() -> String {
     )
 }
 
-/// Shared key dir for the process (leaked so the path stays valid for every
-/// request). The peer/resolver's PUBLIC key is enrolled here once; the funnel's
-/// `lookup_peer_public_key` reads `AI_MEMORY_KEY_DIR`.
+/// Shared key dir for the process, so the path stays valid for every request.
+/// The enrolled PUBLIC key is written here once; the funnel's
+/// `lookup_peer_public_key` reads `AI_MEMORY_KEY_DIR`. #3669: the directory
+/// is removed at process exit instead of being leaked.
 fn enrolled_key_dir() -> (&'static std::path::Path, kp_mod::AgentKeypair) {
     use std::sync::OnceLock;
-    static DIR: OnceLock<(std::path::PathBuf, kp_mod::AgentKeypair)> = OnceLock::new();
-    let (p, kp) = DIR.get_or_init(|| {
-        let tmp = tempfile::TempDir::new().expect("key tempdir");
-        let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp); // leak: keep the dir for the whole test binary
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static KEYPAIR: OnceLock<kp_mod::AgentKeypair> = OnceLock::new();
+    let path = ai_memory::test_scratch::process_lifetime_dir(&DIR, || {
+        tempfile::TempDir::new().expect("key tempdir")
+    });
+    let kp = KEYPAIR.get_or_init(|| {
         let kp = kp_mod::generate(PEER_ID).expect("generate resolver");
         let pub_only = kp_mod::AgentKeypair {
             agent_id: PEER_ID.to_string(),
             public: kp.public,
             private: None,
         };
-        kp_mod::save_public_only(&pub_only, &path).expect("enroll resolver pubkey");
-        (path, kp)
+        kp_mod::save_public_only(&pub_only, path).expect("enroll resolver pubkey");
+        kp
     });
-    (p.as_path(), kp.clone())
+    (path, kp.clone())
 }
 
 /// Point the funnel at the enrolled key dir and the peer's namespace scope.
@@ -147,7 +149,7 @@ fn clear_env() {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -155,10 +157,11 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -207,7 +210,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 /// A locally-PENDING approval checkpoint in `namespace` (carries no
@@ -315,7 +318,7 @@ async fn out_of_scope_stored_anchor_cannot_be_resolved_by_wire_namespace_2708() 
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     reset_env(true);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // A locally-pending freeze anchor in secure/ops (the peer is NOT scoped for
     // it).
@@ -371,7 +374,7 @@ async fn in_scope_stored_anchor_resolution_applies_2708() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     reset_env(true);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // A locally-pending anchor in the peer's declared scope.
     let anchor_id = "cp-public-anchor-2708";
@@ -409,7 +412,7 @@ async fn first_resolution_wins_idempotency_preserved_under_scope_gate_2708() {
     let _g = ENV_LOCK.lock().await;
     let _posture = PostureGuard;
     reset_env(true);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let anchor_id = "cp-idem-anchor-2708";
     seed_pending(&db, &pending_checkpoint(anchor_id, IN_SCOPE_NS)).await;
@@ -479,7 +482,7 @@ async fn no_allowlist_checkpoint_posture_matrix_3582() {
                 );
             }
         }
-        let (router, db) = build_router_with_db();
+        let (router, db, _tmp_guard) = build_router_with_db();
 
         // The identical signed mutation covers first landing and a stored anchor.
         for locally_pending in [false, true] {

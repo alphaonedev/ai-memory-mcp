@@ -109,26 +109,28 @@ fn uniq(prefix: &str) -> String {
     format!("{prefix}-{}", &uuid::Uuid::new_v4().to_string()[..8])
 }
 
-/// Shared key dir for the process (leaked so the path stays valid for every
-/// request). The enrolled resolver's PUBLIC key is written here once; the
-/// funnel's `lookup_peer_public_key` reads `AI_MEMORY_KEY_DIR`.
+/// Shared key dir for the process, so the path stays valid for every request.
+/// The enrolled PUBLIC key is written here once; the funnel's
+/// `lookup_peer_public_key` reads `AI_MEMORY_KEY_DIR`. #3669: the directory
+/// is removed at process exit instead of being leaked.
 fn enrolled_key_dir() -> (&'static std::path::Path, kp_mod::AgentKeypair) {
     use std::sync::OnceLock;
-    static DIR: OnceLock<(std::path::PathBuf, kp_mod::AgentKeypair)> = OnceLock::new();
-    let (p, kp) = DIR.get_or_init(|| {
-        let tmp = tempfile::TempDir::new().expect("key tempdir");
-        let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static KEYPAIR: OnceLock<kp_mod::AgentKeypair> = OnceLock::new();
+    let path = ai_memory::test_scratch::process_lifetime_dir(&DIR, || {
+        tempfile::TempDir::new().expect("key tempdir")
+    });
+    let kp = KEYPAIR.get_or_init(|| {
         let kp = kp_mod::generate(RESOLVER_ENROLLED).expect("generate resolver");
         let pub_only = kp_mod::AgentKeypair {
             agent_id: RESOLVER_ENROLLED.to_string(),
             public: kp.public,
             private: None,
         };
-        kp_mod::save_public_only(&pub_only, &path).expect("enroll resolver pubkey");
-        (path, kp)
+        kp_mod::save_public_only(&pub_only, path).expect("enroll resolver pubkey");
+        kp
     });
-    (p.as_path(), kp.clone())
+    (path, kp.clone())
 }
 
 /// Point the funnel at the enrolled key dir and reach the checkpoint loop (the

@@ -56,7 +56,7 @@ use rusqlite::Connection;
 /// that ladder. We do NOT hardcode the live schema-version literal
 /// here — that lives in exactly one place (the constant) and is
 /// pinned by the lib tests at `current_schema_version_*`.
-fn fresh_v53_db() -> Connection {
+fn fresh_v53_db() -> (Connection, tempfile::TempDir) {
     // Use a tempfile under .local-runs/ rather than `:memory:` so
     // the path-based `ai_memory::storage::open` API works
     // unchanged. Per CLAUDE.md HARD RULE: no `/tmp` scratch.
@@ -71,8 +71,7 @@ fn fresh_v53_db() -> Connection {
     // (Without leaking, `tmpdir` would drop and remove the DB file
     // before `query_row` runs because the Connection holds a separate
     // handle to the file.)
-    std::mem::forget(tmpdir);
-    ai_memory::storage::open(&db_path).expect("open fresh v53 db")
+    (ai_memory::storage::open(&db_path).expect("open fresh v53 db"), tmpdir)
 }
 
 /// Probe the live `memories_au` trigger definition from `sqlite_master`.
@@ -113,7 +112,7 @@ fn v53_trigger_sql_names_only_title_content_tags() {
     // Structural pin — the recreated trigger MUST have an
     // `AFTER UPDATE OF title, content, tags` clause. Future
     // regressions that revert the DDL fail this test immediately.
-    let conn = fresh_v53_db();
+    let (conn, _tmp_guard) = fresh_v53_db();
     let sql = trigger_sql(&conn);
 
     // SQLite normalises trigger SQL to the registered form. The
@@ -153,7 +152,7 @@ fn update_to_non_fts_column_does_not_refresh_fts() {
     // load-bearing observable is the trigger structural pin
     // above + the row-count invariant below + the MATCH semantics
     // after a follow-on update to a *different* row.
-    let conn = fresh_v53_db();
+    let (conn, _tmp_guard) = fresh_v53_db();
 
     // Step 1: INSERT memory M; verify `memories_fts` has 1 row.
     // Title and content share NO words so we can probe each
@@ -227,7 +226,7 @@ fn update_to_fts_column_does_refresh_fts() {
     // (here, `title`) MUST fire `memories_au` so the FTS index
     // re-syncs. Without this control the column-scoping fix
     // could over-narrow and silently break FTS sync.
-    let conn = fresh_v53_db();
+    let (conn, _tmp_guard) = fresh_v53_db();
 
     // Step 1 — INSERT.  Title and content share NO words so we can
     // probe the title and the content independently via FTS MATCH.

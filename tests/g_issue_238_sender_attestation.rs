@@ -46,7 +46,7 @@ use tower::ServiceExt as _;
 /// tripping `clippy::await_holding_lock`.
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -55,11 +55,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -112,7 +113,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 /// Build a minimal `/sync/push` request body with a single memory.
@@ -180,7 +181,7 @@ fn reset_env() {
 async fn case_1_header_matches_body_accepts() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let body = push_body("peer-1");
     let req = Request::builder()
         .method("POST")
@@ -215,7 +216,7 @@ async fn case_1_header_matches_body_accepts() {
 async fn case_2_header_mismatch_no_allowlist_refuses_403() {
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let body = push_body("alice"); // body claims alice
     let req = Request::builder()
         .method("POST")
@@ -258,7 +259,7 @@ async fn case_3_header_absent_body_present_refuses_unless_bypass() {
     // and must 403 (header absent = peer cannot be attested).
     let env_guard = ENV_LOCK.lock().await;
     reset_env();
-    let (router, _db) = build_router_with_db();
+    let (router, _db, _tmp_guard) = build_router_with_db();
     let body = push_body("alice");
     let req = Request::builder()
         .method("POST")
@@ -292,7 +293,7 @@ async fn case_4_env_bypass_allows_mismatch() {
             "1",
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let body = push_body("alice");
     let req = Request::builder()
         .method("POST")
@@ -340,7 +341,7 @@ async fn case_5_allowlist_permits_mismatch() {
             allowlist,
         );
     }
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let body = push_body("alice");
     let req = Request::builder()
         .method("POST")

@@ -450,12 +450,11 @@ mod visibility_1935_tests {
     use super::*;
     use serde_json::json;
 
-    fn open_db() -> rusqlite::Connection {
+    fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.db");
         let c = crate::db::open(&path).expect("db::open");
-        std::mem::forget(dir);
-        c
+        (c, dir)
     }
 
     fn insert_mem(
@@ -485,7 +484,7 @@ mod visibility_1935_tests {
     #[test]
     fn kg_walk_hides_invisible_target_1935() {
         let _envg = crate::identity::agent_id_env_test_lock();
-        let c = open_db();
+        let (c, _tmp_guard) = open_db();
         let src = insert_mem(
             &c,
             "attacker-root",

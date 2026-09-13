@@ -877,6 +877,11 @@ pub mod models;
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
 #[cfg(test)]
 mod test_support;
+/// Process-lifetime temporary directories for tests, removed at process
+/// exit (#3669). Built for the crate's own tests and, through the
+/// `test-support` feature, for the integration-test binaries.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_scratch;
 // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator. Batman
 // closeout: deterministic helpers run first (Jaccard, cosine, FTS
 // classifier), then LLM stages prepend a SHARED PREFIX and consume

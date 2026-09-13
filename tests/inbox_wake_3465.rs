@@ -50,12 +50,11 @@ fn uid(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
-fn temp_db() -> std::path::PathBuf {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+fn temp_db() -> (std::path::PathBuf, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
-    db_path
+    (db_path, f)
 }
 
 fn build_sqlite_router(db_path: &std::path::Path) -> axum::Router {
@@ -149,7 +148,7 @@ async fn wake_for(
 async fn mcp_notify_publishes_a_wake_3465() {
     let recipient = uid("bob");
     let payload = "the body nobody may put on the bus";
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let conn = ai_memory::db::open(&db_path).expect("open");
     let mut rx = subscribe();
 
@@ -217,7 +216,7 @@ async fn mcp_notify_publishes_a_wake_3465() {
 async fn wake_frame_never_carries_the_body_3465() {
     let recipient = uid("carol");
     let secret = "SUPER-SECRET-NOTIFY-BODY-3465";
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let conn = ai_memory::db::open(&db_path).expect("open");
     let mut rx = subscribe();
 
@@ -250,7 +249,7 @@ async fn wake_frame_never_carries_the_body_3465() {
 #[tokio::test]
 async fn sqlite_sal_notify_publishes_a_wake_3465() {
     let recipient = uid("dave");
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let store = ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("SqliteStore");
     let ctx = ai_memory::store::CallerContext::for_agent("ai:alice");
     let mut rx = subscribe();
@@ -312,7 +311,7 @@ async fn inbox_stream_delivers_the_recipients_own_wake_3465() {
     use http_body_util::BodyExt as _;
 
     let recipient = uid("erin");
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let router = build_sqlite_router(&db_path);
 
     let resp = router
@@ -393,7 +392,7 @@ async fn inbox_stream_never_delivers_another_agents_wake_3465() {
 
     let recipient = uid("frank");
     let eavesdropper = uid("mallory");
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let router = build_sqlite_router(&db_path);
 
     let resp = router
@@ -449,7 +448,7 @@ async fn inbox_stream_never_delivers_another_agents_wake_3465() {
 #[tokio::test]
 async fn inbox_stream_anonymous_subscriber_opens_but_is_fail_closed_3465() {
     for header in [None, Some("host:laptop:pid-1")] {
-        let db_path = temp_db();
+        let (db_path, _tmp_guard) = temp_db();
         let router = build_sqlite_router(&db_path);
         let mut req = Request::builder().method("GET").uri("/api/v1/inbox/stream");
         if let Some(h) = header {
@@ -475,7 +474,7 @@ async fn inbox_stream_anonymous_subscriber_opens_but_is_fail_closed_3465() {
 /// is a claim the substrate honours rather than a decorative entry.
 #[test]
 fn agent_notified_is_a_subscribable_webhook_event_3465() {
-    let db_path = temp_db();
+    let (db_path, _tmp_guard) = temp_db();
     let conn = ai_memory::db::open(&db_path).expect("open");
 
     let allowed = ai_memory::subscriptions::insert(

@@ -39,11 +39,10 @@ static APPROVALS_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
 const TEST_SECRET: &str = "cov-fupb-approvals-secret";
 
-fn build_sqlite_router() -> (axum::Router, std::path::PathBuf) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
-    let db_path = f.path().to_path_buf();
+fn build_sqlite_router() -> (axum::Router, std::path::PathBuf, tempfile::TempDir) {
+    let f = tempfile::TempDir::new().expect("tempfile");
+    let db_path = f.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
     let conn = ai_memory::db::open(&db_path).expect("reopen");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -99,7 +98,7 @@ fn build_sqlite_router() -> (axum::Router, std::path::PathBuf) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db_path)
+    (ai_memory::build_router(api_key_state, app_state), db_path, f)
 }
 
 /// Seed a delete-shaped pending row directly into the sqlite DB the
@@ -242,7 +241,7 @@ fn sse_no_namespace_hint_fails_closed() {
 
 #[tokio::test]
 async fn approvals_sse_identified_subscriber_returns_event_stream() {
-    let (router, _p) = build_sqlite_router();
+    let (router, _p, _tmp_guard) = build_sqlite_router();
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/approvals/stream")
@@ -266,7 +265,7 @@ async fn approvals_sse_identified_subscriber_returns_event_stream() {
 async fn approvals_sse_host_prefixed_agent_id_accepted_as_anonymous() {
     // The handshake filters `host:`-prefixed agent_ids to empty — the
     // stream is still established (200), just fail-closed on visibility.
-    let (router, _p) = build_sqlite_router();
+    let (router, _p, _tmp_guard) = build_sqlite_router();
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/approvals/stream")
@@ -279,7 +278,7 @@ async fn approvals_sse_host_prefixed_agent_id_accepted_as_anonymous() {
 
 #[tokio::test]
 async fn approvals_sse_anonymous_subscriber_ok() {
-    let (router, _p) = build_sqlite_router();
+    let (router, _p, _tmp_guard) = build_sqlite_router();
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/approvals/stream")
@@ -299,7 +298,7 @@ async fn approval_decide_deny_sqlite_arm_returns_rejected() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, db_path) = build_sqlite_router();
+    let (router, db_path, _tmp_guard) = build_sqlite_router();
     let pending_id = seed_pending_row(&db_path, "team-a", "alice");
 
     let body = json!({"decision": "deny", "remember": "once"}).to_string();
@@ -330,7 +329,7 @@ async fn approval_decide_deny_missing_row_returns_404() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
-    let (router, _db_path) = build_sqlite_router();
+    let (router, _db_path, _tmp_guard) = build_sqlite_router();
     let body = json!({"decision": "deny", "remember": "once"}).to_string();
     let resp = router
         .oneshot(signed_request("nonexistent-deny-row", &body))
@@ -351,7 +350,7 @@ async fn approval_decide_approve_forever_is_refused_3394() {
         .unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
     ai_memory::approvals::clear_synthetic_rules_for_test();
-    let (router, db_path) = build_sqlite_router();
+    let (router, db_path, _tmp_guard) = build_sqlite_router();
     let pending_id = seed_pending_row(&db_path, "team-syn", "alice");
 
     // #3394 — remember=forever is refused before any decision is recorded.
@@ -387,7 +386,7 @@ async fn approval_decide_missing_hmac_secret_401() {
     // No server-wide HMAC configured → strict refusal (401) regardless
     // of signature contents.
     set_active_hooks_hmac_secret(None);
-    let (router, _db_path) = build_sqlite_router();
+    let (router, _db_path, _tmp_guard) = build_sqlite_router();
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/approvals/some-id")

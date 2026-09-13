@@ -4513,7 +4513,7 @@ mod tests {
         // `StoreError::InvalidTransition` (→ HTTP 409). Pre-#1726 the gate had
         // zero callers and any edge was silently written.
         use crate::models::LifecycleState;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
 
         // Legal: open -> active.
@@ -4606,7 +4606,7 @@ mod tests {
     /// proving the advertised property at runtime, not just on the wire.
     #[tokio::test]
     async fn atomic_multi_write_bit_matches_consolidate_rollback_1670() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         assert!(
             store
                 .capabilities()
@@ -4739,15 +4739,14 @@ mod tests {
     // fresh tempfile DB so cross-test isolation is guaranteed.
     // ---------------------------------------------------------------------
 
-    fn fresh_store() -> SqliteStore {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let path = tmp.path().to_path_buf();
+    fn fresh_store() -> (SqliteStore, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("tempfile");
+        let path = tmp.path().join("test.db");
         // Drop the NamedTempFile guard so close() doesn't race the DB
         // open; the path leaks but it's under the OS tmp dir which
         // colima/macOS reaps. Tests run hermetically inside a worktree
         // tempdir; no /tmp violation per project rule.
-        std::mem::forget(tmp);
-        SqliteStore::open(&path).expect("open SqliteStore")
+        (SqliteStore::open(&path).expect("open SqliteStore"), tmp)
     }
 
     #[tokio::test]
@@ -4756,7 +4755,7 @@ mod tests {
         // `status='expired'` and return its `(id, namespace)` pair (the free-fn
         // internals are exhaustively covered in `storage/mod.rs`; this pins the
         // trait-surface wiring). A non-positive default disables the sweep.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         {
             let conn = store.state.lock().await;
             conn.execute(
@@ -4800,7 +4799,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_version_returns_nonzero_after_open() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let v = store.schema_version().await.expect("schema_version");
         // db::open runs the migration ladder; schema_version should be
         // strictly positive after open. (The exact value tracks the
@@ -4810,7 +4809,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_stored_memories() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("listme", "content for list query");
         let id = store.store(&ctx, &mem).await.expect("store");
@@ -4828,7 +4827,7 @@ mod tests {
         // Filter.limit == 0 should be treated as "100" by the adapter
         // (per the implementation comment). Verify by storing one row
         // and confirming a zero-limit list still returns it.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("default-limit", "needs sufficient content for fts");
         store.store(&ctx, &mem).await.expect("store");
@@ -4846,7 +4845,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_finds_keyword_match() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("searchable", "fts5 token jellyfish for unique grep");
         store.store(&ctx, &mem).await.expect("store");
@@ -4866,7 +4865,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_missing_returns_not_found() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let err = store
             .update(
@@ -4884,7 +4883,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_missing_returns_not_found() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let err = store
             .delete(&ctx, "22222222-2222-2222-2222-222222222222")
@@ -4895,7 +4894,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_then_get_chain() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("ephemeral", "stored briefly for delete test");
         let id = store.store(&ctx, &mem).await.expect("store");
@@ -4906,7 +4905,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_missing_returns_not_found() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let err = store
             .verify(&ctx, "33333333-3333-3333-3333-333333333333")
@@ -4917,7 +4916,7 @@ mod tests {
 
     #[tokio::test]
     async fn link_and_list_links_round_trip() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("source-mem", "content for link source");
         let b = test_memory("target-mem", "content for link target");
@@ -4974,7 +4973,7 @@ mod tests {
         // return BOTH the outbound (source==anchor) and inbound
         // (target==anchor) edges, mirroring `db::get_links`. Pins the
         // SQLite half of the cross-backend parity contract.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("anchor", "central memory for the probe");
         let b = test_memory("downstream", "memory that anchor points to");
@@ -5046,7 +5045,7 @@ mod tests {
         // Unlinked id must yield Ok(empty). Pins the "no rows" branch of
         // the FX-C2 trait addition so downstream consumers can rely on
         // empty-vec semantics rather than `NotFound`.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let m = test_memory("alone", "no edges from or to this memory");
         let id = store.store(&ctx, &m).await.expect("store");
@@ -5065,7 +5064,7 @@ mod tests {
         // `memory_get_links` MCP tool docstring promises them. This
         // test inserts a signed-ish link with explicit temporal anchors
         // and verifies all three round-trip.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("anchor-temp", "anchor for temporal-fields probe");
         let b = test_memory("target-temp", "target for temporal-fields probe");
@@ -5114,7 +5113,7 @@ mod tests {
     #[tokio::test]
     async fn link_signed_unsigned_falls_through() {
         // link_signed with None keypair must land "unsigned" attest.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("ls-a", "content for ls a");
         let b = test_memory("ls-b", "content for ls b");
@@ -5142,7 +5141,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_then_is_registered() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let agent = AgentRegistration {
             agent_id: "ai:tester@host".to_string(),
@@ -5169,7 +5168,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_memories_updated_since_no_filter() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("since-test", "content for since-query test");
         store.store(&ctx, &mem).await.expect("store");
@@ -5185,7 +5184,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_remote_memory_is_idempotent() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("remote", "remote content for apply path");
         let id1 = store
@@ -5206,7 +5205,7 @@ mod tests {
         // permissions mode to Enforce + install a deny-all link rule, whose
         // window would otherwise race this apply_remote_link call. #626 QC.
         let _gate = crate::config::lock_permissions_mode_for_test();
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("rl-a", "content rl a");
         let b = test_memory("rl-b", "content rl b");
@@ -5234,7 +5233,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_remote_deletion_returns_false_for_missing() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let gone = store
             .apply_remote_deletion(&ctx, "44444444-4444-4444-4444-444444444444")
@@ -5248,7 +5247,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_hybrid_keyword_fallback_no_embedding() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory(
             "recall-target",
@@ -5272,7 +5271,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_hybrid_skip_access_ledger_writes_nothing() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory(
             "skip-ledger-target",
@@ -5327,7 +5326,7 @@ mod tests {
 
     #[tokio::test]
     async fn touch_after_recall_is_noop_on_empty_ids() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         store
             .touch_after_recall(&[])
             .await
@@ -5338,7 +5337,7 @@ mod tests {
     async fn touch_after_recall_warn_path_on_missing_id() {
         // touch_after_recall logs-and-swallows touch errors; verify the
         // bulk-path returns Ok even when an id is unknown.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let unknown = vec!["55555555-5555-5555-5555-555555555555".to_string()];
         store
             .touch_after_recall(&unknown)
@@ -5348,7 +5347,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_invalid_input_without_filter() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let err = store
             .forget(&ctx, None, None, None, false)
@@ -5359,7 +5358,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_namespace_succeeds_even_on_empty() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         // No matching rows yet → count is 0 but no error.
         let n = store
@@ -5371,14 +5370,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_gc_returns_zero_on_empty_db() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let n = store.run_gc(false).await.expect("gc empty");
         assert_eq!(n, 0);
     }
 
     #[tokio::test]
     async fn archive_purge_zero_threshold_purges_all() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         // Admin context — full owner-blind wipe (the operator path).
         // The non-admin owner-scoped path is exercised by the
         // regression test in `tests/archive_purge_owner_gate.rs`.
@@ -5399,7 +5398,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_by_ids_is_zero_for_unknown_ids() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let moved = store
             .archive_by_ids(
@@ -5414,7 +5413,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_restore_returns_false_for_missing() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let restored = store
             .archive_restore(&ctx, "77777777-7777-7777-7777-777777777777")
@@ -5431,7 +5430,7 @@ mod tests {
     /// still restore.
     #[tokio::test]
     async fn archive_restore_refuses_non_owner_3271() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let alice = CallerContext::for_agent("alice");
         let mut mem = test_memory("owned-by-alice-3271", "secret");
         mem.metadata = serde_json::json!({ "agent_id": "alice" });
@@ -5467,7 +5466,7 @@ mod tests {
     /// severs it for real.
     #[tokio::test]
     async fn delete_link_refuses_non_owner_3275() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let alice = CallerContext::for_agent("alice");
         let mut a = test_memory("link-src-3275", "source");
         a.metadata = serde_json::json!({ "agent_id": "alice" });
@@ -5519,7 +5518,7 @@ mod tests {
     // pre-fix postgres archive INSERT that omitted lifecycle_state).
     #[tokio::test]
     async fn archive_lifecycle_state_survives_restore_parity_2196() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mut mem = test_memory("lifecycle-roundtrip-2196", "content");
         mem.lifecycle_state = crate::models::LifecycleState::Blocked;
@@ -5567,7 +5566,7 @@ mod tests {
     // refreshed only archived_at/archive_reason (first-payload-wins).
     #[tokio::test]
     async fn archive_rearchive_is_last_wins_parity_2195() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let m1 = test_memory("rearchive-lastwins-2195", "content-v1");
         let id = store.store(&ctx, &m1).await.expect("store v1");
@@ -5625,7 +5624,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_memories_and_links_round_trip() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("export-me", "content for export round trip");
         store.store(&ctx, &mem).await.expect("store");
@@ -5638,7 +5637,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_namespace_chain_includes_self() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let chain = store
             .build_namespace_chain("project/foo")
             .await
@@ -5652,7 +5651,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_governance_policy_none_on_fresh_db() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let policy = store
             .resolve_governance_policy("any/ns")
             .await
@@ -5670,7 +5669,7 @@ mod tests {
         crate::config::override_active_permissions_mode_for_test(
             crate::config::PermissionsMode::Advisory,
         );
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let decision = store
             .enforce_governance_action(
                 super::super::GovernedAction::Store,
@@ -5689,7 +5688,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_namespace_standard_none_initially() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let std_row = store
             .get_namespace_standard(&ctx, "no-such-ns")
@@ -5700,7 +5699,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_then_get_then_clear_namespace_standard() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         // Standard memory has to exist first.
         let std_mem = test_memory("std-doc", "documentation for ns standard");
@@ -5728,7 +5727,7 @@ mod tests {
 
     #[tokio::test]
     async fn quota_status_auto_inserts_default_row() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let q = store
             .quota_status("ai:quota-test")
             .await
@@ -5738,7 +5737,7 @@ mod tests {
 
     #[tokio::test]
     async fn quota_status_list_returns_inserted_row() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         // Force a row via quota_status, then list.
         let _ = store.quota_status("ai:listed").await.expect("seed");
         let rows = store.quota_status_list().await.expect("quota_status_list");
@@ -5747,7 +5746,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_link_rejects_missing_filter() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let filter = VerifyFilter::default();
         let err = store
             .verify_link(filter)
@@ -5758,7 +5757,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_link_rejects_malformed_link_id() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let filter = VerifyFilter {
             link_id: Some("notatriple".to_string()),
             ..Default::default()
@@ -5772,7 +5771,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_link_resolves_unsigned_link() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("vl-a", "content for vl a");
         let b = test_memory("vl-b", "content for vl b");
@@ -5810,7 +5809,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_link_source_only_resolves_first_outbound() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("solo-source", "content for solo source");
         let b = test_memory("solo-target", "content for solo target");
@@ -5842,7 +5841,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_paths_returns_empty_for_unknown_endpoints() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let paths = store
             .find_paths(
@@ -5859,7 +5858,7 @@ mod tests {
 
     #[tokio::test]
     async fn notify_creates_inbox_row() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let id = store
             .notify(
@@ -5886,7 +5885,7 @@ mod tests {
 
     #[tokio::test]
     async fn notify_refuses_sender_over_quota_without_writing_3358() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let target = "ai:notify-quota-target";
         let namespace = crate::inbox_namespace(target);
@@ -5935,7 +5934,7 @@ mod tests {
 
     #[tokio::test]
     async fn consolidate_round_trips_two_sources() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         // Seed two memories that the consolidate path will merge.
         let a = test_memory("consolidate-source-a", "content a one two three four");
@@ -5994,7 +5993,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_decide_false_when_no_row_matches() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let res = store
             .pending_decide(&ctx, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", true, "alice")
@@ -6005,7 +6004,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_pending_returns_none_for_unknown() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let row = store
             .get_pending(&ctx, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -6026,7 +6025,7 @@ mod tests {
         // FX-C2-batch3 — `list_namespaces` returns `(namespace, count)`
         // rows sorted by count desc with deterministic alphabetic
         // tie-break, mirroring `db::list_namespaces`.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         for (ns, n) in &[("alpha", 3usize), ("beta", 1usize), ("gamma", 2usize)] {
             for i in 0..*n {
@@ -6060,7 +6059,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_namespaces_empty_store_returns_empty_vec() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let rows = store
             .list_namespaces()
             .await
@@ -6072,7 +6071,7 @@ mod tests {
     async fn get_taxonomy_assembles_hierarchical_tree() {
         // FX-C2-batch3 — `get_taxonomy` projects a hierarchical tree
         // whose ancestor `subtree_count`s sum every descendant's count.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         for (ns, n) in &[
             ("alphaone", 1usize),
@@ -6098,7 +6097,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_taxonomy_empty_prefix_yields_empty_total() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let tax = store
             .get_taxonomy(Some("nonexistent"), 8, 100)
             .await
@@ -6112,7 +6111,7 @@ mod tests {
         // FX-C2-batch3 — `list_agents` enumerates the `_agents`
         // namespace and parses the metadata blob into the
         // `AgentRegistration` shape.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("daemon");
         let agent = AgentRegistration {
             agent_id: "ai:tester@host".to_string(),
@@ -6135,7 +6134,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_agents_empty_store_returns_empty_vec() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let listed = store.list_agents().await.expect("list_agents");
         assert!(listed.is_empty());
     }
@@ -6144,7 +6143,7 @@ mod tests {
     async fn list_pending_actions_filters_by_status() {
         // FX-C2-batch3 — status filter passes through verbatim.
         use crate::models::GovernedAction;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         {
             let conn = store.state.lock().await;
             db::queue_pending_action(
@@ -6188,7 +6187,7 @@ mod tests {
         // FX-C2-batch3 — `entity_get_by_alias` returns the canonical
         // entity record (entity_id + canonical_name + namespace +
         // alias set).
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         // Stamp the metadata so the entity passes the kind=entity
         // CHECK in `db::entity_get_by_alias`.
@@ -6223,7 +6222,7 @@ mod tests {
 
     #[tokio::test]
     async fn entity_get_by_alias_returns_none_for_unknown() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let rec = store
             .entity_get_by_alias("never-registered", None)
             .await
@@ -6235,7 +6234,7 @@ mod tests {
     async fn entity_get_by_alias_empty_alias_returns_none() {
         // Empty / whitespace-only alias is rejected at the storage
         // layer — verify the SAL preserves the contract.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let rec = store
             .entity_get_by_alias("   ", None)
             .await
@@ -6245,7 +6244,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_returns_true_on_open_store() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ok = store.health_check().await.expect("health_check");
         assert!(ok);
     }
@@ -6254,7 +6253,7 @@ mod tests {
     async fn stats_projects_full_shape() {
         // FX-C2-batch3 — `stats` projects total, per-tier, per-namespace,
         // expiring_soon, links_count, db_size_bytes for the open store.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         for i in 0..3 {
             let mut m = test_memory(
@@ -6287,7 +6286,7 @@ mod tests {
         // FX-C2-batch4 — `SqliteStore::update_embedding` overrides the
         // default no-op and delegates to `db::set_embedding` so the
         // create.rs:475 embedding write is now SAL-routable.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("with-embed", "embedding-fixture body content");
         let id = store.store(&ctx, &mem).await.expect("store");
@@ -6322,7 +6321,7 @@ mod tests {
     async fn find_by_title_namespace_resolves_id() {
         // FX-C2-batch4 — `find_by_title_namespace` returns the live
         // row's id when `(title, namespace)` matches.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("conflict-target", "find_by_title body");
         let id = store.store(&ctx, &mem).await.expect("store");
@@ -6335,7 +6334,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_title_namespace_returns_none_for_unknown() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let found = store
             .find_by_title_namespace("never-stored", "alphaone")
             .await
@@ -6346,7 +6345,7 @@ mod tests {
     #[tokio::test]
     async fn next_versioned_title_first_use_returns_base() {
         // FX-C2-batch4 — on a fresh store the base title is free.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let picked = store
             .next_versioned_title("My Title", "alphaone")
             .await
@@ -6357,7 +6356,7 @@ mod tests {
     #[tokio::test]
     async fn next_versioned_title_appends_suffix_on_collision() {
         // FX-C2-batch4 — when the base title is taken, append `(2)`.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mut mem = test_memory("dup-title", "versioned body content");
         mem.namespace = "alphaone".to_string();
@@ -6373,7 +6372,7 @@ mod tests {
     async fn find_contradictions_returns_fts_matches() {
         // FX-C2-batch4 — `find_contradictions` returns FTS-similar
         // candidates in the same namespace.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mut a = test_memory("rust language semantics", "rust language safety guarantees");
         a.namespace = "alphaone".to_string();
@@ -6405,7 +6404,7 @@ mod tests {
         // FX-C2-batch4 — `invalidate_link` sets `valid_until` on the
         // matching `(source, target, relation)` triple and surfaces
         // `previous_valid_until` (None on first invalidation).
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let src = test_memory("src-row", "source memory body content");
         let dst = test_memory("dst-row", "destination memory body content");
@@ -6444,7 +6443,7 @@ mod tests {
     async fn invalidate_link_returns_not_found_for_unknown_triple() {
         // FX-C2-batch4 — non-existent triple surfaces `found = false`,
         // not an error.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let row = store
             .invalidate_link("nope-src", "nope-dst", "related_to", None, None)
             .await
@@ -6458,7 +6457,7 @@ mod tests {
         // FX-C2-batch4 — phase 1 SHA-256 short-circuit returns
         // `similarity=1.0` when `format!("{title} {content}")` is
         // byte-equal to an existing row's text.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mut mem = test_memory("dup-test-title", "dup-test body content");
         mem.namespace = "alphaone".to_string();
@@ -6478,7 +6477,7 @@ mod tests {
     async fn check_duplicate_with_text_no_match_returns_false() {
         // FX-C2-batch4 — empty candidate pool surfaces non-dup with
         // candidates_scanned=0.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let check = store
             .check_duplicate_with_text(&[], "no-match text", Some("alphaone"), 0.8)
             .await
@@ -6497,7 +6496,7 @@ mod tests {
         // for `pending_decide`; the two surfaces must produce
         // identical results.
         use crate::models::GovernedAction;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let pid = {
             let conn = store.state.lock().await;
@@ -6529,7 +6528,7 @@ mod tests {
         // alias for `governance_approve_with_consensus`; under Human
         // approver_type the result is identical.
         use crate::models::GovernedAction;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let pid = {
             let conn = store.state.lock().await;
@@ -6571,7 +6570,7 @@ mod tests {
     #[tokio::test]
     async fn reject_with_approver_type_refuses_requester_self_veto_3448() {
         use crate::models::GovernedAction;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice3448");
         let pid = {
             let conn = store.state.lock().await;
@@ -6611,7 +6610,7 @@ mod tests {
     #[tokio::test]
     async fn reject_with_approver_type_refuses_unregistered_approver_3448() {
         use crate::models::GovernedAction;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("mallory3448");
         let pid = {
             let conn = store.state.lock().await;
@@ -6648,7 +6647,7 @@ mod tests {
     #[tokio::test]
     async fn reject_with_approver_type_allows_registered_approver_3448() {
         use crate::models::GovernedAction;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("bob3448");
         let pid = {
             let conn = store.state.lock().await;
@@ -6692,7 +6691,7 @@ mod tests {
         // default (UnsupportedCapability); this test pins the new
         // override.
         use crate::models::GovernedAction;
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let memory_payload = serde_json::to_value(test_memory("fx-c2-b5-exec", "executed payload"))
             .expect("serialize memory");
@@ -6733,7 +6732,7 @@ mod tests {
         // trait method must surface the neighbor through the CTE
         // traversal.
         use crate::models::{MemoryLink, MemoryLinkRelation};
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let src = store
             .store(&ctx, &test_memory("kg-src", "source body"))
@@ -6771,7 +6770,7 @@ mod tests {
         // memory_links rows directly so we can pin valid_from
         // explicitly (the `link` trait method does not surface a
         // valid_from override).
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let src = store
             .store(&ctx, &test_memory("tl-src", "tl source body"))
@@ -6824,7 +6823,7 @@ mod tests {
     #[tokio::test]
     async fn fx_c2_batch5_entity_register_creates_new_entity() {
         // Idempotent registration creates a new row on first call.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let reg = store
             .entity_register(
@@ -6846,7 +6845,7 @@ mod tests {
     #[tokio::test]
     async fn fx_c2_batch5_entity_register_unions_aliases_on_reregister() {
         // Second call with new aliases merges into the existing row.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         store
             .entity_register(
@@ -6878,7 +6877,7 @@ mod tests {
     #[tokio::test]
     async fn fx_c2_batch5_list_archived_returns_archived_rows() {
         // Insert + archive a memory; list_archived must surface it.
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let id = store
             .store(&ctx, &test_memory("archived-row", "to be archived"))
@@ -6905,7 +6904,7 @@ mod tests {
 
     #[tokio::test]
     async fn fx_c2_batch5_list_archived_namespace_filter_excludes_other_tenants() {
-        let store = fresh_store();
+        let (store, _tmp_guard) = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let mut m = test_memory("ns-a-row", "body");
         m.namespace = "tenant-a".to_string();

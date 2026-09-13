@@ -59,10 +59,9 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn setup_router() -> (axum::Router, Db) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
-    let db_path = db_tmp.path().to_path_buf();
-    std::mem::forget(db_tmp);
+fn setup_router() -> (axum::Router, Db, tempfile::TempDir) {
+    let db_tmp = tempfile::TempDir::new().expect("db tempfile");
+    let db_path = db_tmp.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((
@@ -120,7 +119,7 @@ fn setup_router() -> (axum::Router, Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, db_tmp)
 }
 
 /// Disable the orthogonal federation gates so each test isolates the #1843
@@ -241,7 +240,7 @@ async fn forged_signature_signal_is_skipped_1843() {
     let _g = env_lock();
     clear_all_env();
     relax_orthogonal_gates(); // zero-config (no allowlist) → Layer 1 is a no-op
-    let (router, _db) = setup_router();
+    let (router, _db, _tmp_guard) = setup_router();
 
     let mut sig = signed_signal("ai:relay", "sig-test/forged");
     sig.signature[0] ^= 0xff; // tamper → signals::verify fails (forged)
@@ -278,7 +277,7 @@ async fn enrolled_peer_forged_authorship_skipped_batch_survives_1843() {
             r#"{"relay-peer": {"allowed_sender_agent_ids": ["alice"], "allowed_namespaces": ["sig-test/**"]}}"#,
         );
     }
-    let (router, _db) = setup_router();
+    let (router, _db, _tmp_guard) = setup_router();
 
     let forged = signed_signal("mallory", "sig-test/b"); // validly self-signed, but unauthorized author
     let body = json!({
@@ -324,7 +323,7 @@ async fn self_relay_and_allowlisted_author_accepted_1843() {
         // to pin the Layer-1 behavior unchanged (the `=0` staged-rollout bridge).
         std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, "0");
     }
-    let (router, _db) = setup_router();
+    let (router, _db, _tmp_guard) = setup_router();
 
     let self_sig = signed_signal("relay-peer", "sig-test/c"); // from_agent == sender → self-relay
     let allowed = signed_signal("alice", "sig-test/c"); // in allowed_sender_agent_ids
@@ -359,7 +358,7 @@ async fn explicit_namespace_and_signal_opt_out_accepts_any_author_1843() {
     // test documents is now the EXPLICIT `=0` opt-out (the staged-rollout
     // bridge); pin the byte-identical pre-flip behavior under that opt-out.
     unsafe { std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, "0") };
-    let (router, _db) = setup_router();
+    let (router, _db, _tmp_guard) = setup_router();
 
     let sig = signed_signal("ai:anyone", "sig-test/d");
     let body = json!({
@@ -396,7 +395,7 @@ async fn strict_mode_requires_enrolled_author_key_1843() {
         std::env::set_var("AI_MEMORY_KEY_DIR", key_dir.path());
         std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, "1");
     }
-    let (router, _db) = setup_router();
+    let (router, _db, _tmp_guard) = setup_router();
 
     // alice: sign with the SAME enrolled key → Layer 2 verifies against it.
     let mut alice_sig = make_signal("alice", "sig-test/e");

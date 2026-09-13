@@ -9219,6 +9219,10 @@ fn curl_delete(port: u16, path: &str, agent_id: Option<&str>) -> String {
 #[allow(dead_code)]
 struct OneshotDaemon {
     router: axum::Router,
+    // #3669: owns the SAL store directory for the daemon's lifetime.
+    // Declared after `router`, so the router (and the store it holds) drops
+    // first and the directory is removed last.
+    _store_dir: tempfile::TempDir,
 }
 
 /// v0.7.0 #238/#239 — set the federation legacy-bypass env vars
@@ -9279,11 +9283,12 @@ impl OneshotDaemon {
             ai_memory::config::ResolvedTtl::default(),
             true,
         )));
+        // #3669: the store file lives in a TempDir the caller owns, so the
+        // database and its -wal/-shm siblings are removed when the test ends.
+        let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
         #[cfg(feature = "sal")]
         let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-            let p = tmp.path().to_path_buf();
-            std::mem::forget(tmp);
+            let p = tmp.path().join("store.db");
             std::sync::Arc::new(
                 ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
             )
@@ -9353,7 +9358,10 @@ impl OneshotDaemon {
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
         };
         let router = ai_memory::build_router(api_key_state, app_state);
-        Self { router }
+        Self {
+            router,
+            _store_dir: tmp,
+        }
     }
 
     async fn request(

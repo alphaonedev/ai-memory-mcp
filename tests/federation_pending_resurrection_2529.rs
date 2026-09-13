@@ -49,7 +49,7 @@ fn set_standard_scope_opt_out() {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -58,11 +58,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -112,7 +113,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 async fn push_pendings(router: &axum::Router, pendings: Vec<Value>) -> (StatusCode, Value) {
@@ -172,7 +173,7 @@ async fn federated_pending_cannot_resurrect_rejected_row_2529() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
     set_standard_scope_opt_out();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     {
         let guard = db.lock().await;
@@ -246,7 +247,7 @@ async fn federated_pending_rejects_wire_non_pending_status_2529() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
     set_standard_scope_opt_out();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let (st, report) = push_pendings(
         &router,
@@ -266,7 +267,7 @@ async fn control_fresh_pending_still_applies_2529() {
     let _lock = ENV_LOCK.lock().await;
     let _g = PostureGuard;
     set_standard_scope_opt_out();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let (st, report) = push_pendings(
         &router,

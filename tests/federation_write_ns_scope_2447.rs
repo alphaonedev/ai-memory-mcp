@@ -49,7 +49,7 @@ const SCOPED_ALLOWLIST: &str =
 /// yields `[]`). Layer 2 governs this peer.
 const UNSCOPED_ALLOWLIST: &str = r#"{"ai:evil":{"allowed_sender_agent_ids":["ai:evil"]}}"#;
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -58,11 +58,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -112,7 +113,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 /// Seed the peer-attestation posture. `allowlist == None` = the ZERO-CONFIG
@@ -233,7 +234,7 @@ async fn row_namespace_and_title(
 async fn federated_write_outside_peer_scope_refused_2447() {
     let _g = ENV_LOCK.lock().await;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // EXPLOIT: a peer scoped to public/* pushes a memory into secure/ops.
     let status = push(
@@ -288,7 +289,7 @@ async fn federated_write_outside_peer_scope_refused_2447() {
 async fn federated_write_cannot_relocate_foreign_row_by_id_collision_2447() {
     let _g = ENV_LOCK.lock().await;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     // Seed a victim row in secure/ops via the normal create path.
     let create = json!({
@@ -359,7 +360,7 @@ async fn federated_write_cannot_relocate_foreign_row_by_id_collision_2447() {
 async fn federated_archive_and_restore_outside_peer_scope_refused_2447() {
     let _g = ENV_LOCK.lock().await;
     set_posture(Some(SCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let create = json!({
         "title": "sensitive-archive",
@@ -417,7 +418,7 @@ async fn no_allowlist_write_posture_matrix_3582() {
         (Some(SCOPED_ALLOWLIST), Some("1"), true),
     ] {
         set_posture(allowlist, require);
-        let (router, db) = build_router_with_db();
+        let (router, db, _tmp_guard) = build_router_with_db();
         let status = push(
             &router,
             &push_body(&[wire_memory(
@@ -446,7 +447,7 @@ async fn enrolled_peer_without_declared_namespaces_denied_by_default_2447() {
     // `allowed_namespaces`, so its read + delete scope are already empty while
     // its write scope was unbounded. Default-deny makes the lanes agree.
     set_posture(Some(UNSCOPED_ALLOWLIST), None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let status = push(
         &router,
@@ -515,7 +516,7 @@ async fn enrolled_peer_without_declared_namespaces_denied_by_default_2447() {
 
     // The documented staged-rollout opt-out restores the legacy posture.
     set_posture(Some(UNSCOPED_ALLOWLIST), Some("0"));
-    let (router2, db2) = build_router_with_db();
+    let (router2, db2, _tmp_guard) = build_router_with_db();
     let status2 = push(
         &router2,
         &push_body(&[wire_memory(
@@ -547,7 +548,7 @@ async fn double_star_scope_is_the_per_peer_allow_all_escape_2447() {
         Some(r#"{"ai:evil":{"allowed_namespaces":["**"],"allowed_sender_agent_ids":["ai:evil"]}}"#),
         None,
     );
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     let status = push(
         &router,

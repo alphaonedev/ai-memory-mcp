@@ -42,15 +42,14 @@ fn scratch_root(tag: &str) -> PathBuf {
     root
 }
 
-fn fresh_db(tag: &str) -> (PathBuf, Connection) {
+fn fresh_db(tag: &str) -> (PathBuf, Connection, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
         .prefix(tag)
         .tempdir_in(scratch_root(tag))
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     let conn = ai_memory::db::open(&path).expect("init db");
-    std::mem::forget(dir); // keep the file alive for the test's connection
-    (path, conn)
+    (path, conn, dir)
 }
 
 fn mem(id: &str, title: &str, ns: &str, content: &str) -> Memory {
@@ -110,7 +109,7 @@ fn opts() -> ImportOptions {
 /// snapshot of a STILL-LIVE row is NOT a genuine archival; a real archival is.
 #[test]
 fn memory_is_genuinely_archived_discriminates_in_place_edit_2570() {
-    let (_path, conn) = fresh_db("predicate");
+    let (_path, conn, _tmp_guard) = fresh_db("predicate");
 
     // (a) An edited-but-live row: insert, then edit in place → #1725 snapshots
     // the prior content under archive_reason='in_place_edit' while the live row
@@ -196,7 +195,7 @@ fn imported_row_diverges_ignores_metadata_2569() {
 /// UNIQUE-id refusal, never a clobber.
 #[test]
 fn v2_reimport_of_edited_corpus_is_idempotent_2569_2570() {
-    let (_path, conn) = fresh_db("v2-edited");
+    let (_path, conn, _tmp_guard) = fresh_db("v2-edited");
 
     // Seed a corpus of 3 rows, then edit ONE in place (in_place_edit snapshot).
     for i in 0..3 {
@@ -271,7 +270,7 @@ fn v2_reimport_of_edited_corpus_is_idempotent_2569_2570() {
 /// same-id idempotent skip (vote lens 5 gating invariant).
 #[test]
 fn v2_covenant_gates_precede_idempotent_skip_2569_2570() {
-    let (_path, conn) = fresh_db("v2-covenant");
+    let (_path, conn, _tmp_guard) = fresh_db("v2-covenant");
 
     // (a) genuinely archived id.
     ai_memory::db::insert(&conn, &mem("arch", "t-arch", "ns", "c")).expect("insert");
@@ -319,7 +318,7 @@ fn v2_covenant_gates_precede_idempotent_skip_2569_2570() {
 /// divergent backup is not silently swallowed (vote: A-with-reporting).
 #[test]
 fn v2_divergent_same_id_reimport_warns_and_never_clobbers_2569() {
-    let (_path, conn) = fresh_db("v2-divergent");
+    let (_path, conn, _tmp_guard) = fresh_db("v2-divergent");
 
     ai_memory::db::insert(&conn, &mem("z", "tz", "ns", "LIVE content")).expect("insert");
 

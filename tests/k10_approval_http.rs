@@ -50,7 +50,7 @@ static K10_HTTP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Build the router from a shared `Db` so the test body can both
 /// hit HTTP routes AND seed `pending_actions` rows directly.
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -64,11 +64,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     // and the trait handle's tempfile is disjoint; this k10 test
     // exercises only the legacy direct-rusqlite path so the disjoint
     // backing file is harmless.
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -122,7 +123,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 async fn seed_pending_row_via_db(
@@ -201,7 +202,7 @@ fn sign(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
 async fn http_approve_with_valid_hmac_returns_200() {
     let _g = K10_HTTP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-test-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_row_via_db(&db, "scratch", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -237,7 +238,7 @@ async fn http_approve_with_valid_hmac_returns_200() {
 async fn http_approve_without_hmac_returns_401() {
     let _g = K10_HTTP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-test-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_row_via_db(&db, "scratch", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -262,7 +263,7 @@ async fn http_approve_without_server_secret_returns_401() {
     // Explicitly clear the server-wide secret. Without it the endpoint
     // MUST refuse all inbound approvals — fail-closed posture.
     set_active_hooks_hmac_secret(None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_row_via_db(&db, "scratch", "alice").await;
 
     // Even with a "looks-valid" signature, no server secret → 401.
@@ -294,7 +295,7 @@ async fn http_approve_without_server_secret_returns_401() {
 async fn http_approve_with_wrong_signature_returns_401() {
     let _g = K10_HTTP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("real-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_row_via_db(&db, "scratch", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "once"}).to_string();
@@ -324,7 +325,7 @@ async fn http_approve_forever_is_refused_nothing_recorded_3394() {
     let _g = K10_HTTP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-test-secret".to_string()));
     ai_memory::approvals::clear_synthetic_rules_for_test();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_row_via_db(&db, "scratch-forever", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "forever"}).to_string();
@@ -365,7 +366,7 @@ async fn http_approve_session_records_rule_3394() {
     let _g = K10_HTTP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("k10-test-secret".to_string()));
     ai_memory::approvals::clear_synthetic_rules_for_test();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pending_id = seed_pending_row_via_db(&db, "scratch-session", "alice").await;
 
     let body = json!({"decision": "approve", "remember": "session"}).to_string();

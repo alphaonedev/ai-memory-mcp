@@ -340,14 +340,11 @@ mod tests {
     use rusqlite::params;
     use sha2::{Digest as _, Sha256};
 
-    fn open_db() -> rusqlite::Connection {
+    fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
         let conn = crate::db::open(&path).expect("db::open");
-        // Keep the tempdir alive by leaking it for the lifetime of this
-        // test process (each test runs in its own DB).
-        std::mem::forget(dir);
-        conn
+        (conn, dir)
     }
 
     fn insert_min_skill(
@@ -373,7 +370,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_skill_id() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let params = json!({});
         let err = handle_skill_get(&conn, &params).unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
@@ -381,7 +378,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_skill_id() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let params = json!({"skill_id": ""});
         let err = handle_skill_get(&conn, &params).unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
@@ -389,7 +386,7 @@ mod tests {
 
     #[test]
     fn rejects_nonstring_skill_id() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let params = json!({"skill_id": 42});
         let err = handle_skill_get(&conn, &params).unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
@@ -397,7 +394,7 @@ mod tests {
 
     #[test]
     fn returns_not_found_for_missing_id() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let params = json!({"skill_id": "no-such-skill"});
         let err = handle_skill_get(&conn, &params).unwrap_err();
         assert!(err.contains("skill not found"), "got: {err}");
@@ -406,7 +403,7 @@ mod tests {
 
     #[test]
     fn returns_minimal_skill_payload() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "11111111-1111-1111-1111-111111111111";
         insert_min_skill(&conn, id, "ns-1", "hello", "# Hello\nbody.");
 
@@ -427,7 +424,7 @@ mod tests {
 
     #[test]
     fn includes_optional_fields_when_present() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "22222222-2222-2222-2222-222222222222";
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0xab_u8; 32];
@@ -453,7 +450,7 @@ mod tests {
 
     #[test]
     fn ignores_malformed_allowed_tools_json() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "33333333-3333-3333-3333-333333333333";
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
@@ -473,7 +470,7 @@ mod tests {
 
     #[test]
     fn marks_superseded_when_chained() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let v1 = "v1aaaaaa-0000-0000-0000-000000000001";
         let v2 = "v2bbbbbb-0000-0000-0000-000000000002";
         insert_min_skill(&conn, v1, "ns", "chain", "body v1");
@@ -494,7 +491,7 @@ mod tests {
 
     #[test]
     fn includes_resource_list_paths_only() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "44444444-4444-4444-4444-444444444444";
         insert_min_skill(&conn, id, "ns", "withres", "body");
         let rblob = zstd::encode_all(b"echo".as_slice(), 3).unwrap();
@@ -524,7 +521,7 @@ mod tests {
 
     #[test]
     fn rejects_corrupt_body_blob() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "55555555-5555-5555-5555-555555555555";
         let bogus_blob: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff]; // not valid zstd
         let digest = vec![0u8; 32];
@@ -545,7 +542,7 @@ mod tests {
 
     #[test]
     fn surfaces_version_one_for_fresh_row() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "77777777-7777-7777-7777-777777777777";
         insert_min_skill(&conn, id, "ns", "versioned", "body");
         let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
@@ -554,7 +551,7 @@ mod tests {
 
     #[test]
     fn surfaces_version_for_superseded_chain_member() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let v1 = "v1cccccc-0000-0000-0000-000000000001";
         let v2 = "v2dddddd-0000-0000-0000-000000000002";
         insert_min_skill(&conn, v1, "ns", "chain-get", "body v1");
@@ -572,7 +569,7 @@ mod tests {
 
     #[test]
     fn captures_invocation_record_on_get() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "88888888-8888-8888-8888-888888888888";
         insert_min_skill(&conn, id, "ns", "invoked", "body");
 
@@ -603,7 +600,7 @@ mod tests {
 
     #[test]
     fn each_get_call_appends_its_own_invocation_record() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "99999999-9999-9999-9999-999999999999";
         insert_min_skill(&conn, id, "ns", "multi-invoke", "body");
 
@@ -626,7 +623,7 @@ mod tests {
 
     #[test]
     fn malformed_metadata_string_skipped() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "66666666-6666-6666-6666-666666666666";
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
@@ -650,7 +647,7 @@ mod tests {
     /// an activation fetch.
     #[test]
     fn refuses_body_decompression_bomb_3171() {
-        let conn = open_db();
+        let (conn, _tmp_guard) = open_db();
         let id = "bbbbbbbb-0000-0000-0000-00000000bomb";
         let cap = crate::transcripts::storage::MAX_DECOMPRESSED_BYTES;
         let bomb_plain = vec![0u8; cap + 1024];

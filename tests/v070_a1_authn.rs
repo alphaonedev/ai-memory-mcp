@@ -89,7 +89,7 @@ fn sign(secret: &str, timestamp: &str, method: &str, pending_id: &str, body: &st
     format!("sha256={sig}")
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -98,11 +98,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -155,7 +156,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db)
+    (router, db, tmp)
 }
 
 async fn seed_pending_store(
@@ -200,7 +201,7 @@ async fn s5c1_approve_without_hmac_returns_401() {
     // configured `api_key` (legacy default-off auth posture).
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("a1-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pid = seed_pending_store(&db, "a1-ns", "alice").await;
 
     let req = Request::builder()
@@ -222,7 +223,7 @@ async fn s5c1_approve_without_hmac_returns_401() {
 async fn s5c1_reject_without_hmac_returns_401() {
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("a1-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pid = seed_pending_store(&db, "a1-ns", "alice").await;
 
     let req = Request::builder()
@@ -246,7 +247,7 @@ async fn s5c1_approve_without_server_secret_returns_401_even_with_signature() {
     // even when a "looks-valid" signature is presented. Fail-closed.
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(None);
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pid = seed_pending_store(&db, "a1-ns", "alice").await;
 
     let body = String::new();
@@ -271,7 +272,7 @@ async fn s5c1_approve_with_valid_hmac_returns_200() {
     // through the HMAC check and lands in the approve path.
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("a1-positive-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let pid = seed_pending_store(&db, "a1-positive-ns", "alice").await;
     // #1796 (5-agent vote 4d3ea1c5) — the HTTP approve surface enforces the
     // Human-arm gate UNCONDITIONALLY (no self-approval; registered approver), so
@@ -307,7 +308,7 @@ async fn s5c1_approve_with_valid_hmac_returns_200() {
 async fn s5c1_reject_with_valid_hmac_returns_200() {
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("a1-positive-secret".to_string()));
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     // v1.0.0 #3448 — the HTTP reject surface now enforces the SAME approver
     // eligibility approve does (`ApproveSurface::Http`, unconditional), so the
     // decider must be a REGISTERED agent distinct from the requester. This is
@@ -350,7 +351,7 @@ async fn r3_s1_subscribe_refuses_without_any_secret_returns_400() {
     // Neither per-sub `secret` nor server-wide override → 400.
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(None);
-    let (router, _db) = build_router_with_db();
+    let (router, _db, _tmp_guard) = build_router_with_db();
 
     let body = json!({
         "url": "https://example.com/webhook",
@@ -382,7 +383,7 @@ async fn r3_s1_subscribe_succeeds_with_per_sub_secret() {
     // Per-sub secret supplied in the body → 201.
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(None);
-    let (router, _db) = build_router_with_db();
+    let (router, _db, _tmp_guard) = build_router_with_db();
 
     let body = json!({
         "url": "https://example.com/webhook",
@@ -410,7 +411,7 @@ async fn r3_s1_subscribe_succeeds_with_server_wide_secret() {
     // a per-sub secret.
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("server-wide-secret".to_string()));
-    let (router, _db) = build_router_with_db();
+    let (router, _db, _tmp_guard) = build_router_with_db();
 
     let body = json!({
         "url": "https://example.com/webhook",
@@ -441,9 +442,8 @@ async fn r3_s1_subscribe_succeeds_with_server_wide_secret() {
 async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
     // The daemon's bootstrap must fail-fast when the operator tries
     // to bind to a routable address with no API key configured.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
-    let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    let tmp = tempfile::TempDir::new().expect("tempfile for db");
+    let path = tmp.path().join("test.db");
 
     let args = ai_memory::daemon_runtime::ServeArgs {
         host: "0.0.0.0".to_string(),
@@ -487,9 +487,8 @@ async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
 async fn s5c1_pattern_a_loopback_bind_without_api_key_succeeds_with_warn() {
     // Loopback bind with no api_key must still boot (single-tenant
     // dev convention). The startup just logs a WARN.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
-    let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    let tmp = tempfile::TempDir::new().expect("tempfile for db");
+    let path = tmp.path().join("test.db");
 
     let args = ai_memory::daemon_runtime::ServeArgs {
         host: "127.0.0.1".to_string(),

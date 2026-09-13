@@ -83,7 +83,7 @@ fn clear_posture() {
     }
 }
 
-fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
+fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db, tempfile::TempDir) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("open sqlite");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -91,11 +91,12 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // #3669: the store file lives in a TempDir the caller owns, so the
+    // database and its -wal/-shm siblings are removed when the test ends.
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-        let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let p = tmp.path().join("store.db");
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
     };
     let app_state = ai_memory::handlers::AppState {
@@ -145,7 +146,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    (ai_memory::build_router(api_key_state, app_state), db)
+    (ai_memory::build_router(api_key_state, app_state), db, tmp)
 }
 
 async fn seed_memory(router: &axum::Router, namespace: &str, title: &str) -> String {
@@ -240,7 +241,7 @@ async fn federated_archive_then_restore_applies_in_scope_3075() {
     let _g = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_scoped_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_memory(&router, IN_SCOPE_NS, "in-scope archive target").await;
 
     let (status, report) = push(
@@ -293,7 +294,7 @@ async fn federated_archive_refused_out_of_scope_3075() {
     let _g = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_scoped_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_memory(&router, VICTIM_NS, "out-of-scope archive target").await;
 
     let (status, report) = push(
@@ -336,9 +337,8 @@ async fn sqlite_sal_archive_restore_methods_and_g30_gate_3075() {
     // the SAL surface, and the sqlite RECEIVE loop deliberately does not reach
     // them (it keeps its inline `db::*` path, byte-for-byte unchanged by #3075).
     let id = format!("sal-3075-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-    let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    let tmp = tempfile::TempDir::new().expect("tempfile");
+    let path = tmp.path().join("test.db");
     let store = ai_memory::store::sqlite::SqliteStore::open(&path).expect("open store");
     let ctx = ai_memory::store::CallerContext::for_agent("ai:victim");
     let mem = ai_memory::models::Memory {
@@ -414,7 +414,7 @@ async fn federated_restore_of_tombstoned_id_is_noop_3075() {
     let _g = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
     set_scoped_posture();
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
     let id = seed_memory(&router, IN_SCOPE_NS, "tombstoned restore target").await;
 
     let (status, _report) = push(
@@ -480,7 +480,7 @@ async fn archive_snapshot_3582(
 async fn archive_restore_allowlist_postures_preserve_rows_3582() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = PostureGuard;
-    let (router, db) = build_router_with_db();
+    let (router, db, _tmp_guard) = build_router_with_db();
 
     for (label, require, scoped, allowed) in [
         ("default-required", None, false, false),

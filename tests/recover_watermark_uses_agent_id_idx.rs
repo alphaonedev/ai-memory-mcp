@@ -42,7 +42,7 @@ use rusqlite::Connection;
 /// plus the migration ladder; the v14 arm installs `agent_id_idx`
 /// and `idx_memories_agent_id`, so by the time `open()` returns
 /// the index the planner needs is in place.
-fn fresh_db() -> Connection {
+fn fresh_db() -> (Connection, tempfile::TempDir) {
     let local_runs = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(".local-runs")
@@ -50,8 +50,7 @@ fn fresh_db() -> Connection {
     std::fs::create_dir_all(&local_runs).expect("create local-runs dir");
     let tmpdir = tempfile::tempdir_in(&local_runs).expect("tempdir under .local-runs");
     let db_path = tmpdir.path().join("test.db");
-    std::mem::forget(tmpdir);
-    ai_memory::storage::open(&db_path).expect("open fresh db")
+    (ai_memory::storage::open(&db_path).expect("open fresh db"), tmpdir)
 }
 
 /// Run `EXPLAIN QUERY PLAN` and return the concatenated plan-detail
@@ -91,7 +90,7 @@ fn watermark_query_uses_idx_memories_agent_id() {
     // a future refactor reverts to `json_extract(...) = ?1`, the
     // plan no longer mentions `idx_memories_agent_id` and the
     // assertion below fires.
-    let conn = fresh_db();
+    let (conn, _tmp_guard) = fresh_db();
     let fixed_sql = "SELECT MAX(created_at) FROM memories WHERE agent_id_idx = ?1";
 
     let plan = explain_query_plan(&conn, fixed_sql, "ai:test-agent");
@@ -133,7 +132,7 @@ fn legacy_json_extract_form_does_full_scan() {
     // longer be strictly necessary and the fix can be
     // re-evaluated — but until then this control documents the
     // observable.
-    let conn = fresh_db();
+    let (conn, _tmp_guard) = fresh_db();
     let legacy_sql = "SELECT MAX(created_at) FROM memories \
                       WHERE json_extract(metadata, '$.agent_id') = ?1";
 
@@ -156,7 +155,7 @@ fn agent_id_idx_column_exists_post_v14() {
     // v14 arm (or the VIRTUAL column changes shape), this test
     // catches it before the L2 watermark rewrite silently
     // regresses back to a SCAN.
-    let conn = fresh_db();
+    let (conn, _tmp_guard) = fresh_db();
 
     // VIRTUAL column probe — `SELECT ... LIMIT 0` succeeds if the
     // column exists, errors if it doesn't.

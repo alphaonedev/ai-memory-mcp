@@ -106,18 +106,18 @@ pub fn armed() -> bool {
 /// Panics if a private temporary directory cannot be allocated outside HOME.
 #[must_use]
 pub fn install() -> &'static Path {
-    let path = DIRECTORY
-        .get_or_init(|| {
-            arm();
-            let root = std::env::temp_dir()
-                .canonicalize()
-                .expect("#3355 resolve temporary root");
-            let dir = tempfile::tempdir_in(root).expect("#3355 allocate isolated key directory");
-            assert_isolated(dir.path());
-            bind_key_dir_env(dir.path());
-            dir
-        })
-        .path();
+    // #3669: a `static OnceLock<TempDir>` is never dropped, so the sandbox
+    // used to outlive every test run. It is now removed at process exit.
+    let path = crate::test_scratch::process_lifetime_dir(&DIRECTORY, || {
+        arm();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("#3355 resolve temporary root");
+        let dir = tempfile::tempdir_in(root).expect("#3355 allocate isolated key directory");
+        assert_isolated(dir.path());
+        bind_key_dir_env(dir.path());
+        dir
+    });
     // Integration-test binaries compile this module without `cfg(test)`.
     // Re-assert so an ambient override set after the first `install()` still
     // cannot defeat the helper. Lib tests (`cfg(test)`) leave `AI_MEMORY_KEY_DIR`

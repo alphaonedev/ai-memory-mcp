@@ -42,10 +42,9 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn setup_router() -> axum::Router {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
-    let db_path = db_tmp.path().to_path_buf();
-    std::mem::forget(db_tmp);
+fn setup_router() -> (axum::Router, tempfile::TempDir) {
+    let db_tmp = tempfile::TempDir::new().expect("db tempfile");
+    let db_path = db_tmp.path().join("test.db");
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((
@@ -103,7 +102,7 @@ fn setup_router() -> axum::Router {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(api_key_state, app_state)
+    (ai_memory::build_router(api_key_state, app_state), db_tmp)
 }
 
 async fn post_sync_push(
@@ -150,7 +149,7 @@ async fn sync_push_unknown_peer_id_refused_when_allowlist_configured_1056() {
         // Disable sig requirement so we're isolating the TOFU gate.
         std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     let (status, body) = post_sync_push(
         &router,
         sample_body("attacker-claim"),
@@ -190,7 +189,7 @@ async fn sync_push_enrolled_peer_id_passes_tofu_gate_1056() {
             "1",
         );
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     let (status, _body) = post_sync_push(
         &router,
         sample_body("ai:enrolled-sender"),
@@ -224,7 +223,7 @@ async fn sync_push_zero_config_skips_tofu_gate_1056() {
             "1",
         );
     }
-    let router = setup_router();
+    let (router, _tmp_guard) = setup_router();
     // No allowlist configured → TOFU gate is a no-op → request
     // flows through to downstream processing.
     let (status, _body) =

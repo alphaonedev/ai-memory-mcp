@@ -83,7 +83,7 @@ fn permissive_attestation_for_tests() {
 /// Build an `AppState` for `backend`. `app.db` is an in-memory sqlite
 /// connection (exactly what `bootstrap_serve` opens on a postgres daemon)
 /// and the SAL handle is a real on-disk `SqliteStore`.
-fn app_state(backend: StorageBackend) -> AppState {
+fn app_state(backend: StorageBackend) -> (AppState, tempfile::TempDir) {
     permissive_attestation_for_tests();
     // #1570 — model an AUTHENTICATED deployment so the #949 admin
     // header-role claim is honoured; otherwise the sqlite control below
@@ -97,13 +97,12 @@ fn app_state(backend: StorageBackend) -> AppState {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
-    let store_path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    let tmp = tempfile::TempDir::new().expect("tempfile for SqliteStore");
+    let store_path = tmp.path().join("test.db");
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
     );
-    AppState {
+    let built = AppState {
         db,
         embedder: Arc::new(None),
         vector_index: Arc::new(tokio::sync::Mutex::new(None)),
@@ -140,10 +139,11 @@ fn app_state(backend: StorageBackend) -> AppState {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
-    }
+    };
+    (built, tmp)
 }
 
-fn router(backend: StorageBackend) -> axum::Router {
+fn router(backend: StorageBackend) -> (axum::Router, tempfile::TempDir) {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
@@ -152,7 +152,8 @@ fn router(backend: StorageBackend) -> axum::Router {
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    ai_memory::build_router(api_key_state, app_state(backend))
+    let (state, dir) = app_state(backend);
+    (ai_memory::build_router(api_key_state, state), dir)
 }
 
 async fn call(
@@ -228,7 +229,7 @@ fn assert_documented_501_envelope(status: StatusCode, body: &Value, path: &str) 
 /// postgres deployment must NOT land in the node-local scratch sqlite file.
 #[tokio::test]
 async fn skill_register_returns_the_documented_501_envelope_on_postgres() {
-    let router = router(StorageBackend::Postgres);
+    let (router, _tmp_guard) = router(StorageBackend::Postgres);
     let (status, body) = call(
         &router,
         "POST",
@@ -243,7 +244,7 @@ async fn skill_register_returns_the_documented_501_envelope_on_postgres() {
 /// `expected_fully_501_paths()` promises, proven at runtime.
 #[tokio::test]
 async fn every_skill_path_fails_closed_on_postgres() {
-    let router = router(StorageBackend::Postgres);
+    let (router, _tmp_guard) = router(StorageBackend::Postgres);
     let id = "sk-3183";
     let cases: &[(&str, String, Option<Value>)] = &[
         (
@@ -309,7 +310,7 @@ async fn every_skill_path_fails_closed_on_postgres() {
 async fn skill_register_handler_refuses_without_the_route_gate() {
     use axum::response::IntoResponse as _;
 
-    let app = app_state(StorageBackend::Postgres);
+    let (app, _tmp_guard) = app_state(StorageBackend::Postgres);
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("x-agent-id", ADMIN.parse().expect("header value"));
     let resp = ai_memory::handlers::skill_register_route(
@@ -331,7 +332,7 @@ async fn skill_register_handler_refuses_without_the_route_gate() {
 /// durably hold a row on this backend.
 #[tokio::test]
 async fn capabilities_discloses_the_skills_plane_as_unsupported_on_postgres() {
-    let router = router(StorageBackend::Postgres);
+    let (router, _tmp_guard) = router(StorageBackend::Postgres);
     let (status, body) = call(&router, "GET", "/api/v1/capabilities", None).await;
     assert_eq!(status, StatusCode::OK, "capabilities: {body}");
     assert_eq!(
@@ -362,7 +363,7 @@ async fn capabilities_discloses_the_skills_plane_as_unsupported_on_postgres() {
 /// guard — a refusal that fired everywhere would be a regression, not a fix.
 #[tokio::test]
 async fn sqlite_daemon_still_serves_the_skills_plane() {
-    let router = router(StorageBackend::Sqlite);
+    let (router, _tmp_guard) = router(StorageBackend::Sqlite);
 
     let (status, body) = call(
         &router,
