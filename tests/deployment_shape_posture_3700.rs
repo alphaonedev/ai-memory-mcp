@@ -133,7 +133,7 @@ fn boot_on_loopback(root: &Path, extra_env: &[(&str, &str)], settle: Duration) -
         })
     });
     let deadline = Instant::now() + BOOT_DEADLINE;
-    let outcome = loop {
+    loop {
         if let Ok(Some(status)) = child.try_wait() {
             if let Some(h) = reader {
                 let _ = h.join();
@@ -158,8 +158,7 @@ fn boot_on_loopback(root: &Path, extra_env: &[(&str, &str)], settle: Duration) -
             buf.lock().unwrap()
         );
         std::thread::sleep(PROBE_INTERVAL);
-    };
-    outcome
+    }
 }
 
 fn doctor_json(root: &Path, extra_env: &[(&str, &str)]) -> serde_json::Value {
