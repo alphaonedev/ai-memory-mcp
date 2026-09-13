@@ -12,13 +12,17 @@
 #
 # The pgdg apt repo (already configured in the base image) ships
 # `postgresql-16-pgvector` as a precompiled .deb — no source build.
+#
+# `openssl` (the CLI) is added for #3705: the one-shot `ic-parity-tls`
+# provisioner runs infra/lan-parity-test/provision-tls.sh in THIS image
+# to mint the fleet CA + server/client certificates every hop now needs.
 
 FROM apache/age:release_PG16_1.6.0
 
 USER root
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends postgresql-16-pgvector \
+ && apt-get install -y --no-install-recommends postgresql-16-pgvector openssl \
  && rm -rf /var/lib/apt/lists/*
 
 # The base image's entrypoint + USER state is preserved by default;

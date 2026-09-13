@@ -329,8 +329,13 @@ a backend that *does* come up; use `doctor` to diagnose one that does not.
 way to bootstrap a fresh postgres backend:
 
 ```bash
-ai-memory schema-init --store-url postgres://aimemory:changeme-please@localhost:5432/aimemory
+ai-memory schema-init --store-url 'postgres://aimemory:changeme-please@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
+
+Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
+daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN
+without it is refused at the connect funnel before any socket is opened —
+there is no plaintext or `require`-only posture to select.
 
 What it does (see `src/cli/schema_init.rs`):
 
@@ -382,17 +387,18 @@ resolves the store URL in this order, first hit wins:
 
 ```bash
 # Preferred (v0.9.0+): non-argv channel
-export AI_MEMORY_STORE_URL='postgres://aimemory:PASSWORD@HOST:5432/aimemory'
+export AI_MEMORY_STORE_URL='postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ai-memory serve
 
 # Still accepted, but the password is exposed via /proc/<pid>/cmdline and `ps`
-ai-memory serve --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+ai-memory serve --store-url 'postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
 
 URL shapes accepted by `--store-url` (and the env/file channels above):
 
-- `postgres://user:pass@host:port/dbname`
-- `postgresql://user:pass@host:port/dbname` (alias)
+- `postgres://user:pass@host:port/dbname?sslmode=verify-full&sslrootcert=<ca.crt>`
+- `postgresql://user:pass@host:port/dbname?sslmode=verify-full&sslrootcert=<ca.crt>` (alias)
+- (#3705) the `sslmode=verify-full` + `sslrootcert` pair is mandatory on both
 - `sqlite:///absolute/path/to/file.db` (also valid — same semantics as `--db`)
 
 `--db` and `--store-url` are **mutually exclusive**. Passing both
@@ -509,7 +515,7 @@ and append the three flags to the `ExecStart=` line:
 ```ini
 [Service]
 ExecStart=/usr/local/bin/ai-memory serve \
-    --store-url postgres://aimemory:PWD@10.20.0.4:5432/aimemory \
+    --store-url 'postgres://aimemory:PWD@10.20.0.4:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt' \
     --tls-cert /etc/ai-memory/tls/server.pem \
     --tls-key  /etc/ai-memory/tls/server.key \
     --mtls-allowlist /etc/ai-memory/tls/mtls-allowlist.txt

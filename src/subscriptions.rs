@@ -2022,11 +2022,19 @@ pub fn validate_url(url: &str) -> Result<()> {
 fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     // Cheap scheme check without pulling the `url` crate.
     let lower = url.to_ascii_lowercase();
-    let (scheme, rest) = lower
-        .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url}"))?;
+    let (scheme, rest) = lower.split_once("://").ok_or_else(|| {
+        anyhow!(
+            "webhook URL missing scheme: {}",
+            crate::transit_encryption::url_origin_for_refusal(url)
+        )
+    })?;
     if scheme != "https" && scheme != "http" {
-        return Err(anyhow!("webhook URL scheme must be https: {url}"));
+        // #3705 review — origin only, never the query/userinfo (a webhook
+        // target routinely carries a token).
+        return Err(anyhow!(
+            "webhook URL scheme must be https: {}",
+            crate::transit_encryption::url_origin_for_refusal(url)
+        ));
     }
     // v1.0.0 #3705 — "only encrypted data in transit": plaintext http:// is
     // refused to EVERY host, loopback included (the pre-#3705 loopback
@@ -2046,7 +2054,12 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         // IPv6: host is everything before the closing bracket.
         match stripped.find(']') {
             Some(i) => stripped[..i].to_string(),
-            None => return Err(anyhow!("malformed IPv6 URL host: {url}")),
+            None => {
+                return Err(anyhow!(
+                    "malformed IPv6 URL host: {}",
+                    crate::transit_encryption::url_origin_for_refusal(url)
+                ));
+            }
         }
     } else {
         // IPv4 / hostname.

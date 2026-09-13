@@ -113,6 +113,19 @@ pub fn install() -> &'static Path {
                 .canonicalize()
                 .expect("#3355 resolve temporary root");
             let dir = tempfile::tempdir_in(root).expect("#3355 allocate isolated key directory");
+            // #3705 review — `tempdir_in` inherits the AMBIENT UMASK (0002 on
+            // this host's default, 0022 on most CI runners): under 0002 the
+            // sandbox comes out 0775 and the #3198 chain check correctly
+            // refuses it, so a test passes for whoever has a strict umask and
+            // fails everywhere else. The sandbox must not depend on ambient
+            // process state: pin 0700 explicitly. The product check is
+            // untouched — it is the control this makes testable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("#3705 chmod 0700 the isolated key directory");
+            }
             assert_isolated(dir.path());
             bind_key_dir_env(dir.path());
             dir
@@ -125,6 +138,26 @@ pub fn install() -> &'static Path {
     #[cfg(not(test))]
     bind_key_dir_env(path);
     path
+}
+
+/// #3705 review — a PRIVATE temporary directory for a test that needs its
+/// own key directory (not the shared sandbox): `tempfile::tempdir()` inherits
+/// the ambient umask, so under `umask 0002` it comes out 0775 and the #3198
+/// chain check correctly refuses it. Every key-directory-creating test goes
+/// through this so the suite never depends on ambient process state.
+///
+/// # Panics
+/// Panics if the directory cannot be allocated or chmodded.
+#[must_use]
+pub fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("allocate private temp dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 private temp dir");
+    }
+    dir
 }
 
 /// The shared sandbox, but ONLY for a process that armed the guard (#3516).

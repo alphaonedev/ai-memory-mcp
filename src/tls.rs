@@ -182,10 +182,13 @@ pub fn host_is_loopback(host: &str) -> bool {
 /// plaintext, or does not name a usable scheme.
 pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
     let trimmed = raw.trim();
+    // #3705 review — refusals render the origin only (never path, query or
+    // userinfo: a peer URL can carry a credential).
     let parsed = reqwest::Url::parse(trimmed).map_err(|e| {
         format!(
-            "federation peer URL {trimmed:?} is not a valid absolute URL ({e}). \
-             Peers must be given as `https://host:port`."
+            "federation peer URL {} is not a valid absolute URL ({e}). \
+             Peers must be given as `https://host:port`.",
+            crate::transit_encryption::url_origin_for_refusal(trimmed)
         )
     })?;
     match parsed.scheme() {
@@ -195,8 +198,9 @@ pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
             trimmed,
         )),
         other => Err(format!(
-            "refusing federation peer {trimmed:?}: unsupported scheme {other:?}. \
-             Federation peers speak HTTPS (or plaintext HTTP to loopback only)."
+            "refusing federation peer {}: unsupported scheme {other:?}. \
+             Federation peers speak HTTPS.",
+            crate::transit_encryption::url_origin_for_refusal(trimmed)
         )),
     }
 }

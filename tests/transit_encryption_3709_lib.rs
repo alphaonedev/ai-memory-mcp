@@ -73,7 +73,10 @@ fn require_tls_token_grammar_3705() {
             "{err}"
         );
         assert!(err.contains("unset AI_MEMORY_REQUIRE_TLS"), "{err}");
-        assert!(err.contains("`ai-memory tls init`"), "{err}");
+        assert!(
+            err.contains("--tls-cert <fullchain.pem> --tls-key <key.pem>"),
+            "{err}"
+        );
     }
     // SAFETY: as above.
     unsafe { std::env::set_var("AI_MEMORY_REQUIRE_TLS", "maybe") };
@@ -148,7 +151,10 @@ fn half_configured_tls_pair_refuses_with_remedy_3709() {
         .map(|e| format!("{e:#}"))
         .expect("#3709: a half-configured TLS pair must be refused");
         assert!(err.contains("#3705"), "{err}");
-        assert!(err.contains("`ai-memory tls init`"), "{err}");
+        assert!(
+            err.contains("--tls-cert <fullchain.pem> --tls-key <key.pem>"),
+            "{err}"
+        );
         assert!(err.contains("--tls-cert/--tls-key"), "{err}");
     }
     // The full pair resolves to exactly the operator's files, unmanaged.
@@ -261,7 +267,10 @@ fn fleet_shape_without_certs_refuses_naming_enterprise_pki_3709() {
         assert!(err.contains("FLEET-shaped"), "{err}");
         assert!(err.contains("enterprise PKI"), "{err}");
         assert!(err.contains("--tls-cert <fullchain.pem>"), "{err}");
-        assert!(err.contains("`ai-memory tls import"), "{err}");
+        assert!(
+            !err.contains("ai-memory tls"),
+            "no fictional verb in a remedy: {err}"
+        );
         assert!(err.contains("Bring your own certificate"), "{err}");
         assert!(
             err.contains(&declared.config_line()),

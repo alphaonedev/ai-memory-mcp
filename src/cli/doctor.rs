@@ -1196,7 +1196,7 @@ fn section_deployment_shape_detector_3700(registered_agents: Option<usize>) -> R
 fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> ReportSection {
     use crate::transit_encryption::{
         self, ENV_REQUIRE_TLS, ISSUE_TAG, MANDATE, PG_SSLMODE_FLOOR, REMEDY_ENTERPRISE_PKI,
-        RequireTls,
+        REMEDY_TLS_RENEW, RequireTls,
     };
     let app_config = if crate::config::skip_config() {
         crate::config::AppConfig::default()
@@ -1230,7 +1230,8 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
             refuses.push(crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.to_string());
             "PLAINTEXT http — REFUSES boot".to_string()
         }
-        Some(_) => "https".to_string(),
+        // Origin only — a forward URL can carry a token; never echo it.
+        Some(u) => format!("https ({})", transit_encryption::url_origin_for_refusal(u)),
     };
     let store_url_sslmode = match crate::store_url::resolve_store_url(None) {
         Ok(None) => "sqlite (no store URL)".to_string(),
@@ -1338,7 +1339,8 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
             )
         }
         Ok(status) if !status.present => {
-            "absent (first boot will generate a local certificate; or run `ai-memory tls init`)"
+            "absent (first boot will generate a local certificate under <key_dir>/tls/, or \
+             supply --tls-cert/--tls-key)"
                 .to_string()
         }
         Ok(_) if fleet && locally_minted => {
@@ -1354,15 +1356,15 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
             if days < 0 {
                 leaf_expired = true;
                 format!(
-                    "present, EXPIRED {} day(s) ago — REFUSES at next boot; run \
-                     `ai-memory tls renew`",
+                    "present, EXPIRED {} day(s) ago — REFUSES at next boot; {REMEDY_TLS_RENEW}",
                     -days
                 )
             } else if status.within_renewal_window || days == 0 {
                 leaf_warning = true;
                 format!(
-                    "present, INSIDE the renewal window ({days} day(s) to expiry) — renews at \
-                     next boot or `ai-memory tls renew`"
+                    "present, INSIDE the renewal window ({days} day(s) to expiry) — a locally \
+                     minted leaf renews at the next boot or by the daily task; operator material: \
+                     {REMEDY_TLS_RENEW}"
                 )
             } else {
                 format!(
