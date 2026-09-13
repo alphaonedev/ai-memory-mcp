@@ -1383,7 +1383,9 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(PG_PROBE_TIMEOUT)
-                .connect(&url)
+                // #3674 — screened options, never the raw DSN: sqlx logs an
+                // unrecognised query parameter with its value.
+                .connect_with(crate::store::postgres::dsn::connect_options(&url)?)
                 .await?;
             let facts = probe_pgvector_preflight(&pool).await?;
             let vector_version = probe_extension_version(&pool, PGVECTOR_EXTENSION_NAME).await?;

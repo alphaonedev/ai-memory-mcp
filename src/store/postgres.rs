@@ -87,6 +87,9 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
+// v1.0.0 #3674 — the one funnel a store DSN crosses into sqlx: removes the
+// query parameters sqlx would log (value included) instead of honour.
+pub mod dsn;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -2566,8 +2569,10 @@ impl PostgresStore {
             return Err(unsupported_embedding_dim(dim));
         }
 
+        // #3674 — `dsn::connect_options`, never `url.parse()`: sqlx logs an
+        // unrecognised query parameter WITH its value.
         let options: PgConnectOptions =
-            url.parse()
+            dsn::connect_options(url)
                 .map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
                     sqlstate: None,

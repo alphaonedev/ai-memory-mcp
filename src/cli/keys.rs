@@ -154,7 +154,10 @@ fn postgres(url: &str, dir: &Path, delete: bool, include_public_only: bool) -> R
     super::doctor::run_pg_probe(|| async {
         use sqlx::Connection as _;
         let operation = async {
-            let mut conn = sqlx::PgConnection::connect(url).await?;
+            // #3674 — screened options, never the raw DSN (sqlx logs an
+            // unrecognised query parameter with its value).
+            let options = crate::store::postgres::dsn::connect_options(url)?;
+            let mut conn = sqlx::PgConnection::connect_with(&options).await?;
             let mut tx = conn.begin().await?;
             if delete {
                 // Protect the entire _agents population against insertion,

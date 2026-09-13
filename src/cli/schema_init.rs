@@ -560,10 +560,18 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
     // and exits. We hold the pool for the duration of this function
     // and let it drop at the end so we don't keep a Postgres
     // connection slot warm.
+    // #3674 — screened options, never the raw DSN: sqlx logs an
+    // unrecognised query parameter with its value.
+    let options = crate::store::postgres::dsn::connect_options(url).with_context(|| {
+        format!(
+            "parse postgres url for enumeration: {}",
+            crate::logging::redact_url_password(url)
+        )
+    })?;
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(15))
-        .connect(url)
+        .connect_with(options)
         .await
         // #1579 A3 (SECURITY) — same redaction as the connect above.
         .with_context(|| {
