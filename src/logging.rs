@@ -39,32 +39,112 @@ use crate::log_paths;
 /// rotated filenames look like `ai-memory.log.2026-04-30`.
 const DEFAULT_PREFIX: &str = "ai-memory.log";
 
-/// Default `tracing` EnvFilter directive applied when `RUST_LOG` is
-/// unset — INFO-level for the substrate's own crate only. One spelling
-/// for every fallback-filter construction site (pm-v3.1 gate, #1558
-/// wave 4).
-pub const DEFAULT_LOG_DIRECTIVE: &str = "ai_memory=info";
-
-/// Initialise the file logging facility. Returns a [`WorkerGuard`] that
-/// the caller MUST keep alive for the lifetime of the process — when
-/// dropped it flushes the in-memory buffer to disk. Returns `None`
-/// when logging is disabled.
+/// Bare level every production subscriber starts from: `info` for EVERY
+/// target, not only the ones under `ai_memory`. One spelling for every
+/// filter construction site (pm-v3.1 gate, #1558 wave 4).
 ///
-/// # Errors
-/// - The configured log directory cannot be created.
-/// - The rolling file appender cannot be constructed.
-/// Build the `EnvFilter` for `level`, falling back to `info` on a
-/// malformed directive. PURE — no global subscriber install, no I/O —
-/// so the level-parse fallback can be asserted deterministically
-/// without going through the fragile process-global install path that
-/// made the #1711 `init_file_logging_*` fallback tests flaky under
-/// parallel `cargo test` (the install path was incidental to what
-/// those tests actually verify: that a garbage directive degrades to
-/// `info` instead of erroring).
+/// #3650: this used to be the directive `ai_memory=info`. Hundreds of event
+/// sites name an explicit target outside that prefix (`store::postgres`,
+/// `federation::…`, `signed_events`, `schema_guard`, `security.posture`,
+/// `http::auth`, …; many modules declare a per-file `TRACE_TARGET`), so the
+/// shipped default discarded their boot, security, replay and degradation
+/// events. A per-prefix allowlist cannot be kept complete by a census, so the
+/// default is a bare level instead.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// A filter ready to install, plus every directive that could not be used.
+///
+/// The rejects are returned rather than logged because no subscriber exists
+/// yet when the filter is built: a `tracing::warn!` at that point is
+/// swallowed. Callers emit them through [`warn_rejected_directives`] once
+/// their subscriber is installed.
+pub(crate) struct BuiltLogFilter {
+    pub(crate) filter: tracing_subscriber::EnvFilter,
+    pub(crate) rejected: Vec<String>,
+}
+
+/// Build the filter every production subscriber (console, file, stdout,
+/// syslog) installs. PURE: no environment read, no global install, no I/O,
+/// so each layering rule is asserted directly in unit tests (the #1711
+/// lesson about the process-global install path).
+///
+/// Layering, in order, later layers winning for the targets they name:
+///
+/// 1. `base`, a full directive string (a bare level for the console,
+///    `[logging].level` for the sinks). Empty means [`DEFAULT_LOG_LEVEL`];
+///    unparseable falls back to it and is reported.
+/// 2. `extras`, the caller's own defaults (e.g. `tower_http=info`).
+/// 3. Each `RUST_LOG` directive, LAST, so the operator's directive replaces
+///    any default for the same target. `tracing-subscriber` replaces a
+///    directive with the same target and field set regardless of level, so
+///    applying a default AFTER the operator's directive silently undid it:
+///    before #3650, `RUST_LOG=ai_memory=debug` was reset to `info` by the
+///    appended `ai_memory=info`. A bare level in `RUST_LOG` (e.g. `warn`)
+///    replaces the bare base level the same way.
+///
+/// `RUST_LOG` directives add to the defaults rather than replacing them, so a
+/// deployment that still sets `RUST_LOG=ai_memory=info` keeps every other
+/// target at `info`.
+pub(crate) fn build_log_filter(
+    base: &str,
+    extras: &[&str],
+    rust_log: Option<&str>,
+) -> BuiltLogFilter {
+    use tracing_subscriber::filter::Directive;
+
+    let mut rejected = Vec::new();
+    let base = base.trim();
+    let mut filter = if base.is_empty() {
+        tracing_subscriber::EnvFilter::new(DEFAULT_LOG_LEVEL)
+    } else {
+        tracing_subscriber::EnvFilter::try_new(base).unwrap_or_else(|e| {
+            rejected.push(format!(
+                "{base:?} ({e}); using the default level {DEFAULT_LOG_LEVEL:?}"
+            ));
+            tracing_subscriber::EnvFilter::new(DEFAULT_LOG_LEVEL)
+        })
+    };
+    let operator = rust_log.into_iter().flat_map(|s| s.split(','));
+    for raw in extras.iter().copied().chain(operator) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        match raw.parse::<Directive>() {
+            Ok(d) => filter = filter.add_directive(d),
+            Err(e) => rejected.push(format!("{raw:?} ({e})")),
+        }
+    }
+    BuiltLogFilter { filter, rejected }
+}
+
+/// The operator's `RUST_LOG`, if set to valid UTF-8. Read once per install.
+fn rust_log_env() -> Option<String> {
+    std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok()
+}
+
+/// Report directives [`build_log_filter`] could not use. Call only after a
+/// subscriber is installed, otherwise the warnings go nowhere. Never fatal: a
+/// bad directive costs verbosity, not the boot.
+fn warn_rejected_directives(rejected: Vec<String>) {
+    for reject in rejected {
+        tracing::warn!(target: "logging", "ignoring unparseable log directive {reject}");
+    }
+}
+
+/// The filter a sink (`file` / `stdout` / `syslog`) installs:
+/// `[logging].level` as the base, then `RUST_LOG`.
+fn sink_log_filter(cfg: &LoggingConfig) -> BuiltLogFilter {
+    let level = cfg.level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
+    build_log_filter(level, &[], rust_log_env().as_deref())
+}
+
+/// `level` as a filter, falling back to [`DEFAULT_LOG_LEVEL`] when it does not
+/// parse. Kept so the #1711 fallback pins assert the sinks' base-level rule
+/// without the process-global install path.
+#[cfg(test)]
 pub(crate) fn level_filter_or_info_fallback(level: &str) -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_new(level).unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::try_new("info").expect("info is a valid filter")
-    })
+    build_log_filter(level, &[], None).filter
 }
 
 /// One-shot detection of a configured-but-unrecognized log sink value
@@ -127,38 +207,33 @@ fn classify_unrecognized_sink(raw: Option<&str>) -> Option<String> {
 /// (e.g. `init_file_logging` ran first), so the order of boot steps does
 /// not matter and a second call cannot panic.
 ///
-/// `extra_directives` are appended to the env filter after
-/// [`DEFAULT_LOG_DIRECTIVE`]; an unparseable directive is skipped with a
-/// WARN rather than aborting the boot, because losing a log directive
-/// must never be fatal to the daemon it configures.
+/// The filter is [`build_log_filter`] over [`DEFAULT_LOG_LEVEL`], then
+/// `extra_directives`, then `RUST_LOG` (#3650). An unparseable directive
+/// is skipped with a WARN rather than aborting the boot, because losing a
+/// log directive must never be fatal to the daemon it configures.
 pub fn init_console_tracing(extra_directives: &[&str]) {
-    let mut filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(
-        DEFAULT_LOG_DIRECTIVE
-            .parse()
-            .expect("DEFAULT_LOG_DIRECTIVE is a compile-time constant and always parses"),
+    let built = build_log_filter(
+        DEFAULT_LOG_LEVEL,
+        extra_directives,
+        rust_log_env().as_deref(),
     );
-    // Collect rejects rather than warning inline: no subscriber is
-    // installed yet, so a `tracing::warn!` here would be swallowed — the
-    // silent-degradation shape this codebase treats as a defect.
-    let mut rejected: Vec<String> = Vec::new();
-    for directive in extra_directives {
-        match directive.parse() {
-            Ok(d) => filter = filter.add_directive(d),
-            Err(e) => rejected.push(format!("{directive:?} ({e})")),
-        }
-    }
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(built.filter)
         // #3436 — the whole point of this funnel. NOT a parameter.
         .with_writer(std::io::stderr)
         .try_init();
     // Now that a subscriber exists, the rejects are actually visible.
-    // Never fatal: a bad directive costs verbosity, not the boot.
-    for reject in rejected {
-        tracing::warn!(target: "logging", "ignoring unparseable log directive {reject}");
-    }
+    warn_rejected_directives(built.rejected);
 }
 
+/// Initialise the file logging facility. Returns a [`WorkerGuard`] that
+/// the caller MUST keep alive for the lifetime of the process — when
+/// dropped it flushes the in-memory buffer to disk. Returns `None`
+/// when logging is disabled.
+///
+/// # Errors
+/// - The configured log directory cannot be created.
+/// - The rolling file appender cannot be constructed.
 pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     if !cfg.enabled.unwrap_or(false) {
         return Ok(None);
@@ -169,14 +244,9 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     // the two sinks are byte-identical on every request path. A configured
     // but unrecognized value falls back to `file` with a loud WARN rather
     // than silently misrouting (louder than `rotation_for`'s silent default).
-    if let Some(bad) = unrecognized_sink_value(cfg) {
-        tracing::warn!(
-            target: "logging",
-            value = %bad,
-            "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
-             falling back to the file sink. Valid: file | stdout | syslog"
-        );
-    }
+    // #3650: the WARN is emitted AFTER the subscriber below is installed.
+    // Emitted here, before any subscriber exists, it went nowhere.
+    let bad_sink = unrecognized_sink_value(cfg);
     // #1765 Tier 2 — the remote syslog sink uses a level-aware `MakeWriter`
     // (so each record's RFC-5424 PRI severity reflects the event's tracing
     // Level) rather than the File/Stdout `NonBlocking` writer, so it installs
@@ -211,18 +281,17 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     // Capture the writer in the static slot so the daemon's tracing
     // subscriber can drain it. `try_init` so multiple test runs
     // (each spinning a fresh subscriber) don't poison the global.
-    let level = cfg.level.as_deref().unwrap_or("info");
-    let filter = level_filter_or_info_fallback(level);
+    let built = sink_log_filter(cfg);
     let structured = cfg.structured.unwrap_or(false);
     let res = if structured {
         tracing_subscriber::fmt()
-            .with_env_filter(filter)
+            .with_env_filter(built.filter)
             .with_writer(writer)
             .json()
             .try_init()
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(filter)
+            .with_env_filter(built.filter)
             .with_writer(writer)
             .try_init()
     };
@@ -234,6 +303,15 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
         //           playbook §3c.
         tracing::debug!("file logging subscriber already initialised: {e}");
     }
+    if let Some(bad) = bad_sink {
+        tracing::warn!(
+            target: "logging",
+            value = %bad,
+            "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
+             falling back to the file sink. Valid: file | stdout | syslog"
+        );
+    }
+    warn_rejected_directives(built.rejected);
     Ok(Some(guard))
 }
 
@@ -246,24 +324,24 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
 #[cfg(feature = "syslog")]
 fn init_syslog_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     let (make_writer, guard) = syslog::build_syslog_make_writer(cfg)?;
-    let level = cfg.level.as_deref().unwrap_or("info");
-    let filter = level_filter_or_info_fallback(level);
+    let built = sink_log_filter(cfg);
     let structured = cfg.structured.unwrap_or(false);
     let res = if structured {
         tracing_subscriber::fmt()
-            .with_env_filter(filter)
+            .with_env_filter(built.filter)
             .with_writer(make_writer)
             .json()
             .try_init()
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(filter)
+            .with_env_filter(built.filter)
             .with_writer(make_writer)
             .try_init()
     };
     if let Err(e) = res {
         tracing::debug!("syslog logging subscriber already initialised: {e}");
     }
+    warn_rejected_directives(built.rejected);
     Ok(Some(guard))
 }
 
@@ -1244,6 +1322,242 @@ mod tests {
             level_filter_or_info_fallback("info").to_string(),
             "a malformed `target=level` directive must fall back to info"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #3650 — the production filter covers every target, and the
+    // operator's RUST_LOG is layered LAST.
+    // -----------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Emit one probe event per (target, level) through a thread-local
+    /// subscriber carrying `filter`, and return what the filter let through.
+    /// Targets are the real SSOT constants where the crate has one, so a
+    /// renamed target keeps this probe honest.
+    fn probe(filter: tracing_subscriber::EnvFilter) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "ai_memory::logging_probe", "probe:ai_memory:info");
+            tracing::debug!(target: "ai_memory::logging_probe", "probe:ai_memory:debug");
+            tracing::info!(target: crate::federation::SIGNING_TRACE_TARGET, "probe:fed:info");
+            tracing::debug!(target: crate::federation::SIGNING_TRACE_TARGET, "probe:fed:debug");
+            tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, "probe:fed:warn");
+            tracing::info!(target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET, "probe:signed:info");
+            tracing::warn!(target: crate::storage::schema_guard::TRACE_TARGET, "probe:schema:warn");
+            tracing::info!(target: crate::handlers::HTTP_AUTH_TRACE_TARGET, "probe:auth:info");
+            tracing::info!(target: "security.posture", "probe:posture:info");
+            tracing::info!(target: "store::postgres", "probe:pg:info");
+            tracing::info!(target: "store::postgres::chain_append", "probe:chain:info");
+            tracing::warn!(target: "store::postgres::chain_append", "probe:chain:warn");
+            tracing::info!(target: "zz_not_yet_written::target", "probe:future:info");
+            tracing::info!(target: "tower_http::trace", "probe:tower:info");
+            tracing::debug!(target: "tower_http::trace", "probe:tower:debug");
+        });
+        let out = buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    /// The shipped default: every target at INFO, including ones nobody has
+    /// written yet, and nothing at DEBUG.
+    #[test]
+    fn default_filter_enables_info_for_every_target_3650() {
+        let out = probe(build_log_filter(DEFAULT_LOG_LEVEL, &[], None).filter);
+        for want in [
+            "probe:ai_memory:info",
+            "probe:fed:info",
+            "probe:fed:warn",
+            "probe:signed:info",
+            "probe:schema:warn",
+            "probe:auth:info",
+            "probe:posture:info",
+            "probe:pg:info",
+            "probe:chain:info",
+            "probe:future:info",
+            "probe:tower:info",
+        ] {
+            assert!(out.contains(want), "default filter dropped {want}:\n{out}");
+        }
+        for unwanted in [
+            "probe:ai_memory:debug",
+            "probe:fed:debug",
+            "probe:tower:debug",
+        ] {
+            assert!(
+                !out.contains(unwanted),
+                "default filter leaked {unwanted}:\n{out}"
+            );
+        }
+    }
+
+    /// Non-vacuity control: the pre-#3650 console composition, frozen here,
+    /// really did drop every target outside `ai_memory` and really did reset
+    /// an operator's `ai_memory=debug` to `info`. If this ever stops holding,
+    /// the two tests below no longer prove anything about the fix.
+    #[test]
+    fn pre_3650_console_composition_dropped_targets_and_reset_debug() {
+        // `EnvFilter::from_default_env()` is exactly this builder over the
+        // value of RUST_LOG; the removed `DEFAULT_LOG_DIRECTIVE` was then
+        // appended.
+        let pre_fix = |rust_log: &str| {
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::ERROR.into())
+                .parse_lossy(rust_log)
+                .add_directive("ai_memory=info".parse().expect("valid directive"))
+        };
+        // RUST_LOG unset: everything outside `ai_memory` is at ERROR.
+        let unset = probe(pre_fix(""));
+        assert!(unset.contains("probe:ai_memory:info"), "{unset}");
+        assert!(!unset.contains("probe:fed:warn"), "{unset}");
+        assert!(!unset.contains("probe:posture:info"), "{unset}");
+        let debug = probe(pre_fix("ai_memory=debug"));
+        assert!(!debug.contains("probe:ai_memory:debug"), "{debug}");
+    }
+
+    /// A deployment that still exports `RUST_LOG=ai_memory=info` (the
+    /// pre-#3650 systemd units) keeps every other target at INFO.
+    #[test]
+    fn legacy_ai_memory_rust_log_keeps_other_targets_3650() {
+        let out = probe(build_log_filter(DEFAULT_LOG_LEVEL, &[], Some("ai_memory=info")).filter);
+        for want in [
+            "probe:ai_memory:info",
+            "probe:fed:info",
+            "probe:posture:info",
+            "probe:pg:info",
+        ] {
+            assert!(
+                out.contains(want),
+                "RUST_LOG=ai_memory=info dropped {want}:\n{out}"
+            );
+        }
+    }
+
+    /// The operator's directive wins over a default for the same target.
+    #[test]
+    fn operator_rust_log_is_applied_last_3650() {
+        let debug = probe(build_log_filter(DEFAULT_LOG_LEVEL, &[], Some("ai_memory=debug")).filter);
+        assert!(debug.contains("probe:ai_memory:debug"), "{debug}");
+        assert!(!debug.contains("probe:fed:debug"), "{debug}");
+
+        let extra_overridden = probe(
+            build_log_filter(
+                DEFAULT_LOG_LEVEL,
+                &["tower_http=debug"],
+                Some("tower_http=warn"),
+            )
+            .filter,
+        );
+        assert!(
+            !extra_overridden.contains("probe:tower:info"),
+            "{extra_overridden}"
+        );
+
+        let extra_kept =
+            probe(build_log_filter(DEFAULT_LOG_LEVEL, &["tower_http=debug"], None).filter);
+        assert!(extra_kept.contains("probe:tower:debug"), "{extra_kept}");
+    }
+
+    /// A bare level in RUST_LOG replaces the base level; target directives
+    /// narrow or widen only the targets they name.
+    #[test]
+    fn rust_log_levels_and_targets_layer_as_documented_3650() {
+        let warn = probe(build_log_filter(DEFAULT_LOG_LEVEL, &[], Some("warn")).filter);
+        assert!(warn.contains("probe:fed:warn"), "{warn}");
+        assert!(warn.contains("probe:schema:warn"), "{warn}");
+        assert!(!warn.contains("probe:fed:info"), "{warn}");
+        assert!(!warn.contains("probe:ai_memory:info"), "{warn}");
+
+        let mixed =
+            probe(build_log_filter(DEFAULT_LOG_LEVEL, &[], Some("warn,federation=debug")).filter);
+        assert!(mixed.contains("probe:fed:debug"), "{mixed}");
+        assert!(!mixed.contains("probe:posture:info"), "{mixed}");
+
+        let narrow = probe(
+            build_log_filter(
+                DEFAULT_LOG_LEVEL,
+                &[],
+                Some("store::postgres::chain_append=warn"),
+            )
+            .filter,
+        );
+        assert!(!narrow.contains("probe:chain:info"), "{narrow}");
+        assert!(narrow.contains("probe:chain:warn"), "{narrow}");
+        assert!(narrow.contains("probe:pg:info"), "{narrow}");
+        assert!(narrow.contains("probe:fed:info"), "{narrow}");
+    }
+
+    /// Unusable directives are reported, never fatal, and never take the
+    /// usable ones down with them.
+    #[test]
+    fn unparseable_directives_are_reported_and_skipped_3650() {
+        let built = build_log_filter(
+            DEFAULT_LOG_LEVEL,
+            &["tower_http=notalevel"],
+            Some("ai_memory=debug, ,federation=@@"),
+        );
+        assert_eq!(built.rejected.len(), 2, "{:?}", built.rejected);
+        assert!(
+            built.rejected[0].contains("tower_http=notalevel"),
+            "{:?}",
+            built.rejected
+        );
+        assert!(
+            built.rejected[1].contains("federation=@@"),
+            "{:?}",
+            built.rejected
+        );
+        let out = probe(built.filter);
+        assert!(out.contains("probe:ai_memory:debug"), "{out}");
+        assert!(out.contains("probe:fed:info"), "{out}");
+
+        let bad_base = build_log_filter("@invalid@directive@", &[], None);
+        assert_eq!(bad_base.rejected.len(), 1, "{:?}", bad_base.rejected);
+        assert!(probe(bad_base.filter).contains("probe:fed:info"));
+
+        let empty_base = build_log_filter("  ", &[], None);
+        assert!(empty_base.rejected.is_empty(), "{:?}", empty_base.rejected);
+        assert!(probe(empty_base.filter).contains("probe:posture:info"));
+    }
+
+    /// The sinks take `[logging].level` as their base and still honour
+    /// RUST_LOG on top of it, like the console.
+    #[test]
+    fn sink_base_level_is_layered_under_rust_log_3650() {
+        let quiet = probe(build_log_filter("warn", &[], None).filter);
+        assert!(!quiet.contains("probe:fed:info"), "{quiet}");
+        assert!(quiet.contains("probe:fed:warn"), "{quiet}");
+        let raised = probe(build_log_filter("warn", &[], Some("federation=info")).filter);
+        assert!(raised.contains("probe:fed:info"), "{raised}");
+        assert!(!raised.contains("probe:posture:info"), "{raised}");
     }
 
     #[test]

@@ -257,29 +257,32 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Setup</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">How tracing initializes.</h2>
-    <p class="lede">The daemon installs a <code>tracing_subscriber::fmt</code> layer with the standard <code>EnvFilter</code> chain. Default directives keep <code>ai_memory</code> + <code>tower_http</code> at <code>info</code> while honoring any <code>RUST_LOG</code> override.</p>
-    <div class="snip">// src/daemon_runtime.rs::init_tracing() — called from serve()
+    <p class="lede">Every console subscriber (<code>serve</code>, <code>mcp</code>, <code>sync-daemon</code>, <code>curator</code>, <code>watch</code>, <code>wake-hub</code>, <code>wake-listen</code>) and every <code>[logging]</code> sink builds its filter in one place, <code>crate::logging::build_log_filter</code>. It starts from a bare level, <code>info</code> for the console and <code>[logging].level</code> for the file / stdout / syslog sinks, which covers every target. The caller's own defaults are added next, and <code>RUST_LOG</code> goes on last, so an operator directive always replaces the default for the target it names (#3650).</p>
+    <div class="snip">// src/logging.rs::init_console_tracing() — the console funnel
+let built = build_log_filter(
+    DEFAULT_LOG_LEVEL,                 <span class="cm">// "info", every target</span>
+    extra_directives,                  <span class="cm">// e.g. ["tower_http=info"] for serve</span>
+    rust_log_env().as_deref(),         <span class="cm">// RUST_LOG, applied LAST</span>
+);
 tracing_subscriber::fmt()
-    .with_env_filter(
-        EnvFilter::<span class="key">from_default_env</span>()
-            .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse()?) <span class="cm">// "ai_memory=info"</span>
-            .add_directive(<span class="val">"tower_http=info"</span>.parse()?),
-    )
+    .with_env_filter(built.filter)
+    .with_writer(std::io::stderr)
     .try_init();</div>
-    <p class="lede" style="margin-top:1rem">To turn the volume up:</p>
-    <div class="snip"><span class="cm"># quiet — only errors</span>
-RUST_LOG=ai_memory=error ai-memory serve
+    <p class="lede" style="margin-top:1rem">Before #3650 the default was the directive <code>ai_memory=info</code>, so events under any other target (<code>store::postgres</code>, <code>federation::…</code>, <code>signed_events</code>, <code>security.posture</code>, …) were dropped, and <code>RUST_LOG=ai_memory=debug</code> was reset to <code>info</code> by that appended default. A deployment that still exports <code>RUST_LOG=ai_memory=info</code> now keeps every other target at <code>info</code>, because <code>RUST_LOG</code> adds to the default rather than replacing it.</p>
+    <p class="lede" style="margin-top:1rem">To change the volume:</p>
+    <div class="snip"><span class="cm"># quiet — warnings and errors only, every target</span>
+RUST_LOG=warn ai-memory serve
 
-<span class="cm"># standard — what runs in prod</span>
-RUST_LOG=ai_memory=info,tower_http=info ai-memory serve
+<span class="cm"># standard — what runs in prod (no RUST_LOG needed)</span>
+ai-memory serve
 
 <span class="cm"># debug a federation issue</span>
-RUST_LOG=ai_memory::federation=debug,ai_memory=info ai-memory serve
+RUST_LOG=ai_memory::federation=debug,federation=debug ai-memory serve
 
 <span class="cm"># everything (very chatty — local dev only)</span>
-RUST_LOG=ai_memory=trace,tower_http=debug ai-memory serve</div>
-    <p class="lede" style="margin-top:1.5rem"><strong>Named metadata targets (post-#1562).</strong> Most events emit under the module-path default, so an <code>ai_memory=…</code> directive matches them (including the named <code>ai_memory::</code>-prefixed targets: <code>ai_memory::subscriptions</code>, <code>ai_memory::authz</code>, <code>ai_memory::handlers::skills</code>, <code>ai_memory::federation::sync</code>, <code>ai_memory::federation::push_dlq</code>, <code>ai_memory::governance::audit</code>). But a set of subsystems emit under <em>literal</em> targets that do <strong>not</strong> start with <code>ai_memory</code> — an <code>ai_memory=debug</code> filter does NOT match these events; name them explicitly:</p>
-    <div class="snip"><span class="cm"># literal targets (RUST_LOG must name them — ai_memory=… won't match)</span>
+RUST_LOG=trace ai-memory serve</div>
+    <p class="lede" style="margin-top:1.5rem"><strong>Named metadata targets (post-#1562).</strong> Most events emit under the module-path default, so an <code>ai_memory=…</code> directive matches them (including the named <code>ai_memory::</code>-prefixed targets: <code>ai_memory::subscriptions</code>, <code>ai_memory::authz</code>, <code>ai_memory::handlers::skills</code>, <code>ai_memory::federation::sync</code>, <code>ai_memory::federation::push_dlq</code>, <code>ai_memory::governance::audit</code>). A set of subsystems emit under <em>literal</em> targets that do <strong>not</strong> start with <code>ai_memory</code>. The default <code>info</code> level covers them, but raising or lowering them needs a directive that names them, because <code>ai_memory=debug</code> does not match these events:</p>
+    <div class="snip"><span class="cm"># literal targets (to change their level, name them — ai_memory=… won't match)</span>
 store::postgres            <span class="cm"># postgres SAL adapter (#1562 — real metadata target)</span>
 store::postgres::kg        <span class="cm"># postgres AGE knowledge-graph ops (#1562)</span>
 schema_init                <span class="cm"># `ai-memory schema-init` CLI (#1562)</span>
@@ -292,7 +295,7 @@ federation::attestation    <span class="cm"># inbound peer attestation</span>
 governance                 <span class="cm"># rule-engine verdicts</span>
 
 <span class="cm"># example: debug the postgres adapter specifically</span>
-RUST_LOG=ai_memory=info,store::postgres=debug,store::postgres::kg=debug ai-memory serve</div>
+RUST_LOG=store::postgres=debug,store::postgres::kg=debug ai-memory serve</div>
     <p class="lede" style="margin-top:1.5rem"><strong>Where the log SINK writes (<code>AI_MEMORY_LOG_SINK</code>, #1463 / #1765, v0.8.0).</strong> <code>RUST_LOG</code> selects WHICH events are emitted; <code>AI_MEMORY_LOG_SINK</code> selects WHERE the global subscriber's worker writes them — resolved once at boot (env &gt; <code>[logging].sink</code> &gt; compiled default <code>file</code>), never on the store/recall hot path, so the choice is byte-identical per request.</p>
     <div class="snip"><span class="cm"># file (default) — rolling file appender under the resolved log dir</span>
 AI_MEMORY_LOG_SINK=file ai-memory serve
@@ -390,7 +393,7 @@ ai-memory serve
   <div class="container">
     <span class="eyebrow">Level taxonomy</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">info / warn / error.</h2>
-    <p class="lede">53 of the 713 call sites are <code>debug!</code>/<code>trace!</code> diagnostics (federation sync, postgres adapter, hooks executor, migrations) — silent under the default <code>ai_memory=info</code> filter until <code>RUST_LOG</code> raises them. Default production output is the three levels below.</p>
+    <p class="lede">53 of the 713 call sites are <code>debug!</code>/<code>trace!</code> diagnostics (federation sync, postgres adapter, hooks executor, migrations) — silent under the default <code>info</code> filter until <code>RUST_LOG</code> raises them. Default production output is the three levels below.</p>
     <div class="lev-grid">
       <div class="lev info">
         <div class="lbl">info</div>

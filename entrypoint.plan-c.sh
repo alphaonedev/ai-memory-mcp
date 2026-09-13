@@ -231,7 +231,8 @@ unset AI_MEMORY_DB
 # AI_MEMORY_AGENT_ID (e.g. `ai:ic-parity-alice@lan-parity` set by
 # docker-compose) flows through unchanged and is honoured by
 # `resolve_agent_id` step 2.
-export RUST_LOG="${RUST_LOG:-ai_memory=info}"
+# RUST_LOG is passed through untouched: the binary defaults to `info` for
+# every target (#3650), and a caller-supplied RUST_LOG is layered on top.
 
 exec /usr/local/bin/ai-memory serve \
   --host "$AI_MEMORY_LISTEN_HOST" --port "$AI_MEMORY_LISTEN_PORT" \

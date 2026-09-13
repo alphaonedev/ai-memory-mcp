@@ -18,7 +18,11 @@ TimeoutStopSec=90
 # State location. The package installer creates /var/lib/ai-memory owned by
 # ai-memory:ai-memory with mode 0750.
 Environment=AI_MEMORY_DB=/var/lib/ai-memory/ai-memory.db
-Environment=RUST_LOG=ai_memory=info
+# Log filter: the binary defaults to `info` for every target (#3650). Set
+# RUST_LOG only to change that; its directives are layered on top, so
+# e.g. `Environment=RUST_LOG=ai_memory=debug` raises only ai-memory's own
+# events. The old `RUST_LOG=ai_memory=info` here hid every event whose
+# target is outside `ai_memory` (store::postgres, federation, security.posture).
 StateDirectory=ai-memory
 StateDirectoryMode=0750
 WorkingDirectory=/var/lib/ai-memory

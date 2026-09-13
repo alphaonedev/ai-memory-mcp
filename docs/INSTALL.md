@@ -745,7 +745,7 @@ ExecStart=/usr/local/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db serve
 Restart=on-failure
 RestartPreventExitStatus=75
 RestartSec=5
-Environment=RUST_LOG=ai_memory=info
+# No RUST_LOG needed: the default is info for every target (#3650).
 
 # Graceful shutdown checkpoints the WAL
 KillSignal=SIGINT
@@ -1011,7 +1011,7 @@ rm -f ai-memory.db ai-memory.db-wal ai-memory.db-shm
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AI_MEMORY_DB` | `ai-memory.db` | Path to the SQLite database file |
-| `RUST_LOG` | (none) | Log level filter (e.g., `ai_memory=info,tower_http=info`) |
+| `RUST_LOG` | (none; default `info` for every target) | Log filter directives layered on the default (e.g., `ai_memory=debug`) |
 
 ### TTL and Archive Configuration
 

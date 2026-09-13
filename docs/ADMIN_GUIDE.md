@@ -64,7 +64,7 @@ ExecStart=/usr/local/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db serve
 Restart=on-failure
 RestartPreventExitStatus=75
 RestartSec=5
-Environment=RUST_LOG=ai_memory=info,tower_http=info
+# No RUST_LOG needed: the default is info for every target (#3650).
 
 # Graceful shutdown: checkpoints WAL before exit
 KillSignal=SIGINT
@@ -360,7 +360,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `AI_MEMORY_MAX_LINKS_PER_DAY` | `5000` | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** daily link-write quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_links_per_day`). |
 | `AI_MEMORY_MAX_PAGE_SIZE` | `1000` | **[#1156 follow-up, v0.7.x]** Cap on list / bulk-write / federation-sync page size — bounds per-request in-memory materialization (OOM guard). Precedence: env > `[limits].max_page_size` > compiled `MAX_BULK_SIZE`. Non-positive / unparseable falls through. |
 | `AI_MEMORY_MAX_INFLIGHT_REQUESTS` | unset ⇒ CPU-scaled | **[#1733 Pillar-4 4.A; TRI-STATE since #2032 M3]** Global HTTP admission-control concurrency cap. `0` **disables** it (the layer is not composed at all). When UNSET the daemon computes a CPU-scaled default — `cores × 64`, clamped to a floor of **256** and a ceiling of **4096** (`resolve_default_max_inflight_requests`, `src/config.rs:4368-4375`; constants `MAX_INFLIGHT_PER_CORE`/`MAX_INFLIGHT_FLOOR`/`MAX_INFLIGHT_CEILING` at `src/config.rs:4347,4352,4356`) — it is NOT "unset = disabled". Precedence: env > `[limits].max_inflight_requests` > CPU-scaled default (`src/config.rs:4326` for the env name, `:8938-8942` for the ladder). |
-| `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
+| `RUST_LOG` | (none; default `info` for every target) | Log filter directives layered on the default (e.g., `ai_memory=debug,tower_http=debug`) |
 | `AI_MEMORY_NO_CONFIG` | (none) | Set to a truthy value (`1`/`true`/`yes`/`on`, trimmed, case-insensitive) to skip config file loading (useful for testing). **[#3167]** Any other value — including an empty `AI_MEMORY_NO_CONFIG=` and `=0` — means "do NOT skip": the config file IS loaded and a one-shot WARN is printed to stderr. Before #3167 mere PRESENCE of the variable disabled the whole config file. **[#3603]** With a truthy value the config-path WARNs (legacy `~/.config` root, shadowed or Library-only macOS config) are not printed either, since no config is read. |
 
 ### Configuration File (config.toml)
@@ -1987,8 +1987,8 @@ Key log messages:
 The HTTP daemon logs via `tracing` with configurable levels:
 
 ```bash
-# Info level (default recommended)
-RUST_LOG=ai_memory=info,tower_http=info ai-memory serve
+# Info level for every target (the default; no RUST_LOG needed)
+ai-memory serve
 
 # Debug level (verbose, includes all HTTP requests)
 RUST_LOG=ai_memory=debug,tower_http=debug ai-memory serve

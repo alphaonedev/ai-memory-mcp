@@ -55,7 +55,8 @@ write_files:
       WorkingDirectory=/opt/ai-memory
       Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
       Environment=AI_MEMORY_AUTONOMOUS_HOOKS=0
-      Environment=RUST_LOG=ai_memory=info,store::postgres=info
+      # No RUST_LOG: the binary defaults to info for every target (#3650),
+      # store::postgres included.
       # Public binding is permitted only with TLS + fingerprint-pinned mTLS.
       # Request authn additionally uses the per-node API key; header trust stays off.
       EnvironmentFile=/etc/ai-memory/fed/runtime.env
@@ -148,8 +149,8 @@ write_files:
       # single-substrate hive and the federated mesh can never drift apart
       # in the postgres/AGE/pgvector half. Only the serve invocation and the
       # federation environment are overridden. Environment= is a list
-      # directive, so the base unit's PERMISSIONS_MODE / AUTONOMOUS_HOOKS /
-      # RUST_LOG settings are preserved, not replaced.
+      # directive, so the base unit's PERMISSIONS_MODE / AUTONOMOUS_HOOKS
+      # settings are preserved, not replaced.
       #
       # WHY THIS UNIT REFUSES TO START BEFORE federate.sh HAS RUN:
       # EnvironmentFile has NO leading '-', so systemd refuses to start the

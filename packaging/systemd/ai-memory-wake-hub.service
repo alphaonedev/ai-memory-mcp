@@ -28,7 +28,11 @@ Group=ai-memory-hub
 # runtime directory, because AllowlistFile::load_from_file requires the
 # file be owned by THIS uid at exact mode 0600.
 EnvironmentFile=-/etc/ai-memory/wake-hub.env
-Environment=RUST_LOG=ai_memory=info
+# Log filter: the binary defaults to `info` for every target (#3650). Set
+# RUST_LOG only to change that; its directives are layered on top, so
+# e.g. `Environment=RUST_LOG=ai_memory=debug` raises only ai-memory's own
+# events. The old `RUST_LOG=ai_memory=info` here hid every event whose
+# target is outside `ai_memory` (store::postgres, federation, security.posture).
 Environment=SOCKET=/run/ai-memory-hub/wake-hub.sock
 Environment=ALLOWLIST=/run/ai-memory-hub/hub-allow.json
 # No --tcp in the shipped ExecStart. The kernel RestrictAddressFamilies

@@ -1699,8 +1699,11 @@ Six surfaces, each load-bearing for different ops scenarios:
    (`src/metrics.rs`).
 3. **Tracing spans on stderr** — every MCP tool call, every governance
    decision, every federation event emits a `tracing::info!` span.
-   `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug`
-   for deep traces.
+   The default is `info` for every target (#3650), with no `RUST_LOG`
+   needed. `RUST_LOG` directives are layered on top of that default:
+   `RUST_LOG=ai_memory=debug` for deep traces of ai-memory's own
+   modules, plus e.g. `store::postgres=debug` for the literal-target
+   subsystems that an `ai_memory=` directive does not match.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
    Rotating appender; off by default.
 5. **`ai-memory doctor`** — 10-section health dashboard run locally.

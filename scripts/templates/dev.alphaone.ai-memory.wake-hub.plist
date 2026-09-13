@@ -98,8 +98,6 @@
         <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>/Users/YOU</string>
-        <key>RUST_LOG</key>
-        <string>ai_memory=info</string>
     </dict>
 
     <key>RunAtLoad</key><true/>
