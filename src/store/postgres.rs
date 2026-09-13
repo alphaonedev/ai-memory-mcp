@@ -14323,8 +14323,14 @@ impl PostgresStore {
                         crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
                         return Ok(None);
                     }
+                    // #3718 — an ABSENT key renders as its class, never as a
+                    // wrong-recipient "decrypt failed", and never with a path.
                     return Err(StoreError::IntegrityFailed {
-                        detail: format!("decrypt failed for memory {}: {e}", memory.id),
+                        detail: format!(
+                            "{} for memory {}",
+                            crate::encryption::read_failure_detail(&e),
+                            memory.id
+                        ),
                     });
                 }
             }

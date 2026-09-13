@@ -1292,7 +1292,11 @@ fn row_to_memory_with_policy(
                     crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
                     return Ok(None);
                 }
-                return Err(undecryptable_row_error(format!("decrypt failed: {e}")));
+                // #3718 — an ABSENT key renders as its class, never as a
+                // wrong-recipient "decrypt failed", and never with a path.
+                return Err(undecryptable_row_error(
+                    crate::encryption::read_failure_detail(&e),
+                ));
             }
         }
     }
