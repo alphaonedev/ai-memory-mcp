@@ -1392,14 +1392,16 @@ impl FederationDlqSink for SqliteDlqSink {
     ) -> Result<Vec<super::freshness::PeerDlqBacklog>, String> {
         // `failed_at` is RFC3339 TEXT whose offset spelling has varied across
         // releases (see `restore_supersedes`), so the minimum is taken over
-        // the PARSED instant (`julianday`), never over the raw string. A row
-        // whose `failed_at` does not parse still counts toward the depth and
-        // simply cannot be the oldest.
+        // the PARSED instant, never over the raw string. `strftime('%s')` is
+        // exact integer seconds; the float `julianday` arithmetic it replaces
+        // truncated to one second early on most instants. A row whose
+        // `failed_at` does not parse yields NULL, so it still counts toward
+        // the depth and simply cannot be the oldest.
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
                 "SELECT peer_id, COUNT(*), \
-                 CAST(MIN((julianday(failed_at) - 2440587.5) * 86400.0) AS INTEGER) \
+                 MIN(CAST(strftime('%s', failed_at) AS INTEGER)) \
                  FROM federation_push_dlq WHERE replayed_at IS NULL GROUP BY peer_id",
             )
             .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer prepare: {e}"))?;

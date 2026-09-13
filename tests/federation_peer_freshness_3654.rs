@@ -497,3 +497,152 @@ async fn catchup_worker_publishes_its_cadence_so_a_stall_is_alertable() {
     // zero that would read as "attempted in 1970".
     assert_eq!(freshness::snapshot_for(&id), None);
 }
+
+/// Unix seconds of an RFC3339 instant, for the DLQ backlog expectations.
+fn unix_of(rfc3339: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .expect("valid rfc3339")
+        .timestamp()
+}
+
+/// The per-peer DLQ backlog the replay tick publishes, on the sqlite sink:
+/// grouped by peer, PENDING rows only, and the oldest row chosen by parsed
+/// instant. `failed_at` offset spellings have varied across releases, so
+/// `…T05:00:01+05:00` (00:00:01Z) is older than `…T01:00:00Z` although it
+/// sorts after it as text; and the `:01` second pins exact integer seconds
+/// (float `julianday` arithmetic truncated it to `:00`). A row whose
+/// timestamp does not parse still counts toward depth, and its peer gets no
+/// oldest series at all (absent, never a fake 0).
+#[tokio::test]
+async fn sqlite_dlq_backlog_is_per_peer_pending_only_and_oldest_by_instant() {
+    use ai_memory::federation::push_dlq::{FederationDlqSink, SqliteDlqSink};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("dlq-backlog-3654.db");
+    let (a, b) = (peer_id(), peer_id());
+    {
+        let conn = ai_memory::storage::open(&path).expect("open db");
+        let rows = [
+            ("m1", a.as_str(), "2026-01-01T01:00:00Z", None),
+            ("m2", a.as_str(), "2026-01-01T05:00:01+05:00", None),
+            (
+                "m3",
+                a.as_str(),
+                "2025-01-01T00:00:00Z",
+                Some("2025-01-02T00:00:00Z"),
+            ),
+            ("m4", b.as_str(), "not-a-timestamp", None),
+        ];
+        for (mem, peer, failed_at, replayed_at) in rows {
+            conn.execute(
+                "INSERT INTO federation_push_dlq (memory_id, peer_id, payload_json, \
+                 attempt_count, last_error, failed_at, replayed_at) \
+                 VALUES (?1, ?2, '{}', 1, 'e', ?3, ?4)",
+                rusqlite::params![mem, peer, failed_at, replayed_at],
+            )
+            .expect("insert dlq row");
+        }
+    }
+    let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
+        ai_memory::storage::open(&path).expect("handle conn"),
+        path.clone(),
+        ai_memory::config::ResolvedTtl::default(),
+        true,
+    )));
+    let sink = SqliteDlqSink::new(db).await.expect("sqlite dlq sink");
+
+    let mut backlog = sink
+        .pending_dlq_backlog_by_peer()
+        .await
+        .expect("backlog by peer");
+    backlog.sort_by(|x, y| x.peer_id.cmp(&y.peer_id));
+    let find = |id: &str| backlog.iter().find(|r| r.peer_id == id).expect("peer row");
+    assert_eq!(backlog.len(), 2, "one row per peer: {backlog:?}");
+    assert_eq!(find(&a).pending, 2, "the replayed row is not pending");
+    assert_eq!(
+        find(&a).oldest_failed_unix,
+        Some(unix_of("2026-01-01T00:00:01Z")),
+        "oldest by instant, to the exact second"
+    );
+    assert_eq!(find(&b).pending, 1, "an unparseable row still counts");
+    assert_eq!(find(&b).oldest_failed_unix, None);
+
+    freshness::record_push_dlq_backlog(&backlog);
+    let (la, lb) = (freshness::peer_label(&a), freshness::peer_label(&b));
+    let depth = "ai_memory_federation_peer_push_dlq_depth";
+    let oldest = "ai_memory_federation_peer_push_dlq_oldest_failed_timestamp_seconds";
+    assert_eq!(sample(depth, &[("peer", la.as_str())]), Some(2));
+    assert_eq!(
+        sample(oldest, &[("peer", la.as_str())]),
+        Some(unix_of("2026-01-01T00:00:01Z"))
+    );
+    assert_eq!(sample(depth, &[("peer", lb.as_str())]), Some(1));
+    assert_eq!(sample(oldest, &[("peer", lb.as_str())]), None);
+}
+
+/// The postgres sink's per-peer backlog (`failed_at` is TIMESTAMPTZ there):
+/// same grouping, pending-only and oldest-instant contract as the sqlite
+/// sink. Runs only against a live PG named by `AI_MEMORY_TEST_POSTGRES_URL`;
+/// every row it writes carries this test's unique peer ids and is deleted
+/// before the assertions run, so a failure leaves no residue.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+#[ignore = "requires a live postgres (AI_MEMORY_TEST_POSTGRES_URL)"]
+async fn pg_dlq_backlog_is_per_peer_pending_only_and_oldest_by_instant() {
+    use ai_memory::federation::push_dlq::{FederationDlqSink, PostgresDlqSink};
+
+    let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
+        .expect("AI_MEMORY_TEST_POSTGRES_URL must name a live scratch postgres");
+    let store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect live PG");
+    let pool = store.pool().clone();
+    let (a, b) = (peer_id(), peer_id());
+    let rows = [
+        ("m1", a.as_str(), "2026-01-01T01:00:00Z", None),
+        ("m2", a.as_str(), "2026-01-01T05:00:01+05:00", None),
+        (
+            "m3",
+            a.as_str(),
+            "2025-01-01T00:00:00Z",
+            Some("2025-01-02T00:00:00Z"),
+        ),
+        ("m4", b.as_str(), "2026-02-01T00:00:00Z", None),
+    ];
+    for (mem, peer, failed_at, replayed_at) in rows {
+        sqlx::query(
+            "INSERT INTO federation_push_dlq (memory_id, peer_id, payload_json, \
+             attempt_count, last_error, failed_at, replayed_at) \
+             VALUES ($1, $2, '{}'::jsonb, 1, 'e', $3::timestamptz, $4::timestamptz)",
+        )
+        .bind(mem)
+        .bind(peer)
+        .bind(failed_at)
+        .bind(replayed_at)
+        .execute(&pool)
+        .await
+        .expect("insert dlq row");
+    }
+
+    let sink = PostgresDlqSink::new(Arc::new(store));
+    let backlog = sink.pending_dlq_backlog_by_peer().await;
+    sqlx::query("DELETE FROM federation_push_dlq WHERE peer_id = $1 OR peer_id = $2")
+        .bind(&a)
+        .bind(&b)
+        .execute(&pool)
+        .await
+        .expect("clean up dlq rows");
+
+    let backlog = backlog.expect("backlog by peer");
+    let find = |id: &str| backlog.iter().find(|r| r.peer_id == id).expect("peer row");
+    assert_eq!(find(&a).pending, 2, "the replayed row is not pending");
+    assert_eq!(
+        find(&a).oldest_failed_unix,
+        Some(unix_of("2026-01-01T00:00:01Z"))
+    );
+    assert_eq!(find(&b).pending, 1);
+    assert_eq!(
+        find(&b).oldest_failed_unix,
+        Some(unix_of("2026-02-01T00:00:00Z"))
+    );
+}
