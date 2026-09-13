@@ -272,11 +272,50 @@ impl UdsWakeSink {
         let metrics = Arc::new(SinkMetrics::default());
         let (tx, rx) = mpsc::channel::<Bytes>(cfg.queue_frames);
         let task_metrics = Arc::clone(&metrics);
-        handle.spawn(async move { forwarder_loop(cfg, credential, task_metrics, rx).await });
+        // #3657 (review) — GAUGE OWNERSHIP. The fallback gauge has exactly one
+        // writer once a forwarder exists: the forwarder task. `CONNECTING` is
+        // stamped HERE, synchronously, BEFORE the task is spawned — on a
+        // multi-thread runtime a spawned task can run to its first write
+        // before `spawn` returns, so stamping after the spawn would race the
+        // task's own `HUB_LIVE` / `BACKSTOP` and could leave the gauge saying
+        // "connecting" over a session that is already live or already dead.
+        // Every later transition is written by the task itself
+        // (`connect_and_pump` → HUB_LIVE, `forwarder_loop` → BACKSTOP); the
+        // sink handle never writes it again. Pinned on a multi-thread runtime
+        // by `tests/wake_fallback_ordering_3657.rs`.
         crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_CONNECTING);
+        handle.spawn(async move { forwarder_loop(cfg, credential, task_metrics, rx).await });
         Ok(Self::from_parts(tx, metrics))
     }
 }
+
+/// #3657 (review) — [`install_uds`] refused to install a forwarder that was
+/// ALREADY spawned (another sink holds the slot, or the runtime vanished
+/// between spawn and install). The spawned task still owns the fallback
+/// gauge: dropping the sink closes its channel and the task writes `BACKSTOP`
+/// on its way out. The caller must therefore NOT write the gauge for this
+/// error — that is what [`AlreadyInstalled::forwarder_owns_gauge`] tells it.
+#[derive(Debug)]
+pub struct AlreadyInstalled;
+
+impl AlreadyInstalled {
+    /// `true`: a forwarder task exists and will stamp the terminal state.
+    #[must_use]
+    pub const fn forwarder_owns_gauge(&self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Display for AlreadyInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "wake sink: a wake sink is already installed on this process, or there is no \
+             Tokio runtime; refusing to replace it",
+        )
+    }
+}
+
+impl std::error::Error for AlreadyInstalled {}
 
 impl InboxWakeSink for UdsWakeSink {
     fn on_wake(&self, event: &InboxEvent) {
@@ -342,11 +381,10 @@ pub fn install_uds(
     let metrics = sink.metrics();
     if !crate::inbox_wake::install_sink(Arc::new(sink)) {
         // Dropping the sink closes the hand-off channel, so the forwarder task
-        // we just started shuts itself down rather than lingering.
-        bail!(
-            "wake sink: a wake sink is already installed on this process, or there is no \
-             Tokio runtime; refusing to replace it"
-        );
+        // we just started shuts itself down rather than lingering — and, as
+        // the gauge's owner, stamps BACKSTOP itself (#3657 review: the caller
+        // sees `AlreadyInstalled` and leaves the gauge alone).
+        return Err(anyhow::Error::new(AlreadyInstalled));
     }
     super::remember_installed_sink_metrics(Arc::clone(&metrics));
     tracing::info!(

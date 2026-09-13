@@ -867,7 +867,12 @@ yet (unavailable, never healthy), `3` = a forwarder is installed and
 connecting but no session has been authenticated, `1` = a hub session is live
 (a handshake completed; a co-hosted hub is live on install), `2` = recipients
 rely on the backstop poll (never configured, refused, the session broke, or
-the sink was dropped). The
+the sink was dropped). The gauge has one owner once a forwarder exists: `3`
+is stamped synchronously BEFORE the forwarder task is spawned, and every
+later transition is written by that task alone (boot writes `2` only for a
+refusal that leaves no task), so a multi-thread runtime can never show a
+late `connecting` over a session the task already reported live or dead
+(#3657 review; pinned by `tests/wake_fallback_ordering_3657.rs`). The
 health-monitoring JSON surface (#3646) gathers from that registry; it does
 not invent a second transport. Hub-process census (connected agents, egress
 bytes) still lives on the hub snapshot — a scrape of the daemon cannot see

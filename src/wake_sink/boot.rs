@@ -178,7 +178,17 @@ pub fn install_from_config_logged(app_config: &AppConfig) -> WakeSinkBoot {
             installed
         }
         Err(e) => {
-            crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
+            // #3657 (review) — GAUGE OWNERSHIP. Boot writes the gauge only when
+            // NO forwarder task exists to own it: a refusal BEFORE the spawn
+            // (bad credential, no key dir, zero-depth channel, no runtime). A
+            // refusal AFTER the spawn (`AlreadyInstalled`) leaves a task that
+            // stamps BACKSTOP as its channel closes; writing here as well
+            // would be a second writer racing the owner.
+            if e.downcast_ref::<super::uds::AlreadyInstalled>()
+                .is_none_or(|already| !already.forwarder_owns_gauge())
+            {
+                crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
+            }
             tracing::error!(
                 "wake sink: `[wake_hub].sink_socket` IS configured but the forwarder was \
                  REFUSED, so this daemon is pushing no wakes and its recipients are \
