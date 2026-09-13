@@ -150,6 +150,9 @@ fn event_named<'a>(bodies: &'a [serde_json::Value], event: &str) -> Option<&'a s
 
 fn store_args(namespace: &str, title: &str, content: &str) -> ai_memory::cli::store::StoreArgs {
     ai_memory::cli::store::StoreArgs {
+        // #3409 — a --sign write whose caller is not bound to its key is refused
+        // unless the caller opts into the degraded (claimed) posture explicitly.
+        allow_claimed: false,
         tier: "mid".to_string(),
         namespace: Some(namespace.to_string()),
         title: title.to_string(),
