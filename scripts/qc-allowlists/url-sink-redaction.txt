@@ -1,0 +1,47 @@
+# #3688/2 baseline — sink interpolations that existed when the gate landed (2026-09-13).
+# Key: <file>:<enclosing fn>:<sink kind: log|error>:{binding}
+#
+# The gate's job is to stop NEW instances. These are triaged by DIRECTION, which
+# is what determines whether a hit is a disclosure:
+#
+#   DISCLOSURE direction (DEFECT, never allowlisted): the URL came from CONFIG or a
+#   PEER — a sync peer, a forward target, a registered webhook, a DSN — so it can
+#   carry credentials the emitting caller does not otherwise hold, and the sink is
+#   a LOG line or a stored error (journald, forensic bundle, DLQ row, MCP error
+#   text). Redact before rendering. A `log` sink is NEVER allowlistable.
+#
+#   ECHO direction (baseline): the URL is the CALLER'S OWN INPUT being refused by a
+#   validator, and the `error` text goes back to that same caller BEFORE the value
+#   is accepted or stored. Nothing is disclosed that the recipient did not supply.
+#   Still wants `redact_url_password` eventually (a caller may paste the error into
+#   a ticket), but it fails in the safe direction.
+#
+# CRITICAL — disclosure-direction sites, NOT allowlisted, must fail until fixed:
+#   src/daemon_runtime.rs:sync_cycle_once:log:{peer_url}
+#   src/daemon_runtime.rs:run_sync_daemon_with_shutdown_using_client:log:{peer_url}
+#       sync-daemon logs the raw configured peer URL (#3667; fix in flight on
+#       fix/3667-url-query-password-redaction-v2 — this gate goes green there)
+#   src/subscriptions.rs:send:log:{url}                         (3 sites)
+#       registered webhook URL in tracing::warn! — may carry basic-auth
+#       (NEEDS AN ISSUE; not covered by #3667)
+#   src/subscriptions.rs:validate_url_dns_with:log:{url}        (1 site)
+#       the SSRF-guard degrade WARN carries the URL — same class as `send`
+#   src/mcp/tools/store/transport.rs:forward_to_http:error:{url} (4 sites)
+#       the CONFIGURED forward URL in error Strings that surface as MCP error
+#       text and get logged by the tool loop (NEEDS AN ISSUE; not covered by #3667)
+#
+# ECHO direction — allowlisted with reason:
+#
+# validate_url_with / validate_url_dns_with refuse the caller's own webhook URL
+# (missing scheme, non-https, loopback/private/link-local target, DNS failure)
+# and return the reason to the registering caller. The `log` sink inside
+# validate_url_dns_with is deliberately NOT covered by these keys.
+src/subscriptions.rs:validate_url_with:error:{url}
+src/subscriptions.rs:validate_url_dns_with:error:{url}
+#
+# `ai-memory doctor --remote <url>`: the operator's own argv, rendered into the
+# report that operator asked for (HTTP status line; "could not reach" note).
+# argv is already world-readable via /proc/<pid>/cmdline (#1927), so the report
+# does not widen exposure. Redact when convenient.
+src/cli/doctor.rs:http_get_json:error:{url}
+src/cli/doctor.rs:section_capabilities_remote:error:{url}
