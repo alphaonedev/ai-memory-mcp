@@ -2310,11 +2310,14 @@ fn verify_credential_pubkey(
 /// [`crate::correlation::push_ref`] the sender logged at dispatch, emitted
 /// inside this request's span so it carries the receiver's operation id.
 /// `verified` is true only when the nonce was signature-bound and fresh.
-fn log_push_received(nonce: &str, peer_id: &str, verified: bool) {
+/// An absent `X-Peer-Id` records NO `peer_id` field (`Option` is recorded
+/// only when `Some`), never `""`: a missing peer id is unknown, and an
+/// empty-string value would join every header-less push to each other.
+fn log_push_received(nonce: &str, peer_id: Option<&str>, verified: bool) {
     tracing::info!(
         target: crate::correlation::TARGET,
         push_ref = %crate::correlation::push_ref(nonce),
-        peer_id = %peer_id,
+        peer_id,
         verified,
         "federation push received"
     );
@@ -2354,7 +2357,7 @@ pub(super) fn verify_signature_or_reject(
             .and_then(|v| v.to_str().ok())
             .filter(|n| !n.is_empty())
         {
-            log_push_received(nonce, peer_id.unwrap_or(""), false);
+            log_push_received(nonce, peer_id, false);
         }
         return None;
     }
@@ -2405,7 +2408,7 @@ pub(super) fn verify_signature_or_reject(
                 Some(nonce) if !nonce.is_empty() => {
                     match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
                         crate::identity::replay::ReplayDecision::Fresh => {
-                            log_push_received(nonce, pid_for_cache, true);
+                            log_push_received(nonce, peer_id, true);
                             None
                         }
                         crate::identity::replay::ReplayDecision::Replay => {
