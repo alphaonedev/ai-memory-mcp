@@ -319,7 +319,13 @@ fn main() -> Result<()> {
     // files chained + signed by the daemon's Ed25519 key (when one is
     // enrolled). The sink is process-wide; failures here are logged
     // and swallowed so a missing key never blocks daemon startup.
-    init_forensic_audit(&app_config);
+    // #3354 — the WRITE PATH: a ledger-writing command gets its signing key
+    // ensured (generated when absent) before its first row, or does not start.
+    init_forensic_audit(
+        &app_config,
+        hosts_ledger_writers(&cli.command),
+        ledger_writer(&cli.command),
+    )?;
 
     // v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin HERE, in the same
     // SYNCHRONOUS pre-runtime phase as the posture enforcement above (the #1889
@@ -394,27 +400,121 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
+/// v1.0.0 #3354 — the long-running entry points that HOST the ledger
+/// writers (the HTTP daemon, the MCP stdio server, the sync daemon) print
+/// the one-line unsigned-ledger warning at boot. One-shot verbs stay quiet
+/// on stderr (hook-driven `boot` / `capture-turn --quiet` pin an empty
+/// stderr; the diagnostics report the state instead): the caller-visible
+/// surfaces are `memory_session_start.signing`, capabilities
+/// `signing_key_installed`, `/health.signed_events_signing` and `doctor`.
+fn hosts_ledger_writers(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Serve(_)
+            | daemon_runtime::Command::Mcp { .. }
+            | daemon_runtime::Command::SyncDaemon(_)
+    )
+}
+
+/// v1.0.0 #3354 — every command that can append a `signed_events` row is a
+/// LEDGER WRITER and must not start without a signing key for the resolved
+/// agent id (the key is generated when absent; only a failed generation
+/// refuses). The read-only and remediation verbs are enumerated instead —
+/// they open no write funnel, so the posture can always be diagnosed and
+/// fixed from them. An unknown new verb is a writer by default: the safe
+/// side of the default is the signed one.
+fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
+    !matches!(
+        cmd,
+        daemon_runtime::Command::Doctor(_)
+            | daemon_runtime::Command::Config(_)
+            | daemon_runtime::Command::Completions(_)
+            | daemon_runtime::Command::Man
+            | daemon_runtime::Command::Identity(_)
+            | daemon_runtime::Command::Keys(_)
+            | daemon_runtime::Command::Stats
+            | daemon_runtime::Command::Namespaces
+            | daemon_runtime::Command::Get(_)
+            | daemon_runtime::Command::List(_)
+            | daemon_runtime::Command::Recall(_)
+            | daemon_runtime::Command::Search(_)
+            | daemon_runtime::Command::Inbox(_)
+            | daemon_runtime::Command::Logs(_)
+            | daemon_runtime::Command::Features
+            | daemon_runtime::Command::VerifyReflectionChain(_)
+            | daemon_runtime::Command::VerifySignedEventsChain(_)
+            | daemon_runtime::Command::VerifyAuditTrail(_)
+            | daemon_runtime::Command::VerifyForensicBundle(_)
+    )
+}
+
 /// v0.7.0 #697 — best-effort init for the forensic governance log.
 /// Resolves the directory parallel to the flat audit log, loads the
 /// daemon's signing key (when present), and brings up the sink. A
-/// missing key results in unsigned rows — never a fatal error.
-fn init_forensic_audit(app_config: &config::AppConfig) {
+/// missing key results in unsigned rows — never a fatal error, but since
+/// #3354 never a SILENT one either: `warn_unsigned` prints the one-line
+/// operator warning (with the provisioning command) when the process will
+/// write unsigned `signed_events` rows.
+fn init_forensic_audit(
+    app_config: &config::AppConfig,
+    hosts_writers: bool,
+    ledger_writer: bool,
+) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
     // Reuse the flat audit log path resolver — same directory pattern.
     let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
     let Some(dir) = log_path.parent() else {
         eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
-        return;
+        return Ok(());
     };
-    // Resolve the daemon's agent_id with the standard precedence
-    // chain and try to load its keypair. Unsigned rows are accepted.
+    // Resolve the daemon's agent_id with the standard precedence chain.
     let agent_id = ai_memory::identity::resolve_agent_id(None, None)
         .unwrap_or_else(|_| "ai-memory".to_string());
-    let signing_key =
-        ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None);
+    // #3354 — the WRITE PATH never accepts an unsigned append: the resolved
+    // id gets its key ENSURED here (loaded, or generated when absent — the
+    // `daemon` label has always been generated at boot; this closes the gap
+    // for a resolved id that differs from it). Only a ledger writer whose
+    // key cannot be ensured refuses to start; read-only verbs carry on so
+    // the posture can be diagnosed and fixed.
+    let (signing_key, generated) =
+        match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if ledger_writer {
+                    anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+                        &agent_id,
+                        &format!("{e:#}")
+                    ));
+                }
+                (None, None)
+            }
+        };
+    if let Some(ai_memory::identity::keypair::EnsureOutcome::Generated { pub_path }) = &generated {
+        let notice =
+            ai_memory::governance::audit::signing_key_generated_notice(&agent_id, pub_path);
+        if hosts_writers {
+            eprintln!("ai-memory: {notice}");
+        } else {
+            tracing::info!("{notice}");
+        }
+    }
+    if signing_key.is_none() {
+        if ledger_writer {
+            anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+                &agent_id,
+                "no key was loadable after the ensure step"
+            ));
+        }
+        if hosts_writers
+            && let Some(warning) = ai_memory::governance::audit::ledger_signing_status().warning
+        {
+            eprintln!("ai-memory: {warning}");
+        }
+    }
     if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
         eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -520,7 +620,7 @@ mod tests {
 
         let app_config = config::AppConfig::default();
         // Must not panic and must leave the process bootable (unsigned).
-        init_forensic_audit(&app_config);
+        init_forensic_audit(&app_config, false, false).expect("init");
 
         match prev {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },
