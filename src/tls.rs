@@ -124,24 +124,15 @@ pub fn server_verify_required() -> bool {
 /// hatch itself is no-disable there.
 pub const FED_ALLOW_PLAINTEXT_PEERS_ENV: &str = "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS";
 
-/// Whether the operator has acknowledged plaintext transport to a
-/// non-loopback federation peer (#2477).
-///
-/// Permissive-knob grammar (default OFF): enabled ONLY by an explicit
-/// truthy token (`1`/`true`/`yes`/`on`, trimmed, case-insensitive). Unset,
-/// empty, or an unrecognised word all keep the refusal in force — an
-/// unrecognised token must never silently widen the control (the FBL-14
-/// rule).
+/// #2477 → #3705 — the plaintext-peer acknowledgement is a REMOVED downgrade
+/// path: nothing can open plaintext federation transport any more, loopback
+/// included. A truthy [`FED_ALLOW_PLAINTEXT_PEERS_ENV`] refuses boot
+/// ([`crate::transit_encryption::enforce_no_downgrade_paths`]), so this
+/// resolver always answers `false`. The env name is kept so the refusal,
+/// the `asi-hard` pin (which requires it unset) and the docs can name it.
 #[must_use]
 pub fn plaintext_peers_allowed() -> bool {
-    std::env::var(FED_ALLOW_PLAINTEXT_PEERS_ENV)
-        .ok()
-        .is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    false
 }
 
 /// The loopback host set. SSOT shared by the daemon's inbound bind guard
@@ -174,69 +165,35 @@ pub fn host_is_loopback(host: &str) -> bool {
 /// `cli::sync::build_sync_client` applied the #2448 ceremony over whatever
 /// scheme it was handed.
 ///
-/// Disposition:
-/// * `https://` — always accepted.
-/// * `http://` to a LITERAL loopback host — always accepted, no hatch
-///   needed. The bytes never leave the kernel, so none of the disclosure
-///   risk applies, and forcing a hatch-flip on every dev laptop and CI
-///   fixture would train reflexive hatch use (a worse long-run posture).
-///   Mirrors the inbound `tls_bind_guard`'s silent loopback exemption.
-/// * `http://` to any other host — REFUSED unless
-///   [`FED_ALLOW_PLAINTEXT_PEERS_ENV`] is explicitly truthy, in which case
-///   it is accepted with a loud WARN naming the exposure.
+/// Disposition (#3705 — "only encrypted data in transit"):
+/// * `https://` — accepted.
+/// * `http://` to ANY host, loopback included — REFUSED. Loopback is shared
+///   by every local process on a multi-agent host; *peer is loopback* is
+///   not *peer is trusted* (the #2502 ruling). The former
+///   [`FED_ALLOW_PLAINTEXT_PEERS_ENV`] acknowledgement is a removed
+///   downgrade path (setting it refuses boot).
 /// * anything else (`ws://`, `file://`, a scheme-less `peer.example:9077`)
 ///   — REFUSED. A scheme-less peer already failed at request time with an
 ///   opaque relative-URL error; refusing at boot is strictly clearer.
 ///
-/// The refusal message names the SECURE remedy first and the escape hatch
-/// last, so an operator is steered to fix the posture rather than to
-/// disable the control (the #2448 ordering discipline, pinned by a test).
-///
 /// # Errors
 ///
 /// Returns the operator-facing refusal string when `raw` would carry
-/// plaintext to a non-loopback peer, or does not name a usable scheme.
+/// plaintext, or does not name a usable scheme.
 pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
     let trimmed = raw.trim();
     let parsed = reqwest::Url::parse(trimmed).map_err(|e| {
         format!(
             "federation peer URL {trimmed:?} is not a valid absolute URL ({e}). \
-             Peers must be given as `https://host:port` (or `http://127.0.0.1:port` \
-             for a loopback-only development mesh)."
+             Peers must be given as `https://host:port`."
         )
     })?;
     match parsed.scheme() {
         "https" => Ok(()),
-        "http" => {
-            let host = parsed.host_str().unwrap_or_default();
-            if host_is_loopback(host) {
-                return Ok(());
-            }
-            if plaintext_peers_allowed() {
-                tracing::warn!(
-                    target: "federation",
-                    peer_url = %trimmed,
-                    host = %host,
-                    "federation peer {trimmed} uses PLAINTEXT http:// to a non-loopback \
-                     host — replicated memory CONTENT crosses the network in the clear \
-                     and is readable/modifiable by anyone on the path. Accepted only \
-                     because {} is set. Move the peer to https:// .",
-                    FED_ALLOW_PLAINTEXT_PEERS_ENV,
-                );
-                return Ok(());
-            }
-            Err(format!(
-                "refusing federation peer {trimmed:?}: plaintext http:// to the \
-                 non-loopback host {host:?} would replicate memory CONTENT across \
-                 the network in the clear (federation is not end-to-end encrypted). \
-                 Use https:// for this peer — pair it with --quorum-ca-cert for a \
-                 self-signed fleet CA, or pin the peer via \
-                 AI_MEMORY_FED_PEER_FINGERPRINTS. Loopback peers \
-                 (http://127.0.0.1:PORT) are exempt. If TLS is genuinely terminated \
-                 by a sidecar on a trusted link, acknowledge it with \
-                 {FED_ALLOW_PLAINTEXT_PEERS_ENV}=1."
-            ))
-        }
+        "http" => Err(crate::transit_encryption::plaintext_url_refusal(
+            "federation peer",
+            trimmed,
+        )),
         other => Err(format!(
             "refusing federation peer {trimmed:?}: unsupported scheme {other:?}. \
              Federation peers speak HTTPS (or plaintext HTTP to loopback only)."
@@ -2483,37 +2440,39 @@ mod tests {
         }
     }
 
-    /// #2677 — scheme guard refuses spoofed "loopback" HTTP peers (hatch off).
+    /// #2677 → #3705 — the scheme guard refuses EVERY http:// peer: the
+    /// spoofed-loopback shapes as before, and (since the mandate) the
+    /// literal loopback forms too, hatch or no hatch.
     #[test]
-    fn validate_peer_url_refuses_loopback_spoof_http_2677() {
+    fn validate_peer_url_refuses_every_http_peer_3705() {
         let _g = fed_pin_env_lock();
-        // Ensure hatch is off for this process while we hold the pin lock.
         // SAFETY: single-threaded unit test under process-wide pin lock.
         unsafe {
-            std::env::remove_var(FED_ALLOW_PLAINTEXT_PEERS_ENV);
+            std::env::set_var(FED_ALLOW_PLAINTEXT_PEERS_ENV, "1");
         }
         for peer in [
             "http://127.0.0.1.evil.com:9077",
             "http://localhost.evil.com:9077",
             "http://evil.com/?x=127.0.0.1",
             "http://127.0.0.2:9077",
+            "http://127.0.0.1:9077",
+            "http://localhost:9077",
+            "http://[::1]:9077",
+            "http://2130706433/",
+            "http://0x7f000001/",
         ] {
+            let err = validate_peer_url_scheme(peer)
+                .expect_err("#3705: every http:// peer must be REFUSED, loopback included");
             assert!(
-                validate_peer_url_scheme(peer).is_err(),
-                "#2677: spoof loopback HTTP peer must be REFUSED: {peer}"
+                err.contains(crate::transit_encryption::ISSUE_TAG) && err.contains("https://"),
+                "{peer}: {err}"
             );
         }
-        // Positive control: literal loopback still exempt.
-        assert!(validate_peer_url_scheme("http://127.0.0.1:9077").is_ok());
-        // url/reqwest normalises decimal/hex IPv4 forms to 127.0.0.1 before
-        // host_str(); they ARE loopback. Pin accept so a silent behaviour
-        // flip is reviewed (not a silent widen of a non-loopback host).
-        for peer in ["http://2130706433/", "http://0x7f000001/"] {
-            assert!(
-                validate_peer_url_scheme(peer).is_ok(),
-                "#2677: decimal/hex IPv4 loopback forms normalise to 127.0.0.1 \
-                 and must stay exempt: {peer}"
-            );
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(FED_ALLOW_PLAINTEXT_PEERS_ENV);
         }
+        assert!(validate_peer_url_scheme("https://127.0.0.1:9077").is_ok());
+        assert!(!plaintext_peers_allowed(), "the hatch is closed for good");
     }
 }

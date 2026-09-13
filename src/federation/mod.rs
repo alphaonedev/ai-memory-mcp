@@ -371,7 +371,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
-    use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
     fn sample_memory() -> Memory {
@@ -482,12 +481,9 @@ mod tests {
         let app = Router::new()
             .route("/api/v1/sync/push", post(mock_handler))
             .with_state(state);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        (format!("http://{addr}"), call_count)
+        // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+        let base = crate::test_support::spawn_tls_mock(app).await;
+        (base, call_count)
     }
 
     fn build_config(peers: Vec<String>, w: usize, timeout_ms: u64) -> FederationConfig {
@@ -505,10 +501,7 @@ mod tests {
         // save/restore RAII guard is structurally impossible on a one-shot
         // `OnceLock` and must not be invented.
         crate::governance::wire_check::ensure_installed_for_test();
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .build()
-            .unwrap();
+        let client = crate::test_support::tls_test_client(Duration::from_millis(timeout_ms));
         let n = 1 + peers.len();
         FederationConfig {
             policy: QuorumPolicy::new(
@@ -861,7 +854,7 @@ mod tests {
     fn config_build_disabled_when_w_zero() {
         let cfg = FederationConfig::build(
             0,
-            &["http://example.com".to_string()],
+            &["https://example.com".to_string()],
             Duration::from_millis(500),
             None,
             None,
@@ -1653,9 +1646,9 @@ mod tests {
     fn peer_count_matches_peer_list() {
         let cfg = build_config(
             vec![
-                "http://a.example".to_string(),
-                "http://b.example".to_string(),
-                "http://c.example".to_string(),
+                "https://a.example".to_string(),
+                "https://b.example".to_string(),
+                "https://c.example".to_string(),
             ],
             2,
             500,
@@ -1723,12 +1716,8 @@ mod tests {
 
     async fn spawn_id_drift_peer() -> String {
         let app = Router::new().route("/api/v1/sync/push", post(id_drift_handler));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        format!("http://{addr}")
+        // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+        crate::test_support::spawn_tls_mock(app).await
     }
 
     #[tokio::test]
@@ -1874,12 +1863,9 @@ mod tests {
         let app = Router::new()
             .route("/api/v1/sync/since", axum::routing::get(since_handler))
             .with_state(state);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        (format!("http://{addr}"), hits, last_since, last_peer)
+        // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+        let base = crate::test_support::spawn_tls_mock(app).await;
+        (base, hits, last_since, last_peer)
     }
 
     /// Build an in-memory `Db` matching `handlers::Db` shape. Catchup only
@@ -1952,10 +1938,7 @@ mod tests {
     /// depends on the trailing `/api/v1/sync/push` and the id stays opaque
     /// either way — but the simpler shape is also closer to production.
     fn build_catchup_cfg(peer_url: &str, timeout_ms: u64) -> FederationConfig {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .build()
-            .unwrap();
+        let client = crate::test_support::tls_test_client(Duration::from_millis(timeout_ms));
         FederationConfig {
             policy: QuorumPolicy::new(
                 2,
@@ -2446,10 +2429,7 @@ mod tests {
     #[tokio::test]
     async fn post_and_classify_persistent_fail_concatenates_both_reasons() {
         let (url, count) = spawn_mock_peer(MockBehaviour::Fail).await;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(2000))
-            .build()
-            .unwrap();
+        let client = crate::test_support::tls_test_client(Duration::from_millis(2000));
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
         let target = format!("{url}/api/v1/sync/push");
 
@@ -2499,17 +2479,11 @@ mod tests {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        let url = format!("http://{addr}/api/v1/sync/push");
+        // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+        let base = crate::test_support::spawn_tls_mock(app).await;
+        let url = format!("{base}/api/v1/sync/push");
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(2000))
-            .build()
-            .unwrap();
+        let client = crate::test_support::tls_test_client(Duration::from_millis(2000));
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
         let outcome =
             post_and_classify(&client, &url, &body, "mem-x", Some("mem-x"), None, None).await;
@@ -2535,20 +2509,14 @@ mod tests {
                 async move { (StatusCode::OK, AxumJson(env)) }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        format!("http://{addr}/api/v1/sync/push")
+        // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+        let base = crate::test_support::spawn_tls_mock(app).await;
+        format!("{base}/api/v1/sync/push")
     }
 
     async fn classify_against_envelope(envelope: serde_json::Value) -> AckOutcome {
         let url = spawn_envelope_peer(envelope).await;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(2000))
-            .build()
-            .unwrap();
+        let client = crate::test_support::tls_test_client(Duration::from_millis(2000));
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
         super::sync::post_once(&client, &url, &body, "mem-x", Some("mem-x"), None, None).await
     }
@@ -2638,10 +2606,7 @@ mod tests {
     /// only.
     #[tokio::test]
     async fn bulk_catchup_push_no_peers_is_noop() {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
+        let client = crate::test_support::tls_test_client(Duration::from_millis(500));
         let cfg = FederationConfig {
             policy: QuorumPolicy::new(1, 1, Duration::from_millis(500), Duration::from_secs(30))
                 .unwrap(),
@@ -2907,10 +2872,7 @@ mod tests {
                 // Build a config whose peer.sync_push_url does NOT end in
                 // `/api/v1/sync/push`. The trim_end_matches in catchup_once is
                 // a no-op for this shape, so the base URL is the raw `url`.
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_millis(2000))
-                    .build()
-                    .unwrap();
+                let client = crate::test_support::tls_test_client(Duration::from_millis(2000));
                 let cfg = FederationConfig {
                     policy: QuorumPolicy::new(
                         2,
@@ -3117,12 +3079,9 @@ mod tests {
                         )
                     }),
                 );
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let addr = listener.local_addr().unwrap();
-                tokio::spawn(async move {
-                    axum::serve(listener, app).await.ok();
-                });
-                let url = format!("http://{addr}");
+                // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+                let base = crate::test_support::spawn_tls_mock(app).await;
+                let url = base;
                 let cfg = build_catchup_cfg(&url, 2000);
                 let db = build_test_db();
                 catchup_once(&cfg, &db).await;
@@ -3169,12 +3128,9 @@ mod tests {
                         }
                     }),
                 );
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let addr = listener.local_addr().unwrap();
-                tokio::spawn(async move {
-                    axum::serve(listener, app).await.ok();
-                });
-                let url = format!("http://{addr}");
+                // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+                let base = crate::test_support::spawn_tls_mock(app).await;
+                let url = base;
                 let cfg = build_catchup_cfg(&url, 2000);
                 let db = build_test_db();
                 catchup_once(&cfg, &db).await;

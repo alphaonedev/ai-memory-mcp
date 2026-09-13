@@ -78,6 +78,7 @@ dependencies = [
  "instant-distance",
  "libc",
  "notify",
+ "pem",
  "pgvector",
  "predicates",
  "prometheus",
@@ -99,6 +100,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
+ "time",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -113,6 +115,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "x25519-dalek",
+ "x509-parser",
  "zeroize",
  "zstd",
 ]

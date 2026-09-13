@@ -1049,7 +1049,7 @@ async fn consolidate_fanout_postgres_under_replicated_is_202_2861() {
 
     // A dead peer: a free port with nothing listening → connection refused
     // → AckOutcome::Fail, so W=2 is never reached.
-    let dead_url = format!("http://127.0.0.1:{}", free_port());
+    let dead_url = format!("https://127.0.0.1:{}", free_port());
     let cfg = federation_cfg_for_test(&[dead_url], 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;

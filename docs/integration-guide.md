@@ -198,12 +198,12 @@ The handful of routes you'll actually call:
 
 ```bash
 # Store a memory
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{"title":"Test","content":"Stored from ChatGPT","tier":"mid"}'
 
 # Recall
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"context":"what did I store","limit":5}'
 ```
@@ -317,24 +317,24 @@ scripts, multi-host setups, and browser extensions.
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
-curl http://127.0.0.1:9077/api/v1/health  # {"status":"ok"}
+curl https://127.0.0.1:9077/api/v1/health  # {"status":"ok"}
 ```
 
 **Three curl recipes you'll actually use:**
 
 ```bash
 # Store a memory
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{"title":"Deploy target","content":"EKS in us-west-2","tier":"long","namespace":"platform"}'
 
 # Recall (semantic + keyword hybrid)
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"context":"what is our deploy target","namespace":"platform","limit":5}'
 
 # Check whether an action would be governance-allowed (v0.7.0 7th-form)
-curl -X POST http://127.0.0.1:9077/api/v1/memory_check_agent_action \
+curl -X POST https://127.0.0.1:9077/api/v1/memory_check_agent_action \
   -H "Content-Type: application/json" \
   -d '{"agent_id":"ai:gpt-5@my-laptop","action":"store","namespace":"platform","content":"test"}'
 ```

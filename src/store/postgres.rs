@@ -2568,6 +2568,16 @@ impl PostgresStore {
         if !SUPPORTED_EMBEDDING_DIMS.contains(&i32::try_from(dim).unwrap_or(-1)) {
             return Err(unsupported_embedding_dim(dim));
         }
+        // v1.0.0 #3705 — "only encrypted data in transit": the ONE connect
+        // funnel every PostgreSQL path (daemon, CLI verbs, curator, doctor,
+        // tests) goes through, so the sslmode=verify-full floor cannot be
+        // bypassed. Refused BEFORE any socket is opened; the DSN is never
+        // echoed (it may carry credentials).
+        if !crate::transit_encryption::dsn_pins_sslmode_verify_full(url) {
+            return Err(StoreError::InvalidInput {
+                detail: crate::transit_encryption::pg_sslmode_refusal(),
+            });
+        }
 
         let options: PgConnectOptions =
             url.parse()

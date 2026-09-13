@@ -117,7 +117,7 @@ fn peer(id: &str, url: &str) -> PeerEndpoint {
 fn dead_peer(id: &str) -> PeerEndpoint {
     PeerEndpoint {
         id: id.to_string(),
-        sync_push_url: "http://127.0.0.1:1/api/v1/sync/push".to_string(),
+        sync_push_url: "https://127.0.0.1:1/api/v1/sync/push".to_string(),
     }
 }
 

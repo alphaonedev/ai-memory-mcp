@@ -984,8 +984,16 @@ pub mod spawn_audit;
 pub mod subscriptions;
 pub mod synthesis;
 pub mod tls;
+// v1.0.0 #3705 — the operator mandate "only encrypted data in transit": the
+// one floor every transit surface consults (daemon listener, federation
+// peers, webhook targets, the PostgreSQL DSN, the MCP forward URL), the one
+// truthy grammar, and the refusals. Plaintext is impossible to select.
 pub mod toon;
 pub mod transcripts;
+pub mod transit_encryption;
+// v1.0.0 #3709 item 1 — zero-config TLS: local CA + server certificate
+// generated into the key directory on first boot, renewed automatically.
+pub mod tls_bootstrap;
 pub mod trust;
 pub mod validate;
 /// #951 (Track A QC sweep, 2026-05-20) — canonical
