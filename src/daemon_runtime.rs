@@ -6286,6 +6286,13 @@ pub async fn bootstrap_serve(
     let resolved_ttl = app_config.effective_ttl();
     let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(db_path)?;
+    // v1.0.0 #3700 — read the sqlite agent registry while the connection is
+    // still ours (it moves into the shared `Db` state below); the shape gate
+    // consumes it after the SAL handle is built. A registry that cannot be
+    // read refuses (fail closed: an unobserved fleet is not a singleton).
+    let sqlite_registered_agents = db::list_agents(&conn)
+        .context("#3700: agent registry could not be read")?
+        .len();
 
     // v0.7.0 SEC-2 (Cluster D, issue #767) — fail-OPEN diagnostic + the
     // operator-opt-in fail-CLOSED knob. When `governance_rules` has any
@@ -6861,9 +6868,7 @@ pub async fn bootstrap_serve(
         #[cfg(feature = "sal")]
         let registered_agents =
             if matches!(storage_backend, crate::handlers::StorageBackend::Sqlite) {
-                db::list_agents(&conn)
-                    .context("#3700: agent registry could not be read")?
-                    .len()
+                sqlite_registered_agents
             } else {
                 crate::store::MemoryStore::list_agents(&*store_handle)
                     .await
@@ -6871,9 +6876,7 @@ pub async fn bootstrap_serve(
                     .len()
             };
         #[cfg(not(feature = "sal"))]
-        let registered_agents = db::list_agents(&conn)
-            .context("#3700: agent registry could not be read")?
-            .len();
+        let registered_agents = sqlite_registered_agents;
         crate::deployment_shape::enforce_post_open(registered_agents)?;
     }
 

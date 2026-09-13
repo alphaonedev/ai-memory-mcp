@@ -519,7 +519,7 @@ pub fn derive_pre_runtime(
     argv: Option<(bool, Option<&Path>)>,
     announce: bool,
 ) -> Result<PostureResolution> {
-    let mut resolution = resolve(observe(Some(app_config), argv))?;
+    let resolution = resolve(observe(Some(app_config), argv))?;
     match resolution.origin {
         PostureOrigin::DerivedFromShape => {
             let below = security_profile::asi_hard_below_floor();
