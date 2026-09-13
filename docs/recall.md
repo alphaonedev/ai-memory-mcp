@@ -172,7 +172,7 @@ MCP:
 HTTP:
 
 ```bash
-curl -sS -X POST http://localhost:9077/api/v1/recall \
+curl -sS -X POST https://localhost:9077/api/v1/recall \
   -H 'content-type: application/json' \
   -d '{"context":"what is our refund policy","budget_tokens":4096}'
 ```

@@ -80,8 +80,10 @@ agent-id, and receivers verify that credential against a small
 This is the **shape** of SPIFFE/SPIRE (CA-rooted, attestation-issued,
 short-lived, auto-rotating) but is **first-party**: it composes the
 Ed25519 sign/verify and canonical-CBOR primitives already in
-`src/identity/`. There is **no new dependency** — no `rcgen`, no
-`openssl`, no X.509. The full design rationale is recorded in
+`src/identity/`. There is **no new dependency for identity** — no
+`openssl`, no X.509 in the identity layer (the listener's zero-config TLS
+material, #3709, uses `rcgen`/`x509-parser` in `src/tls_bootstrap.rs`, a
+separate concern that never issues or trusts peer identity). The full design rationale is recorded in
 ADR-001 ("Federation identity at scale" — a design-cycle artifact;
 the shipped decisions are mirrored in the module docs under
 [`src/federation/identity/`](../src/federation/identity/)).

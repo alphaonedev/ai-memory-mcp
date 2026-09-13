@@ -177,7 +177,7 @@ substrate, sorted by `(agent_id ASC, namespace ASC)`:
 curl -X POST -H "Content-Type: application/json" \
   -H "X-API-Key: $API_KEY" \
   -H "X-Agent-Id: ai:claude-opus@host:pid-12345" \
-  http://127.0.0.1:9077/api/v1/quota/status \
+  https://127.0.0.1:9077/api/v1/quota/status \
   -d '{}'
 ```
 

@@ -309,7 +309,7 @@ ai-memory serve --port 9077 --db /var/lib/ai-memory/ai-memory.db
 # Agent 1
 curl -H "X-Agent-Id: alice@team-finance" \
      -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
-     http://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
+     https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 
 # Agent 2 (using ai-memory CLI as a thin client)
 AI_MEMORY_AGENT_ID="bob@team-finance" ai-memory recall "quarterly forecast"

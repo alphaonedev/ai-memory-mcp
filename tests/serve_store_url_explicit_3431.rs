@@ -40,6 +40,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Command, Output};
 
+#[cfg(feature = "sal")]
+mod common;
+
 /// Project HARD RULE: scratch lives under `.local-runs/`, never `/tmp`.
 fn scratch_root() -> PathBuf {
     let root = std::env::current_dir()
@@ -234,6 +237,8 @@ fn serve_with_config_db_and_store_url_starts_3431() {
         l.local_addr().expect("addr").port()
     };
 
+    // #3705 — the daemon refuses every plaintext bind.
+    let tls = common::tls::TestTls::generate(&sb.store("tls-3705"));
     let mut cmd = sb.base_command();
     cmd.args([
         "serve",
@@ -244,6 +249,7 @@ fn serve_with_config_db_and_store_url_starts_3431() {
         "--store-url",
         &sqlite_url(&target),
     ])
+    .args(tls.serve_arg_strs())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn ai-memory serve");
@@ -264,11 +270,8 @@ fn serve_with_config_db_and_store_url_starts_3431() {
         });
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client");
-    let url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let client = tls.client_with_timeout(Duration::from_secs(2));
+    let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut healthy = false;
     while Instant::now() < deadline {
