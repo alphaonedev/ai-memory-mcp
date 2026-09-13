@@ -499,7 +499,11 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         if c is CLEAN: return CLEAN
         if c: return T(c.kind, c.why + ' @ ' + '>'.join(trail))
         # unknown: follow identifiers, then any embedded calls to our own functions
-        for name in rendered_idents(expr):
+        # Deterministic order: `rendered_idents` is a set, and the FIRST tainted identifier names the
+        # finding's source kind. Iterating the raw set let one site key as `:http` on one run and
+        # `:dsn` on the next (PYTHONHASHSEED), which no ledger can track. Alphabetical is the fixed
+        # tie-break; a site that renders several foreign values keys on the first by name.
+        for name in sorted(rendered_idents(expr)):
             r = resolve_ident(name, f, at, depth + 1, trail, side)
             if r: return r
         for m in re.finditer(r'(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([a-z_][a-z0-9_]*)\s*\(', expr_nl):
@@ -904,6 +908,9 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
                     r = field_taint(v, fld, 0, [f'StoreError::{v}.{fld}'])
                     key = f'{p}:store_err_to_response:funnel-arm:StoreError::{v}.{fld}'
                     if r:
+                        ledgered = disposition(key)
+                        if ledgered:
+                            add('INFO', key, p, line_of(text, g.body_start + arm_start), 'store_err_to_response', ledgered); continue
                         add('FAIL', key, p, line_of(text, g.body_start + arm_start), 'store_err_to_response',
                             f'funnel arm renders StoreError::{v} through `{resp_expr.strip()[:60]}` and its text field `{fld}` is FOREIGN: {r.why}. '
                             f'A masked value (redact_*) is still foreign — render an allowlisted projection or drop the detail from the body (operator log keeps it).')
@@ -912,6 +919,7 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
                             f'funnel arm renders StoreError::{v} unsanitised ({spelled}); text field `{fld}` walked to own-code constructions only (caller-safe by walk).')
 
     # ----------------------------------------------------------------- allowlist
+    counts = collections.Counter()
     allow = {}
     if ALLOWF and os.path.exists(ALLOWF):
         for l in open(ALLOWF):
@@ -920,11 +928,25 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             if '=' in l: k, v = l.split('=', 1); allow[k.strip()] = v.strip()
             else: allow[l] = ''
     EXTRA_MAPPERS = [v for k, v in allow.items() if k == 'mapper']
+
+    def disposition(key):
+        """The ledger's answer for a live foreign render: an INFO text for an `echo:` or `pending:#N`
+        entry, None when the key is not ledgered. A masker-naming entry is NOT a disposition (the
+        caller emits the FAIL). Shared by the sink walk and the funnel-arm walk so a funnel arm can
+        be held under an issue exactly like any other sink (it could not be before)."""
+        v = allow.get(key)
+        if v is None: return None
+        if v.startswith('echo:'):
+            counts['ledger:echo'] += 1
+            return f'acknowledged as ECHO direction (caller\'s own input): {v}'
+        if re.match(r'pending:\s*#\d+', v):
+            counts['ledger:pending'] += 1; counts['ledger:pending:' + v[8:].strip()] += 1
+            return f'PENDING FIX under {v[8:].strip()} — still foreign, tracked, not yet closed'
+        return None
     if EXTRA_MAPPERS:
         CLEAN_RE = re.compile(CLEAN_RE.pattern + '|' + '|'.join(re.escape(x) + r'\(' for x in EXTRA_MAPPERS))
 
     # -------------------------------------------------------------------- run
-    counts = collections.Counter()
     for p in sorted(files):
         text = files[p]['text']
         for (kind, expr, at) in list(sink_exprs_in(p)) + list(record_sinks(p)):
@@ -939,10 +961,9 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
                 counts['clean'] += 1; continue
             ln = line_of(text, at)
             key = f'{p}:{fname}:{kind}:{r.kind}'
-            if key in allow and allow[key].startswith('echo:'):
-                add('INFO', key, p, ln, fname, f'acknowledged as ECHO direction (caller\'s own input): {allow[key]}'); continue
-            if key in allow and re.match(r'pending:\s*#\d+', allow[key]):
-                add('INFO', key, p, ln, fname, f'PENDING FIX under {allow[key][8:].strip()} — still foreign, tracked, not yet closed'); continue
+            ledgered = disposition(key)
+            if ledgered:
+                add('INFO', key, p, ln, fname, ledgered); continue
             # apply the rule to itself: an ack that names a masker is refused
             if key in allow and re.search(r'redact|mask|scrub', allow[key]):
                 add('FAIL', key, p, ln, fname, f'allowlist entry `{allow[key]}` names a MASKER — masking is not a passing state; render from an allowlist or drop.'); continue
@@ -1293,6 +1314,20 @@ def self_test(scratch):
     with open(allowf, 'w') as fh: fh.write(f'{key}=echo: fixture ack\n')
     f3, _ = analyze(root, ALLOWF=allowf)
     expect(not any(x['key'] == key and x['sev'] == 'FAIL' for x in f3), 'ALLOWLIST CONTROL: an echo acknowledgement downgrades that key to INFO')
+    # LEDGER LEGS (the #3688 ledger, three rules):
+    #  (a) a `pending:#N` entry holds a live render as INFO, and the run reports it as LIVE, not silent;
+    #  (b) a funnel-arm key is held by the ledger exactly like any other sink (it could not be before);
+    #  (c) a stale entry is a NOTICE, never a pass; (d) keys are DETERMINISTIC across runs.
+    fkey = next((k for k in fails if ':funnel-arm:' in k), None)
+    expect(fkey is not None, 'LEDGER CONTROL: the fixture carries a funnel-arm finding to hold')
+    with open(allowf, 'w') as fh:
+        fh.write(f'{key}=pending:#1\n{fkey}=pending:#2\nsrc/gone.rs:gone:http-body:db=pending:#3\n')
+    f4, c4 = analyze(root, ALLOWF=allowf)
+    expect(not any(x['key'] in (key, fkey) and x['sev'] == 'FAIL' for x in f4), 'LEDGER CONTROL: a pending entry holds a live sink AND a live funnel arm as INFO')
+    expect(c4['ledger:pending'] >= 2 and c4['ledger:pending:#1'] >= 1 and c4['ledger:pending:#2'] >= 1, 'LEDGER CONTROL: ledgered renders are counted LIVE per issue, never folded into clean')
+    expect(any(x['sev'] == 'NOTICE' and 'src/gone.rs' in x['key'] for x in f4), 'LEDGER CONTROL: a stale entry is a NOTICE, not a pass')
+    k1 = sorted(x['key'] for x in analyze(root, ALLOWF='/dev/null')[0]); k2 = sorted(x['key'] for x in analyze(root, ALLOWF='/dev/null')[0])
+    expect(k1 == k2, 'LEDGER CONTROL: keys are deterministic across runs')
     print('foreign-text-to-caller self-test: ' + ('PASS' if ok else 'FAIL'))
     return 0 if ok else 1
 
@@ -1317,6 +1352,16 @@ def main(argv):
     print(f"\nforeign-text-to-caller: {counts['sinks']} caller-facing sinks examined "
           f"({', '.join(f'{k[5:]}={v}' for k, v in sorted(counts.items()) if k.startswith('sink:'))}); "
           f"{counts['clean']} clean; {nfail} FAIL; {ninfo} INFO")
+    # Rule 3: LIVE foreign renders are reported SEPARATELY from what the ledger holds. A ledger that
+    # turned findings into silence would be the same defect as a gate that certifies nothing.
+    pending = counts['ledger:pending']; echo = counts['ledger:echo']
+    live = nfail + pending
+    walked = ninfo - pending - echo
+    per_issue = ', '.join(f'{k.split(":", 2)[2]}={v}' for k, v in sorted(counts.items()) if k.startswith('ledger:pending:'))
+    print(f"  LIVE foreign renders reaching a caller: {live} instances = {nfail} unledgered (FAIL) + {pending} ledgered pending"
+          f"{' (' + per_issue + ')' if per_issue else ''}; {echo} acknowledged as caller echo; {walked} walked to own-code constructions.")
+    if pending and not nfail:
+        print('  The gate is green because every live render is TRACKED, not because none exists.')
     if nfail:
         print('  FAIL by source: ' + ', '.join(f'{k}={v}' for k, v in by_src.most_common()))
         print('  FAIL by sink:   ' + ', '.join(f'{k}={v}' for k, v in by_sink.most_common()))
