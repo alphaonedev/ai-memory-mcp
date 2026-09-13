@@ -534,8 +534,8 @@ ExecStart=%h/.local/bin/ai-memory \
   --db %h/.claude/ai-memory.db curator --daemon \
   --interval-secs 300 --max-ops 100
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-StandardOutput=append:%h/.local/state/ai-memory/log/curator.log
-StandardError=append:%h/.local/state/ai-memory/log/curator.log
+StandardOutput=journal
+StandardError=journal
 Restart=on-failure
 RestartSec=30s
 Nice=5
@@ -547,7 +547,6 @@ WantedBy=default.target
 Load:
 
 ```bash
-mkdir -p ~/.local/state/ai-memory/log
 systemctl --user daemon-reload
 systemctl --user enable --now ai-memory-curator.service
 systemctl --user status ai-memory-curator.service

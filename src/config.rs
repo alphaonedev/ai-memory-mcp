@@ -7124,14 +7124,19 @@ pub struct LoggingConfig {
     pub enabled: Option<bool>,
     /// Directory for rotated logs. Default `~/.local/state/ai-memory/logs/`.
     pub path: Option<String>,
-    /// Soft cap on a single rotated file (advisory — informs rotation
-    /// configuration; the appender enforces this via the chosen
-    /// `rotation` cadence). Default 100.
+    /// NOT ENFORCED (#3652). Still parsed so existing configs load, but
+    /// the rolling appender rotates by time only and never reads this
+    /// value. On disk the file sink is bounded by `max_files` × one
+    /// `rotation` period's volume; pick a shorter period for a tighter
+    /// bound.
     pub max_size_mb: Option<u64>,
-    /// Maximum number of rotated files retained on disk. Default 30.
+    /// Maximum number of rotated files retained on disk; the appender
+    /// deletes the oldest beyond this count. This is the file sink's only
+    /// retention bound. Default 30.
     pub max_files: Option<usize>,
-    /// Days of log history to keep before `ai-memory logs archive`
-    /// would compress them. Default 90.
+    /// Age in days after which `ai-memory logs archive` compresses a
+    /// rotated file. It deletes nothing, and nothing applies it unless an
+    /// operator runs that command (#3652). Default 90.
     pub retention_days: Option<u32>,
     /// Emit JSON lines instead of the human-readable fmt layer. Default `false`.
     pub structured: Option<bool>,

@@ -265,7 +265,7 @@ PLIST_EOF
     fi
 elif [[ "$PLATFORM" == "Linux" ]]; then
     UNIT="$HOME/.config/systemd/user/ai-memory-curator.service"
-    mkdir -p "$(dirname "$UNIT")" "$HOME/.local/state/ai-memory/log"
+    mkdir -p "$(dirname "$UNIT")"
     AI_MEMORY_BIN=$(command -v ai-memory)
     if [[ ! -f "$UNIT" ]]; then
         cat > "$UNIT" <<UNIT_EOF
@@ -280,8 +280,11 @@ Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=AI_MEMORY_AUTO_CONFIDENCE=1
 Environment=AI_MEMORY_CONFIDENCE_SHADOW=1
 Environment=AI_MEMORY_CONFIDENCE_DECAY=1
-StandardOutput=append:$HOME/.local/state/ai-memory/log/curator.log
-StandardError=append:$HOME/.local/state/ai-memory/log/curator.log
+# #3652: journald owns capture, rotation and retention (SystemMaxUse=,
+# MaxRetentionSec=). An append: file here grew without bound, and nothing
+# rotated or reopened it. Read it with: journalctl --user -u ai-memory-curator
+StandardOutput=journal
+StandardError=journal
 Restart=on-failure
 RestartSec=30s
 Nice=5

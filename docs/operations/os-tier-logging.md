@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# OS-tier logging (journald / unified log / Event Log)
+# OS-tier logging (journald / launchd / Event Log)
 
 > **Issue #1463 — Tier 1.** ai-memory's operational logs can be emitted as
 > structured lines on **stdout** so the host's init system captures, rotates,
@@ -43,17 +43,19 @@ one-shot WARN.
 
 ## Why this satisfies "use the pre-existing OS facilities"
 
-Every major init system already captures a service's stdout and applies its own
-structured-log storage, rotation, retention, and forwarding:
+systemd already captures a service's stdout and applies its own structured-log
+storage, rotation, retention and forwarding. launchd does not (see the macOS
+row and [macOS — launchd plist](#macos--launchd-plist)):
 
 | OS | Captures service stdout into | Rotation / retention | Forwarding |
 |----|------------------------------|----------------------|------------|
 | Linux (systemd) | **systemd-journald** | `journald.conf` (`SystemMaxUse`, `MaxRetentionSec`) | `systemd-journal-upload`, rsyslog → SIEM |
 | Linux (syslog) | rsyslog/syslog-ng via stdout→journal→syslog | `/etc/logrotate.d` | rsyslog `omfwd` (RFC 5424, TCP+TLS) |
-| macOS (launchd) | **unified logging** / `StandardOutPath` | `log` subsystem retention | `log collect`, MDM log pipelines |
+| macOS (launchd) | nothing: stdout is discarded, or appended to a pinned `StandardOutPath` file that launchd never rotates or reopens (#3652) | none from launchd; use ai-memory's rolling file sink (`rotation` + `max_files`) | ship the rolling files with your log agent |
 
-ai-memory does not reimplement any of that — it just emits clean structured
-lines and lets the platform own the lifecycle.
+Where the platform owns the lifecycle, ai-memory doesn't reimplement it: it
+emits clean structured lines and lets the platform own it. Where it doesn't
+(launchd), the rolling file sink is the bounded owner.
 
 ## Linux — systemd unit
 
@@ -100,6 +102,33 @@ action(type="omfwd" target="siem.example" port="6514"
 
 ## macOS — launchd plist
 
+launchd does **not** forward a job's stdout to the unified log. `log stream`
+only shows messages a program sends through `os_log`, and ai-memory does not
+use `os_log`. launchd does one of two things with a job's stdout and stderr:
+
+- **No `StandardOutPath` / `StandardErrorPath`:** the output is discarded.
+- **Pinned paths:** launchd opens each file once and appends to it for the
+  life of the job. Nothing rotates it. If `newsyslog` renames it, launchd
+  keeps writing into the renamed file until the job restarts, so size-based
+  rotation doesn't bound it (#3652).
+
+So on macOS the operational log's bounded owner is ai-memory's own rolling
+file sink (`sink = "file"`, the default): it rotates by `rotation` and deletes
+files beyond `max_files` (see [Logging policy](#logging-policy--archival-guidance)).
+Keep the pinned launchd path only for stderr. A running ai-memory writes
+little there: start-up refusals, and at most one sink-failure diagnostic per
+minute.
+
+`~/.config/ai-memory/config.toml`:
+
+```toml
+[logging]
+enabled   = true
+sink      = "file"
+rotation  = "daily"
+max_files = 30
+```
+
 `~/Library/LaunchAgents/co.alphaone.ai-memory.plist`:
 
 ```xml
@@ -114,12 +143,9 @@ action(type="omfwd" target="siem.example" port="6514"
     <string>/usr/local/bin/ai-memory</string>
     <string>serve</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict><key>AI_MEMORY_LOG_SINK</key><string>stdout</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <!-- launchd captures stdout into the unified log; or pin a file: -->
-  <key>StandardOutPath</key><string>/usr/local/var/log/ai-memory.out.log</string>
+  <!-- stderr only: start-up refusals and rate-limited sink diagnostics. -->
   <key>StandardErrorPath</key><string>/usr/local/var/log/ai-memory.err.log</string>
 </dict>
 </plist>
@@ -127,7 +153,7 @@ action(type="omfwd" target="siem.example" port="6514"
 
 ```bash
 launchctl load ~/Library/LaunchAgents/co.alphaone.ai-memory.plist
-log stream --predicate 'process == "ai-memory"' --style json   # unified log
+tail -F ~/Library/Logs/ai-memory/ai-memory.log.*   # the rolling file sink (macOS default dir)
 ```
 
 ## Tier 2 — native remote `syslog` sink (`--features syslog`)
@@ -234,7 +260,16 @@ targets with no syslog daemon.
 - **Pick one owner of the log lifecycle.** With `sink = "stdout"`, the init
   system owns rotation/retention/forwarding — do **not** also enable the file
   sink for the same process. With `sink = "file"` (default), ai-memory's
-  rolling appender owns it (`rotation`, `max_files`, `retention_days`).
+  rolling appender owns it. It starts a new file each `rotation` period and
+  deletes the oldest beyond `max_files`, so the bound on disk is `max_files`
+  × one period's volume.
+- **The file sink's contract (#3652).** Don't point `logrotate` or
+  `newsyslog` at these files: the appender holds the current file open and
+  never reopens it, so a rename leaves it writing into the renamed file.
+  There is no size cap. `max_size_mb` is parsed but not enforced; use
+  `rotation = "hourly"` for a tighter bound. `retention_days` deletes
+  nothing. It only sets the age at which `ai-memory logs archive` compresses
+  a rotated file, and only when an operator runs that command.
 - **Operational logs are not the audit trail.** The tamper-evident signed
   audit chain (`[audit]`, `AI_MEMORY_AUDIT_DIR`) remains the source of truth for
   security/forensic events; OS-tier sinks carry *operational* info/warn/error

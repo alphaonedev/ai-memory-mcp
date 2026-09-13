@@ -8,7 +8,7 @@
 # have at least one peer address to mesh with.
 #
 # Install:
-#   mkdir -p ~/.config/systemd/user ~/.local/state/ai-memory/log
+#   mkdir -p ~/.config/systemd/user
 #   cp scripts/templates/ai-memory-sync.service \
 #      ~/.config/systemd/user/
 #   sed -i 's|REPLACE_DB|%h/.claude/ai-memory.db|g; \
@@ -44,8 +44,10 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=AI_MEMORY_AUTO_CONFIDENCE=1
 Environment=AI_MEMORY_CONFIDENCE_SHADOW=1
 Environment=AI_MEMORY_CONFIDENCE_DECAY=1
-StandardOutput=append:%h/.local/state/ai-memory/log/sync.log
-StandardError=append:%h/.local/state/ai-memory/log/sync.log
+# #3652: journald owns capture, rotation and retention (SystemMaxUse=,
+# MaxRetentionSec=); `journalctl --user -u ai-memory-sync.service` reads it.
+StandardOutput=journal
+StandardError=journal
 Restart=on-failure
 RestartSec=60s
 Nice=5

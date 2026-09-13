@@ -60,14 +60,13 @@ Three surfaces ship in v0.7.0 (stderr, rolling file, Prometheus `/metrics`), joi
 [logging]
 enabled = true
 path = "~/.local/state/ai-memory/logs/"
-max_size_mb = 100
-max_files = 30
-retention_days = 90
+rotation = "daily"    # a new file each period
+max_files = 30        # the only retention bound: older files are deleted
 structured = true     # JSON output for SIEM ingestion
 level = "info"        # tracing::EnvFilter syntax
 ```
 
-The appender writes rotated files (`ai-memory.log.YYYY-MM-DD`) under the resolved path. Path precedence: CLI flag `--log-dir` > `AI_MEMORY_LOG_DIR` env > `[logging] path` config > platform default. The substrate refuses world-writable log directories — set `chmod 750` on the parent. Shipped in v0.7.0 at 98.98% test coverage; see `src/logging.rs` and the SIEM ingestion runbook at [`security/audit-trail.md`](security/audit-trail.html).
+The appender writes rotated files (`ai-memory.log.YYYY-MM-DD`) under the resolved path and deletes the oldest beyond `max_files`. `max_size_mb` is not enforced and `retention_days` only drives `ai-memory logs archive` compression (#3652); see [OS-tier logging](operations/os-tier-logging.html#logging-policy--archival-guidance) for the full rotation and retention contract. Path precedence: CLI flag `--log-dir` > `AI_MEMORY_LOG_DIR` env > `[logging] path` config > platform default. The substrate refuses world-writable log directories — set `chmod 750` on the parent. Shipped in v0.7.0 at 98.98% test coverage; see `src/logging.rs` and the SIEM ingestion runbook at [`security/audit-trail.md`](security/audit-trail.html).
 
 **OpenTelemetry OTLP exporter — NOT SHIPPED; DEFERRED to v1.x.** The substrate's span shape is intentionally OTel-compatible, but **no OTLP exporter exists at v1.0.0**: there is no `opentelemetry`/OTLP dependency in `Cargo.toml`, no exporter in `src/`, and no `OTEL_*` env surface. The ROADMAP §11.6 v1.0.0 disposition ruling records OpenTelemetry standardization as DEFERRED to v1.x (it was never a v1.0.0 acceptance criterion). Use the file sink with `structured = true` — it produces JSON that any OTel-aware collector ingests as a log-receiver input — or the `--features syslog` RFC-5424 remote sink.
 
