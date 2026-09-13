@@ -138,6 +138,7 @@ fn health_state(failing: bool, degraded: bool) -> HealthState {
 
 /// `state` of every field this surface cannot report a number for.
 const UNAVAILABLE_STATE: &str = "unavailable";
+const AVAILABLE_STATE: &str = "available";
 
 #[derive(Serialize)]
 struct Unavailable {
@@ -163,6 +164,23 @@ struct NotObserved {
     reason: &'static str,
 }
 
+/// A per-peer field this node HAS observed. Still a signal object, never a
+/// bare number: the v1 contract (docs/HEALTH-MONITORING.md) keeps the field's
+/// type stable across the unavailable -> available transition, so a client
+/// never has to tell "not measured" from a value by its JSON type.
+#[derive(Serialize)]
+struct Observed {
+    state: &'static str,
+    value: i64,
+}
+
+fn available(value: i64) -> serde_json::Value {
+    json!(Observed {
+        state: AVAILABLE_STATE,
+        value
+    })
+}
+
 /// Issue that owns the per-peer fields #3654 does not measure.
 const PEER_LAG_ISSUE: u32 = 3681;
 const NO_PUSH_SUCCESS: &str = "no_push_success_observed";
@@ -172,7 +190,8 @@ const DLQ_BACKLOG_EMPTY: &str = "backlog_empty";
 const DLQ_OLDEST_UNPARSEABLE: &str = "oldest_failure_unparseable";
 const NO_PEER_DATE_HEADER: &str = "no_catchup_response_date_observed";
 
-/// `value` when observed, otherwise the explicit not-observed object.
+/// The available signal object when observed, otherwise the explicit
+/// not-observed object with its reason.
 fn observed(value: Option<i64>, reason: &'static str) -> serde_json::Value {
     value.map_or_else(
         || {
@@ -181,7 +200,7 @@ fn observed(value: Option<i64>, reason: &'static str) -> serde_json::Value {
                 reason
             })
         },
-        |v| json!(v),
+        available,
     )
 }
 
@@ -205,7 +224,7 @@ fn peer_status(
         (None, _) => observed(None, DLQ_NOT_MEASURED),
         (Some(0), _) => observed(None, DLQ_BACKLOG_EMPTY),
         (Some(_), None) => observed(None, DLQ_OLDEST_UNPARSEABLE),
-        (Some(_), Some(ts)) => json!(now.saturating_sub(ts).max(0)),
+        (Some(_), Some(ts)) => available(now.saturating_sub(ts).max(0)),
     };
     json!({
         "identity_ref": identity_ref(id),
@@ -393,7 +412,7 @@ mod tests {
     fn issue_3654_peer_fields_report_only_what_was_observed() {
         use crate::federation::freshness::{DirectionFreshness, PeerFreshness};
         let now = 50_000;
-        let every_30s = Some(std::time::Duration::from_secs(30));
+        let catchup_interval = Some(std::time::Duration::from_secs(30));
 
         // Quiet peer: pulls fine, never pushed to, backlog never measured.
         let quiet = PeerFreshness {
@@ -404,7 +423,7 @@ mod tests {
             },
             ..PeerFreshness::default()
         };
-        let v = peer_status("peer-0", Some(&quiet), every_30s, now);
+        let v = peer_status("peer-0", Some(&quiet), catchup_interval, now);
         assert_eq!(v["reachability"]["state"], "reachable");
         for field in [
             "last_successful_push_age_seconds",
@@ -442,13 +461,19 @@ mod tests {
             push_dlq_oldest_failed_unix: Some(now - 3_500),
             ..PeerFreshness::default()
         };
-        let v = peer_status("peer-1", Some(&rejecting), every_30s, now);
-        assert_eq!(v["last_successful_push_age_seconds"], 3_600);
-        assert_eq!(v["last_accepted_push_at_seconds"], now - 3_600);
-        assert_eq!(v["last_push_attempt_at_seconds"], now - 5);
-        assert_eq!(v["dlq_depth"], 4);
-        assert_eq!(v["dlq_oldest_age_seconds"], 3_500);
-        assert_eq!(v["clock_skew_seconds"], -2);
+        let v = peer_status("peer-1", Some(&rejecting), catchup_interval, now);
+        for (field, value) in [
+            ("last_successful_push_age_seconds", 3_600),
+            ("last_accepted_push_at_seconds", now - 3_600),
+            ("last_push_attempt_at_seconds", now - 5),
+            ("dlq_depth", 4),
+            ("dlq_oldest_age_seconds", 3_500),
+            ("clock_skew_seconds", -2),
+        ] {
+            // Observed values stay signal objects, never bare numbers.
+            assert_eq!(v[field]["state"], "available", "{field}");
+            assert_eq!(v[field]["value"], value, "{field}");
+        }
         assert_eq!(v["reachability"]["reason"], "no_pull_observation");
 
         // Measured empty backlog: depth 0 is a measurement, the oldest age is
@@ -457,12 +482,13 @@ mod tests {
             push_dlq_depth: Some(0),
             ..PeerFreshness::default()
         };
-        let v = peer_status("peer-2", Some(&drained), every_30s, now);
-        assert_eq!(v["dlq_depth"], 0);
+        let v = peer_status("peer-2", Some(&drained), catchup_interval, now);
+        assert_eq!(v["dlq_depth"]["state"], "available");
+        assert_eq!(v["dlq_depth"]["value"], 0);
         assert_eq!(v["dlq_oldest_age_seconds"]["reason"], "backlog_empty");
 
         // A peer the registry has never seen.
-        let v = peer_status("peer-3", None, every_30s, now);
+        let v = peer_status("peer-3", None, catchup_interval, now);
         assert_eq!(v["reachability"]["reason"], "no_pull_observation");
         assert_eq!(
             v["clock_skew_seconds"]["reason"],

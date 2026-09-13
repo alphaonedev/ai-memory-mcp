@@ -982,8 +982,10 @@ catch-up loop runs, no pull was observed, or the last pull is older than
 three catch-up intervals), `last_successful_push_age_seconds` and
 `last_accepted_push_at_seconds` (the last push the peer applied),
 `last_push_attempt_at_seconds`, `dlq_depth`, `dlq_oldest_age_seconds`
-and `clock_skew_seconds`. A field this node has not observed renders
-`{"state": "unavailable", "reason": ...}`, never a number.
+and `clock_skew_seconds`. An observed field renders
+`{"state": "available", "value": ...}` and a field this node has not
+observed renders `{"state": "unavailable", "reason": ...}`, never a bare
+number.
 
 Deliberately not covered by #3654: per-peer replication lag and catch-up
 progress are NOT measured (the two status fields stay `unavailable`,

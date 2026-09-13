@@ -36,9 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reachability` is derived from pulls only and is `unknown` (with a
   reason) when there is no fresh pull, never healthy from silence, and
   `last_successful_push_age_seconds` is the age of the last push the
-  peer applied, or an explicit not-observed object. Not measured by this
-  change: per-peer replication lag and catch-up progress (#3681), and
-  the `ai-memory sync-daemon` lane (#3682).
+  peer applied. Every observed per-peer value is an
+  `{"state":"available","value":…}` signal object and every unobserved
+  one an explicit not-observed object, never a bare number. Not measured
+  by this change: per-peer replication lag and catch-up progress
+  (#3681), the `ai-memory sync-daemon` lane (#3682), and inbound-only
+  peers, which are not enumerated on the status surface (#3686).
 
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 

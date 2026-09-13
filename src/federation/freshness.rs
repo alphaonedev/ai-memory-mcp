@@ -884,7 +884,7 @@ mod tests {
     /// (the periodic probe) decides reachability.
     #[test]
     fn reachability_is_unknown_without_a_fresh_pull_observation() {
-        let every_30s = Some(Duration::from_secs(30));
+        let catchup_interval = Some(Duration::from_secs(30));
         let now = 10_000;
         // No catch-up loop: even a perfect old pull says nothing now.
         assert_eq!(
@@ -895,7 +895,7 @@ mod tests {
         );
         // A peer the registry has never seen, and one with pushes only.
         assert_eq!(
-            reachability(None, every_30s, now),
+            reachability(None, catchup_interval, now),
             Reachability::Unknown {
                 reason: UNKNOWN_NO_PULL_OBSERVATION
             }
@@ -909,7 +909,7 @@ mod tests {
             ..PeerFreshness::default()
         };
         assert_eq!(
-            reachability(Some(&push_only), every_30s, now),
+            reachability(Some(&push_only), catchup_interval, now),
             Reachability::Unknown {
                 reason: UNKNOWN_NO_PULL_OBSERVATION
             }
@@ -917,13 +917,21 @@ mod tests {
         // Exactly at the window (3 x 30 s) the observation still counts; one
         // second past it, the stalled loop's last word is no longer believed.
         assert_eq!(
-            reachability(Some(&pulled(now - 90, Some(now - 90), 0)), every_30s, now),
+            reachability(
+                Some(&pulled(now - 90, Some(now - 90), 0)),
+                catchup_interval,
+                now
+            ),
             Reachability::Reachable {
                 last_pull_success_at_seconds: now - 90
             }
         );
         assert_eq!(
-            reachability(Some(&pulled(now - 91, Some(now - 91), 0)), every_30s, now),
+            reachability(
+                Some(&pulled(now - 91, Some(now - 91), 0)),
+                catchup_interval,
+                now
+            ),
             Reachability::Unknown {
                 reason: UNKNOWN_PULL_OBSERVATION_STALE
             }
