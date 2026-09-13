@@ -400,9 +400,16 @@ mod tests {
             "http://[::1]:9077"
         );
         assert_eq!(url_origin_for_refusal("https://h/p?token=t"), "https://h");
+        // A scheme with no host parses host-less or fails: either way the
+        // query never leaks.
+        let hostless = url_origin_for_refusal("nonsense://///?token=t");
+        assert!(
+            hostless.starts_with("nonsense://") && !hostless.contains("token"),
+            "{hostless}"
+        );
         assert_eq!(
-            url_origin_for_refusal("nonsense://///?token=t"),
-            "nonsense://<unparseable>"
+            url_origin_for_refusal("not a url at all"),
+            "<unparseable URL, no scheme>"
         );
         assert!(!url_origin_for_refusal("user:pw@host?token=t").contains("pw"));
     }
