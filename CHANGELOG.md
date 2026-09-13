@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3662 — federation nonce-cache health contract)
+
+- **#3662 (HIGH, audit #3645 F16) — the replay-nonce cache reports what it
+  measures.** `FederationNonceCache` now counts replay refusals, per-peer
+  FIFO fingerprint evictions, occupancy and every sqlite-mirror failure by
+  op, tracks the last successful mirror write, and derives a persistence
+  state (`memory_only` / `durable` / `degraded`) plus a restart-protection
+  classification (`disabled` / `durable` / `lost`; `lost` sustained for
+  300 s is `actionable`). Surfaced on `/health` under
+  `federation.nonce_cache` as a #3646 signal object, on `/metrics` as the
+  `ai_memory_federation_nonce_cache_*` family, and offline in `ai-memory
+  doctor` ("Federation nonce cache (#3662)"). The daemon's boot fallback to
+  an in-memory cache (#1255) is now reported as `lost` /
+  `persistence_open_failed_at_boot` instead of looking healthy. Replay
+  refusal itself is unchanged.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`

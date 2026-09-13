@@ -32,6 +32,7 @@ pub mod curator;
 pub mod doctor;
 /// v1.0.0 #3471 — the `ai-memory doctor` wake-hub posture section (socket and
 /// directory mode + ownership, file-descriptor budget, supervisor unit).
+pub mod doctor_nonce_cache;
 pub mod doctor_wake_hub;
 pub mod epoch_apply;
 /// v0.7.0 L2-5 (issue #670) — `ai-memory export-forensic-bundle` and

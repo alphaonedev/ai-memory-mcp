@@ -1243,6 +1243,11 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     sections.push(section_atomisation_curator_2985(&conn));
     sections.push(section_llm_reachability_1146());
     sections.push(section_embeddings_reachability_1598());
+    // v1.0.0 #3662 — the federation nonce-cache sqlite mirror: the durable
+    // half of restart protection, measured offline from `conn`.
+    sections.push(crate::cli::doctor_nonce_cache::section_nonce_cache_3662(
+        &conn,
+    ));
     // v1.0.0 #3471 — the wake-hub posture. Filesystem + `getrlimit` only: the
     // hub opens no store, so this section cannot be affected by (or affect)
     // the database connection above.
@@ -3980,7 +3985,11 @@ mod tests {
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 18);
+        //
+        // #3662 appended "Federation nonce cache (#3662)" (the sqlite mirror
+        // of the replay-nonce cache, measured from `conn`) before the wake
+        // hub — total is now 19.
+        assert_eq!(report.sections.len(), 19);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -4002,6 +4011,7 @@ mod tests {
                 "Atomisation Curator",
                 "LLM Reachability (#1146)",
                 "Embeddings Reachability (#1598)",
+                crate::cli::doctor_nonce_cache::SECTION_NONCE_CACHE,
                 crate::cli::doctor_wake_hub::SECTION_WAKE_HUB,
             ]
         );

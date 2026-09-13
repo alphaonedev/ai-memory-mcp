@@ -12325,6 +12325,52 @@ async fn http_health_route_returns_200_with_status_ok() {
     assert_eq!(v["federation_enabled"], false);
 }
 
+// #3662 — /health carries the nonce cache as a #3646 signal object: an
+// `available` state with additive `value`, never a bare number, and the
+// persistence posture is the cache's MEASURED state (the test AppState
+// builds an in-memory cache, so it must say `memory_only` / `disabled`,
+// not pretend durability).
+#[tokio::test]
+async fn http_health_route_carries_nonce_cache_signal_object_3662() {
+    let state = test_state();
+    let app = Router::new()
+        .route("/api/v1/health", axum_get(health))
+        .with_state(test_app_state(state));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let nc = &v[super::transport::HEALTH_KEY_FEDERATION][super::transport::HEALTH_KEY_NONCE_CACHE];
+    assert_eq!(
+        nc["state"], "available",
+        "signal object, not a bare value: {v}"
+    );
+    assert!(nc["observed_at_seconds"].as_u64().is_some_and(|t| t > 0));
+    assert_eq!(nc["value"]["peers"], 0);
+    assert_eq!(nc["value"]["fingerprints"], 0);
+    assert_eq!(
+        nc["value"]["max_peers"],
+        crate::identity::replay::FEDERATION_NONCE_MAX_PEERS as u64
+    );
+    assert_eq!(nc["value"]["persistence"]["state"], "memory_only");
+    assert_eq!(nc["value"]["persistence"]["restart_protection"], "disabled");
+    assert_eq!(nc["value"]["persistence"]["actionable"], false);
+    assert!(
+        nc["value"]["persistence"]["last_success_at_seconds"].is_null(),
+        "no write has happened, so no timestamp may be invented"
+    );
+}
+
 // ---- prometheus_metrics happy path ----
 
 #[tokio::test]

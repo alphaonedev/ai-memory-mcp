@@ -7366,10 +7366,10 @@ pub async fn bootstrap_serve(
                         db_path = %db_path.display(),
                         err = %e,
                         "#1255: FederationNonceCache persistence open failed; falling back to \
-                         in-memory cache. Daemon restarts will reopen the replay window until \
-                         operators resolve the underlying sqlite issue."
+                         in-memory cache (reported as degraded on /health, /metrics: #3662). \
+                         Daemon restarts reopen the replay window until the sqlite issue is fixed."
                     );
-                    crate::identity::replay::FederationNonceCache::new()
+                    crate::identity::replay::FederationNonceCache::new_after_persistence_open_failure()
                 }
             },
         ),

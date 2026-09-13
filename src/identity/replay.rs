@@ -58,7 +58,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -606,6 +606,247 @@ pub const FEDERATION_NONCE_CAPACITY_PER_PEER: usize = 10_000;
 /// pushes past the ceiling.
 pub const FEDERATION_NONCE_MAX_PEERS: usize = 1024;
 
+/// #3662 — one tracing target for the nonce-cache observability sites
+/// added by that issue (the hardcoded-literal gate is a ratchet: new
+/// sites must reference a const, not repeat the string).
+const TRACE_TARGET: &str = "ai_memory::identity::replay";
+
+/// #3662 — how long restart protection may be LOST (persistence
+/// degraded, or never opened) before the loss is classified as
+/// actionable. A single failed INSERT during a WAL checkpoint or a
+/// transient lock is not an incident: the next Fresh nonce re-tries and
+/// flips the state back to durable. Sustained loss past this window
+/// means every restart re-opens the replay window for every peer, which
+/// IS an incident. Aligned with `daemon_runtime::PULL_CURSOR_FUTURE_SKEW_SECS`
+/// (5 minutes) so the two federation-freshness thresholds read the same.
+pub const NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS: u64 = 5 * (crate::SECS_PER_MINUTE as u64);
+
+/// #3662 — the closed set of persistence operations the
+/// `FederationNonceCache` performs against its sqlite mirror. Each has
+/// its own failure counter (in-process AND the `op` label of
+/// `ai_memory_federation_nonce_cache_persistence_failed_total`) so an
+/// operator can tell "cannot open the database" from "the evicted-row
+/// DELETE keeps failing" without reading logs. The label set is closed:
+/// no tenant string, peer id or path ever reaches a metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoncePersistenceOp {
+    /// `crate::db::open` on the mirror path (boot hydration or per-write).
+    Open,
+    /// `INSERT OR REPLACE` of a Fresh fingerprint.
+    Insert,
+    /// `DELETE` of the fingerprint the per-peer FIFO just evicted.
+    DeleteFingerprint,
+    /// `DELETE` of every row of the peer slot the outer LRU just evicted.
+    DeletePeer,
+    /// The #1690 over-cap prune that runs once on hydration.
+    HydratePrune,
+}
+
+impl NoncePersistenceOp {
+    /// Every op, in counter-slot order. Used to pre-touch the labelled
+    /// metric family at registration so each series renders as a
+    /// measured `0` from boot instead of being absent until it fails.
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Insert,
+        Self::DeleteFingerprint,
+        Self::DeletePeer,
+        Self::HydratePrune,
+    ];
+
+    /// Stable metric-label / JSON-key spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Insert => "insert",
+            Self::DeleteFingerprint => "delete_fingerprint",
+            Self::DeletePeer => "delete_peer",
+            Self::HydratePrune => "hydrate_prune",
+        }
+    }
+
+    const fn slot(self) -> usize {
+        match self {
+            Self::Open => 0,
+            Self::Insert => 1,
+            Self::DeleteFingerprint => 2,
+            Self::DeletePeer => 3,
+            Self::HydratePrune => 4,
+        }
+    }
+}
+
+/// #3662 — the persistence posture of a `FederationNonceCache`, as
+/// measured from the outcome of its LAST persistence interaction. Also
+/// the value of the `ai_memory_federation_nonce_cache_persistence_state`
+/// gauge (`0` / `1` / `2` in declaration order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoncePersistenceState {
+    /// No mirror path was configured (`FederationNonceCache::new`).
+    /// Restart protection is DISABLED by construction; a daemon restart
+    /// re-opens the replay window. Production never builds this shape —
+    /// it is the harness / opt-out posture.
+    MemoryOnly = 0,
+    /// A mirror path is configured and the last persistence interaction
+    /// succeeded: Fresh fingerprints reach disk and survive a restart.
+    Durable = 1,
+    /// A mirror path is configured (or was intended) and the last
+    /// persistence interaction FAILED, or the mirror could not be opened
+    /// at boot. The in-memory bound still holds, so replay refusal keeps
+    /// working within this process, but restart protection is LOST until
+    /// a later write succeeds.
+    Degraded = 2,
+}
+
+impl NoncePersistenceState {
+    /// Stable JSON spelling (matches the serde rename).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MemoryOnly => "memory_only",
+            Self::Durable => "durable",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Durable,
+            2 => Self::Degraded,
+            _ => Self::MemoryOnly,
+        }
+    }
+}
+
+/// #3662 — what a daemon restart would do to the replay window, derived
+/// from [`NoncePersistenceState`]. This is the operator-facing
+/// classification: `lost` for longer than
+/// [`NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS`] is actionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartProtection {
+    /// Persistence was never configured for this cache.
+    Disabled,
+    /// Fingerprints are reaching the disk mirror.
+    Durable,
+    /// Persistence was configured but is not currently working.
+    Lost,
+}
+
+/// #3662 — the persistence half of [`NonceCacheHealth`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NoncePersistenceHealth {
+    /// Measured from the last persistence interaction.
+    pub state: NoncePersistenceState,
+    /// Derived classification (see [`RestartProtection`]).
+    pub restart_protection: RestartProtection,
+    /// Why protection is not `durable`, when it is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// Failures since boot, by operation (every op always present).
+    pub failures_by_op: Vec<(&'static str, u64)>,
+    /// Sum of `failures_by_op`.
+    pub failures_total: u64,
+    /// Unix seconds of the last fully successful persistence write
+    /// (INSERT plus any evict DELETEs). `None` = no write has succeeded
+    /// since boot — a rehydrated-but-idle cache reports `None` honestly.
+    pub last_success_at_seconds: Option<u64>,
+    /// Unix seconds of the last failed persistence operation.
+    pub last_failure_at_seconds: Option<u64>,
+    /// Unix seconds at which the current `lost` stretch began.
+    pub degraded_since_at_seconds: Option<u64>,
+    /// `now - degraded_since` while `lost`.
+    pub degraded_for_seconds: Option<u64>,
+    /// `true` once protection has been `lost` for at least
+    /// [`NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS`].
+    pub actionable: bool,
+}
+
+/// #3662 — a point-in-time, fully measured snapshot of a
+/// [`FederationNonceCache`]. Every number is read from the cache's own
+/// atomics or the in-memory map; nothing is estimated. Carries no peer
+/// id, path or tenant string, so it is safe to embed in `/health`
+/// unchanged. `to_signal_json` renders it in the #3646 signal-object
+/// shape (`state: "available"` plus additive `value` / freshness fields)
+/// so the `federation.nonce_cache` field that #3646 reports as
+/// `not_yet_instrumented` can be replaced by this object in place.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NonceCacheHealth {
+    /// Peer slots currently resident.
+    pub peers: u64,
+    /// The outer LRU ceiling (`FEDERATION_NONCE_MAX_PEERS`).
+    pub max_peers: u64,
+    /// Fingerprints resident across all peers.
+    pub fingerprints: u64,
+    /// The per-peer FIFO ceiling (`FEDERATION_NONCE_CAPACITY_PER_PEER`).
+    pub per_peer_capacity: u64,
+    /// Outer-LRU peer-slot evictions since boot (#1038).
+    pub peer_evictions_total: u64,
+    /// Per-peer FIFO fingerprint evictions since boot.
+    pub fingerprint_evictions_total: u64,
+    /// `ReplayDecision::Replay` outcomes since boot — refused requests.
+    pub replay_refusals_total: u64,
+    /// Persistence posture.
+    pub persistence: NoncePersistenceHealth,
+    /// The unix second this snapshot was taken at.
+    pub observed_at_seconds: u64,
+}
+
+impl NonceCacheHealth {
+    /// Reason spelling for the boot-time fallback.
+    pub const REASON_OPEN_FAILED_AT_BOOT: &'static str = "persistence_open_failed_at_boot";
+    /// Reason spelling for a per-write failure after a working boot.
+    pub const REASON_WRITE_FAILED: &'static str = "persistence_write_failed";
+    /// Reason spelling for the opt-out constructor.
+    pub const REASON_DISABLED: &'static str = "persistence_disabled";
+
+    /// The #3646 signal-object rendering: an instrumented field keeps
+    /// the `state` discriminator and adds `value` + freshness; it never
+    /// collapses to a bare number.
+    #[must_use]
+    pub fn to_signal_json(&self) -> serde_json::Value {
+        let failures: serde_json::Map<String, serde_json::Value> = self
+            .persistence
+            .failures_by_op
+            .iter()
+            .map(|(op, n)| ((*op).to_string(), serde_json::Value::from(*n)))
+            .collect();
+        serde_json::json!({
+            "state": "available",
+            "observed_at_seconds": self.observed_at_seconds,
+            "value": {
+                "peers": self.peers,
+                "max_peers": self.max_peers,
+                "fingerprints": self.fingerprints,
+                "per_peer_capacity": self.per_peer_capacity,
+                "peer_evictions_total": self.peer_evictions_total,
+                "fingerprint_evictions_total": self.fingerprint_evictions_total,
+                "replay_refusals_total": self.replay_refusals_total,
+                "persistence": {
+                    "state": self.persistence.state,
+                    "restart_protection": self.persistence.restart_protection,
+                    "reason": self.persistence.reason,
+                    "failures_by_op": failures,
+                    "failures_total": self.persistence.failures_total,
+                    "last_success_at_seconds": self.persistence.last_success_at_seconds,
+                    "last_failure_at_seconds": self.persistence.last_failure_at_seconds,
+                    "degraded_since_at_seconds": self.persistence.degraded_since_at_seconds,
+                    "degraded_for_seconds": self.persistence.degraded_for_seconds,
+                    "actionable": self.persistence.actionable,
+                },
+            },
+        })
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// v0.7.0 #1033 (federation parity) — same O(1) `HashSet + VecDeque`
 /// shape as `ReplayCacheInner`, applied per-peer so each peer's
 /// freshness check runs in O(1) instead of the pre-#1033 O(N) linear
@@ -649,6 +890,32 @@ pub struct FederationNonceCache {
     /// opens a fresh replay window (pre-#1255 behaviour, preserved
     /// for test harnesses and for any caller that opts out).
     db_path: Option<PathBuf>,
+    /// #3662 — `ReplayDecision::Replay` outcomes since boot.
+    replay_refusals: AtomicU64,
+    /// #3662 — per-peer FIFO fingerprint evictions since boot (the
+    /// inner-cap twin of `peer_evictions`, which was the only eviction
+    /// counted pre-#3662).
+    fingerprint_evictions: AtomicU64,
+    /// #3662 — fingerprints resident across all peer slots, maintained
+    /// in lockstep with the map so occupancy is O(1) to read.
+    fingerprints_total: AtomicU64,
+    /// #3662 — persistence failures since boot, one slot per
+    /// [`NoncePersistenceOp`] (`NoncePersistenceOp::slot`).
+    persistence_failures: [AtomicU64; 5],
+    /// #3662 — [`NoncePersistenceState`] as `u8`, measured from the
+    /// outcome of the last persistence interaction.
+    persistence_state: AtomicU8,
+    /// #3662 — unix seconds of the last fully successful persistence
+    /// write; `0` = none since boot.
+    last_persist_ok_unix: AtomicU64,
+    /// #3662 — unix seconds of the last failed persistence op; `0` = none.
+    last_persist_fail_unix: AtomicU64,
+    /// #3662 — unix seconds at which the current degraded stretch began;
+    /// `0` = not degraded.
+    degraded_since_unix: AtomicU64,
+    /// #3662 — set by `new_after_persistence_open_failure`: the daemon
+    /// WANTED persistence and could not open the mirror at boot.
+    boot_open_failed: AtomicBool,
 }
 
 /// #1690 — prune the on-disk `federation_nonce_cache` to the newest
@@ -690,7 +957,26 @@ impl FederationNonceCache {
     /// replay window on every restart.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let cache = Self::default();
+        cache.publish_gauges();
+        cache
+    }
+
+    /// #3662 — the daemon's boot fallback. Use this — not [`Self::new`]
+    /// — when [`Self::new_with_db_persistence`] failed: the resulting
+    /// cache is in-memory only exactly like `new()`, but it REPORTS that
+    /// posture as `degraded` / restart protection `lost` with reason
+    /// `persistence_open_failed_at_boot`, counts one `open` failure, and
+    /// starts the actionable clock. Pre-#3662 the fallback was
+    /// indistinguishable from a healthy cache on every surface but the
+    /// boot log line.
+    #[must_use]
+    pub fn new_after_persistence_open_failure() -> Self {
+        let cache = Self::default();
+        cache.boot_open_failed.store(true, Ordering::Relaxed);
+        cache.note_persistence_failure(NoncePersistenceOp::Open);
+        cache.publish_gauges();
+        cache
     }
 
     /// #1255 (MED, 2026-05-25) — persistence-enabled constructor.
@@ -713,12 +999,16 @@ impl FederationNonceCache {
     pub fn new_with_db_persistence(db_path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let db_path = db_path.into();
         let cache = Self {
-            inner: Mutex::new(HashMap::new()),
-            touch_counter: AtomicU64::new(0),
-            peer_evictions: AtomicU64::new(0),
             db_path: Some(db_path.clone()),
+            // #3662 — a configured mirror starts `Durable`; the first
+            // failed interaction flips it. Hydration failure below returns
+            // `Err` and the caller decides (the daemon falls back via
+            // `new_after_persistence_open_failure`).
+            persistence_state: AtomicU8::new(NoncePersistenceState::Durable as u8),
+            ..Self::default()
         };
         cache.hydrate_from_disk(&db_path)?;
+        cache.publish_gauges();
         Ok(cache)
     }
 
@@ -791,6 +1081,11 @@ impl FederationNonceCache {
             slot.seen.insert(fp);
             slot.last_touch = touch_u64;
         }
+        // #3662 — occupancy is measured from the map, not the row count:
+        // over-cap rows dropped above must not be counted.
+        let resident: usize = guard.values().map(|s| s.order.len()).sum();
+        self.fingerprints_total
+            .store(resident as u64, Ordering::Relaxed);
         drop(guard);
         // `rows` was consumed by the `for` loop above; dropping `stmt`
         // releases its borrow on `conn` before the prune `execute`.
@@ -814,12 +1109,17 @@ impl FederationNonceCache {
                 "FederationNonceCache: pruned {n} over-cap disk row(s) on hydration \
                  (#1690 legacy-bloat repair); disk now bounded to the per-peer cap"
             ),
-            Err(e) => tracing::warn!(
-                target: "ai_memory::identity::replay",
-                err = %e,
-                "FederationNonceCache: hydration over-cap prune failed (non-fatal; in-memory \
-                 cache still bounded)"
-            ),
+            Err(e) => {
+                // #3662 — counted, not just logged: a mirror that refuses
+                // DELETE at boot will refuse it on every eviction too.
+                self.note_persistence_failure(NoncePersistenceOp::HydratePrune);
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    err = %e,
+                    "FederationNonceCache: hydration over-cap prune failed (non-fatal; in-memory \
+                     cache still bounded)"
+                );
+            }
         }
 
         // Advance the in-process touch counter past every observed
@@ -859,17 +1159,23 @@ impl FederationNonceCache {
         let conn = match crate::db::open(path) {
             Ok(c) => c,
             Err(e) => {
+                // #3662 — every swallowed failure is now COUNTED and flips
+                // the persistence state to `degraded`, so the "graceful"
+                // degradation is visible on /health, /metrics and doctor
+                // instead of only in a WARN line nobody is tailing.
+                self.note_persistence_failure(NoncePersistenceOp::Open);
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: TRACE_TARGET,
                     peer_id = %peer_id,
                     path = %path.display(),
                     err = %e,
                     "FederationNonceCache: persist open failed; in-memory cache still holds \
-                     (#1255 graceful degradation)",
+                     (#1255 graceful degradation; restart protection LOST until a write succeeds, #3662)",
                 );
                 return;
             }
         };
+        let mut all_ok = true;
         // `i64::try_from` is safe because `touch_counter` advances
         // at most once per record_and_check; a daemon would need to
         // sustain >2^63 federated pushes/sec to overflow, which is
@@ -883,12 +1189,14 @@ impl FederationNonceCache {
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![peer_id, fp.as_slice(), last_touch_i64, now],
         ) {
+            all_ok = false;
+            self.note_persistence_failure(NoncePersistenceOp::Insert);
             tracing::warn!(
-                target: "ai_memory::identity::replay",
+                target: TRACE_TARGET,
                 peer_id = %peer_id,
                 err = %e,
                 "FederationNonceCache: persist insert failed; in-memory cache still holds \
-                 (#1255 graceful degradation)",
+                 (#1255 graceful degradation; counted #3662)",
             );
         }
         // #1690 — delete-on-evict: prune the disk rows the in-memory LRU
@@ -902,12 +1210,14 @@ impl FederationNonceCache {
                 "DELETE FROM federation_nonce_cache WHERE peer_id = ?1 AND fingerprint = ?2",
                 rusqlite::params![peer_id, efp.as_slice()],
             ) {
+                all_ok = false;
+                self.note_persistence_failure(NoncePersistenceOp::DeleteFingerprint);
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: TRACE_TARGET,
                     peer_id = %peer_id,
                     err = %e,
                     "FederationNonceCache: evicted-fingerprint delete failed; disk row lingers \
-                     (#1690 graceful degradation)",
+                     (#1690 graceful degradation; counted #3662)",
                 );
             }
         }
@@ -916,20 +1226,173 @@ impl FederationNonceCache {
                 "DELETE FROM federation_nonce_cache WHERE peer_id = ?1",
                 rusqlite::params![ep],
             ) {
+                all_ok = false;
+                self.note_persistence_failure(NoncePersistenceOp::DeletePeer);
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: TRACE_TARGET,
                     evicted_peer = %ep,
                     err = %e,
                     "FederationNonceCache: evicted-peer delete failed; disk rows linger \
-                     (#1690 graceful degradation)",
+                     (#1690 graceful degradation; counted #3662)",
                 );
             }
         }
+        if all_ok {
+            self.note_persistence_ok();
+        }
+    }
+
+    /// #3662 — record one failed persistence op: bump its counter (in
+    /// process and on `/metrics`), stamp the failure instant, and flip
+    /// the state to `Degraded`, starting the actionable clock if this is
+    /// the first failure of the current stretch.
+    fn note_persistence_failure(&self, op: NoncePersistenceOp) {
+        let now = unix_now_secs();
+        self.persistence_failures[op.slot()].fetch_add(1, Ordering::Relaxed);
+        self.last_persist_fail_unix.store(now, Ordering::Relaxed);
+        let was = self
+            .persistence_state
+            .swap(NoncePersistenceState::Degraded as u8, Ordering::Relaxed);
+        if was != NoncePersistenceState::Degraded as u8 {
+            self.degraded_since_unix.store(now, Ordering::Relaxed);
+        }
+        let m = crate::metrics::registry();
+        m.federation_nonce_cache_persistence_failed_total
+            .with_label_values(&[op.as_str()])
+            .inc();
+        m.federation_nonce_cache_persistence_state
+            .set(i64::from(NoncePersistenceState::Degraded as u8));
+    }
+
+    /// #3662 — record one fully successful persistence write: stamp the
+    /// instant and return the state to `Durable` (ending any degraded
+    /// stretch — a later failure starts a fresh clock).
+    fn note_persistence_ok(&self) {
+        let now = unix_now_secs();
+        self.last_persist_ok_unix.store(now, Ordering::Relaxed);
+        self.persistence_state
+            .store(NoncePersistenceState::Durable as u8, Ordering::Relaxed);
+        self.degraded_since_unix.store(0, Ordering::Relaxed);
+        let m = crate::metrics::registry();
+        m.federation_nonce_cache_persistence_state
+            .set(i64::from(NoncePersistenceState::Durable as u8));
+        #[allow(clippy::cast_possible_wrap)]
+        m.federation_nonce_cache_last_persisted_at_seconds
+            .set(now as i64);
+    }
+
+    /// #3662 — push the occupancy / capacity / state gauges to
+    /// `/metrics`. Counters are incremented at their event sites; gauges
+    /// are set here from the cache's own atomics, so a scrape never sees
+    /// a value this cache did not measure. Called at construction and
+    /// after every `record_and_check`.
+    fn publish_gauges(&self) {
+        let m = crate::metrics::registry();
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            m.federation_nonce_cache_peers.set(self.peer_count() as i64);
+            m.federation_nonce_cache_fingerprints
+                .set(self.fingerprints_total.load(Ordering::Relaxed) as i64);
+            m.federation_nonce_cache_peer_capacity
+                .set(FEDERATION_NONCE_MAX_PEERS as i64);
+            m.federation_nonce_cache_per_peer_capacity
+                .set(FEDERATION_NONCE_CAPACITY_PER_PEER as i64);
+            m.federation_nonce_cache_last_persisted_at_seconds
+                .set(self.last_persist_ok_unix.load(Ordering::Relaxed) as i64);
+        }
+        m.federation_nonce_cache_persistence_state
+            .set(i64::from(self.persistence_state.load(Ordering::Relaxed)));
+    }
+
+    /// #3662 — the measured persistence posture of this cache.
+    #[must_use]
+    pub fn persistence_state(&self) -> NoncePersistenceState {
+        NoncePersistenceState::from_u8(self.persistence_state.load(Ordering::Relaxed))
+    }
+
+    /// #3662 — replay refusals since boot.
+    #[must_use]
+    pub fn replay_refusals_since_boot(&self) -> u64 {
+        self.replay_refusals.load(Ordering::Relaxed)
+    }
+
+    /// #3662 — per-peer FIFO fingerprint evictions since boot.
+    #[must_use]
+    pub fn fingerprint_evictions_since_boot(&self) -> u64 {
+        self.fingerprint_evictions.load(Ordering::Relaxed)
+    }
+
+    /// #3662 — failures since boot for one persistence op.
+    #[must_use]
+    pub fn persistence_failures(&self, op: NoncePersistenceOp) -> u64 {
+        self.persistence_failures[op.slot()].load(Ordering::Relaxed)
+    }
+
+    /// #3662 — a fully measured snapshot, as of `now_unix` (injected so
+    /// the actionable classification is testable without sleeping).
+    #[must_use]
+    pub fn health_at(&self, now_unix: u64) -> NonceCacheHealth {
+        let nz = |v: u64| if v == 0 { None } else { Some(v) };
+        let state = self.persistence_state();
+        let (restart_protection, reason) = match state {
+            NoncePersistenceState::MemoryOnly => (
+                RestartProtection::Disabled,
+                Some(NonceCacheHealth::REASON_DISABLED),
+            ),
+            NoncePersistenceState::Durable => (RestartProtection::Durable, None),
+            NoncePersistenceState::Degraded => (
+                RestartProtection::Lost,
+                Some(
+                    if self.boot_open_failed.load(Ordering::Relaxed)
+                        && self.last_persist_ok_unix.load(Ordering::Relaxed) == 0
+                    {
+                        NonceCacheHealth::REASON_OPEN_FAILED_AT_BOOT
+                    } else {
+                        NonceCacheHealth::REASON_WRITE_FAILED
+                    },
+                ),
+            ),
+        };
+        let degraded_since = nz(self.degraded_since_unix.load(Ordering::Relaxed));
+        let degraded_for = degraded_since.map(|s| now_unix.saturating_sub(s));
+        let failures_by_op: Vec<(&'static str, u64)> = NoncePersistenceOp::ALL
+            .iter()
+            .map(|op| (op.as_str(), self.persistence_failures(*op)))
+            .collect();
+        let failures_total = failures_by_op.iter().map(|(_, n)| *n).sum();
+        NonceCacheHealth {
+            peers: self.peer_count() as u64,
+            max_peers: FEDERATION_NONCE_MAX_PEERS as u64,
+            fingerprints: self.fingerprints_total.load(Ordering::Relaxed),
+            per_peer_capacity: FEDERATION_NONCE_CAPACITY_PER_PEER as u64,
+            peer_evictions_total: self.peer_evictions_since_boot(),
+            fingerprint_evictions_total: self.fingerprint_evictions_since_boot(),
+            replay_refusals_total: self.replay_refusals_since_boot(),
+            persistence: NoncePersistenceHealth {
+                state,
+                restart_protection,
+                reason,
+                failures_by_op,
+                failures_total,
+                last_success_at_seconds: nz(self.last_persist_ok_unix.load(Ordering::Relaxed)),
+                last_failure_at_seconds: nz(self.last_persist_fail_unix.load(Ordering::Relaxed)),
+                degraded_since_at_seconds: degraded_since,
+                degraded_for_seconds: degraded_for,
+                actionable: restart_protection == RestartProtection::Lost
+                    && degraded_for.is_some_and(|d| d >= NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS),
+            },
+            observed_at_seconds: now_unix,
+        }
+    }
+
+    /// #3662 — [`Self::health_at`] at the wall clock.
+    #[must_use]
+    pub fn health(&self) -> NonceCacheHealth {
+        self.health_at(unix_now_secs())
     }
 
     /// Check + record `(peer_id, nonce)`.
     pub fn record_and_check(&self, peer_id: &str, nonce: &str) -> ReplayDecision {
-        use std::sync::atomic::Ordering;
         let fp = Self::fingerprint(peer_id, nonce);
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
@@ -959,10 +1422,17 @@ impl FederationNonceCache {
                 .min_by_key(|(_, s)| s.last_touch)
                 .map(|(k, s)| (k.clone(), s.last_touch))
             {
-                guard.remove(&evict_id);
+                if let Some(slot) = guard.remove(&evict_id) {
+                    // #3662 — occupancy drops by the evicted slot's rows.
+                    self.fingerprints_total
+                        .fetch_sub(slot.order.len() as u64, Ordering::Relaxed);
+                }
                 self.peer_evictions.fetch_add(1, Ordering::Relaxed);
+                crate::metrics::registry()
+                    .federation_nonce_cache_peer_evictions_total
+                    .inc();
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: TRACE_TARGET,
                     evicted_peer = %evict_id,
                     "FederationNonceCache: at peer ceiling ({}); evicted LRU peer slot to make \
                      room. Operator-visible via peer_evictions_since_boot() (#1038).",
@@ -976,6 +1446,14 @@ impl FederationNonceCache {
         slot.last_touch = touch;
         // v0.7.0 #1033 — O(1) HashSet membership replaces O(N) scan.
         if slot.seen.contains(&fp) {
+            // #3662 — a refused replay is a measured security event, not
+            // only a per-request WARN at the handler.
+            self.replay_refusals.fetch_add(1, Ordering::Relaxed);
+            drop(guard);
+            crate::metrics::registry()
+                .federation_nonce_cache_replay_refused_total
+                .inc();
+            self.publish_gauges();
             return ReplayDecision::Replay;
         }
         let mut evicted_fp: Option<[u8; 32]> = None;
@@ -984,10 +1462,19 @@ impl FederationNonceCache {
             if let Some(evicted) = slot.order.pop_front() {
                 slot.seen.remove(&evicted);
                 evicted_fp = Some(evicted);
+                // #3662 — the inner-cap eviction was uncounted pre-#3662;
+                // a peer cycling its FIFO is exactly the flush-attack
+                // shape the capacity comment above describes.
+                self.fingerprint_evictions.fetch_add(1, Ordering::Relaxed);
+                self.fingerprints_total.fetch_sub(1, Ordering::Relaxed);
+                crate::metrics::registry()
+                    .federation_nonce_cache_fingerprint_evictions_total
+                    .inc();
             }
         }
         slot.order.push_back(fp);
         slot.seen.insert(fp);
+        self.fingerprints_total.fetch_add(1, Ordering::Relaxed);
         // Release the inner mutex before doing disk I/O so a slow
         // SQLite WAL fsync doesn't block sibling
         // `record_and_check` calls. The persistence call itself
@@ -1006,6 +1493,7 @@ impl FederationNonceCache {
             evicted_fp.as_ref(),
             evicted_peer.as_deref(),
         );
+        self.publish_gauges();
         ReplayDecision::Fresh
     }
 
@@ -1015,8 +1503,7 @@ impl FederationNonceCache {
     /// older peer's slot. Operators page on sustained growth.
     #[must_use]
     pub fn peer_evictions_since_boot(&self) -> u64 {
-        self.peer_evictions
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.peer_evictions.load(Ordering::Relaxed)
     }
 
     /// Distinct peers with at least one cached fingerprint.
@@ -1342,6 +1829,213 @@ mod federation_nonce_cache_tests {
     /// daemon bootstrap) get a clear error and fall back to either
     /// retrying with the right path OR booting with the in-memory
     /// constructor [`Self::new`].
+    // ---- #3662 — nonce-cache health contract -------------------------------
+
+    #[test]
+    fn replay_refusal_and_fifo_eviction_are_counted_3662() {
+        let cache = FederationNonceCache::new();
+        let m = crate::metrics::registry();
+        let refused_before = m.federation_nonce_cache_replay_refused_total.get();
+        let evicted_before = m.federation_nonce_cache_fingerprint_evictions_total.get();
+        for i in 0..FEDERATION_NONCE_CAPACITY_PER_PEER {
+            assert_eq!(
+                cache.record_and_check("p", &format!("n-{i}")),
+                ReplayDecision::Fresh
+            );
+        }
+        let h = cache.health_at(1);
+        assert_eq!(h.peers, 1);
+        assert_eq!(h.fingerprints, FEDERATION_NONCE_CAPACITY_PER_PEER as u64);
+        assert_eq!(h.fingerprint_evictions_total, 0);
+        assert_eq!(h.replay_refusals_total, 0);
+        // One past the cap: FIFO evicts n-0 — counted (pre-#3662 it was not).
+        assert_eq!(cache.record_and_check("p", "n-new"), ReplayDecision::Fresh);
+        // A replay — counted (pre-#3662 only a handler WARN).
+        assert_eq!(cache.record_and_check("p", "n-new"), ReplayDecision::Replay);
+        let h = cache.health_at(1);
+        assert_eq!(
+            h.fingerprint_evictions_total, 1,
+            "#3662: FIFO eviction counted"
+        );
+        assert_eq!(h.replay_refusals_total, 1, "#3662: replay refusal counted");
+        assert_eq!(
+            h.fingerprints, FEDERATION_NONCE_CAPACITY_PER_PEER as u64,
+            "occupancy stays at the cap after evict+insert"
+        );
+        assert!(m.federation_nonce_cache_replay_refused_total.get() > refused_before);
+        assert!(m.federation_nonce_cache_fingerprint_evictions_total.get() > evicted_before);
+    }
+
+    #[test]
+    fn peer_eviction_reduces_measured_occupancy_3662() {
+        let cache = FederationNonceCache::new();
+        for i in 0..FEDERATION_NONCE_MAX_PEERS {
+            let _ = cache.record_and_check(&format!("peer-{i}"), "n");
+        }
+        // peer-0 gets 3 fingerprints and the freshest touch on a different
+        // peer so that peer-0 is not the LRU.
+        let _ = cache.record_and_check("peer-0", "n2");
+        let _ = cache.record_and_check("peer-0", "n3");
+        let h = cache.health_at(1);
+        assert_eq!(h.peers, FEDERATION_NONCE_MAX_PEERS as u64);
+        assert_eq!(h.fingerprints, FEDERATION_NONCE_MAX_PEERS as u64 + 2);
+        // A new peer evicts the LRU slot (one fingerprint).
+        assert_eq!(
+            cache.record_and_check("peer-new", "n"),
+            ReplayDecision::Fresh
+        );
+        let h = cache.health_at(1);
+        assert_eq!(h.peer_evictions_total, 1);
+        assert_eq!(h.peers, FEDERATION_NONCE_MAX_PEERS as u64);
+        assert_eq!(
+            h.fingerprints,
+            FEDERATION_NONCE_MAX_PEERS as u64 + 2,
+            "evicted slot's rows leave the occupancy, the new peer's row enters"
+        );
+    }
+
+    #[test]
+    fn memory_only_cache_reports_protection_disabled_3662() {
+        let cache = FederationNonceCache::new();
+        let h = cache.health_at(1);
+        assert_eq!(h.persistence.state, NoncePersistenceState::MemoryOnly);
+        assert_eq!(
+            h.persistence.restart_protection,
+            RestartProtection::Disabled
+        );
+        assert_eq!(
+            h.persistence.reason,
+            Some(NonceCacheHealth::REASON_DISABLED)
+        );
+        assert_eq!(h.persistence.last_success_at_seconds, None);
+        assert!(!h.persistence.actionable);
+        let j = h.to_signal_json();
+        assert_eq!(j["state"], "available");
+        assert_eq!(j["value"]["persistence"]["state"], "memory_only");
+        assert_eq!(j["value"]["persistence"]["restart_protection"], "disabled");
+        assert_eq!(j["value"]["max_peers"], FEDERATION_NONCE_MAX_PEERS as u64);
+        assert_eq!(j["value"]["persistence"]["failures_by_op"]["open"], 0);
+    }
+
+    #[test]
+    fn boot_open_failure_is_lost_protection_and_actionable_when_sustained_3662() {
+        let cache = FederationNonceCache::new_after_persistence_open_failure();
+        assert_eq!(cache.persistence_state(), NoncePersistenceState::Degraded);
+        assert_eq!(cache.persistence_failures(NoncePersistenceOp::Open), 1);
+        let since = cache
+            .health_at(0)
+            .persistence
+            .degraded_since_at_seconds
+            .expect("degraded clock started at construction");
+        // Just under the window: lost, but not yet actionable.
+        let h = cache.health_at(since + NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS - 1);
+        assert_eq!(h.persistence.restart_protection, RestartProtection::Lost);
+        assert_eq!(
+            h.persistence.reason,
+            Some(NonceCacheHealth::REASON_OPEN_FAILED_AT_BOOT)
+        );
+        assert!(!h.persistence.actionable);
+        // At the window: actionable.
+        let h = cache.health_at(since + NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS);
+        assert!(
+            h.persistence.actionable,
+            "#3662: sustained loss is actionable"
+        );
+        assert_eq!(
+            h.persistence.degraded_for_seconds,
+            Some(NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS)
+        );
+        assert_eq!(h.persistence.failures_total, 1);
+        // Replay refusal keeps working in-process while protection is lost.
+        assert_eq!(cache.record_and_check("p", "n"), ReplayDecision::Fresh);
+        assert_eq!(cache.record_and_check("p", "n"), ReplayDecision::Replay);
+    }
+
+    #[test]
+    fn persistence_write_failure_flips_to_degraded_and_recovers_3662() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("nonce-3662.db");
+        let cache =
+            FederationNonceCache::new_with_db_persistence(&db_path).expect("open + migrate");
+        assert_eq!(cache.persistence_state(), NoncePersistenceState::Durable);
+        assert_eq!(
+            cache.health_at(1).persistence.last_success_at_seconds,
+            None,
+            "hydrated-but-idle: no write has succeeded yet, and the snapshot says so"
+        );
+        assert_eq!(cache.record_and_check("p", "n-1"), ReplayDecision::Fresh);
+        let h = cache.health_at(1);
+        assert_eq!(h.persistence.state, NoncePersistenceState::Durable);
+        assert_eq!(h.persistence.restart_protection, RestartProtection::Durable);
+        assert!(h.persistence.last_success_at_seconds.is_some());
+        assert_eq!(h.persistence.failures_total, 0);
+
+        // Break the mirror: replace the database file with a directory so
+        // `db::open` fails on the next Fresh nonce.
+        std::fs::remove_file(&db_path).expect("remove db");
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.path().join(format!("nonce-3662.db{suffix}")));
+        }
+        std::fs::create_dir(&db_path).expect("shadow dir");
+        assert_eq!(
+            cache.record_and_check("p", "n-2"),
+            ReplayDecision::Fresh,
+            "the in-memory cache still admits while persistence is broken"
+        );
+        let h = cache.health_at(1);
+        assert_eq!(h.persistence.state, NoncePersistenceState::Degraded);
+        assert_eq!(h.persistence.restart_protection, RestartProtection::Lost);
+        assert_eq!(
+            h.persistence.reason,
+            Some(NonceCacheHealth::REASON_WRITE_FAILED)
+        );
+        assert_eq!(cache.persistence_failures(NoncePersistenceOp::Open), 1);
+        assert!(h.persistence.last_failure_at_seconds.is_some());
+        assert!(h.persistence.degraded_since_at_seconds.is_some());
+        assert_eq!(
+            crate::metrics::registry()
+                .federation_nonce_cache_persistence_state
+                .get(),
+            i64::from(NoncePersistenceState::Degraded as u8)
+        );
+
+        // Repair: remove the shadow directory; the next write re-creates the
+        // database and the state returns to durable.
+        std::fs::remove_dir(&db_path).expect("remove shadow dir");
+        assert_eq!(cache.record_and_check("p", "n-3"), ReplayDecision::Fresh);
+        let h = cache.health_at(1);
+        assert_eq!(h.persistence.state, NoncePersistenceState::Durable);
+        assert_eq!(h.persistence.restart_protection, RestartProtection::Durable);
+        assert_eq!(h.persistence.degraded_since_at_seconds, None);
+        assert_eq!(h.persistence.failures_total, 1, "history is kept");
+        assert_eq!(
+            crate::metrics::registry()
+                .federation_nonce_cache_persistence_state
+                .get(),
+            i64::from(NoncePersistenceState::Durable as u8)
+        );
+    }
+
+    #[test]
+    fn persistence_op_labels_are_closed_and_stable_3662() {
+        let labels: Vec<&str> = NoncePersistenceOp::ALL
+            .iter()
+            .map(|op| op.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "open",
+                "insert",
+                "delete_fingerprint",
+                "delete_peer",
+                "hydrate_prune"
+            ]
+        );
+        let slots: Vec<usize> = NoncePersistenceOp::ALL.iter().map(|op| op.slot()).collect();
+        assert_eq!(slots, [0, 1, 2, 3, 4]);
+    }
+
     #[test]
     fn issue_1255_persistence_constructor_surfaces_open_errors() {
         // Point at a path that cannot exist as a sqlite DB (a directory).

@@ -406,6 +406,22 @@ independently — these are layered on top.
   `unsupported_on_postgres` (honest count, never a silent drop) — the
   sqlite / MCP-native path applies them fully.
 
+- **Nonce-cache health contract
+  ([#3662](https://github.com/alphaonedev/ai-memory-mcp/issues/3662)).**
+  The per-peer `federation_nonce_cache` now reports what it measures:
+  occupancy against both ceilings, outer-LRU peer evictions, per-peer
+  FIFO evictions, replay refusals, and its persistence posture
+  (`durable` / `degraded` / `memory_only`, with per-op failure counts
+  and the last successful mirror write) on `/health` under
+  `federation.nonce_cache`, on `/metrics` as
+  `ai_memory_federation_nonce_cache_*`, and offline in `ai-memory doctor`
+  ("Federation nonce cache (#3662)", the sqlite mirror's shape). Every
+  swallowed mirror failure (#1255 / #1690 "graceful degradation") is
+  counted and flips the state to `degraded` = restart protection LOST;
+  the daemon's boot fallback to an in-memory cache is reported the same
+  way. Loss sustained for 300 s is classified `actionable`. Replay
+  refusal itself keeps working in-process throughout.
+
 - **Per-transition replay nonce
   ([#1805](https://github.com/alphaonedev/ai-memory-mcp/issues/1805)).**
   The signed transition nonce is recorded in the per-peer

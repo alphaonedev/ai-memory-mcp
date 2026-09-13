@@ -1225,6 +1225,13 @@ pub fn health_status_code(
 /// A cached `failed` verdict still answers `503`: the pre-#2579 fail-closed
 /// contract is preserved, sourced from a completed check instead of a
 /// per-probe scan. `ai-memory doctor` runs the same deep check on demand.
+/// #3662 — `/health` key that groups federation sub-signals (matches the
+/// #3646 monitoring surface's `federation` object).
+pub const HEALTH_KEY_FEDERATION: &str = "federation";
+/// #3662 — `/health` key of the nonce-cache signal object under
+/// [`HEALTH_KEY_FEDERATION`].
+pub const HEALTH_KEY_NONCE_CACHE: &str = "nonce_cache";
+
 pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — Postgres-backed daemons
     // ride the `MemoryStore::health_check` trait method which is natively
@@ -1245,6 +1252,8 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
 
     let now = chrono::Utc::now();
     let verdict = app.runtime.fts_integrity.verdict_at(now.timestamp());
+    #[allow(clippy::cast_sign_loss)]
+    let nonce_now = now.timestamp().max(0) as u64;
     let live = connection_ok && fts_state != PROBE_ERROR;
     let code = health_status_code(live, verdict);
     let ok = code == StatusCode::OK;
@@ -1278,6 +1287,13 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
                 "status": verdict.as_str(),
                 "checked_at": checked_at,
                 "interval_secs": app.runtime.fts_integrity.interval_secs(),
+            },
+            // #3662 — the federation nonce cache's measured snapshot in the
+            // #3646 signal-object shape (`state: "available"` + `value`).
+            // Atomics only: no lock on the request path beyond the cache's
+            // own map mutex for the peer count. Carries no peer id or path.
+            HEALTH_KEY_FEDERATION: {
+                HEALTH_KEY_NONCE_CACHE: app.federation_nonce_cache.health_at(nonce_now).to_signal_json(),
             },
         })),
     )

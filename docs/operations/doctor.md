@@ -174,6 +174,30 @@ sections.
   nodes; CPU-only nodes use API backends. See the
   [enterprise reference architectures](../reference-architecture/enterprise-cpu-memory.md).
 
+### Federation nonce cache (#3662)
+
+Renders on every local run from the open database. `doctor` runs in its own
+process, so it cannot see the live daemon's in-memory replay-nonce counters
+— those are on `/health` under `federation.nonce_cache` and on `/metrics` as
+`ai_memory_federation_nonce_cache_*` — and it says so in the `live_counters`
+fact instead of printing zeros. What it measures offline is the durable half
+of restart protection: the sqlite mirror table `federation_nonce_cache`
+(schema v51 / #1255).
+
+- `mirror_table_present` — `yes`, `no`, or `unreadable`. **N/A** when `no`
+  (a pre-v51 schema has nothing to measure; the note says replay protection
+  on that node is in-memory only). **Critical** when `unreadable`: a present
+  table that cannot be read is the restart-protection store failing.
+- `mirror_rows`, `mirror_peers`, `largest_peer_rows`, `over_capacity_peers`,
+  `newest_row_inserted_at` — the mirror's measured shape. An EMPTY mirror is
+  **Info**, not a finding: a node that has never received a nonce-bound
+  federated request has nothing to persist.
+- `max_peers`, `per_peer_capacity` — the in-memory ceilings the mirror is
+  supposed to track. **Warning** when any peer holds more rows than
+  `per_peer_capacity`, or the mirror holds more peers than `max_peers`: the
+  #1690 delete-on-evict prune is not keeping the disk bounded, and the note
+  names the `persistence_failed_total{op}` series to check on the daemon.
+
 ### Wake hub (#3471)
 
 Renders on every local run; reads only the filesystem and this process's own

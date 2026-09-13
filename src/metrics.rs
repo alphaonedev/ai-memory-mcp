@@ -191,6 +191,45 @@ pub struct Metrics {
     /// survives.
     pub deferred_audit_drainer_terminal_state: IntGauge,
 
+    /// #3662 — federation nonce-cache occupancy: peer slots resident.
+    /// Set by the cache itself after every `record_and_check` (and at
+    /// construction), so a scrape only ever sees a value the cache
+    /// measured. Ceiling twin: `federation_nonce_cache_peer_capacity`.
+    pub federation_nonce_cache_peers: IntGauge,
+    /// #3662 — fingerprints resident across all peer slots. Ceiling twin
+    /// per peer: `federation_nonce_cache_per_peer_capacity`.
+    pub federation_nonce_cache_fingerprints: IntGauge,
+    /// #3662 — `FEDERATION_NONCE_MAX_PEERS`, published so a ratio alert
+    /// needs no hardcoded constant on the Prometheus side.
+    pub federation_nonce_cache_peer_capacity: IntGauge,
+    /// #3662 — `FEDERATION_NONCE_CAPACITY_PER_PEER`.
+    pub federation_nonce_cache_per_peer_capacity: IntGauge,
+    /// #3662 — outer-LRU peer-slot evictions (#1038), previously only a
+    /// private atomic. Sustained growth = peer churn past the ceiling.
+    pub federation_nonce_cache_peer_evictions_total: IntCounter,
+    /// #3662 — per-peer FIFO fingerprint evictions, previously uncounted.
+    /// A single peer cycling its FIFO is the flush-attack shape.
+    pub federation_nonce_cache_fingerprint_evictions_total: IntCounter,
+    /// #3662 — `ReplayDecision::Replay` outcomes: requests refused as
+    /// nonce replays. Previously only a per-request WARN.
+    pub federation_nonce_cache_replay_refused_total: IntCounter,
+    /// #3662 — persistence failures by op. Closed label set
+    /// (`identity::replay::NoncePersistenceOp::ALL`), pre-touched at
+    /// registration so every series renders as a measured `0` from boot;
+    /// no peer id or path ever reaches this label.
+    pub federation_nonce_cache_persistence_failed_total: IntCounterVec,
+    /// #3662 — `identity::replay::NoncePersistenceState` as a gauge:
+    /// `0` = memory-only (never configured), `1` = durable, `2` =
+    /// degraded (configured but the last persistence op failed, or the
+    /// mirror could not be opened at boot). Non-zero-and-not-one sustained
+    /// past `NONCE_PERSISTENCE_LOSS_ACTIONABLE_SECS` means every restart
+    /// re-opens the replay window — page on it.
+    pub federation_nonce_cache_persistence_state: IntGauge,
+    /// #3662 — unix seconds of the last fully successful persistence
+    /// write; `0` = none since boot (a rehydrated-but-idle daemon reports
+    /// `0` honestly rather than inventing a timestamp).
+    pub federation_nonce_cache_last_persisted_at_seconds: IntGauge,
+
     /// #1032 (HIGH, 2026-05-21) — monotonic counter for DLQ rows the
     /// replay worker has marked as quarantined (`attempt_count >=
     /// MAX_REPLAY_ATTEMPTS`). Pre-#1032 the replay loop retried
@@ -713,6 +752,93 @@ impl Metrics {
         )?;
         registry.register(Box::new(deferred_audit_drainer_terminal_state.clone()))?;
 
+        // #3662 — federation nonce-cache family. Gauges are written by the
+        // cache from its own atomics; counters at the event sites.
+        let federation_nonce_cache_peers = IntGauge::new(
+            "ai_memory_federation_nonce_cache_peers",
+            "Peer slots resident in the federation nonce cache (outer LRU).",
+        )?;
+        registry.register(Box::new(federation_nonce_cache_peers.clone()))?;
+        let federation_nonce_cache_fingerprints = IntGauge::new(
+            "ai_memory_federation_nonce_cache_fingerprints",
+            "Nonce fingerprints resident across all peer slots of the \
+             federation nonce cache.",
+        )?;
+        registry.register(Box::new(federation_nonce_cache_fingerprints.clone()))?;
+        let federation_nonce_cache_peer_capacity = IntGauge::new(
+            "ai_memory_federation_nonce_cache_peer_capacity",
+            "Outer LRU ceiling of the federation nonce cache (peer slots).",
+        )?;
+        registry.register(Box::new(federation_nonce_cache_peer_capacity.clone()))?;
+        let federation_nonce_cache_per_peer_capacity = IntGauge::new(
+            "ai_memory_federation_nonce_cache_per_peer_capacity",
+            "Per-peer FIFO ceiling of the federation nonce cache (fingerprints).",
+        )?;
+        registry.register(Box::new(federation_nonce_cache_per_peer_capacity.clone()))?;
+        let federation_nonce_cache_peer_evictions_total = IntCounter::new(
+            "ai_memory_federation_nonce_cache_peer_evictions_total",
+            "Peer slots evicted by the federation nonce cache's outer LRU \
+             since boot (#1038). Sustained growth means peer churn past \
+             the ceiling.",
+        )?;
+        registry.register(Box::new(
+            federation_nonce_cache_peer_evictions_total.clone(),
+        ))?;
+        let federation_nonce_cache_fingerprint_evictions_total = IntCounter::new(
+            "ai_memory_federation_nonce_cache_fingerprint_evictions_total",
+            "Fingerprints evicted by a per-peer FIFO of the federation \
+             nonce cache since boot. One peer cycling its FIFO is the \
+             replay-window flush shape.",
+        )?;
+        registry.register(Box::new(
+            federation_nonce_cache_fingerprint_evictions_total.clone(),
+        ))?;
+        let federation_nonce_cache_replay_refused_total = IntCounter::new(
+            "ai_memory_federation_nonce_cache_replay_refused_total",
+            "Federated requests refused because their X-Memory-Nonce was \
+             already seen for that peer (replay), since boot.",
+        )?;
+        registry.register(Box::new(
+            federation_nonce_cache_replay_refused_total.clone(),
+        ))?;
+        let federation_nonce_cache_persistence_failed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_nonce_cache_persistence_failed_total",
+                "Federation nonce-cache persistence operations that failed \
+                 since boot, by op (open | insert | delete_fingerprint | \
+                 delete_peer | hydrate_prune). Any increment means the \
+                 sqlite mirror missed a write the in-memory cache applied.",
+            ),
+            &["op"],
+        )?;
+        registry.register(Box::new(
+            federation_nonce_cache_persistence_failed_total.clone(),
+        ))?;
+        for op in crate::identity::replay::NoncePersistenceOp::ALL {
+            // Pre-touch the closed label set: a counter at 0 is a measured
+            // "no failures since boot", and a missing series is not.
+            federation_nonce_cache_persistence_failed_total
+                .with_label_values(&[op.as_str()])
+                .reset();
+        }
+        let federation_nonce_cache_persistence_state = IntGauge::new(
+            "ai_memory_federation_nonce_cache_persistence_state",
+            "Persistence posture of the federation nonce cache: 0 = memory \
+             only (never configured), 1 = durable, 2 = degraded (configured \
+             but the last persistence op failed or the mirror could not be \
+             opened at boot). Sustained 2 means every restart re-opens the \
+             replay window.",
+        )?;
+        registry.register(Box::new(federation_nonce_cache_persistence_state.clone()))?;
+        let federation_nonce_cache_last_persisted_at_seconds = IntGauge::new(
+            "ai_memory_federation_nonce_cache_last_persisted_at_seconds",
+            "Unix seconds of the last fully successful federation \
+             nonce-cache persistence write; 0 = none since boot.",
+        )?;
+        registry.register(Box::new(
+            federation_nonce_cache_last_persisted_at_seconds.clone(),
+        ))?;
+
         // #1032 (HIGH, 2026-05-21) — federation push DLQ quarantine counter.
         let federation_push_dlq_quarantined = IntCounter::new(
             "ai_memory_federation_push_dlq_quarantined_total",
@@ -1093,6 +1219,16 @@ impl Metrics {
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,
             deferred_audit_drainer_terminal_state,
+            federation_nonce_cache_peers,
+            federation_nonce_cache_fingerprints,
+            federation_nonce_cache_peer_capacity,
+            federation_nonce_cache_per_peer_capacity,
+            federation_nonce_cache_peer_evictions_total,
+            federation_nonce_cache_fingerprint_evictions_total,
+            federation_nonce_cache_replay_refused_total,
+            federation_nonce_cache_persistence_failed_total,
+            federation_nonce_cache_persistence_state,
+            federation_nonce_cache_last_persisted_at_seconds,
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
             federation_push_dlq_legacy_positional,
@@ -1497,8 +1633,38 @@ mod tests {
             "ai_memory_federation_inbound_cred_total",
             "ai_memory_federation_cred_max_age_seconds",
             "ai_memory_federation_renewal_lag_seconds",
+            // #3662 — federation nonce-cache family.
+            "ai_memory_federation_nonce_cache_peers",
+            "ai_memory_federation_nonce_cache_fingerprints",
+            "ai_memory_federation_nonce_cache_peer_capacity",
+            "ai_memory_federation_nonce_cache_per_peer_capacity",
+            "ai_memory_federation_nonce_cache_peer_evictions_total",
+            "ai_memory_federation_nonce_cache_fingerprint_evictions_total",
+            "ai_memory_federation_nonce_cache_replay_refused_total",
+            "ai_memory_federation_nonce_cache_persistence_failed_total{op=\"open\"}",
+            "ai_memory_federation_nonce_cache_persistence_failed_total{op=\"hydrate_prune\"}",
+            "ai_memory_federation_nonce_cache_persistence_state",
+            "ai_memory_federation_nonce_cache_last_persisted_at_seconds",
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
+        }
+    }
+
+    #[test]
+    fn nonce_cache_persistence_failed_family_pre_touched_3662() {
+        // #3662 — every op of the closed label set renders from boot as a
+        // measured 0, so a dashboard can tell "no failures" from "not
+        // instrumented".
+        let text = render();
+        for op in crate::identity::replay::NoncePersistenceOp::ALL {
+            let series = format!(
+                "ai_memory_federation_nonce_cache_persistence_failed_total{{op=\"{}\"}}",
+                op.as_str()
+            );
+            assert!(
+                text.contains(&series),
+                "/metrics missing {series}\n\n{text}"
+            );
         }
     }
 
