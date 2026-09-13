@@ -1037,7 +1037,7 @@ fn section_deployment_shape_detector_3700(registered_agents: Option<usize>) -> R
     } else {
         crate::config::AppConfig::load_for_boot().unwrap_or_default()
     };
-    let mut observed = config::shape::detector::observe(Some(&app_config), None);
+    let mut observed = detector::observe(Some(&app_config), None);
     if let Some(n) = registered_agents {
         observed = observed.with_registry(n);
     }
