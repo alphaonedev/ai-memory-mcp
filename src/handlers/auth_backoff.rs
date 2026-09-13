@@ -360,12 +360,6 @@ impl AuthBackoffState {
             mtls_enforced,
         }
     }
-
-    /// The table, when the layer is on.
-    #[must_use]
-    pub fn table(&self) -> Option<&Arc<AuthBackoff>> {
-        self.table.as_ref()
-    }
 }
 
 fn refusal(remaining: Duration) -> Response {
