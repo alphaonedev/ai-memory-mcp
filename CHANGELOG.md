@@ -22,8 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forensic sink is configured, and `db::open` imports every un-imported line
   as a `backup.restore_unverified` signed event into the spine of whichever
   database is live at that path (restored, rolled back, or left by an aborted
-  publish), then stamps it — one `stat` per open when no journal exists, and
-  never a refused open. `--json` `audit_sink` becomes an object reporting what
+  publish) — one `stat` per open when no journal exists, and never a refused
+  open. Review rework: the journal is append-only evidence and is never
+  rewritten; import state is held out of band in a sidecar cursor
+  (`<db>.restore-evidence.imported`, append-only, one line per imported
+  entry keyed by the entry's digest and naming the spine row it became), so
+  a damaged journal line stays in the file and is reported on every open. `--json` `audit_sink` becomes an object reporting what
   each sink actually persisted (`forensic.{intent,outcome}`,
   `journal.{path,intent,outcome}`, `spine`), and every sink failure is WARNed
   on stderr. Tests: acknowledged sinks + import at next open, forensic-sink

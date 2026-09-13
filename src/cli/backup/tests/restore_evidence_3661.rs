@@ -19,6 +19,15 @@ use super::*;
 use crate::restore_evidence::{self, PHASE_INTENT, PHASE_OUTCOME, SINK_DISABLED, SINK_PERSISTED};
 use crate::signed_events::event_types::BACKUP_RESTORE_UNVERIFIED;
 
+/// Review rework (#3661): import state lives in the sidecar cursor keyed by
+/// entry digest, never in the journal. `true` when every journal entry's
+/// digest is recorded there.
+fn all_imported(db: &std::path::Path) -> bool {
+    let cursor = restore_evidence::read_cursor(db).expect("cursor");
+    let entries = journal_entries(db);
+    !entries.is_empty() && entries.iter().all(|e| cursor.contains(&e.entry_hash()))
+}
+
 type Guards = (
     std::sync::MutexGuard<'static, ()>,
     std::sync::MutexGuard<'static, ()>,
@@ -148,8 +157,10 @@ fn unverified_restore_persists_acknowledged_evidence_and_imports_at_next_open_36
     assert!(entries.iter().all(|x| x.forensic_sink == SINK_PERSISTED));
     assert!(entries[1].durable_publish.is_some());
     assert!(
-        entries.iter().all(|x| x.imported_at.is_none()),
-        "not yet opened"
+        restore_evidence::read_cursor(&db)
+            .expect("cursor")
+            .is_empty(),
+        "not yet opened: nothing is in the import cursor"
     );
 
     // The forensic chain carries both rows (flushed, then read back).
@@ -165,7 +176,7 @@ fn unverified_restore_persists_acknowledged_evidence_and_imports_at_next_open_36
 
     // The next open imports both entries into the spine, once.
     assert_eq!(spine_events(&db).len(), 2);
-    assert!(journal_entries(&db).iter().all(|x| x.imported_at.is_some()));
+    assert!(all_imported(&db), "every journal entry is in the cursor");
     assert_eq!(spine_events(&db).len(), 2, "a second open imports nothing");
     crate::governance::audit::shutdown();
 }
@@ -250,10 +261,14 @@ fn rollback_copy_back_keeps_the_evidence_for_the_next_open_3661() {
     // The operator puts the previous database back. The journal is a sibling
     // FILE of the path, so it is untouched by the copy.
     std::fs::copy(&rollback, &db).expect("copy the rollback back");
-    assert!(journal_entries(&db).iter().all(|x| x.imported_at.is_none()));
+    assert!(
+        restore_evidence::read_cursor(&db)
+            .expect("cursor")
+            .is_empty()
+    );
     // The next open — of the ROLLED-BACK database — imports the evidence.
     assert_eq!(spine_events(&db).len(), 2);
-    assert!(journal_entries(&db).iter().all(|x| x.imported_at.is_some()));
+    assert!(all_imported(&db));
 }
 
 /// A publish that aborts after the intent (here: the pre-copy checkpoint

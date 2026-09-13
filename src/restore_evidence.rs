@@ -29,13 +29,21 @@
 //!    signed event in whichever database is live at that path — the restored
 //!    one, or the rolled-back one — with the entry's canonical bytes as the
 //!    payload hash, so the spine row is bound to the journal line and to the
-//!    acknowledged forensic row it names. The entry is then stamped
-//!    `imported_at` (atomic rewrite), so a second open imports nothing.
+//!    acknowledged forensic row it names. Import state is held OUT OF BAND:
+//!    the journal is append-only evidence and is never rewritten (review
+//!    rework — an evidence file that gets rewritten is no longer evidence).
+//!    A sidecar cursor, `<db>.restore-evidence.imported` ([`cursor_path`]),
+//!    records one line per imported entry keyed by the entry's digest
+//!    ([`RestoreEvidenceEntry::entry_hash`]); it too is append-only and
+//!    fsynced. A second open finds every digest in the cursor and imports
+//!    nothing.
 //!
 //! The import never refuses an open: a database must stay openable after a
 //! disaster-recovery restore, and a refused open would destroy the evidence
 //! path it exists to protect. Failures are logged at `error` and the entry
-//! stays un-imported for the next open.
+//! stays un-imported for the next open. A damaged journal line is counted
+//! and reported on every open — it stays in the file, because the file is
+//! evidence and the damage is part of it.
 //!
 //! Why not append into the restored database during `restore`? Because the
 //! published file must be byte-identical to the snapshot (#3131), and
@@ -68,10 +76,12 @@ pub const SINK_DISABLED: &str = "disabled";
 pub const SINK_FAILED_PREFIX: &str = "failed: ";
 /// Envelope value for the spine until the next open imports the journal.
 pub const SPINE_PENDING_IMPORT: &str = "pending_import_at_next_open";
+/// File-name suffix of the import cursor, appended to the database file name.
+pub const CURSOR_SUFFIX: &str = ".restore-evidence.imported";
 
-/// One journal line. `imported_at` is the only field that changes after the
-/// line is written; [`Self::entry_hash`] excludes it, so the hash a spine
-/// row commits to is the hash of the line as `restore` wrote it.
+/// One journal line. Nothing in it changes after the line is written: import
+/// state lives in the sidecar cursor, keyed by [`Self::entry_hash`], so the
+/// hash a spine row commits to is the hash of the line as `restore` wrote it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RestoreEvidenceEntry {
     pub schema: u32,
@@ -93,12 +103,12 @@ pub struct RestoreEvidenceEntry {
     pub rollback: Option<String>,
     #[serde(default)]
     pub durable_publish: Option<bool>,
-    #[serde(default)]
-    pub imported_at: Option<String>,
 }
 
 impl RestoreEvidenceEntry {
-    /// Canonical bytes: the entry with `imported_at` cleared.
+    /// Canonical bytes: the entry as serialised. A pre-rework journal line
+    /// may carry an `imported_at` field; serde ignores it on read, so the
+    /// digest of such a line is the digest of the entry `restore` wrote.
     ///
     /// # Panics
     ///
@@ -106,9 +116,7 @@ impl RestoreEvidenceEntry {
     /// that invariant (ERRORS-07).
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut clone = self.clone();
-        clone.imported_at = None;
-        serde_json::to_vec(&clone).expect("RestoreEvidenceEntry always serialises")
+        serde_json::to_vec(self).expect("RestoreEvidenceEntry always serialises")
     }
 
     /// Hex sha256 of [`Self::canonical_bytes`].
@@ -123,12 +131,73 @@ impl RestoreEvidenceEntry {
 /// `<db>.restore-evidence.jsonl` beside `target_db`.
 #[must_use]
 pub fn journal_path(target_db: &Path) -> PathBuf {
+    sibling_path(target_db, JOURNAL_SUFFIX)
+}
+
+/// `<db>.restore-evidence.imported` beside `target_db`: the append-only
+/// import cursor, one line per imported entry, keyed by entry digest.
+#[must_use]
+pub fn cursor_path(target_db: &Path) -> PathBuf {
+    sibling_path(target_db, CURSOR_SUFFIX)
+}
+
+fn sibling_path(target_db: &Path, suffix: &str) -> PathBuf {
     let mut name = target_db
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
-    name.push(JOURNAL_SUFFIX);
+    name.push(suffix);
     target_db.with_file_name(name)
+}
+
+/// One cursor line: which entry was imported, when, and as which spine row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportCursorLine {
+    /// [`RestoreEvidenceEntry::entry_hash`] of the imported journal entry.
+    pub entry_hash: String,
+    /// RFC 3339 instant of the import.
+    pub imported_at: String,
+    /// `signed_events.id` of the row the entry became.
+    pub event_id: String,
+}
+
+/// Append one line to a sidecar file, `fsync` it and its directory.
+fn append_line(path: &Path, line: &str, what: &str) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {what} {}", path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("appending to {what} {}", path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("fsyncing {what} {}", path.display()))?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("fsyncing {} after the {what} append", dir.display()))?;
+    Ok(())
+}
+
+/// Every digest the cursor beside `target_db` records as imported. An absent
+/// cursor is an empty set (nothing imported yet); a damaged cursor line is
+/// skipped, so at worst an entry is imported twice — never lost.
+///
+/// # Errors
+///
+/// The cursor exists but cannot be read.
+pub fn read_cursor(target_db: &Path) -> Result<std::collections::HashSet<String>> {
+    let path = cursor_path(target_db);
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading restore evidence cursor {}", path.display()))?;
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<ImportCursorLine>(l).ok())
+        .map(|c| c.entry_hash)
+        .collect())
 }
 
 /// Append one entry, `fsync` the file and its directory, and return the
@@ -140,19 +209,7 @@ pub fn journal_path(target_db: &Path) -> PathBuf {
 pub fn append(target_db: &Path, entry: &RestoreEvidenceEntry) -> Result<PathBuf> {
     let path = journal_path(target_db);
     let line = serde_json::to_string(entry).context("serialising restore evidence")?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening restore evidence journal {}", path.display()))?;
-    writeln!(file, "{line}")
-        .with_context(|| format!("appending to restore evidence journal {}", path.display()))?;
-    file.sync_data()
-        .with_context(|| format!("fsyncing restore evidence journal {}", path.display()))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .with_context(|| format!("fsyncing {} after the journal append", dir.display()))?;
+    append_line(&path, &line, "restore evidence journal")?;
     Ok(path)
 }
 
@@ -191,25 +248,30 @@ pub struct ImportSummary {
 }
 
 /// Import every not-yet-imported entry of the journal beside `db_path` into
-/// `conn`'s `signed_events` spine, then stamp the imported entries.
+/// `conn`'s `signed_events` spine, recording each import in the sidecar
+/// cursor. The journal itself is never written here.
 ///
 /// # Errors
 ///
-/// The journal cannot be read or rewritten. A single failed spine append is
+/// The journal or the cursor cannot be read. A single failed spine append is
 /// NOT an error: it is counted in [`ImportSummary::failed`] and the entry is
-/// retried at the next open.
+/// retried at the next open. A spine append that succeeded but whose cursor
+/// line could not be written is ALSO counted as failed and logged: the next
+/// open re-imports it (a duplicate spine row, never a missing one — the
+/// spine is append-only and the payload hash names the same evidence).
 pub fn import_journal(conn: &rusqlite::Connection, db_path: &Path) -> Result<ImportSummary> {
     let path = journal_path(db_path);
     let mut summary = ImportSummary::default();
     if std::fs::symlink_metadata(&path).is_err() {
         return Ok(summary);
     }
-    let (mut entries, malformed) = read_journal(&path)?;
+    let (entries, malformed) = read_journal(&path)?;
     summary.malformed = malformed;
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut changed = false;
-    for entry in &mut entries {
-        if entry.imported_at.is_some() {
+    let imported = read_cursor(db_path)?;
+    let cursor = cursor_path(db_path);
+    for entry in &entries {
+        let digest = entry.entry_hash();
+        if imported.contains(&digest) {
             summary.already_imported = summary.already_imported.saturating_add(1);
             continue;
         }
@@ -220,54 +282,40 @@ pub fn import_journal(conn: &rusqlite::Connection, db_path: &Path) -> Result<Imp
             entry.ts.clone(),
             None,
         );
-        match crate::signed_events::append_signed_event(conn, &event) {
-            Ok(()) => {
-                entry.imported_at = Some(now.clone());
-                summary.imported = summary.imported.saturating_add(1);
-                changed = true;
-            }
+        let event_id = event.id.clone();
+        if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
+            summary.failed = summary.failed.saturating_add(1);
+            tracing::error!(
+                target: TRACE_TARGET,
+                phase = %entry.phase,
+                snapshot = %entry.snapshot,
+                "restore evidence: could not append {} entry to the signed_events spine \
+                 (left in the journal for the next open): {e:#}",
+                entry.phase,
+            );
+            continue;
+        }
+        let line = ImportCursorLine {
+            entry_hash: digest,
+            imported_at: chrono::Utc::now().to_rfc3339(),
+            event_id,
+        };
+        let serialised = serde_json::to_string(&line).context("serialising the import cursor")?;
+        match append_line(&cursor, &serialised, "restore evidence cursor") {
+            Ok(()) => summary.imported = summary.imported.saturating_add(1),
             Err(e) => {
                 summary.failed = summary.failed.saturating_add(1);
                 tracing::error!(
                     target: TRACE_TARGET,
                     phase = %entry.phase,
-                    snapshot = %entry.snapshot,
-                    "restore evidence: could not append {} entry to the signed_events spine \
-                     (left in the journal for the next open): {e:#}",
+                    "restore evidence: the {} entry reached the spine but its cursor line could \
+                     not be written (it will be re-imported at the next open): {e:#}",
                     entry.phase,
                 );
             }
         }
     }
-    if changed {
-        rewrite_journal(&path, &entries)?;
-    }
     Ok(summary)
-}
-
-/// Atomic rewrite: temp file in the same directory, fsync, rename, dir fsync.
-/// Malformed lines are dropped by construction here — they were counted and
-/// reported by the read, and a rewrite that carried them forward could not
-/// stamp them.
-fn rewrite_journal(path: &Path, entries: &[RestoreEvidenceEntry]) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = path.with_extension(format!("jsonl.{}.tmp", std::process::id()));
-    {
-        let mut file =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        for entry in entries {
-            let line = serde_json::to_string(entry).context("serialising restore evidence")?;
-            writeln!(file, "{line}").with_context(|| format!("writing {}", tmp.display()))?;
-        }
-        file.sync_data()
-            .with_context(|| format!("fsyncing {}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .with_context(|| format!("fsyncing {} after the journal rewrite", dir.display()))?;
-    Ok(())
 }
 
 /// The open-time hook: import, log, never refuse. One `stat` when there is
@@ -318,28 +366,84 @@ mod tests {
             intent_ref: None,
             rollback: None,
             durable_publish: None,
-            imported_at: None,
         }
     }
 
     #[test]
-    fn journal_path_is_a_sibling_of_the_database_3661() {
+    fn journal_and_cursor_are_siblings_of_the_database_3661() {
         let p = journal_path(Path::new("/var/lib/ai-memory/ai-memory.db"));
         assert_eq!(
             p,
             PathBuf::from("/var/lib/ai-memory/ai-memory.db.restore-evidence.jsonl")
         );
+        let c = cursor_path(Path::new("/var/lib/ai-memory/ai-memory.db"));
+        assert_eq!(
+            c,
+            PathBuf::from("/var/lib/ai-memory/ai-memory.db.restore-evidence.imported")
+        );
     }
 
     #[test]
-    fn entry_hash_ignores_the_import_stamp_3661() {
+    fn entry_hash_ignores_a_legacy_import_stamp_and_tracks_content_3661() {
         let a = entry(PHASE_INTENT);
-        let mut b = a.clone();
-        b.imported_at = Some("later".to_string());
+        // A pre-rework journal line carried `imported_at`; on read it is
+        // ignored, so its digest is the digest of what `restore` wrote.
+        let mut legacy: serde_json::Value = serde_json::to_value(&a).unwrap();
+        legacy["imported_at"] = serde_json::Value::from("2026-09-12T01:00:00+00:00");
+        let b: RestoreEvidenceEntry = serde_json::from_value(legacy).unwrap();
         assert_eq!(a.entry_hash(), b.entry_hash());
         let mut c = a.clone();
         c.detail.push('!');
         assert_ne!(a.entry_hash(), c.entry_hash());
+    }
+
+    /// Review rework: the journal is evidence and is NEVER rewritten — not
+    /// to stamp an import, not to drop a damaged line. Import state lives in
+    /// the sidecar cursor, keyed by entry digest.
+    #[test]
+    fn import_never_rewrites_the_journal_and_keys_the_cursor_by_digest_3661() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("live.db");
+        let conn = crate::db::open(&db).unwrap();
+        append(&db, &entry(PHASE_INTENT)).unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(journal_path(&db))
+                .unwrap();
+            writeln!(f, "{{not json").unwrap();
+        }
+        append(&db, &entry(PHASE_OUTCOME)).unwrap();
+        let bytes_before = std::fs::read(journal_path(&db)).unwrap();
+        let first = import_journal(&conn, &db).unwrap();
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.malformed, 1);
+        assert_eq!(
+            std::fs::read(journal_path(&db)).unwrap(),
+            bytes_before,
+            "the journal must be byte-identical after an import"
+        );
+        let cursor = read_cursor(&db).unwrap();
+        assert_eq!(cursor.len(), 2);
+        assert!(cursor.contains(&entry(PHASE_INTENT).entry_hash()));
+        assert!(cursor.contains(&entry(PHASE_OUTCOME).entry_hash()));
+        // Cursor lines name the spine row each entry became.
+        let text = std::fs::read_to_string(cursor_path(&db)).unwrap();
+        let lines: Vec<ImportCursorLine> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let events = crate::signed_events::list_signed_events(&conn, None, 100, 0).unwrap();
+        for l in &lines {
+            assert!(events.iter().any(|e| e.id == l.event_id), "{l:?}");
+        }
+        // Second open: nothing imported, the damaged line is still reported,
+        // the journal is still untouched.
+        let second = import_journal(&conn, &db).unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.already_imported, 2);
+        assert_eq!(second.malformed, 1, "damage is evidence too; it stays");
+        assert_eq!(std::fs::read(journal_path(&db)).unwrap(), bytes_before);
     }
 
     #[test]
@@ -381,9 +485,10 @@ mod tests {
         let second = import_journal(&conn, &db).unwrap();
         assert_eq!(second.imported, 0);
         assert_eq!(second.already_imported, 2);
-        assert_eq!(second.malformed, 0, "the rewrite dropped the damaged line");
+        assert_eq!(second.malformed, 1, "the damaged line stays in the journal");
         let (entries, _) = read_journal(&journal_path(&db)).unwrap();
-        assert!(entries.iter().all(|e| e.imported_at.is_some()));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(read_cursor(&db).unwrap().len(), 2);
     }
 
     #[test]

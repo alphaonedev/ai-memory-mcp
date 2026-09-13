@@ -2154,7 +2154,6 @@ fn note_unverified_restore(
         intent_ref: None,
         rollback: None,
         durable_publish: None,
-        imported_at: None,
     };
     let journal = crate::restore_evidence::append(target, &intent).map_err(|e| format!("{e:#}"));
     report_evidence_failures(out, "intent", &forensic_outcome, &journal)?;
@@ -2237,7 +2236,6 @@ fn record_restore_outcome(
         intent_ref: Some(intent_hash),
         rollback: rollback.map(|p| p.to_string_lossy().into_owned()),
         durable_publish: Some(durable_publish),
-        imported_at: None,
     };
     let journal = crate::restore_evidence::append(target, &outcome).map_err(|e| format!("{e:#}"));
     report_evidence_failures(out, "outcome", &forensic_outcome, &journal)?;

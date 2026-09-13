@@ -765,8 +765,10 @@ were swallowed):
 - **The `signed_events` spine, at the next open**: `db::open` imports every
   not-yet-imported journal line as a `backup.restore_unverified` signed event
   into whichever database is live at that path — the restored one, the
-  rolled-back one, or the one an aborted publish left — and stamps the line
-  `imported_at`. The import never refuses an open.
+  rolled-back one, or the one an aborted publish left. The journal itself is
+  append-only evidence and is never rewritten; which lines were imported is
+  held out of band in `<db>.restore-evidence.imported`, an append-only
+  cursor keyed by each line's digest. The import never refuses an open.
 
 `--json` reports `manifest_verification` and an `audit_sink` object that says
 what each sink ACTUALLY persisted: `forensic.{intent,outcome}` and
