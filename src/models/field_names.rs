@@ -213,6 +213,8 @@ pub const DEFAULT_TIMEOUT_SECONDS: &str = "default_timeout_seconds";
 /// `description` — wire/row field name.
 pub const DESCRIPTION: &str = "description";
 /// `dependents` — MCP/HTTP `memory_dependents_of_invalidated` list key.
+/// #3714 — the `[deployment]` config block.
+pub const DEPLOYMENT: &str = "deployment";
 pub const DEPENDENTS: &str = "dependents";
 /// `earliest_updated_at` — wire/row field name.
 pub const EARLIEST_UPDATED_AT: &str = "earliest_updated_at";
@@ -453,6 +455,8 @@ pub const SENDER_POLICY_DIGEST_HEX: &str = "sender_policy_digest_hex";
 /// field: the sender's committed governance `policy_version` sequence at push
 /// time. ADDITIVE + backward-compatible (absent on pre-#1947 peers).
 pub const SENDER_POLICY_SEQ: &str = "sender_policy_seq";
+/// #3714 — `[deployment] shape`.
+pub const SHAPE: &str = "shape";
 /// `signing_agent` — wire/row field name.
 pub const SIGNING_AGENT: &str = "signing_agent";
 /// `similar_count` — boot / session_start payload annotation (#3352): how

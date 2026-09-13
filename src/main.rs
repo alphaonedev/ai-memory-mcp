@@ -93,7 +93,17 @@ fn main() -> Result<()> {
     // (`AppConfig::load_for_boot` matches `ErrorKind::NotFound` explicitly),
     // and `AI_MEMORY_NO_CONFIG=1` still short-circuits to defaults, so CI and
     // the test suite are byte-identical.
-    let app_config = match config::AppConfig::load_for_boot() {
+    // #3715 carve-out 1 — the `config` verbs (`check` / `migrate` / `show`)
+    // are the repair tools for a refused config: they read the file through
+    // `toml::Value` themselves and never depend on the boot loader, so they
+    // do not run it (running it would print the refusal they exist to
+    // explain, ahead of their own report).
+    let is_config_verb = matches!(&cli.command, daemon_runtime::Command::Config(_));
+    let app_config = match if is_config_verb {
+        Ok(config::AppConfig::default())
+    } else {
+        config::AppConfig::load_for_boot()
+    } {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("ai-memory: config is UNUSABLE — {e:#}");
@@ -145,6 +155,20 @@ fn main() -> Result<()> {
     // token aborts the boot right here, before anything else starts. The
     // async body logs the stashed pin report via the READ-ONLY
     // `security_profile::runtime_boot_report`.
+    // #3714 — the deployment shape derives the posture: under a hardened
+    // shape an unset `AI_MEMORY_SECURITY_PROFILE` is pinned to `asi-hard`
+    // (same `set_var` pre-runtime contract as the KNOBS pins below) and a
+    // `standard` override refuses; the at-rest floor is checked here too.
+    // MUST precede `security_profile::enforce_at_boot_pre_runtime` so the
+    // posture enforcement observes the pin. `doctor` still runs so it can
+    // report a shape refusal.
+    match ai_memory::config::shape::enforce_at_boot_pre_runtime(&app_config) {
+        Ok(_) => {}
+        // `doctor` reports a shape refusal in its "Deployment shape"
+        // section instead of dying on it (the pin is simply not applied).
+        Err(e) if is_doctor => eprintln!("ai-memory: WARN shape enforcement: {e:#}"),
+        Err(e) => return Err(e),
+    }
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
     // v1.0.0 #3124 — the unstamped-row mutation posture is a mandate-class
@@ -332,6 +356,14 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
             | daemon_runtime::Command::Config(_)
             | daemon_runtime::Command::Completions(_)
             | daemon_runtime::Command::Man
+            // #3715 carve-out 1 — the K11 `[[governance.policy]]` translator
+            // is a config REPAIR tool (parses via `toml::Value`); a
+            // fail-closed loader whose repair path sits behind the same
+            // gate is a lockout, not a control.
+            | daemon_runtime::Command::Governance(daemon_runtime::GovernanceCliArgs {
+                action: daemon_runtime::GovernanceAction::MigrateToPermissions(_),
+                ..
+            })
     )
 }
 

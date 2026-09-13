@@ -37,7 +37,7 @@
 use crate::models::field_names;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
 use crate::cli::CliOutput;
@@ -81,13 +81,28 @@ pub enum ConfigAction {
     /// failure refuses `exec` (EX_CONFIG) instead of
     /// `AppConfig::load_from` fail-opening to a keyless daemon.
     ///
-    /// Exit 0 = valid TOML; 2 = file missing; 3 = not valid TOML;
-    /// 4 = unreadable. The toml crate's `Display` is deliberately
+    /// Exit 0 = valid TOML with no unknown keys; 2 = file missing; 3 =
+    /// not valid TOML; 4 = unreadable; 5 = valid TOML carrying keys the
+    /// daemon refuses to boot on (#3715 — run this BEFORE upgrading; it
+    /// never refuses, it reports). The toml crate's `Display` is deliberately
     /// omitted from the error line — it can echo the offending
     /// source, which may carry `api_key`.
     Check {
         /// Config file to validate. Defaults to the resolved
         /// `~/.config/ai-memory/config.toml`.
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
+
+    /// #3714 — print the deployment shape and every setting it derives,
+    /// each marked FLOOR (an override below it refuses boot) or default
+    /// (an explicit value wins). Prints no secret and no effective
+    /// value: it renders what the SHAPE says, so an operator can see
+    /// which knobs they may override before they touch one.
+    Show {
+        /// Config file to read the `[deployment]` block from. Defaults to
+        /// the resolved `~/.config/ai-memory/config.toml`; a missing file
+        /// renders the `singleton` table.
         #[arg(long, value_name = "FILE")]
         file: Option<PathBuf>,
     },
@@ -105,7 +120,72 @@ pub fn run(_db: &Path, args: ConfigCliArgs, out: &mut CliOutput) -> Result<i32> 
             also_clean_claude_json,
         } => migrate(dry_run, also_clean_claude_json, out),
         ConfigAction::Check { file } => check_toml(file.as_deref(), out),
+        ConfigAction::Show { file } => show_shape(file.as_deref(), out),
     }
+}
+
+/// #3714 — render the shape-derived table for the config at `file`.
+/// Parses through `toml::Value` first so an unknown key elsewhere in the
+/// file cannot stop the operator from seeing what their shape derives;
+/// only the `[deployment]` block is interpreted.
+fn show_shape(file: Option<&Path>, out: &mut CliOutput) -> Result<i32> {
+    use crate::config::{AppConfig, DeploymentShape};
+
+    let resolved;
+    let path: Option<&Path> = if let Some(p) = file {
+        Some(p)
+    } else {
+        resolved = AppConfig::config_path();
+        resolved.as_deref()
+    };
+    let shape = match path {
+        Some(p) if p.exists() => {
+            let contents = std::fs::read_to_string(p)
+                .with_context(|| crate::config::reading_config_context(p))?;
+            let value: toml::Value = match toml::from_str(&contents) {
+                Ok(v) => v,
+                Err(e) => {
+                    write_not_valid_toml(out, p, &e);
+                    return Ok(3);
+                }
+            };
+            match value
+                .get(field_names::DEPLOYMENT)
+                .and_then(|d| d.get(field_names::SHAPE))
+                .and_then(toml::Value::as_str)
+            {
+                Some(token) => match DeploymentShape::parse(token) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = writeln!(out.stderr, "ERROR: {}: {e}", p.display());
+                        return Ok(3);
+                    }
+                },
+                None => DeploymentShape::Singleton,
+            }
+        }
+        _ => DeploymentShape::Singleton,
+    };
+    let source = match path {
+        Some(p) if p.exists() => format!("from {}", p.display()),
+        Some(p) => format!("no config at {} — singleton", p.display()),
+        None => "no config path ($HOME unset) — singleton".to_string(),
+    };
+    let _ = writeln!(out.stdout, "# {source}");
+    let _ = write!(out.stdout, "{}", shape.derive().render_table());
+    Ok(0)
+}
+
+/// The ONE "not valid TOML" error line (three verbs; pm-v3.1
+/// hardcoded-literal gate). Routes the toml error through the #3432
+/// redaction funnel so the offending source line is never echoed.
+fn write_not_valid_toml(out: &mut CliOutput, path: &Path, e: &toml::de::Error) {
+    let _ = writeln!(
+        out.stderr,
+        "ERROR: {} is not valid TOML: {}",
+        path.display(),
+        crate::config_redact::redact_parse_error(e)
+    );
 }
 
 /// #3197 — parse-only TOML check. Does not migrate, does not print the
@@ -148,9 +228,42 @@ fn check_toml(file: Option<&Path>, out: &mut CliOutput) -> Result<i32> {
         }
     };
     match toml::from_str::<toml::Value>(&contents) {
-        Ok(_) => {
-            let _ = writeln!(out.stderr, "OK: {} is valid TOML", path.display());
-            Ok(0)
+        Ok(value) => {
+            // #3715 — the DETECTOR half of fail-closed unknown keys. This
+            // verb parses through `toml::Value` and never refuses; it
+            // reports what the boot loader WOULD refuse so an operator
+            // finds it on their schedule, before upgrading. Exit 5 =
+            // valid TOML that the daemon would refuse to boot on.
+            let unknown = crate::config::unknown_keys::find_unknown_keys(&value);
+            if unknown.is_empty() {
+                let _ = writeln!(
+                    out.stderr,
+                    "OK: {} is valid TOML with no unknown keys",
+                    path.display()
+                );
+                return Ok(0);
+            }
+            let _ = writeln!(
+                out.stderr,
+                "WOULD REFUSE: {} is valid TOML but carries {} unknown key{} the daemon \
+                 refuses to boot on (#3715):",
+                path.display(),
+                unknown.len(),
+                if unknown.len() == 1 { "" } else { "s" }
+            );
+            for u in &unknown {
+                let _ = writeln!(
+                    out.stderr,
+                    "  - {}",
+                    crate::config::unknown_keys::describe(u)
+                );
+            }
+            let _ = writeln!(
+                out.stderr,
+                "  {}",
+                crate::config::unknown_keys::repair_hint(path, &unknown)
+            );
+            Ok(5)
         }
         Err(e) => {
             // #3197 refused to interpolate the toml error at all, because
@@ -159,12 +272,7 @@ fn check_toml(file: Option<&Path>, out: &mut CliOutput) -> Result<i32> {
             // position: the shared funnel drops the echoed source block and
             // screens what is left, so the operator gets "line 3, column 11"
             // instead of an unlocatable "not valid TOML".
-            let _ = writeln!(
-                out.stderr,
-                "ERROR: {} is not valid TOML: {}",
-                path.display(),
-                crate::config_redact::redact_parse_error(&e)
-            );
+            write_not_valid_toml(out, path, &e);
             Ok(3)
         }
     }
@@ -212,12 +320,7 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
             // the same leak `config check` (#3197) declined to take; route
             // it through the shared funnel, which keeps the position and
             // drops the echoed source.
-            let _ = writeln!(
-                out.stderr,
-                "ERROR: {} is not valid TOML: {}",
-                path.display(),
-                crate::config_redact::redact_parse_error(&e)
-            );
+            write_not_valid_toml(out, &path, &e);
             return Ok(3);
         }
     };
@@ -1270,5 +1373,149 @@ model = "grok-4.3"
             run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
         };
         assert_eq!(code, 2);
+    }
+
+    /// #3715 — `config check` is the DETECTOR: valid TOML carrying keys the
+    /// daemon would refuse to boot on exits 5, names every key with its
+    /// nearest sibling and the repair command, and never refuses (it is a
+    /// report). Secrets on the same file are not echoed.
+    #[test]
+    fn check_reports_unknown_keys_with_exit_five_and_no_secret_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        std::fs::write(
+            &path,
+            "api_key = \"sekrit-must-not-leak\"\n\n[memory]\ntier = \"x\"\n\n[storage]\ndb_mmap_size_byte = 1\n",
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Check {
+                    file: Some(path.clone()),
+                },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 5);
+        let err = String::from_utf8(stderr).unwrap();
+        assert!(err.contains("WOULD REFUSE"), "got: {err}");
+        assert!(err.contains("`memory`"), "got: {err}");
+        assert!(err.contains("`storage.db_mmap_size_byte`"), "got: {err}");
+        assert!(err.contains("db_mmap_size_bytes"), "nearest sibling: {err}");
+        assert!(err.contains("config check --file"), "repair hint: {err}");
+        assert!(
+            !err.contains("sekrit-must-not-leak"),
+            "secret echoed: {err}"
+        );
+        // The file is untouched — a detector never repairs.
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[memory]"));
+    }
+
+    /// #3715 — a clean file still exits 0 and says so.
+    #[test]
+    fn check_clean_file_reports_no_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 2\n[deployment]\nshape = \"team\"\n",
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Check { file: Some(path) },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("no unknown keys")
+        );
+    }
+
+    /// #3714 — `config show` renders the shape's derivation table with a
+    /// FLOOR / default marker on every row; a missing file renders
+    /// `singleton`; an unknown key ELSEWHERE in the file does not stop the
+    /// render (it parses through `toml::Value`).
+    #[test]
+    fn show_renders_the_shape_table_with_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        std::fs::write(
+            &path,
+            "[deployment]\nshape = \"production\"\n\n[memory]\ntier = \"x\"\n",
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Show { file: Some(path) },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(
+            text.contains("[deployment] shape = \"production\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("security_posture") && text.contains("asi-hard"),
+            "{text}"
+        );
+        assert!(text.contains("FLOOR"), "{text}");
+        assert!(
+            text.contains("at_rest") && text.contains("pending recovery escrow"),
+            "{text}"
+        );
+
+        let missing = dir.path().join("absent.toml");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Show {
+                    file: Some(missing),
+                },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(
+            text.contains("[deployment] shape = \"singleton\""),
+            "{text}"
+        );
+        assert!(text.contains("standard"), "{text}");
+    }
+
+    /// #3714 — a typo in the primary input fails loud, never `singleton`.
+    #[test]
+    fn show_refuses_an_unrecognised_shape_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        std::fs::write(&path, "[deployment]\nshape = \"prod\"\n").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Show { file: Some(path) },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 3);
+        assert!(String::from_utf8(stderr).unwrap().contains("production"));
     }
 }

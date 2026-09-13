@@ -112,6 +112,31 @@ CLI subcommands):
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
 | Schema | **v98** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v98" |
 
+## Before upgrading — run `ai-memory config check` (#3715)
+
+v1.0.0 REFUSES to boot on a `config.toml` that carries a key it does not
+recognise, at any nesting level (exit 78). Before v1.0.0 a nested unknown
+key was silently dropped and a top-level one only WARNed, so a typo or a
+stale section (`[memory]`, `[autonomous]`, `[federation]`,
+`[[governance.policy]]`) could neutralise an operator's intent with
+nothing loud. The in-tree cost was measured (0 tracked config files, 0
+deploy renders); the field cost is not measurable from here — which is
+why the detector ships with the refusal:
+
+```bash
+ai-memory config check            # exit 0: clean; exit 5: lists every key v1.0.0 would refuse
+```
+
+`config check` never refuses; it reports each unknown key with its
+nearest accepted sibling and the repair command. Run it on the OLD binary
+or the new one — it reads the file through `toml::Value` either way.
+`[[governance.policy]]` blocks are translated by
+`ai-memory governance migrate-to-permissions`. Nothing in this release
+rewrites your file for you.
+
+A config with no `[deployment]` block boots as the `singleton` shape
+(#3714) — the upgrade never promotes a node to a stricter shape.
+
 ## Secure-default flips (breaking)
 
 v1.0.0 flips the Gate-1′ "defaults stop lying" knobs to their secure

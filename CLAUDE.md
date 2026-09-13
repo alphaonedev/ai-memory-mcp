@@ -633,6 +633,11 @@ uses a schema-versioned, sectioned shape:
 ```toml
 schema_version = 2
 
+# #3714 — the deployment shape is the PRIMARY input; everything below
+# is overridable within the floors it derives (see "Deployment shape").
+[deployment]
+shape = "singleton"   # singleton | team | production | federated | hive
+
 tier = "autonomous"
 db = "/Users/fate/.claude/ai-memory.db"
 
@@ -816,6 +821,39 @@ parse time with a clear stderr error and the daemon falls back to
 continue to parse and feed the resolver's `Legacy` arm. Loading a
 legacy config emits a `Once`-gated stderr WARN pointing at
 `ai-memory config migrate`. Legacy fields will be removed in v0.8.0.
+
+**Deployment shape (#3714, v1.0.0) and unknown-key refusal (#3715).**
+`[deployment] shape` is the ONE top-level setting the configuration
+programme adds. `config::shape::DeploymentShape::derive` is the single
+derivation — a `ShapeDerived` table whose every row is a **FLOOR** (an
+override below it refuses boot) or a **default** (an explicit value
+wins); `#3700` and `#3709` consume that table, never env. Absent block =
+`singleton`; an upgrade never promotes a node to a stricter shape. v1.0.0
+enforces two rows at boot (`config::shape::enforce_at_boot_pre_runtime`,
+which runs BEFORE `security_profile::enforce_at_boot_pre_runtime`):
+`production` / `federated` / `hive` pin `AI_MEMORY_SECURITY_PROFILE=asi-hard`
+when unset and refuse `standard`; the same shapes REQUIRE at-rest
+encryption, and because no recovery escrow for the at-rest key exists yet
+(#3717) that requirement is DECLARED (boot WARN + `doctor` "Deployment
+shape" section, #3557) rather than silently enabled — a lost key must
+never mean lost memory. `ai-memory config show` renders the table.
+**Unknown config keys REFUSE the boot loader at every nesting level**
+(`AppConfig::refuse_unknown_keys`, exit 78). The accepted key tree is
+derived from the `AppConfig` schema (`config::unknown_keys`, every config
+struct derives `schemars::JsonSchema`; `accepted_leaf_count()` = **174**
+at v1.0.0 and is the #3716 surface count — pinned by
+`config::unknown_keys::tests::accepted_leaf_count_is_the_published_surface_count`,
+so the number changes only when someone reviews it). The refusal names
+the path, the nearest accepted sibling, any section where that key name
+IS accepted, and the repair command. `config check` is the DETECTOR
+(exit 5 = valid TOML the daemon would refuse; it never refuses) — the
+release notes tell operators to run it BEFORE upgrading. `config
+migrate`, `config check`, `config show` and `governance
+migrate-to-permissions` parse via `toml::Value` and remain reachable
+from a refused config (the tolerant list in `src/main.rs::config_tolerant_command`).
+`init` / `plan` / `apply`, the `1→2→3` migrator ladder, provenance on
+every resolver, drift and the key-set collapse are v1.0.1 (Conductor
+ruling on #3714).
 
 **Migration tool.**
 

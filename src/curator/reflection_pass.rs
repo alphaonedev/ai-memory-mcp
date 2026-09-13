@@ -195,7 +195,7 @@ pub(crate) const MIN_RECALL_COUNT: i64 = 1;
 /// at the time the pass runs, and (b) it writes new (typed) memories
 /// to the namespace, which operators may want to gate by namespace
 /// rather than enable globally.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ReflectionPassConfig {
     /// When `false` (default), the pass skips this namespace entirely.
     #[serde(default)]
