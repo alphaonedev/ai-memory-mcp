@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::{ResolvedTtl, TierConfig};
 use crate::db;
 use crate::embeddings::{Embed, Embedder};
+use crate::handlers::auth_backoff::AuthRejected;
 use crate::hnsw::VectorSearchIndex;
 use crate::profile::Family;
 
@@ -985,8 +986,10 @@ pub async fn api_key_auth(
         return next.run(req).await.into_response();
     };
 
-    // Exempt health endpoint
-    if req.uri().path() == super::routes::HEALTH {
+    // Exempt health endpoint, and the mTLS-authenticated federation paths
+    // explained below. `auth_exempt` is the one predicate; the #2502 backoff
+    // layer shares it, so it never refuses a request this gate would pass.
+    if auth_exempt(req.uri().path(), auth.mtls_enforced) {
         return next.run(req).await.into_response();
     }
 
@@ -1032,10 +1035,7 @@ pub async fn api_key_auth(
     // NOT used as the identity anchor; the operator-declared fingerprint is.
     // The axum peer-cert-in-extensions plumbing this comment once said was
     // "unlanded" is what the acceptor now provides.
-    let path = req.uri().path();
-    if auth.mtls_enforced && path.starts_with(super::authority::SYNC_PREFIX) {
-        return next.run(req).await.into_response();
-    }
+    // (The bypass itself is the `auth_exempt` early return above.)
 
     // #2044 — resolve the presented credential (header only, since #2032 L1
     // removed the `?api_key=` query form). We keep the raw token so we can BOTH
@@ -1074,11 +1074,7 @@ pub async fn api_key_auth(
     }
 
     let Some(token) = presented else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "missing or invalid API key"})),
-        )
-            .into_response();
+        return rejected_auth();
     };
 
     // Transport auth: accept the SHARED global key OR any ENROLLED per-agent
@@ -1098,11 +1094,7 @@ pub async fn api_key_auth(
             .cloned()
     };
     if !is_global && per_agent.is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "missing or invalid API key"})),
-        )
-            .into_response();
+        return rejected_auth();
     }
 
     // #2044 (#2032-A / H1 IDOR + M1 admin spoof) — per-agent-key PRINCIPAL
@@ -1168,6 +1160,27 @@ pub async fn api_key_auth(
     }
 
     next.run(req).await.into_response()
+}
+
+/// Requests [`api_key_auth`] passes without judging a key: `/health`, and the
+/// `/sync/*` federation paths when mTLS client-cert pinning already
+/// authenticated the peer.
+#[must_use]
+pub fn auth_exempt(path: &str, mtls_enforced: bool) -> bool {
+    path == super::routes::HEALTH
+        || (mtls_enforced && path.starts_with(super::authority::SYNC_PREFIX))
+}
+
+/// The transport-auth `401`, stamped [`AuthRejected`] so the #2502 backoff
+/// layer counts it against the source.
+fn rejected_auth() -> axum::response::Response {
+    AuthRejected::stamp(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API key"})),
+        )
+            .into_response(),
+    )
 }
 
 /// `checks.*` value for a probe that answered.

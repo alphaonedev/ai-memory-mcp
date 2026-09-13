@@ -1179,6 +1179,10 @@ pub fn build_router_with_timeout(
     };
     use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
+    // #2502 — one backoff table per router; skips what `api_key_auth` skips.
+    let auth_backoff_state =
+        handlers::auth_backoff::AuthBackoffState::from_env(api_key_state.mtls_enforced);
+
     // Timeout middleware: wraps each downstream future in
     // `tokio::time::timeout`. The closure captures the `Duration` by
     // value so it lives for the router's lifetime.
@@ -1600,6 +1604,13 @@ pub fn build_router_with_timeout(
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
             handlers::api_key_auth,
+        ))
+        // #2502 — per-source auth-failure backoff, directly OUTSIDE
+        // `api_key_auth` so it counts that gate's 401s and refuses a source
+        // in backoff before its key is examined.
+        .layer(axum::middleware::from_fn_with_state(
+            auth_backoff_state,
+            handlers::auth_backoff::auth_backoff_layer,
         ))
         // v0.7.0 Wave-3 Continuation — postgres route gate. On sqlite
         // deployments this is a pure pass-through. On postgres-backed

@@ -198,6 +198,7 @@ impl BoolKnob {
 pub const REGISTRY: &[&BoolKnob] = &[
     &knobs::REQUIRE_API_KEY,
     &knobs::REQUIRE_TLS,
+    &knobs::AUTH_FAILURE_BACKOFF,
     &knobs::ALLOW_PLAINTEXT_NONLOOPBACK,
     &knobs::GOVERNANCE_FAIL_OPEN_ON_ERROR,
     &knobs::PASSPHRASE_FILE_ALLOW_LAX_PERMS,
@@ -277,6 +278,13 @@ pub mod knobs {
         crate::daemon_runtime::ENV_REQUIRE_TLS,
         Some(false),
         Legacy::OneOrTrue,
+    );
+    /// #2502 — per-source backoff after repeated HTTP auth failures. New at
+    /// v1.0.0, so no reader predates the shared grammar.
+    pub const AUTH_FAILURE_BACKOFF: BoolKnob = mandate(
+        crate::handlers::auth_backoff::ENV_AUTH_FAILURE_BACKOFF,
+        Some(true),
+        Legacy::DefaultOnCaseInsensitive,
     );
     /// #2032 M2 — acknowledge upstream TLS termination (silences the WARN).
     pub const ALLOW_PLAINTEXT_NONLOOPBACK: BoolKnob = hatch(

@@ -1377,6 +1377,14 @@ ssh -L 9077:127.0.0.1:9077 daemon-host
 then POST `/api/v1/agents/{id}/api-key` at `127.0.0.1:9077` with the
 `x-api-key` and `X-Agent-Id` headers from any admin client.
 
+The same-host proxy must APPEND the client address to `X-Forwarded-For`
+(nginx `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`).
+Repeated wrong keys back a source off (`AI_MEMORY_AUTH_FAILURE_BACKOFF`,
+#2502), and for a loopback peer the daemon takes the source from the
+rightmost `X-Forwarded-For` hop. A proxy that does not append its hop makes
+every client one source, so one client with a stale key would put all of them
+in backoff for up to five minutes.
+
 **3. Give the daemon its own TLS listener.** `serve --tls-cert … --tls-key …`
 makes the listener confidential in-process, wherever it binds, so the mint
 route is available even off-host. The proxy may still front it (TLS-to-TLS):

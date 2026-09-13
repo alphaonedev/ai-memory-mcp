@@ -8069,13 +8069,13 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                         bindings,
                     ))
                     .handle(handle)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             } else {
                 axum_server::bind(socket_addr)
                     .acceptor(tls::serve_rustls_acceptor(&tls_config))
                     .handle(handle)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             }
         } else {
@@ -8105,7 +8105,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 .push(signal_task);
             axum_server::bind(socket_addr)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
         Ok(())
@@ -8503,10 +8503,14 @@ where
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("axum::serve")?;
+    // #2502 — connect info carries the peer address the auth backoff keys on.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("axum::serve")?;
     Ok(())
 }
 

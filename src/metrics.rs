@@ -364,6 +364,17 @@ pub struct Metrics {
     /// (the cap defaults to disabled).
     pub admission_shed_total: IntCounter,
 
+    /// #2502 — monotonic count of HTTP requests the transport-auth gate
+    /// (`api_key_auth`) rejected with `401` (no key, or an unknown key).
+    /// A sustained rate names credential guessing or a client holding a
+    /// stale key; no per-source label (a source label is unbounded).
+    pub auth_failures_total: IntCounter,
+
+    /// #2502 — monotonic count of HTTP requests refused with `429` because
+    /// their source was in auth-failure backoff. Non-zero means some source
+    /// crossed the free-failure threshold.
+    pub auth_backoff_refusals_total: IntCounter,
+
     /// #2577 — monotonic count of recalls whose query embedding could not
     /// be produced within [`crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS`]
     /// (or failed outright), so the recall degraded to keyword/FTS.
@@ -927,6 +938,23 @@ impl Metrics {
         )?;
         registry.register(Box::new(admission_shed_total.clone()))?;
 
+        let auth_failures_total = IntCounter::new(
+            "ai_memory_auth_failures_total",
+            "Monotonic counter of HTTP requests rejected with 401 by the \
+             transport-auth gate (no API key, or a key that is neither the \
+             shared key nor an enrolled per-agent key). A sustained rate means \
+             credential guessing or a client holding a stale key (#2502).",
+        )?;
+        registry.register(Box::new(auth_failures_total.clone()))?;
+
+        let auth_backoff_refusals_total = IntCounter::new(
+            "ai_memory_auth_backoff_refusals_total",
+            "Monotonic counter of HTTP requests refused with 429 because their \
+             source address was in auth-failure backoff after repeated 401s \
+             (#2502, AI_MEMORY_AUTH_FAILURE_BACKOFF).",
+        )?;
+        registry.register(Box::new(auth_backoff_refusals_total.clone()))?;
+
         let recall_embed_degraded_total = IntCounter::new(
             "ai_memory_recall_embed_degraded_total",
             "Monotonic counter of recalls that fell back to keyword/FTS because \
@@ -1108,6 +1136,8 @@ impl Metrics {
             federation_cred_max_age_seconds,
             federation_renewal_lag_seconds,
             admission_shed_total,
+            auth_failures_total,
+            auth_backoff_refusals_total,
             recall_embed_degraded_total,
             rerank_budget_degraded_total,
             query_embed_cache_hits_total,
