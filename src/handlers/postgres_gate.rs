@@ -882,6 +882,37 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         )
             .into_response();
     }
+    // #3426 — the cross-owner owner-gate refusals, rendered in the SAME
+    // leak-resistant envelope the sqlite handler branch returns via
+    // `parity::owner_gate_refusal`, so the `error` + `code` a client
+    // matches on are byte-identical whichever backend served the request.
+    // Pre-fix the generic arm below rendered `PermissionDenied`'s `Display`
+    // (`"caller lacks permission for {action} on {target}: {reason}"`) whose
+    // reason NAMED THE ROW OWNER — `sanitize_store_err_message` redacts URLs
+    // and filesystem paths, never principals.
+    //
+    // Anchored on the SSOT consts, which are the ONLY reason strings the SAL
+    // adapters emit for these gates (`assert_caller_owns_for_mutation` for a
+    // memory, the postgres link gate for a link source), not on a substring
+    // sniff. Any other `PermissionDenied` falls through to the generic arm,
+    // which is leak-free as well now that no refusal reason interpolates an
+    // owner.
+    if let StoreError::PermissionDenied { target, reason, .. } = &e {
+        if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY {
+            return crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+                None,
+                crate::handlers::parity::RefusedResource::Memory(target),
+            );
+        }
+        if reason == crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER {
+            return crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
+                None,
+                crate::handlers::parity::RefusedResource::SourceMemory(target),
+            );
+        }
+    }
     let (status, msg) = match &e {
         StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "not found".to_string()),
         StoreError::Conflict { .. } => (
