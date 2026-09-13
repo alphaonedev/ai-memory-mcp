@@ -21,7 +21,35 @@ inside the §5 watch set on top of the 2026-09-11 tip `b0483115`; re-bound by
 federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-12** (re-bound after #3204 at 22 checks; re-issued 2026-09-11 after #3549 / #3553 / #3199)
+> ## STATUS — **VOID as of 2026-09-13** (expiry trigger FIRED: the certified surface drifted past the bound commit)
+>
+> **FIRED 2026-09-13 — §7 expiry trigger, path-based arm.** Ten files in the
+> §5/§7 watch set changed between the bound commit
+> `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` and the chain-12 tip
+> `8b4f65a2261477850461b615a1fd282a4f27d430`:
+> `src/federation/applied_wake.rs`, `src/federation/mod.rs`,
+> `src/federation/receive.rs`, `src/handlers/federation_receive.rs`,
+> `src/handlers/federation_signing_check.rs`, `src/identity/mod.rs`,
+> `src/identity/owner_stamp.rs`, `src/identity/sign.rs`,
+> `src/store/postgres.rs`, `src/store/postgres/reown_3124.rs`.
+>
+> `identity/sign.rs` and the two federation receive paths **are** the certified
+> surface, so this certificate no longer describes the code in this tree. It is
+> VOID until the §5.4(2)-(5) evidence is re-run and re-bound.
+>
+> **This is a deliberate VOID, not a lapse.** The Conductor ruled
+> ([#3556](https://github.com/alphaonedev/ai-memory-mcp/issues/3556)) that a
+> re-issue means RE-RUNNING THE EVIDENCE, never editing the bind SHA: re-binding
+> to a tip whose signing and federation code was never re-verified would produce
+> exactly the forged artifact this document's expiry trigger exists to catch.
+> A VOID certificate costs a procurement conversation; a false LIVE one costs the
+> customer. The re-issue binds to the chain-13 tip, not this one, because the
+> approved merge queue changes fourteen further watched files — binding here
+> would buy a certificate honest for one merge and VOID again the same day.
+>
+> The prior LIVE record is preserved verbatim below as history.
+>
+> ## SUPERSEDED — LIVE as of 2026-09-12 (re-bound after #3204 at 22 checks; re-issued 2026-09-11 after #3549 / #3553 / #3199)
 >
 > Re-validated and re-bound against `ab6f2175077afd47e0a0ac65d5121db97e1d22d5`
 > by [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)
