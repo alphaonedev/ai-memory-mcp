@@ -17413,8 +17413,7 @@ pub(crate) fn export_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<
         source_id: row.get(0)?,
         target_id: row.get(1)?,
         // v0.7.0 fix campaign R1-M4 — see `get_links` for rationale.
-        relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
-            .unwrap_or_default(),
+        relation: crate::models::MemoryLinkRelation::from_str(&relation_str).unwrap_or_default(),
         created_at: row.get(3)?,
         signature: row.get::<_, Option<Vec<u8>>>(4)?,
         observed_by: row.get::<_, Option<String>>(5)?,

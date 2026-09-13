@@ -1427,11 +1427,41 @@ Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
 Every body also carries `withheld` (the counts of live rows it does not
 carry: `withheld` forbidden-class drops with `withheld_by_class`,
 `quarantined`, `undecryptable`, plus the reported `tombstoned`, `expired`,
-`redacted` and `dangling_links_withheld`) and `partial` (`true` when a
-forbidden-class, quarantined or undecryptable row was withheld). In paged mode
-the counts are per page: sum them, and OR `partial`, across the walk. Refusals:
-`400 EXPORT_LIMIT_OUT_OF_RANGE` (with `max`) and `400 EXPORT_CURSOR_INVALID`.
-The Python SDK's `export_pages()` performs the walk.
+`redacted` and `dangling_links_withheld` — that last key is the "withheld
+edges" count the acceptance names; the SDK sums it under that name) and
+`partial` (`true` when a forbidden-class, quarantined or undecryptable row was
+withheld). In paged mode the counts are per page: sum them, and OR `partial`,
+across the walk. Refusals: `400 EXPORT_LIMIT_OUT_OF_RANGE` (with `max`) and
+`400 EXPORT_CURSOR_INVALID`. The Python SDK's `export_pages()` performs the
+walk.
+
+**Namespace scope (`?namespace=<ns>`, #3427).** Restricts the export — the
+unpaged body and every page — to one namespace, as a `WHERE` predicate on the
+same ordered query (never a post-filter, so the page bound holds and the
+`withheld` counts are scoped too). The scope is pinned in the cursor: a
+cursor minted under one scope presented with another is refused
+(`400 EXPORT_CURSOR_INVALID`). Every body echoes the scope that was applied
+as `namespace` (`null` = whole corpus), so the operator holding the file can
+see it without trusting the request. An edge whose other endpoint lies
+outside the scope is not carried and is counted in
+`dangling_links_withheld`. Any query parameter the export does not know is
+refused with `400` naming it — a parameter that claims to bound an egress and
+does not is worse than no parameter, so nothing is silently ignored. A
+malformed namespace is `400 VALIDATION_FAILED`.
+
+**Consistency (`"snapshot": false`, #3288 amended acceptance).** A paged walk
+is a **live keyset scan**, not a snapshot, and every body says so. Rows that
+sort *after* the cursor are visited exactly once even when inserted during
+the walk. A row inserted during the walk whose `(created_at, id)` sorts
+*before* the cursor is **not** visited — a federated receive keeps the peer's
+`created_at`, so a backdated insert is not hypothetical on a federating node;
+take the export when the node is quiet, or re-walk. The cursor pins the expiry
+cutoff `as_of` of the walk's first page; a walk continued with an old cursor
+therefore still exports rows that expired after that cutoff and have not yet
+been collected (consistent-walk behaviour, admin-only). Keyset order assumes
+the storage-stable `created_at` rendering every local writer uses
+(`+00:00`, UTC); a row carrying a different offset rendering would sort by
+its text, not its instant.
 
 ### `POST /api/v1/import`
 

@@ -311,6 +311,11 @@ pub const UNDECRYPTABLE: &str = "undecryptable";
 /// reported but are not partial (see
 /// [`crate::export_scope::ExportWithholdLedger::is_partial`]).
 pub const PARTIAL: &str = "partial";
+/// #3288 — export body: `false` on every response today (the paged walk is
+/// a live keyset scan, never a snapshot); declared so a consumer can tell.
+pub const SNAPSHOT: &str = "snapshot";
+/// The row / export-body namespace key (one spelling for the SSOT gates).
+pub const NAMESPACE: &str = "namespace";
 /// `forged_signature_skipped` — import/sync report field name.
 pub const FORGED_SIGNATURE_SKIPPED: &str = "forged_signature_skipped";
 /// `from_agent_id` — wire/row field name.

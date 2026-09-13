@@ -358,3 +358,191 @@ async fn malformed_paging_parameters_are_refused_3288() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["code"], json!(error_codes::EXPORT_CURSOR_INVALID));
 }
+
+// ---------------------------------------------------------------------------
+// #3427 — the `namespace` parameter is HONOURED on the same bounded path
+// (never post-filtered), pinned in the cursor, echoed in the body; an
+// unknown parameter is refused; and #3288's live-scan semantics are declared
+// and pinned.
+// ---------------------------------------------------------------------------
+
+/// A foreign-namespace row never appears in a scoped export — legacy body or
+/// paged walk — and the body says which scope was applied.
+#[tokio::test]
+async fn export_namespace_scope_is_honoured_on_body_and_every_page_3427() {
+    let (_dir, db_path) = fixture();
+    {
+        let conn = ai_memory::db::open(&db_path).expect("open");
+        for i in 0..5 {
+            let mut m = mem(
+                &format!("alice-{i}"),
+                &format!("2026-01-0{}T00:00:00+00:00", i + 1),
+            );
+            m.namespace = "alice-ns".to_string();
+            ai_memory::db::insert(&conn, &m).expect("insert alice");
+        }
+        let mut bob = mem("bob-0", "2026-01-03T00:00:00+00:00");
+        bob.namespace = "bob-ns".to_string();
+        ai_memory::db::insert(&conn, &bob).expect("insert bob");
+    }
+    let router = router(&db_path, 1000);
+
+    // Legacy (unpaged) body, scoped.
+    let (status, body) = get(&router, "/api/v1/export?namespace=alice-ns").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 5, "{body}");
+    assert_eq!(
+        body["namespace"], "alice-ns",
+        "the applied scope is echoed: {body}"
+    );
+    assert_eq!(
+        body["snapshot"], false,
+        "#3288: a live scan says so: {body}"
+    );
+    assert!(
+        ids_of(&body).iter().all(|id| id.starts_with("alice-")),
+        "a foreign-namespace row must be absent: {body}"
+    );
+
+    // Paged walk, scoped: every page carries the scope and only scoped rows.
+    let mut cursor: Option<String> = None;
+    let mut seen = Vec::new();
+    for _ in 0..10 {
+        let uri = match &cursor {
+            None => "/api/v1/export?namespace=alice-ns&limit=2".to_string(),
+            Some(c) => format!("/api/v1/export?namespace=alice-ns&limit=2&cursor={c}"),
+        };
+        let (status, page) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["namespace"], "alice-ns", "{page}");
+        assert!(
+            ids_of(&page).iter().all(|id| id.starts_with("alice-")),
+            "{page}"
+        );
+        seen.extend(ids_of(&page));
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    seen.sort();
+    assert_eq!(seen.len(), 5, "every scoped row exactly once: {seen:?}");
+
+    // An unscoped export still carries everything (the whole-corpus semantic
+    // is unchanged) and says so.
+    let (status, body) = get(&router, "/api/v1/export").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 6, "{body}");
+    assert!(body["namespace"].is_null(), "{body}");
+}
+
+/// A cursor minted under one scope cannot continue a walk under another,
+/// and a parameter the export does not know is refused — never silently
+/// dropped (#3427: silence is the one unacceptable outcome).
+#[tokio::test]
+async fn export_refuses_scope_switches_and_unknown_parameters_3427() {
+    let (_dir, db_path) = fixture();
+    {
+        let conn = ai_memory::db::open(&db_path).expect("open");
+        seed(&conn, 4);
+    }
+    let router = router(&db_path, 1000);
+    let (status, first) = get(&router, "/api/v1/export?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("a second page")
+        .to_string();
+
+    let (status, body) = get(
+        &router,
+        &format!("/api/v1/export?limit=2&cursor={cursor}&namespace=ns-0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "EXPORT_CURSOR_INVALID", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("different namespace scope"),
+        "{body}"
+    );
+
+    let (status, body) = get(&router, "/api/v1/export?namespaces=ns-0").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown parameter is refused: {body}"
+    );
+
+    let (status, body) = get(&router, "/api/v1/export?namespace=%20bad%20ns").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a malformed namespace is refused: {body}"
+    );
+    assert_eq!(body["code"], "VALIDATION_FAILED", "{body}");
+}
+
+/// #3288 amended acceptance 1/3 — the paged walk is a LIVE keyset scan,
+/// declared `snapshot: false`. What it can miss is pinned here: a row
+/// inserted DURING the walk with a backdated `created_at` that sorts before
+/// the cursor is not visited (a federated receive keeps the peer's
+/// `created_at`, so this is not hypothetical); a row that sorts after the
+/// cursor is visited exactly once.
+#[tokio::test]
+async fn export_live_scan_semantics_are_declared_and_pinned_3288() {
+    let (_dir, db_path) = fixture();
+    {
+        let conn = ai_memory::db::open(&db_path).expect("open");
+        for i in 0..4 {
+            ai_memory::db::insert(
+                &conn,
+                &mem(
+                    &format!("m-{i}"),
+                    &format!("2026-02-0{}T00:00:00+00:00", i + 1),
+                ),
+            )
+            .expect("insert");
+        }
+    }
+    let router = router(&db_path, 1000);
+    let (status, first) = get(&router, "/api/v1/export?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["snapshot"], false, "declared in-band: {first}");
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("second page")
+        .to_string();
+
+    // A racing writer: one row backdated BEFORE the cursor, one AFTER.
+    {
+        let conn = ai_memory::db::open(&db_path).expect("open");
+        ai_memory::db::insert(&conn, &mem("backdated", "2026-01-01T00:00:00+00:00"))
+            .expect("insert backdated");
+        ai_memory::db::insert(&conn, &mem("later", "2026-03-01T00:00:00+00:00"))
+            .expect("insert later");
+    }
+    let mut rest = Vec::new();
+    let mut cursor = Some(cursor);
+    while let Some(c) = cursor.take() {
+        let (status, page) = get(&router, &format!("/api/v1/export?limit=2&cursor={c}")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        rest.extend(ids_of(&page));
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+    }
+    assert!(
+        !rest.contains(&"backdated".to_string()),
+        "a live scan does not revisit: {rest:?}"
+    );
+    assert_eq!(
+        rest.iter().filter(|id| *id == "later").count(),
+        1,
+        "{rest:?}"
+    );
+    assert!(
+        rest.contains(&"m-2".to_string()) && rest.contains(&"m-3".to_string()),
+        "{rest:?}"
+    );
+}

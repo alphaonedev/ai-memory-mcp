@@ -70,6 +70,7 @@ pub fn memories_page(
     cursor: Option<&ExportCursor>,
     limit: usize,
     as_of: DateTime<Utc>,
+    namespace: Option<&str>,
 ) -> Result<ExportMemoriesPage> {
     let lv = crate::models::lifecycle_visible_clause("");
     let after = if cursor.is_some() {
@@ -77,14 +78,23 @@ pub fn memories_page(
     } else {
         ""
     };
+    // #3427 — the namespace scope is a WHERE predicate on the same query the
+    // walk orders by, never a post-filter: a scoped page is exactly the
+    // scoped rows in key order, and the page ceiling counts scoped rows.
+    let ns = if namespace.is_some() {
+        "AND namespace = :ns"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT * FROM memories \
-         WHERE (expires_at IS NULL OR expires_at > :as_of) {lv} {after} \
+         WHERE (expires_at IS NULL OR expires_at > :as_of) {lv} {after} {ns} \
          ORDER BY created_at ASC, id ASC \
          LIMIT :lim"
     );
     let as_of_s = as_of_text(as_of);
     let lim = i64::try_from(limit).context("export page limit exceeds i64")?;
+    let ns_s = namespace.map(str::to_owned);
     let mut binds: Vec<(&str, &dyn ToSql)> = vec![
         (":as_of", &as_of_s as &dyn ToSql),
         (":lim", &lim as &dyn ToSql),
@@ -92,6 +102,9 @@ pub fn memories_page(
     if let Some(c) = cursor {
         binds.push((":lc", &c.after.created_at));
         binds.push((":li", &c.after.id));
+    }
+    if let Some(n) = &ns_s {
+        binds.push((":ns", n));
     }
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(binds.as_slice(), |row| {
@@ -109,10 +122,18 @@ pub fn memories_page(
         last = Some(key);
     }
     let lower = cursor.map(|c| c.after.clone());
-    let (range, next) = close_page(lower, last, page.scope.raw_ids.len(), limit, as_of);
-    page.excluded = excluded_in_range(conn, &range, as_of)?;
+    let (range, next) = close_page(
+        lower,
+        last,
+        page.scope.raw_ids.len(),
+        limit,
+        as_of,
+        namespace,
+    );
+    page.excluded = excluded_in_range(conn, &range, as_of, namespace)?;
     page.scope.range = range;
     page.scope.as_of = as_of;
+    page.scope.namespace = namespace.map(str::to_owned);
     page.next_cursor = next;
     Ok(page)
 }
@@ -122,16 +143,23 @@ fn excluded_in_range(
     conn: &Connection,
     range: &crate::export_paging::ExportPageRange,
     as_of: DateTime<Utc>,
+    namespace: Option<&str>,
 ) -> Result<ExportExcludedCounts> {
     let mut preds: Vec<String> = Vec::new();
     let as_of_s = as_of_text(as_of);
     let q = LifecycleState::Quarantined.as_str();
     let t = LifecycleState::Tombstoned.as_str();
+    let ns_s = namespace.map(str::to_owned);
     let mut binds: Vec<(&str, &dyn ToSql)> = vec![
         (":as_of", &as_of_s as &dyn ToSql),
         (":q", &q as &dyn ToSql),
         (":t", &t as &dyn ToSql),
     ];
+    // #3427 — the excluded counts are scoped exactly like the page.
+    if let Some(n) = &ns_s {
+        preds.push("namespace = :ns".to_string());
+        binds.push((":ns", n));
+    }
     if let Some(l) = &range.lower {
         preds.push("(created_at > :lc OR (created_at = :lc AND id > :li))".to_string());
         binds.push((":lc", &l.created_at));
@@ -248,7 +276,7 @@ pub fn links_page(
         planned.push((link, plan));
     }
     let recheck = counterparts_to_recheck(&planned);
-    let alive = surviving_counterparts(conn, &recheck, scope.as_of)?;
+    let alive = surviving_counterparts(conn, &recheck, scope.as_of, scope.namespace.as_deref())?;
     Ok(finalize_edges(planned, survivors, &alive))
 }
 
@@ -257,6 +285,7 @@ fn surviving_counterparts(
     conn: &Connection,
     ids: &[String],
     as_of: DateTime<Utc>,
+    namespace: Option<&str>,
 ) -> Result<HashSet<String>> {
     let mut alive = HashSet::new();
     if ids.is_empty() {
@@ -264,14 +293,28 @@ fn surviving_counterparts(
     }
     let ids_json = serde_json::to_string(ids)?;
     let as_of_s = as_of_text(as_of);
+    // #3427 — a counterpart outside the namespace scope is not carried by
+    // the export, so it does not survive: its edge is withheld.
+    let ns = if namespace.is_some() {
+        "AND namespace = :ns"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT * FROM memories \
          WHERE id IN (SELECT value FROM json_each(:ids)) \
-           AND (expires_at IS NULL OR expires_at > :as_of) {lv}",
+           AND (expires_at IS NULL OR expires_at > :as_of) {lv} {ns}",
         lv = crate::models::lifecycle_visible_clause(""),
     );
+    let ns_s = namespace.map(str::to_owned);
+    let mut binds: Vec<(&str, &dyn ToSql)> = vec![
+        (":ids", &ids_json as &dyn ToSql),
+        (":as_of", &as_of_s as &dyn ToSql),
+    ];
+    if let Some(n) = &ns_s {
+        binds.push((":ns", n));
+    }
     let mut stmt = conn.prepare(&sql)?;
-    let binds: [(&str, &dyn ToSql); 2] = [(":ids", &ids_json), (":as_of", &as_of_s)];
     let rows = stmt.query_map(binds.as_slice(), super::row_to_memory_scan)?;
     for row in rows {
         if let Some(mem) = row?

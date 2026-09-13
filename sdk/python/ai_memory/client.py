@@ -439,7 +439,9 @@ class AiMemoryClient:
         """
         return self._request("GET", "/api/v1/export")
 
-    def export_pages(self, limit: int | None = None) -> Iterator[dict[str, Any]]:
+    def export_pages(
+        self, limit: int | None = None, *, namespace: str | None = None
+    ) -> Iterator[dict[str, Any]]:
         """Yield every page of ``GET /api/v1/export?limit=&cursor=`` in order.
 
         Each page is a full export body (``memories``, ``links``, ``count``,
@@ -451,7 +453,9 @@ class AiMemoryClient:
         """
         cursor: str | None = None
         while True:
-            params: dict[str, Any] = {"limit": limit, "cursor": cursor}
+            # #3427 — ``namespace`` scopes the walk; the daemon pins it in
+            # the cursor and echoes it as ``namespace`` on every page.
+            params: dict[str, Any] = {"limit": limit, "cursor": cursor, "namespace": namespace}
             if limit is None and cursor is None:
                 # An explicit paging parameter is what selects paged mode.
                 params["limit"] = DEFAULT_EXPORT_PAGE_ROWS

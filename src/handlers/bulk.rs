@@ -960,7 +960,21 @@ pub async fn bulk_create(
             continue;
         }
         if let Err(e) = validate::RequestValidator::validate_create(body) {
-            ledger.reject(index, &e.field, &e.to_string());
+            // #3427 — a `validate_create` failure IS a validation failure by
+            // construction: classify it as VALIDATION_FAILED (400) instead of
+            // text-matching the message (an `invalid kind '…'` refusal used
+            // to fall through to INTERNAL_ERROR).
+            ledger.reject_class(
+                index,
+                &e.field,
+                crate::handlers::errors::BulkRowErrorClass {
+                    code: crate::errors::error_codes::VALIDATION_FAILED,
+                    label: crate::handlers::errors::VALIDATION_FAILED_LABEL,
+                    status: StatusCode::BAD_REQUEST,
+                    retryable: false,
+                },
+                &e.to_string(),
+            );
             continue;
         }
         // #2725 (CB-23) — parse the per-row `on_conflict` disposition up front,
@@ -971,7 +985,19 @@ pub async fn bulk_create(
             match OnConflictMode::parse(body.on_conflict.as_deref().unwrap_or("error")) {
                 Ok(m) => m,
                 Err(msg) => {
-                    ledger.reject(index, ON_CONFLICT, &msg);
+                    // #3427 — an unknown `on_conflict` token is a validation
+                    // failure, never an internal error.
+                    ledger.reject_class(
+                        index,
+                        ON_CONFLICT,
+                        crate::handlers::errors::BulkRowErrorClass {
+                            code: crate::errors::error_codes::VALIDATION_FAILED,
+                            label: crate::handlers::errors::VALIDATION_FAILED_LABEL,
+                            status: StatusCode::BAD_REQUEST,
+                            retryable: false,
+                        },
+                        &msg,
+                    );
                     continue;
                 }
             };

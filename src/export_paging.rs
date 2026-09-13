@@ -92,6 +92,10 @@ pub struct ExportCursor {
     pub after: ExportKey,
     /// Expiry cutoff of the whole walk.
     pub as_of: DateTime<Utc>,
+    /// #3427 — the namespace scope the walk was started with (`None` = the
+    /// whole corpus). Pinned in the cursor so a page can never be served
+    /// under a different scope than the one the operator asked for.
+    pub namespace: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,6 +105,9 @@ struct CursorWire {
     c: String,
     i: String,
     a: String,
+    /// #3427 — namespace scope; absent on an unscoped walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n: Option<String>,
 }
 
 /// Why a presented cursor was refused (rendered into a 400 body).
@@ -132,6 +139,7 @@ impl ExportCursor {
             a: self
                 .as_of
                 .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            n: self.namespace.clone(),
         };
         let bytes = serde_json::to_vec(&wire)
             .map_err(|e| ExportCursorError(format!("cursor encode failed: {e}")))?;
@@ -172,12 +180,20 @@ impl ExportCursor {
         if as_of > now + chrono::Duration::seconds(MAX_AS_OF_SKEW_SECS) {
             return Err(ExportCursorError("cursor cutoff is in the future".into()));
         }
+        if let Some(ns) = &wire.n
+            && crate::validate::validate_namespace(ns).is_err()
+        {
+            return Err(ExportCursorError(
+                "cursor namespace scope is malformed".into(),
+            ));
+        }
         Ok(Self {
             after: ExportKey {
                 created_at: wire.c,
                 id: wire.i,
             },
             as_of,
+            namespace: wire.n,
         })
     }
 }
@@ -228,6 +244,7 @@ pub fn resolve_mode(
     cursor: Option<&str>,
     max_page_size: usize,
     now: DateTime<Utc>,
+    namespace: Option<&str>,
 ) -> Result<ExportMode, ExportModeError> {
     let max = max_page_size.max(1);
     if limit.is_none() && cursor.is_none() {
@@ -245,6 +262,18 @@ pub fn resolve_mode(
         .map(|raw| ExportCursor::decode(raw, now))
         .transpose()
         .map_err(ExportModeError::Cursor)?;
+    // #3427 — a cursor minted under one namespace scope cannot continue a
+    // walk under another: the operator would receive rows outside the scope
+    // they asked for, with a 200. Refused, never widened or narrowed.
+    if let Some(c) = &cursor
+        && c.namespace.as_deref() != namespace
+    {
+        return Err(ExportModeError::Cursor(ExportCursorError(
+            "cursor was minted under a different namespace scope; restart the walk with the \
+             scope you want (or continue it with the scope it was started with)"
+                .into(),
+        )));
+    }
     let as_of = cursor.as_ref().map_or(now, |c| c.as_of);
     Ok(ExportMode::Paged {
         cursor,
@@ -282,6 +311,10 @@ pub struct ExportPageScope {
     pub range: ExportPageRange,
     /// Expiry cutoff of the walk.
     pub as_of: DateTime<Utc>,
+    /// #3427 — the namespace scope (`None` = whole corpus). A counterpart
+    /// outside the scope is not carried by the export, so its edge is
+    /// withheld like any other dangling edge.
+    pub namespace: Option<String>,
     /// Ids of EVERY row the page query returned, including rows the decrypt
     /// projection then skipped.
     pub raw_ids: Vec<String>,
@@ -464,6 +497,7 @@ pub fn close_page(
     fetched: usize,
     limit: usize,
     as_of: DateTime<Utc>,
+    namespace: Option<&str>,
 ) -> (ExportPageRange, Option<ExportCursor>) {
     match last {
         Some(last) if fetched >= limit => (
@@ -471,7 +505,11 @@ pub fn close_page(
                 lower,
                 upper: Some(last.clone()),
             },
-            Some(ExportCursor { after: last, as_of }),
+            Some(ExportCursor {
+                after: last,
+                as_of,
+                namespace: namespace.map(str::to_owned),
+            }),
         ),
         _ => (ExportPageRange { lower, upper: None }, None),
     }
@@ -524,6 +562,7 @@ mod tests {
         let c = ExportCursor {
             after: key("2026-01-01T00:00:00.000001Z", "m-1"),
             as_of: now(),
+            namespace: None,
         };
         let raw = c.encode().expect("encode");
         assert_eq!(ExportCursor::decode(&raw, now()), Ok(c));
@@ -589,14 +628,14 @@ mod tests {
     fn mode_resolution() {
         let n = now();
         assert_eq!(
-            resolve_mode(None, None, 1000, n),
+            resolve_mode(None, None, 1000, n, None),
             Ok(ExportMode::Legacy {
                 ceiling: 1000,
                 as_of: n
             })
         );
         assert_eq!(
-            resolve_mode(Some(10), None, 1000, n),
+            resolve_mode(Some(10), None, 1000, n, None),
             Ok(ExportMode::Paged {
                 cursor: None,
                 limit: 10,
@@ -604,47 +643,49 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_mode(Some(0), None, 1000, n),
+            resolve_mode(Some(0), None, 1000, n, None),
             Err(ExportModeError::LimitOutOfRange { max: 1000 })
         );
         assert_eq!(
-            resolve_mode(Some(1001), None, 1000, n),
+            resolve_mode(Some(1001), None, 1000, n, None),
             Err(ExportModeError::LimitOutOfRange { max: 1000 })
         );
         let pinned = n - chrono::Duration::hours(1);
         let raw = ExportCursor {
             after: key("c", "i"),
             as_of: pinned,
+            namespace: None,
         }
         .encode()
         .expect("encode");
         // A cursor alone pages at the ceiling and keeps the pinned cutoff.
         assert_eq!(
-            resolve_mode(None, Some(&raw), 1000, n),
+            resolve_mode(None, Some(&raw), 1000, n, None),
             Ok(ExportMode::Paged {
                 cursor: Some(ExportCursor {
                     after: key("c", "i"),
-                    as_of: pinned
+                    as_of: pinned,
+                    namespace: None,
                 }),
                 limit: 1000,
                 as_of: pinned
             })
         );
         assert!(matches!(
-            resolve_mode(None, Some("garbage"), 1000, n),
+            resolve_mode(None, Some("garbage"), 1000, n, None),
             Err(ExportModeError::Cursor(_))
         ));
     }
 
     #[test]
     fn close_page_short_page_is_the_last() {
-        let (range, next) = close_page(Some(key("a", "1")), Some(key("b", "2")), 3, 5, now());
+        let (range, next) = close_page(Some(key("a", "1")), Some(key("b", "2")), 3, 5, now(), None);
         assert_eq!(range.upper, None);
         assert_eq!(next, None);
-        let (range, next) = close_page(None, Some(key("b", "2")), 5, 5, now());
+        let (range, next) = close_page(None, Some(key("b", "2")), 5, 5, now(), None);
         assert_eq!(range.upper, Some(key("b", "2")));
         assert_eq!(next.map(|c| c.after), Some(key("b", "2")));
-        let (range, next) = close_page(None, None, 0, 5, now());
+        let (range, next) = close_page(None, None, 0, 5, now(), None);
         assert_eq!(range, ExportPageRange::default());
         assert_eq!(next, None);
     }

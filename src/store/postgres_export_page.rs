@@ -74,6 +74,7 @@ pub(crate) async fn export_memories_page(
     cursor: Option<&ExportCursor>,
     limit: usize,
     as_of: DateTime<Utc>,
+    namespace: Option<&str>,
     map_row: MapRow,
 ) -> StoreResult<ExportMemoriesPage> {
     let lower = decode_bound(cursor.map(|c| &c.after))?;
@@ -85,9 +86,18 @@ pub(crate) async fn export_memories_page(
     } else {
         ""
     };
+    // #3427 — the namespace scope is a WHERE predicate on the same ordered
+    // query, never a post-filter (a post-filter would break the page bound).
+    // `$3`/`$4` are the cursor bounds when present; the scope binds after
+    // whatever is present, so its placeholder index follows the cursor.
+    let ns = match (lower.is_some(), namespace.is_some()) {
+        (_, false) => String::new(),
+        (true, true) => "AND namespace = $5".to_string(),
+        (false, true) => "AND namespace = $3".to_string(),
+    };
     let sql = format!(
         "SELECT {cols} FROM memories \
-         WHERE (expires_at IS NULL OR expires_at > $1) {lv} {after} \
+         WHERE (expires_at IS NULL OR expires_at > $1) {lv} {after} {ns} \
          ORDER BY created_at ASC, id COLLATE \"C\" ASC \
          LIMIT $2",
         cols = MEMORY_READ_COLUMNS,
@@ -96,6 +106,9 @@ pub(crate) async fn export_memories_page(
     let mut q = sqlx::query(&sql).bind(as_of).bind(lim);
     if let Some((ts, id)) = &lower {
         q = q.bind(*ts).bind(id.as_str());
+    }
+    if let Some(n) = namespace {
+        q = q.bind(n);
     }
     let rows = q
         .fetch_all(pool)
@@ -135,10 +148,12 @@ pub(crate) async fn export_memories_page(
         rows.len(),
         limit,
         as_of,
+        namespace,
     );
-    page.excluded = excluded_in_range(pool, &range, as_of).await?;
+    page.excluded = excluded_in_range(pool, &range, as_of, namespace).await?;
     page.scope.range = range;
     page.scope.as_of = as_of;
+    page.scope.namespace = namespace.map(str::to_owned);
     page.next_cursor = next;
     Ok(page)
 }
@@ -147,9 +162,12 @@ async fn excluded_in_range(
     pool: &PgPool,
     range: &ExportPageRange,
     as_of: DateTime<Utc>,
+    namespace: Option<&str>,
 ) -> StoreResult<ExportExcludedCounts> {
     let lower = decode_bound(range.lower.as_ref())?;
     let upper = decode_bound(range.upper.as_ref())?;
+    // #3427 — the excluded counts are scoped exactly like the page
+    // (`$8` NULL = whole corpus).
     let row = sqlx::query(
         "SELECT \
             COUNT(*) FILTER (WHERE lifecycle_state = $2) AS quarantined, \
@@ -159,7 +177,8 @@ async fn excluded_in_range(
          WHERE ($4::timestamptz IS NULL \
                 OR created_at > $4 OR (created_at = $4 AND id COLLATE \"C\" > $5::text)) \
            AND ($6::timestamptz IS NULL \
-                OR created_at < $6 OR (created_at = $6 AND id COLLATE \"C\" <= $7::text))",
+                OR created_at < $6 OR (created_at = $6 AND id COLLATE \"C\" <= $7::text)) \
+           AND ($8::text IS NULL OR namespace = $8)",
     )
     .bind(as_of)
     .bind(LifecycleState::Quarantined.as_str())
@@ -168,6 +187,7 @@ async fn excluded_in_range(
     .bind(lower.as_ref().map(|(_, i)| i.as_str()))
     .bind(upper.as_ref().map(|(t, _)| *t))
     .bind(upper.as_ref().map(|(_, i)| i.as_str()))
+    .bind(namespace)
     .fetch_one(pool)
     .await
     .map_err(|e| to_store_err("export page excluded counts", e))?;
@@ -274,7 +294,14 @@ pub(crate) async fn export_links_page(
         planned.push((link, plan));
     }
     let recheck = counterparts_to_recheck(&planned);
-    let alive = surviving_counterparts(pool, &recheck, scope.as_of, map_row).await?;
+    let alive = surviving_counterparts(
+        pool,
+        &recheck,
+        scope.as_of,
+        scope.namespace.as_deref(),
+        map_row,
+    )
+    .await?;
     Ok(finalize_edges(planned, survivors, &alive))
 }
 
@@ -282,21 +309,26 @@ async fn surviving_counterparts(
     pool: &PgPool,
     ids: &[String],
     as_of: DateTime<Utc>,
+    namespace: Option<&str>,
     map_row: MapRow,
 ) -> StoreResult<HashSet<String>> {
     let mut alive = HashSet::new();
     if ids.is_empty() {
         return Ok(alive);
     }
+    // #3427 — a counterpart outside the namespace scope is not carried by
+    // the export, so it does not survive: its edge is withheld.
     let sql = format!(
         "SELECT {cols} FROM memories \
-         WHERE id = ANY($1::text[]) AND (expires_at IS NULL OR expires_at > $2) {lv}",
+         WHERE id = ANY($1::text[]) AND (expires_at IS NULL OR expires_at > $2) {lv} \
+           AND ($3::text IS NULL OR namespace = $3)",
         cols = MEMORY_READ_COLUMNS,
         lv = crate::models::lifecycle_visible_clause(""),
     );
     let rows = sqlx::query(&sql)
         .bind(ids)
         .bind(as_of)
+        .bind(namespace)
         .fetch_all(pool)
         .await
         .map_err(|e| to_store_err("export page counterparts", e))?;
