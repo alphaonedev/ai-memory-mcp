@@ -453,6 +453,28 @@ pub fn refusal_message(
     }
 }
 
+/// The refusal for a direct library caller (no `fn main()` pre-runtime
+/// phase ran) on a fleet shape whose posture nobody chose: the protections
+/// cannot be pinned from the live runtime, so the caller states the posture.
+#[must_use]
+pub fn library_caller_refusal(
+    shape: &ShapeReport,
+    below_floor: &[(&str, String, &str)],
+    unpinned: &[(&str, &str)],
+) -> String {
+    let signals = shape.present().join(", ");
+    let count = below_floor.len() + unpinned.len();
+    format!(
+        "{ISSUE_TAG}: this deployment is FLEET-shaped (signals: {signals}) and no security \
+         posture was chosen, but this process did not boot through the ai-memory binary (a \
+         direct `daemon_runtime` caller), where the posture would have been derived and every \
+         protection pinned; from the live runtime nothing can be pinned, so {count} \
+         protection(s) stay OFF. Choose on ONE line before starting: \
+         {EXPLICIT_ASI_HARD_SELECTOR} (with every pinned knob at its floor) or \
+         {EXPLICIT_STANDARD_OVERRIDE} (deliberate exception: boots, warns once, is recorded)."
+    )
+}
+
 /// Every pinned knob that is currently UNSET (off by its own default).
 #[must_use]
 pub fn unpinned_knobs() -> Vec<(&'static str, &'static str)> {
@@ -605,11 +627,7 @@ pub fn enforce_pre_open(
             if r.origin == PostureOrigin::DerivedFromShape {
                 let below = security_profile::asi_hard_below_floor();
                 let unpinned = unpinned_knobs();
-                bail!(
-                    "{} The pre-runtime derivation never ran (direct `daemon_runtime` caller?): \
-                     boot through the ai-memory binary, or set the selector explicitly.",
-                    refusal_message(&r.shape, &below, &unpinned, false)
-                );
+                bail!(library_caller_refusal(&r.shape, &below, &unpinned));
             }
             r
         }

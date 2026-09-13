@@ -13385,6 +13385,15 @@ async fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
+    // #3700 — an in-process sync daemon with explicit peers is FLEET-shaped;
+    // this lab states the deliberate `standard` exception explicitly (the
+    // library entry cannot derive/pin from the async runtime). Held under
+    // the file's env lock like every other env write in this suite.
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env write serialised by ENV_LOCK, mirroring the sibling tests.
+    unsafe {
+        std::env::set_var("AI_MEMORY_SECURITY_PROFILE", "standard");
+    }
     // Coverage: run_sync_daemon_with_shutdown + sync_cycle_once — the loop
     // body, JoinSet fanout across peers, sleep-vs-shutdown select.
     // Mirrors main.rs::cmd_sync_daemon's loop (lines 3336-3374 of v0.6.3).
@@ -13604,6 +13613,15 @@ async fn test_daemon_serve_http_with_shutdown_future_runs_with_custom_cleanup() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
+    // #3700 — an in-process sync daemon with explicit peers is FLEET-shaped;
+    // this lab states the deliberate `standard` exception explicitly (the
+    // library entry cannot derive/pin from the async runtime). Held under
+    // the file's env lock like every other env write in this suite.
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env write serialised by ENV_LOCK, mirroring the sibling tests.
+    unsafe {
+        std::env::set_var("AI_MEMORY_SECURITY_PROFILE", "standard");
+    }
     // Coverage: run_sync_daemon_with_shutdown_using_client — the variant
     // of run_sync_daemon_with_shutdown that takes a caller-built
     // reqwest::Client. Production main.rs::cmd_sync_daemon constructs an
