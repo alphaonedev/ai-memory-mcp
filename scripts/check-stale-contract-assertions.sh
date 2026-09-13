@@ -225,17 +225,37 @@ PY
 }
 
 if [ "$SELF_TEST" -eq 1 ]; then
-  # Negative control (#3648): the commit that turned "Ollama pull failed (…)"
-  # into a bounded ProviderError, while an untouched test still asserted the
-  # old text. The gate must flag that range. Positive control: a range whose
-  # literal change touched every asserting test must pass.
-  neg=$(git diff 1fd7e29d5~1..1fd7e29d5 2>/dev/null | run_check 1fd7e29d5 1fd7e29d5~1); nrc=$?
+  # SELF-CONTAINED FIXTURES. The previous self-test drove real chain-12
+  # candidate commits (1fd7e29d5 #3648, 74c87d599 the repair). Neither is an
+  # ancestor of release/v1.0.0, so on a clean CI clone those objects do not
+  # exist and the self-test cannot run -- a gate whose self-test reds on the
+  # published head cannot be a required context. Fixtures are synthesised here.
+  T=.local-runs/stale-selftest; rm -rf "$T"; mkdir -p "$T" || { echo "self-test: cannot create $T"; exit 1; }
+  (
+    cd "$T" || exit 1
+    git init -q . && git config user.name g && git config user.email g@x
+    mkdir -p src tests
+    printf 'pub fn e() -> String { "Ollama pull failed (boom)".into() }\n' > src/p.rs
+    printf 'fn t() { assert!(e().contains("Ollama pull failed")); }\n'     > tests/p.rs
+    git add -A && git commit -q -m "base"
+    # (1) src literal changes, the asserting test is NOT touched -> MUST flag
+    printf 'pub fn e() -> String { ProviderError::Pull.to_string() }\n' > src/p.rs
+    git commit -q -am "fix: bounded ProviderError"
+    # (2) the repair: src changes AND every asserting test changes -> MUST pass
+    printf 'pub fn e() -> String { ProviderError::Pull2.to_string() }\n' > src/p.rs
+    printf 'fn t() { assert!(e().contains("provider pull")); }\n'        > tests/p.rs
+    git commit -q -am "fix: bounded ProviderError and its pins"
+  ) || { echo "stale-contract-assertions self-test: FAIL — fixture setup"; rm -rf "$T"; exit 1; }
+  neg=$( cd "$T" && git diff HEAD~2..HEAD~1 | run_check HEAD~1 HEAD~2 ); nrc=$?
   if [ $nrc -ne 1 ] || ! printf '%s' "$neg" | grep -q 'Ollama pull failed'; then
-    echo "stale-contract-assertions self-test: FAIL — did not flag the #3648 range (rc=$nrc): $neg"; exit 1
+    echo "stale-contract-assertions self-test: FAIL — did not flag the stale pin (rc=$nrc): $neg"; rm -rf "$T"; exit 1
   fi
-  pos=$(git diff 74c87d599~1..74c87d599 2>/dev/null | run_check 74c87d599 74c87d599~1); prc=$?
-  if [ $prc -ne 0 ]; then echo "stale-contract-assertions self-test: FAIL — flagged the repair commit 74c87d599: $pos"; exit 1; fi
-  echo "stale-contract-assertions self-test: PASS (flags the #3648 stale pin; passes its repair)"; exit 0
+  pos=$( cd "$T" && git diff HEAD~1..HEAD | run_check HEAD HEAD~1 ); prc=$?
+  if [ $prc -ne 0 ]; then
+    echo "stale-contract-assertions self-test: FAIL — flagged the repair commit: $pos"; rm -rf "$T"; exit 1
+  fi
+  rm -rf "$T"
+  echo "stale-contract-assertions self-test: PASS (flags a stale pin; passes its repair; fixtures synthesised, no history dependency)"; exit 0
 fi
 
 if [ "$STAGED" -eq 1 ]; then out=$(git diff --cached | run_check WORKTREE WORKTREE); rc=$?
