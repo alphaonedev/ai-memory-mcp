@@ -273,9 +273,12 @@ fn resolve_mcp_agent_id(arguments: &Value, mcp_client: Option<&str>) -> String {
         .filter(|id| crate::validate::validate_agent_id(id).is_ok())
         .map(str::to_string)
         .unwrap_or_else(|| {
-            mcp_client
-                .map(|c| format!("ai:{c}"))
-                .unwrap_or_else(|| "anonymous".into())
+            // #3393 — the fallback is the canonical durable derivation
+            // (`ai:<sanitised client>@<hostname>`, env first), never a raw
+            // client-chosen string prefixed with `ai:`: the audit actor
+            // must be an identity, not a label the client typed.
+            crate::identity::resolve_agent_id(None, mcp_client)
+                .unwrap_or_else(|_| "anonymous".into())
         })
 }
 
@@ -2827,7 +2830,9 @@ fn dispatch_memory_quota_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 /// #1415 signed_events row carry the authenticated-via-MCP-
 /// handshake caller identity rather than a body-claimed one.
 fn dispatch_memory_capture_turn(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_capture_turn(ctx.conn, ctx.arguments, ctx.mcp_client)
+    // #3393 — the RESOLVED authority principal, never the raw handshake
+    // `clientInfo.name` (which the row could then never be read back by).
+    capture_turn::handle_capture_turn_mcp(ctx.conn, ctx.arguments, ctx.authority)
 }
 
 fn dispatch_memory_check_agent_action(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -8486,15 +8491,33 @@ mod tests {
     /// #3204 item 4 — a reserved sentinel must not stamp the audit actor.
     #[test]
     fn resolve_mcp_agent_id_rejects_reserved_sentinel_3204() {
+        // #3393 — the synthesized fallback is the canonical durable
+        // `ai:<client>@<hostname>` derivation, never the raw `ai:<client>`.
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
         let forged = resolve_mcp_agent_id(&json!({"agent_id": "daemon"}), Some("claude"));
-        assert_eq!(
-            forged, "ai:claude",
-            "reserved sentinel must fall through to the synthesized client id"
+        assert!(
+            forged.starts_with("ai:claude@"),
+            "reserved sentinel must fall through to the synthesized client id: {forged}"
         );
+        crate::validate::validate_agent_id(&forged).expect("synthesized id is valid");
         let ok = resolve_mcp_agent_id(&json!({"agent_id": "alice"}), None);
         assert_eq!(ok, "alice");
         let newline = resolve_mcp_agent_id(&json!({"agent_id": "a\nb"}), Some("claude"));
-        assert_eq!(newline, "ai:claude");
+        assert!(newline.starts_with("ai:claude@"), "{newline}");
+    }
+
+    /// #3393 — a client name the id grammar forbids never reaches the audit
+    /// actor raw (control characters were a log-injection vector, #3204).
+    #[test]
+    fn resolve_mcp_agent_id_never_stamps_raw_client_name_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let actor = resolve_mcp_agent_id(&json!({}), Some("bad name\nwith newline"));
+        assert!(!actor.contains('\n') && !actor.contains(' '), "{actor}");
+        crate::validate::validate_agent_id(&actor).expect("actor is a valid id");
+        let env = crate::identity::test_agent_id::AgentIdOverride::set("ai:env-owner");
+        let actor = resolve_mcp_agent_id(&json!({}), Some("claude"));
+        assert_eq!(actor, "ai:env-owner", "the configured identity wins");
+        drop(env);
     }
 
     #[test]

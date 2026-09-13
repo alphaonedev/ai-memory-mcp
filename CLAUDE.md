@@ -868,7 +868,11 @@ with agent registration (Task 1.3, upcoming).
    `metadata.agent_id` embedded in an MCP store request)
 2. `AI_MEMORY_AGENT_ID` environment variable
 3. (MCP only) Value captured from `initialize.clientInfo.name` →
-   `ai:<client>@<hostname>` (**durable**; pid-free since #1720 B1)
+   `ai:<client>@<hostname>` (**durable**; pid-free since #1720 B1). Since
+   #3393 `memory_capture_turn` resolves its caller through this same ladder
+   (the #3549 authority principal) like every other tool — the raw handshake
+   string is never stamped, and the tool envelope names the `agent_id` it
+   attributed the row to.
 4. `host:<hostname>` (**durable** host-scoped default; pid-free since #1720 B1)
 5. `anonymous:pid-<pid>-<uuid8>` (ephemeral fallback if hostname unavailable)
 
