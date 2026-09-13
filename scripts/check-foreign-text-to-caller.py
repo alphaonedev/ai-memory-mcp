@@ -878,26 +878,38 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             else:
                 arm = expr_until(body, arm_start, stop_tokens=(',\n',))
             variants = [am.group(1)] + [v for v in re.findall(r'StoreError::([A-Z][A-Za-z0-9]*)', am.group(0))[1:]]
-            # rendering shape
+            # rendering shape: the RESPONSE text expression of the arm, judged like any other sink.
+            # A pattern binding (`{ detail }`, `{ detail: d }`) maps to the variant's field; `e` maps to
+            # every text field of the variant. An arm that renders through anything but a declared typed
+            # mapper (redact_*, a bare field, a prefix wrapper) is judged by where the field's text came from.
             tuples = list(re.finditer(r'\(\s*StatusCode::[A-Z_]+\s*,\s*', arm))
             if not tuples: continue
             tm = tuples[-1]; te = find_matching(arm, tm.start(), '(', ')')
             resp_expr = arm[tm.end():te] if te > 0 else ''
-            unsanitised = re.search(r'\be\.to_string\(\)|format!\(', resp_expr) and not CLEAN_RE.search(resp_expr.replace('StatusCode::', ''))
-            if not unsanitised: continue
+            if classify_expr(resp_expr, 'value') is CLEAN: continue           # a constant / msg:: const / a typed mapper alone
+            bound = {}                                                           # binding name -> field name
+            for pm in re.finditer(r'\{([^}]*)\}', am.group(0)):
+                for part in split_args(pm.group(1)):
+                    part = part.strip()
+                    if not part or part == '..': continue
+                    mm = re.match(r'([a-z_][a-z0-9_]*)\s*(?::\s*([a-z_][a-z0-9_]*))?$', part)
+                    if mm: bound[mm.group(2) or mm.group(1)] = mm.group(1)
+            rendered = rendered_idents(resp_expr)
+            spelled = 'e.to_string()' if 'e' in rendered else ', '.join(sorted(rendered)) or resp_expr.strip()[:40]
             for v in variants:
                 tf = enum_fields.get(v, [])
                 if not tf: continue
-                for fld in tf:
+                fields = set(tf) if 'e' in rendered else {bound[n] for n in rendered if n in bound and bound[n] in tf}
+                for fld in sorted(fields):
                     r = field_taint(v, fld, 0, [f'StoreError::{v}.{fld}'])
                     key = f'{p}:store_err_to_response:funnel-arm:StoreError::{v}.{fld}'
                     if r:
                         add('FAIL', key, p, line_of(text, g.body_start + arm_start), 'store_err_to_response',
-                            f'funnel arm renders StoreError::{v} UNSANITISED (e.to_string()) and its text field `{fld}` is FOREIGN: {r.why}. '
+                            f'funnel arm renders StoreError::{v} through `{resp_expr.strip()[:60]}` and its text field `{fld}` is FOREIGN: {r.why}. '
                             f'A masked value (redact_*) is still foreign — render an allowlisted projection or drop the detail from the body (operator log keeps it).')
                     else:
                         add('INFO', key, p, line_of(text, g.body_start + arm_start), 'store_err_to_response',
-                            f'funnel arm renders StoreError::{v} unsanitised; text field `{fld}` walked to own-code constructions only (caller-safe by walk).')
+                            f'funnel arm renders StoreError::{v} unsanitised ({spelled}); text field `{fld}` walked to own-code constructions only (caller-safe by walk).')
 
     # ----------------------------------------------------------------- allowlist
     allow = {}
@@ -962,11 +974,29 @@ pub enum StoreError {
     BackendUnavailable { detail: String },
     Stopped { issued_by: String },
     SchemaAheadOfBinary { detail: String },
+    SchemaStampInvalid { detail: String },
+    SchemaVersionPoisoned { detail: String },
+    SchemaHatchMismatch { detail: String },
 }
 pub type StoreResult<T> = Result<T, StoreError>;
 impl From<crate::storage::schema_guard::SchemaAheadOfBinary> for StoreError {
     fn from(e: crate::storage::schema_guard::SchemaAheadOfBinary) -> Self {
         Self::SchemaAheadOfBinary { detail: e.detail }
+    }
+}
+impl From<crate::storage::schema_guard::SchemaStampZeroed> for StoreError {
+    fn from(e: crate::storage::schema_guard::SchemaStampZeroed) -> Self {
+        Self::SchemaStampInvalid { detail: e.detail }
+    }
+}
+impl From<crate::storage::schema_guard::SchemaPoisoned> for StoreError {
+    fn from(e: crate::storage::schema_guard::SchemaPoisoned) -> Self {
+        Self::SchemaVersionPoisoned { detail: e.detail }
+    }
+}
+impl From<crate::storage::schema_guard::SchemaHatch> for StoreError {
+    fn from(e: crate::storage::schema_guard::SchemaHatch) -> Self {
+        Self::SchemaHatchMismatch { detail: e.detail }
     }
 }
 ''')
@@ -979,11 +1009,26 @@ pub fn evaluate(observed: i64, target: &str) -> Result<(), SchemaAheadOfBinary> 
     let detail = render(observed, target);
     Err(SchemaAheadOfBinary { detail })
 }
+pub struct SchemaStampZeroed { pub detail: String }
+pub struct SchemaPoisoned { pub detail: String }
+pub struct SchemaHatch { pub detail: String }
+pub fn evaluate_stamp(observed: i64, target: &str) -> Result<(), SchemaStampZeroed> {
+    Err(SchemaStampZeroed { detail: render(observed, target) })
+}
+pub fn evaluate_poison(observed: i64, target: &str) -> Result<(), SchemaPoisoned> {
+    Err(SchemaPoisoned { detail: render(observed, target) })
+}
+pub fn evaluate_hatch(observed: i64, target: &str) -> Result<(), SchemaHatch> {
+    Err(SchemaHatch { detail: render(observed, target) })
+}
 ''')
     _write(root, 'src/storage/connection.rs', '''
 pub fn open(db_path: &std::path::Path) -> anyhow::Result<()> {
     let target = db_path.display().to_string();
     crate::storage::schema_guard::evaluate(99, &target)?;
+    crate::storage::schema_guard::evaluate_stamp(0, &target)?;
+    crate::storage::schema_guard::evaluate_poison(9999, &target)?;
+    crate::storage::schema_guard::evaluate_hatch(98, &target)?;
     Ok(())
 }
 ''')
@@ -1013,6 +1058,13 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         }
         StoreError::Stopped { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
         StoreError::SchemaAheadOfBinary { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        // THE CONDUCTOR'S CHECK — the schema-guard 503 "fixed" by masking. The label is the DSN
+        // minus only its userinfo password; redact_url_password leaves host, user, db and every
+        // query parameter in the body. Both spellings must stay RED.
+        StoreError::SchemaStampInvalid { .. } => (StatusCode::SERVICE_UNAVAILABLE, crate::logging::redact_url_password(&e.to_string())),
+        StoreError::SchemaVersionPoisoned { detail } => (StatusCode::SERVICE_UNAVAILABLE, crate::logging::redact_urls_in_message(&detail)),
+        // a bare destructured field, no wrapper at all
+        StoreError::SchemaHatchMismatch { detail } => (StatusCode::SERVICE_UNAVAILABLE, detail),
     };
     (status, Json(json!({"error": msg}))).into_response()
 }
@@ -1211,6 +1263,9 @@ def self_test(scratch):
     expect(has('src/errors.rs', ':from:memory-error:db'), 'From<rusqlite::Error> -> MemoryError::DatabaseError(e.to_string())')
     expect(has('src/subscriptions.rs', ':send:dlq-record:http'), "receiver's ack field persisted into subscription_dlq.last_error")
     expect(has('src/handlers/postgres_gate.rs', 'funnel-arm:StoreError::SchemaAheadOfBinary.detail'), 'funnel arm renders a variant whose text field walks back to an operator path (schema-guard 503)')
+    expect(has('src/handlers/postgres_gate.rs', 'funnel-arm:StoreError::SchemaStampInvalid.detail'), "CONDUCTOR'S CHECK: the schema-guard arm wrapped in redact_url_password(&e.to_string()) stays RED")
+    expect(has('src/handlers/postgres_gate.rs', 'funnel-arm:StoreError::SchemaVersionPoisoned.detail'), "CONDUCTOR'S CHECK: { detail } => redact_urls_in_message(&detail) stays RED")
+    expect(has('src/handlers/postgres_gate.rs', 'funnel-arm:StoreError::SchemaHatchMismatch.detail'), 'a bare destructured field rendered without any wrapper stays RED')
     # the self-check the Conductor asked for: masking must NOT be a passing state
     coord = [x for x in findings if x['file'] == 'src/handlers/coord.rs' and x['sev'] == 'FAIL']
     expect(any('redact_url_password' in x['text'] for x in coord), 'MASKER CONTROL: redact_url_password(&e.to_string()) stays RED')
