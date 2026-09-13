@@ -102,6 +102,10 @@ pub mod rules_store;
 // are CLI-reachable; federation::sync + hooks::executor use
 // `check_governed` because they are daemon/MCP-only) consults it.
 pub mod wire_check;
+// #3660 — read-audit delivery evidence: the engaged-read `governance.check`
+// append is direct and unqueued; this module counts the gap honestly and
+// carries the `AI_MEMORY_READ_AUDIT_STRICT` enterprise policy.
+pub mod read_audit;
 // #963 — typed governance refusal envelope. Currently exposed as a
 // self-contained module + unit-tested in isolation; the wire-in to
 // `GovernanceDecision::Deny` lands in the follow-up commit per the

@@ -1281,7 +1281,12 @@ pub fn check_agent_action_cached(
 
 /// v0.7.0 #697 — translate a `(action, decision)` into the forensic
 /// log shape and emit. No-op when the forensic sink is uninitialised.
-fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decision) {
+///
+/// #3660 — returns `true` only when the forensic sink is ENABLED and
+/// accepted the row, so a caller whose chain append failed can say where
+/// the evidence actually lives instead of assuming. A disabled sink is
+/// `false`: "no error" is not "recorded".
+fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decision) -> bool {
     let (decision_str, rule_id) = match decision {
         Decision::Allow => ("allow", String::new()),
         Decision::Refuse { rule_id, .. } => ("refuse", rule_id.clone()),
@@ -1295,13 +1300,13 @@ fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decis
         "action": action,
         "decision_detail": decision,
     });
-    crate::governance::audit::record_decision(
+    crate::governance::audit::record_decision_checked(
         agent_id,
         decision_str,
         action.kind(),
         &rule_id,
         payload,
-    );
+    )
 }
 
 /// Append a `governance.check` row to `signed_events`. Helper so
@@ -1432,12 +1437,21 @@ pub fn decision_wire_parts(decision: &Decision) -> (&'static str, &str, &str) {
 ///   row. Default deployments pay nothing, so the recall hot path stays
 ///   free (a per-read `signed_events` INSERT would turn every read into a
 ///   serialized WAL write).
-/// * **Best-effort audit (NON-FATAL).** When read rules exist, the
-///   decision is appended to `signed_events`, but an append failure is
-///   logged and the read PROCEEDS — read availability is never coupled to
-///   audit-sink liveness (the SPLIT fail-posture; the deferred-audit DLQ
-///   keeps the trail recoverable). This is why it does NOT reuse
-///   `check_agent_action`'s fatal `emit_check_event(...)?`.
+/// * **Best-effort audit (NON-FATAL) — with a MEASURED gap (#3660).** When
+///   read rules exist, the decision is appended to `signed_events`, but an
+///   append failure is logged and the read PROCEEDS — read availability is
+///   never coupled to audit-sink liveness (the SPLIT fail-posture). This is
+///   why it does NOT reuse `check_agent_action`'s fatal
+///   `emit_check_event(...)?`. **A decision whose append fails is NOT
+///   queued, spooled or retried**: the deferred-audit DLQ is the write
+///   pre-hook's refusal-only mechanism and is not on this call path (the
+///   pre-#3660 comment claiming "DLQ-backed" recovery was wrong). Its only
+///   residence is the best-effort forensic file, if that sink is enabled.
+///   Every such gap is counted (`governance::read_audit`, `/metrics`
+///   `ai_memory_governance_read_audit_*`, `/health`
+///   `governance.read_audit_delivery`), and the enterprise policy knob
+///   `AI_MEMORY_READ_AUDIT_STRICT=1` selects the stricter behaviour: refuse
+///   the read instead.
 /// * **Fail-CLOSED on a blocking verdict** (`Refuse` / `Escalate`) and on a
 ///   rule-LOAD error — unless the operator opted into
 ///   `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (same knob the write
@@ -1456,6 +1470,32 @@ pub fn gate_read(
     agent_id: &str,
     action: &AgentAction,
 ) -> std::result::Result<(), crate::storage::GovernanceRefusal> {
+    gate_read_with_policy(
+        conn,
+        agent_id,
+        action,
+        crate::governance::read_audit::strict_policy_from_env(),
+    )
+}
+
+/// #3660 — [`gate_read`] with the read-audit policy injected: `strict_audit
+/// = true` refuses a read whose engaged decision could not be chain-logged
+/// (the `AI_MEMORY_READ_AUDIT_STRICT` posture); `false` is the documented
+/// best-effort posture. Split out so the policy is testable without
+/// touching the process environment.
+///
+/// # Errors
+///
+/// As [`gate_read`], plus — under `strict_audit` — a refusal carrying
+/// [`crate::governance::read_audit::STRICT_REFUSAL_REASON`] when the
+/// `governance.check` append fails.
+pub fn gate_read_with_policy(
+    conn: &Connection,
+    agent_id: &str,
+    action: &AgentAction,
+    strict_audit: bool,
+) -> std::result::Result<(), crate::storage::GovernanceRefusal> {
+    use crate::governance::read_audit;
     // Load the enabled `read_action` rules. A load error is a governance
     // outage: fail CLOSED unless the operator opted into the legacy
     // permissive posture (parity with the write pre-hook).
@@ -1481,13 +1521,42 @@ pub fn gate_read(
     }
 
     let decision = engine.evaluate(agent_id, action);
+    read_audit::record_evaluated();
 
-    // Best-effort audit — a read is NEVER blocked by an audit-append
-    // failure (SPLIT fail-posture; the DLQ keeps the trail recoverable).
-    if let Err(e) = emit_check_event(conn, agent_id, action, &decision) {
-        tracing::warn!("read-gate: audit append failed (read proceeds; DLQ-backed): {e:#}");
+    // Best-effort audit — under the default policy a read is NEVER blocked
+    // by an audit-append failure (SPLIT fail-posture). #3660: there is NO
+    // DLQ behind this append — `emit_check_event` is a direct
+    // `append_signed_event`, and the deferred-audit queue neither sees read
+    // decisions nor is reachable from here. A failed append is a permanent
+    // evidence gap in `signed_events`; count it, name where the evidence
+    // actually went, and let the strict policy refuse instead if the
+    // deployment asked for that.
+    let chain = emit_check_event(conn, agent_id, action, &decision);
+    let forensic_accepted = emit_forensic_decision(agent_id, action, &decision);
+    match chain {
+        Ok(()) => read_audit::record_chain_appended(),
+        Err(e) => {
+            let residence = read_audit::record_chain_append_failed(forensic_accepted);
+            if strict_audit {
+                read_audit::record_strict_refusal();
+                tracing::error!(
+                    residence = residence.as_str(),
+                    "read-gate: governance.check append failed; read REFUSED under \
+                     AI_MEMORY_READ_AUDIT_STRICT (#3660): {e:#}"
+                );
+                return Err(crate::storage::GovernanceRefusal {
+                    reason: read_audit::STRICT_REFUSAL_REASON.to_string(),
+                });
+            }
+            tracing::warn!(
+                residence = residence.as_str(),
+                "read-gate: governance.check append failed; read proceeds (best-effort \
+                 policy). This decision is NOT in signed_events and is NOT queued, spooled \
+                 or retried — its only residence is `{}` (#3660): {e:#}",
+                residence.as_str()
+            );
+        }
     }
-    emit_forensic_decision(agent_id, action, &decision);
 
     if decision.is_blocking() {
         let reason = match &decision {
@@ -3453,6 +3522,145 @@ mod tests {
         assert!(
             n >= 1,
             "an engaged read gate must append a governance.check audit row"
+        );
+    }
+
+    // ---- #3660 — forced signed-event append failure ------------------------
+
+    /// Make every `signed_events` INSERT fail so `emit_check_event` errors
+    /// exactly the way a wedged / read-only audit store would.
+    fn break_signed_events(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TRIGGER fail_3660 BEFORE INSERT ON signed_events \
+             BEGIN SELECT RAISE(ABORT, 'forced append failure #3660'); END",
+        )
+        .expect("install failing trigger");
+    }
+
+    fn check_rows(conn: &Connection, agent: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+            rusqlite::params![GOVERNANCE_CHECK_EVENT_TYPE, agent],
+            |r| r.get(0),
+        )
+        .expect("count audit rows")
+    }
+
+    #[test]
+    fn gate_read_append_failure_proceeds_and_counts_the_gap_3660() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-warn-3660",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "warn",
+            true,
+        );
+        break_signed_events(&conn);
+        let before = crate::governance::read_audit::delivery_at(0, false);
+        // Default (best-effort) policy: the read proceeds ...
+        gate_read_with_policy(&conn, "ai:gap-3660", &read_act("recall", None, None), false)
+            .expect("best-effort policy: an append failure must not block the read");
+        // ... the chain holds NOTHING for it ...
+        assert_eq!(check_rows(&conn, "ai:gap-3660"), 0);
+        // ... and the gap is measured, with its residence, not wished away.
+        let after = crate::governance::read_audit::delivery_at(0, false);
+        assert_eq!(after.evaluated_total, before.evaluated_total + 1);
+        assert_eq!(after.chain_appended_total, before.chain_appended_total);
+        assert_eq!(after.evidence_gap_total, before.evidence_gap_total + 1);
+        assert!(after.actionable, "#3660: lost evidence is actionable");
+        assert!(after.gap_open);
+        assert!(after.last_gap_at_seconds.is_some());
+        // The forensic sink is not initialised in this test process (the
+        // forensic lock serialises against tests that do), so the residence
+        // must be `none` — NOT `forensic_only`.
+        let none_before = before
+            .evidence_gap_by_residence
+            .iter()
+            .find(|(k, _)| *k == "none")
+            .map_or(0, |(_, n)| *n);
+        let none_after = after
+            .evidence_gap_by_residence
+            .iter()
+            .find(|(k, _)| *k == "none")
+            .map_or(0, |(_, n)| *n);
+        assert_eq!(
+            none_after,
+            none_before + 1,
+            "a disabled forensic sink is not a residence: {after:?}"
+        );
+    }
+
+    #[test]
+    fn gate_read_append_failure_refuses_under_strict_policy_3660() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-warn-3660s",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "warn",
+            true,
+        );
+        break_signed_events(&conn);
+        let before = crate::governance::read_audit::delivery_at(0, true);
+        let err =
+            gate_read_with_policy(&conn, "ai:strict-3660", &read_act("get", None, None), true)
+                .expect_err("strict policy: an append failure must refuse the read");
+        assert_eq!(
+            err.reason,
+            crate::governance::read_audit::STRICT_REFUSAL_REASON
+        );
+        let after = crate::governance::read_audit::delivery_at(0, true);
+        assert_eq!(
+            after.strict_refusals_total,
+            before.strict_refusals_total + 1
+        );
+        assert_eq!(after.evidence_gap_total, before.evidence_gap_total + 1);
+        assert_eq!(after.policy, "strict");
+    }
+
+    #[test]
+    fn gate_read_successful_append_is_counted_and_closes_the_gap_3660() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-warn-3660ok",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "warn",
+            true,
+        );
+        let before = crate::governance::read_audit::delivery_at(0, false);
+        gate_read_with_policy(&conn, "ai:ok-3660", &read_act("list", None, None), false)
+            .expect("warn allows");
+        assert_eq!(check_rows(&conn, "ai:ok-3660"), 1);
+        let after = crate::governance::read_audit::delivery_at(0, false);
+        assert_eq!(after.chain_appended_total, before.chain_appended_total + 1);
+        assert_eq!(after.evidence_gap_total, before.evidence_gap_total);
+        assert!(after.last_chain_append_at_seconds.is_some());
+        // Strict policy with a WORKING sink never refuses.
+        gate_read_with_policy(&conn, "ai:ok-3660", &read_act("list", None, None), true)
+            .expect("strict policy only bites when the append fails");
+    }
+
+    #[test]
+    fn gate_read_zero_rule_fast_path_is_not_counted_3660() {
+        let conn = full_conn();
+        let before = crate::governance::read_audit::delivery_at(0, false);
+        gate_read_with_policy(&conn, "ai:fast-3660", &read_act("recall", None, None), true)
+            .expect("fast path");
+        let after = crate::governance::read_audit::delivery_at(0, false);
+        assert_eq!(
+            after.evaluated_total, before.evaluated_total,
+            "the zero-rule fast path emits no audit by design and must not count as evaluated"
         );
     }
 }

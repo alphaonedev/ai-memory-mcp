@@ -12323,6 +12323,13 @@ async fn http_health_route_returns_200_with_status_ok() {
     // straight from the AppState wiring — both false in this test.
     assert_eq!(v["embedder_ready"], false);
     assert_eq!(v["federation_enabled"], false);
+    // #3660 — read-audit delivery rides /health as a signal object.
+    let ra = &v[super::transport::HEALTH_KEY_GOVERNANCE]
+        [super::transport::HEALTH_KEY_READ_AUDIT_DELIVERY];
+    assert_eq!(ra["state"], "available", "signal object expected: {v}");
+    assert_eq!(ra["value"]["scope"], crate::governance::read_audit::SCOPE);
+    assert!(ra["value"]["evidence_gap_total"].is_u64());
+    assert!(ra["value"]["actionable"].is_boolean());
 }
 
 // ---- prometheus_metrics happy path ----

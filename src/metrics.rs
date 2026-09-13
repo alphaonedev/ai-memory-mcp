@@ -354,6 +354,25 @@ pub struct Metrics {
     /// though the worker thread is still alive.
     pub federation_renewal_lag_seconds: IntGauge,
 
+    /// #3660 — engaged read decisions evaluated by `gate_read` since boot
+    /// (the zero-rule fast path is not counted: it emits no audit by
+    /// design). Scope: the MCP sqlite read gate only.
+    pub governance_read_audit_evaluated_total: IntCounter,
+    /// #3660 — read decisions whose `governance.check` row reached
+    /// `signed_events`.
+    pub governance_read_audit_chain_appended_total: IntCounter,
+    /// #3660 — read decisions whose chain append FAILED, by where the
+    /// evidence ended up (`forensic_only` = best-effort file only; `none` =
+    /// gone). Closed label set, pre-touched to 0 at boot. There is no DLQ
+    /// behind this append: every increment is a permanent gap in
+    /// `signed_events`.
+    pub governance_read_audit_evidence_gap_total: IntCounterVec,
+    /// #3660 — reads refused under `AI_MEMORY_READ_AUDIT_STRICT`.
+    pub governance_read_audit_strict_refusals_total: IntCounter,
+    /// #3660 — unix seconds of the most recent read-audit evidence gap;
+    /// `0` = none since boot.
+    pub governance_read_audit_last_gap_at_seconds: IntGauge,
+
     /// #1733 (Pillar-4 4.A) — monotonic counter of HTTP requests shed by
     /// the admission-control layer because the in-flight-request cap
     /// (`AI_MEMORY_MAX_INFLIGHT_REQUESTS`) was already saturated. Each
@@ -915,6 +934,49 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_renewal_lag_seconds.clone()))?;
 
+        // #3660 — read-audit delivery evidence.
+        let governance_read_audit_evaluated_total = IntCounter::new(
+            "ai_memory_governance_read_audit_evaluated_total",
+            "Engaged read-action governance decisions evaluated by the MCP \
+             sqlite read gate since boot (zero-rule fast path excluded).",
+        )?;
+        registry.register(Box::new(governance_read_audit_evaluated_total.clone()))?;
+        let governance_read_audit_chain_appended_total = IntCounter::new(
+            "ai_memory_governance_read_audit_chain_appended_total",
+            "Read-action decisions whose governance.check row reached \
+             signed_events since boot.",
+        )?;
+        registry.register(Box::new(governance_read_audit_chain_appended_total.clone()))?;
+        let governance_read_audit_evidence_gap_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_governance_read_audit_evidence_gap_total",
+                "Read-action decisions whose governance.check append FAILED, \
+                 by residence (forensic_only | none). No DLQ backs this \
+                 append: every increment is a permanent gap in signed_events.",
+            ),
+            &["residence"],
+        )?;
+        registry.register(Box::new(governance_read_audit_evidence_gap_total.clone()))?;
+        for r in crate::governance::read_audit::GapResidence::ALL {
+            governance_read_audit_evidence_gap_total
+                .with_label_values(&[r.as_str()])
+                .reset();
+        }
+        let governance_read_audit_strict_refusals_total = IntCounter::new(
+            "ai_memory_governance_read_audit_strict_refusals_total",
+            "Reads refused because their decision could not be chain-logged \
+             and AI_MEMORY_READ_AUDIT_STRICT is armed.",
+        )?;
+        registry.register(Box::new(
+            governance_read_audit_strict_refusals_total.clone(),
+        ))?;
+        let governance_read_audit_last_gap_at_seconds = IntGauge::new(
+            "ai_memory_governance_read_audit_last_gap_at_seconds",
+            "Unix seconds of the most recent read-audit evidence gap; 0 = \
+             none since boot.",
+        )?;
+        registry.register(Box::new(governance_read_audit_last_gap_at_seconds.clone()))?;
+
         let admission_shed_total = IntCounter::new(
             "ai_memory_admission_shed_total",
             "Monotonic counter of HTTP requests shed by the admission-control \
@@ -1107,6 +1169,11 @@ impl Metrics {
             federation_inbound_cred_total,
             federation_cred_max_age_seconds,
             federation_renewal_lag_seconds,
+            governance_read_audit_evaluated_total,
+            governance_read_audit_chain_appended_total,
+            governance_read_audit_evidence_gap_total,
+            governance_read_audit_strict_refusals_total,
+            governance_read_audit_last_gap_at_seconds,
             admission_shed_total,
             recall_embed_degraded_total,
             rerank_budget_degraded_total,
@@ -1497,6 +1564,13 @@ mod tests {
             "ai_memory_federation_inbound_cred_total",
             "ai_memory_federation_cred_max_age_seconds",
             "ai_memory_federation_renewal_lag_seconds",
+            // #3660 — read-audit delivery evidence.
+            "ai_memory_governance_read_audit_evaluated_total",
+            "ai_memory_governance_read_audit_chain_appended_total",
+            "ai_memory_governance_read_audit_evidence_gap_total{residence=\"forensic_only\"}",
+            "ai_memory_governance_read_audit_evidence_gap_total{residence=\"none\"}",
+            "ai_memory_governance_read_audit_strict_refusals_total",
+            "ai_memory_governance_read_audit_last_gap_at_seconds",
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }

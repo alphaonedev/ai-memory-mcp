@@ -46,6 +46,24 @@ action is refused and a synthetic
 `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1` reverts to the legacy
 permissive posture (UNSAFE; the degraded-ALLOW path is WARN-logged).
 
+Read-action audit is **best-effort by policy**
+([#1730](https://github.com/alphaonedev/ai-memory-mcp/issues/1730)):
+an engaged `read_action` decision is chain-logged, but if that
+`signed_events` append fails the read proceeds. As of
+[#3660](https://github.com/alphaonedev/ai-memory-mcp/issues/3660) that
+gap is stated honestly and measured: the append is direct — **no DLQ or
+spool retries it** — so a failed append is a permanent hole in
+`signed_events` (the decision survives, at most, in the best-effort
+forensic file). Counters: `/metrics`
+`ai_memory_governance_read_audit_{evaluated,chain_appended,evidence_gap,strict_refusals}_total`
+and `/health` `governance.read_audit_delivery` (`actionable = true` once
+any evidence has been lost). `AI_MEMORY_READ_AUDIT_STRICT=1` (same `1` /
+`true` grammar as the fail-open knob) selects the stricter enterprise
+posture: a read whose decision cannot be chain-logged is **refused** with
+a governance-refusal wire shape instead of proceeding. It is not part of
+the `asi-hard` floor — it trades read availability for audit
+completeness, and that is a deployment's call.
+
 ## Namespace-standard defaults (allow-on-silence)
 
 Per-namespace access control is carried by a **namespace standard**

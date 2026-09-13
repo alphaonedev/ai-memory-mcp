@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3660 — engaged read decisions: honest audit posture + measured gap)
+
+- **#3660 (HIGH, audit #3645 F14) — the read gate's "DLQ-backed" audit
+  claim was false; the code wording is corrected, not the docs.**
+  `gate_read`'s `governance.check` append is a direct `signed_events`
+  INSERT with no queue, spool or retry behind it (the deferred-audit DLQ
+  is the write pre-hook's refusal-only mechanism and is not on this
+  path); `docs/security/audit-trail-coverage.md` had always said only
+  "logs a warning and the read proceeds". Now the gap is MEASURED
+  (`governance::read_audit`; `/metrics`
+  `ai_memory_governance_read_audit_*` with a closed `residence` label;
+  `/health` `governance.read_audit_delivery` signal object), the forensic
+  residence is reported truthfully (`forensic_only` vs `none`), and the
+  enterprise knob `AI_MEMORY_READ_AUDIT_STRICT=1` refuses a read whose
+  decision cannot be chain-logged. Default posture unchanged.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`

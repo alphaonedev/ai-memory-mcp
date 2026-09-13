@@ -494,11 +494,33 @@ pub fn record_decision(
     rule_id: &str,
     payload: serde_json::Value,
 ) {
-    if let Err(e) = try_record_decision(actor, decision, kind, rule_id, payload) {
-        tracing::error!(
-            target: AUDIT_TRACE_TARGET,
-            "forensic: emission failed: {e}"
-        );
+    record_decision_checked(actor, decision, kind, rule_id, payload);
+}
+
+/// #3660 — [`record_decision`] that reports whether the row was ACCEPTED
+/// by an ENABLED sink: `false` when the sink is not initialised (nothing
+/// was written anywhere) or its write failed (logged, as before). Callers
+/// that need to state where evidence resides use this; fire-and-forget
+/// callers keep [`record_decision`].
+pub fn record_decision_checked(
+    actor: &str,
+    decision: &str,
+    kind: &str,
+    rule_id: &str,
+    payload: serde_json::Value,
+) -> bool {
+    if !is_enabled() {
+        return false;
+    }
+    match try_record_decision(actor, decision, kind, rule_id, payload) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                target: AUDIT_TRACE_TARGET,
+                "forensic: emission failed: {e}"
+            );
+            false
+        }
     }
 }
 
