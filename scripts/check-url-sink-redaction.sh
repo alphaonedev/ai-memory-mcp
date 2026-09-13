@@ -17,10 +17,19 @@
 # The fourth is why redacting our own rendering is not enough: the value must
 # be screened BEFORE it reaches anything that formats it.
 #
-# The redaction funnel is: crate::logging::redact_url_password,
-# crate::logging::redact_urls_in_message, crate::errors::without_request_url,
+# The redaction funnel is: crate::logging::redact_urls_in_message,
+# crate::errors::without_request_url,
 # LlmProvider::safe_name, or a binding that is itself the redacted alias
 # (display_url / peer_log / redacted_*).
+#
+# NOT in the funnel, deliberately: crate::logging::redact_url_password.
+# It masks ONLY the userinfo password (between the first ':' and the last '@')
+# and returns every other shape UNCHANGED -- so a token in the path
+# (https://hooks.slack.com/services/T/B/XXXX) or in the query (?token=SECRET)
+# passes through it verbatim. Accepting it here would let a site go GREEN with
+# the leak fully intact, which is the one thing a gate must never do.
+# Redact by ALLOWLIST: render scheme/host/port and emit nothing else.
+# See #3674, #3697, #3698.
 #
 # NOT flagged: URL CONSTRUCTION — `format!("{url}/api/tags")` builds a request
 # target, it does not render one. The interpolation is followed by a path or
@@ -40,7 +49,7 @@ SINK_RE='(tracing::)?(trace|debug|info|warn|error)!\(|eprintln!\(|println!\(|any
 # ALL_CAPS constants), with optional field path and :? / :# specs.
 BIND_RE='\{[a-z0-9_.]*(url|uri|dsn|endpoint)[a-z0-9_.]*(:[^}]*)?\}'
 # Redacted alias names and funnel calls that make a hit safe on the same window.
-SAFE_RE='redact_url_password|redact_urls_in_message|without_request_url|safe_name|\{display_url|\{peer_log|\{redacted|\{safe_url|screen_dsn|redact_dsn'
+SAFE_RE='redact_urls_in_message|without_request_url|safe_name|\{display_url|\{peer_log|\{redacted|\{safe_url|screen_dsn|redact_dsn'
 
 scan() { # $1 = root dir; prints "file:line  {binding}" per unredacted sink
   local root=$1; [ "$root" = "." ] && root=""
@@ -82,7 +91,7 @@ fn cycle(peer_url: &str, e: &str) {
     tracing::warn!("sync-daemon: peer {peer_url} cycle failed: {e}");
 }
 fn build(url: &str) -> String { format!("{url}/api/v1/sync/push") }
-fn ok(url: &str) { let peer_log = crate::logging::redact_url_password(url); tracing::info!("peer={peer_log}"); }
+fn ok(url: &str) { let peer_log = crate::logging::host_only(url); tracing::info!("peer={peer_log}"); }
 RS
   got=$(scan "$T")
   rm -rf "$T"
@@ -98,7 +107,7 @@ while IFS= read -r hit; do
   loc=${hit%%  *}; key=${hit##*  }
   LIVE=$((LIVE+1))
   [ -f "$ALLOW" ] && grep -qxF "$key" "$ALLOW" && continue
-  echo "  $loc  $key — URL reaches a sink unredacted; route through crate::logging::redact_url_password / redact_urls_in_message"
+  echo "  $loc  $key — URL reaches a sink unredacted; render scheme/host/port only (allowlist), or redact_urls_in_message for wrapped foreign errors"
   FAIL=$((FAIL+1))
 done < <(scan .)
 
@@ -112,8 +121,10 @@ A url / dsn / endpoint / peer URL can carry credentials (DSN password, basic-aut
 userinfo, API key in the query). In a tracing line, an anyhow!/bail! message or
 a doctor note it lands in journald, forensic bundles and DLQ rows.
 
-Fix: interpolate the REDACTED form —
-  let shown = crate::logging::redact_url_password(&url);   // or redact_urls_in_message
+Fix: interpolate an ALLOWLIST-RENDERED form — scheme/host/port only —
+  let shown = crate::logging::host_only(&url);   // NEVER redact_url_password:
+  // it masks only the userinfo password and passes a token in the path or
+  // query through verbatim, so the gate would go green with the leak intact.
 or drop the URL from the message (errors::without_request_url for reqwest errors).
 If a site is ECHO-direction (the caller's own input refused back to that caller),
 add its key \`<file>:<fn>:<log|error>:{binding}\` to
