@@ -266,7 +266,7 @@ pub async fn dispatch(
             anyhow::bail!(
                 "reown on {} requires the 'sal' build feature; this binary was built \
                  without it",
-                crate::logging::redact_url_password(url)
+                crate::url_display::store_url_display(url)
             );
         }
     }
@@ -276,7 +276,7 @@ pub async fn dispatch(
         anyhow::bail!(
             "reown --store-url accepts a postgres:// store only; use --db for a \
              SQLite file (got {})",
-            crate::logging::redact_url_password(flag)
+            crate::url_display::store_url_display(flag)
         );
     }
     let stdout = std::io::stdout();

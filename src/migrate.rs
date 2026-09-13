@@ -152,7 +152,7 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     // credentials in the userinfo; redact before echoing.
     anyhow::bail!(
         "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-        crate::logging::redact_url_password(url)
+        crate::url_display::store_url_display(url)
     )
 }
 

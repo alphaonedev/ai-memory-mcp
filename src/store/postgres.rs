@@ -2588,7 +2588,7 @@ impl PostgresStore {
                     // interpolate the raw URL (credential included)
                     // into their Display; scrub any embedded URL's
                     // password before the detail leaves the adapter.
-                    detail: crate::logging::redact_urls_in_message(&format!("parse url: {e}")),
+                    detail: format!("parse url: {e}"),
                 })?;
         // v0.7.0 M4/M7 — `after_connect` hook fires the moment a new
         // connection is acquired. We use it to apply per-session
@@ -2726,7 +2726,7 @@ impl PostgresStore {
         // doesn't invalidate the lock-holding connection.
         // v1.0.0 #2445 — operator-facing label for the downgrade guard, with
         // any embedded DSN password scrubbed (#1579 A3 discipline).
-        let store_label = crate::logging::redact_urls_in_message(url);
+        let store_label = crate::url_display::store_url_display(url);
 
         let bootstrap_result: StoreResult<Self> = async move {
             // v1.0.0 #2445 — DOWNGRADE guard. Placed HERE: inside the bootstrap
@@ -7565,7 +7565,7 @@ impl PostgresStore {
                 return Err(StoreError::BackendUnavailable {
                     backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
                     sqlstate: None,
-                    detail: crate::logging::redact_urls_in_message(&format!(
+                    detail: format!(
                         "{DDL_BUDGET_EXHAUSTED_MARKER} REFUSING to boot: schema migration \
                          {label} could not acquire the \
                          ACCESS EXCLUSIVE lock on `{table}` after {DDL_ARM_MAX_ATTEMPTS} \
@@ -7578,7 +7578,7 @@ impl PostgresStore {
                          blocking writer (`SELECT pid, query FROM pg_stat_activity WHERE \
                          state <> 'idle'`), or apply the arm by hand inside a maintenance \
                          window and let the ladder resume."
-                    )),
+                    ),
                 });
             }
             let backoff_ms = DDL_ARM_RETRY_BACKOFF_MS.saturating_mul(1_u64 << (attempt - 1));
@@ -17473,7 +17473,7 @@ pub(crate) fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
         // connection URL — credentials included — into its Display.
         // Scrub any embedded URL's password before the detail leaves
         // the adapter, mirroring the A3 parse-url site.
-        detail: crate::logging::redact_urls_in_message(&format!("{what}: {e}")),
+        detail: format!("{what}: {e}"),
     }
 }
 
