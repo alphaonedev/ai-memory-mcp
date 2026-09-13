@@ -344,7 +344,11 @@ fn fleet_explicit_standard_boots_warns_once_and_is_recorded_3700() {
     if let Ok(entries) = std::fs::read_dir(&audit_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("forensic-") && name.ends_with(".jsonl") {
+            if name.starts_with("forensic-")
+                && std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+            {
                 let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
                 if text.contains("deployment_shape.posture_exception") {
                     recorded = true;
