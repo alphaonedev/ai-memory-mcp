@@ -295,6 +295,22 @@ pub(crate) fn inbox_envelope(
     unread_only: bool,
     messages: Vec<Value>,
 ) -> Value {
+    // #3663 — recipient-read hop mapping. Every inbox read surface (MCP,
+    // HTTP, CLI) renders through this envelope, so the inbox row ids a
+    // notify published are joined here to the reader's operation id. An
+    // empty read has nothing to join and is not logged (the <=60 s
+    // backstop poll would otherwise emit one line per client per minute).
+    if !messages.is_empty() {
+        tracing::info!(
+            target: crate::correlation::TARGET,
+            recipient = %owner,
+            count = messages.len(),
+            inbox_row_ids = %crate::correlation::bounded_row_ids(
+                messages.iter().filter_map(|m| m.get("id").and_then(Value::as_str)),
+            ),
+            "inbox read"
+        );
+    }
     let unread_count = messages
         .iter()
         .filter(|message| message.get("read").and_then(Value::as_bool) != Some(true))

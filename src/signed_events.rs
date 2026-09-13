@@ -2975,6 +2975,16 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
         ],
     )
     .context("append signed_event")?;
+    // #3663 — signed-write hop mapping, inside the caller's span so the
+    // operation id joins to this row. The row commits with the caller's
+    // transaction; an id that never appears in the table was rolled back.
+    tracing::info!(
+        target: crate::correlation::TARGET,
+        event_id = %event.id,
+        sequence = next_seq,
+        event_type = %event.event_type,
+        "signed event written"
+    );
 
     // v0.8.1 #1850 (CWE-354) — stamp the just-written chain head into the
     // #697 append-only forensic JSONL chain as an OFF-TABLE truncation

@@ -462,6 +462,16 @@ pub(super) async fn append_signed_event_row(
             .await?;
 
         if let Some(won) = claimed(&inserted, (next_seq, resigned)) {
+            // #3663 — signed-write hop mapping (the postgres twin of
+            // `signed_events::append_signed_event_no_tx`). The row commits
+            // with the caller's transaction.
+            tracing::info!(
+                target: crate::correlation::TARGET,
+                event_id = %id,
+                sequence = next_seq,
+                event_type = %event_type,
+                "signed event written"
+            );
             return Ok(won);
         }
         retry.lost()?;

@@ -86,7 +86,11 @@ where
         + Send
         + 'static,
 {
+    // #3663 — a blocking worker thread starts with no span; re-enter the
+    // request's span so events emitted by `op` keep its operation id.
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         let mut guard = db.blocking_lock();
 
         // v1.0.0 #3163 PRE-SWEEP — the writer is a SINGLE connection behind a

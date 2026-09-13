@@ -156,6 +156,14 @@ fn build_governed_peer_post(
         let nonce = uuid::Uuid::new_v4().to_string();
         let sig_header =
             crate::federation::signing::sign_body_with_nonce_header(sk, &body_bytes, &nonce);
+        // #3663 — sender half of the federation hop mapping; the receiver
+        // logs the same `push_ref` under its own operation id.
+        tracing::info!(
+            target: crate::correlation::TARGET,
+            push_ref = %crate::correlation::push_ref(&nonce),
+            peer_host = %host,
+            "federation push dispatched"
+        );
         req = req
             .header(crate::federation::signing::SIGNATURE_HEADER, sig_header)
             .header(crate::federation::signing::NONCE_HEADER, nonce);
@@ -672,7 +680,7 @@ pub async fn broadcast_store_quorum_with_embedding(
         let payload = body.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -751,7 +759,7 @@ pub async fn broadcast_store_quorum_with_embedding(
         // still fire-and-forget — a full shutdown-drain would require
         // plumbing a shared JoinSet into AppState; tracked separately.
         let mem_id = mem.id.clone();
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 match res {
                     Ok((peer_id, AckOutcome::Ack)) => {
@@ -908,7 +916,7 @@ pub async fn broadcast_delete_quorum(
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -958,7 +966,7 @@ pub async fn broadcast_delete_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -1106,7 +1114,7 @@ pub async fn broadcast_archive_quorum(
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -1149,7 +1157,7 @@ pub async fn broadcast_archive_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -1221,7 +1229,7 @@ pub async fn broadcast_restore_quorum(
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -1264,7 +1272,7 @@ pub async fn broadcast_restore_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -1331,7 +1339,7 @@ pub async fn broadcast_link_quorum(
         let log_id = log_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -1374,7 +1382,7 @@ pub async fn broadcast_link_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -1470,7 +1478,7 @@ pub async fn broadcast_consolidate_quorum(
         let target_id = new_mem.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -1516,7 +1524,7 @@ pub async fn broadcast_consolidate_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -1589,7 +1597,7 @@ pub async fn broadcast_pending_quorum(
         let target_id = pending.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -1635,7 +1643,7 @@ pub async fn broadcast_pending_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -1703,7 +1711,7 @@ pub async fn broadcast_pending_decision_quorum(
         let target_id = decision.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -1749,7 +1757,7 @@ pub async fn broadcast_pending_decision_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -1872,7 +1880,7 @@ pub async fn broadcast_action_transition_quorum(
         let target_id = op.action_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -1918,7 +1926,7 @@ pub async fn broadcast_action_transition_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -2003,7 +2011,7 @@ pub async fn broadcast_checkpoint_resolution_quorum(
         let target_id = checkpoint.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -2049,7 +2057,7 @@ pub async fn broadcast_checkpoint_resolution_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -2118,7 +2126,7 @@ pub async fn broadcast_signal_create_quorum(
         let target_id = signal.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -2164,7 +2172,7 @@ pub async fn broadcast_signal_create_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -2234,7 +2242,7 @@ pub async fn broadcast_namespace_meta_quorum(
         let target = target_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -2280,7 +2288,7 @@ pub async fn broadcast_namespace_meta_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -2354,7 +2362,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
         let target = target_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             let outcome = post_and_classify(
                 &client,
                 &url,
@@ -2400,7 +2408,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     }
 
     if !joins.is_empty() {
-        tokio::spawn(async move {
+        crate::correlation::spawn_detached(async move {
             while let Some(res) = joins.join_next().await {
                 if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
                 {
@@ -2484,7 +2492,7 @@ pub async fn bulk_catchup_push(
         let payload = body.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
-        joins.spawn(async move {
+        crate::correlation::spawn_in_set(&mut joins, async move {
             // #3148 — the catch-up batch is a FULL memory-content egress, so
             // it goes through the SAME `build_governed_peer_post` builder the
             // per-row fanout uses: the `NetworkRequest` governance gate runs

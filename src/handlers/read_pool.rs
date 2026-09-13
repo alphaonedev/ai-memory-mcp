@@ -248,7 +248,11 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> T + Send + 'static,
 {
+    // #3663 — re-enter the request's span on the blocking worker (see
+    // `transport::db_op`).
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<T, DbOpError> {
                 match pool_for(&db) {

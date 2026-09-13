@@ -1982,7 +1982,7 @@ fn spawn_deferred_embedding_refresh(app: &AppState, rows: Vec<(String, String)>)
     let db = app.db.clone();
     let embedder = app.embedder.clone();
     let vector_index = app.vector_index.clone();
-    tokio::spawn(async move {
+    crate::correlation::spawn_detached(async move {
         for (id, text) in rows {
             let emb = embedder.clone();
             let embed_res =

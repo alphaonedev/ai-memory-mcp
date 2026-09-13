@@ -2098,7 +2098,7 @@ fn spawn_deferred_embedding_refresh_via_store(
     let store = app.store.clone();
     let embedder = app.embedder.clone();
     let ctx = ctx.clone();
-    tokio::spawn(async move {
+    crate::correlation::spawn_detached(async move {
         for (id, text) in rows {
             let emb = embedder.clone();
             let embed_res =
@@ -2306,6 +2306,20 @@ fn verify_credential_pubkey(
     }
 }
 
+/// #3663 — the receiver half of the federation hop mapping: the same
+/// [`crate::correlation::push_ref`] the sender logged at dispatch, emitted
+/// inside this request's span so it carries the receiver's operation id.
+/// `verified` is true only when the nonce was signature-bound and fresh.
+fn log_push_received(nonce: &str, peer_id: &str, verified: bool) {
+    tracing::info!(
+        target: crate::correlation::TARGET,
+        push_ref = %crate::correlation::push_ref(nonce),
+        peer_id = %peer_id,
+        verified,
+        "federation push received"
+    );
+}
+
 /// v0.7.0 #791 — verify the `X-Memory-Sig` header against the raw
 /// body bytes the receiver observed. Returns `Some(Response)` to
 /// short-circuit with a 401 when verification is required and fails;
@@ -2333,6 +2347,15 @@ pub(super) fn verify_signature_or_reject(
     federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
 ) -> Option<Response> {
     if !fed_signing::require_sig() {
+        // #3663 — record the join key even when signatures are not
+        // required; `verified = false` marks it as unauthenticated.
+        if let Some(nonce) = headers
+            .get(fed_signing::NONCE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .filter(|n| !n.is_empty())
+        {
+            log_push_received(nonce, peer_id.unwrap_or(""), false);
+        }
         return None;
     }
     let sig_header = headers
@@ -2381,7 +2404,10 @@ pub(super) fn verify_signature_or_reject(
             match nonce_header {
                 Some(nonce) if !nonce.is_empty() => {
                     match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
-                        crate::identity::replay::ReplayDecision::Fresh => None,
+                        crate::identity::replay::ReplayDecision::Fresh => {
+                            log_push_received(nonce, pid_for_cache, true);
+                            None
+                        }
                         crate::identity::replay::ReplayDecision::Replay => {
                             tracing::warn!(
                                 target: crate::federation::SIGNING_TRACE_TARGET,

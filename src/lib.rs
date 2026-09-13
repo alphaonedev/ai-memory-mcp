@@ -754,6 +754,7 @@ pub mod coordination_audit;
 pub mod coordination_guard;
 /// v1.0.0 #3323 — per-lineage + per-namespace token/cost accounting
 /// (advisory, self-contained; gives a runaway cascade a dollar figure).
+pub mod correlation;
 pub mod cost;
 pub mod curator;
 pub mod daemon_runtime;
@@ -1608,7 +1609,10 @@ pub fn build_router_with_timeout(
             app_state.clone(),
             postgres_route_gate_layer,
         ))
-        .layer(TraceLayer::new_for_http())
+        // #3663 — an INFO-level request span carrying a fresh operation id,
+        // so every event a handler emits (and every hop mapping under
+        // `crate::correlation::TARGET`) joins back to this request.
+        .layer(TraceLayer::new_for_http().make_span_with(crate::correlation::HttpOpSpan))
         .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
         // #1579 B4 — gzip response compression (4.6× measured
         // response-size win on recall payloads in the perf audit).

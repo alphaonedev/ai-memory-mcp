@@ -3567,10 +3567,13 @@ fn handle_request(
             // attribute latency per tool. The span carries the tool name
             // and JSON-RPC id; outcome and elapsed wall time are emitted
             // as a child event after dispatch returns.
+            // #3663 — `op_id` joins this dispatch to its signed write,
+            // federation push and notify hops (see `crate::correlation`).
             let span = tracing::info_span!(
                 "mcp_tool_call",
                 tool = tool_name,
                 rpc_id = ?id,
+                op_id = %crate::correlation::mint_op_id(),
             );
             let _enter = span.enter();
             let started = Instant::now();

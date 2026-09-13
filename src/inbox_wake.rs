@@ -214,6 +214,15 @@ pub(crate) fn publish_agent_notified(
     // with no attached streams — never an error (ERRORS-19: deliberate,
     // commented discard).
     let _ = bus().send(event.clone());
+    // #3663 — notify hop mapping: the inbox row id (the durable record) and
+    // the host wake sequence, inside the notifying operation's span. The
+    // recipient's read logs the same row id under its own operation id.
+    tracing::info!(
+        target: crate::correlation::TARGET,
+        inbox_row_id = %inbox_row_id,
+        seq = event.seq(),
+        "inbox notify published"
+    );
     event
 }
 
