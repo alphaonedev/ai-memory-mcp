@@ -246,6 +246,11 @@ impl UdsWakeSink {
     /// zero-depth, or when there is no Tokio runtime to host the forwarder.
     /// Every one of these is a case where starting anyway would mean a daemon
     /// that looks attached and wakes nobody.
+    ///
+    /// #3657 — on success the fallback gauge reads CONNECTING: a forwarder
+    /// exists but no session has been observed. It becomes HUB LIVE only when
+    /// a handshake completes, and BACKSTOP when a session fails or the sink is
+    /// dropped. It is never stamped BACKSTOP here (trap 1 of the handoff).
     pub fn spawn(cfg: UdsSinkConfig, credential: Arc<dyn JoinCredential>) -> Result<Self> {
         if credential.agent_id() != WAKE_HUB_PRODUCER {
             bail!(
@@ -268,6 +273,7 @@ impl UdsWakeSink {
         let (tx, rx) = mpsc::channel::<Bytes>(cfg.queue_frames);
         let task_metrics = Arc::clone(&metrics);
         handle.spawn(async move { forwarder_loop(cfg, credential, task_metrics, rx).await });
+        crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_CONNECTING);
         Ok(Self::from_parts(tx, metrics))
     }
 }
@@ -334,7 +340,6 @@ pub fn install_uds(
 ) -> Result<Arc<SinkMetrics>> {
     let sink = UdsWakeSink::spawn(cfg, credential)?;
     let metrics = sink.metrics();
-    crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
     if !crate::inbox_wake::install_sink(Arc::new(sink)) {
         // Dropping the sink closes the hand-off channel, so the forwarder task
         // we just started shuts itself down rather than lingering.
@@ -399,6 +404,9 @@ async fn forwarder_loop(
         let started = tokio::time::Instant::now();
         match connect_and_pump(&cfg, credential.as_ref(), &metrics, &mut rx).await {
             Ok(()) => {
+                // #3657 — no forwarder means the backstop poll is now the
+                // only delivery path; say so rather than leave a stale LIVE.
+                crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
                 tracing::info!("wake sink: forwarder stopped because the sink was dropped");
                 return;
             }
@@ -429,6 +437,7 @@ async fn forwarder_loop(
             // this plane advertises — and a forwarder that retried forever
             // against a dead producer would be an unbounded task in a
             // long-lived daemon.
+            crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_BACKSTOP);
             tracing::info!("wake sink: forwarder stopping; the sink was dropped");
             return;
         }
@@ -732,8 +741,7 @@ mod tests {
         assert_eq!(s.dropped_transport_full, 1);
         assert_eq!(s.total_dropped(), 1);
         assert!(
-            crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::TransportFull)
-                >= before + 1,
+            crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::TransportFull) > before,
             "overflow must scrape as cause=transport_full, not an unlabeled total"
         );
         let text = crate::metrics::render();
@@ -752,9 +760,7 @@ mod tests {
         drop(rx);
         sink.on_wake(&event("bob"));
         assert_eq!(sink.metrics().snapshot().dropped_hub_down, 1);
-        assert!(
-            crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::HubDown) >= before + 1
-        );
+        assert!(crate::metrics::wake_drop_count(crate::metrics::WakeDropCause::HubDown) > before);
         let text = crate::metrics::render();
         assert!(
             text.contains("cause=\"hub_down\""),

@@ -627,7 +627,7 @@ mod tests {
         let metrics = ClientMetrics::default();
         assert!(offer(&tx, WakeSignal::bare(WakeReason::Backstop), &metrics));
         assert_eq!(metrics.backstop_reliance(), 1);
-        assert!(crate::metrics::wake_backstop_reliance_count() >= before + 1);
+        assert!(crate::metrics::wake_backstop_reliance_count() > before);
         let text = crate::metrics::render();
         assert!(
             text.contains(crate::metrics::METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL),

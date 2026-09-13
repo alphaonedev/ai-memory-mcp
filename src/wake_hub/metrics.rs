@@ -92,10 +92,16 @@ pub struct MetricsSnapshot {
     /// Frames dropped by the writer because the socket write failed or the
     /// frame could not be re-encoded on the way out (#3471).
     pub drop_write_failed: u64,
+    /// #3657 — wakes withheld because the recipient's session authority no
+    /// longer verified (delegation expired or revoked).
+    pub drop_delegation_revoked: u64,
     /// Frames read from peers.
     pub frames_in: u64,
     /// Frames written to peers.
     pub frames_out: u64,
+    /// #3657 — wake frames actually written to a recipient socket (control
+    /// frames excluded). `frames_out` counts every frame; this counts delivery.
+    pub wakes_written: u64,
     /// Wake frames routed (once per source frame, not per recipient).
     pub wakes_routed: u64,
     /// Total per-recipient deliveries produced by those routes.
@@ -145,8 +151,10 @@ pub struct HubMetrics {
     drop_global_egress_full: AtomicU64,
     drop_channel_full: AtomicU64,
     drop_write_failed: AtomicU64,
+    drop_delegation_revoked: AtomicU64,
     frames_in: AtomicU64,
     frames_out: AtomicU64,
+    wakes_written: AtomicU64,
     wakes_routed: AtomicU64,
     fanout_deliveries: AtomicU64,
     pending_coalesced: AtomicU64,
@@ -191,7 +199,6 @@ impl HubMetrics {
         denied_peer_cred,
         denied_ceiling,
         denied_hello,
-        denied_malformed,
         denied_forged_from,
         rate_limited,
         overflow,
@@ -209,7 +216,18 @@ impl HubMetrics {
         (drop_channel_full, ChannelFull),
         (drop_write_failed, WriteFailed),
         (pending_dropped_unknown, Unknown),
+        // #3657 — the two causes the audit named that had no scrape series:
+        // a refused (revoked/expired) delegation and an undecodable frame.
+        (drop_delegation_revoked, DelegationRevoked),
+        (denied_malformed, MalformedFrame),
     );
+
+    /// #3657 — one wake frame written to a recipient socket. Dual-writes onto
+    /// [`crate::metrics::METRIC_WAKE_DELIVERED_TOTAL`].
+    pub fn wake_written(&self) {
+        self.wakes_written.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::inc_wake_delivered();
+    }
 
     /// Add `n` per-recipient deliveries from one routed wake.
     pub fn add_fanout(&self, n: u64) {
@@ -296,8 +314,10 @@ impl HubMetrics {
             drop_global_egress_full: self.drop_global_egress_full.load(Ordering::Relaxed),
             drop_channel_full: self.drop_channel_full.load(Ordering::Relaxed),
             drop_write_failed: self.drop_write_failed.load(Ordering::Relaxed),
+            drop_delegation_revoked: self.drop_delegation_revoked.load(Ordering::Relaxed),
             frames_in: self.frames_in.load(Ordering::Relaxed),
             frames_out: self.frames_out.load(Ordering::Relaxed),
+            wakes_written: self.wakes_written.load(Ordering::Relaxed),
             wakes_routed: self.wakes_routed.load(Ordering::Relaxed),
             fanout_deliveries: self.fanout_deliveries.load(Ordering::Relaxed),
             pending_coalesced: self.pending_coalesced.load(Ordering::Relaxed),
@@ -365,11 +385,14 @@ impl MetricsSnapshot {
                 (crate::metrics::WAKE_CAUSE_GLOBAL_EGRESS_FULL): self.drop_global_egress_full,
                 (crate::metrics::WAKE_CAUSE_CHANNEL_FULL): self.drop_channel_full,
                 (crate::metrics::WAKE_CAUSE_WRITE_FAILED): self.drop_write_failed,
+                (crate::metrics::WAKE_CAUSE_DELEGATION_REVOKED): self.drop_delegation_revoked,
+                (crate::metrics::WAKE_CAUSE_MALFORMED_FRAME): self.denied_malformed,
                 "offline_unknown": self.pending_dropped_unknown,
             },
             "traffic": {
                 "frames_in_total": self.frames_in,
                 "frames_out_total": self.frames_out,
+                "wakes_written_total": self.wakes_written,
                 "wakes_routed_total": self.wakes_routed,
                 "fanout_deliveries_total": self.fanout_deliveries,
                 "pending_coalesced_total": self.pending_coalesced,

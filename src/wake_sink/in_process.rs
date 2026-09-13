@@ -159,6 +159,9 @@ pub fn install_in_process(router: Arc<Router>) -> Option<Arc<SinkMetrics>> {
     let metrics = sink.metrics();
     if crate::inbox_wake::install_sink(Arc::new(sink)) {
         super::remember_installed_sink_metrics(Arc::clone(&metrics));
+        // #3657 — a co-hosted hub is in this process: there is no handshake
+        // to wait for, the route IS the session.
+        crate::metrics::set_wake_fallback_state(crate::metrics::WAKE_FALLBACK_HUB_LIVE);
         tracing::info!(
             "wake sink: co-hosted wake-hub attached to the agent_notified bus; clients \
              must still poll their inbox at least every {:?}",

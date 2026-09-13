@@ -25,6 +25,10 @@ pub const METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL: &str = "ai_memory_wake_backstop_r
 pub const METRIC_WAKE_FALLBACK_STATE: &str = "ai_memory_wake_fallback_state";
 /// Prometheus family name for the daemon→hub hand-off occupancy (#3657).
 pub const METRIC_WAKE_QUEUE_PRESSURE: &str = "ai_memory_wake_queue_pressure";
+/// Prometheus family name for wake frames a hub WROTE to a recipient socket
+/// (#3657). Measured at the hub writer, control frames excluded — the only
+/// place "delivered" is observed rather than inferred from a route.
+pub const METRIC_WAKE_DELIVERED_TOTAL: &str = "ai_memory_wake_delivered_total";
 
 /// Label name on [`METRIC_WAKE_DROPS_TOTAL`].
 pub const WAKE_DROP_LABEL: &str = "cause";
@@ -53,6 +57,12 @@ pub const WAKE_CAUSE_GLOBAL_EGRESS_FULL: &str = "global_egress_full";
 pub const WAKE_CAUSE_CHANNEL_FULL: &str = "channel_full";
 /// Prometheus `cause` label: hub writer failed after accept (#3471).
 pub const WAKE_CAUSE_WRITE_FAILED: &str = "write_failed";
+/// Prometheus `cause` label: the recipient's session authority no longer
+/// verifies (delegation expired or revoked), so the hub withheld the wake.
+pub const WAKE_CAUSE_DELEGATION_REVOKED: &str = "delegation_revoked";
+/// Prometheus `cause` label: a frame the hub could not decode (malformed
+/// frame, hello, wake metadata or topic list) — refused, never routed.
+pub const WAKE_CAUSE_MALFORMED_FRAME: &str = "malformed_frame";
 
 /// [`wake_fallback_state`] value: no boot decision has been observed yet.
 /// This is UNAVAILABLE, never "healthy".
@@ -61,6 +71,13 @@ pub const WAKE_FALLBACK_UNOBSERVED: i64 = 0;
 pub const WAKE_FALLBACK_HUB_LIVE: i64 = 1;
 /// [`wake_fallback_state`] value: recipients rely on the backstop poll.
 pub const WAKE_FALLBACK_BACKSTOP: i64 = 2;
+/// [`wake_fallback_state`] value: a forwarder is installed and connecting,
+/// but no hub session has been authenticated yet. Distinct from
+/// [`WAKE_FALLBACK_BACKSTOP`] on purpose: a healthy hub that is one handshake
+/// away must never report itself as fallen back (#3657 trap 1), and
+/// distinct from [`WAKE_FALLBACK_HUB_LIVE`] because nobody has observed a
+/// session yet.
+pub const WAKE_FALLBACK_CONNECTING: i64 = 3;
 
 /// Closed set of wake-drop causes published on [`METRIC_WAKE_DROPS_TOTAL`].
 ///
@@ -91,6 +108,10 @@ pub enum WakeDropCause {
     ChannelFull,
     /// Hub: writer failed after accept.
     WriteFailed,
+    /// Hub: the recipient's delegation no longer verifies (expired/revoked).
+    DelegationRevoked,
+    /// Hub: an undecodable frame was refused before routing.
+    MalformedFrame,
 }
 
 impl WakeDropCause {
@@ -109,11 +130,13 @@ impl WakeDropCause {
             Self::GlobalEgressFull => WAKE_CAUSE_GLOBAL_EGRESS_FULL,
             Self::ChannelFull => WAKE_CAUSE_CHANNEL_FULL,
             Self::WriteFailed => WAKE_CAUSE_WRITE_FAILED,
+            Self::DelegationRevoked => WAKE_CAUSE_DELEGATION_REVOKED,
+            Self::MalformedFrame => WAKE_CAUSE_MALFORMED_FRAME,
         }
     }
 
     /// Every published cause, in the HELP-string order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Unknown,
         Self::Overflow,
         Self::Unaddressable,
@@ -125,6 +148,8 @@ impl WakeDropCause {
         Self::GlobalEgressFull,
         Self::ChannelFull,
         Self::WriteFailed,
+        Self::DelegationRevoked,
+        Self::MalformedFrame,
     ];
 }
 
@@ -602,8 +627,14 @@ pub struct Metrics {
     /// #3657 — daemon-side wake fallback posture. `0` = not yet observed
     /// (unavailable, never "healthy"), `1` = hub session live, `2` =
     /// recipients are on the backstop poll (hub down, refused, or never
-    /// configured).
+    /// configured), `3` = forwarder installed and connecting (no session
+    /// observed yet — not live, not fallen back).
     pub wake_fallback_state: IntGauge,
+
+    /// #3657 — wake frames a hub in THIS process wrote to a recipient
+    /// socket. Counted at the writer after a successful `write_all`, control
+    /// frames excluded; a co-hosted hub makes this scrapeable on the daemon.
+    pub wake_delivered_total: IntCounter,
 
     /// #3657 — frames currently sitting in the daemon→hub hand-off
     /// channel. Measured on the UDS sink; `0` after process start until
@@ -1211,8 +1242,8 @@ impl Metrics {
                  (#3657). Closed set: unknown|overflow|unaddressable|\
                  unencodable|transport_full|hub_down|bus_lagged|\
                  recipient_queue_full|global_egress_full|channel_full|\
-                 write_failed. A single unlabeled drops total is \
-                 deliberately not emitted.",
+                 write_failed|delegation_revoked|malformed_frame. A single \
+                 unlabeled drops total is deliberately not emitted.",
             ),
             &[WAKE_DROP_LABEL],
         )?;
@@ -1231,9 +1262,18 @@ impl Metrics {
             METRIC_WAKE_FALLBACK_STATE,
             "Daemon wake-plane fallback posture (#3657). 0 = not yet \
              observed (unavailable, never healthy), 1 = hub session live, \
-             2 = recipients rely on the backstop poll.",
+             2 = recipients rely on the backstop poll, 3 = forwarder \
+             installed and connecting (no session observed yet).",
         )?;
         registry.register(Box::new(wake_fallback_state.clone()))?;
+
+        let wake_delivered_total = IntCounter::new(
+            METRIC_WAKE_DELIVERED_TOTAL,
+            "Wake frames a wake-hub in this process wrote to a recipient \
+             socket (#3657). Counted after a successful write, control \
+             frames excluded: measured delivery, not a routed count.",
+        )?;
+        registry.register(Box::new(wake_delivered_total.clone()))?;
 
         let wake_queue_pressure = IntGauge::new(
             METRIC_WAKE_QUEUE_PRESSURE,
@@ -1298,6 +1338,7 @@ impl Metrics {
             wake_drops_total,
             wake_backstop_reliance_total,
             wake_fallback_state,
+            wake_delivered_total,
             wake_queue_pressure,
         })
     }
@@ -1594,6 +1635,18 @@ pub fn wake_fallback_state() -> i64 {
     registry().wake_fallback_state.get()
 }
 
+/// #3657 — record one wake frame written to a recipient socket by a hub in
+/// this process.
+pub fn inc_wake_delivered() {
+    registry().wake_delivered_total.inc();
+}
+
+/// Current [`METRIC_WAKE_DELIVERED_TOTAL`].
+#[must_use]
+pub fn wake_delivered_count() -> u64 {
+    registry().wake_delivered_total.get()
+}
+
 /// #3657 — publish the measured daemon→hub hand-off occupancy.
 pub fn set_wake_queue_pressure(frames: usize) {
     let value = i64::try_from(frames).unwrap_or(i64::MAX);
@@ -1717,6 +1770,7 @@ mod tests {
         inc_wake_backstop_reliance();
         set_wake_fallback_state(WAKE_FALLBACK_BACKSTOP);
         set_wake_queue_pressure(1);
+        inc_wake_delivered();
 
         let text = render();
         for name in [
@@ -1744,6 +1798,7 @@ mod tests {
             METRIC_WAKE_BACKSTOP_RELIANCE_TOTAL,
             METRIC_WAKE_FALLBACK_STATE,
             METRIC_WAKE_QUEUE_PRESSURE,
+            METRIC_WAKE_DELIVERED_TOTAL,
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }

@@ -857,8 +857,17 @@ shape (`wake_hub::metrics::MetricsSnapshot::to_json`), published at rest by
 `wake-hub --posture --json` under `metrics_schema` so an exporter can be
 written against a documented contract. The **daemon** scrape (`GET /metrics`)
 is a separate registry: as of #3657 it emits `ai_memory_wake_drops_total{cause=...}`
-(never an unlabeled drops total), `ai_memory_wake_backstop_reliance_total`,
-`ai_memory_wake_fallback_state` and `ai_memory_wake_queue_pressure`. The
+(never an unlabeled drops total; closed set `unknown|overflow|unaddressable|unencodable|transport_full|hub_down|bus_lagged|recipient_queue_full|global_egress_full|channel_full|write_failed|delegation_revoked|malformed_frame`),
+`ai_memory_wake_backstop_reliance_total`, `ai_memory_wake_fallback_state`,
+`ai_memory_wake_queue_pressure` and `ai_memory_wake_delivered_total` (wake
+frames a hub in the scraped process wrote to a recipient socket — measured at
+the writer, control frames excluded). `ai_memory_wake_fallback_state` is a
+measured ladder, never an inference from configuration: `0` = nothing observed
+yet (unavailable, never healthy), `3` = a forwarder is installed and
+connecting but no session has been authenticated, `1` = a hub session is live
+(a handshake completed; a co-hosted hub is live on install), `2` = recipients
+rely on the backstop poll (never configured, refused, the session broke, or
+the sink was dropped). The
 health-monitoring JSON surface (#3646) gathers from that registry; it does
 not invent a second transport. Hub-process census (connected agents, egress
 bytes) still lives on the hub snapshot — a scrape of the daemon cannot see

@@ -220,6 +220,9 @@ impl Conn {
         match self.state.deps.verifier.verify(&request) {
             Ok(verified) => verified == *agent,
             Err(reason) => {
+                // #3657 — a wake withheld because the delegation no longer
+                // verifies is a drop with its own cause, not silence.
+                self.state.metrics.drop_delegation_revoked();
                 tracing::info!(agent = %agent.agent_id, reason = reason.label(), "wake-hub: session authority expired or revoked");
                 false
             }
@@ -847,6 +850,10 @@ async fn teardown(conn: Conn, mut writer_task: tokio::task::JoinHandle<()>) {
     state.metrics.connection_closed();
 }
 
+/// #3657 — byte offset of the frame kind inside an encoded frame: after the
+/// four magic bytes and the version byte (`Frame::encode`).
+const WIRE_KIND_OFFSET: usize = 5;
+
 /// Drain the writer channel to the socket.
 ///
 /// The ONLY place bytes leave the hub. Egress reservations are released here
@@ -869,6 +876,10 @@ async fn writer_loop(
     while let Some(item) = queue.rx.recv().await {
         let Egress::Frame(bytes) = item else { break };
         let len = bytes.len();
+        // #3657 — the queue holds already-encoded, validated frames; the kind
+        // byte follows the magic and version bytes. Only a WAKE counts as a
+        // delivery: a pong or an error frame must never inflate it.
+        let is_wake = bytes.get(WIRE_KIND_OFFSET) == Some(&Kind::Wake.as_u8());
         out.clear();
         // The SAME `max_frame_length` the reader enforces, applied on the way
         // out: the hub can never emit a frame it would refuse to read.
@@ -888,6 +899,9 @@ async fn writer_loop(
             break;
         }
         state.metrics.add_frames_out(1);
+        if is_wake {
+            state.metrics.wake_written();
+        }
     }
     drop(queue);
     let _ = write_half.shutdown().await;
