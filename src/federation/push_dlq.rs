@@ -1402,7 +1402,7 @@ impl FederationDlqSink for SqliteDlqSink {
                  CAST(MIN((julianday(failed_at) - 2440587.5) * 86400.0) AS INTEGER) \
                  FROM federation_push_dlq WHERE replayed_at IS NULL GROUP BY peer_id",
             )
-            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer: {e}"))?;
+            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer prepare: {e}"))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(super::freshness::PeerDlqBacklog {
@@ -1411,9 +1411,9 @@ impl FederationDlqSink for SqliteDlqSink {
                     oldest_failed_unix: r.get(2)?,
                 })
             })
-            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer: {e}"))?;
+            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer query: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer: {e}"))
+            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer collect: {e}"))
     }
 
     async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
