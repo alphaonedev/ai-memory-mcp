@@ -135,7 +135,10 @@ mod tests {
         assert!(failed[0].error.is_panic());
         let rendered = failed[0].to_string();
         let label = super::super::freshness::peer_label(&peer);
-        assert!(rendered.starts_with(&format!("peer {label}: ")), "{rendered}");
+        assert!(
+            rendered.starts_with(&format!("peer {label}: ")),
+            "{rendered}"
+        );
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(!rendered.contains(".example"), "{rendered}");
         let fresh = super::super::freshness::snapshot_for(&peer).expect("failure recorded");
