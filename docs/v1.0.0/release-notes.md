@@ -137,6 +137,20 @@ rewrites your file for you.
 A config with no `[deployment]` block boots as the `singleton` shape
 (#3714) — the upgrade never promotes a node to a stricter shape.
 
+**Egress is preserved (the #2445 disposition):** `ai-memory backup` and
+`ai-memory export` load the KNOWN keys (so `db` is your configured
+database, never the relative default) and print the refusal as a WARN
+instead of refusing, so a config the daemon will not boot on never stops
+you taking your durable text out. `doctor` and the `config` verbs run too.
+Nothing that writes or serves does.
+
+**Rollback caveat:** a config carrying keys a NEWER binary accepts (a key
+added in v1.0.1 and later) is an *unknown* key to this binary. Rolling the
+binary back across a config-schema step therefore means rolling the file
+back too (`config migrate` leaves `<config.toml>.bak.<timestamp>`) — the
+config analogue of the schema-ahead guard, and the reason a version-bound
+rollback runbook must name both artifacts.
+
 ## Secure-default flips (breaking)
 
 v1.0.0 flips the Gate-1′ "defaults stop lying" knobs to their secure

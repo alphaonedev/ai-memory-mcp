@@ -99,8 +99,35 @@ fn main() -> Result<()> {
     // do not run it (running it would print the refusal they exist to
     // explain, ahead of their own report).
     let is_config_verb = matches!(&cli.command, daemon_runtime::Command::Config(_));
+    // #3715 / the #2445 disposition — `backup` / `export` take the durable
+    // text OUT and must not be locked behind a config key the daemon refuses:
+    // they load with the KNOWN keys applied (so `db` is the configured one,
+    // never the relative default) and the refusal text as a loud WARN.
+    let is_egress_verb = matches!(
+        &cli.command,
+        daemon_runtime::Command::Backup(_)
+            | daemon_runtime::Command::Export(_)
+            | daemon_runtime::Command::ExportForensicBundle(_)
+    );
     let app_config = match if is_config_verb {
         Ok(config::AppConfig::default())
+    } else if is_egress_verb && !config::skip_config() {
+        config::AppConfig::config_path().map_or_else(
+            || Ok(config::AppConfig::default()),
+            |p| {
+                config::AppConfig::try_load_from_optional_for_egress(&p).map(|(cfg, warn)| {
+                    if let Some(w) = warn {
+                        eprintln!(
+                            "ai-memory: WARN {w}\nai-memory: continuing for this EGRESS verb with \
+                             the KNOWN keys applied (#3715 / #2445 disposition): your durable \
+                             text is taken from the CONFIGURED `db`, but `serve` / `mcp` and \
+                             every writing verb REFUSE this config until the key is fixed."
+                        );
+                    }
+                    cfg
+                })
+            },
+        )
     } else {
         config::AppConfig::load_for_boot()
     } {

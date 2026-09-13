@@ -8434,6 +8434,43 @@ impl AppConfig {
         // `governance migrate-to-permissions`) parse through `toml::Value`
         // and never cross this funnel, so the refused state is repairable.
         Self::refuse_unknown_keys(path, contents)?;
+        Self::from_toml_contents_unchecked(path, contents)
+    }
+
+    /// #3715 / the #2445 disposition — the EGRESS loader. `backup` / `export`
+    /// take the operator's durable text OUT; a guard whose observable effect
+    /// is "you may not back up your data" would invert the North Star it
+    /// serves, so for those verbs an unknown key is a loud WARN and the
+    /// config is loaded with serde's ignore-unknown semantics (every KNOWN
+    /// key, including `db`, still applies — falling back to compiled
+    /// defaults would back up the WRONG database). Nothing that WRITES or
+    /// SERVES uses this arm. Returns the WARN text alongside the config so
+    /// the caller prints it; a missing file is compiled defaults as in
+    /// [`Self::try_load_from_optional`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::try_load_from_optional`] except that unknown keys do
+    /// not refuse.
+    pub fn try_load_from_optional_for_egress(
+        path: &Path,
+    ) -> anyhow::Result<(Self, Option<String>)> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let warn = Self::refuse_unknown_keys(path, &contents)
+                    .err()
+                    .map(|e| e.to_string());
+                Ok((Self::from_toml_contents_unchecked(path, &contents)?, warn))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Self::default(), None)),
+            Err(e) => Err(anyhow::Error::new(e).context(reading_config_context(path))),
+        }
+    }
+
+    /// The parse + secret-handling tail shared by the boot loader and the
+    /// egress loader. NEVER call this from a boot path directly — the
+    /// unknown-key refusal lives in [`Self::from_toml_contents`].
+    fn from_toml_contents_unchecked(path: &Path, contents: &str) -> anyhow::Result<Self> {
         // #3277 / #3197 — toml 0.8 Display echoes the offending source
         // line (caret-underlined). A malformed `api_key = "…"` therefore
         // lands in stderr/journald if we chain the toml error through
@@ -12401,6 +12438,50 @@ legacy_scoring = false
         // Carve-out 1: the same document parses through `toml::Value` for
         // the repair tools — refusal lives ONLY in the AppConfig funnel.
         assert!(toml::from_str::<toml::Value>(toml_src).is_ok());
+    }
+
+    /// #3715 / #2445 — the EGRESS loader (`backup` / `export`) applies every
+    /// KNOWN key (so `db` is the configured one, never the relative default)
+    /// and returns the refusal text as a WARN instead of refusing; a clean
+    /// file yields no WARN; a MALFORMED file still errors (that is not an
+    /// unknown key, it is an unparseable config).
+    #[test]
+    fn egress_loader_applies_known_keys_and_warns_on_unknown_ones() {
+        let toml_src =
+            "tier = \"keyword\"\ndb = \"/srv/ai-memory/live.db\"\n\n[memory]\ntier = \"x\"\n";
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), toml_src).expect("write temp config");
+        assert!(
+            AppConfig::try_load_from_optional(tmp.path()).is_err(),
+            "boot refuses"
+        );
+        let (cfg, warn) =
+            AppConfig::try_load_from_optional_for_egress(tmp.path()).expect("egress loads");
+        assert_eq!(
+            cfg.db.as_deref(),
+            Some("/srv/ai-memory/live.db"),
+            "the CONFIGURED db, not the default"
+        );
+        assert_eq!(cfg.tier.as_deref(), Some("keyword"));
+        let warn = warn.expect("the refusal text is returned as a WARN");
+        assert!(warn.contains("`memory`"), "{warn}");
+
+        std::fs::write(tmp.path(), "tier = \"keyword\"\n").unwrap();
+        let (_, warn) = AppConfig::try_load_from_optional_for_egress(tmp.path()).unwrap();
+        assert!(warn.is_none(), "a clean file has nothing to warn about");
+
+        std::fs::write(tmp.path(), "tier = \"unclosed\n").unwrap();
+        assert!(
+            AppConfig::try_load_from_optional_for_egress(tmp.path()).is_err(),
+            "malformed TOML still errors"
+        );
+
+        let missing = tmp.path().with_extension("absent");
+        let (cfg, warn) = AppConfig::try_load_from_optional_for_egress(&missing).unwrap();
+        assert!(
+            cfg.db.is_none() && warn.is_none(),
+            "a missing file is compiled defaults"
+        );
     }
 
     /// #3715 — a clean config (every key accepted, secrets included)
