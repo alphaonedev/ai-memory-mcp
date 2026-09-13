@@ -11353,7 +11353,9 @@ mod tests {
         ) {
             return;
         }
-        let _g = crate::config::test_env_lock();
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
         }
@@ -11390,7 +11392,9 @@ mod tests {
         ) {
             return;
         }
-        let _g = crate::config::test_env_lock();
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
         }
@@ -11428,7 +11432,9 @@ mod tests {
         ) {
             return;
         }
-        let _g = crate::config::test_env_lock();
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
         }
@@ -12759,7 +12765,9 @@ decision = "allow"
         ) {
             return;
         }
-        let _g = crate::config::test_env_lock();
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
         }
