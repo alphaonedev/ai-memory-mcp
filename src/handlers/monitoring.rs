@@ -413,7 +413,10 @@ mod tests {
             assert_eq!(v[field]["state"], "unavailable", "{field}");
             assert_eq!(v[field]["reason"], "no_push_success_observed", "{field}");
         }
-        assert_eq!(v["last_push_attempt_at_seconds"]["reason"], "no_push_attempt_observed");
+        assert_eq!(
+            v["last_push_attempt_at_seconds"]["reason"],
+            "no_push_attempt_observed"
+        );
         assert_eq!(v["dlq_depth"]["reason"], "dlq_not_measured");
         assert_eq!(v["replication_lag"]["issue"], 3681);
         assert_eq!(v["catch_up_progress"]["issue"], 3681);
@@ -461,6 +464,9 @@ mod tests {
         // A peer the registry has never seen.
         let v = peer_status("peer-3", None, every_30s, now);
         assert_eq!(v["reachability"]["reason"], "no_pull_observation");
-        assert_eq!(v["clock_skew_seconds"]["reason"], "no_catchup_response_date_observed");
+        assert_eq!(
+            v["clock_skew_seconds"]["reason"],
+            "no_catchup_response_date_observed"
+        );
     }
 }
