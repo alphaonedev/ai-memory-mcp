@@ -441,7 +441,7 @@ without operator material. The declaration decides — a node whose signals
 or agent registry look like a fleet is WARNED by the #3700 detector, never
 re-postured (promotion is an operator act) — see
 `docs/SECURITY.md` "Bring your own certificate". The `ai-memory tls
-init|import|renew` and `ai-memory db check-tls` verbs the refusals name are
+init|import|renew` and `ai-memory db check-tls` verbs are v1.0.1 (#3709 items 2-4); until they ship the refusals name only what exists — `--tls-cert/--tls-key`, `sslmode=verify-full&sslrootcert=<ca.crt>`, the files under `<key_dir>/tls/` — and are
 #3709 items 2–4 (a separate branch); until they land, first-boot generation
 and `--tls-cert`/`--tls-key` are the two paths.
 

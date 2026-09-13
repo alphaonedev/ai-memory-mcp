@@ -377,7 +377,14 @@ fn unwritable_key_dir_refuses_never_plaintext_3709() {
         err.contains("could not generate") || err.contains("unusable"),
         "the refusal must say the certificate could not be produced: {err}"
     );
-    assert!(err.contains("`ai-memory tls init`"), "{err}");
+    assert!(
+        err.contains("--tls-cert <fullchain.pem> --tls-key <key.pem>"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("ai-memory tls"),
+        "no fictional verb in a remedy: {err}"
+    );
     assert!(!err.contains("listening"), "never a listener: {err}");
     assert!(
         !key_dir(root.path())

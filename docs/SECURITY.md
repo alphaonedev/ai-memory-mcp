@@ -258,11 +258,14 @@ constraints hold this in the mandate:
   next boot (doctor's `local_tls_material` fact says so first).
 
 Operators with their own PKI pass `--tls-cert`/`--tls-key`; the local CA
-is then not consulted for the listener. Every refusal names its fix; the
-`ai-memory tls init|import|renew` and `ai-memory db check-tls` verbs those
-fixes name are #3709 items 2–4 on a separate branch — until they land,
-first-boot generation (singleton) and `--tls-cert`/`--tls-key` are the two
-paths.
+is then not consulted for the listener. Every refusal names its fix, and
+names only what exists in this release: the `--tls-cert`/`--tls-key` flags,
+the `sslmode=verify-full&sslrootcert=<ca.crt>` DSN parameters, and the files
+under `<key_dir>/tls/`. The `ai-memory tls init|import|renew` and
+`ai-memory db check-tls` verbs are #3709 items 2–4 (v1.0.1, a separate
+branch); a refusal never points at a verb that does not ship with it. Until
+they land, first-boot generation (singleton) and `--tls-cert`/`--tls-key`
+are the two paths.
 
 #### Bring your own certificate (enterprise PKI) — the fleet path
 
@@ -287,7 +290,7 @@ by the bundled clients on that host — never by a peer).
   directory `0700`; the daemon refuses lax modes the same way it refuses a
   lax key directory (#3198).
 - **Rotation.** Replace the files in place and restart, or use
-  `ai-memory tls import --cert <p> --key <p>` (#3709 item 2, separate
+  `--tls-cert <fullchain.pem> --tls-key <key.pem>` (an `ai-memory tls import` verb is #3709 item 2, v1.0.1, separate
   owner) which validates the pair and hands it to the daily reload task so
   the listener picks the new material up without a restart. Expiry shows in
   `ai-memory doctor` (`local_tls_material`) before it bites.

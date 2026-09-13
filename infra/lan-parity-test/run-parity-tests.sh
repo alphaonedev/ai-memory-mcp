@@ -69,11 +69,32 @@ PG_MAINT_DB="ai_memory_test"
 # Prefix for the throwaway per-binary Pass-2 probe databases. Kept distinct
 # from PG_MAINT_DB so leftover probes are trivially identifiable + reapable.
 PG_PROBE_PREFIX="ai_memory_test_p2_"
-PG_URL="postgres://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${PG_MAINT_DB}"
+# #3705 — "only encrypted data in transit": the SAL postgres adapter refuses
+# a DSN that does not pin `sslmode=verify-full` at the connect funnel, so
+# every DSN this script hands to cargo carries it, verified against the
+# fleet CA the compose stack's one-shot `ic-parity-tls` provisioner minted.
+# Export the CA from the volume once (compose names it
+# <project>_ic-parity-tls; the pg image is already built so nothing is pulled):
+#   docker run --rm -v ai-memory-lan-parity_ic-parity-tls:/t:ro \
+#     ai-memory-pg-age-vector:latest cat /t/ca.pem > .local-runs/lan-parity-ca.pem
+PG_CA="${PG_CA:-$REPO_ROOT/.local-runs/lan-parity-ca.pem}"
+if [ ! -s "$PG_CA" ]; then
+    echo "[lan-parity] ERROR: fleet CA not found at $PG_CA (#3705: the pg DSN must pin" >&2
+    echo "  sslmode=verify-full&sslrootcert=<ca>). Export it from the compose volume:" >&2
+    echo "  docker run --rm -v ai-memory-lan-parity_ic-parity-tls:/t:ro ai-memory-pg-age-vector:latest cat /t/ca.pem > $PG_CA" >&2
+    echo "  (or set PG_CA=<path> to a copy of /tls/ca.pem)" >&2
+    exit 2
+fi
+PG_SSL_QUERY="sslmode=verify-full&sslrootcert=${PG_CA}"
+PG_URL="postgres://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${PG_MAINT_DB}?${PG_SSL_QUERY}"
+# psql honours the same floor through libpq's env (the CLI is not gated by
+# the adapter, but the pre-flight should prove the TLS path the tests use).
+export PGSSLMODE="verify-full" PGSSLROOTCERT="$PG_CA"
 
 echo "[lan-parity] PG URL: ${PG_URL/${PG_PASS}@/<redacted>@}"
+echo "[lan-parity] PG CA:  $PG_CA"
 echo "[lan-parity] Log:    $LOG"
-echo "[lan-parity] Pre-flight PG reach check..."
+echo "[lan-parity] Pre-flight PG reach check (TLS, verify-full)..."
 PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_MAINT_DB" \
     -c "SELECT 'pg+age reachable' AS status;" >/dev/null
 echo "[lan-parity] PG+AGE reachable. Running cargo SAL-postgres tests..."
@@ -216,7 +237,8 @@ else
             continue
         fi
 
-        PROBE_URL="postgres://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${PROBE_DB}"
+        # #3705 — same verify-full pin as PG_URL.
+        PROBE_URL="postgres://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${PROBE_DB}?${PG_SSL_QUERY}"
         AI_MEMORY_TEST_POSTGRES_URL="$PROBE_URL" \
         AI_MEMORY_NO_CONFIG=1 \
         "$BIN" --include-ignored --test-threads=1 2>&1 | tee -a "$LOG"

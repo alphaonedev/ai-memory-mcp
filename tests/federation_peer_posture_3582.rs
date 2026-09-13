@@ -268,6 +268,12 @@ fn no_peers_and_reserved_local_key_do_not_trigger_peer_refusal_3582() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("keys");
         std::fs::create_dir(&dir).unwrap();
+        // #3705 review — a key dir never inherits the ambient umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let key = ai_memory::identity::keypair::generate("peer").unwrap();
         std::fs::write(dir.join("daemon.pub"), key.public.to_bytes()).unwrap();
         let out = command(root.path(), posture)
