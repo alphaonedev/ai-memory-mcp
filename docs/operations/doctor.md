@@ -121,11 +121,22 @@ sections.
   as `peer::<agent>/<peer>::invalid = <column and reason>`. **Warning** when
   > 0: an invalid row is neither healthy nor absent (#3655).
 - Per peer (`peer::<agent>/<peer>::…`, #3655):
-  - `observed_age_secs` — seconds since this node last observed the peer
-    (`last_pulled_at`, this node's clock). **Critical** when > 600s: the
-    peer is stale no matter what its data says. This is the case the old
-    `|last_seen_at - last_pulled_at|` skew could never see — two equal but
-    hours-old cursors reported as healthy.
+  - `reachability` — `reachable`, or `unknown:<reason>` using the SAME
+    definition the live daemon's `/health` uses (#3654): a peer's last
+    ANSWERED pull older than 3 × its catch-up cadence is
+    `unknown:pull_observation_stale` → **Critical** (the mesh is not
+    converging through this node); a row with no recorded contact is
+    `unknown:no_pull_observation`, and one whose contact carries no cadence
+    is `unknown:no_catchup_loop` → **Warning**, counted in `unknown_peers`
+    — neither healthy nor stale, and never rendered as an age of 0.
+  - `contact_age_secs` / `catchup_interval_secs` — seconds since the peer
+    last answered a pull (`sync_peer_contact.last_contact_at`, this node's
+    clock; stamped on every answered pull, EMPTY window included) and the
+    cadence of the loop that pulled; `not_observed` when absent.
+  - `advanced_age_secs` — seconds since the data watermark last advanced
+    (`last_pulled_at`, this node's clock). `last_pulled_at` only moves when
+    a pull carried rows, so it is a data-watermark stamp, not a contact
+    time: old is the normal state of a quiet peer and is not a finding.
   - `data_age_secs` — seconds since the newest peer data seen
     (`last_seen_at`, the peer's clock). Old is legitimate for a quiet peer.
   - `pushed_age_secs` — seconds since the last local watermark the peer
@@ -134,9 +145,11 @@ sections.
     when it exceeds the sync daemon's pull-cursor future bound (300s): the
     peer stamps data in this node's future, so its cursors will be refused.
     Negative is the quiet-peer case and is not a finding.
-- `stale_peers`, `max_observed_age_secs`, `max_data_age_secs` — measured
-  maxima over valid rows; `max_skew_secs` (the largest `|clock_lead_secs|`)
-  is kept for existing consumers and no longer drives severity.
+- `stale_peers`, `unknown_peers`, `max_contact_age_secs`,
+  `max_advanced_age_secs`, `max_data_age_secs` — measured counts and maxima
+  over valid rows (`not_observed` when nothing was measured);
+  `max_skew_secs` (the largest `|clock_lead_secs|`) is kept for existing
+  consumers and no longer drives severity.
 - **Critical** with `sync_state = unreadable` and `sync_query_error` when the
   table cannot be queried — peer health is unknown, which is not the same as
   a single node (#3655).

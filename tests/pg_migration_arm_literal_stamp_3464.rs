@@ -179,24 +179,26 @@ fn migrate_v97_stamps_the_literal_97_3464() {
     );
 }
 
-/// v98 occupies the moving-tip dispatch slot; v97 remains a settled literal.
-/// Both backends must retain this handoff so v97 cannot be skipped on upgrade.
+/// v99 occupies the moving-tip dispatch slot; v97 and v98 remain settled
+/// literals. Both backends must retain this handoff so neither settled rung
+/// can be skipped on upgrade.
 #[test]
-fn v98_owns_tip_and_v97_is_settled_3401() {
+fn v99_owns_tip_and_v98_is_settled_3655() {
     let pg = postgres_source();
     assert!(
         pg.contains(
-            "if current_version < CURRENT_SCHEMA_VERSION {\n            self.migrate_v98().await?;"
+            "if current_version < CURRENT_SCHEMA_VERSION {\n            self.migrate_v99().await?;"
         ),
-        "#3464: PostgreSQL must dispatch v98 from the single current-tip arm"
+        "#3464: PostgreSQL must dispatch v99 from the single current-tip arm"
     );
-
+    assert!(pg.contains("if current_version < 98 {\n            self.migrate_v98().await?;"));
     assert!(pg.contains("if current_version < 97 {\n            self.migrate_v97().await?;"));
     let sqlite = sqlite_migrations_source();
     assert!(sqlite.contains("if version < 97 {\n            // v97"));
+    assert!(sqlite.contains("if version < 98 {\n            // v98 (#3401)"));
     assert!(
-        sqlite.contains("if version < CURRENT_SCHEMA_VERSION {\n            // v98 (#3401)"),
-        "#3464: SQLite must dispatch v98 from the single current-tip arm"
+        sqlite.contains("if version < CURRENT_SCHEMA_VERSION {\n            // v99 (#3655)"),
+        "#3464: SQLite must dispatch v99 from the single current-tip arm"
     );
 }
 
