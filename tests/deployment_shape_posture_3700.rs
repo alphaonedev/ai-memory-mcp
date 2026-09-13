@@ -9,7 +9,7 @@
 //! agent registry) against that declaration:
 //!
 //! - a hardened DECLARED shape with a pinned knob below its floor REFUSES,
-//!   naming EVERY disabled knob (the #3714/security_profile refusal named
+//!   naming EVERY disabled knob (the #3714/`security_profile` refusal named
 //!   only the first);
 //! - signals that look like a stricter shape than declared are a boot WARN
 //!   and a forensic record — NEVER a re-posture: promotion is an operator
