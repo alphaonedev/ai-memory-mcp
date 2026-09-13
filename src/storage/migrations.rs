@@ -1280,7 +1280,7 @@ const MIGRATION_V28_SQLITE: &str =
 // `governance_rules` table holds typed rules (kind / matcher / severity)
 // evaluated by `check_agent_action`. Seed rules R001-R004 land at
 // `enabled=0` (per design revision 2026-05-13) so the test fleet does
-// not break on macOS `/private/tmp` realpath. Operator activates with
+// not break on the macOS realpath of the system temp directory. Operator activates with
 // `ai-memory rules enable <id> --sign` after running the test-fleet
 // audit. CREATE TABLE IF NOT EXISTS + INSERT OR IGNORE — fully
 // idempotent.

@@ -30,7 +30,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIVE_DB="${AI_MEMORY_DB:-$HOME/.claude/ai-memory.db}"
 # Scratch lives in the repo-local, gitignored .local-runs/ (CLAUDE.md
-# §"Allowed scratch location"), never /tmp: a /tmp backup of the LIVE MCP
+# §"Allowed scratch location"), never the system temp directory: a system-temp backup of the LIVE MCP
 # database is reaped by tmpfiles/reboot, so the one artifact that makes
 # this script recoverable would silently disappear.
 BACKUP_DB="$REPO/.local-runs/ai-memory-dogfood-test-$(date +%Y%m%dT%H%M%S).db"

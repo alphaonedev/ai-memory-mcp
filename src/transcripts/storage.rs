@@ -608,7 +608,7 @@ pub(crate) fn zstd_decompress(input: &[u8]) -> Result<Vec<u8>> {
 // -----------------------------------------------------------------
 // L0.7-2 Tier A — transcripts/storage tests
 // All paths exercised over `:memory:` SQLite via `crate::db::open` so
-// the daemon's schema is applied. No /tmp writes.
+// the daemon's schema is applied. No system-temp writes.
 // -----------------------------------------------------------------
 #[cfg(test)]
 mod tests {

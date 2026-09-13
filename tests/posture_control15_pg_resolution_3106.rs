@@ -72,7 +72,7 @@ const AGENT_ID: &str = "cert-node-3106";
 /// Approver identity minted for the check #20 enrollment.
 const APPROVER_ID: &str = "cert-approver-3106";
 
-/// A fresh sandbox under `.local-runs/` (project no-`/tmp` HARD RULE).
+/// A fresh sandbox under `.local-runs/` (project scratch-location HARD RULE).
 fn sandbox(label: &str) -> tempfile::TempDir {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

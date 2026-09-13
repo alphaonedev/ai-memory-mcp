@@ -40,7 +40,7 @@ use std::sync::OnceLock;
 ///   runner injects this via the `ANDROID_DATA_DIR` env var).
 /// - **Host (linux/macOS/windows)**: a project-local `.local-runs/`
 ///   subdir, used as the smoke-run fallback in normal CI (honors the
-///   no-/tmp HARD RULE in CLAUDE.md — see `sandbox_root`).
+///   scratch-location HARD RULE in CLAUDE.md — see `sandbox_root`).
 pub fn sandbox_db_path(test_name: &str) -> PathBuf {
     let base = sandbox_root();
     let p = base.join(format!("ai-memory-test-{test_name}.db"));
@@ -81,7 +81,7 @@ fn sandbox_root() -> &'static Path {
             return PathBuf::from("/data/local/tmp");
         }
         // Host fallback: project-local .local-runs to honor the
-        // no-/tmp HARD RULE documented in CLAUDE.md.
+        // scratch-location HARD RULE documented in CLAUDE.md.
         let mut p = std::env::var_os("CARGO_MANIFEST_DIR")
             .map_or_else(|| PathBuf::from("."), PathBuf::from);
         p.push(".local-runs");

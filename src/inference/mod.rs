@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn compute_and_verify_attested_weights_round_trip() {
         // Write a tiny fixture file to .local-runs/ so we honor the
-        // no-/tmp HARD RULE in CLAUDE.md.
+        // scratch-location HARD RULE in CLAUDE.md.
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
         std::fs::create_dir_all(&dir).expect("mkdir .local-runs");
         let path = dir.join(format!(

@@ -58,7 +58,7 @@
 # failure handling, and its real verification branch.
 #
 # Scratch lives under `.local-runs/` per the project hard rule — never
-# `/tmp`, `/var/tmp`, or any tmpfs.
+# the system temp directories or any tmpfs.
 
 set -euo pipefail
 
@@ -436,7 +436,7 @@ run_scenario() {
 # ---------------------------------------------------------------------------
 # STATIC self-test: prove the static gate is load-bearing by planting the
 # exact regressions it exists to catch into a throwaway copy of the repo
-# (under .local-runs/, never /tmp) and asserting the gate rejects each.
+# (under .local-runs/, never the system temp directory) and asserting the gate rejects each.
 #
 # Without this, the static mode is an assertion nobody has ever seen fail
 # — which is the same "decorative control" defect #2449 is about, one

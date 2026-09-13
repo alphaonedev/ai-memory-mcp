@@ -83,7 +83,7 @@ const MARKER_SUFFIX: &str = ".federation-outbox";
 // ---------------------------------------------------------------------
 
 fn scratch_dir(prefix: &str) -> tempfile::TempDir {
-    // Project HARD RULE: no agent-created files under /tmp.
+    // Project HARD RULE: no agent-created files in the system temp directory.
     tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/.local-runs"))

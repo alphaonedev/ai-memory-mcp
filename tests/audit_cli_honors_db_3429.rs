@@ -39,7 +39,7 @@ use std::process::{Command, Output};
 
 const AGENT: &str = "audit-db-3429";
 
-/// Project HARD RULE: scratch lives under `.local-runs/`, never `/tmp`.
+/// Project HARD RULE: scratch lives under `.local-runs/`, never the system temp directory.
 fn scratch_root() -> PathBuf {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

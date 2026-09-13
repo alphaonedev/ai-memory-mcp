@@ -480,13 +480,13 @@ mod tests {
 
     #[test]
     fn an_over_long_socket_path_is_refused_rather_than_truncated() {
-        let long = PathBuf::from(format!("/tmp/{}/s.sock", "d".repeat(MAX_SOCKET_PATH_BYTES)));
+        let long = PathBuf::from(format!("/example/{}/s.sock", "d".repeat(MAX_SOCKET_PATH_BYTES)));
         let err = check_socket_path_length(&long).expect_err("must refuse");
         assert!(
             format!("{err}").contains("silently TRUNCATED"),
             "unexpected: {err}"
         );
-        assert!(check_socket_path_length(Path::new("/tmp/a/s.sock")).is_ok());
+        assert!(check_socket_path_length(Path::new("/example/a/s.sock")).is_ok());
     }
 
     /// #3471 — the drain unlinks the socket IT created, in the order the hub

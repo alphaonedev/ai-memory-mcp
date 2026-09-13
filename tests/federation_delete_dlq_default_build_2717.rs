@@ -96,7 +96,7 @@ async fn spawn_mock_peer(state: PeerState) -> String {
 }
 
 /// On-disk sqlite `Db` migrated past v48 so `federation_push_dlq` exists.
-/// Scratch lives under `.local-runs/` per the project no-`/tmp` hard rule.
+/// Scratch lives under `.local-runs/` per the project scratch-location hard rule.
 fn fresh_dlq_db() -> (tempfile::TempDir, ai_memory::handlers::Db) {
     let tmp = tempfile::Builder::new()
         .prefix("v100-2717-delete-dlq-default-")

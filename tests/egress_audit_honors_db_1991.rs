@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Fresh per-test directory pair under `.local-runs/` (project no-`/tmp`
+/// Fresh per-test directory pair under `.local-runs/` (project scratch-location
 /// HARD RULE): a CWD directory and a SEPARATE db directory, so the resolved
 /// `--db` path can never coincide with CWD `ai-memory.db`.
 fn fresh_dirs(label: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {

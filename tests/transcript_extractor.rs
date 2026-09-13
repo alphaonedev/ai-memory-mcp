@@ -81,7 +81,7 @@ fn build_extractor_once() -> PathBuf {
     // Build into a dedicated target dir, separate from the main crate's so a
     // parallel `cargo test` against `ai-memory` doesn't race the sibling-crate
     // build cache.
-    // #1721 — project-local scratch (no /tmp writes; CLAUDE.md hard rule).
+    // #1721 — project-local scratch (no system-temp writes; CLAUDE.md hard rule).
     //
     // v1.0.0 #3140 — this used to be scoped by PID. Cargo already takes an
     // exclusive lock on a target dir, so two concurrent driver processes were

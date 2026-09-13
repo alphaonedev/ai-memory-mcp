@@ -7,7 +7,7 @@
 //! the `tests/mcp_integration.rs` spawn convention).
 //!
 //! Each test seeds a scratch sqlite DB (under the cargo target dir —
-//! never `/tmp`, per the project hard rule) with memories embedded at
+//! never the system temp directory, per the project hard rule) with memories embedded at
 //! one dim, then spawns the binary with the `AI_MEMORY_EMBED_*` env
 //! vars pointed at a wiremock OpenAI-compatible `/embeddings` server
 //! resolving to a DIFFERENT dim:
@@ -45,7 +45,7 @@ const TARGET_DIM: usize = 384;
 const TARGET_MODEL: &str = "bge-small-en";
 const NAMESPACE: &str = "reembed-e2e-1598";
 
-/// Project-local scratch dir (never `/tmp`): a fresh subdir under the
+/// Project-local scratch dir (never the system temp directory): a fresh subdir under the
 /// cargo target dir, which always exists at test runtime.
 fn scratch_db(tag: &str) -> (tempfile::TempDir, PathBuf) {
     let target_root = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
@@ -152,7 +152,7 @@ const REEMBED_CHILD_POLL: Duration = Duration::from_millis(25);
 /// exits parks the test forever. Redirecting to files instead of pipes keeps
 /// the reap free of the classic full-pipe deadlock: the child can always make
 /// progress, so `try_wait` is a truthful liveness signal. Capture files live
-/// beside the scratch DB (never `/tmp`, per the project hard rule).
+/// beside the scratch DB (never the system temp directory, per the project hard rule).
 fn output_within(mut cmd: std::process::Command, db_path: &Path) -> Output {
     let stem = db_path.with_extension(format!("{}", std::process::id()));
     let out_path = PathBuf::from(format!("{}.stdout", stem.display()));

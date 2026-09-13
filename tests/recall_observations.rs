@@ -20,8 +20,8 @@
 use ai_memory::observations::{self, Candidate};
 use rusqlite::params;
 
-/// `.local-runs/`-anchored scratch DB so the project's no-`/tmp`
-/// hard rule (CLAUDE.md §"No agent-created files under /tmp") is
+/// `.local-runs/`-anchored scratch DB so the project's scratch-location
+/// hard rule (the CLAUDE.md scratch-location section) is
 /// observed. We use an in-memory connection rather than a file path
 /// here because the on-disk semantics for these tests are
 /// transient; an in-memory DB writes nothing to the filesystem and

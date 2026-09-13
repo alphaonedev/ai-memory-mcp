@@ -84,7 +84,7 @@
 #
 # POST-RUN VERIFICATION
 # ---------------------
-#   * /tmp/aimemory-schema-init.json should show
+#   * the $SCHEMA_INIT_JSON report (default: beside the backup) should show
 #       tables   > 0
 #       schema_version == 28   (v0.7.0 expected)
 #       extensions includes "age" and "vector"
@@ -115,7 +115,7 @@ PG_PASSWORD_FILE="${PG_PASSWORD_FILE:-/root/aimemory-pg-password.txt}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_FILE="${BACKUP_DIR}/aimemory-pre-reinit-${TIMESTAMP}.dump"
-SCHEMA_INIT_JSON="${SCHEMA_INIT_JSON:-/tmp/aimemory-schema-init-${TIMESTAMP}.json}"
+SCHEMA_INIT_JSON="${SCHEMA_INIT_JSON:-${BACKUP_DIR}/aimemory-schema-init-${TIMESTAMP}.json}"
 
 AI_MEMORY_BIN="${AI_MEMORY_BIN:-/opt/ai-memory-src/target/release/ai-memory}"
 AI_MEMORY_SSH_HOST="${AI_MEMORY_SSH_HOST:-}"   # empty => run binary locally

@@ -701,13 +701,13 @@ mod tests {
     #[test]
     fn strictly_newer_is_refused_and_names_both_versions() {
         with_hatch(None, || {
-            let err = evaluate(92, 87, BACKEND_SQLITE, "/tmp/x.db")
+            let err = evaluate(92, 87, BACKEND_SQLITE, "/example/x.db")
                 .expect_err("a newer database must be refused");
             assert_eq!(err.observed, 92);
             assert_eq!(err.supported, 87);
             assert!(err.detail.contains("v92"), "{}", err.detail);
             assert!(err.detail.contains("v87"), "{}", err.detail);
-            assert!(err.detail.contains("/tmp/x.db"), "{}", err.detail);
+            assert!(err.detail.contains("/example/x.db"), "{}", err.detail);
         });
     }
 

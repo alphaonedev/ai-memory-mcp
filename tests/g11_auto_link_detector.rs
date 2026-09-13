@@ -59,7 +59,7 @@ fn build_detector_once() -> PathBuf {
     // sibling-crate build cache. Scope the temp dir by current
     // PID so two concurrent `cargo test` driver processes (e.g.
     // CI sharding) cannot stomp each other's target/.
-    // #1721 — project-local scratch (no /tmp writes; CLAUDE.md hard rule).
+    // #1721 — project-local scratch (no system-temp writes; CLAUDE.md hard rule).
     let scratch_root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(".local-runs")

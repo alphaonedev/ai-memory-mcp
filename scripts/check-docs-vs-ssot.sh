@@ -1567,7 +1567,7 @@ run_all_rules() {
 # scripts/check-vendor-literals.sh self-test convention.
 
 run_self_test() {
-    # Scratch lives UNDER the repo, never system /tmp and never
+    # Scratch lives UNDER the repo, never the system temp directory and never
     # `mktemp -d` (CLAUDE.md project hard rule; the #2494 /
     # migration-ladder gates set the precedent).
     local tmpdir="$REPO_ROOT/.local-runs/docs-ssot-selftest-$$"

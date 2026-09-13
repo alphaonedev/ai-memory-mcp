@@ -611,7 +611,7 @@ fn purge_marker_blocks_cross_process_remint_until_row_and_bundle_are_gone() {
     // Model the second process: its sweep starts from an empty in-process
     // frontier while the durable archived row remains visible.
     // Use the store's canonical directory: on macOS the fixture path can be
-    // spelled through /tmp while ErasureStore resolves it through /private/tmp,
+    // spelled through the temp-root symlink while ErasureStore resolves it through its realpath,
     // and the process cache is keyed by the latter PathBuf.
     archive_sync::reset_process_static_sweep_state_for_dir(store.dir());
     let raced = archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("racing sweep");
@@ -1356,7 +1356,7 @@ fn poison_plus_successors_fixture() -> (Fixture, PathBuf) {
     // poison skip-set start empty — no reset needed here. A reset that DID
     // matter (the restart test) must key on the store's OWN `dir()` (the exact
     // PathBuf the sweep uses as its registry key), NOT a recomputed
-    // `erasure_dir(db_path)`: on macOS the tempdir path is a `/tmp`→`/private/tmp`
+    // `erasure_dir(db_path)`: on macOS the tempdir path can be a temp-root
     // symlink, so `is_file()` resolves it but a raw-string PathBuf HashMap-key
     // comparison does not — the two strings differ and the wrong key is cleared.
     let dir = erasure_dir(&f.db_path);

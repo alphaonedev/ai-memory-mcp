@@ -10934,13 +10934,13 @@ mod tests {
     fn config_parse_toml() {
         let toml_str = r#"
             tier = "smart"
-            db = "/tmp/test.db"
+            db = "/example/test.db"
             ollama_url = "http://localhost:11434"
             cross_encoder = true
         "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.tier.as_deref(), Some("smart"));
-        assert_eq!(cfg.db.as_deref(), Some("/tmp/test.db"));
+        assert_eq!(cfg.db.as_deref(), Some("/example/test.db"));
         assert!(cfg.cross_encoder.unwrap());
     }
 
@@ -14023,7 +14023,7 @@ max_page_size = 1000000
         use std::os::unix::fs::PermissionsExt;
         let _g = env_var_lock();
         scrub_llm_env();
-        // Tempdir under .local-runs (project HARD rule: no /tmp).
+        // Tempdir under .local-runs (project HARD rule: no system temp directory).
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join(format!("test-1146-perms-{}", std::process::id()));

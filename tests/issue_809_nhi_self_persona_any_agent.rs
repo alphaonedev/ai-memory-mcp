@@ -276,7 +276,7 @@ fn nhi_self_persona_any_agent_substrate_resident() {
     // ----- Assertion 1: NO filesystem side-channels -------------------
     let candidate_disk_paths = [
         dirs::home_dir().map(|h| h.join(".ai-memory").join("personas")),
-        Some(PathBuf::from("/tmp").join("ai-memory-personas")),
+        Some(std::env::temp_dir().join("ai-memory-personas")),
     ];
     for p in candidate_disk_paths.iter().flatten() {
         // It's fine if the operator already had one (we don't unfuck

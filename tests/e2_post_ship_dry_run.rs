@@ -75,7 +75,7 @@ fn build_verifier_once() -> PathBuf {
         manifest_path.display()
     );
 
-    // #1721 — project-local scratch (no /tmp writes; CLAUDE.md hard rule).
+    // #1721 — project-local scratch (no system-temp writes; CLAUDE.md hard rule).
     let scratch_root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(".local-runs")

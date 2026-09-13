@@ -195,12 +195,12 @@ fn negative_stamp_refuses_even_without_corroboration_2564() {
 /// The shared verdict is a RANGE check now, not a ceiling check.
 #[test]
 fn evaluate_refuses_a_negative_observed_version_2564() {
-    let err = schema_guard::evaluate(-1, 90, BACKEND_SQLITE, "/tmp/x.db")
+    let err = schema_guard::evaluate(-1, 90, BACKEND_SQLITE, "/example/x.db")
         .expect_err("a negative observed version is illegal at the low end");
     assert_eq!(err.observed, -1);
     // The sane range still passes untouched.
-    assert!(schema_guard::evaluate(0, 90, BACKEND_SQLITE, "/tmp/x.db").is_ok());
-    assert!(schema_guard::evaluate(90, 90, BACKEND_SQLITE, "/tmp/x.db").is_ok());
+    assert!(schema_guard::evaluate(0, 90, BACKEND_SQLITE, "/example/x.db").is_ok());
+    assert!(schema_guard::evaluate(90, 90, BACKEND_SQLITE, "/example/x.db").is_ok());
 }
 
 // ---------------------------------------------------------------------------

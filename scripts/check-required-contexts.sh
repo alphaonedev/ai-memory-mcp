@@ -237,7 +237,7 @@
 # CLI:
 #   scripts/check-required-contexts.sh              — run the gate (exit 0/1)
 #   scripts/check-required-contexts.sh --self-test  — plant the historical
-#       shapes in a throwaway copy UNDER the repo (never system /tmp) and
+#       shapes in a throwaway copy UNDER the repo (never the system temp directory) and
 #       confirm the gate rejects EACH: the (b1) matrix+`if:` wedge, an (a)
 #       mirror context matching no job, the (e) #2473 unquoted ` #` job name
 #       (which first asserts through `--dump` that the parse IS truncated at
@@ -1144,7 +1144,7 @@ selftest() {
     echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; #2473 (e) unquoted ' #' job name -> FAIL (and the parse is asserted truncated); (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted; #2508 (d) verbatim cancelled-duplicate carrier -> FAIL, its four near-miss shapes -> PASS; #2636 (f) a gating-workflow job declared in NEITHER the mirror nor the not-required ledger -> FAIL)"
 
     # Fixtures are staged under the repo's gitignored `.local-runs/` scratch
-    # root — never system /tmp (project hard rule), and never `mktemp -d`,
+    # root — never the system temp directory (project hard rule), and never `mktemp -d`,
     # whose TMPDIR-honouring default is exactly how that rule gets violated by
     # accident. The path is PID-scoped so two concurrent self-tests cannot
     # stomp each other. Nothing here is visible to the gate under test except

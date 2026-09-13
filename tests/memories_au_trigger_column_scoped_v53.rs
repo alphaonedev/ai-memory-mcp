@@ -59,7 +59,7 @@ use rusqlite::Connection;
 fn fresh_v53_db() -> (Connection, tempfile::TempDir) {
     // Use a tempfile under .local-runs/ rather than `:memory:` so
     // the path-based `ai_memory::storage::open` API works
-    // unchanged. Per CLAUDE.md HARD RULE: no `/tmp` scratch.
+    // unchanged. Per CLAUDE.md HARD RULE: no system-temp scratch.
     let local_runs = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(".local-runs")

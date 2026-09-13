@@ -18,7 +18,7 @@
 //!
 //! All tests set `AI_MEMORY_NO_CONFIG=1` per the standard CLI test
 //! convention. Scratch lives in per-test `tempfile::TempDir`s —
-//! never `/tmp` (project hard rule).
+//! never the system temp directory (project hard rule).
 
 use ai_memory::db;
 use ai_memory::identity::keypair as kp_mod;

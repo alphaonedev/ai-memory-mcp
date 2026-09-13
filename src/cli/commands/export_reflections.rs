@@ -577,8 +577,8 @@ mod tests {
 
     #[test]
     fn resolve_out_dir_explicit_overrides_default() {
-        let p = resolve_out_dir(Some(Path::new("/tmp/some-path"))).unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/some-path"));
+        let p = resolve_out_dir(Some(Path::new("/example/some-path"))).unwrap();
+        assert_eq!(p, PathBuf::from("/example/some-path"));
     }
 
     #[test]

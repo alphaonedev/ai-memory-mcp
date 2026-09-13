@@ -1046,7 +1046,7 @@ mod tests {
     fn migrate_v1_legacy_fields_to_sections() {
         let toml_text = r#"
 tier = "autonomous"
-db = "/tmp/test.db"
+db = "/example/test.db"
 llm_model = "gemma4:e4b"
 ollama_url = "http://localhost:11434"
 embed_url = "http://localhost:11434"
@@ -1138,7 +1138,7 @@ archive_on_gc = true
         );
         assert_eq!(
             migrated.get("db").and_then(toml::Value::as_str),
-            Some("/tmp/test.db")
+            Some("/example/test.db")
         );
     }
 

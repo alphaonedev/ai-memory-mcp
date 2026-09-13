@@ -1327,7 +1327,7 @@ mod tests {
     fn audit_resolve_path_directory_expands_to_file() {
         let cfg = crate::config::AuditConfig {
             enabled: Some(true),
-            path: Some("/tmp/ai-memory/audit/".to_string()),
+            path: Some("/example/ai-memory/audit/".to_string()),
             ..Default::default()
         };
         let p = resolve_audit_path(&cfg);

@@ -442,7 +442,7 @@ mod tests {
             !marker.to_string().contains("secret-id"),
             "the in-band marker must never publish a withheld endpoint id"
         );
-        let report = ledger.stderr_report_line("/tmp/x.db", 0);
+        let report = ledger.stderr_report_line("/example/x.db", 0);
         assert!(
             report.contains("a->secret-id"),
             "the operator channel DOES carry the edges: {report}"

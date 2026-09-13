@@ -691,7 +691,7 @@ pub fn validate_id(id: &str) -> Result<()> {
     // #1051 (HIGH, 2026-05-21) — tighten ID validation to reject
     // path-traversal sequences. Pre-#1051 the loose `is_clean_string`
     // check allowed `/`, `\`, and `..` substrings. An attacker who
-    // could federate/import a memory with id = "../../../tmp/evil"
+    // could federate/import a memory with id = "../../../var/evil"
     // could redirect downstream file writes (export-reflections,
     // forensic dumps) outside the requested out-dir, overwriting
     // operator-writable files. Now restricted to a SPIFFE-style
@@ -2157,7 +2157,7 @@ mod tests {
             "../etc/passwd",
             "..",
             "../../",
-            "../../../tmp/evil",
+            "../../../var/evil",
             "foo/../bar",
             "foo/bar",
             "/foo",

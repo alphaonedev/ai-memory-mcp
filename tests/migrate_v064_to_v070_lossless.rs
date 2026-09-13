@@ -410,7 +410,7 @@ fn column_present(conn: &Connection, table: &str, column: &str) -> bool {
 /// A process-local, collision-resistant directory under the repo-local
 /// run area (NEVER a temp dir) so the on-disk DB *and* the sibling
 /// pre-migration snapshot the migration writes both land in a path the
-/// operator's no-`/tmp` rule permits. Caller cleans it up.
+/// operator's scratch-location rule permits. Caller cleans it up.
 fn local_run_dir(tag: &str) -> std::path::PathBuf {
     let token = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

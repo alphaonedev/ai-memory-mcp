@@ -462,7 +462,7 @@ mod tests {
         assert!(parse_host("claude-code").is_ok());
         assert!(parse_host("codex").is_ok());
         assert!(parse_host("gemini").is_ok());
-        assert!(parse_host("file:/tmp/outbox.log").is_ok());
+        assert!(parse_host("file:/example/outbox.log").is_ok());
         assert!(parse_host("file:").is_err());
     }
 

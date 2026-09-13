@@ -370,7 +370,7 @@ mod tests {
         for status in unhealthy {
             assert!(!status.is_reachable(), "{status} must not read as healthy");
             let r = HealthReport {
-                socket: PathBuf::from("/tmp/x.sock"),
+                socket: PathBuf::from("/example/x.sock"),
                 status,
                 latency_ms: None,
                 posture: SocketPosture::default(),
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn the_json_shape_never_carries_the_challenge_nonce() {
         let doc = HealthReport {
-            socket: PathBuf::from("/tmp/x.sock"),
+            socket: PathBuf::from("/example/x.sock"),
             status: HealthStatus::Reachable,
             latency_ms: Some(3),
             posture: SocketPosture::default(),
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn an_io_status_carries_its_detail_instead_of_collapsing_it() {
         let doc = HealthReport {
-            socket: PathBuf::from("/tmp/x.sock"),
+            socket: PathBuf::from("/example/x.sock"),
             status: HealthStatus::Io("disk on fire".into()),
             latency_ms: None,
             posture: SocketPosture::default(),

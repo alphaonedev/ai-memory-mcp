@@ -1334,9 +1334,9 @@ pub(crate) fn key_dir_owner_ok(dir_uid: u32, euid: u32) -> bool {
 /// only the leaf would leave the nested layout half-guarded.
 ///
 /// The walk STOPS at `base`. Ancestors above the caller-supplied key directory
-/// (`~/.config`, `$HOME`, sticky `/tmp` parents) are out of contract: a sticky
+/// (`~/.config`, `$HOME`, a sticky system temp directory) are out of contract: a sticky
 /// world-writable parent of `base` is a host-layout concern, and refusing it
-/// would brick `/tmp`-style deployments. Write access to a link *inside* the
+/// would brick deployments whose keys live under a shared temp root. Write access to a link *inside* the
 /// keystore tree is enough to replace the subtree; write access *above* `base`
 /// is not this gate's job.
 ///

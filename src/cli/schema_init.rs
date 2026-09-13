@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn classifies_sqlite_urls() {
-        assert!(is_sqlite_url("sqlite:///tmp/foo.db"));
+        assert!(is_sqlite_url("sqlite:///example/foo.db"));
         assert!(is_sqlite_url("sqlite://./rel.db"));
         assert!(!is_sqlite_url("postgres://x"));
         assert!(!is_sqlite_url("nosql://x"));
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn sqlite_path_strips_prefix_and_third_slash() {
-        assert_eq!(sqlite_path_from_url("sqlite:///tmp/foo.db"), "/tmp/foo.db");
+        assert_eq!(sqlite_path_from_url("sqlite:///example/foo.db"), "/example/foo.db");
         assert_eq!(sqlite_path_from_url("sqlite://./rel.db"), "./rel.db");
     }
 
@@ -880,8 +880,8 @@ mod tests {
         // no credential, so masking must be a no-op — the report still
         // echoes the operator's `--store-url` for diagnostics.
         assert_eq!(
-            masked_report_url("sqlite:///tmp/foo.db"),
-            "sqlite:///tmp/foo.db"
+            masked_report_url("sqlite:///example/foo.db"),
+            "sqlite:///example/foo.db"
         );
         assert_eq!(
             masked_report_url("postgres://db.internal:5432/prod"),
@@ -1613,7 +1613,7 @@ mod tests {
         // The age_projection footer fires only for `kind == "postgres"`
         // (line 617). SQLite should skip it.
         let report = SchemaInitReport {
-            url: "sqlite:///tmp/x.db".to_string(),
+            url: "sqlite:///example/x.db".to_string(),
             kind: "sqlite".to_string(),
             tables: vec![],
             views: vec![],

@@ -60,7 +60,7 @@ use ai_memory::storage::{self, GovernanceRefusal};
 mod common;
 use common::{free_port, fresh_conn};
 
-/// #1721 — project-local scratch DB path (no files under /tmp; CLAUDE.md
+/// #1721 — project-local scratch DB path (no files in the system temp directory; CLAUDE.md
 /// hard rule). One fresh uuid-named DB per call under the gitignored
 /// `.local-runs/` tree.
 fn scratch_db(infix: &str) -> std::path::PathBuf {
@@ -292,7 +292,7 @@ fn hook_gates_all_three_insert_paths() {
 
 #[test]
 fn cli_one_shot_does_not_install_hook() {
-    // Project-local scratch DB (no /tmp writes — CLAUDE.md hard rule).
+    // Project-local scratch DB (no system-temp writes — CLAUDE.md hard rule).
     let db_path = scratch_db("ai-memory-l16e-cli");
     let bin = env!("CARGO_BIN_EXE_ai-memory");
 
@@ -562,7 +562,7 @@ fn refusal_maps_to_http_403() {
         "metadata": {},
     })
     .to_string();
-    // Project hard rule: no agent-created files under /tmp / /private/tmp / etc.
+    // Project hard rule: no agent-created files in the system temp directories.
     // We capture curl's body via stdout (the `STATUS:` separator is
     // parsed below) rather than `-o <path>` — keeps the test free of
     // any tmpfs-side-effect.

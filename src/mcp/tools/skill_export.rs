@@ -781,7 +781,7 @@ mod tests {
     fn rejects_missing_skill_id() {
         let (conn, _dir) = open_db();
         let err =
-            handle_skill_export(&conn, &json!({"target_folder": "/tmp/x"}), None).unwrap_err();
+            handle_skill_export(&conn, &json!({"target_folder": "/example/x"}), None).unwrap_err();
         assert!(err.contains("requires 'skill_id'"));
     }
 
@@ -790,7 +790,7 @@ mod tests {
         let (conn, _dir) = open_db();
         let err = handle_skill_export(
             &conn,
-            &json!({"skill_id": "", "target_folder": "/tmp/x"}),
+            &json!({"skill_id": "", "target_folder": "/example/x"}),
             None,
         )
         .unwrap_err();
@@ -1090,7 +1090,7 @@ mod tests {
         let blob = zstd::encode_all(b"pwned\n".as_slice(), 3).unwrap();
         let dig = vec![0u8; 32];
         // Absolute path inside the test's own tempdir so even a
-        // hypothetical write would respect the no-/tmp project rule.
+        // hypothetical write would respect the project scratch-location rule.
         let abs = dir.path().join("absolute-pwned.txt");
         let abs_str = abs.to_str().unwrap();
         conn.execute(

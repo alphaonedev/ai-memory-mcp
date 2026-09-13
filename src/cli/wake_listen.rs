@@ -643,21 +643,21 @@ mod tests {
     fn the_resolution_ladder_matches_the_hub_3470() {
         let mut a = args();
         a.no_hub = false;
-        a.socket = Some(PathBuf::from("/tmp/flag-3470.sock"));
+        a.socket = Some(PathBuf::from("/example/flag-3470.sock"));
         let mut app = AppConfig::default();
         app.wake_hub = Some(WakeHubConfig {
-            socket: Some(PathBuf::from("/tmp/config-3470.sock")),
+            socket: Some(PathBuf::from("/example/config-3470.sock")),
             hub_id: Some("hub-from-config".into()),
             ..WakeHubConfig::default()
         });
         let r = resolve(&a, &app, None).expect("resolve");
-        assert_eq!(r.socket, Some(PathBuf::from("/tmp/flag-3470.sock")));
+        assert_eq!(r.socket, Some(PathBuf::from("/example/flag-3470.sock")));
         assert_eq!(r.hub_id, "hub-from-config");
 
         // No config block at all falls through to the compiled hub id.
         let mut bare = args();
         bare.no_hub = false;
-        bare.socket = Some(PathBuf::from("/tmp/x-3470.sock"));
+        bare.socket = Some(PathBuf::from("/example/x-3470.sock"));
         let r = resolve(&bare, &AppConfig::default(), None).expect("resolve");
         assert_eq!(r.hub_id, DEFAULT_HUB_ID);
         assert_eq!(

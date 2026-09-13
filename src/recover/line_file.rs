@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn title_uses_basename_and_sha8() {
-        let p = Path::new("/tmp/outbox.md");
+        let p = Path::new("/example/outbox.md");
         let sha = "abcdef0123456789";
         assert_eq!(title_for(p, sha), "outbox.md:abcdef01");
     }

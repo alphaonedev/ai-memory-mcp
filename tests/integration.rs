@@ -263,7 +263,7 @@ fn wait_child_bounded(
     }
 }
 
-/// #1713 — project-local scratch DB root (no files under /tmp; CLAUDE.md
+/// #1713 — project-local scratch DB root (no files in the system temp directory; CLAUDE.md
 /// hard rule). One fresh uuid-named DB per call under the gitignored
 /// `.local-runs/` tree.
 fn integration_scratch_root() -> std::path::PathBuf {
@@ -12959,7 +12959,7 @@ const FAILURE_CASES: &[FailureCase] = &[
     // 26. sync: invalid direction
     FailureCase {
         subcommand: "sync",
-        args: &["sync", "/tmp/nonexistent.db", "--direction", "invalid"],
+        args: &["sync", "/example/nonexistent.db", "--direction", "invalid"],
         expected_stderr_contains: "invalid",
     },
     // 27. sync-daemon: missing required peers
@@ -13073,7 +13073,7 @@ const FAILURE_CASES: &[FailureCase] = &[
     // 44. restore: nonexistent backup file
     FailureCase {
         subcommand: "restore",
-        args: &["restore", "--from", "/tmp/nonexistent-backup.db"],
+        args: &["restore", "--from", "/example/nonexistent-backup.db"],
         expected_stderr_contains: "not found",
     },
     // 45. curator: mutually exclusive flags

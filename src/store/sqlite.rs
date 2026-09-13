@@ -4745,7 +4745,7 @@ mod tests {
         // Drop the NamedTempFile guard so close() doesn't race the DB
         // open; the path leaks but it's under the OS tmp dir which
         // colima/macOS reaps. Tests run hermetically inside a worktree
-        // tempdir; no /tmp violation per project rule.
+        // tempdir; no system-temp violation per project rule.
         (SqliteStore::open(&path).expect("open SqliteStore"), tmp)
     }
 

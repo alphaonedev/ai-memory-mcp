@@ -275,7 +275,7 @@ fn l1_per_session_independence_does_not_inflate_mean_cost() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scratch helpers — honoring the project no-`/tmp` HARD RULE per CLAUDE.md.
+// Scratch helpers — honoring the project scratch-location HARD RULE per CLAUDE.md.
 // Tempdirs land under the worktree's gitignored `.local-runs/`, never on a
 // tmpfs path.
 // ─────────────────────────────────────────────────────────────────────────────

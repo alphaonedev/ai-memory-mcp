@@ -558,16 +558,16 @@ mod tests {
     #[test]
     fn a_cli_flag_beats_the_config_block() {
         let mut a = args();
-        a.socket = Some(PathBuf::from("/tmp/flag.sock"));
+        a.socket = Some(PathBuf::from("/example/flag.sock"));
         a.max_connections = Some(9);
         let mut app = AppConfig::default();
         app.wake_hub = Some(WakeHubConfig {
-            socket: Some(PathBuf::from("/tmp/config.sock")),
+            socket: Some(PathBuf::from("/example/config.sock")),
             max_connections: Some(77),
             ..WakeHubConfig::default()
         });
         let cfg = resolve_config(&a, &app).expect("resolve");
-        assert_eq!(cfg.socket_path, PathBuf::from("/tmp/flag.sock"));
+        assert_eq!(cfg.socket_path, PathBuf::from("/example/flag.sock"));
         assert_eq!(cfg.max_connections, 9);
     }
 
@@ -575,13 +575,13 @@ mod tests {
     fn the_config_block_beats_the_compiled_default() {
         let mut app = AppConfig::default();
         app.wake_hub = Some(WakeHubConfig {
-            socket: Some(PathBuf::from("/tmp/config.sock")),
+            socket: Some(PathBuf::from("/example/config.sock")),
             hub_id: Some("hub-b".into()),
             rate_per_sec: Some(11),
             ..WakeHubConfig::default()
         });
         let cfg = resolve_config(&args(), &app).expect("resolve");
-        assert_eq!(cfg.socket_path, PathBuf::from("/tmp/config.sock"));
+        assert_eq!(cfg.socket_path, PathBuf::from("/example/config.sock"));
         assert_eq!(cfg.hub_id, "hub-b");
         assert_eq!(cfg.rate_per_sec, 11);
         assert_eq!(
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn an_absent_config_block_yields_the_compiled_defaults() {
         let mut a = args();
-        a.socket = Some(PathBuf::from("/tmp/x.sock"));
+        a.socket = Some(PathBuf::from("/example/x.sock"));
         let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
         assert_eq!(cfg.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(cfg.rate_per_sec, DEFAULT_RATE_TOKENS_PER_SEC);
@@ -608,10 +608,14 @@ mod tests {
     fn posture_reports_the_configured_verifier_in_both_renderings() {
         for (allowlist, expected_label) in [
             (None, "deny-all"),
-            (Some(PathBuf::from("/tmp/allow-3468.json")), "delegation/v1"),
+            (Some(PathBuf::from("/example/allow-3468.json")), "delegation/v1"),
         ] {
+            // #3669: a real, writable directory, so the assertion below would
+            // catch a socket bound by mistake.
+            let dir = tempfile::TempDir::new().expect("socket dir");
+            let socket = dir.path().join("never-bound-3468.sock");
             let mut a = args();
-            a.socket = Some(PathBuf::from("/tmp/never-bound-3468.sock"));
+            a.socket = Some(socket.clone());
             a.allowlist = allowlist.clone();
             a.posture = true;
             let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
@@ -652,7 +656,7 @@ mod tests {
             );
 
             assert!(
-                !std::path::Path::new("/tmp/never-bound-3468.sock").exists(),
+                !socket.exists(),
                 "--posture must never create a socket"
             );
         }
@@ -663,7 +667,7 @@ mod tests {
         // The fail-closed default is a property of the CONFIG, not of a code
         // path somebody remembered to take.
         let mut a = args();
-        a.socket = Some(PathBuf::from("/tmp/x.sock"));
+        a.socket = Some(PathBuf::from("/example/x.sock"));
         let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
         assert!(cfg.allowlist_path.is_none());
         assert_eq!(IdentityPosture::resolve(&cfg), IdentityPosture::DenyAll);
@@ -672,17 +676,17 @@ mod tests {
     #[test]
     fn the_allowlist_flag_beats_the_config_block() {
         let mut a = args();
-        a.socket = Some(PathBuf::from("/tmp/x.sock"));
-        a.allowlist = Some(PathBuf::from("/tmp/from-flag.json"));
+        a.socket = Some(PathBuf::from("/example/x.sock"));
+        a.allowlist = Some(PathBuf::from("/example/from-flag.json"));
         let mut app = AppConfig::default();
         app.wake_hub = Some(WakeHubConfig {
-            allowlist: Some(PathBuf::from("/tmp/from-config.json")),
+            allowlist: Some(PathBuf::from("/example/from-config.json")),
             ..WakeHubConfig::default()
         });
         let cfg = resolve_config(&a, &app).expect("resolve");
         assert_eq!(
             cfg.allowlist_path,
-            Some(PathBuf::from("/tmp/from-flag.json"))
+            Some(PathBuf::from("/example/from-flag.json"))
         );
     }
 
@@ -691,8 +695,12 @@ mod tests {
     /// `--posture` has to read the source to write an alert rule.
     #[test]
     fn the_posture_reports_the_ops_budgets_and_the_metric_schema() {
+        // #3669: a real, writable directory, so the assertion at the end
+        // would catch a socket bound by mistake.
+        let dir = tempfile::TempDir::new().expect("socket dir");
+        let socket = dir.path().join("never-bound-3471.sock");
         let mut a = args();
-        a.socket = Some(PathBuf::from("/tmp/never-bound-3471.sock"));
+        a.socket = Some(socket.clone());
         a.posture = true;
         a.json = true;
         let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
@@ -718,13 +726,13 @@ mod tests {
         assert!(doc["metrics_schema"]["drops"].is_object());
         assert!(doc["metrics_schema"]["fanout_latency_us"]["p99"].is_null());
         // A posture run binds NOTHING.
-        assert!(!std::path::Path::new("/tmp/never-bound-3471.sock").exists());
+        assert!(!socket.exists());
     }
 
     #[test]
     fn the_human_posture_names_the_drain_and_the_fd_budget() {
         let mut a = args();
-        a.socket = Some(PathBuf::from("/tmp/never-bound-3471b.sock"));
+        a.socket = Some(PathBuf::from("/example/never-bound-3471b.sock"));
         a.posture = true;
         let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
         let mut so = Vec::new();

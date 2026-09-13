@@ -46,7 +46,7 @@ fn forensic_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Tempdirs under `.local-runs/` (project no-`/tmp` HARD RULE).
+/// Tempdirs under `.local-runs/` (project scratch-location HARD RULE).
 fn local_runs_root() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

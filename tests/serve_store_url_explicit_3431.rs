@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Command, Output};
 
-/// Project HARD RULE: scratch lives under `.local-runs/`, never `/tmp`.
+/// Project HARD RULE: scratch lives under `.local-runs/`, never the system temp directory.
 fn scratch_root() -> PathBuf {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

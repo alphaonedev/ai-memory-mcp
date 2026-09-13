@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 /// report block (`target: "security.posture"`).
 const ASI_HARD_BANNER: &str = "asi-hard security posture ENGAGED";
 
-/// Scratch dir under `.local-runs/` (project no-`/tmp` HARD RULE).
+/// Scratch dir under `.local-runs/` (project scratch-location HARD RULE).
 fn scratch(label: &str) -> tempfile::TempDir {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

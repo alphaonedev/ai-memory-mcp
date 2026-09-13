@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn defaults_are_bounded_and_non_permissive() {
-        let cfg = HubConfig::with_socket_path(PathBuf::from("/tmp/x.sock"));
+        let cfg = HubConfig::with_socket_path(PathBuf::from("/example/x.sock"));
         assert!(cfg.max_connections > 0);
         assert!(cfg.queue_bytes > 0);
         assert!(cfg.global_egress_bytes >= cfg.queue_bytes);
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn nonces_are_fresh_per_call() {
         let state = HubState::new(
-            HubConfig::with_socket_path(PathBuf::from("/tmp/x.sock")),
+            HubConfig::with_socket_path(PathBuf::from("/example/x.sock")),
             HubDeps::default(),
         );
         let a = state.new_nonce();

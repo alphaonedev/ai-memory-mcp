@@ -66,7 +66,7 @@
 #   scripts/check-doc-surface-completeness.sh --self-test  — plant one
 #       real omission per rule (an undocumented subcommand, an
 #       undocumented route, an undocumented tool) in a throwaway copy
-#       UNDER `.local-runs/` (never system `/tmp`, never `mktemp -d`) and
+#       UNDER `.local-runs/` (never the system temp directory, never `mktemp -d`) and
 #       prove the gate rejects each, alongside near-miss controls that
 #       must PASS (a subcommand documented only in a code fence; a route
 #       documented with `:id` not `{id}`) and the frozen-exclusion

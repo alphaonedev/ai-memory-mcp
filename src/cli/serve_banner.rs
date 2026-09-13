@@ -161,7 +161,7 @@ mod tests {
     fn banner_includes_auto_gen_keypair_line() {
         let lines = compose_banner(&BannerInputs {
             configured_permissions_mode: Some(PermissionsMode::Enforce),
-            auto_generated_keypair_path: Some("/tmp/k.priv".into()),
+            auto_generated_keypair_path: Some("/example/k.priv".into()),
             identity_disabled: false,
         });
         // permissions: enforce + the keypair warning.
@@ -169,7 +169,7 @@ mod tests {
         assert!(lines[1].is_warn());
         let msg = lines[1].message();
         assert!(
-            msg.contains("auto-generated identity keypair at /tmp/k.priv"),
+            msg.contains("auto-generated identity keypair at /example/k.priv"),
             "got: {msg}"
         );
         assert!(msg.contains("consider backing up"));
@@ -196,7 +196,7 @@ mod tests {
         // the auto-gen line wins because it's the load-bearing event.
         let lines = compose_banner(&BannerInputs {
             configured_permissions_mode: Some(PermissionsMode::Enforce),
-            auto_generated_keypair_path: Some("/tmp/k.priv".into()),
+            auto_generated_keypair_path: Some("/example/k.priv".into()),
             identity_disabled: true,
         });
         assert_eq!(lines.len(), 2);

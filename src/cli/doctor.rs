@@ -5839,7 +5839,7 @@ enabled = true
         let hooks = crate::hooks::config::HookConfig::load_from_str(toml_src).expect("parse hooks");
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
-        let synthetic_path = std::path::PathBuf::from("/tmp/synthetic/hooks.toml");
+        let synthetic_path = std::path::PathBuf::from("/example/synthetic/hooks.toml");
         {
             let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
             render_hooks_human_with(&mut out, Some(&synthetic_path), &hooks).unwrap();

@@ -59,7 +59,7 @@
 # CLI:
 #   scripts/check-sdk-route-paths.sh              — run the gate (exit 0/1)
 #   scripts/check-sdk-route-paths.sh --self-test  — plant C-19 + C-20 in a
-#       throwaway copy UNDER `.local-runs/` (never system /tmp, never
+#       throwaway copy UNDER `.local-runs/` (never the system temp directory, never
 #       `mktemp -d`) and prove the gate rejects each, alongside NEAR-MISS
 #       controls that must each PASS so the rule is shown to fire on the
 #       defect and not on its neighbourhood.

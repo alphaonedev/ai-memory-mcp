@@ -1082,7 +1082,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
+    /// In-tree scratch root honoring the project scratch-location HARD RULE.
     fn fresh_dir() -> tempfile::TempDir {
         let root = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))

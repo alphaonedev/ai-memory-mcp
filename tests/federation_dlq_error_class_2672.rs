@@ -87,7 +87,7 @@ async fn spawn_mock_peer(state: PeerState) -> String {
 }
 
 /// On-disk sqlite `Db` migrated past v48 so `federation_push_dlq` exists.
-/// Scratch under `.local-runs/` per the project no-`/tmp` HARD RULE.
+/// Scratch under `.local-runs/` per the project scratch-location HARD RULE.
 fn fresh_dlq_db() -> (
     tempfile::TempDir,
     ai_memory::handlers::Db,

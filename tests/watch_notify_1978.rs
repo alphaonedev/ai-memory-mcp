@@ -7,7 +7,7 @@
 //! `fs-notify` feature so the default build is byte-identical without it.
 //!
 //! All tests are hermetic: they point the watcher at a `tempfile` temp
-//! directory under `.local-runs/` (honouring the project no-`/tmp` HARD
+//! directory under `.local-runs/` (honouring the project scratch-location HARD
 //! RULE), inject a PURE resolver so no real `$HOME` walk happens, and —
 //! by returning `Ok(None)` from the injected resolver — never open the
 //! recovery DB, so a triggered tick is fully observable without any
@@ -23,7 +23,7 @@ use ai_memory::recover::HostKind;
 use ai_memory::recover::transcript_paths::ResolveError;
 use ai_memory::recover::watcher::{self, WatchConfig, notify_backed_watch};
 
-/// In-tree scratch root honouring the project no-`/tmp` HARD RULE.
+/// In-tree scratch root honouring the project scratch-location HARD RULE.
 fn local_runs_root() -> PathBuf {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

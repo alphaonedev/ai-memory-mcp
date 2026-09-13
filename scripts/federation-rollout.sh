@@ -62,7 +62,7 @@ AI_MEMORY_BIN="${AI_MEMORY_BIN:-/usr/local/bin/ai-memory}"
 # The freshly-built candidate binary to roll out.
 NEW_BINARY="${NEW_BINARY:-$REPO/target/release/ai-memory}"
 
-# Durable, OFF-tmpfs state dir for backups. NEVER /tmp (project hard rule +
+# Durable, OFF-tmpfs state dir for backups. NEVER the system temp directory (project hard rule +
 # tmpfs is wiped on reboot, which would lose the rollback target across a
 # crash-restart). Defaults to the systemd StateDirectory convention.
 FED_ROLLOUT_STATE_DIR="${FED_ROLLOUT_STATE_DIR:-/var/lib/ai-memory/rollout}"

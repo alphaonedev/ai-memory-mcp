@@ -85,7 +85,7 @@ fn run_ai_memory_in(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output 
 }
 
 /// A fresh per-test working directory under `.local-runs/` (project
-/// no-`/tmp` HARD RULE), mirroring
+/// scratch-location HARD RULE), mirroring
 /// `tests/record_stop_cli_dispatch_1955.rs::fresh_db`. Returns the
 /// directory itself (not a db file path) — pass it straight to
 /// [`run_ai_memory_in`]; the db file (both the command's functional db

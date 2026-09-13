@@ -98,7 +98,7 @@
 #   scripts/check-migration-ladder.sh --self-test  — plant the #2036/#2192
 #       same-prefix-different-name shape AND a same-version-two-arms case AND
 #       the #2424 v84 bootstrap-inline-index shape (both backends) in a
-#       throwaway copy UNDER the repo (never system /tmp) AND the #3158
+#       throwaway copy UNDER the repo (never the system temp directory) AND the #3158
 #       metadata-matrix escapes (a ladder arm with no meta row; a tail row
 #       re-keyed to `current_schema_version()`) AND the #3608 rule-(e)
 #       SIGPIPE false-ORPHAN class (long first-line-match reference list)
@@ -799,7 +799,7 @@ run_gate() {
 run_self_test() {
     echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL; #2424 bootstrap-inline index on a ladder-added column, postgres v84 + sqlite cid -> FAIL; #3158 metadata-matrix missing row + symbolic tail key -> FAIL; #3608 rule-(e) SIGPIPE false-ORPHAN class -> helper still hits)"
     local scratch
-    # Project hard rule: scratch UNDER the repo, never system /tmp.
+    # Project hard rule: scratch UNDER the repo, never the system temp directory.
     scratch="$(mktemp -d "$ROOT/.migration-ladder-selftest.XXXXXX")"
     trap 'rm -rf "$scratch"' RETURN
 

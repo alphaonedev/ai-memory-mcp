@@ -228,7 +228,7 @@ hub that "lost" every wake.
 
 ```sh
 ulimit -n 4096
-export TMPDIR=/private/tmp/ai-memory-f1-3473        # f2 uses its own
+export TMPDIR=<scratch-root>/ai-memory-f1-3473   # not the system temp dir, a tmpfs or $HOME; f2 uses its own
 RUN=<repo>/.local-runs/wake-3473
 
 # 1. latency, hub arm vs SSE arm, across the four rungs

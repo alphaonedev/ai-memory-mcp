@@ -63,7 +63,7 @@ fn uid(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
-/// Tempdirs under `.local-runs/` (project no-`/tmp` HARD RULE).
+/// Tempdirs under `.local-runs/` (project scratch-location HARD RULE).
 fn fresh_dir(label: &str) -> tempfile::TempDir {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

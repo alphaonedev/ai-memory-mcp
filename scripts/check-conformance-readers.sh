@@ -74,7 +74,7 @@
 #     can never be misread as "the test failed".
 #
 # Scratch lives under `.local-runs/` per the project hard rule -- never
-# `/tmp`, `/var/tmp`, or any tmpfs.
+# the system temp directories or any tmpfs.
 
 set -euo pipefail
 

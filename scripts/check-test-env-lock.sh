@@ -572,7 +572,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
 fn contrived_home_mutation_without_lock() {
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived");
+        std::env::set_var("HOME", "/example/contrived");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },
@@ -594,7 +594,7 @@ fn contrived_home_mutation_with_lock() {
     let _guard = crate::config::test_env_lock();
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived");
+        std::env::set_var("HOME", "/example/contrived");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },
@@ -623,7 +623,7 @@ fn contrived_home_mutation_with_handrolled_lock() {
     let _guard = CONTRIVED_LOCAL_LOCK.lock().unwrap();
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived");
+        std::env::set_var("HOME", "/example/contrived");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },
@@ -648,7 +648,7 @@ fn contrived_home_mutation_comment_only_mention() {
     let _guard = CONTRIVED_COMMENT_ONLY_LOCK.lock().unwrap();
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived_comment_only");
+        std::env::set_var("HOME", "/example/contrived_comment_only");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },
@@ -682,7 +682,7 @@ fn contrived_compliant_first_test() {
     let _guard = crate::config::test_env_lock();
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived_b_first");
+        std::env::set_var("HOME", "/example/contrived_b_first");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },
@@ -701,7 +701,7 @@ fn contrived_handrolled_second_test() {
     let _guard = CONTRIVED_LOCAL_LOCK_ARM_B.lock().unwrap();
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived_b_second");
+        std::env::set_var("HOME", "/example/contrived_b_second");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },
@@ -734,7 +734,7 @@ fn contrived_naked_first_test() {
     let _guard = crate::config::test_env_lock();
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived_naked_first");
+        std::env::set_var("HOME", "/example/contrived_naked_first");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },
@@ -750,7 +750,7 @@ EOF
 #[test]
 fn contrived_naked_second_test() {
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived_naked_second");
+        std::env::set_var("HOME", "/example/contrived_naked_second");
     }
     unsafe {
         std::env::remove_var("HOME");
@@ -781,7 +781,7 @@ fn contrived_delegate_wrapper_test() {
     let _g = env_var_lock();
     let prev = std::env::var("HOME").ok();
     unsafe {
-        std::env::set_var("HOME", "/tmp/contrived_delegate");
+        std::env::set_var("HOME", "/example/contrived_delegate");
     }
     match prev {
         Some(p) => unsafe { std::env::set_var("HOME", p) },

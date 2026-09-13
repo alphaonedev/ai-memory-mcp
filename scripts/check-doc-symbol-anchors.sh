@@ -75,7 +75,7 @@
 #       historical shapes (a `decorate_memory` rename, a
 #       pre-modularisation path, an out-of-range line anchor, a stale
 #       `migrate_vNN`) in a throwaway copy UNDER `.local-runs/` (never
-#       system /tmp, never `mktemp -d`) and prove the gate rejects each,
+#       the system temp directory, never `mktemp -d`) and prove the gate rejects each,
 #       alongside near-miss controls that must PASS.
 
 set -euo pipefail

@@ -31,7 +31,7 @@ use std::process::{Command, Output};
 /// pinning.
 const EX_CONFIG: i32 = 78;
 
-/// Scratch root under the repo's gitignored `.local-runs/` (project no-`/tmp`
+/// Scratch root under the repo's gitignored `.local-runs/` (project scratch-location
 /// HARD RULE), mirroring `tests/security_profile_prerun_2386.rs`.
 fn scratch_root() -> PathBuf {
     let root = std::env::current_dir()

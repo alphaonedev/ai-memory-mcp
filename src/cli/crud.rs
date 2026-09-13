@@ -1020,16 +1020,16 @@ mod tests {
                 "--capability",
                 "cap1:abc",
                 "--capability-file",
-                "/tmp/cap.tok",
+                "/example/cap.tok",
             ])
             .is_err(),
             "--capability + --capability-file must conflict at parse"
         );
-        let ok = TestCli::try_parse_from(["x", "some-id", "--capability-file", "/tmp/cap.tok"])
+        let ok = TestCli::try_parse_from(["x", "some-id", "--capability-file", "/example/cap.tok"])
             .expect("--capability-file alone must parse");
         assert_eq!(
             ok.args.capability_file.as_deref(),
-            Some(std::path::Path::new("/tmp/cap.tok"))
+            Some(std::path::Path::new("/example/cap.tok"))
         );
         let plain = TestCli::try_parse_from(["x", "some-id"]).expect("plain parse");
         assert!(plain.args.capability.is_none() && plain.args.capability_file.is_none());

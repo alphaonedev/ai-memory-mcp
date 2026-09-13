@@ -90,7 +90,7 @@ echo "== LEG A — #3061 pg posture armability =="
 # signing key satisfy #19.
 # HERMETIC key dir: a fresh PRIVATE parent, not bare $TMPDIR. `enrolled_
 # approver_keys` -> `resolve_operator_pubkey` walks BOTH the key dir and its
-# PARENT for an on-disk `operator.key.pub`, so a shared /tmp could otherwise
+# PARENT for an on-disk `operator.key.pub`, so a shared temp directory could otherwise
 # make the keyless negative control below silently un-negative on a dev host.
 WORK_A="$(mktemp -d)"
 KEYDIR_A="$WORK_A/keys"

@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(parsed, HostKind::Codex);
     }
 
-    /// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
+    /// In-tree scratch root honoring the project scratch-location HARD RULE.
     fn local_runs_dir() -> std::path::PathBuf {
         let root = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))

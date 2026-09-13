@@ -1014,7 +1014,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         // A file-backed DB is REQUIRED — `:memory:` connections do not share
-        // state. Scratch under a project-local temp dir (never system /tmp).
+        // state. Scratch under a project-local temp dir (never the system temp directory).
         let dir = tempfile::tempdir().expect("temp dir for shared file DB");
         let db_path = dir.path().join("act3191_transition_race.db");
         {
@@ -1604,7 +1604,7 @@ mod tests {
 
         // A file-backed DB is REQUIRED — `:memory:` connections do not share
         // state, so the cross-process contention cannot be reproduced there.
-        // Scratch under a project-local temp dir (never system /tmp).
+        // Scratch under a project-local temp dir (never the system temp directory).
         let dir = tempfile::tempdir().expect("temp dir for shared file DB");
         let db_path = dir.path().join("fbl06_lease_race.db");
 

@@ -22,7 +22,7 @@
 # Usage:
 #   scripts/batman-bench.sh                       # 10 samples per size
 #   scripts/batman-bench.sh --samples 30
-#   scripts/batman-bench.sh --namespace bench-batman --db /tmp/x.db
+#   scripts/batman-bench.sh --namespace bench-batman --db .local-runs/x.db
 #
 # Default --namespace is `_bench_batman_active`, which won't pollute
 # your real namespace if you re-run.

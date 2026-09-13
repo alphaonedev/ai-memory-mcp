@@ -42,7 +42,7 @@ use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError, UpdatePatch};
 use serde_json::json;
 
-/// Hermetic DB path under `.local-runs/` (never `/tmp`, per project rule).
+/// Hermetic DB path under `.local-runs/` (never the system temp directory, per project rule).
 fn fresh_db_path() -> (tempfile::TempDir, PathBuf) {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

@@ -88,7 +88,7 @@ fn fresh_governance_conn() -> Connection {
 
 /// Insert an operator-signed bash rule that refuses any command
 /// containing `/tmp/`. Mirrors the operator-policy intent of R001
-/// (no /tmp writes) projected onto the bash command surface. The
+/// (no system-temp writes) projected onto the bash command surface. The
 /// caller passes the test `signing` key so the signature actually
 /// verifies against the matching pubkey installed via
 /// `install_test_operator_key()`.

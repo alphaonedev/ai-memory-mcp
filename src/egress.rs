@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn emit_inference_egress_refusal_appends_a_row() {
-        // Fresh db under .local-runs (no-/tmp HARD RULE).
+        // Fresh db under .local-runs (scratch-location HARD RULE).
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
         std::fs::create_dir_all(&dir).expect("mkdir .local-runs");
         let path = dir.join(format!("egress-refusal-{}.db", uuid::Uuid::new_v4()));

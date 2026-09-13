@@ -46,7 +46,7 @@ impl Drop for McpChild {
     }
 }
 
-/// Project-local scratch root (no-/tmp hard rule).
+/// Project-local scratch root (scratch-location hard rule).
 fn scratch_root(tag: &str) -> std::path::PathBuf {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))

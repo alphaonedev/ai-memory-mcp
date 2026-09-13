@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use ai_memory::recover::{HostKind, RecoverOpts, recover_from_transcript};
 
-/// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
+/// In-tree scratch root honoring the project scratch-location HARD RULE.
 /// Tempdirs land under the repo's gitignored `.local-runs/`, never
 /// on a tmpfs path.
 fn local_runs_root() -> PathBuf {

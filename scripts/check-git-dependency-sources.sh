@@ -103,8 +103,8 @@ allowed() {
 # NOTE ON THE `.local-runs` EXCLUSION BELOW — it is deliberately ANCHORED to
 # `$dir` (`"${dir}/.local-runs/*"`) rather than written as the free glob
 # `'*/.local-runs/*'`. `--self-test` stages its fixtures under
-# `$ROOT/.local-runs/` (project hard rule: scratch under the repo, never system
-# /tmp), so a free glob would make every staged fixture INVISIBLE to this
+# `$ROOT/.local-runs/` (project hard rule: scratch under the repo, never the system
+# temp directory), so a free glob would make every staged fixture INVISIBLE to this
 # function — the three violation assertions would then pass VACUOUSLY and the
 # gate would report a green self-test while detecting nothing. Anchoring keeps
 # both properties: the live scan (`$dir` == `$ROOT`) still skips the real
@@ -139,7 +139,7 @@ scan() {
 }
 
 if [ "${1:-}" = "--self-test" ]; then
-  # Project hard rule: scratch UNDER the repo, never system /tmp (zero-strike).
+  # Project hard rule: scratch UNDER the repo, never the system temp directory (zero-strike).
   # Mirrors `check-migration-ladder.sh` / `check-required-contexts.sh`, the two
   # newest gates. `.local-runs/` is gitignored (`.gitignore:53` — `/.local-runs/*`),
   # so a staged fixture can never be committed, and `$$` keeps concurrent runs

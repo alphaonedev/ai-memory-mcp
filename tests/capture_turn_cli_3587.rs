@@ -15,7 +15,7 @@
 //!   loudly without `--quiet`; with `--quiet` (the Stop-hook contract) it
 //!   never fails and reports on stderr, exit 0.
 //!
-//! Scratch DBs live under the cargo target dir (project no-`/tmp` HARD RULE).
+//! Scratch DBs live under the cargo target dir (project scratch-location HARD RULE).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

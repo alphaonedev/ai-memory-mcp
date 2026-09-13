@@ -9163,7 +9163,7 @@ mod tests {
         for url in [
             "postgresql://h/db",
             "http://example/db",
-            "sqlite:///tmp/x.db",
+            "sqlite:///example/x.db",
         ] {
             assert!(
                 reject_url_shaped_db_path(Path::new(url)).is_err(),
@@ -10070,7 +10070,7 @@ mod tests {
             &["ai-memory", "link", "a", "b"],
             &["ai-memory", "consolidate", "ids"],
             &["ai-memory", "resolve", "a", "b"],
-            &["ai-memory", "sync", "--peer", "/tmp/peer.db"],
+            &["ai-memory", "sync", "--peer", "/example/peer.db"],
             &[
                 "ai-memory",
                 "sync-daemon",

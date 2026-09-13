@@ -857,7 +857,7 @@ mod tests {
     const USER_LINE_2: &str = r#"{"timestamp":"2026-05-28T12:01:00Z","type":"user","message":{"content":[{"type":"text","text":"operator directive two"}]}}"#;
     const USER_LINE_3: &str = r#"{"timestamp":"2026-05-28T12:02:00Z","type":"user","message":{"content":[{"type":"text","text":"operator directive three"}]}}"#;
 
-    /// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
+    /// In-tree scratch root honoring the project scratch-location HARD RULE.
     /// Tempdirs land under the repo's gitignored `.local-runs/`, never
     /// on a tmpfs path.
     fn fresh_dir() -> tempfile::TempDir {

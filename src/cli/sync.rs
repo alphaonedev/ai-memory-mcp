@@ -945,16 +945,16 @@ mod tests {
             "https://p",
             "--insecure-skip-server-verify",
             "--ca-cert",
-            "/tmp/ca.pem",
+            "/example/ca.pem",
         ]);
         assert!(
             conflict.is_err(),
             "--ca-cert + --insecure-skip-server-verify must conflict at parse"
         );
         // --ca-cert alone parses + populates the field.
-        let ok = TestCli::try_parse_from(["x", "--peers", "https://p", "--ca-cert", "/tmp/ca.pem"])
+        let ok = TestCli::try_parse_from(["x", "--peers", "https://p", "--ca-cert", "/example/ca.pem"])
             .expect("--ca-cert alone must parse");
-        assert_eq!(ok.args.ca_cert.as_deref(), Some(Path::new("/tmp/ca.pem")));
+        assert_eq!(ok.args.ca_cert.as_deref(), Some(Path::new("/example/ca.pem")));
         // Default: neither flag set.
         let plain = TestCli::try_parse_from(["x", "--peers", "https://p"]).expect("plain parse");
         assert!(plain.args.ca_cert.is_none() && !plain.args.insecure_skip_server_verify);

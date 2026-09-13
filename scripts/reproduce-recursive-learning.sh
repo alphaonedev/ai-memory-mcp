@@ -8,7 +8,7 @@
 #      runtime backend).
 #   2. Creates a fresh sqlite DB under
 #      `.local-runs/repro-recursive-learning-<timestamp>/memory.db`
-#      (NOT /tmp — the project HARD RULE in CLAUDE.md forbids
+#      (NOT the system temp directory — the project HARD RULE in CLAUDE.md forbids
 #      agent-created files on tmpfs).
 #   3. Inserts 3 sample memories at depth=0 via the CLI `store` verb.
 #   4. Drives the MCP server over stdio JSON-RPC to call
@@ -82,7 +82,7 @@ fi
 step "2/8  create fresh sqlite DB"
 info "db path: $DB"
 # `--db` will create the file on first open; the boot path runs the
-# v29 schema (Task 1/8 ladder). No /tmp.
+# v29 schema (Task 1/8 ladder). No system temp directory.
 "$BIN" --db "$DB" stats >/dev/null 2>>"$LOG" || true
 if [[ -f "$DB" ]]; then
   ok "fresh DB initialised"

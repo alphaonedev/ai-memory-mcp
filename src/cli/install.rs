@@ -2712,10 +2712,9 @@ mod tests {
     }
 
     /// Run the snippet emit path for `target` against an isolated
-    /// tempdir and return `(snippet_path, snippet_body)`. The tempdir
-    /// is leaked so the snippet file remains on disk for the caller
-    /// to inspect after the helper returns; the OS sweeps `/tmp` on
-    /// reboot.
+    /// tempdir and return `(snippet_path, snippet_body, dir)`. The caller
+    /// holds `dir`, so the snippet file stays on disk until the test ends
+    /// and is then removed (#3669).
     fn emit_snippet_isolated(target: Target) -> (PathBuf, String, tempfile::TempDir) {
         // Uses the dir-parameterised helper so the test does NOT touch
         // the process-global `AI_MEMORY_SYSTEM_PROMPT_DIR` env var.

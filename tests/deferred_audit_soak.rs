@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn fresh_tempdir() -> tempfile::TempDir {
-    // Honor the project's no-/tmp hard rule by routing tempdirs
+    // Honor the project's scratch-location hard rule by routing tempdirs
     // through TMPDIR which the operator points at .local-runs/.
     tempfile::Builder::new()
         .prefix("ai-memory-soak-")

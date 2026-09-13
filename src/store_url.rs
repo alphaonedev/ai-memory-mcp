@@ -347,7 +347,7 @@ mod tests {
 
         // sqlite:// → ok (explicit local file is still the store).
         unsafe {
-            std::env::set_var(STORE_URL_ENV, "sqlite:///tmp/legit.db");
+            std::env::set_var(STORE_URL_ENV, "sqlite:///example/legit.db");
         }
         refuse_postgres_store_url_without_feature(None).expect("sqlite url must pass");
         unsafe {

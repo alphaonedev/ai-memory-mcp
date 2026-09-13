@@ -417,7 +417,7 @@ fn build_command_for_strategy(
 /// - The wrapped agent binary cannot be spawned (`Command::status`
 ///   surfaces the OS-level error).
 /// - `tempfile::NamedTempFile::new()` fails when the strategy is
-///   `MessageFile` (very rare; `/tmp` full or unwritable).
+///   `MessageFile` (very rare; the temp directory is full or unwritable).
 pub fn run(
     db_path: &Path,
     args: &WrapArgs,

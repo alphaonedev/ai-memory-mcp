@@ -74,7 +74,7 @@ fn lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Tempdirs under `.local-runs/` (project no-`/tmp` HARD RULE).
+/// Tempdirs under `.local-runs/` (project scratch-location HARD RULE).
 fn fresh_dir(label: &str) -> tempfile::TempDir {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

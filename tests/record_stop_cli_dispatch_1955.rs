@@ -29,7 +29,7 @@ fn run_stop(db_path: &Path, args: &[&str]) -> Output {
     cmd.output().expect("spawn ai-memory stop")
 }
 
-/// A fresh temp DB path under `.local-runs/` (project no-`/tmp` HARD RULE).
+/// A fresh temp DB path under `.local-runs/` (project scratch-location HARD RULE).
 fn fresh_db(label: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))

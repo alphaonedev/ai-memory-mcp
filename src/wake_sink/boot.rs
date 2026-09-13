@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn a_configured_sink_with_no_credential_material_refuses_3469() {
         let empty = tempfile::tempdir().expect("tempdir");
-        let cfg = config(Some(PathBuf::from("/tmp/wake-sink-never-opened-3469.sock")));
+        let cfg = config(Some(PathBuf::from("/example/wake-sink-never-opened-3469.sock")));
         let err =
             install_with_key_dir(&cfg, empty.path()).expect_err("no enrolled key, no forwarder");
         let rendered = format!("{err:#}");

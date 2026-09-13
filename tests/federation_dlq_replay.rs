@@ -139,7 +139,7 @@ fn sample_memory(id: &str) -> Memory {
 }
 
 /// Build an on-disk sqlite `Db` (under a tmpdir-scoped tempdir; honors
-/// the project no-`/tmp` rule by using cargo's manifest dir) that has
+/// the project scratch-location rule by using cargo's manifest dir) that has
 /// run every migration up to v48, so the `federation_push_dlq` table
 /// is present.
 fn fresh_dlq_db() -> (tempfile::TempDir, ai_memory::handlers::Db) {

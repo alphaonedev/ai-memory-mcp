@@ -28,7 +28,7 @@
 # Run directly:
 #   bash tests/lan_parity_provision_peer_keys.sh
 #
-# Scratch lives under `.local-runs/` per the project no-`/tmp` rule
+# Scratch lives under `.local-runs/` per the project scratch-location rule
 # and is cleaned up on success.
 #
 # Exit codes:

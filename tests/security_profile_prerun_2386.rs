@@ -78,7 +78,7 @@ fn enforcement_is_pre_runtime_and_absent_from_the_async_body_2386() {
 /// relocation — now from the pre-runtime phase of `fn main()`.
 #[test]
 fn below_floor_abort_still_fires_after_relocation_2386() {
-    // Scratch under the repo's gitignored .local-runs/ (project no-/tmp
+    // Scratch under the repo's gitignored .local-runs/ (project scratch-location
     // HARD RULE), mirroring tests/security_profile_dispatch_1961.rs.
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

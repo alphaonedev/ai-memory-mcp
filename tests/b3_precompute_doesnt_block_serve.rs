@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 mod common;
 use common::free_port;
 
-/// #1721 — project-local scratch DB path (no /tmp writes; CLAUDE.md hard rule).
+/// #1721 — project-local scratch DB path (no system-temp writes; CLAUDE.md hard rule).
 fn scratch_db(infix: &str) -> std::path::PathBuf {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))

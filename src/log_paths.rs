@@ -693,9 +693,9 @@ mod tests {
         let _g = env_lock();
         let env = EnvGuard::capture(LOG_DIR_ENV);
         env.unset();
-        let r = resolve_log_dir(None, Some("/tmp/explicit-config")).unwrap();
+        let r = resolve_log_dir(None, Some("/example/explicit-config")).unwrap();
         assert_eq!(r.source, PathSource::ConfigToml);
-        assert_eq!(r.path, PathBuf::from("/tmp/explicit-config"));
+        assert_eq!(r.path, PathBuf::from("/example/explicit-config"));
     }
 
     #[test]

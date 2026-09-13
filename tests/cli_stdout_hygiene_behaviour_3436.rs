@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-/// Fresh per-test directory under `.local-runs/` — the project's no-`/tmp`
+/// Fresh per-test directory under `.local-runs/` — the project's scratch-location
 /// HARD RULE. Holds the scratch DB and any key material the verb writes, so
 /// nothing lands in the operator's real config/key dirs (#3355).
 fn fresh_dir(label: &str) -> tempfile::TempDir {

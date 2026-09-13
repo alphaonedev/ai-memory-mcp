@@ -41,7 +41,7 @@
 # `git show` of the pre-fix commit precisely so it survives CI's shallow
 # checkout — a regression leg that silently SKIPs in CI is not a regression leg.
 #
-# Scratch lives UNDER the repo (never system /tmp), trap-cleaned.
+# Scratch lives UNDER the repo (never the system temp directory), trap-cleaned.
 #
 # CLI:
 #   scripts/test/test-ci-workflow-invariants.sh   — run (exit 0/1)
@@ -654,7 +654,7 @@ fi
 # the scan to CATCH it. Without this, a scan whose regex silently stopped
 # matching would report 0/0-clean forever — the same vacuous-assertion hazard
 # Sections A and C each carry a frozen-fixture leg against. Scratch lives under
-# the repo (never system /tmp), trap-cleaned by the SCRATCH dir above.
+# the repo (never the system temp directory), trap-cleaned by the SCRATCH dir above.
 if [ "$d_total" -gt 0 ]; then
     D_MUT="$SCRATCH/ci-2657-mutant.yml"
     grep -v 'cargo test --no-run "\$@" || return "\$?"' "$CI_YML" > "$D_MUT"

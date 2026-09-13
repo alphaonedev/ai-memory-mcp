@@ -86,7 +86,7 @@ const CASES: &[(&str, bool, ConfigSource)] = &[
     ),
 ];
 
-/// A per-case scratch home under the repo's `.local-runs/` (never `/tmp`,
+/// A per-case scratch home under the repo's `.local-runs/` (never the system temp directory,
 /// never the operator's real `~/.config/ai-memory`).
 fn sandbox() -> tempfile::TempDir {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");

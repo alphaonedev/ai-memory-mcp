@@ -18,7 +18,7 @@
 #   scripts/check-evidence-bundle.sh --bundle path/to/record.json
 #   scripts/check-evidence-bundle.sh --self-test
 #
-# Scratch for --self-test lives under <repo>/.local-runs/ (never system /tmp).
+# Scratch for --self-test lives under <repo>/.local-runs/ (never the system temp directory).
 # Exit: 0 clean · 1 violation · 2 usage / self-test fail.
 set -euo pipefail
 

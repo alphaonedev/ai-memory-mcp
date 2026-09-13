@@ -32,7 +32,7 @@
 #                  altered nfpm tarball BEFORE tar runs. R-203: the frozen
 #                  pre-fix block pipes the altered bytes straight into tar.
 #
-# Scratch lives under .local-runs/ (never mktemp -d / system /tmp).
+# Scratch lives under .local-runs/ (never mktemp -d / the system temp directory).
 # Exit codes: 0 all cases behave · 1 a case misbehaved.
 
 set -euo pipefail

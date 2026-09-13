@@ -50,7 +50,7 @@ fn run_ai_memory(db_path: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output
     cmd.output().expect("spawn ai-memory")
 }
 
-/// A fresh temp DB path under `.local-runs/` (project no-`/tmp` HARD RULE),
+/// A fresh temp DB path under `.local-runs/` (project scratch-location HARD RULE),
 /// mirroring `tests/record_stop_cli_dispatch_1955.rs::fresh_db`.
 fn fresh_db(label: &str) -> (tempfile::TempDir, PathBuf) {
     let root = std::env::current_dir()

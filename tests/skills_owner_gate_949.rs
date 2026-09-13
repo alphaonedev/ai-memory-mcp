@@ -185,7 +185,7 @@ fn build_req(
 /// `{id}` placeholder is replaced with a seeded skill id.
 fn route_table(seeded_id: &str) -> Vec<(&'static str, Method, String, Option<Value>)> {
     let register_body = json!({"inline_skill": minimal_skill_md("gated-register")});
-    // Project hard-rule: no agent-created files under /tmp. The 403
+    // Project hard-rule: no agent-created files in the system temp directory. The 403
     // path SHOULD never touch this folder because the gate rejects
     // before the substrate runs; still, point at a path that would
     // fail safely (non-existent) on any accidental fall-through.

@@ -1135,7 +1135,7 @@ mod tests {
     // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`) so they serialize on
     // `ENV_LOCK` and restore the prior values on exit, per the
     // env-test discipline. Key material lives under a `tempfile::tempdir()`
-    // (never `/tmp` directly — the OS temp root is fine for the OS-created
+    // (never the system temp directory directly — the OS temp root is fine for the OS-created
     // dir; the project no-/tmp rule covers agent-AUTHORED scratch paths).
 
     /// Process-global env lock shared with

@@ -33,7 +33,7 @@ use serde_json::json;
 /// Returns `(connection, temp-path)`. The path is held by the caller so
 /// the file outlives the connection.
 fn fresh_db() -> (rusqlite::Connection, std::path::PathBuf) {
-    // #1721 — project-local scratch DB (no /tmp writes; CLAUDE.md hard rule).
+    // #1721 — project-local scratch DB (no system-temp writes; CLAUDE.md hard rule).
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(".local-runs")

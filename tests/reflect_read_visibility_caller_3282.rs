@@ -65,7 +65,7 @@ static ENV_GUARD: Mutex<()> = Mutex::new(());
 
 const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 
-/// Hermetic file-backed DB under `.local-runs/` (never `/tmp`, per project
+/// Hermetic file-backed DB under `.local-runs/` (never the system temp directory, per project
 /// rule; a real path so `handle_reflect`'s post-write dispatch has a db to
 /// open). Returns the `TempDir` guard (kept alive by the caller) + path.
 fn fresh_db() -> (tempfile::TempDir, PathBuf, Connection) {

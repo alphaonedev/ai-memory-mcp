@@ -655,7 +655,7 @@ mod tests {
             Err(CredentialError::NotConfigured)
         );
         let err = UdsWakeSink::spawn(
-            UdsSinkConfig::with_socket_path(PathBuf::from("/tmp/never-opened-3469.sock")),
+            UdsSinkConfig::with_socket_path(PathBuf::from("/example/never-opened-3469.sock")),
             Arc::new(NoJoinCredential),
         )
         .expect_err("must refuse to start");
@@ -668,7 +668,7 @@ mod tests {
     async fn a_credential_for_another_identity_is_refused_at_startup_3469() {
         for claimed in ["ai:alice", "daemon", ""] {
             let err = UdsWakeSink::spawn(
-                UdsSinkConfig::with_socket_path(PathBuf::from("/tmp/never-opened-3469.sock")),
+                UdsSinkConfig::with_socket_path(PathBuf::from("/example/never-opened-3469.sock")),
                 NamedCredential::new(claimed),
             )
             .expect_err("must refuse to start");
@@ -680,7 +680,7 @@ mod tests {
     /// hand-off; refused.
     #[tokio::test]
     async fn a_zero_depth_handoff_is_refused_3469() {
-        let mut cfg = UdsSinkConfig::with_socket_path(PathBuf::from("/tmp/never-opened-3469.sock"));
+        let mut cfg = UdsSinkConfig::with_socket_path(PathBuf::from("/example/never-opened-3469.sock"));
         cfg.queue_frames = 0;
         let err =
             UdsWakeSink::spawn(cfg, NamedCredential::new(WAKE_HUB_PRODUCER)).expect_err("refuse");
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn defaults_are_bounded_3469() {
-        let cfg = UdsSinkConfig::with_socket_path(PathBuf::from("/tmp/x.sock"));
+        let cfg = UdsSinkConfig::with_socket_path(PathBuf::from("/example/x.sock"));
         assert!(cfg.queue_frames > 0);
         assert!(cfg.handshake_timeout > Duration::ZERO);
         assert!(cfg.reconnect_jitter > Duration::ZERO, "must be jittered");

@@ -50,7 +50,6 @@ const FORBIDDEN_LEAK_SUBSTRINGS: &[&str] = &[
     "UPDATE ",
     "DELETE FROM",
     // Filesystem hints
-    "/private/tmp/",
     "/var/folders/",
     "/Users/",
     ".sqlite",
@@ -158,6 +157,14 @@ fn assert_no_leaks(context: &str, body: &str) {
             "{context}: response body leaks forbidden substring {needle:?}\nbody={body}"
         );
     }
+    // The test databases live under the process temp directory, whatever it
+    // is on this host (#3669: this replaced a hardcoded macOS temp prefix).
+    let temp_root = std::env::temp_dir();
+    let temp_root = temp_root.to_string_lossy();
+    assert!(
+        !body.contains(temp_root.as_ref()),
+        "{context}: response body leaks the temp directory path {temp_root:?}\nbody={body}"
+    );
 }
 
 /// Assert the body parses as JSON with a top-level `error` field whose

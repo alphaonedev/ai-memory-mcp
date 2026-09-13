@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// A scratch HOME under the repo's gitignored `.local-runs/` (project
-/// no-`/tmp` HARD RULE). Each call makes a fresh unique subdir.
+/// scratch-location HARD RULE). Each call makes a fresh unique subdir.
 fn scratch_home() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".local-runs")

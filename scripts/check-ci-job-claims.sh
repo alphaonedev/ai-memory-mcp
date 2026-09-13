@@ -58,7 +58,7 @@
 # CLI:
 #   scripts/check-ci-job-claims.sh              — run the gate (exit 0/1)
 #   scripts/check-ci-job-claims.sh --self-test  — plant C-21/C-23/C-24/C-31
-#       in a throwaway copy UNDER `.local-runs/` (never system /tmp,
+#       in a throwaway copy UNDER `.local-runs/` (never the system temp directory,
 #       never `mktemp -d`) and prove the gate rejects each, alongside
 #       NEAR-MISS controls that must PASS.
 

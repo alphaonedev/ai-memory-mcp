@@ -12,7 +12,7 @@
 //!    verifier names the offender, not just "FAIL").
 //! 3. Bundle reproducible (byte-identical mod timestamp).
 //!
-//! All scratch lives in per-test `TempDir`s — never `/tmp` (project
+//! All scratch lives in per-test `TempDir`s — never the system temp directory (project
 //! hard rule). `AI_MEMORY_NO_CONFIG=1` is set on every spawned
 //! subprocess per the standard CLI test convention.
 

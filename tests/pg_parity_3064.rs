@@ -16,7 +16,7 @@
 //! HTTP daemon so a wire-shape divergence cannot hide:
 //!
 //! * **sqlite** — always runs (default features included), over a temp DB
-//!   under `.local-runs/` (project no-`/tmp` HARD RULE);
+//!   under `.local-runs/` (project scratch-location HARD RULE);
 //! * **postgres** — gated on `feature = "sal-postgres"` + a live
 //!   `AI_MEMORY_TEST_POSTGRES_URL`, and skipped cleanly (with a `skipping`
 //!   line) when either is absent — the established pattern from
@@ -53,7 +53,7 @@ const OWNER_AGENT: &str = "ai:pgparity-3064";
 /// A second, unrelated principal — the DENIED half of every family.
 const OTHER_AGENT: &str = "ai:pgparity-3064-intruder";
 
-/// Tempdirs under `.local-runs/` (project no-`/tmp` HARD RULE).
+/// Tempdirs under `.local-runs/` (project scratch-location HARD RULE).
 fn fresh_dir(label: &str) -> tempfile::TempDir {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))

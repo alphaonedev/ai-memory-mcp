@@ -136,7 +136,7 @@ fn assert_shape_and_markers(v: &Value, ctx: &str) {
 
 #[test]
 fn cli_export_warns_on_stderr_and_marks_payload_without_changing_shape_1944() {
-    // Arrange: a fresh db under .local-runs (project no-/tmp HARD RULE) with
+    // Arrange: a fresh db under .local-runs (project scratch-location HARD RULE) with
     // one seeded row so `count` is non-trivial.
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))

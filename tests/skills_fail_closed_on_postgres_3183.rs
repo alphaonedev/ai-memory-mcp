@@ -269,7 +269,7 @@ async fn every_skill_path_fails_closed_on_postgres() {
             format!("/api/v1/skill/{id}/export"),
             // Deliberately a path that does not exist and is never
             // written: the refusal fires before the handler resolves it.
-            // (Project rule: no agent-created files under /tmp.)
+            // (Project rule: no agent-created files in the system temp directory.)
             Some(json!({ "target_folder": "./.never-written-3183" })),
         ),
         (
