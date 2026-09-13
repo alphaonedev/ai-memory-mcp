@@ -49,21 +49,36 @@ check_range() { # $1 = A..B ; prints findings; returns 1 on any
 }
 
 if [ "$SELF_TEST" -eq 1 ]; then
-  # Negative control (#3124, chain 12): the commit that changed the doctor
-  # sections assertion 18 -> 19 with no declaration — the exact shape that
-  # later auto-merged silently against #3651's identical edit.
-  neg=$(check_range dbcfea710~1..dbcfea710); nrc=$?
+  # SELF-CONTAINED FIXTURES. The previous self-test drove real chain-12
+  # candidate commits (dbcfea710 etc). None of them is an ancestor of
+  # release/v1.0.0, so on a clean CI clone the objects do not exist and the
+  # self-test cannot run -- a gate whose self-test reds on the published head
+  # cannot be a required context. Fixtures are synthesised here instead, so the
+  # check is provable from any checkout with no history dependency.
+  T=.local-runs/count-selftest; rm -rf "$T"; mkdir -p "$T" || { echo "self-test: cannot create $T"; exit 1; }
+  (
+    cd "$T" || exit 1
+    git init -q . && git config user.name g && git config user.email g@x
+    mkdir -p tests
+    printf 'fn a() { assert_eq!(sections.len(), 18); }\n' > tests/f.rs
+    git add -A && git commit -q -m "base"
+    # (1) undeclared count bump -> MUST be flagged
+    printf 'fn a() { assert_eq!(sections.len(), 19); }\n' > tests/f.rs
+    git commit -q -am "test: bump sections"
+    # (2) the same shape WITH a declaration -> MUST pass
+    printf 'fn a() { assert_eq!(sections.len(), 20); }\n' > tests/f.rs
+    git commit -q -am "test: bump sections again" -m "Count: sections.len() 19 -> 20 (fixture)"
+  ) || { echo "count-assertion-declared self-test: FAIL — fixture setup"; rm -rf "$T"; exit 1; }
+  neg=$( cd "$T" && check_range HEAD~2..HEAD~1 ); nrc=$?
   if [ $nrc -ne 1 ] || ! printf '%s' "$neg" | grep -q 'sections.len()'; then
-    echo "count-assertion-declared self-test: FAIL — did not flag dbcfea710 (#3124): $neg"; exit 1
+    echo "count-assertion-declared self-test: FAIL — did not flag the undeclared bump: $neg"; rm -rf "$T"; exit 1
   fi
-  # Positive control: the same diff under a commit whose message declares the
-  # count must pass. Synthesised in a throwaway clone under the repo scratch.
-  T=.local-runs/count-selftest; rm -rf "$T"; git worktree add -q --detach "$T" dbcfea710~1 2>/dev/null || { echo "self-test: cannot create scratch worktree"; exit 1; }
-  ( cd "$T" && git cherry-pick --no-commit dbcfea710 >/dev/null 2>&1 && git -c user.name=g -c user.email=g@x commit -q -am "test: same change, declared" -m "Count: doctor sections 18 -> 19 (#3124 unstamped owners)" \
-    && pos=$(check_range HEAD~1..HEAD) ; rc=$?; echo "$rc" > ../count-selftest.rc )
-  prc=$(cat .local-runs/count-selftest.rc 2>/dev/null); git worktree remove --force "$T" >/dev/null 2>&1; rm -f .local-runs/count-selftest.rc
-  if [ "$prc" != "0" ]; then echo "count-assertion-declared self-test: FAIL — flagged a declared count change (rc=$prc)"; exit 1; fi
-  echo "count-assertion-declared self-test: PASS (flags the undeclared #3124 count change; passes it once declared)"; exit 0
+  pos=$( cd "$T" && check_range HEAD~1..HEAD ); prc=$?
+  if [ $prc -ne 0 ]; then
+    echo "count-assertion-declared self-test: FAIL — flagged a DECLARED count change (rc=$prc): $pos"; rm -rf "$T"; exit 1
+  fi
+  rm -rf "$T"
+  echo "count-assertion-declared self-test: PASS (flags an undeclared count change; passes it once declared; fixtures synthesised, no history dependency)"; exit 0
 fi
 
 out=$(check_range "$RANGE"); rc=$?
