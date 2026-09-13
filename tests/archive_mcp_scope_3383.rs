@@ -20,17 +20,8 @@ fn call(
     tool: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    // #3647 — governance decision rows are written only with
-    // `audit.enabled = true`, so the child reads a config under its own HOME
-    // (the documented `~/.config/ai-memory/config.toml`, which is also the XDG
-    // path once XDG_CONFIG_HOME points there) instead of skipping config.
-    let config_home = home.join(".config");
-    let config_dir = config_home.join("ai-memory");
-    std::fs::create_dir_all(&config_dir).expect("config dir");
-    std::fs::write(config_dir.join("config.toml"), "[audit]\nenabled = true\n").expect("config");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-        .env_remove("AI_MEMORY_NO_CONFIG")
-        .env("XDG_CONFIG_HOME", &config_home)
+        .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_AGENT_ID", caller)
         .env("AI_MEMORY_ADMIN_AGENT_IDS", admins)
         .env("AI_MEMORY_AUDIT_DIR", home.join("audit"))

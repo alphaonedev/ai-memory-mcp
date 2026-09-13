@@ -9,11 +9,16 @@
 //!   evidence: the #1850 truncation watermark and the #3199 unverified-restore
 //!   record. They are written whenever the sink is up, which it is on every
 //!   boot, so `verify-audit-trail`'s watermark lanes work by default.
-//! - **Governance decision rows** ([`record_decision`]) — written only when
-//!   `audit.enabled = true` (the sink's decision-row gate). Their payload is a
-//!   [`ForensicPayload`], which has no way to carry free-form text: action
+//! - **Governance decision rows** ([`record_decision`]) — also written
+//!   whenever the sink is up (Conductor ruling on #3647: the screening is the
+//!   fix, so the operator's evidence is kept, never suppressed). Their payload
+//!   is a [`ForensicPayload`], which has no way to carry free-form text: action
 //!   content, decision reasons and other free text become a keyed commitment
 //!   before signing, and `actor` / `rule_id` are sanitised at this chokepoint.
+//!   The commitment is DETERMINISTIC under one daemon key: identical content
+//!   gives an identical `content_mac`, so an operator can see that the same
+//!   command was refused twice without learning what it was. That is a
+//!   feature, not a leak to fix.
 //!
 //! ```text
 //! <forensic_dir>/forensic-<YYYY-MM-DD>.jsonl
@@ -356,9 +361,6 @@ struct ForensicSink {
     dir: PathBuf,
     last_hash: String,
     signing_key: Option<SigningKey>,
-    /// #3647 — whether governance decision rows ([`record_decision`]) are
-    /// written. Integrity rows ([`IntegrityRow`]) ignore this gate.
-    decision_rows: bool,
     /// #3647 — commitment key derived once from `signing_key`; `None` when
     /// the sink is unsigned (commitments are then withheld).
     commitment_key: Option<zeroize::Zeroizing<[u8; 32]>>,
@@ -722,13 +724,6 @@ impl IntegrityRow<'_> {
     }
 }
 
-/// Which row class an append belongs to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowClass {
-    Decision,
-    Integrity,
-}
-
 /// Install database audit signers independently of forensic file enablement.
 ///
 /// The first installed daemon/recorder key wins for the process lifetime.
@@ -762,28 +757,12 @@ pub fn init_audit_signers(signing_key: Option<&SigningKey>) {
     }
 }
 
-/// Initialise the forensic audit sink with governance decision rows ON.
-///
-/// Library and test callers that bring the sink up directly get the full
-/// row set; the boot path uses [`init_with_decision_rows`] so decision rows
-/// follow `audit.enabled`.
+/// Initialise the forensic audit sink (#3647). Integrity rows and governance
+/// decision rows are both written once the sink is up.
 ///
 /// # Errors
 /// - The directory cannot be created.
 pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
-    init_with_decision_rows(dir, signing_key, true)
-}
-
-/// Initialise the forensic audit sink (#3647). Integrity rows are always
-/// written once the sink is up; `decision_rows` gates [`record_decision`].
-///
-/// # Errors
-/// - The directory cannot be created.
-pub fn init_with_decision_rows(
-    dir: &Path,
-    signing_key: Option<SigningKey>,
-    decision_rows: bool,
-) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
     let last_hash = read_chain_tail(dir).unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
@@ -793,7 +772,6 @@ pub fn init_with_decision_rows(
         dir: dir.to_path_buf(),
         last_hash,
         signing_key,
-        decision_rows,
         commitment_key,
     };
     let mut guard = sink()
@@ -826,28 +804,17 @@ pub fn shutdown() {
     }
 }
 
-/// `true` when [`init`] has been called and the sink is active. Integrity
-/// rows are written whenever this is true; see [`decision_rows_enabled`] for
-/// governance decision rows.
+/// `true` when [`init`] has been called and the sink is active. Integrity and
+/// governance decision rows are both written whenever this is true.
 #[must_use]
 pub fn is_enabled() -> bool {
     sink().lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// `true` when the sink is up AND governance decision rows are enabled
-/// (`audit.enabled = true` on the boot path).
-#[must_use]
-pub fn decision_rows_enabled() -> bool {
-    sink()
-        .lock()
-        .map(|g| g.as_ref().is_some_and(|s| s.decision_rows))
-        .unwrap_or(false)
-}
-
 /// Record a governance decision to the forensic log.
 ///
-/// A no-op unless the sink is up with decision rows enabled. `actor`,
-/// `decision` and `rule_id` are sanitised here: a value that is not
+/// A no-op unless the sink is up. `actor`, `decision` and `rule_id` are
+/// sanitised here: a value that is not
 /// identifier-shaped, or that carries a credential, is written as a keyed
 /// commitment. `kind` is a compile-time label.
 ///
@@ -862,7 +829,7 @@ pub fn try_record_decision(
     rule_id: &str,
     payload: ForensicPayload,
 ) -> Result<()> {
-    append_row(RowClass::Decision, actor, decision, kind, rule_id, &payload)
+    append_row(actor, decision, kind, rule_id, &payload)
 }
 
 /// Record an [`IntegrityRow`]. Written whenever the sink is up.
@@ -871,7 +838,7 @@ pub fn try_record_decision(
 /// As [`try_record_decision`].
 pub(crate) fn try_record_integrity(row: IntegrityRow<'_>) -> Result<()> {
     let (actor, decision, kind, payload) = row.into_parts();
-    append_row(RowClass::Integrity, &actor, decision, kind, "", &payload)
+    append_row(&actor, decision, kind, "", &payload)
 }
 
 /// Fire-and-forget [`try_record_integrity`]. Errors logged + swallowed.
@@ -885,7 +852,6 @@ pub(crate) fn record_integrity(row: IntegrityRow<'_>) {
 }
 
 fn append_row(
-    class: RowClass,
     actor: &str,
     decision: &str,
     kind: &'static str,
@@ -898,9 +864,6 @@ fn append_row(
     let Some(s) = guard.as_mut() else {
         return Ok(());
     };
-    if class == RowClass::Decision && !s.decision_rows {
-        return Ok(());
-    }
 
     let now = Utc::now();
     let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -3848,20 +3811,21 @@ mod tests {
         rows
     }
 
+    /// Conductor ruling on #3647: decision rows are written whenever the sink
+    /// is up, exactly like integrity rows, and stay screened.
     #[test]
-    fn issue_3647_decision_gate_never_silences_integrity_rows() {
+    fn issue_3647_decision_rows_follow_the_sink_like_integrity_rows() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         shutdown();
-        init_with_decision_rows(tmp.path(), Some(fresh_key()), false).expect("init");
+        init(tmp.path(), Some(fresh_key())).expect("init");
         assert!(is_enabled());
-        assert!(!decision_rows_enabled());
         record_decision(
             "ai:t",
             "refuse",
             "bash",
             "R3647",
-            ForensicPayload::new().commit("reason", "ISSUE_3647_GATED"),
+            ForensicPayload::new().commit("reason", "ISSUE_3647_SCREENED"),
         );
         record_audit_watermark(128, &"cd".repeat(32), None);
         let snapshot = std::path::Path::new("/srv/backups/snap.db");
@@ -3879,19 +3843,37 @@ mod tests {
             gap: 50,
         });
         shutdown();
+        let body: String = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect();
+        assert!(
+            !body.contains("ISSUE_3647_SCREENED"),
+            "decision content is screened"
+        );
         let rows = rows_3647(tmp.path());
         let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(
             kinds,
             [
+                "bash",
                 AUDIT_WATERMARK_KIND,
                 "backup_restore_unverified",
                 AUDIT_ROLLBACK_EVIDENCE_KIND
             ]
         );
-        assert_eq!(rows[0].payload["head_sequence"], 128);
-        assert_eq!(rows[1].payload["snapshot"], "/srv/backups/snap.db");
-        assert_eq!(rows[2].payload["gap"], 50);
+        assert_eq!(rows[0].decision, "refuse");
+        assert!(
+            rows[0].payload["reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with(FORENSIC_COMMITMENT_PREFIX)),
+            "keyed commitment, never text: {:?}",
+            rows[0].payload
+        );
+        assert_eq!(rows[1].payload["head_sequence"], 128);
+        assert_eq!(rows[2].payload["snapshot"], "/srv/backups/snap.db");
+        assert_eq!(rows[3].payload["gap"], 50);
     }
 
     #[test]
