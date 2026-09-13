@@ -301,13 +301,18 @@ pub(crate) fn inbox_envelope(
     // empty read has nothing to join and is not logged (the <=60 s
     // backstop poll would otherwise emit one line per client per minute).
     if !messages.is_empty() {
+        // Computed outside the macro: `tracing::info!` brings
+        // `tracing::field::Value` into scope for its field expressions.
+        let row_ids = crate::correlation::bounded_row_ids(
+            messages
+                .iter()
+                .filter_map(|m| m.get("id").and_then(serde_json::Value::as_str)),
+        );
         tracing::info!(
             target: crate::correlation::TARGET,
             recipient = %owner,
             count = messages.len(),
-            inbox_row_ids = %crate::correlation::bounded_row_ids(
-                messages.iter().filter_map(|m| m.get("id").and_then(Value::as_str)),
-            ),
+            inbox_row_ids = %row_ids,
             "inbox read"
         );
     }
