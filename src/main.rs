@@ -145,6 +145,28 @@ fn main() -> Result<()> {
     // token aborts the boot right here, before anything else starts. The
     // async body logs the stashed pin report via the READ-ONLY
     // `security_profile::runtime_boot_report`.
+    // v1.0.0 #3700 — the deployment SHAPE decides the default posture, in
+    // the SAME pre-runtime phase: a fleet-shaped deployment (federation or
+    // multi-agent configured) with the selector unset derives `asi-hard`
+    // and writes it into the environment so the enforcement right below
+    // pins every protection; a loosened knob on such a deployment refuses
+    // here, naming every disabled knob and the deliberate override; an
+    // explicit `standard` on a fleet warns once. `doctor` never refuses —
+    // it reports the shape, the posture and whether they match.
+    if !is_doctor {
+        let argv = match &cli.command {
+            daemon_runtime::Command::Serve(args) => Some((
+                !args.quorum_peers.is_empty(),
+                args.mtls_allowlist.as_deref(),
+            )),
+            daemon_runtime::Command::SyncDaemon(args) => Some((!args.peers.is_empty(), None)),
+            _ => None,
+        };
+        // Daemon entry points announce the derivation / exception on stderr;
+        // one-shot verbs derive silently (hooks capture stderr).
+        let announce = argv.is_some();
+        ai_memory::deployment_shape::derive_pre_runtime(&app_config, argv, announce)?;
+    }
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
     // #3582: evaluate the argv peer lists even with quorum_writes=0, before

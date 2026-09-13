@@ -8502,6 +8502,8 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     // Same ChildGuard pattern: an unwrap on the cmd output below could
     // panic, and we don't want a leaked sync-daemon if it does.
     let daemon_child = cmd(bin)
+        // #3700 — lab mesh: deliberate standard exception
+        .env("AI_MEMORY_SECURITY_PROFILE", "standard")
         .args([
             "--db",
             db_a.to_str().unwrap(),
@@ -8763,6 +8765,8 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // during unwind. Bare `Child` would orphan the server to PID 1.
     let port_b = free_port();
     let serve_b_child = cmd(bin)
+        // #3700 — lab mesh (mTLS allowlist): deliberate standard exception
+        .env("AI_MEMORY_SECURITY_PROFILE", "standard")
         .args([
             "--db",
             db_b.to_str().unwrap(),
@@ -8849,6 +8853,8 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // Same ChildGuard pattern: an unwrap on the cmd output below could
     // panic, and we don't want a leaked sync-daemon if it does.
     let daemon_ok_child = cmd(bin)
+        // #3700 — lab mesh: deliberate standard exception
+        .env("AI_MEMORY_SECURITY_PROFILE", "standard")
         .args([
             "--db",
             db_a.to_str().unwrap(),
@@ -10019,7 +10025,12 @@ fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
             args.push("15000".into());
         }
         let (stderr_file, stderr_log) = serve_stderr_log();
-        let mut child = cmd(bin)
+        let mut leader = cmd(bin);
+        if quorum_writes > 0 && !peer_urls.is_empty() {
+            // #3700 — lab mesh: deliberate standard exception
+            leader.env("AI_MEMORY_SECURITY_PROFILE", "standard");
+        }
+        let mut child = leader
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(stderr_file))
@@ -11538,7 +11549,12 @@ fn spawn_leader_with_timeout(
         args.push(timeout_ms.to_string());
     }
     let (stderr_file, stderr_log) = serve_stderr_log();
-    let mut child = cmd(bin)
+    let mut leader = cmd(bin);
+    if quorum_writes > 0 && !peer_urls.is_empty() {
+        // #3700 — lab mesh: deliberate standard exception
+        leader.env("AI_MEMORY_SECURITY_PROFILE", "standard");
+    }
+    let mut child = leader
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr_file))

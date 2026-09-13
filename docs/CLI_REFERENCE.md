@@ -1129,6 +1129,21 @@ caller id and whether a signing key for THAT id is enrolled.
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
 
+**`Deployment shape (#3700)` section** — SECOND in the default local
+report, before the database open, so a fleet-shaped deployment running
+`standard` is reported unprompted at the top. Facts: `shape`
+(`singleton` / `fleet`), `posture`, `posture_origin` (`explicit` /
+`derived_from_shape` / `compiled_default`), `shape_matches_posture`,
+`signals_present`, `signals_unobservable` (argv signals are unobservable
+from doctor; the store is unobservable until it opens), `registered_agents`
+(folded in from the store once the read-only connection is open),
+`protections_off` + `protections_off_list` (the pinned knobs not in force),
+and `boot_verdict` (`boots`, `boots — deliberate exception (recorded)`, or
+`REFUSES …`). Critical when a fleet runs `standard` by omission or a knob
+sits below the `asi-hard` floor; Warning for the recorded explicit
+`standard` exception; Info otherwise. This is the pre-upgrade detector: run
+it before upgrading to learn what will refuse.
+
 ```bash
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'

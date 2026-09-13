@@ -137,6 +137,49 @@ Per the adjudication these carry design-level mitigation for v1.0.0 (no
 dedicated build lane); each is split into its own tracking issue if it
 grows one.
 
+### Deployment shape decides the posture (#3700)
+
+The "with the variable unset the profile is `standard` and no pins are in
+force, silently" limitation above is now bounded by the deployment SHAPE
+([`src/deployment_shape.rs`](../src/deployment_shape.rs)). The
+anti-cascade protections exist to stop one agent's wrong conclusion from
+becoming a swarm's shared truth, so a deployment that IS a swarm gets them
+by default; a single-agent developer install is left alone.
+
+| signal | source | present when |
+|---|---|---|
+| `outbound_peers` | argv | `serve --quorum-peers` / `sync-daemon --peers` |
+| `inbound_bindings` | env | peer fingerprints, cert↔peer-id bindings or a trust bundle |
+| `listener_mtls` | argv | `serve --mtls-allowlist` |
+| `peer_allowlist` | env | `AI_MEMORY_FED_PEER_ATTESTATION` is set (even `{}`, even invalid) |
+| `mcp_federation_forward_url` | config | MCP writes fan out to a federation daemon |
+| `wake_hub` | config | `[wake_hub]` — the multi-agent wake plane |
+| `agent_registry` | store | 2 or more registered agents |
+
+Any present signal makes the deployment **fleet-shaped**; none makes it a
+**singleton**. A signal a process cannot see (argv from `doctor`, the store
+before it opens) is `unobservable`, never `absent`. The four states:
+
+1. **Fleet, selector unset** — `asi-hard` is DERIVED in the pre-runtime
+   phase and every protection is pinned, exactly as if the operator had
+   selected it. If any pinned knob is set below its floor the boot is
+   REFUSED and the refusal names every disabled knob and the one-line
+   override. A fleet learned only from the agent registry (after the store
+   opens, where nothing can be pinned) refuses too, naming every protection
+   that is off and both one-liners.
+2. **Singleton, selector unset** — `standard`, byte-identical boot.
+3. **Fleet, `AI_MEMORY_SECURITY_PROFILE=standard` set explicitly** — boots,
+   warns once, and the exception is RECORDED (forensic audit kind
+   `deployment_shape.posture_exception`; the `deployment_shape` field of
+   capabilities). Never reached by omission.
+4. **Fleet, `asi-hard` explicit** — unchanged.
+
+**Migration honesty.** The detector shipped with the refusal, so run
+`ai-memory doctor` BEFORE upgrading: its default report opens with
+"Deployment shape (#3700)" and states the shape, the posture and its
+origin, whether they match, the protections that are off, and the boot
+verdict the next boot will reach. Doctor never refuses.
+
 ## Trust boundaries
 
 ```

@@ -1016,6 +1016,29 @@ A missed step fails loudly rather than corrupting data: the substrate refuses to
 
 Schema migrations run automatically on startup. No manual migration steps are required.
 
+**Before upgrading to v1.0.0: check your deployment shape (#3700).** From
+v1.0.0 the security posture defaults from the deployment SHAPE: a
+federated or multi-agent deployment (peers, a peer allowlist, inbound
+certificate bindings, `mcp_federation_forward_url`, `[wake_hub]`, or two
+or more registered agents) derives `asi-hard` and pins every anti-cascade
+protection, and such a deployment that has a protection knob set below
+its floor — or whose fleet shape is learned only from the agent registry
+with no posture selected — REFUSES to boot. A single-agent install is
+unaffected. Run the detector first, with the new binary against the
+existing database and environment:
+
+```bash
+ai-memory doctor            # second section: "Deployment shape (#3700)"
+ai-memory doctor --json | jq '.sections[1]'
+```
+
+It reports the shape, the posture and its origin, the protections that are
+off, and the boot verdict the next boot will reach, without refusing
+anything. Then choose on one line: `AI_MEMORY_SECURITY_PROFILE=asi-hard`
+(pin everything) or `AI_MEMORY_SECURITY_PROFILE=standard` (a deliberate,
+recorded exception for a lab or a migration window). See
+[`SECURITY.md`](SECURITY.html) "Deployment shape decides the posture".
+
 ### Database Maintenance
 
 Manually trigger garbage collection:
