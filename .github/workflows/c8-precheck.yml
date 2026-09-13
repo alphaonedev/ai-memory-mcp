@@ -197,6 +197,25 @@ jobs:
         # confirms the gate exits non-zero + names the offender, cleans up.
         run: bash scripts/check-hardcoded-literals.sh --self-test
 
+  temp-hygiene-gate:
+    # #3669: fixtures leaked hundreds of thousands of temp directories and
+    # SQLite files on the gate host (291 GB). Blocks the three shapes that
+    # did it: a forgotten tempfile guard, a `static OnceLock<TempDir>` that
+    # is never dropped, and a literal system temp root in src/, tests/ or
+    # scripts/. Required in the mirror at introduction (mirror FIRST).
+    name: Temp-hygiene gate (#3669)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run temp-hygiene gate
+        run: bash scripts/check-temp-hygiene.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants each violation in a scratch copy under .local-runs/ and
+        # confirms the gate rejects it by the right rule; a clean control
+        # tree with near misses must pass.
+        run: bash scripts/check-temp-hygiene.sh --self-test
+
   const-name-literal-gate:
     # #3122 follow-up: the companion name-literal gate was script-only
     # and unwired. Mirror hardcoded-literals (run + --self-test). NOT

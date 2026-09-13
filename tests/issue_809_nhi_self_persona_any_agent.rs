@@ -32,7 +32,6 @@
 
 #![allow(clippy::needless_update)]
 
-use std::path::PathBuf;
 use std::sync::Once;
 
 use ai_memory::db;

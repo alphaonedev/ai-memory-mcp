@@ -190,6 +190,7 @@ C8 caller-context allowlist check
 Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
 L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
 Hardcoded-literal duplication ratchet (pm-v3.1)
+Temp-hygiene gate (#3669)
 Docs vs SSOT drift gate
 Cloud-init ASCII gate
 Test-reachable stdin-read gate (#1989)
