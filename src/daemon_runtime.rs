@@ -6136,11 +6136,21 @@ fn cert_peer_binding_boot_warnings(
 /// reads while keeping the deprecation warning live for external
 /// consumers.
 #[allow(deprecated)]
+// #3582 — `peer_posture::enforce_at_boot` MUST be the FIRST statement in this
+// function body; `tests/federation_peer_posture_3582.rs` asserts that structurally,
+// and the assertion reads the raw body text, so nothing (not even a comment) may
+// precede it. #3646's monitoring-scope validation was inserted ahead of the gate
+// during the chain-12 merge, which let a node with an uncertified federation
+// posture do work before the refusal fired. Refuse first, validate scopes after.
 pub async fn bootstrap_serve(
     db_path: &Path,
     args: &ServeArgs,
     app_config: &AppConfig,
 ) -> Result<ServeBootstrap> {
+    crate::federation::peer_posture::enforce_at_boot(
+        !args.quorum_peers.is_empty(),
+        args.mtls_allowlist.as_deref(),
+    )?;
     if let Some(scopes) = &app_config.monitoring
         && !scopes.peer_ids.is_empty()
     {
@@ -6156,10 +6166,6 @@ pub async fn bootstrap_serve(
             "monitoring peer scopes require TLS, the mTLS allowlist, and an existing certificate binding for every scoped peer"
         );
     }
-    crate::federation::peer_posture::enforce_at_boot(
-        !args.quorum_peers.is_empty(),
-        args.mtls_allowlist.as_deref(),
-    )?;
     // S5-C1 (v0.7.0 fix campaign 2026-05-13): refuse default-off auth
     // on non-loopback binds. When `api_key` is unset, the `api_key_auth`
     // middleware is a pass-through — every privileged endpoint (write,
