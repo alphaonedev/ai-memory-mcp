@@ -8,8 +8,10 @@
 #
 # Grammar:
 #   ceiling:<src path>=<resolved value>   the ceiling-table entry this queue lands
-#   dup:<issue>=<shortA>+<shortB>         two DIFFERENT-surface branches under one
-#                                         issue are both wanted (sorted short shas)
+#   dup:<issue>=<branchA>+<branchB>       two DIFFERENT-surface branches under one
+#                                         issue are both wanted (sorted branch names,
+#                                         no origin/ prefix — never SHAs, which every
+#                                         push invalidates)
 #   (no grammar exists for a schema-version collision: renumber, never acknowledge)
 #
 # chain 13 — MERGE-PLAYBOOK-chain13.md ruling: migrations.rs lands at 7_440
@@ -19,4 +21,4 @@ ceiling:src/storage/migrations.rs=7_440
 # #3688 ships as two complementary branches: gates 1+3 (98fe07055, plus the
 # ceiling-headroom sweep) and gates 2+4+5 (d4573b94b). Different surfaces,
 # both wanted.
-dup:3688=98fe07055+d4573b94b
+dup:3688=gates/3688-recurring-classes+gates/3688-recurring-classes-2-4-5

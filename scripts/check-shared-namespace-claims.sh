@@ -30,16 +30,30 @@
 #                   wrong-branch merge goes green and reports nothing.
 #
 # Usage:
-#   scripts/check-shared-namespace-claims.sh --base <sha> <branch|sha> [<branch|sha>...]
-#                                            [--scan-origin] [--self-test]
+#   scripts/check-shared-namespace-claims.sh --base <sha> [<branch|sha>...]
+#                                            [--anchor <ref>] [--scan-origin] [--self-test]
+#
+# THE CANDIDATE SET IS DERIVED, NOT HAND-MAINTAINED. A hand list is the
+# denominator of this gate, and a denominator someone types is the artefact that
+# rots: the branch nobody typed is exactly the one whose SCHEMA_VERSION=99
+# collides. With no branches named, the candidates are every `origin/*` branch
+# (main / develop / release/* excluded) whose tip is NOT already in --base and
+# whose merge-base with --base is AT OR AFTER the anchor — the published release
+# head, `origin/release/v1.0.0` unless --anchor says otherwise. That is "every
+# branch built on the current release head or a later candidate"; a branch cut
+# from an older head is stale by construction (it needs a rebase before it can
+# be merged, and its claims are re-derived then). Naming branches NARROWS the set
+# — the gate still derives it and WARNs about every derived candidate the list
+# left out, so a hand list cannot rot in silence.
 # Cargo-free. Nothing is merged; every claim is read from the branch tip and
 # its merge-base with --base.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 ALLOW=scripts/qc-allowlists/shared-namespace-claims.txt
-BASE=""; SELF_TEST=0; SCAN_ORIGIN=0; CANDS=()
+BASE=""; SELF_TEST=0; SCAN_ORIGIN=0; CANDS=(); ANCHOR="origin/release/v1.0.0"
 while [ $# -gt 0 ]; do case "$1" in
   --base) BASE=$2; shift 2;; --self-test) SELF_TEST=1; shift;; --scan-origin) SCAN_ORIGIN=1; shift;;
+  --anchor) ANCHOR=$2; shift 2;;
   -h|--help) sed -n '2,40p' "$0"; exit 0;; *) CANDS+=("$1"); shift;; esac; done
 
 run_check() { # $1 = base; rest = candidates. Prints findings. Exit 1 on FAIL, 0 otherwise.
@@ -182,12 +196,15 @@ for iss, cs in sorted(by_issue.items()):
         same = []
         for a, b in itertools.combinations(cs, 2):
             if subprocess.run(['git','diff','--quiet',a,b,'--','src','tests']).returncode == 0: same.append((a, b))
-        acked = any(a == f'dup:{iss}=' + '+'.join(sorted(short(c) for c in cs)) or a == f'dup:{iss}' for a in allow)
+        # keyed on BRANCH NAMES (`origin/` stripped), never on SHAs: a sha key is invalidated by every
+        # push to either branch, which is how the first form of this ledger went stale within hours
+        names = '+'.join(sorted(c.replace('origin/', '', 1) for c in cs))
+        acked = any(a == f'dup:{iss}={names}' for a in allow)
         if same:
             sev = 'FAIL'   # identical surface: one is the other re-cut; a wrong-branch merge goes green
         else:
             sev = 'INFO' if acked else 'WARN'   # two different deliverables under one issue (gates 1+3 / 2+4+5) are legitimate once acknowledged
-        note(sev, f'dup-branch:{iss}', f'issue #{iss} has {len(cs)} candidate branches in the queue: ' + ', '.join(f'{c}@{short(c)}' for c in cs) + ('. IDENTICAL src+tests surface: ' + '; '.join(f'{a} == {b}' for a, b in same) + ' — a wrong-branch merge goes green and reports nothing; the queue must name exactly ONE.' if same else ('. Different surfaces' + (' (acknowledged as complementary in the allowlist)' if acked else ' — confirm both are wanted, or acknowledge with `dup:<issue>=<shortA>+<shortB>`'))))
+        note(sev, f'dup-branch:{iss}', f'issue #{iss} has {len(cs)} candidate branches in the queue: ' + ', '.join(f'{c}@{short(c)}' for c in cs) + ('. IDENTICAL src+tests surface: ' + '; '.join(f'{a} == {b}' for a, b in same) + ' — a wrong-branch merge goes green and reports nothing; the queue must name exactly ONE.' if same else ('. Different surfaces' + (' (acknowledged as complementary in the allowlist)' if acked else ' — confirm both are wanted, or acknowledge with `dup:<issue>=<branchA>+<branchB>` (branch names, sorted, no origin/ prefix)'))))
 if scan_origin:
     origin = git('for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin/').split()
     for c, d in claims.items():
@@ -252,8 +269,31 @@ SH
   exit 1
 fi
 
-[ -z "$BASE" ] && { echo "usage: $0 --base <sha> <branch|sha>... [--scan-origin] [--self-test]" >&2; exit 2; }
-[ "${#CANDS[@]}" -eq 0 ] && { echo "no candidate branches given" >&2; exit 2; }
+[ -z "$BASE" ] && { echo "usage: $0 --base <sha> [<branch|sha>...] [--anchor <ref>] [--scan-origin] [--self-test]" >&2; exit 2; }
+
+# derive_candidates <base> <anchor> — every origin branch built on the anchor or later, not yet in base
+derive_candidates() {
+  local base=$1 anchor=$2 b s mb
+  git rev-parse --verify -q "$anchor^{commit}" >/dev/null || { echo "anchor $anchor does not resolve — pass --anchor <ref>" >&2; return 2; }
+  git for-each-ref --format='%(refname:short) %(objectname)' refs/remotes/origin | grep -vE '^origin/(HEAD|main|develop|release/)' | while read -r b s; do
+    git merge-base --is-ancestor "$s" "$base" 2>/dev/null && continue          # already in the base
+    mb=$(git merge-base "$s" "$base" 2>/dev/null) || continue
+    git merge-base --is-ancestor "$anchor" "$mb" 2>/dev/null && echo "$b"        # cut from the anchor or later
+  done
+  return 0
+}
+DERIVED=$(derive_candidates "$BASE" "$ANCHOR") || exit 2
+if [ "${#CANDS[@]}" -eq 0 ]; then
+  [ -z "$DERIVED" ] && { echo "shared-namespace-claims: no candidate branches derived (nothing on origin is built on $ANCHOR or later and not yet in $BASE)"; exit 0; }
+  mapfile -t CANDS <<< "$DERIVED"
+  echo "candidates DERIVED from origin (built on $ANCHOR or later, not in $BASE): ${#CANDS[@]}"
+else
+  missing=$(comm -23 <(printf '%s\n' "$DERIVED" | sort) <(printf '%s\n' "${CANDS[@]}" | sed 's#^refs/remotes/##' | sort))
+  if [ -n "$missing" ]; then
+    echo "  [WARN] the named list NARROWS the derived set — derived candidates you did not name (a list is the denominator, and this is how it rots):"
+    printf '%s\n' "$missing" | sed 's/^/         /'
+  fi
+fi
 run_check "$BASE" "${CANDS[@]}"; rc=$?
 if [ $rc -ne 0 ]; then cat <<'MSG'
 
