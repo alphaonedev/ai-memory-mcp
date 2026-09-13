@@ -3821,10 +3821,15 @@ impl MemoryStore for SqliteStore {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
+        // #3639 — unique stored title + verbatim subject (see
+        // `crate::inbox_stored_title`); inserted refuse-on-conflict below.
+        let row_id = uuid::Uuid::new_v4().to_string();
+        let stored_title = crate::inbox_stored_title(title, &row_id);
         let mut metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
             (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
+            (crate::INBOX_SUBJECT_META_KEY): title,
         });
         // #2122 — caller-supplied covenant clause-1 rationale (the payload
         // is verbatim caller content, so the substrate never stamps its own
@@ -3833,10 +3838,10 @@ impl MemoryStore for SqliteStore {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
         }
         let mem = Memory {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: row_id,
             tier: resolved_tier,
             namespace: crate::inbox_namespace(target_agent),
-            title: title.to_string(),
+            title: stored_title,
             content: payload.to_string(),
             tags: vec!["notify".to_string()],
             priority,
@@ -3886,7 +3891,7 @@ impl MemoryStore for SqliteStore {
             }
             Err(quotas::QuotaCheckError::Sql(e)) => return Err(box_err(e)),
         }
-        match db::insert(&conn, &mem) {
+        match db::insert_no_overwrite(&conn, &mem) {
             Ok(new_id) => {
                 // #3465 — the row is durable: wake the recipient on the
                 // in-process bus AND fan the `agent_notified` event to

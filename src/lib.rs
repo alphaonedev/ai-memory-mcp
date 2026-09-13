@@ -691,6 +691,33 @@ pub fn inbox_namespace(target_agent: &str) -> String {
     format!("{INBOX_NAMESPACE_PREFIX}{target_agent}")
 }
 
+/// v1.0.0 #3639 — metadata key that carries the caller's ORIGINAL notify
+/// title (the "subject" a recipient reads) on every inbox row.
+pub const INBOX_SUBJECT_META_KEY: &str = "subject";
+
+/// v1.0.0 #3639 — how many leading characters of the row id the stored
+/// inbox title carries as its uniqueness suffix.
+pub const INBOX_TITLE_ID_CHARS: usize = 8;
+
+/// v1.0.0 #3639 — the STORED title of an inbox row: `<subject> [<id prefix>]`.
+///
+/// Inbox rows are unique by construction. Before #3639 a repeated subject to
+/// the same recipient landed on the `(title, namespace)` upsert, which
+/// replaced the earlier body IN PLACE while keeping the FIRST sender's
+/// `metadata.agent_id` (loss plus impersonation on the durable A2A record)
+/// and handed both senders the same row id. Minting the stored title from
+/// the fresh row id means two deliveries can never share a key, every notify
+/// funnel on both backends inserts with the refuse-on-conflict arm, and the
+/// caller's subject is kept verbatim in `metadata.subject`. The subject part
+/// is bounded so the stored title never exceeds the validated title ceiling.
+#[must_use]
+pub fn inbox_stored_title(subject: &str, row_id: &str) -> String {
+    let prefix: String = row_id.chars().take(INBOX_TITLE_ID_CHARS).collect();
+    let budget = validate::MAX_TITLE_LEN.saturating_sub(INBOX_TITLE_ID_CHARS + 3);
+    let head: String = subject.trim().chars().take(budget).collect();
+    format!("{head} [{prefix}]")
+}
+
 pub mod approvals;
 // v0.7.0 WT-1-B — substrate-level atomisation engine. Decomposes
 // long-form memories into atomic propositions with full provenance
