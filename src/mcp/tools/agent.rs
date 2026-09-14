@@ -35,6 +35,36 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
     validate::validate_agent_type(agent_type).map_err(|e| e.to_string())?;
     validate::validate_capabilities(&capabilities).map_err(|e| e.to_string())?;
 
+    // #3372 — re-registering an existing agent with a DIFFERENT `agent_type` or
+    // `capabilities` silently OVERWROTE identity metadata: no error, no record of
+    // the prior value (the reown shape, cf. #3694). The docs promise only
+    // "refreshes last_seen_at; preserves registered_at". Refuse a type/capability
+    // change unless the caller explicitly opts in with `update: true`; when they
+    // do, the prior values are recorded in the audit row below.
+    let update = params
+        .get("update")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let existing = db::list_agents(conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|a| a.agent_id == agent_id);
+    let identity_change = existing.as_ref().is_some_and(|ex| {
+        let (mut had, mut want) = (ex.capabilities.clone(), capabilities.clone());
+        had.sort();
+        want.sort();
+        ex.agent_type != agent_type || had != want
+    });
+    if identity_change && !update {
+        let ex = existing.as_ref().expect("identity_change implies existing");
+        return Err(format!(
+            "agent '{agent_id}' is already registered as '{}' with {:?}; re-registering with a \
+             different type or capabilities is refused — the prior identity would be lost with no \
+             record. Pass update:true to change it (the prior values are then recorded in the audit).",
+            ex.agent_type, ex.capabilities
+        ));
+    }
+
     // #913 (security-medium / SOC2, 2026-05-19) — admin/state-change
     // audit. Registering an agent_id mints a new principal in the
     // `_agents` namespace; emit the forensic-chain row BEFORE the
@@ -61,6 +91,10 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
             "new_agent_id": agent_id,
             (field_names::AGENT_TYPE): agent_type,
             (field_names::CAPABILITIES): &capabilities,
+            // #3372 — an update that CHANGES an existing identity records what it
+            // replaced, so the prior value is never silently lost.
+            "prior_agent_type": existing.as_ref().filter(|_| identity_change).map(|e| e.agent_type.clone()),
+            "prior_capabilities": existing.as_ref().filter(|_| identity_change).map(|e| e.capabilities.clone()),
         }),
     );
 
@@ -212,6 +246,62 @@ mod tests {
 
     fn open_conn() -> rusqlite::Connection {
         crate::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    #[test]
+    fn agent_register_refuses_silent_identity_overwrite_3372() {
+        // #3372 — re-registering an existing agent_id with a DIFFERENT type/caps
+        // must be REFUSED (the reown shape), not silently overwrite the identity.
+        // `update: true` opts in; an idempotent re-register still refreshes.
+        let conn = open_conn();
+        handle_agent_register(
+            &conn,
+            &json!({"agent_id": "ai:alice", "agent_type": "ai:worker",
+                    "capabilities": ["recall"], "caller_agent_id": "ai:alice"}),
+        )
+        .expect("first register");
+        // differing re-register WITHOUT update -> refused (before any overwrite).
+        let err = handle_agent_register(
+            &conn,
+            &json!({"agent_id": "ai:alice", "agent_type": "ai:admin",
+                    "capabilities": ["admin"], "caller_agent_id": "ai:alice"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("refused") && err.contains("update:true"),
+            "#3372: differing re-register must be refused pointing at update:true, got: {err}"
+        );
+        // the stored identity is UNCHANGED by the refused call.
+        let a = crate::db::list_agents(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.agent_id == "ai:alice")
+            .expect("alice present");
+        assert_eq!(a.agent_type, "ai:worker");
+        assert_eq!(a.capabilities, vec!["recall".to_string()]);
+        // CONTROL 1 — identical re-register still succeeds (refresh, no change).
+        handle_agent_register(
+            &conn,
+            &json!({"agent_id": "ai:alice", "agent_type": "ai:worker",
+                    "capabilities": ["recall"], "caller_agent_id": "ai:alice"}),
+        )
+        .expect("#3372: identical re-register still refreshes");
+        // CONTROL 2 — explicit update:true applies the change.
+        handle_agent_register(
+            &conn,
+            &json!({"agent_id": "ai:alice", "agent_type": "ai:admin",
+                    "capabilities": ["admin"], "update": true, "caller_agent_id": "ai:alice"}),
+        )
+        .expect("#3372: update:true applies the change");
+        let a = crate::db::list_agents(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.agent_id == "ai:alice")
+            .expect("alice present");
+        assert_eq!(
+            a.agent_type, "ai:admin",
+            "#3372: update:true changes the type"
+        );
     }
 
     #[test]
