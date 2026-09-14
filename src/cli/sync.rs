@@ -693,9 +693,15 @@ pub async fn run_daemon(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = build_sync_client(&args).await?;
 
+    // #3667/#3711 — the boot line is a sink: each peer renders as its origin
+    // + path (#3675 identity), never its userinfo or query.
+    let peers: Vec<String> = args
+        .peers
+        .iter()
+        .map(|p| crate::url_display::url_origin_and_path(p))
+        .collect();
     tracing::info!(
-        "sync-daemon: local_agent_id={local_agent_id} peers={peers:?} interval={interval}s",
-        peers = args.peers
+        "sync-daemon: local_agent_id={local_agent_id} peers={peers:?} interval={interval}s"
     );
 
     let shutdown = Arc::new(tokio::sync::Notify::new());

@@ -158,13 +158,42 @@ fn redact_in(value: &mut toml::Value, under_secret_key: bool) {
         other => {
             if under_secret_key {
                 *other = toml::Value::String(CONFIG_REDACTION_MASK.to_string());
-            } else if let toml::Value::String(s) = other
-                && let Some(screened) = crate::secret_screen::redact_for_storage(s)
-            {
-                *s = screened;
+            } else if let toml::Value::String(s) = other {
+                // #3667/#3711 — a URL-valued setting (`db`, `[llm].base_url`,
+                // `[embeddings].url`, a peer, a webhook) renders through the
+                // ALLOWLIST renderer, never a masker: a store URL keeps
+                // scheme/host/port/database, any other URL keeps its origin.
+                // A masker can only hide the credential shapes its author
+                // enumerated; the renderer never looks for one.
+                if let Some(rendered) = display_url_value(s) {
+                    *s = rendered;
+                }
+                if let Some(screened) = crate::secret_screen::redact_for_storage(s) {
+                    *s = screened;
+                }
             }
         }
     }
+}
+
+/// The display form of a string setting that is a URL, or `None` when the
+/// value is not URL-shaped (no `scheme://`). Store URLs (`sqlite://`,
+/// `postgres://`, `postgresql://`) render through
+/// [`crate::url_display::store_url_display`] so the database name survives;
+/// every other URL renders as its origin through
+/// [`crate::url_display::url_origin`] (a webhook target carries its secret
+/// in the PATH, #3684, so the path is not shown either).
+fn display_url_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if !trimmed.contains("://") {
+        return None;
+    }
+    if trimmed.starts_with(crate::store_url::SQLITE_URL_SCHEME)
+        || crate::store_url::is_postgres_url(trimmed)
+    {
+        return Some(crate::url_display::store_url_display(trimmed));
+    }
+    Some(crate::url_display::url_origin(trimmed))
 }
 
 /// Render a config table for HUMAN DISPLAY, redacted.
@@ -429,6 +458,52 @@ fn is_source_echo_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3667 in the #3711 idiom — URL-valued settings render through the
+    /// allowlist: a store URL keeps scheme/host/port/database, an LLM base
+    /// URL keeps its origin, a credential-free local URL is unchanged. The
+    /// query string is never shown (it is where `password=` lives), so the
+    /// presence half asserts the origin and the negative half the canaries.
+    #[test]
+    fn url_values_render_from_the_allowlist_3667() {
+        let mut value: toml::Value = toml::from_str(
+            r#"
+db = "postgres://ai:DB_CANARY@db.internal:5432/ai?password=Q_CANARY&sslmode=verify-full"
+[llm]
+base_url = "https://svc:LLM_CANARY@llm.internal/v1?token=T_CANARY"
+[embeddings]
+url = "http://localhost:11434"
+[federation]
+peers = ["https://u:PEER_CANARY@peer.internal:8443/m"]
+"#,
+        )
+        .expect("fixture parses");
+        redact_toml_value(&mut value);
+        let rendered = toml::to_string_pretty(&value).expect("render");
+        for secret in [
+            "DB_CANARY",
+            "Q_CANARY",
+            "LLM_CANARY",
+            "T_CANARY",
+            "PEER_CANARY",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+        assert!(
+            rendered.contains("postgres://db.internal:5432/ai"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("https://llm.internal"), "{rendered}");
+        assert!(rendered.contains("http://localhost:11434"), "{rendered}");
+        assert!(
+            rendered.contains("https://peer.internal:8443"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("sslmode"),
+            "the query is never rendered: {rendered}"
+        );
+    }
 
     #[test]
     fn secret_value_keys_are_recognised_by_suffix_3432() {

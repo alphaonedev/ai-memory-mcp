@@ -279,9 +279,14 @@ impl FederationConfig {
             crate::tls::validate_peer_url_scheme(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
             let normalized = normalize_peer_url(raw);
             if !seen_urls.insert(normalized.clone()) {
+                // #3667/#3711 — a refusal is a sink: render the peer as its
+                // origin + path (its identity, #3675), never its userinfo or
+                // query.
                 return Err(anyhow::anyhow!(
-                    "duplicate peer URL in --quorum-peers: {raw} (normalized: {normalized}) \
-                     — duplicates would let a single peer contribute to quorum more than once"
+                    "duplicate peer URL in --quorum-peers: {} (normalized: {}) \
+                     — duplicates would let a single peer contribute to quorum more than once",
+                    crate::url_display::url_origin_and_path(raw),
+                    crate::url_display::url_origin_and_path(&normalized)
                 ));
             }
         }
@@ -331,7 +336,7 @@ impl FederationConfig {
                     target: FED_LOG_TARGET,
                     peer_index = i,
                     peer_id = %id,
-                    url = trimmed,
+                    url = %crate::url_display::url_origin_and_path(trimmed),
                     "registered peer (#2442: peer_id is derived from the URL, not the \
                      flag position; this line is the id -> url map for DLQ triage)"
                 );
@@ -368,6 +373,8 @@ impl FederationConfig {
             .map(|(peer, raw)| (peer.id.as_str(), raw.as_str()))
             .collect();
         if let Some((first, duplicate, id)) = first_peer_id_collision(&id_url_pairs) {
+            let first = crate::url_display::url_origin_and_path(first);
+            let duplicate = crate::url_display::url_origin_and_path(duplicate);
             return Err(anyhow::anyhow!(
                 "federation peer-id collision in --quorum-peers: {first} and {duplicate} both \
                  derive the stable peer id {id} — refusing to start, because a shared routing \
@@ -589,6 +596,68 @@ mod resolve_signing_key_tests {
 mod build_pinning_tests {
     use super::FederationConfig;
     use std::time::Duration;
+
+    /// #3667 in the #3711 idiom — the duplicate-peer refusal is a sink: it
+    /// names each peer as its origin + path (the #3675 identity) and never
+    /// its userinfo password or query token. Positive half: the host and
+    /// path are present; negative half: the canaries are not.
+    #[test]
+    fn duplicate_peer_refusal_renders_the_peer_from_the_allowlist_3667() {
+        let url = "https://u:AUTH_CANARY@peer.example:8443/m?%70assword=QUERY_CANARY".to_string();
+        let err = match FederationConfig::build(
+            1,
+            &[url.clone(), url],
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+            "test-agent".into(),
+            None,
+        ) {
+            Ok(_) => panic!("duplicate peers must fail before client construction"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(text.contains("duplicate peer URL"), "{text}");
+        assert!(
+            text.contains("https://peer.example:8443/m"),
+            "the refusal must NAME the peer's origin + path: {text}"
+        );
+        for leaked in ["AUTH_CANARY", "QUERY_CANARY", "query_canary", "u:"] {
+            assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+        }
+    }
+
+    /// #3667 — the peer-id collision refusal renders both spellings from
+    /// the allowlist. Two URLs that differ only by userinfo derive the same
+    /// stable id and collide; the refusal must name the origin + path and
+    /// neither password.
+    #[test]
+    fn peer_id_collision_refusal_renders_the_peers_from_the_allowlist_3667() {
+        let a = "https://alice:FIRST_CANARY@peer.example:8443/m".to_string();
+        let b = "https://bob:SECOND_CANARY@peer.example:8443/m".to_string();
+        let err = match FederationConfig::build(
+            1,
+            &[a, b],
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+            "test-agent".into(),
+            None,
+        ) {
+            Ok(_) => panic!("colliding peer ids must fail before client construction"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("https://peer.example:8443/m"),
+            "the refusal must NAME the peer's origin + path: {text}"
+        );
+        for leaked in ["FIRST_CANARY", "SECOND_CANARY", "alice", "bob"] {
+            assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+        }
+    }
 
     /// #1678 — exercise the outbound-pinning branch of `build()`: with
     /// `AI_MEMORY_FED_PEER_FINGERPRINTS` set to a valid host→fp file, the
