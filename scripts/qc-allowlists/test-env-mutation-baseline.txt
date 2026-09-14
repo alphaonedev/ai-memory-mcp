@@ -33,7 +33,7 @@
 0 141 src/config.rs
 0 1 src/config/shape.rs
 1 2 src/coordination_guard.rs
-0 65 src/daemon_runtime.rs
+0 69 src/daemon_runtime.rs
 0 5 src/egress.rs
 0 9 src/embeddings.rs
 0 47 src/enterprise_federation_posture.rs
@@ -86,4 +86,4 @@
 0 10 src/store_url.rs
 0 2 src/subscriptions.rs
 0 4 src/test_support.rs
-0 6 src/tls.rs
+0 7 src/tls.rs
