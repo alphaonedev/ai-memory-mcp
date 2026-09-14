@@ -349,7 +349,7 @@ fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
         decision,
         "pending_approve",
         "",
-        json!({ (field_names::PENDING_ID): id }),
+        crate::governance::audit::ForensicPayload::new().ident(field_names::PENDING_ID, id),
     );
 }
 
@@ -362,7 +362,7 @@ fn audit_reject_verdict(agent_id: &str, id: &str) {
         "refuse",
         "pending_reject",
         "",
-        json!({ (field_names::PENDING_ID): id }),
+        crate::governance::audit::ForensicPayload::new().ident(field_names::PENDING_ID, id),
     );
 }
 

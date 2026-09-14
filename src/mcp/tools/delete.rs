@@ -119,7 +119,7 @@ pub(super) fn handle_delete(
         "allow",
         crate::mcp::registry::tool_names::MEMORY_DELETE,
         "",
-        json!({ "id": id }),
+        crate::governance::audit::ForensicPayload::new().ident("id", id),
     );
 
     // Resolve the memory first so governance has owner context.

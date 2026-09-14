@@ -182,7 +182,7 @@ fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
         decision,
         "pending_approve",
         "",
-        json!({ (field_names::PENDING_ID): id }),
+        crate::governance::audit::ForensicPayload::new().ident(field_names::PENDING_ID, id),
     );
 }
 
@@ -558,7 +558,7 @@ pub async fn reject_pending(
         "refuse",
         "pending_reject",
         "",
-        json!({ (field_names::PENDING_ID): &id }),
+        crate::governance::audit::ForensicPayload::new().ident(field_names::PENDING_ID, &id),
     );
 
     // v0.7.0 Wave-3 Continuation 2 (Phase 11) — postgres-backed reject.
