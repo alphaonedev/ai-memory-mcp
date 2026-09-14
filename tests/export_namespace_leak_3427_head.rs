@@ -24,6 +24,7 @@ use ai_memory::daemon_runtime::{ServeArgs, bootstrap_serve, serve_http_with_shut
 use tokio::sync::Notify;
 
 const ADMIN: &str = "ops:admin-3427";
+const API_KEY: &str = "k-3427-fixture";
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn serve_args(port: u16) -> ServeArgs {
@@ -69,6 +70,9 @@ async fn boot() -> Daemon {
     // tasks exist; this test binary has no other env reader racing it.
     unsafe {
         std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
+        // Hermetic: never inherit an operator config (ambient state is not
+        // a fixture).
+        std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
     }
     let dir = tempfile::tempdir().expect("tempdir under TMPDIR");
     let db_path = dir.path().join("head-3427.db");
@@ -78,6 +82,12 @@ async fn boot() -> Daemon {
     cfg.admin = Some(AdminConfig {
         agent_ids: vec![ADMIN.to_string()],
     });
+    // #3427 review — the fixture authenticates like a real admin export: an
+    // api_key is configured and presented, so `require_admin`'s #1582 gate
+    // ADMITS the caller and the namespace assertions below actually execute
+    // (a green line must mean the filter was tested, not that the request was
+    // refused before reaching it). No ambient config / header-trust env.
+    cfg.api_key = Some(API_KEY.to_string());
     let boot = bootstrap_serve(&db_path, &serve_args(port), &cfg)
         .await
         .expect("bootstrap_serve on loopback");
@@ -123,6 +133,7 @@ async fn seed(client: &reqwest::Client, base: &str, namespace: &str, title: &str
     let resp = client
         .post(format!("{base}/api/v1/memories"))
         .header("x-agent-id", ADMIN)
+        .header("x-api-key", API_KEY)
         .json(&serde_json::json!({
             "namespace": namespace,
             "title": title,
@@ -148,6 +159,7 @@ async fn export_namespace_filter_is_honoured_3427_head() {
     let resp = client
         .get(format!("{}/api/v1/export?namespace=ns-a-3427", d.base))
         .header("x-agent-id", ADMIN)
+        .header("x-api-key", API_KEY)
         .send()
         .await
         .expect("export request");
@@ -174,6 +186,7 @@ async fn bulk_invalid_kind_is_validation_failed_3427_head() {
     let resp = client
         .post(format!("{}/api/v1/memories/bulk", d.base))
         .header("x-agent-id", ADMIN)
+        .header("x-api-key", API_KEY)
         .json(&serde_json::json!([{
             "namespace": "bulk-kind-3427",
             "title": "bad kind",
