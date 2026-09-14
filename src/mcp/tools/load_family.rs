@@ -365,15 +365,24 @@ pub fn handle_load_family(
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("prepare memory_load_family failed: {e}"))?;
+        // #3373 (review) — the family read is a DISCOVERY SCAN, like `get_many`
+        // (#2383 N1): now that the projection reaches `encrypted_envelope`, one
+        // sealed row whose envelope will not open must be SKIPPED (WARN +
+        // metric inside the mapper), never fail the whole family for every
+        // caller. `Err` still means a real read failure (missing column,
+        // corrupt row) and is surfaced.
         let rows = stmt
             .query_map(
                 rusqlite::params![namespace, family_name, now, limit],
-                db::row_to_memory,
+                db::row_to_memory_scan,
             )
             .map_err(|e| format!("query memory_load_family failed: {e}"))?;
-        let memories: Vec<Memory> = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| format!("collect memory_load_family rows failed: {e}"))?;
+        let mut memories: Vec<Memory> = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| format!("collect memory_load_family rows failed: {e}"))?;
+            let Some(mem) = row else { continue };
+            memories.push(mem);
+        }
         Ok(memories
             .into_iter()
             .filter(|m| crate::visibility::is_readable_on_query(m, caller, namespace))
