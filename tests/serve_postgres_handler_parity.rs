@@ -620,26 +620,23 @@ async fn bucket_b_inbox_recipient_delete_archives_and_drains_3730() {
         "recall must not surface an archived row: {recalled_text}"
     );
 
-    // ... and present in the archive.
-    let archived = client
-        .get(format!("{base}/api/v1/archive"))
-        .query(&[("namespace", ns.as_str()), ("limit", "50")])
-        .header("x-agent-id", &bob)
-        .send()
+    // ... and present in the archive. `GET /api/v1/archive` is ADMIN-ONLY
+    // by design (`handlers::archive::list_archive` -> `require_admin`; a
+    // recipient must not enumerate the archive), so the archive is read
+    // through a probe store on the same database, the pattern the other
+    // pins in this file use, never through a relaxed route.
+    let probe = PostgresStore::connect(&url)
         .await
-        .expect("archive GET");
-    assert_eq!(archived.status(), reqwest::StatusCode::OK);
-    let archived = archived.json::<Value>().await.expect("archive body");
-    let ids: Vec<&str> = archived["archived"]
-        .as_array()
-        .unwrap_or_else(|| panic!("archive list: {archived}"))
-        .iter()
-        .filter_map(|m| m["id"].as_str())
-        .collect();
+        .expect("connect probe pool");
+    let archived = probe
+        .list_archived(Some(ns.as_str()), 50, 0)
+        .await
+        .expect("list_archived via store");
+    let ids: Vec<&str> = archived.iter().filter_map(|m| m["id"].as_str()).collect();
     assert_eq!(
         ids,
         vec![id.as_str()],
-        "the archive holds the drained message: {archived}"
+        "the archive holds the drained message: {archived:?}"
     );
 
     // Negative control: an ordinary row deleted the same way is ERASED.
@@ -668,19 +665,13 @@ async fn bucket_b_inbox_recipient_delete_archives_and_drains_3730() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.json::<Value>().await.expect("delete body");
     assert_eq!(body["archived"], json!(false), "negative control: {body}");
-    let archived = client
-        .get(format!("{base}/api/v1/archive"))
-        .query(&[("namespace", "notes-3730"), ("limit", "50")])
-        .header("x-agent-id", &bob)
-        .send()
+    let archived = probe
+        .list_archived(Some("notes-3730"), 50, 0)
         .await
-        .expect("archive GET")
-        .json::<Value>()
-        .await
-        .expect("archive body");
+        .expect("list_archived via store");
     assert!(
-        archived["archived"].as_array().is_some_and(Vec::is_empty),
-        "an ordinary delete leaves no archive copy: {archived}"
+        archived.is_empty(),
+        "an ordinary delete leaves no archive copy: {archived:?}"
     );
 
     shutdown.notify_one();
