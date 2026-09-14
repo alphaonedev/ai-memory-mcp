@@ -1488,6 +1488,12 @@ def main(argv):
     verbose = '--verbose' in argv; json_out = '--json' in argv
     only = next((a.split('=', 1)[1] for a in argv if a.startswith('--only=')), None)
     findings, counts = analyze(root, allowf, verbose, only)
+    # A scan root with no src/**.rs under it is a WRONG ROOT, not a clean tree: every ledger entry
+    # would read as stale (NOTICE) and the summary would print "0 FAIL" over nothing. Refuse it,
+    # loudly, before anything else is printed (the Conductor read exactly that run as a finding).
+    if counts['files_scanned'] == 0:
+        print(f"foreign-text-to-caller: REFUSED — scan root {root!r} has no src/**.rs files (wrong root? pass the repo root, not src/)", file=sys.stderr)
+        return 2
     nfail = sum(1 for x in findings if x['sev'] == 'FAIL'); ninfo = sum(1 for x in findings if x['sev'] == 'INFO')
     if json_out:
         print(json.dumps({'findings': findings, 'counts': counts}, indent=1)); return 1 if nfail else 0
