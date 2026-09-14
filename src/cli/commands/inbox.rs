@@ -24,7 +24,10 @@ pub struct InboxArgs {
     #[arg(long = "agent-id", value_name = "AGENT_ID")]
     pub agent_id: Option<String>,
 
-    /// Only return messages with `access_count == 0`.
+    /// Accepted for compatibility; narrows nothing (#3730). Every message
+    /// still in the inbox is unhandled — drain it with `ai-memory delete <id>`
+    /// once you have handled a message (never `--hard`: on an inbox row that
+    /// destroys the record of what you were told).
     #[arg(long = "unread-only")]
     pub unread_only: bool,
 
@@ -111,8 +114,7 @@ pub fn cmd_inbox(
             let id = m.get("id").and_then(Value::as_str).unwrap_or("?");
             let from = m.get("from").and_then(Value::as_str).unwrap_or("?");
             let title = m.get("title").and_then(Value::as_str).unwrap_or("");
-            let read = m.get("read").and_then(Value::as_bool).unwrap_or(false);
-            writeln!(out.stdout, "  {id}  from={from}  read={read}  {title}")?;
+            writeln!(out.stdout, "  {id}  from={from}  {title}")?;
         }
     }
     Ok(())
@@ -245,11 +247,12 @@ mod tests {
         assert!(stdout.contains("1 message(s) for ai:bob"), "got: {stdout}");
         assert!(stdout.contains("from=test-agent"), "got: {stdout}");
         assert!(stdout.contains("hello bob"), "got: {stdout}");
-        assert!(stdout.contains("read=false"), "got: {stdout}");
+        // #3730 — no `read=` column: the inbox carries no read marker.
+        assert!(!stdout.contains("read="), "got: {stdout}");
     }
 
     #[test]
-    fn inbox_cli_unread_only_filters() {
+    fn inbox_cli_unread_only_narrows_nothing_3730() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         crate::cli::test_utils::seed_memory(&db, "_inbox/ai:carol", "msg", "body");
@@ -266,7 +269,7 @@ mod tests {
             cmd_inbox(&db, &args, Some("ai:carol"), &mut out).expect("ok");
         }
         let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
-        // Freshly seeded row has access_count==0 → unread → still listed.
+        // #3730 — `--unread-only` narrows nothing; the seeded row is listed.
         assert_eq!(envelope["count"].as_u64(), Some(1));
     }
 

@@ -23647,6 +23647,32 @@ impl MemoryStore for PostgresStore {
         self.assert_caller_owns_for_mutation(ctx, id, "delete", REASON_UNSTAMPED_TENANT_DELETE)
             .await?;
 
+        // #3730 — retention policy by namespace, the twin of the sqlite
+        // adapter: an inbox message is ARCHIVED through the existing
+        // `archive_by_ids` path (`archive_reason = "delete"`, same owner /
+        // recipient predicate, same AGE unprojection), every other row is
+        // erased below.
+        let namespace: Option<String> =
+            sqlx::query_scalar("SELECT namespace FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("delete namespace lookup", e))?;
+        if namespace.is_some_and(|ns| crate::visibility::inbox_delete_retains(&ns)) {
+            let moved = self
+                .archive_by_ids(
+                    ctx,
+                    std::slice::from_ref(&id.to_string()),
+                    Some(field_names::ARCHIVE_REASON_DELETE),
+                )
+                .await?;
+            if moved == 0 {
+                return Err(StoreError::NotFound { id: id.to_string() });
+            }
+            self.unproject_memory_ids_best_effort(&[id]).await;
+            return Ok(());
+        }
+
         // #3192 + #3245 — one tx: namespace-meta SEVER + forget-tombstone +
         // crypto-erase + optional G6 leaf + DELETE. `pg_hard_delete_in_tx`
         // is a no-op (returns 0) when the row is already gone, so a NotFound
@@ -23771,21 +23797,6 @@ impl MemoryStore for PostgresStore {
         } else {
             ""
         };
-        // v1.0.0 #3463 — the unread narrowing, pushed into SQL so it applies
-        // BEFORE `LIMIT`, byte-for-byte the same point in the pipeline as the
-        // sqlite twin's `SQL_FRAGMENT_AND_UNREAD`. The inbox surfaces used to
-        // fetch the newest `limit` rows and drop the read ones in Rust
-        // afterwards, so an agent whose newest page was all read was told it had
-        // nothing unread while older unread rows remained. `access_count` is
-        // `BIGINT NOT NULL DEFAULT 0` here and `= 0` is the identical #3027
-        // unread marker the projection reports as `read`. A parameter-free
-        // constant, so it adds NO bind and cannot shift the `$10`/`$11`
-        // metadata-equality placeholder numbers.
-        let unread_predicate = if filter.unread_only {
-            "AND access_count = 0"
-        } else {
-            ""
-        };
         // #1876 — thread the `Filter` OFFSET so the postgres adapter pages
         // identically to sqlite (SAL parity — both clamp LIMIT to
         // LIST_MAX_LIMIT and page PAST the first window via OFFSET). The
@@ -23831,7 +23842,6 @@ impl MemoryStore for PostgresStore {
                        AND (valid_until IS NULL OR valid_until > $8))
                )
                {metadata_eq_predicate}
-               {unread_predicate}
                {lifecycle_vis}
              ORDER BY priority DESC, updated_at DESC, id COLLATE \"C\" ASC
              LIMIT $5 OFFSET $9",
@@ -23886,15 +23896,6 @@ impl MemoryStore for PostgresStore {
             .into_iter()
             .flatten()
             .collect();
-        // #3463 belt-and-suspenders, the twin of the sqlite adapter's re-check:
-        // re-apply the unread marker in-process so a drift between the SQL
-        // fragment and the canonical Rust predicate can only NARROW the result,
-        // never widen it. O(returned-rows).
-        let mems: Vec<Memory> = if filter.unread_only {
-            mems.into_iter().filter(|m| m.access_count == 0).collect()
-        } else {
-            mems
-        };
         if ctx.bypass_visibility {
             return Ok(mems);
         }

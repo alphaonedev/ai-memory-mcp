@@ -284,7 +284,7 @@ footer a{color:var(--text-muted)}
 
     <div class="tool notify">
       <div class="tool-head"><span class="tool-name">memory_inbox</span><span class="tool-tag">since v0.6.0</span></div>
-      <div class="tool-desc">Recipient drains their inbox. Returns messages sent via <code>memory_notify</code> — <code>access_count == 0</code> is the unread marker. Filter with <code>unread_only</code> and cap with <code>limit</code> (default 50, max 500).</div>
+      <div class="tool-desc">Recipient reads their inbox: the messages sent via <code>memory_notify</code> that it has not yet handled. Handled = the recipient deleted the message (<code>memory_delete</code> archives an inbox message, #3730); reads never mark anything and there is no read marker. <code>unread_only</code> is accepted for compatibility and narrows nothing; cap with <code>limit</code> (default 50, max 500).</div>
       <div class="snip"><span class="cm">// MCP — memory_inbox</span>
 {
   <span class="key">"agent_id"</span>:        <span class="val">"alphaone/eng/platform/team-a/bob"</span>,    <span class="cm">// optional · defaults to caller</span>

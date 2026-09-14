@@ -280,7 +280,10 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
         "metadata": m.metadata,
         (field_names::CREATED_AT): m.created_at,
         (field_names::UPDATED_AT): m.updated_at,
-        "read": m.access_count > 0,
+        // #3730 — no `read` field. `access_count` counts TOUCHES (a recall
+        // landed by the fold); it was reported as `read`, which no inbox
+        // operation ever sets and which a consumer took for HANDLED. The
+        // count stays on the wire under its own name; the claim does not.
         (field_names::ACCESS_COUNT): m.access_count,
         "agent_id": sender,
         (field_names::FROM_AGENT_ID): from_agent_id,
@@ -289,21 +292,23 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
 }
 
 /// Canonical backend-blind inbox response envelope (#3401).
+///
+/// #3730 — every message still in the inbox is one the recipient has not
+/// declared handled (handled = the recipient deleted it), so `unread_count`
+/// equals `count` by contract. It is kept on the wire, with that contract,
+/// rather than removed: a value is not a lie when its contract says what it
+/// measures. `unread_only` is echoed back as sent.
 pub(crate) fn inbox_envelope(
     owner: &str,
     namespace: &str,
     unread_only: bool,
     messages: Vec<Value>,
 ) -> Value {
-    let unread_count = messages
-        .iter()
-        .filter(|message| message.get("read").and_then(Value::as_bool) != Some(true))
-        .count();
     json!({
         "agent_id": owner,
         "namespace": namespace,
         "count": messages.len(),
-        "unread_count": unread_count,
+        "unread_count": messages.len(),
         (field_names::UNREAD_ONLY): unread_only,
         "messages": messages,
     })
@@ -367,28 +372,31 @@ pub(crate) fn handle_inbox_with_policy(
             }
         }
     };
-    // #3374 — both were read with a silent fallback. `unread_only: "yes"` (a
-    // string, the shape an LLM caller emits most often) read as `false`, so a
-    // caller asking for its UNREAD messages got its ENTIRE inbox back — more
-    // rows than it asked for, and no signal that the filter was ignored. And
-    // `limit` was read `as_u64()`, for which any NEGATIVE is indistinguishable
-    // from absent, so `limit: -5` silently became the 50-row default. Refuse
-    // the wrong type; ABSENT still takes the documented default, and the 500
-    // cap still applies.
+    // #3374 — both were read with a silent fallback (`unread_only: "yes"`
+    // read as `false`; `limit: -5` became the 50-row default). Refuse the
+    // wrong type; ABSENT still takes the documented default, and the 500 cap
+    // still applies. #3730 — `unread_only` no longer narrows (see below), but
+    // a wrong TYPE is still a malformed call and is still refused.
     let unread_only =
         crate::mcp::param_guard::optional_bool(params, field_names::UNREAD_ONLY)?.unwrap_or(false);
     let limit = crate::mcp::param_guard::optional_non_negative_u64(params, param_names::LIMIT)?
         .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX))
         .min(500);
     let namespace = crate::inbox_namespace(&owner);
-    // v1.0.0 #3463 — the unread narrowing is PUSHED DOWN into the query
-    // (`list_filtered`'s `unread_only` axis -> `AND access_count = 0` before the
-    // SQL `LIMIT`). It used to run in Rust on the already-limited page, so an
-    // agent whose newest `limit` messages were all read got `count: 0` for
-    // `unread_only: true` while OLDER unread messages sat in its inbox — a
-    // silent false negative that a wake-then-read-once push design would
-    // inherit wholesale. The `limit` now bounds the UNREAD set, not the set the
-    // unread rows are looked for in.
+    // #3730 — `unread_only` narrows NOTHING. It used to mean
+    // `access_count == 0`, a TOUCH counter that no inbox operation ever
+    // advanced (only a namespaced recall plus the periodic fold did), so an
+    // agent draining with `inbox` then `get` never marked anything read and a
+    // redelivery loop keyed on the marker re-sent the same message forever.
+    // The inbox is now the PENDING set: a message leaves it when its recipient
+    // deletes it (the one recipient-side mutation the product authorises on a
+    // message — `caller_owns_for_mutation(.., allow_inbox = true)`), and every
+    // message still listed is one nobody has declared handled. The parameter
+    // is accepted (and still type-checked, #3374) for wire compatibility and
+    // is echoed back; its contract is stated in the tool docs. Retiring the
+    // #3463 `AND access_count = 0` pushdown dissolves the problem #3463 fixed
+    // rather than reverting it: with no read rows in the inbox, a page cannot
+    // be spent on them.
     let items = db::list_filtered(
         conn,
         Some(&namespace),
@@ -402,18 +410,9 @@ pub(crate) fn handle_inbox_with_policy(
         None,
         None, // #1834 valid_at (no as-of)
         None, // #2580 metadata_eq (no narrowing)
-        unread_only,
     )
     .map_err(|e| e.to_string())?;
-    // #3463 belt-and-suspenders: the SAME marker re-checked in-process, so a
-    // drift between the SQL fragment and this predicate can only NARROW what
-    // the agent is shown, never widen it. With the pushdown in place this is a
-    // no-op on every correct path.
-    let filtered: Vec<&Memory> = items
-        .iter()
-        .filter(|m| !unread_only || m.access_count == 0)
-        .collect();
-    let messages = filtered.into_iter().map(inbox_message).collect();
+    let messages = items.iter().map(inbox_message).collect();
     Ok(inbox_envelope(&owner, &namespace, unread_only, messages))
 }
 
@@ -481,7 +480,8 @@ pub struct InboxRequest {
     #[serde(default)]
     pub agent_id: Option<String>,
 
-    /// access_count==0 only.
+    /// Accepted for compatibility; narrows nothing (#3730). Every message
+    /// still in the inbox is unhandled: drain by deleting what you handled.
     #[serde(default)]
     pub unread_only: Option<bool>,
 
@@ -502,16 +502,19 @@ impl McpTool for InboxTool {
         "List messages sent to an agent via memory_notify."
     }
     fn docs() -> &'static str {
-        // v0.9.0 P0-1 (#1869) — recall is pure by default, so
-        // read-marking is EVENTUALLY consistent: recalling a message
-        // appends a ledger row and the periodic fold (default 60 s;
-        // gc-tick fallback) is what bumps access_count past 0. A
-        // just-recalled message can list as unread for up to one fold
-        // interval. Pinned by
-        // `tests/recall_purity_p01.rs::fold_flips_inbox_unread_marker`.
-        "Read _messages/<agent_id>. access_count==0 is the unread marker \
-         (eventually consistent under pure recall: the periodic \
-         recall-access fold, default 60s, read-marks recalled messages)."
+        // #3730 — the inbox is the PENDING set. There is no read marker:
+        // `access_count` counts touches (a recall landed by the #1869 fold),
+        // which no inbox operation advances and which never meant handled.
+        // A recipient declares a message handled by deleting it
+        // (`memory_delete` — authorised for the addressee). `unread_only`
+        // is accepted for compatibility and narrows nothing; it is echoed
+        // back so a caller can see what it sent. Pinned by
+        // `tests/inbox_drain_not_touch_3730.rs`.
+        "Read _messages/<agent_id>: the messages the recipient has not yet \
+         handled. Handled = deleted by the recipient (memory_delete); reads \
+         never mark anything. unread_only is accepted for compatibility and \
+         narrows nothing — every listed message is unhandled. access_count \
+         counts touches, not handling."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<InboxRequest>()

@@ -50,7 +50,9 @@ impl McpTool for DeleteTool {
     fn docs() -> &'static str {
         "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk \
          pattern delete (archives first). #3171: `id` also accepts a UNIQUE ID PREFIX on this \
-         IRREVERSIBLE delete — pass the full id unless you intend prefix resolution."
+         IRREVERSIBLE delete — pass the full id unless you intend prefix resolution. #3730: a \
+         message in the caller's inbox (_inbox/<agent>) is ARCHIVED instead (restorable via \
+         memory_archive_restore); the response says which: `archived: true|false`."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<DeleteRequest>()
@@ -272,7 +274,17 @@ pub(super) fn handle_delete(
         }
     }
 
-    let deleted = db::delete(conn, &target.id).map_err(|e| e.to_string())?;
+    // #3730 — retention policy by namespace (`inbox_delete_retains`): a
+    // message in the recipient's inbox is ARCHIVED (restorable, listed by
+    // memory_archive_list), every other row is erased as before. The
+    // disposition is reported on the wire (`archived`) so a caller never has
+    // to consult documentation to know whether its data still exists.
+    let archived = crate::visibility::inbox_delete_retains(&target.namespace);
+    let deleted = if archived {
+        db::delete_archive_first(conn, &target.id).map_err(|e| e.to_string())?
+    } else {
+        db::delete(conn, &target.id).map_err(|e| e.to_string())?
+    };
     if deleted {
         // v1.0.0 #2446 — queue the erasure for federated fan-out. The MCP
         // surface never constructs a `FederationConfig` (it is HTTP-`serve`
@@ -323,7 +335,7 @@ pub(super) fn handle_delete(
                 tier: snapshot_tier,
             },
         );
-        Ok(json!({"deleted": true}))
+        Ok(json!({"deleted": true, "archived": archived}))
     } else {
         Err(crate::errors::msg::MEMORY_NOT_FOUND.into())
     }

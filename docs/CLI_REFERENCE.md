@@ -208,7 +208,7 @@ live at delete time, so a restore returns the content you deleted.
 
 | Flag | Applies to | Notes |
 |---|---|---|
-| `--hard` | `delete` | Skip the archive copy and destroy the row irreversibly (the pre-v1.0.0 behaviour, now an explicit opt-in). There is no recovery afterwards short of a `backup`. |
+| `--hard` | `delete` | Skip the archive copy and destroy the row irreversibly (the pre-v1.0.0 behaviour, now an explicit opt-in). There is no recovery afterwards short of a `backup`. On an inbox message (`_inbox/<agent>`) it prints one warning line naming what is being destroyed — the record of what that agent was told — and proceeds ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)); to DRAIN an inbox use plain `delete`, which archives. |
 | `--capability <TOKEN>` | `delete` | v0.9.0 G10.1 macaroon token; inert unless `[capabilities].enabled`. |
 | `--capability-file <PATH>` | `delete` | Non-argv `cap1:` token file (`0600`); conflicts with `--capability`. |
 
@@ -1546,7 +1546,7 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 | `reflect` | `memory_reflect` | Synthesize a reflection over source memories (CLI dispatcher runs unsigned / no LLM dedup — use MCP/HTTP for those). |
 | `subscribe` / `unsubscribe` / `list-subscriptions` | `memory_subscribe` / `memory_unsubscribe` / `memory_list_subscriptions` | Webhook subscription CRUD. `created_by` / the #870/#872 owner gate is the global `--agent-id` ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
 | `subscription-replay` / `subscription-dlq-list` | `memory_subscription_replay` / `memory_subscription_dlq_list` | Webhook DLQ replay + inspection. |
-| `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. Sender/owner is the global `--agent-id`; a subcommand `inbox --agent-id` that disagrees is refused ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
+| `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. Sender/owner is the global `--agent-id`; a subcommand `inbox --agent-id` that disagrees is refused ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). **The inbox is a queue: `inbox` lists what you have not yet handled, and you drain it with `ai-memory delete <id>` once a message is handled** ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). Plain `delete` ARCHIVES an inbox message (restorable, `archive list`); `delete --hard` ERASES it and destroys the record of what the agent was told — it warns, then proceeds. Reads never mark anything; there is no read marker (`access_count` counts touches). `--unread-only` is accepted for compatibility and narrows nothing. |
 | `ingest-multistep` | `memory_ingest_multistep` | Form 3 multi-step ingest (CLI passes no LLM handler; tier-locked advisory on every tier). |
 | `entity-register` / `entity-get-by-alias` | `memory_entity_register` / `memory_entity_get_by_alias` | Entity registry. CLI errors name `--canonical-name`, not MCP `title` ([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)). |
 | `dependents-of-invalidated` | `memory_dependents_of_invalidated` | Memories citing invalidated KG edges. |
