@@ -70,8 +70,8 @@ The HTTP daemon takes an optional shared API key from the `api_key` field of `~/
 **The only supported credential channel is the `x-api-key` request header** (constant-time compared in `handlers::transport::api_key_auth`). The `?api_key=` query-parameter form is **rejected with `401` at v1.0.0** ([#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032) L1): a credential in the URL leaks into access logs, `Referer` headers, and proxy logs, all of which may outlive your key-rotation window. It was deprecated at v0.7.0 ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — accepted for back-compat with a once-per-process operator-visible WARN — and v1.0.0 removed it outright: there is **no opt-back-in escape hatch**. A request that still presents `?api_key=` is refused (a once-per-process WARN fires on the first such refusal). Use the header:
 
 ```bash
-curl -H "x-api-key: $KEY" http://127.0.0.1:9077/api/v1/stats   # supported
-curl "http://127.0.0.1:9077/api/v1/stats?api_key=$KEY"         # REJECTED (401) since v1.0.0
+curl -H "x-api-key: $KEY" https://127.0.0.1:9077/api/v1/stats   # supported
+curl "https://127.0.0.1:9077/api/v1/stats?api_key=$KEY"         # REJECTED (401) since v1.0.0
 ```
 
 mTLS-authenticated federation peers bypass the api-key check on `/api/v1/sync/*` only (they have already cleared a stronger gate; see [`federation.md`](federation.html)).

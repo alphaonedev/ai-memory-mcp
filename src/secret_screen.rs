@@ -39,7 +39,17 @@
 use std::sync::OnceLock;
 
 /// Per-write screening disposition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretScreenMode {
     /// No screening — byte-identical to the pre-W1 write path. The explicit

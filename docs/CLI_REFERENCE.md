@@ -401,7 +401,7 @@ API key comes from the `api_key` field in `config.toml`).
 |------|------|---------|-------|
 | `--host` | string | `127.0.0.1` | |
 | `--port` | u16 | `9077` | |
-| `--tls-cert`/`--tls-key` | path | — | Enable HTTPS. rustls, no OpenSSL. |
+| `--tls-cert`/`--tls-key` | path | — | Operator-supplied in-process HTTPS material (rustls, no OpenSSL): full chain PEM + PKCS#8 key, SANs covering every bind host. TLS itself is REQUIRED since v1.0.0 (#3705, "only encrypted data in transit"). On a SINGLETON the flags are optional — first boot generates a local CA + server certificate under `<key_dir>/tls/` and renews it (#3709 item 1). On a FLEET-shaped deployment (production / federated / hive, per #3700) they are REQUIRED: enterprise PKI is the first-class path and a fleet without operator material is refused (3x7 audit ruling — an unmanaged CA in an enterprise estate is an audit finding). A plaintext listener is refused everywhere, loopback included. |
 | `--mtls-allowlist` | path | — | SHA-256 cert-fingerprint allowlist (requires `--tls-cert`). |
 | `--shutdown-grace-secs` | u64 | `30` | SIGINT grace period. |
 | `--quorum-writes` | usize | `0` | v0.7 federation: W (peer acks required). `0` = federation off. |
@@ -414,10 +414,36 @@ API key comes from the `api_key` field in `config.toml`).
 | `--store-url` | URL | — | SAL backend selector (`postgres://…` under `--features sal-postgres`). **Mutually exclusive with `--db`** — passing both is rejected at startup with a clear error. A userinfo password should be supplied via `AI_MEMORY_STORE_URL` (owner-only environment) or `AI_MEMORY_STORE_URL_FILE` (a `0600` file) rather than on argv, which is exposed via `/proc/<pid>/cmdline` and `ps auxww` to any local UID (#1927). |
 
 ```bash
+# singleton, zero-config: first boot generates <key_dir>/tls/{local-ca.pem,local-ca.key,server.pem,server.key}
+ai-memory serve
+# declared non-singleton shape ([deployment] shape = team / production / federated / hive):
+# enterprise PKI is REQUIRED —
 ai-memory serve --host 0.0.0.0 --port 9077 \
   --tls-cert /etc/ai-memory/cert.pem \
   --tls-key /etc/ai-memory/key.pem
 ```
+
+**Zero-config TLS (#3709 item 1) — singleton shape only.** On a singleton
+with no `--tls-cert`/`--tls-key` the daemon issues itself a certificate
+from an installation-local CA kept under
+`<key_dir>/tls/` (`local-ca.pem`, `local-ca.key` 0600, `server.pem`,
+`server.key` 0600; directory 0700): the CA lives 3650 days, the leaf 90 days
+and is re-issued inside a 30-day window at boot and by a daily in-daemon
+task that hot-reloads the listener. A renewal failure is loud and never
+downgrades to plaintext. Clients trust the local CA explicitly —
+`curl --cacert <key_dir>/tls/local-ca.pem https://127.0.0.1:9077/…` — and the
+bundled clients (`doctor --remote`, the MCP forwarder) do so automatically.
+The local CA is NEVER used to trust a federation peer: peer trust stays
+explicit (`--quorum-ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`,
+`--mtls-allowlist`; the #2448 posture is unchanged). **A deployment whose
+declared shape is not `singleton` gets no local CA at all**: `serve` refuses
+without operator material. The declaration decides — a node whose signals
+or agent registry look like a fleet is WARNED by the #3700 detector, never
+re-postured (promotion is an operator act) — see
+`docs/SECURITY.md` "Bring your own certificate". The `ai-memory tls
+init|import|renew` and `ai-memory db check-tls` verbs are v1.0.1 (#3709 items 2-4); until they ship the refusals name only what exists — `--tls-cert/--tls-key`, `sslmode=verify-full&sslrootcert=<ca.crt>`, the files under `<key_dir>/tls/` — and are
+#3709 items 2–4 (a separate branch); until they land, first-boot generation
+and `--tls-cert`/`--tls-key` are the two paths.
 
 ### `sync`, `sync-daemon`
 
@@ -1128,6 +1154,50 @@ caller id and whether a signing key for THAT id is enrolled.
 
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
+
+**`Deployment shape detector (#3700)` section** — right after the
+declared-shape section (#3714) in the default local report, before the
+database open, so a node configured like a fleet but declared `singleton`
+is reported unprompted at the top. Facts: `declared_shape`,
+`observed_floor` (`singleton` / `team` / `federated`, the least demanding
+shape the present signals allow), `signals_present`,
+`signals_unobservable` (argv signals are unobservable from doctor; the
+store is unobservable until it opens), `registered_agents` (folded in from
+the store once the read-only connection is open), `undeclared_promotion`,
+`promotion_line` (the exact `[deployment] shape = "…"` line to declare, or
+`none`), `posture`, `posture_origin` (`explicit` / `shape_floor` /
+`compiled_default`), `protections_off` + `protections_off_list` (the
+pinned knobs not in force), and `boot_verdict` (`boots`, `boots — signals
+exceed the declared shape …`, `boots UNPROTECTED …`, or `REFUSES …`).
+Critical when the node is an undeclared fleet running `standard` or a
+hardened declared shape has a knob below its floor; Warning for an
+undeclared promotion under an explicit hardened posture; Info otherwise.
+Detection never re-postures — promotion is an operator act. This is the
+pre-upgrade detector: run it before upgrading to learn what will refuse.
+
+**`Transit encryption (#3705)` section** — THIRD in the default local
+report, right after the deployment shape: every transit surface versus the
+"only encrypted data in transit" mandate. Facts: `mandate`, `listener_tls`
+(operator `--tls-cert`/`--tls-key` are argv and unobservable from doctor, or
+the local certificate under `<key_dir>/tls`; a bind without either is
+refused), `local_tls_material` (singleton: `absent` — first boot generates it — /
+`present, <n> day(s) to expiry, SANs: …` / `INSIDE the renewal window` /
+`EXPIRED — REFUSES at next boot`; fleet: `absent — enterprise PKI
+required … REFUSES boot` / `present but LOCALLY MINTED — … audit finding;
+REFUSES at next boot`; `unreadable`), `require_tls_token` (`unset
+(floor)` / `affirmed` / `downgrade requested … — REFUSES boot` /
+`unrecognised … — REFUSES boot`), `downgrade_paths_armed` (the removed
+`AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` / `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`
+hatches, each refusing boot when set), `mcp_federation_forward_url`,
+`store_url_sslmode` (`sqlite` / `postgres: sslmode=verify-full pinned` /
+`… NOT pinned — REFUSES at connect`), `webhook_plaintext_targets` (folded in
+from the store once open; refused at dispatch and at create),
+`llm_egress_plaintext` (DETECTED only — model-server egress awaits the
+operator's ruling) and `boot_verdict`. Critical when anything will refuse or
+a plaintext webhook target is stored, the local certificate is expired, or
+a declared non-singleton shape lacks enterprise PKI;
+Warning for plaintext model-server egress or a leaf inside its renewal
+window; Info otherwise. Doctor never refuses.
 
 ```bash
 ai-memory doctor

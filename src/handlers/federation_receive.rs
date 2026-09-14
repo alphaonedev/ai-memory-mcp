@@ -4879,7 +4879,7 @@ mod tests {
 
     #[test]
     fn historical_registry_miss_never_falls_back_to_current_keydir_3464() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "history-gap-author";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll keydir key");
@@ -4922,7 +4922,7 @@ mod tests {
     /// itself — not passed in, unlike the push-side tests above.)
     #[test]
     fn pull_attestation_valid_sig_upgrades_and_applies_2715() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "alice";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll alice");
@@ -5073,7 +5073,7 @@ mod tests {
     /// masking — the gate returns `false` on the explicit `Err`.
     #[test]
     fn pull_attestation_forged_sig_refused_2715() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "alice";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll alice");
@@ -5100,7 +5100,7 @@ mod tests {
     /// overridden to `claimed` (a peer cannot self-assert attestation).
     #[test]
     fn pull_attestation_unsigned_lands_claimed_2715() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "alice";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll alice");

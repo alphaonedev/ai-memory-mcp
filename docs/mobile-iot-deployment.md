@@ -166,7 +166,7 @@ sv up ai-memory
 
 Now any Termux-hosted AI client on the phone (Ollama-on-Termux,
 llama.cpp server, an MCP-speaking app shelled over `adb`, etc.)
-can hit `http://127.0.0.1:9077/api/v1/` for memory persistence.
+can hit `https://127.0.0.1:9077/api/v1/` for memory persistence.
 
 ### Battery hygiene
 
