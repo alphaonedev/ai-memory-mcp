@@ -66,9 +66,9 @@ fn memory_stamp_value_set_is_exactly_four_3548() {
     }
 }
 
-/// The `content_attestation` bullet in docs/API_REFERENCE.md enumerates the
-/// values as `  - \`value\` — …` sub-bullets; that list must equal the
-/// constant, exactly.
+/// The `content_attestation` bullet in `docs/API_REFERENCE.md` enumerates the
+/// values as indented sub-bullets, one backticked value per line followed by
+/// an em-dash gloss; that list must equal the constant, exactly.
 #[test]
 fn api_reference_enumeration_is_bound_to_the_constant_3548() {
     let doc = std::fs::read_to_string("docs/API_REFERENCE.md").expect("API_REFERENCE.md");
