@@ -139,25 +139,32 @@ fn ledger_levels(rt: &tokio::runtime::Runtime, url: &str) -> Vec<(String, String
     })
 }
 
+/// Review round 3: a `capture_turn` row carries the L4 HOST attestation level
+/// (`self_signed` with no host signature pair) and the HOST's signature — it
+/// says nothing about the daemon key. The capture cell below proves key
+/// generation + that the writer appends its row; the signed property is
+/// proved on a writer that daemon-signs: `DELETE /api/v1/memories/{id}`
+/// writes a forget tombstone signed through `try_sign_audit_payload`, so
+/// `signature IS NOT NULL` and it verifies under `<id>.pub`.
 #[test]
-fn pg_daemon_without_key_generates_it_and_signs_the_ledger_3354() {
+fn pg_daemon_generates_the_key_at_boot_and_signs_the_first_tombstone_3354() {
     let Some(url) = pg_url() else { return };
     let sb = sandbox();
     let (_daemon, port) = serve(&sb, &url);
 
     // The daemon generated the key for the resolved id at boot.
     let priv_path = sb.keys.join(format!("{AGENT_ID}.priv"));
+    let pub_path = sb.keys.join(format!("{AGENT_ID}.pub"));
     assert!(
         priv_path.is_file(),
         "signing key generated at boot for the resolved id"
     );
+    assert!(pub_path.is_file(), "with its public half");
 
-    // One captured turn through the HTTP surface appends a ledger row. The
-    // row is keyed to the RESOLVED CALLER of the HTTP request (the L4 channel
-    // stamps `metadata.agent_id` from the caller, #1413), not to the daemon's
-    // own `AI_MEMORY_AGENT_ID` — so the ledger is read as a BEFORE/AFTER delta
-    // over every agent, the same shape the SQLite twin asserts, instead of a
-    // filter on the daemon's id that the capture row never carries.
+    // One captured turn through the HTTP surface appends its ledger row
+    // (keyed to the resolved HTTP caller, #1413 — read as a before/after
+    // delta over every agent). Key generation is the claim here, not the
+    // row's attestation level, which is the host's, not the daemon's.
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let before = ledger_levels(&rt, &url);
     let client = reqwest::blocking::Client::builder()
@@ -171,7 +178,7 @@ fn pg_daemon_without_key_generates_it_and_signs_the_ledger_3354() {
             "host_session_id": session,
             "host_turn_index": 1,
             "role": "assistant",
-            "content": "pg turn — its ledger row must be self_signed (#3354)",
+            "content": "pg turn — the daemon key was generated at boot (#3354)",
             "host_kind": "claude-code",
         }))
         .send()
@@ -182,30 +189,76 @@ fn pg_daemon_without_key_generates_it_and_signs_the_ledger_3354() {
         resp.status(),
         resp.text().unwrap_or_default()
     );
-
-    // The postgres ledger carries the NEW row signed, never unsigned.
     let after = ledger_levels(&rt, &url);
-    let levels: Vec<(String, String, i64)> = after
-        .iter()
-        .map(|(agent, level, n)| {
-            let was = before
-                .iter()
-                .find(|(a, l, _)| a == agent && l == level)
-                .map_or(0, |(_, _, n)| *n);
-            (agent.clone(), level.clone(), n - was)
-        })
-        .filter(|(_, _, delta)| *delta > 0)
-        .collect();
+    let appended: i64 = after.iter().map(|(_, _, n)| n).sum::<i64>()
+        - before.iter().map(|(_, _, n)| n).sum::<i64>();
+    assert!(appended >= 1, "the turn appended a ledger row on postgres");
+
+    // A daemon-signing writer: create, then DELETE — the forget tombstone is
+    // signed with the key ensured at boot.
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/api/v1/memories"))
+        .header("x-agent-id", AGENT_ID)
+        .json(&serde_json::json!({
+            "title": format!("row to forget {}", uuid::Uuid::new_v4().simple()),
+            "content": "its tombstone must be daemon-signed (#3354)",
+        }))
+        .send()
+        .expect("create request");
     assert!(
-        !levels.is_empty(),
-        "the turn appended a ledger row on postgres"
+        resp.status().is_success(),
+        "create: {} {}",
+        resp.status(),
+        resp.text().unwrap_or_default()
     );
+    let created: serde_json::Value = resp.json().expect("create json");
+    let id = created["id"].as_str().expect("id").to_string();
+    let resp = client
+        .delete(format!("http://127.0.0.1:{port}/api/v1/memories/{id}"))
+        .header("x-agent-id", AGENT_ID)
+        .send()
+        .expect("delete request");
     assert!(
-        levels.iter().all(|(_, level, _)| level != "unsigned"),
-        "#3354 (pg): no unsigned row: {levels:?}"
+        resp.status().is_success(),
+        "delete: {} {}",
+        resp.status(),
+        resp.text().unwrap_or_default()
     );
-    assert!(
-        levels.iter().any(|(_, level, _)| level == "self_signed"),
-        "#3354 (pg): the row is self_signed (L4: the capture-turn row is signed by the resolved agent`s own key): {levels:?}"
-    );
+
+    let (namespace, forgotten_at, signature): (String, String, Option<Vec<u8>>) =
+        rt.block_on(async {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .expect("pg pool");
+            sqlx::query_as::<_, (String, String, Option<Vec<u8>>)>(
+                "SELECT namespace, forgotten_at, signature FROM forget_tombstones \
+                 WHERE memory_id = $1",
+            )
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .expect("the delete left a forget tombstone")
+        });
+    let signature = signature.unwrap_or_else(|| {
+        panic!(
+            "#3354 (pg): the fresh store's first tombstone is daemon-signed, never signature = NULL"
+        )
+    });
+    let pub_bytes: [u8; 32] = std::fs::read(&pub_path)
+        .expect("read .pub")
+        .try_into()
+        .expect("a raw 32-byte Ed25519 public key");
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes).expect("public key");
+    let sig_bytes: [u8; 64] = signature
+        .as_slice()
+        .try_into()
+        .expect("a 64-byte Ed25519 signature");
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let signable =
+        ai_memory::storage::forget_tombstone_signable_bytes(&id, &namespace, &forgotten_at);
+    verifying
+        .verify_strict(&signable, &sig)
+        .expect("#3354 (pg): the tombstone signature verifies under <id>.pub");
 }

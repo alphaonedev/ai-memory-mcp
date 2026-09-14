@@ -117,11 +117,15 @@ fn ledger_levels(db: &Path) -> Vec<(String, i64)> {
         .expect("rows")
 }
 
-/// THE regression: an empty key directory, a resolved id nobody
-/// provisioned, one turn — the row is `self_signed`, the key was
-/// generated (0600) for exactly that id, and NO row is `unsigned`.
+/// Key generation on a fresh store: an empty key directory, a resolved id
+/// nobody provisioned, one ledger-writing verb — the key is generated (0600)
+/// for exactly that id, once. This cell proves key generation only; the
+/// signed property is proved by [`fresh_store_daemon_signs_its_first_tombstone_3354`]
+/// on a writer that daemon-signs (a `capture-turn` row carries the L4 HOST
+/// attestation level and the host's signature — `self_signed` with no host
+/// signature pair — so it says nothing about the daemon key).
 #[test]
-fn fresh_store_signs_the_ledger_from_its_first_row_3354() {
+fn fresh_store_generates_the_signing_key_at_boot_3354() {
     let sb = sandbox();
     assert!(
         std::fs::read_dir(&sb.keys).expect("list").next().is_none(),
@@ -148,40 +152,105 @@ fn fresh_store_signs_the_ledger_from_its_first_row_3354() {
             & 0o777;
         assert_eq!(mode, 0o600, "a generated private key is owner-only");
     }
-
-    let levels = ledger_levels(&sb.db);
     assert!(
-        !levels.is_empty(),
-        "capture-turn appends at least one ledger row"
-    );
-    assert!(
-        levels.iter().all(|(level, _)| level != "unsigned"),
-        "{ISSUE}: no row may be unsigned on a fresh store: {levels:?}"
-    );
-    assert!(
-        levels
-            .iter()
-            .any(|(level, n)| level == "self_signed" && *n >= 1),
-        "{ISSUE}: the turn's row is self_signed (L4: the capture-turn row is signed by the resolved agent`s own key): {levels:?}"
+        !ledger_levels(&sb.db).is_empty(),
+        "capture-turn appends its ledger row"
     );
 
-    // A second turn re-uses the generated key: still signed, still no
-    // unsigned row, no second key generation.
+    // A second writer re-uses the generated key: no second key generation.
     let out = capture_turn(&sb, 2);
     assert!(
         out.status.success(),
         "second capture-turn: {}",
         stderr_of(&out)
     );
-    let levels = ledger_levels(&sb.db);
-    assert!(
-        levels.iter().all(|(level, _)| level != "unsigned"),
-        "{levels:?}"
-    );
     let entries = std::fs::read_dir(&sb.keys).expect("list").count();
     assert_eq!(
         entries, 2,
         "exactly one keypair (pub + priv) under the key dir"
+    );
+}
+
+/// THE regression (review round 3): the property #3354 delivers is that a
+/// fresh store's first DAEMON-SIGNED row is actually signed under the key
+/// ensured at boot. `delete` is such a writer: its forget tombstone is signed
+/// through `try_sign_audit_payload` with the daemon audit key. On the pre-fix
+/// head the key was never generated, so the tombstone's `signature` was NULL
+/// and the receipt verified as `unsigned`. Now: `signature IS NOT NULL`, it
+/// verifies under `<id>.pub` (raw Ed25519 verification over the canonical
+/// signable bytes), and the product's own verifier says `valid`.
+#[test]
+fn fresh_store_daemon_signs_its_first_tombstone_3354() {
+    let sb = sandbox();
+    assert!(
+        std::fs::read_dir(&sb.keys).expect("list").next().is_none(),
+        "the key directory starts empty"
+    );
+
+    let out = command(&sb)
+        .args([
+            "--json",
+            "store",
+            "-T",
+            "row to forget",
+            "--content",
+            "its tombstone must be daemon-signed (#3354)",
+        ])
+        .output()
+        .expect("store");
+    assert!(out.status.success(), "store: {}", stderr_of(&out));
+    let stored: serde_json::Value = serde_json::from_slice(&out.stdout).expect("store json");
+    let id = stored["id"].as_str().expect("id").to_string();
+
+    let out = command(&sb).args(["delete", &id]).output().expect("delete");
+    assert!(out.status.success(), "delete: {}", stderr_of(&out));
+
+    let pub_path = sb.keys.join(format!("{AGENT_ID}.pub"));
+    assert!(pub_path.is_file(), "the signing key was generated at boot");
+
+    let conn = rusqlite::Connection::open(&sb.db).expect("open sqlite");
+    let (namespace, forgotten_at, signature): (String, String, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT namespace, forgotten_at, signature FROM forget_tombstones WHERE memory_id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("the delete left a forget tombstone");
+    let signature = signature.unwrap_or_else(|| {
+        panic!(
+            "{ISSUE}: the fresh store's first tombstone is daemon-signed, never signature = NULL"
+        )
+    });
+
+    // Verifies under the generated public key.
+    let pub_bytes: [u8; 32] = std::fs::read(&pub_path)
+        .expect("read .pub")
+        .try_into()
+        .expect("a raw 32-byte Ed25519 public key");
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes).expect("public key");
+    let sig_bytes: [u8; 64] = signature
+        .as_slice()
+        .try_into()
+        .expect("a 64-byte Ed25519 signature");
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let signable =
+        ai_memory::storage::forget_tombstone_signable_bytes(&id, &namespace, &forgotten_at);
+    verifying
+        .verify_strict(&signable, &sig)
+        .unwrap_or_else(|e| {
+            panic!("{ISSUE}: the tombstone signature verifies under <id>.pub: {e}")
+        });
+
+    // And the product's own verifier agrees.
+    let out = command(&sb)
+        .args(["--json", "forget", "--verify-receipt", &id])
+        .output()
+        .expect("verify-receipt");
+    assert!(out.status.success(), "verify-receipt: {}", stderr_of(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("receipt json");
+    assert_eq!(
+        v["verdict"], "valid",
+        "{ISSUE}: the forget receipt verifies under the daemon key: {v}"
     );
 }
 
@@ -248,9 +317,7 @@ fn egress_verb_without_a_key_it_cannot_generate_still_runs_3354() {
         stderr_of(&backup)
     );
     assert!(
-        std::fs::read_dir(&backups)
-            .map(|d| d.count() > 0)
-            .unwrap_or(false),
+        std::fs::read_dir(&backups).is_ok_and(|d| d.count() > 0),
         "`backup` still wrote a snapshot under {}",
         backups.display()
     );
