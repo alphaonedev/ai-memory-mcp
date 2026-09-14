@@ -14,6 +14,7 @@
 //!   the query was silently ignored and the whole corpus dumped.
 //! - `bulk_invalid_kind_is_validation_failed_3427_head`: the per-row error
 //!   for `kind: "nonsense"` is classed `INTERNAL_ERROR`.
+//!
 //! On the fixed branch both pass.
 
 use std::sync::Arc;
@@ -77,17 +78,19 @@ async fn boot() -> Daemon {
     let dir = tempfile::tempdir().expect("tempdir under TMPDIR");
     let db_path = dir.path().join("head-3427.db");
     let port = free_port();
-    let mut cfg = AppConfig::default();
-    cfg.tier = Some("keyword".to_string());
-    cfg.admin = Some(AdminConfig {
-        agent_ids: vec![ADMIN.to_string()],
-    });
     // #3427 review — the fixture authenticates like a real admin export: an
     // api_key is configured and presented, so `require_admin`'s #1582 gate
     // ADMITS the caller and the namespace assertions below actually execute
     // (a green line must mean the filter was tested, not that the request was
     // refused before reaching it). No ambient config / header-trust env.
-    cfg.api_key = Some(API_KEY.to_string());
+    let cfg = AppConfig {
+        tier: Some("keyword".to_string()),
+        admin: Some(AdminConfig {
+            agent_ids: vec![ADMIN.to_string()],
+        }),
+        api_key: Some(API_KEY.to_string()),
+        ..AppConfig::default()
+    };
     let boot = bootstrap_serve(&db_path, &serve_args(port), &cfg)
         .await
         .expect("bootstrap_serve on loopback");
