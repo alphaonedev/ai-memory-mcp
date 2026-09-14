@@ -3,7 +3,7 @@
 
 //! #3354 — PostgreSQL twin through the daemon: a postgres-backed `serve`
 //! whose resolved agent id has no signing key generates one at boot and the
-//! ledger row a captured turn appends on postgres is `daemon_signed`, never
+//! ledger row a captured turn appends on postgres is `self_signed`, never
 //! `unsigned`. Live only under `AI_MEMORY_TEST_POSTGRES_URL` (a FRESH
 //! `ai_memory_f2a_*` database — never `ai_memory_test`); skips otherwise.
 //!
@@ -121,6 +121,24 @@ fn serve(sb: &Sandbox, url: &str) -> (Daemon, u16) {
     (daemon, port)
 }
 
+/// `(agent_id, attest_level, count)` over the whole `signed_events` ledger.
+fn ledger_levels(rt: &tokio::runtime::Runtime, url: &str) -> Vec<(String, String, i64)> {
+    rt.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(url)
+            .await
+            .expect("pg pool");
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT agent_id, attest_level, COUNT(*) FROM signed_events \
+             GROUP BY agent_id, attest_level",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("levels")
+    })
+}
+
 #[test]
 fn pg_daemon_without_key_generates_it_and_signs_the_ledger_3354() {
     let Some(url) = pg_url() else { return };
@@ -134,7 +152,14 @@ fn pg_daemon_without_key_generates_it_and_signs_the_ledger_3354() {
         "signing key generated at boot for the resolved id"
     );
 
-    // One captured turn through the HTTP surface appends a ledger row.
+    // One captured turn through the HTTP surface appends a ledger row. The
+    // row is keyed to the RESOLVED CALLER of the HTTP request (the L4 channel
+    // stamps `metadata.agent_id` from the caller, #1413), not to the daemon's
+    // own `AI_MEMORY_AGENT_ID` — so the ledger is read as a BEFORE/AFTER delta
+    // over every agent, the same shape the SQLite twin asserts, instead of a
+    // filter on the daemon's id that the capture row never carries.
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let before = ledger_levels(&rt, &url);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -146,7 +171,7 @@ fn pg_daemon_without_key_generates_it_and_signs_the_ledger_3354() {
             "host_session_id": session,
             "host_turn_index": 1,
             "role": "assistant",
-            "content": "pg turn — its ledger row must be daemon_signed (#3354)",
+            "content": "pg turn — its ledger row must be self_signed (#3354)",
             "host_kind": "claude-code",
         }))
         .send()
@@ -158,33 +183,29 @@ fn pg_daemon_without_key_generates_it_and_signs_the_ledger_3354() {
         resp.text().unwrap_or_default()
     );
 
-    // The postgres ledger carries the row signed, never unsigned.
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let levels: Vec<(String, i64)> = rt.block_on(async {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .expect("pg pool");
-        sqlx::query_as::<_, (String, i64)>(
-            "SELECT attest_level, COUNT(*) FROM signed_events WHERE agent_id = $1 \
-             GROUP BY attest_level",
-        )
-        .bind(AGENT_ID)
-        .fetch_all(&pool)
-        .await
-        .expect("levels")
-    });
+    // The postgres ledger carries the NEW row signed, never unsigned.
+    let after = ledger_levels(&rt, &url);
+    let levels: Vec<(String, String, i64)> = after
+        .iter()
+        .map(|(agent, level, n)| {
+            let was = before
+                .iter()
+                .find(|(a, l, _)| a == agent && l == level)
+                .map_or(0, |(_, _, n)| *n);
+            (agent.clone(), level.clone(), n - was)
+        })
+        .filter(|(_, _, delta)| *delta > 0)
+        .collect();
     assert!(
         !levels.is_empty(),
         "the turn appended a ledger row on postgres"
     );
     assert!(
-        levels.iter().all(|(level, _)| level != "unsigned"),
+        levels.iter().all(|(_, level, _)| level != "unsigned"),
         "#3354 (pg): no unsigned row: {levels:?}"
     );
     assert!(
-        levels.iter().any(|(level, _)| level == "daemon_signed"),
-        "#3354 (pg): the row is daemon_signed: {levels:?}"
+        levels.iter().any(|(_, level, _)| level == "self_signed"),
+        "#3354 (pg): the row is self_signed (L4: the capture-turn row is signed by the resolved agent`s own key): {levels:?}"
     );
 }
