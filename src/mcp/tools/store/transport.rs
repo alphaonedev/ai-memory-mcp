@@ -56,17 +56,25 @@ pub(crate) fn forward_to_http(
     // that exists but does not parse is an error, not silently ignored.
     let mut builder =
         reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15));
-    if let Some(ca) = crate::tls_bootstrap::local_ca_certificate()
-        .map_err(|e| format!("federation_forward: local CA: {e}"))?
-    {
+    // The load error names the key directory on disk (an operator path):
+    // that belongs in the operator log, never in the MCP caller's error
+    // text (gate 7, #3688/7 — surfaced on the #3705+#3711 resolved tree).
+    if let Some(ca) = crate::tls_bootstrap::local_ca_certificate().map_err(|e| {
+        tracing::warn!(
+            target: "federation.forward",
+            error = %e,
+            "federation_forward: the local CA certificate could not be loaded"
+        );
+        String::from(
+            "federation_forward: local CA certificate could not be loaded (see the operator log)",
+        )
+    })? {
         builder = builder.add_root_certificate(ca);
     }
-    let client = builder
-        .build()
-        .map_err(|e| {
-            let reason = crate::url_display::network_failure(&e);
-            format!("federation_forward: build client: {reason}")
-        })?;
+    let client = builder.build().map_err(|e| {
+        let reason = crate::url_display::network_failure(&e);
+        format!("federation_forward: build client: {reason}")
+    })?;
     let mut req = client.request(method, url);
     for (k, v) in extra_headers {
         req = req.header(*k, v);
