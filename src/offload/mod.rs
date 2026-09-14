@@ -307,10 +307,12 @@ impl<'a> ContextOffloader<'a> {
     /// - [`OffloadError::SignatureFailed`] when a signer was provided
     ///   and the stored Ed25519 signature fails to verify.
     pub fn deref(&self, ref_id: &str, caller_agent_id: Option<&str>) -> Result<DerefResult> {
-        let row: Option<(Vec<u8>, String, i64, String, String, String)> = self
+        // #3392 — read `ttl_seconds` too, so the read path can REFUSE an expired
+        // blob instead of serving it verbatim (TTL was write-side only before).
+        let row: Option<(Vec<u8>, String, i64, Option<i64>, String, String, String)> = self
             .conn
             .query_row(
-                "SELECT content_zstd, content_sha256, stored_at, namespace,
+                "SELECT content_zstd, content_sha256, stored_at, ttl_seconds, namespace,
                         agent_id, signature_b64
                  FROM offloaded_blobs WHERE ref_id = ?1",
                 params![ref_id],
@@ -322,18 +324,36 @@ impl<'a> ContextOffloader<'a> {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )
             .optional()
             .context("SELECT offloaded_blobs failed")?;
 
-        let (blob, stored_sha, stored_at, namespace, agent_id, signature_b64) =
-            row.ok_or_else(|| {
+        let (blob, stored_sha, stored_at, ttl_seconds, namespace, agent_id, signature_b64) = row
+            .ok_or_else(|| {
                 anyhow!(OffloadError::NotFound {
                     ref_id: ref_id.to_string(),
                 })
             })?;
+
+        // #3392 (RETENTION) — enforce TTL on READ. Before this, `ttl_seconds` was
+        // honoured only by the write-side reaper, so a blob past its TTL was served
+        // verbatim to a caller who believed it was gone. An expired blob is NotFound
+        // (leak-resistant, same disposition as the SEC-4 ownership gate). Only the
+        // authenticated user read path enforces it; substrate-internal callers
+        // (`caller_agent_id == None`: the TTL sweeper / integrity audit / operator
+        // dump) still reach the row so they can reap or inspect it.
+        if caller_agent_id.is_some()
+            && let Some(ttl) = ttl_seconds
+            && ttl > 0
+            && stored_at.saturating_add(ttl) <= now_unix_seconds()
+        {
+            return Err(anyhow!(OffloadError::NotFound {
+                ref_id: ref_id.to_string(),
+            }));
+        }
 
         // SEC-4 (Cluster D, issue #767) — IDOR gate. The MCP
         // `handle_deref` handler always passes an authenticated
