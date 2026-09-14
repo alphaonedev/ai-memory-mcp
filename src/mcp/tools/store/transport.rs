@@ -44,6 +44,12 @@ pub(crate) fn forward_to_http(
     body: Option<&Value>,
     extra_headers: &[(&str, String)],
 ) -> Result<Value, String> {
+    // #3711 — the forward URL is operator config and may carry userinfo
+    // (`https://user:pw@host/…`); every rendering of it is the allowlist
+    // origin+path, and every reqwest failure is its transport CLASS, never
+    // the crate's Display (which repeats the full URL). The daemon's own
+    // response `text` is a separate lane (#3698).
+    let target = crate::url_display::url_origin_and_path(url);
     // v1.0.0 #3709 — the bundled MCP → daemon client trusts the local CA
     // this installation wrote (zero-config TLS). Only the local CA: this is
     // the same-installation trust, never a peer's certificate. A CA file
@@ -65,20 +71,26 @@ pub(crate) fn forward_to_http(
     if let Some(b) = body {
         req = req.json(b);
     }
-    let resp = req
-        .send()
-        .map_err(|e| format!("federation_forward: POST {url}: {e}"))?;
+    let resp = req.send().map_err(|e| {
+        format!(
+            "federation_forward: POST {target}: {}",
+            crate::url_display::network_failure(&e)
+        )
+    })?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| format!("federation_forward: read body from {url}: {e}"))?;
+    let text = resp.text().map_err(|e| {
+        format!(
+            "federation_forward: read body from {target}: {}",
+            crate::url_display::network_failure(&e)
+        )
+    })?;
     if !status.is_success() {
         return Err(format!(
-            "federation_forward: {url} returned {status}: {text}"
+            "federation_forward: {target} returned {status}: {text}"
         ));
     }
     serde_json::from_str::<Value>(&text)
-        .map_err(|e| format!("federation_forward: parse body from {url}: {e} (raw: {text})"))
+        .map_err(|e| format!("federation_forward: parse body from {target}: {e} (raw: {text})"))
 }
 
 /// MCP `memory_store` → HTTP `POST {forward_url}/api/v1/memories`.
@@ -223,5 +235,40 @@ mod coordination_forward_tests {
         .expect_err("dead URL must error");
         assert!(err.contains("federation_forward"), "got: {err}");
         assert!(err.contains("/api/v1/signals"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod credential_to_sink_3711_tests {
+    use super::*;
+
+    /// #3711 — a forward URL carrying userinfo never reaches the MCP error
+    /// string: neither through the rendered target nor through reqwest's
+    /// URL-bearing Display. A closed loopback port makes the send fail.
+    #[test]
+    fn forward_to_http_error_renders_the_target_from_the_allowlist_3711() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let url =
+            format!("http://svc:s3cr3t-3711@127.0.0.1:{port}/api/v1/memories?api_key=q-t0ken-3711");
+        let err = forward_to_http(
+            reqwest::Method::POST,
+            &url,
+            Some(&serde_json::json!({})),
+            &[],
+        )
+        .expect_err("a closed port refuses the connection");
+        assert!(!err.contains("s3cr3t-3711"), "{err}");
+        assert!(!err.contains("q-t0ken-3711"), "{err}");
+        assert!(!err.contains("svc:"), "{err}");
+        assert!(
+            err.starts_with(&format!(
+                "federation_forward: POST http://127.0.0.1:{port}/api/v1/memories: "
+            )),
+            "{err}"
+        );
     }
 }
