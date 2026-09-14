@@ -93,7 +93,39 @@ fn main() -> Result<()> {
     // (`AppConfig::load_for_boot` matches `ErrorKind::NotFound` explicitly),
     // and `AI_MEMORY_NO_CONFIG=1` still short-circuits to defaults, so CI and
     // the test suite are byte-identical.
-    let app_config = match config::AppConfig::load_for_boot() {
+    // #3715 carve-out 1 — the `config` verbs (`check` / `migrate` / `show`)
+    // are the repair tools for a refused config: they read the file through
+    // `toml::Value` themselves and never depend on the boot loader, so they
+    // do not run it (running it would print the refusal they exist to
+    // explain, ahead of their own report).
+    let is_config_verb = matches!(&cli.command, daemon_runtime::Command::Config(_));
+    // #3715 / the #2445 disposition — `backup` / `export` take the durable
+    // text OUT and must not be locked behind a config key the daemon refuses:
+    // they load with the KNOWN keys applied (so `db` is the configured one,
+    // never the relative default) and the refusal text as a loud WARN.
+    let is_egress_verb = is_egress_verb(&cli.command);
+    let app_config = match if is_config_verb {
+        Ok(config::AppConfig::default())
+    } else if is_egress_verb && !config::skip_config() {
+        config::AppConfig::config_path().map_or_else(
+            || Ok(config::AppConfig::default()),
+            |p| {
+                config::AppConfig::try_load_from_optional_for_egress(&p).map(|(cfg, warn)| {
+                    if let Some(w) = warn {
+                        eprintln!(
+                            "ai-memory: WARN {w}\nai-memory: continuing for this EGRESS verb with \
+                             the KNOWN keys applied (#3715 / #2445 disposition): your durable \
+                             text is taken from the CONFIGURED `db`, but `serve` / `mcp` and \
+                             every writing verb REFUSE this config until the key is fixed."
+                        );
+                    }
+                    cfg
+                })
+            },
+        )
+    } else {
+        config::AppConfig::load_for_boot()
+    } {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("ai-memory: config is UNUSABLE — {e:#}");
@@ -145,6 +177,20 @@ fn main() -> Result<()> {
     // token aborts the boot right here, before anything else starts. The
     // async body logs the stashed pin report via the READ-ONLY
     // `security_profile::runtime_boot_report`.
+    // #3714 — the deployment shape derives the posture: under a hardened
+    // shape an unset `AI_MEMORY_SECURITY_PROFILE` is pinned to `asi-hard`
+    // (same `set_var` pre-runtime contract as the KNOBS pins below) and a
+    // `standard` override refuses; the at-rest floor is checked here too.
+    // MUST precede `security_profile::enforce_at_boot_pre_runtime` so the
+    // posture enforcement observes the pin. `doctor` still runs so it can
+    // report a shape refusal.
+    match ai_memory::config::shape::enforce_at_boot_pre_runtime(&app_config) {
+        Ok(_) => {}
+        // `doctor` reports a shape refusal in its "Deployment shape"
+        // section instead of dying on it (the pin is simply not applied).
+        Err(e) if is_doctor => eprintln!("ai-memory: WARN shape enforcement: {e:#}"),
+        Err(e) => return Err(e),
+    }
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
     // v1.0.0 #3124 — the unstamped-row mutation posture is a mandate-class
@@ -268,7 +314,13 @@ fn main() -> Result<()> {
     // files chained + signed by the daemon's Ed25519 key (when one is
     // enrolled). The sink is process-wide; failures here are logged
     // and swallowed so a missing key never blocks daemon startup.
-    init_forensic_audit(&app_config);
+    // #3354 — the WRITE PATH: a ledger-writing command gets its signing key
+    // ensured (generated when absent) before its first row, or does not start.
+    init_forensic_audit(
+        &app_config,
+        hosts_ledger_writers(&cli.command),
+        ledger_writer(&cli.command),
+    )?;
 
     // v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin HERE, in the same
     // SYNCHRONOUS pre-runtime phase as the posture enforcement above (the #1889
@@ -332,35 +384,216 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
             | daemon_runtime::Command::Config(_)
             | daemon_runtime::Command::Completions(_)
             | daemon_runtime::Command::Man
+            // #3715 carve-out 1 — the K11 `[[governance.policy]]` translator
+            // is a config REPAIR tool (parses via `toml::Value`); a
+            // fail-closed loader whose repair path sits behind the same
+            // gate is a lockout, not a control.
+            | daemon_runtime::Command::Governance(daemon_runtime::GovernanceCliArgs {
+                action: daemon_runtime::GovernanceAction::MigrateToPermissions(_),
+                ..
+            })
     )
+}
+
+/// v1.0.0 #3354 — the long-running entry points that HOST the ledger
+/// writers (the HTTP daemon, the MCP stdio server, the sync daemon) print
+/// the one-line unsigned-ledger warning at boot. One-shot verbs stay quiet
+/// on stderr (hook-driven `boot` / `capture-turn --quiet` pin an empty
+/// stderr; the diagnostics report the state instead): the caller-visible
+/// surfaces are `memory_session_start.signing`, capabilities
+/// `signing_key_installed`, `/health.signed_events_signing` and `doctor`.
+fn hosts_ledger_writers(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Serve(_)
+            | daemon_runtime::Command::Mcp { .. }
+            | daemon_runtime::Command::SyncDaemon(_)
+    )
+}
+
+/// #3715 / the #2445 disposition — the EGRESS verbs: the ones that take the
+/// operator's durable text OUT of the store. This is the single definition
+/// of that set; every posture that must not stand between an operator and
+/// their data (the refused-config loader, the #3354 unsigned-ledger refusal)
+/// reads it from here rather than re-listing the verbs.
+fn is_egress_verb(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Backup(_)
+            | daemon_runtime::Command::Export(_)
+            | daemon_runtime::Command::ExportForensicBundle(_)
+    )
+}
+
+/// #3354 review — the REMEDIATION verbs: the way BACK IN for a broken store.
+/// Same reasoning as [`is_egress_verb`] — a posture that diagnoses an
+/// unwritable key dir must not lock the operator out of restoring / migrating
+/// the data the posture exists to protect. `migrate` only exists under the
+/// `sal` feature, hence the split arm.
+fn is_remediation_verb(cmd: &daemon_runtime::Command) -> bool {
+    #[cfg(feature = "sal")]
+    if matches!(cmd, daemon_runtime::Command::Migrate(_)) {
+        return true;
+    }
+    matches!(cmd, daemon_runtime::Command::Restore(_))
+}
+
+/// v1.0.0 #3354 — every command that can append a `signed_events` row is a
+/// LEDGER WRITER and must not start without a signing key for the resolved
+/// agent id (the key is generated when absent; only a failed generation
+/// refuses). The read-only and remediation verbs are enumerated instead —
+/// they open no write funnel, so the posture can always be diagnosed and
+/// fixed from them. An unknown new verb is a writer by default: the safe
+/// side of the default is the signed one. `boot` stays a writer on purpose:
+/// it recovers memories into the store, so its rows must be signed like any
+/// other writer's.
+fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
+    !(is_egress_verb(cmd)
+        || is_remediation_verb(cmd)
+        || matches!(
+            cmd,
+            // Read-only and diagnostic verbs: no write funnel.
+            daemon_runtime::Command::Doctor(_)
+                | daemon_runtime::Command::Config(_)
+                | daemon_runtime::Command::Completions(_)
+                | daemon_runtime::Command::Man
+                | daemon_runtime::Command::Identity(_)
+                | daemon_runtime::Command::Keys(_)
+                | daemon_runtime::Command::Stats
+                | daemon_runtime::Command::Namespaces
+                | daemon_runtime::Command::Get(_)
+                | daemon_runtime::Command::List(_)
+                | daemon_runtime::Command::Recall(_)
+                | daemon_runtime::Command::Search(_)
+                | daemon_runtime::Command::Inbox(_)
+                | daemon_runtime::Command::Logs(_)
+                | daemon_runtime::Command::Features
+                | daemon_runtime::Command::VerifyReflectionChain(_)
+                | daemon_runtime::Command::VerifySignedEventsChain(_)
+                | daemon_runtime::Command::VerifyAuditTrail(_)
+                | daemon_runtime::Command::VerifyForensicBundle(_)
+        ))
 }
 
 /// v0.7.0 #697 — best-effort init for the forensic governance log.
 /// Resolves the directory parallel to the flat audit log, loads the
 /// daemon's signing key (when present), and brings up the sink. A
-/// missing key results in unsigned rows — never a fatal error.
-fn init_forensic_audit(app_config: &config::AppConfig) {
+/// missing key results in unsigned rows — never a fatal error, but since
+/// #3354 never a SILENT one either: `warn_unsigned` prints the one-line
+/// operator warning (with the provisioning command) when the process will
+/// write unsigned `signed_events` rows.
+fn init_forensic_audit(
+    app_config: &config::AppConfig,
+    hosts_writers: bool,
+    ledger_writer: bool,
+) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
     // Reuse the flat audit log path resolver — same directory pattern.
     let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
     let Some(dir) = log_path.parent() else {
         eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
-        return;
+        return Ok(());
     };
-    // Resolve the daemon's agent_id with the standard precedence
-    // chain and try to load its keypair. Unsigned rows are accepted.
+    // Resolve the daemon's agent_id with the standard precedence chain.
     let agent_id = ai_memory::identity::resolve_agent_id(None, None)
         .unwrap_or_else(|_| "ai-memory".to_string());
-    let signing_key =
-        ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None);
+    // #3354 — the WRITE PATH never accepts an unsigned append: the resolved
+    // id gets its key ENSURED here (loaded, or generated when absent — the
+    // `daemon` label has always been generated at boot; this closes the gap
+    // for a resolved id that differs from it). Only a ledger writer whose
+    // key cannot be ensured refuses to start; read-only verbs carry on so
+    // the posture can be diagnosed and fixed.
+    let (signing_key, generated) =
+        match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if ledger_writer {
+                    anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+                        &agent_id,
+                        &format!("{e:#}")
+                    ));
+                }
+                (None, None)
+            }
+        };
+    if let Some(ai_memory::identity::keypair::EnsureOutcome::Generated { pub_path }) = &generated {
+        let notice =
+            ai_memory::governance::audit::signing_key_generated_notice(&agent_id, pub_path);
+        if hosts_writers {
+            eprintln!("ai-memory: {notice}");
+        } else {
+            tracing::info!("{notice}");
+        }
+    }
+    if signing_key.is_none() {
+        if ledger_writer {
+            anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+                &agent_id,
+                "no key was loadable after the ensure step"
+            ));
+        }
+        if hosts_writers
+            && let Some(warning) = ai_memory::governance::audit::ledger_signing_status().warning
+        {
+            eprintln!("ai-memory: {warning}");
+        }
+    }
     if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
         eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3354 review — the egress verbs are ONE definition, and the unsigned-
+    /// ledger refusal reads it: an operator whose key dir is unwritable can
+    /// always get their data OUT (and back IN via the remediation verbs),
+    /// while the writers stay behind the posture.
+    #[test]
+    fn egress_and_remediation_verbs_are_never_ledger_writers_3354() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).expect("argv parses").command;
+        for argv in [
+            &["ai-memory", "backup", "--to", "/nonexistent"][..],
+            &["ai-memory", "export"][..],
+            &["ai-memory", "export-forensic-bundle", "--memory-id", "m1"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(is_egress_verb(&cmd), "{argv:?} is an egress verb");
+            assert!(
+                !ledger_writer(&cmd),
+                "{argv:?} is never refused for a key it cannot mint"
+            );
+        }
+        #[cfg(feature = "sal")]
+        let migrate = Some(&["ai-memory", "migrate", "--from", "a", "--to", "b"][..]);
+        #[cfg(not(feature = "sal"))]
+        let migrate: Option<&[&str]> = None;
+        let non_writers = [
+            &["ai-memory", "restore", "--from", "/nonexistent", "--latest"][..],
+            &["ai-memory", "stats"][..],
+        ];
+        for argv in non_writers.into_iter().chain(migrate) {
+            let cmd = parse(argv);
+            assert!(!is_egress_verb(&cmd), "{argv:?} is not egress");
+            assert!(
+                !ledger_writer(&cmd),
+                "{argv:?} is remediation / read-only, never refused"
+            );
+        }
+        for argv in [
+            &["ai-memory", "serve"][..],
+            &["ai-memory", "capture-turn"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(
+                ledger_writer(&cmd),
+                "{argv:?} writes the ledger and stays behind the posture"
+            );
+        }
+    }
 
     #[test]
     fn id_short_truncates() {
@@ -461,7 +694,7 @@ mod tests {
 
         let app_config = config::AppConfig::default();
         // Must not panic and must leave the process bootable (unsigned).
-        init_forensic_audit(&app_config);
+        init_forensic_audit(&app_config, false, false).expect("init");
 
         match prev {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },

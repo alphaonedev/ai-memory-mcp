@@ -34,6 +34,16 @@
 
 schema_version = 2
 
+# #3714 — the deployment shape is the PRIMARY input. `production` derives
+# the asi-hard posture as a FLOOR (asi-hard.env's AI_MEMORY_SECURITY_PROFILE
+# stays compliant; an unset env is pinned to it; `standard` refuses boot)
+# and REQUIRES at-rest encryption — pending the #3717 recovery escrow, the
+# requirement is declared (boot WARN + doctor), not silently enabled,
+# because a lost key must never mean lost memory. `ai-memory config show`
+# prints every derived row with its FLOOR / default marker.
+[deployment]
+shape = "production"
+
 # Hardened deployments run at least the semantic tier; autonomous adds the
 # cross-encoder reranker. Keep inference LOCAL (see asi-hard.env
 # AI_MEMORY_INFERENCE_EGRESS=loopback-only) so memory content never leaves
