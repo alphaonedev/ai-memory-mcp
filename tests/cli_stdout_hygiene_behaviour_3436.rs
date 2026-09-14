@@ -26,6 +26,11 @@
 //! * (d) `gc --json` still exits 0 with JSON — the OVER-refusal guard, so
 //!   the fix cannot be "refuse everything".
 
+// #3733 — create key dirs 0700, not at the ambient umask (0o775 @umask0002,
+// which the #3198 key-dir guard refuses).
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -50,7 +55,7 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
 fn run(dir: &Path, args: &[&str]) -> Output {
     let db = dir.join("scratch.db");
     let keys = dir.join("keys");
-    std::fs::create_dir_all(&keys).ok();
+    key_dir_sandbox::mkdir_0700(&keys);
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.current_dir(dir)
         .arg("--db")

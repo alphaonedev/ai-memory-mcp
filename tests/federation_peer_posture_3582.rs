@@ -7,6 +7,11 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+// #3733 — key dirs MUST be created 0700, not left at the ambient umask (0o775
+// on a umask-0002 host), which the #3198 key-dir guard correctly refuses.
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use ai_memory::config::{FeatureTier, ResolvedModels};
 use ai_memory::mcp::{
     CapabilitiesAccept, handle_capabilities_with_conn, handle_capabilities_with_conn_v3,
@@ -236,7 +241,7 @@ fn configured_fingerprint_certificate_and_issuer_sources_refuse_3582() {
             }
             "issuer" => {
                 let dir = root.path().join("issuers");
-                std::fs::create_dir(&dir).unwrap();
+                key_dir_sandbox::mkdir_0700(&dir);
                 let key = ai_memory::identity::keypair::generate("issuer").unwrap();
                 std::fs::write(dir.join("issuer.pub"), key.public.to_bytes()).unwrap();
                 cmd.env("AI_MEMORY_FED_TRUST_BUNDLE_DIR", dir);
@@ -267,7 +272,7 @@ fn no_peers_and_reserved_local_key_do_not_trigger_peer_refusal_3582() {
     for posture in ["standard", "asi-hard"] {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("keys");
-        std::fs::create_dir(&dir).unwrap();
+        key_dir_sandbox::mkdir_0700(&dir);
         let key = ai_memory::identity::keypair::generate("peer").unwrap();
         std::fs::write(dir.join("daemon.pub"), key.public.to_bytes()).unwrap();
         let out = command(root.path(), posture)
@@ -381,7 +386,7 @@ fn unreadable_shared_enrollment_warns_without_refusing_boot_3582() {
     for posture in ["standard", "asi-hard"] {
         let root = tempfile::tempdir().unwrap();
         let keys = root.path().join("keys");
-        std::fs::create_dir(&keys).unwrap();
+        key_dir_sandbox::mkdir_0700(&keys);
         std::fs::write(keys.join("peer.pub"), b"invalid public key").unwrap();
         let out = command(root.path(), posture)
             .env("AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE", "1")
