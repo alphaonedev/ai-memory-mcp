@@ -249,8 +249,10 @@ pub(crate) fn notify_receipt(
     delivered_at: &str,
     subject: &str,
 ) -> Value {
-    // #3639 — the receipt names the stored (unique) title and the subject the
-    // caller sent, so a sender can see exactly which row its delivery became.
+    // #3639 — `title` is the SUBJECT the sender wrote. The unique stored
+    // title (`<subject> [<id8>]`, `crate::inbox_stored_title`) is an internal
+    // uniqueness key that no caller was ever promised; it never leaks into a
+    // response. `id` already names exactly which row the delivery became.
     json!({
         "id": id,
         "from": sender,
@@ -258,7 +260,7 @@ pub(crate) fn notify_receipt(
         "namespace": namespace,
         "tier": tier,
         "delivered_at": delivered_at,
-        "title": crate::inbox_stored_title(subject, id),
+        "title": subject,
         (crate::INBOX_SUBJECT_META_KEY): subject,
     })
 }
@@ -285,8 +287,11 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
         .namespace
         .strip_prefix(crate::LEGACY_INBOX_NAMESPACE_PREFIX)
         .map_or_else(|| m.namespace.clone(), crate::inbox_namespace);
-    // #3639 — the subject the sender wrote (metadata.subject); pre-#3639 rows
-    // carry no subject and fall back to their (then verbatim) title.
+    // #3639 — `title` is the subject the sender wrote: `metadata.subject`
+    // on a post-#3639 row, the verbatim stored title on a pre-#3639 row (which
+    // carried no subject and was stored verbatim). One shape across the
+    // migration boundary; the unique stored form (`<subject> [<id8>]`) is an
+    // internal uniqueness key and never reaches a caller.
     let subject = m
         .metadata
         .get(crate::INBOX_SUBJECT_META_KEY)
@@ -295,7 +300,7 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
     json!({
         "id": m.id,
         "from": sender,
-        "title": m.title,
+        "title": subject,
         (crate::INBOX_SUBJECT_META_KEY): subject,
         "payload": m.content,
         "content": m.content,
@@ -912,6 +917,85 @@ mod d1_5_986_tests {
             handle_inbox_with_policy(&conn, &json!({"agent_id": owner}), None, None, true).unwrap();
         assert_eq!(response["count"].as_u64(), Some(1));
         assert_eq!(response["agent_id"].as_str(), Some(owner));
+    }
+
+    // ---- #3639 — the response `title` is the subject on BOTH sides of the ---
+    // ---- migration boundary; the unique stored form never leaks ------------
+    #[test]
+    fn inbox_title_is_the_subject_for_pre_and_post_3639_rows() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // A pre-#3639 row: stored verbatim, no metadata.subject.
+        let now = chrono::Utc::now().to_rfc3339();
+        let legacy = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Short,
+            namespace: crate::inbox_namespace("ai:bob"),
+            title: "deploy approval".to_string(),
+            content: "legacy body".to_string(),
+            tags: vec!["notify".to_string()],
+            priority: 5,
+            confidence: 1.0,
+            source: "notify".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": "ai:alice", "target_agent_id": "ai:bob", "notify": true}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let legacy_id = db::insert(&conn, &legacy).unwrap();
+        // A post-#3639 row through the real funnel with the same subject.
+        let receipt = handle_notify(
+            &conn,
+            std::path::Path::new(":memory:"),
+            &json!({
+                "target_agent_id": "ai:bob",
+                "title": "deploy approval",
+                "payload": "new body",
+            }),
+            &crate::config::ResolvedTtl::default(),
+            Some("ai:mallory"),
+        )
+        .unwrap();
+        assert_eq!(
+            receipt["title"], "deploy approval",
+            "the receipt names the subject"
+        );
+        let new_id = receipt["id"].as_str().unwrap().to_string();
+        assert_ne!(new_id, legacy_id, "a new row, never a merge");
+
+        let legacy_row = db::get(&conn, &legacy_id).unwrap().unwrap();
+        let new_row = db::get(&conn, &new_id).unwrap().unwrap();
+        assert_ne!(new_row.title, legacy_row.title, "stored titles stay unique");
+        let a = inbox_message(&legacy_row);
+        let b = inbox_message(&new_row);
+        assert_eq!(a["title"], "deploy approval");
+        assert_eq!(b["title"], "deploy approval");
+        assert_eq!(
+            a["title"], b["title"],
+            "one shape across the migration boundary"
+        );
+        assert_eq!(a["from"], "ai:alice");
+        assert_eq!(b["from"], "ai:mallory");
+        assert!(
+            !b["title"].as_str().unwrap().contains('['),
+            "the internal uniqueness tag never reaches a caller: {b}"
+        );
     }
 
     // ---- #3639 — a repeated subject never overwrites or re-attributes -----
