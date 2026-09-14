@@ -10,7 +10,9 @@
 
 #![cfg(feature = "sal-postgres")]
 
-use ai_memory::encryption::{KeyAbsent, evict_cached_keypair, load_keypair};
+use ai_memory::encryption::{
+    KeyAbsent, SealRefusedSealedRowsExist, evict_cached_keypair, load_keypair,
+};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore};
@@ -100,9 +102,7 @@ fn write_0600(path: &Path, bytes: &[u8]) {
 async fn pg_read_with_absent_key_is_typed_never_mints_and_leaves_the_row_3718() {
     let Some(pg) = connect().await else { return };
     let key_dir = key_dir_sandbox::pin();
-    // The only env-gated test in this binary: set once, no interleaving.
-    // SAFETY: single test in this binary; nothing else reads the gate.
-    unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+    gate_on();
     let agent = format!("agent-3718-pg-{}", uuid::Uuid::new_v4().simple());
     let plaintext = "pg sealed secret — #3718";
     let ctx = CallerContext::for_admin("test-3718");
@@ -155,4 +155,108 @@ async fn pg_read_with_absent_key_is_typed_never_mints_and_leaves_the_row_3718() 
         .await
         .expect("restored key opens the row");
     assert_eq!(back.content, plaintext);
+}
+
+/// Every test in this binary turns the at-rest gate ON and never turns it off,
+/// so the concurrent writers of the same value cannot interleave into a
+/// different state.
+fn gate_on() {
+    // SAFETY: every test in this binary sets the same value and none removes
+    // it; no test reads a different gate state.
+    unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+}
+
+async fn sealed_rows(pg: &PostgresStore, agent: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memories WHERE encrypted_envelope IS NOT NULL \
+         AND metadata->>'agent_id' = $1",
+    )
+    .bind(agent)
+    .fetch_one(pg.pool())
+    .await
+    .expect("count sealed rows")
+}
+
+fn wipe_key_material(key_dir: &Path, agent: &str) {
+    for name in listing(key_dir) {
+        if name.starts_with(agent) {
+            std::fs::remove_file(key_dir.join(name)).expect("wipe key material");
+        }
+    }
+    evict_cached_keypair(agent);
+}
+
+/// #3718 (review, pg) — written FIRST: no sealed rows + wiped key dir is a
+/// fresh agent; its first seal mints normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_no_sealed_rows_with_wiped_key_dir_mints_normally_3718() {
+    let Some(pg) = connect().await else { return };
+    let key_dir = key_dir_sandbox::pin();
+    gate_on();
+    let agent = format!("agent-3718-pg-fresh-{}", uuid::Uuid::new_v4().simple());
+    let priv_path = key_dir.join(format!("{agent}{PRIV_SUFFIX}"));
+    let ctx = CallerContext::for_admin("test-3718");
+
+    ai_memory::encryption::get_or_create_keypair(&agent).expect("mint out of band");
+    wipe_key_material(key_dir, &agent);
+    assert!(!priv_path.exists());
+    assert_eq!(sealed_rows(&pg, &agent).await, 0, "a fresh agent");
+
+    let id = MemoryStore::store(&pg, &ctx, &make_mem("pg-fresh", "first — #3718", &agent))
+        .await
+        .expect("#3718 (pg): a fresh agent's first seal mints normally");
+    assert!(priv_path.is_file(), "the seal minted the live key");
+    assert!(raw_row(&pg, &id).await.0.is_some(), "the row is sealed");
+    assert_eq!(sealed_rows(&pg, &agent).await, 1);
+}
+
+/// #3718 (review, pg) — sealed rows + wiped key dir REFUSES, names the count,
+/// mints nothing, writes nothing; a restored key makes the write succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_sealed_rows_with_wiped_key_dir_refuse_to_mint_3718() {
+    let Some(pg) = connect().await else { return };
+    let key_dir = key_dir_sandbox::pin();
+    gate_on();
+    let agent = format!("agent-3718-pg-lost-{}", uuid::Uuid::new_v4().simple());
+    let priv_path = key_dir.join(format!("{agent}{PRIV_SUFFIX}"));
+    let ctx = CallerContext::for_admin("test-3718");
+
+    let first = MemoryStore::store(&pg, &ctx, &make_mem("pg-lost-1", "one — #3718", &agent))
+        .await
+        .expect("first seal mints");
+    let priv_bytes = std::fs::read(&priv_path).expect("snapshot .priv");
+    let row_first = raw_row(&pg, &first).await;
+    assert_eq!(sealed_rows(&pg, &agent).await, 1);
+
+    wipe_key_material(key_dir, &agent);
+    let before = listing(key_dir);
+
+    let err = MemoryStore::store(&pg, &ctx, &make_mem("pg-lost-2", "two — #3718", &agent))
+        .await
+        .expect_err("#3718 (pg): a seal over sealed rows with no key must refuse");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(SealRefusedSealedRowsExist::CLASS) && msg.contains("#3718"),
+        "class named: {msg}"
+    );
+    assert!(msg.contains("1 sealed row"), "count named: {msg}");
+    assert!(msg.contains(&agent), "agent named: {msg}");
+    assert!(
+        !msg.contains(&key_dir.display().to_string()) && !msg.contains(PRIV_SUFFIX),
+        "the caller never sees the key path: {msg}"
+    );
+    assert_eq!(listing(key_dir), before, "#3718 (pg): nothing minted");
+    assert_eq!(sealed_rows(&pg, &agent).await, 1, "nothing written");
+    assert_eq!(raw_row(&pg, &first).await, row_first, "row one untouched");
+
+    write_0600(&priv_path, &priv_bytes);
+    evict_cached_keypair(&agent);
+    MemoryStore::store(&pg, &ctx, &make_mem("pg-lost-2", "two — #3718", &agent))
+        .await
+        .expect("restored key seals");
+    assert_eq!(sealed_rows(&pg, &agent).await, 2);
+    let back = MemoryStore::get(&pg, &ctx, &first)
+        .await
+        .expect("row one opens");
+    assert_eq!(back.content, "one — #3718");
 }
