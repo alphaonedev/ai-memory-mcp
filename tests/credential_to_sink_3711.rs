@@ -21,6 +21,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ai_memory::subscriptions::{NewSubscription, dispatch_event, dlq_reason, insert, list_dlq};
+
+mod common;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -303,31 +305,35 @@ async fn sync_cycle_never_persists_or_logs_the_peer_credential_3675_3687_3710() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724() {
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    // #3705 — every http:// webhook target is refused, loopback included, so
+    // the hostile receiver speaks TLS through the shared fixture and the
+    // dispatcher trusts that leaf as its operator-installed root
+    // (`[subscriptions] ca_cert`). Loopback is still the SSRF guard's call.
     ai_memory::config::set_allow_loopback_webhooks(true);
-    let server = MockServer::start().await;
+    let dir = scratch("webhook");
+    let tls = common::tls::TestTls::generate(&dir.path().join("tls"));
+    ai_memory::subscriptions::install_dispatch_root_certificate(tls.cert_pem.as_bytes())
+        .expect("install the fixture leaf as the dispatcher root (#3705)");
     // A hostile receiver: 2xx with a chosen `status` and a chosen
     // `correlation_id` — both used to be persisted verbatim.
     let hostile_status = "<script>evil-3724</script>";
     let hostile_corr = "attacker-chosen-corr-3724";
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+    let app = axum::Router::new().fallback(move || async move {
+        axum::Json(serde_json::json!({
             "status": hostile_status,
             "correlation_id": hostile_corr,
-        })))
-        .mount(&server)
-        .await;
+        }))
+    });
+    let (port, _receiver) = tls.serve_router(app).await;
 
-    let dir = scratch("webhook");
     let db = dir.path().join("hooks.db");
     let _ = ai_memory::db::open(&db).expect("seed db");
     // The Slack/Discord shape: the credential IS the path.
     let hostile_url = format!(
         "{}/services/T1/B2/{PATH_TOKEN}?t={QUERY_TOKEN}",
-        server.uri()
+        common::tls::TestTls::base_url(port)
     );
-    let unreachable_url = format!("http://127.0.0.1:9/hooks/{PATH_TOKEN}?t={QUERY_TOKEN}");
+    let unreachable_url = format!("https://127.0.0.1:9/hooks/{PATH_TOKEN}?t={QUERY_TOKEN}");
     let (sub_hostile, sub_unreachable) = {
         let conn = Connection::open(&db).expect("open");
         let mk = |url: &str| {
