@@ -42,11 +42,13 @@ src/subscriptions.rs:validate_url_dns_with:error:{url}
 src/cli/doctor.rs:http_get_json:error:{url}
 src/cli/doctor.rs:section_capabilities_remote:error:{url}
 
-# PENDING-FIX LEDGER (Conductor ruling, #3688 c5660422072, 2026-09-14). Grammar: <key>=pending:#NNNN.
-# A real disclosure-direction sink held under its tracking issue: reported as INFO, counted live,
-# and the entry going STALE (NOTICE) is that issue's acceptance test. #3710 stays a GA blocker —
-# credential-bearing peer/webhook URLs in log lines that ship to an aggregator; this is sequencing.
-src/daemon_runtime.rs:sync_cycle_once:log:{peer_url}=pending:#3710
-src/daemon_runtime.rs:run_sync_daemon_with_shutdown_using_client:log:{peer_url}=pending:#3710
-src/subscriptions.rs:send:log:{url}=pending:#3710
-src/subscriptions.rs:validate_url_dns_with:log:{url}=pending:#3710
+# PENDING-FIX LEDGER. Grammar: <key>=pending:#NNNN — a real disclosure-direction sink held under its
+# tracking issue: reported as INFO, counted live, and the entry going STALE (NOTICE) is that issue's
+# acceptance test (Conductor ruling, #3688 c5660422072). EMPTY on 2026-09-14: the six #3710 log sinks
+# (daemon_runtime.rs sync_cycle_once / run_sync_daemon_with_shutdown_using_client {peer_url};
+# subscriptions.rs send x3 + validate_url_dns_with {url}) were ledgered here for one commit
+# (897acc80f) and then MEASURED as fixed by fix/3711 (228efec20 renders them through
+# crate::url_display), which lands ahead of this branch — on the merged tree every entry went
+# NOTICE on the first run (#3688 c5660630847), and a ledger that ships dead teaches people to
+# ignore NOTICEs. A re-plant of {peer_url} into the fixed sync_cycle_once line on the merged tree
+# is caught (FAIL unledgered / INFO ledgered), so the gate sees those sites; nothing is hidden.
