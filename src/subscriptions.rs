@@ -1669,12 +1669,15 @@ fn send(
         let mut body = String::new();
         // Read one byte past the cap so an exactly-at-cap body still
         // reads fully while an over-cap body is detected and rejected.
-        if let Err(e) = resp
+        match resp
             .take(WEBHOOK_ACK_MAX_BYTES as u64 + 1)
             .read_to_string(&mut body)
         {
-            tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook ack from {target}: read failed: {e}");
-            return Err(dlq_reason::ACK_READ.to_string());
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook ack from {target}: read failed: {e}");
+                return Err(dlq_reason::ACK_READ.to_string());
+            }
         }
         if body.len() > WEBHOOK_ACK_MAX_BYTES {
             tracing::warn!(
