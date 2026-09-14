@@ -8623,13 +8623,9 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["count"], 1);
     let msg = &v["messages"][0];
-    // #3639 — `<subject> [<id8>]`: unique per delivery, never overwritten.
-    assert!(
-        msg["title"]
-            .as_str()
-            .is_some_and(|t| t.starts_with("ping [")),
-        "stored title is the subject plus the row-id tag: {msg}"
-    );
+    // #3639 — a caller reads the SUBJECT in `title` (the unique stored form is
+    // internal): this assertion is the head's, unchanged.
+    assert_eq!(msg["title"], "ping");
     // `from` is the resolved sender — `handle_notify` calls
     // `identity::resolve_agent_id(None, mcp_client)` which synthesizes the
     // durable `ai:<client>@<host>` form when only `mcp_client` is set
