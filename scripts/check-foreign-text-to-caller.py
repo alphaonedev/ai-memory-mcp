@@ -477,6 +477,14 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         if side == 'err' and SERDE_RE.search(expr_nl.split('(', 1)[0] + '('): return CLEAN   # a serde ERROR (at the call HEAD) carries line/col only
         # a call to one of OUR functions: the callee decides (return error type, which params it renders)
         cm = CALL_RE.match(expr_nl)
+        # #3711 — crate::url_display::* is a SANITISATION BOUNDARY, not a transparent text->text
+        # helper: reducing a URL to scheme/host/path is precisely the cleansing a taint tracker
+        # must honour (the gate-2 lesson). When a value passes THROUGH url_display the taint STOPS
+        # here — never walk to the argument. Provenance/module-path anchored (not a binding name),
+        # so renaming a local cannot re-arm or disarm it. Specific to this module: a generic
+        # redact_/prefix/msg helper stays transparent (RED) per the masker/wrapper controls.
+        if cm and re.search(r'(?:^|::)url_display::$', cm.group(1) or ''):
+            return CLEAN
         if cm:   # a single call only when its parentheses are the OUTERMOST pair (not `a(..).b(..)`)
             op = expr_nl.find('(', cm.start(2)); cl = find_matching(expr_nl, op, '(', ')')
             if cl < 0 or expr_nl[cl+1:].strip() not in ('', '?', '.into()', '.to_string()'): cm = None
@@ -920,6 +928,7 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
 
     # ----------------------------------------------------------------- allowlist
     counts = collections.Counter()
+    counts['files_scanned'] = len(files)   # #3711 — surface the scan denominator so a file NOT in the tree (silently unscanned) cannot read as a pass
     allow = {}
     if ALLOWF and os.path.exists(ALLOWF):
         for l in open(ALLOWF):
@@ -1202,6 +1211,26 @@ fn map_to_wire(err: db::ReflectError) -> String {
     tracing::warn!(error = %err, "refused");
     match err { db::ReflectError::Validation(m) => m, _ => "REFLECTION_FAILED".into() }
 }
+fn forward_sanitised(url: &str) -> Result<Value, String> {
+    // #3711 SANITISER — url_display::* reduces the URL to scheme/host/path: {target} is CLEAN.
+    let target = crate::url_display::url_origin_and_path(url);
+    let resp = reqwest::blocking::get(url).map_err(|e| crate::url_display::network_failure(&e))?;
+    let status = resp.status();
+    // #3711 ANTI-LAUNDERING — url_display sanitises the ERROR e in THIS map_err; it says NOTHING
+    // about the OK value `text` (the peer body). The sanitiser must NOT clean `text` just because
+    // it shares the binding expression (the exact fc0b9516a transport.rs shape).
+    let text = resp.text().map_err(|e| format!("read body from {target}: {}", crate::url_display::network_failure(&e)))?;
+    // MIXED SINK — the finding MUST key on the peer body {text} (http), NEVER on the sanitised {target} (dsn).
+    if !status.is_success() {
+        return Err(format!("forward: {target} returned {status}: {text}"));
+    }
+    Ok(json!({"ok": true}))
+}
+fn only_sanitised(url: &str) -> Result<Value, String> {
+    // SPARE — a sink rendering ONLY a url_display-rendered value is CLEAN.
+    let target = crate::url_display::url_origin_and_path(url);
+    Err(format!("forward refused for {target}"))
+}
 ''')
     _write(root, 'src/hooks/chain.rs', '''
 async fn fire(executor: &Executor, event: Event) -> ChainResult {
@@ -1280,6 +1309,10 @@ def self_test(scratch):
     expect(has('src/handlers/coord.rs', ':signal_send:http-body:db'), 'rusqlite/anyhow text inline into a body (sqlite twin)')
     expect(has('src/mcp/tools/relay.rs', ':forward_to_http:mcp-error:http'), 'reqwest error / peer body into an MCP tool error (#3698)')
     expect(has('src/mcp/tools/relay.rs', ':handle_get:mcp-error:db'), 'db::get error text into an MCP tool error')
+    # #3711 — url_display is a SANITISER, not a transparent helper (the gate-7 twin of the gate-2 fix)
+    expect(has('src/mcp/tools/relay.rs', ':forward_sanitised:mcp-error:http'), '#3711 mixed sink fires on the peer body {text} (http)')
+    expect(not has('src/mcp/tools/relay.rs', ':forward_sanitised:mcp-error:dsn'), '#3711 the url_display-sanitised {target} is NOT flagged as dsn (taint stops at the sanitiser, does not walk to the arg)')
+    expect(not has('src/mcp/tools/relay.rs', ':only_sanitised:'), '#3711 a sink rendering ONLY a url_display-rendered value is CLEAN')
     expect(has('src/hooks/chain.rs', ':fire:deny-reason:proc'), 'hook subprocess text in Deny.reason (#3704)')
     expect(has('src/errors.rs', ':from:memory-error:db'), 'From<rusqlite::Error> -> MemoryError::DatabaseError(e.to_string())')
     expect(has('src/subscriptions.rs', ':send:dlq-record:http'), "receiver's ack field persisted into subscription_dlq.last_error")
@@ -1349,7 +1382,7 @@ def main(argv):
         print(f"  [{x['sev']}] {x['key']}\n         {x['file']}:{x['line']} in {x['fn']}: {x['text']}")
     by_src = collections.Counter(x['key'].rsplit(':', 1)[-1] for x in findings if x['sev'] == 'FAIL' and 'funnel-arm' not in x['key'])
     by_sink = collections.Counter(x['key'].split(':')[2] for x in findings if x['sev'] == 'FAIL')
-    print(f"\nforeign-text-to-caller: {counts['sinks']} caller-facing sinks examined "
+    print(f"\nforeign-text-to-caller: {counts['files_scanned']} src/**.rs files scanned; {counts['sinks']} caller-facing sinks examined "
           f"({', '.join(f'{k[5:]}={v}' for k, v in sorted(counts.items()) if k.startswith('sink:'))}); "
           f"{counts['clean']} clean; {nfail} FAIL; {ninfo} INFO")
     # Rule 3: LIVE foreign renders are reported SEPARATELY from what the ledger holds. A ledger that
