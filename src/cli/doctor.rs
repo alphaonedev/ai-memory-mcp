@@ -2011,7 +2011,7 @@ fn section_identity_3147(
     let (mut facts, mut severity, mut notes) = identity_keystore_facts();
     identity_caller_signing_facts(caller_agent_id, &mut facts, &mut severity, &mut notes, None);
     let inventory = crate::identity::keypair::resolved_default_key_dir_path()
-        .and_then(|dir| super::keys::inventory(db_path, None, &dir, false, false));
+        .and_then(|dir| super::keys::inventory(db_path, None, &dir, false, false, caller_agent_id));
     match inventory {
         Ok(inventory) => {
             facts.push((
