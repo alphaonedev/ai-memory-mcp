@@ -6,6 +6,7 @@
 use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorSearchIndex;
+use crate::mcp::param_guard;
 use crate::mcp::param_names;
 use crate::models::field_names;
 use crate::models::{GovernedAction, Tier};
@@ -230,20 +231,36 @@ pub(crate) fn parse_reflect_input(
         .as_str()
         .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
-    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
+    // #3390 — TYPE-STRICT optionals: an ABSENT key still takes its default,
+    // but a PRESENT wrong-typed value is REFUSED (the same discipline the
+    // sibling tools apply through `param_guard`). Pre-fix every optional was
+    // read with `.as_T().unwrap_or(default)`, so `tier: 123`,
+    // `priority: "high"`, `tags: "notarray"` or `confidence: "hi"` silently
+    // fell to the default and the reflection was written as if the caller
+    // had asked for it.
+    let tier_str = param_guard::optional_str(params, "tier")?.unwrap_or(Tier::Mid.as_str());
     let tier =
         Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
-    let namespace = params["namespace"].as_str().map(str::to_string);
-    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
-    let tags: Vec<String> = params["tags"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let namespace = param_guard::optional_str(params, "namespace")?.map(str::to_string);
+    let priority =
+        i32::try_from(param_guard::optional_i64(params, "priority")?.unwrap_or(5)).unwrap_or(5);
+    let confidence = match params.get(param_names::CONFIDENCE) {
+        None | Some(Value::Null) => 1.0,
+        Some(v) => v.as_f64().ok_or("confidence must be a number")?,
+    };
+    let tags: Vec<String> = match params.get("tags") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or("tags must be an array of strings")?
+            .iter()
+            .map(|t| {
+                t.as_str()
+                    .map(String::from)
+                    .ok_or("tags must be an array of strings")
+            })
+            .collect::<Result<_, _>>()?,
+    };
     let mut metadata = if params["metadata"].is_object() {
         params["metadata"].clone()
     } else {
@@ -379,20 +396,36 @@ pub fn handle_reflect_caller(
         .as_str()
         .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
-    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
+    // #3390 — TYPE-STRICT optionals: an ABSENT key still takes its default,
+    // but a PRESENT wrong-typed value is REFUSED (the same discipline the
+    // sibling tools apply through `param_guard`). Pre-fix every optional was
+    // read with `.as_T().unwrap_or(default)`, so `tier: 123`,
+    // `priority: "high"`, `tags: "notarray"` or `confidence: "hi"` silently
+    // fell to the default and the reflection was written as if the caller
+    // had asked for it.
+    let tier_str = param_guard::optional_str(params, "tier")?.unwrap_or(Tier::Mid.as_str());
     let tier =
         Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
-    let namespace = params["namespace"].as_str().map(str::to_string);
-    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
-    let tags: Vec<String> = params["tags"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let namespace = param_guard::optional_str(params, "namespace")?.map(str::to_string);
+    let priority =
+        i32::try_from(param_guard::optional_i64(params, "priority")?.unwrap_or(5)).unwrap_or(5);
+    let confidence = match params.get(param_names::CONFIDENCE) {
+        None | Some(Value::Null) => 1.0,
+        Some(v) => v.as_f64().ok_or("confidence must be a number")?,
+    };
+    let tags: Vec<String> = match params.get("tags") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or("tags must be an array of strings")?
+            .iter()
+            .map(|t| {
+                t.as_str()
+                    .map(String::from)
+                    .ok_or("tags must be an array of strings")
+            })
+            .collect::<Result<_, _>>()?,
+    };
     let mut metadata = if params["metadata"].is_object() {
         params["metadata"].clone()
     } else {
@@ -1221,6 +1254,57 @@ mod tests {
     }
 
     // Validation: source_ids missing.
+    /// #3390 — type-strict optionals: a PRESENT wrong-typed value is refused
+    /// (naming the field), while a well-typed request with every optional
+    /// set still succeeds. Table-driven so a future optional joins the table
+    /// rather than inheriting `unwrap_or(default)`. Both parsers carry the
+    /// same block (`parse_reflect_input` for `handle_reflect`, and the
+    /// caller-bound `handle_reflect_caller`); the table drives the former,
+    /// the second loop the latter.
+    #[test]
+    fn reflect_refuses_wrong_typed_optionals_3390() {
+        let (conn, tmp) = fresh_db();
+        let src = seed_observation(&conn, "ns-3390", "source for the reflect optionals");
+        let base = json!({ "source_ids": [src.clone()], "title": "t", "content": "c" });
+        let table = [
+            ("tier", json!(123), "expected a non-empty string"),
+            ("namespace", json!(7), "expected a non-empty string"),
+            ("priority", json!("high"), "must be an integer"),
+            ("tags", json!("notarray"), "tags must be an array"),
+            ("tags", json!(["ok", 5]), "tags must be an array"),
+            ("confidence", json!("hi"), "confidence must be a number"),
+        ];
+        for (key, bad, want) in &table {
+            let mut p = base.clone();
+            p[*key] = bad.clone();
+            let err = handle_reflect(&conn, tmp.path(), &p, None, None, None, None)
+                .expect_err("#3390: a present wrong-typed optional must be refused");
+            assert!(
+                err.contains(want),
+                "#3390 {key}={bad}: expected refusal naming the type, got: {err}"
+            );
+        }
+        // The caller-bound twin carries the same parser block: same table.
+        for (key, bad, want) in &table {
+            let mut p = base.clone();
+            p[*key] = bad.clone();
+            let err = handle_reflect_caller(&conn, tmp.path(), &p, None, None, None, None, None)
+                .expect_err("#3390: handle_reflect_caller refuses the same wrong-typed optional");
+            assert!(err.contains(want), "#3390 (caller) {key}={bad}: got: {err}");
+        }
+        // CONTROL — absent optionals default, and well-typed optionals succeed.
+        handle_reflect(&conn, tmp.path(), &base, None, None, None, None)
+            .expect("#3390: absent optionals still default");
+        let full = json!({
+            "source_ids": [src], "title": "t2", "content": "c2",
+            "tier": "long", "namespace": "ns-3390", "priority": 8,
+            "tags": ["a", "b"], "confidence": 0.9
+        });
+        let out = handle_reflect(&conn, tmp.path(), &full, None, None, None, None)
+            .expect("#3390: well-typed optionals succeed");
+        assert!(out.get("id").is_some(), "a reflection was written: {out}");
+    }
+
     #[test]
     fn missing_source_ids_errors() {
         let (conn, tmp) = fresh_db();
