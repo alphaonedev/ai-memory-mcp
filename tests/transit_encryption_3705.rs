@@ -351,6 +351,46 @@ fn observed_fleet_signals_never_promote_out_of_zero_config_3709() {
     );
 }
 
+/// Run one ledger-writing CLI verb (`capture-turn`, the verb the #3354 suite
+/// uses) against the sandbox while its key dir is still writable. On a tree
+/// that carries #3354 this generates the daemon SIGNING key, which #3354's
+/// boot check would otherwise refuse to generate into a read-only key dir —
+/// BEFORE #3705's certificate generation runs. On this branch's own base
+/// nothing is generated and the step is inert. Either way the verb opens no
+/// listener, so no TLS material is produced and the certificate stays the
+/// one thing left for `serve` to generate. Only the verb's success is
+/// asserted; whether a key file appears depends on the tree, not on this cell.
+#[cfg(unix)]
+fn provision_daemon_signing_key(root: &Path) {
+    use std::io::Write as _;
+    let params = serde_json::json!({
+        "host_session_id": "sess-3705",
+        "host_turn_index": 1,
+        "role": "assistant",
+        "content": "provision the daemon signing key before the key dir is made read-only",
+        "host_kind": "claude-code",
+    });
+    let mut child = command(root)
+        .args(["capture-turn", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn capture-turn");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(params.to_string().as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("capture-turn output");
+    assert!(
+        out.status.success(),
+        "capture-turn must succeed on a writable key dir: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// #3709 item 5 — when the local certificate cannot be generated (read-only
 /// key directory) the boot REFUSES with the remedy and never falls back to
 /// plaintext.
@@ -363,6 +403,13 @@ fn unwritable_key_dir_refuses_never_plaintext_3709() {
     use std::os::unix::fs::PermissionsExt as _;
     let root = tempfile::tempdir().unwrap();
     let port = free_port();
+    // #3354 generates the daemon SIGNING key before #3705 generates the TLS
+    // material, and refuses first when it cannot write it. Provision the
+    // signing key while the key dir is still writable (one ledger-writing
+    // verb, no listener, so no TLS material is produced) so that the ONLY
+    // thing left to generate at boot is the certificate — the refusal this
+    // cell pins.
+    provision_daemon_signing_key(root.path());
     let mut cmd = command(root.path());
     // `command` created keys/ as 0700; make it read-only AFTER creation.
     std::fs::set_permissions(key_dir(root.path()), std::fs::Permissions::from_mode(0o500))
