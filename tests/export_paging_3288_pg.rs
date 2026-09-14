@@ -101,7 +101,7 @@ async fn walk(store: &PostgresStore, limit: usize) -> Vec<ExportMemoriesPage> {
     let mut pages = Vec::new();
     for _ in 0..1_000_000 {
         let page = store
-            .export_memories_page(cursor.as_ref(), limit, as_of)
+            .export_memories_page(cursor.as_ref(), limit, as_of, None)
             .await
             .expect("export page");
         assert!(page.raw_rows() <= limit, "a page never exceeds its limit");
@@ -286,7 +286,7 @@ async fn pg_export_namespace_scope_is_honoured_on_every_page_3427() {
     let mut seen = Vec::new();
     for _ in 0..10 {
         let page = store
-            .export_memories_page(cursor.as_ref(), 2, Utc::now(), Some(alice.as_str()))
+            .export_memories_page(cursor.as_ref(), 2, chrono::Utc::now(), Some(alice.as_str()))
             .await
             .expect("scoped page");
         assert_eq!(page.scope.namespace.as_deref(), Some(alice.as_str()));
