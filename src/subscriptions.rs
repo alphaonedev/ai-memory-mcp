@@ -21,6 +21,9 @@
 //!   subscription time and never leaves the DB after.
 
 use crate::models::field_names;
+
+// #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
+pub mod audit_status;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1163,11 +1166,11 @@ pub fn dispatch_event_to_subs(
                 // v0.7.0 #1072 — reuse `worker_conn` for every sqlite
                 // write below.
                 if let Some(c) = worker_conn.as_ref() {
-                    record_dispatch_with_conn(c, &sub_id, ok);
-                    update_event_status_with_conn(c, &correlation_id, ok);
+                    record_dispatch_with_conn(c, &sub_id, &correlation_id, ok);
+                    update_event_status_with_conn(c, &sub_id, &correlation_id, ok);
                 } else {
-                    record_dispatch(&db_path, &sub_id, ok);
-                    update_event_status(&db_path, &correlation_id, ok);
+                    record_dispatch(&db_path, &sub_id, &correlation_id, ok);
+                    update_event_status(&db_path, &sub_id, &correlation_id, ok);
                 }
                 let dlq_result = if let Some(c) = worker_conn.as_ref() {
                     record_dlq_with_conn(
@@ -1205,11 +1208,11 @@ pub fn dispatch_event_to_subs(
             // v0.7.0 #1072 — reuse `worker_conn` for every sqlite write
             // below.
             if let Some(c) = worker_conn.as_ref() {
-                record_dispatch_with_conn(c, &sub_id, ok);
-                update_event_status_with_conn(c, &correlation_id, ok);
+                record_dispatch_with_conn(c, &sub_id, &correlation_id, ok);
+                update_event_status_with_conn(c, &sub_id, &correlation_id, ok);
             } else {
-                record_dispatch(&db_path, &sub_id, ok);
-                update_event_status(&db_path, &correlation_id, ok);
+                record_dispatch(&db_path, &sub_id, &correlation_id, ok);
+                update_event_status(&db_path, &sub_id, &correlation_id, ok);
             }
             if !ok {
                 let dlq_result = if let Some(c) = worker_conn.as_ref() {
@@ -2195,24 +2198,30 @@ pub fn record_subscription_event_with_conn(
 }
 
 /// v0.7.0 K6 — transition the audit row's `delivery_status` after the
-/// retry ladder settles. Best-effort: a failure here is logged and
-/// otherwise ignored so the dispatcher loop never blocks on the
-/// audit table.
-fn update_event_status(db_path: &std::path::Path, correlation_id: &str, ok: bool) {
-    let Ok(conn) = Connection::open(db_path) else {
-        return;
-    };
-    update_event_status_with_conn(&conn, correlation_id, ok);
+/// retry ladder settles. Best-effort: the dispatcher loop never blocks on
+/// the audit table. #3659 — but never SILENT: an open failure is logged
+/// with the subscription + correlation identity and counted at stage
+/// `open` (`audit_status`), so the persisted history can no longer
+/// disagree with the wire without anyone knowing.
+fn update_event_status(db_path: &std::path::Path, sub_id: &str, correlation_id: &str, ok: bool) {
+    match Connection::open(db_path) {
+        Ok(conn) => {
+            update_event_status_with_conn(&conn, sub_id, correlation_id, ok);
+        }
+        Err(e) => audit_status::note_failure(
+            audit_status::AuditStage::Open,
+            sub_id,
+            correlation_id,
+            &e.to_string(),
+        ),
+    }
 }
 
 /// v0.7.0 #1072 — `Connection`-reuse variant of
-/// [`update_event_status`].
-fn update_event_status_with_conn(conn: &Connection, correlation_id: &str, ok: bool) {
-    let status = if ok { "ack" } else { "failed" };
-    let _ = conn.execute(
-        "UPDATE subscription_events SET delivery_status = ?1 WHERE correlation_id = ?2",
-        params![status, correlation_id],
-    );
+/// [`update_event_status`]. #3659 — the UPDATE's result is observed
+/// (SQL error and zero-rows-matched are distinct counted stages).
+fn update_event_status_with_conn(conn: &Connection, sub_id: &str, correlation_id: &str, ok: bool) {
+    audit_status::persist_event_status(conn, sub_id, correlation_id, ok);
 }
 
 /// v0.7.0 K6 — append a `subscription_dlq` row for a delivery that
@@ -2522,22 +2531,23 @@ pub fn memory_subscription_replay(
     }))
 }
 
-fn record_dispatch(db_path: &std::path::Path, sub_id: &str, ok: bool) {
-    let Ok(conn) = Connection::open(db_path) else {
-        return;
-    };
-    record_dispatch_with_conn(&conn, sub_id, ok);
+fn record_dispatch(db_path: &std::path::Path, sub_id: &str, correlation_id: &str, ok: bool) {
+    match Connection::open(db_path) {
+        Ok(conn) => record_dispatch_with_conn(&conn, sub_id, correlation_id, ok),
+        Err(e) => audit_status::note_failure(
+            audit_status::AuditStage::Open,
+            sub_id,
+            correlation_id,
+            &e.to_string(),
+        ),
+    }
 }
 
 /// v0.7.0 #1072 — `Connection`-reuse variant of [`record_dispatch`].
-fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, ok: bool) {
-    let now = chrono::Utc::now().to_rfc3339();
-    let sql = if ok {
-        "UPDATE subscriptions SET dispatch_count = dispatch_count + 1, last_dispatched_at = ?1 WHERE id = ?2"
-    } else {
-        "UPDATE subscriptions SET dispatch_count = dispatch_count + 1, failure_count = failure_count + 1, last_dispatched_at = ?1 WHERE id = ?2"
-    };
-    let _ = conn.execute(sql, params![now, sub_id]);
+/// #3659 — the counter UPDATE's result is observed (stage
+/// `dispatch_counter`) instead of discarded.
+fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &str, ok: bool) {
+    audit_status::persist_dispatch_counter(conn, sub_id, correlation_id, ok);
 }
 
 #[cfg(test)]
@@ -3544,8 +3554,8 @@ mod tests {
             )
             .unwrap()
         };
-        record_dispatch(&path, &id, true);
-        record_dispatch(&path, &id, true);
+        record_dispatch(&path, &id, "cid-3659", true);
+        record_dispatch(&path, &id, "cid-3659", true);
         let conn = Connection::open(&path).unwrap();
         let (dc, fc): (i64, i64) = conn
             .query_row(
@@ -3577,7 +3587,7 @@ mod tests {
             )
             .unwrap()
         };
-        record_dispatch(&path, &id, false);
+        record_dispatch(&path, &id, "cid-3659", false);
         let conn = Connection::open(&path).unwrap();
         let (dc, fc): (i64, i64) = conn
             .query_row(
@@ -3595,8 +3605,8 @@ mod tests {
         let (_keep, path) = fresh_db();
         // No subscription with this id; the UPDATE simply matches zero
         // rows. Function must not panic and must not poison the DB.
-        record_dispatch(&path, "no-such-id", true);
-        record_dispatch(&path, "no-such-id", false);
+        record_dispatch(&path, "no-such-id", "cid-3659", true);
+        record_dispatch(&path, "no-such-id", "cid-3659", false);
         // Sanity: subscriptions table still queryable.
         let conn = Connection::open(&path).unwrap();
         let n: i64 = conn
@@ -3611,7 +3621,13 @@ mod tests {
         // `Connection::open` early-return branch (let-Err shortcut).
         // Must not panic.
         let bad = std::path::PathBuf::from("/nonexistent-dir-w12c/does-not-exist.db");
-        record_dispatch(&bad, "x", true);
+        // #3659 — the open failure is no longer silent: both bookkeeping
+        // writers count it at stage `open` (a global counter; other tests
+        // may add to it, so the bound is at-least, not exact).
+        let before = audit_status::failures(audit_status::AuditStage::Open);
+        record_dispatch(&bad, "x", "cid-3659", true);
+        update_event_status(&bad, "x", "cid-3659", true);
+        assert!(audit_status::failures(audit_status::AuditStage::Open) >= before + 2);
     }
 
     #[test]

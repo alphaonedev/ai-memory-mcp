@@ -117,6 +117,17 @@ pub struct Metrics {
     pub contradiction_detected_total: IntCounter,
     pub webhook_dispatched_total: IntCounter,
     pub webhook_failed_total: IntCounter,
+    /// #3659 — `subscription_events.delivery_status` transitions that
+    /// reached the database. The persistence twin of the wire counters
+    /// above: "delivered" and "history persisted" are different claims.
+    pub webhook_audit_status_persisted_total: IntCounter,
+    /// #3659 — delivery-audit bookkeeping failures by stage (`open` |
+    /// `status_update` | `status_no_row` | `dispatch_counter`; closed set,
+    /// pre-touched to 0). Any increment means the persisted delivery
+    /// history disagrees with the wire outcome for some correlation id.
+    pub webhook_audit_update_failed_total: IntCounterVec,
+    /// #3659 — unix seconds of the last bookkeeping failure; `0` = none.
+    pub webhook_audit_last_failure_at_seconds: IntGauge,
     pub memories_gauge: IntGauge,
     /// v1.0.0 #2583 — UNIX seconds at which `memories_gauge` was last
     /// recomputed; `0` = never. Published in lockstep with the count by
@@ -576,6 +587,36 @@ impl Metrics {
             "Webhook deliveries that failed after all retries.",
         )?;
         registry.register(Box::new(webhook_failed_total.clone()))?;
+
+        // #3659 — delivery-audit persistence evidence.
+        let webhook_audit_status_persisted_total = IntCounter::new(
+            "ai_memory_webhook_audit_status_persisted_total",
+            "Webhook delivery-audit status transitions (ack/failed) that \
+             reached subscription_events since boot.",
+        )?;
+        registry.register(Box::new(webhook_audit_status_persisted_total.clone()))?;
+        let webhook_audit_update_failed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_webhook_audit_update_failed_total",
+                "Webhook delivery-audit bookkeeping failures since boot, by \
+                 stage (open | status_update | status_no_row | \
+                 dispatch_counter). Any increment means the persisted \
+                 delivery history disagrees with the wire outcome.",
+            ),
+            &["stage"],
+        )?;
+        registry.register(Box::new(webhook_audit_update_failed_total.clone()))?;
+        for stage in crate::subscriptions::audit_status::AuditStage::ALL {
+            webhook_audit_update_failed_total
+                .with_label_values(&[stage.as_str()])
+                .reset();
+        }
+        let webhook_audit_last_failure_at_seconds = IntGauge::new(
+            "ai_memory_webhook_audit_last_failure_at_seconds",
+            "Unix seconds of the last webhook delivery-audit bookkeeping \
+             failure; 0 = none since boot.",
+        )?;
+        registry.register(Box::new(webhook_audit_last_failure_at_seconds.clone()))?;
 
         let memories_gauge = IntGauge::new(
             "ai_memory_memories",
@@ -1079,6 +1120,9 @@ impl Metrics {
             contradiction_detected_total,
             webhook_dispatched_total,
             webhook_failed_total,
+            webhook_audit_status_persisted_total,
+            webhook_audit_update_failed_total,
+            webhook_audit_last_failure_at_seconds,
             memories_gauge,
             memories_gauge_refreshed_at,
             hnsw_size_gauge,
@@ -1485,6 +1529,11 @@ mod tests {
             "ai_memory_contradiction_detected_total",
             "ai_memory_webhook_dispatched_total",
             "ai_memory_webhook_failed_total",
+            // #3659 — delivery-audit persistence evidence.
+            "ai_memory_webhook_audit_status_persisted_total",
+            "ai_memory_webhook_audit_update_failed_total{stage=\"open\"}",
+            "ai_memory_webhook_audit_update_failed_total{stage=\"status_no_row\"}",
+            "ai_memory_webhook_audit_last_failure_at_seconds",
             "ai_memory_memories",
             // v1.0.0 #2583 — the freshness twin of the pre-computed count.
             "ai_memory_memories_refreshed_at_seconds",

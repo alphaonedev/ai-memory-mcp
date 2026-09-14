@@ -904,11 +904,12 @@ pub mod sqlite_integrity;
 // (M-NO-GLOB-REEXPORTS: explicit list, so any accidental visibility
 // widening or loss is visible in review).
 pub use doctor::{
-    CapabilityExpansionRow, ReflectionDepthRow, count_active_governance_rules,
-    count_pending_actions_by_status, count_subscriptions, doctor_dim_violations,
-    doctor_governance_coverage, doctor_governance_depth_distribution, doctor_max_sync_skew_secs,
-    doctor_oldest_pending_age_secs, doctor_reflection_depth_distribution,
-    doctor_reflection_depth_exceeded_count, doctor_reflection_totals_by_namespace,
+    CapabilityExpansionRow, ReflectionDepthRow, WEBHOOK_AUDIT_SETTLE_SECS,
+    count_active_governance_rules, count_pending_actions_by_status, count_subscriptions,
+    doctor_dim_violations, doctor_governance_coverage, doctor_governance_depth_distribution,
+    doctor_max_sync_skew_secs, doctor_oldest_pending_age_secs,
+    doctor_reflection_depth_distribution, doctor_reflection_depth_exceeded_count,
+    doctor_reflection_totals_by_namespace, doctor_webhook_audit_pending,
     doctor_webhook_delivery_totals, is_namespace_standard, list_active_governance_policies,
     list_capability_expansions, record_capability_expansion, sweep_pending_action_timeouts,
 };
