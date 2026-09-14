@@ -379,6 +379,7 @@ checks for HTTP reachability will mask a corrupted FTS5 index.
 | `fts_integrity.status` | the deep verdict — see below |
 | `fts_integrity.checked_at` | RFC3339 instant the verdict was produced, or `null` if none has completed |
 | `fts_integrity.interval_secs` | the configured check cadence |
+| `webhook_audit_delivery` | webhook delivery-audit persistence for this process (#3659) as a signal object: `state: "available"`, `observed_at_seconds`, and `value` with `status_persisted_total` (ack/failed transitions that reached `subscription_events`), `failed_by_stage` (`open` / `status_update` / `status_no_row` / `dispatch_counter`), `failed_total`, `last_persisted_at_seconds` / `last_failure_at_seconds` (`null` = none since boot), `failing_now` and `actionable` (`true` once any delivery's persisted history is known to disagree with the wire outcome). Carries no subscription or correlation id. Does not affect the HTTP code. |
 
 **The FTS5 integrity verdict is CACHED, not per-request** (#2579). The
 full FTS5 `'integrity-check'` re-tokenizes the whole corpus and is
@@ -480,6 +481,7 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_operator_dequarantined_total` | counter | The route-OUT twin (#2402): quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release`. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change; a no-op release does not increment. Pairs with the `quarantine.operator_release` WARN. |
 | `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_size` | counter, gauge | Vector-index pressure; see `AI_MEMORY_VECTOR_INDEX_CAPACITY`. |
 | `ai_memory_federation_push_dlq_depth`, `..._quarantined_by_cause_total{cause}` | gauge, counter | Federation push-DLQ backlog and its cause breakdown. |
+| `ai_memory_webhook_audit_status_persisted_total`, `ai_memory_webhook_audit_update_failed_total{stage}`, `ai_memory_webhook_audit_last_failure_at_seconds` | counter, counter, gauge | Webhook delivery-audit bookkeeping (#3659): status transitions that reached `subscription_events`, and bookkeeping failures by stage (`open` \| `status_update` \| `status_no_row` \| `dispatch_counter`; closed set, pre-touched to `0`). The wire counters above say a delivery happened; these say whether its HISTORY was persisted. Any `update_failed_total` increment means `doctor`'s success rate and K7 replay decisions read a history that disagrees with the wire; the ERROR log line carries the subscription and correlation id. |
 | `ai_memory_deferred_audit_drainer_terminal_state` | gauge | Terminal state of the deferred-audit drainer supervisor: `0` = running/graceful, `1` = sink unresolved past `max_restarts`, `2` = sink panicked past `max_restarts` (#3164). **Page on any non-zero value** — the daemon keeps serving requests, but governance refusals are no longer reaching `signed_events` on that node, so it is audit-degraded until restarted. |
 
 This table is the operationally load-bearing subset, not the full

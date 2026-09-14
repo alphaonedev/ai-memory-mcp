@@ -1225,6 +1225,10 @@ pub fn health_status_code(
 /// A cached `failed` verdict still answers `503`: the pre-#2579 fail-closed
 /// contract is preserved, sourced from a completed check instead of a
 /// per-probe scan. `ai-memory doctor` runs the same deep check on demand.
+/// #3659 — `/health` key of the webhook delivery-audit signal object
+/// (matches the #3646 monitoring surface's field name).
+pub const HEALTH_KEY_WEBHOOK_AUDIT_DELIVERY: &str = "webhook_audit_delivery";
+
 pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — Postgres-backed daemons
     // ride the `MemoryStore::health_check` trait method which is natively
@@ -1272,6 +1276,10 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
                 "connection": if connection_ok { PROBE_OK } else { PROBE_ERROR },
                 "fts_index": fts_state,
             },
+            // #3659 — webhook delivery-audit persistence evidence as a #3646
+            // signal object (process-wide atomics; no identity inside).
+            HEALTH_KEY_WEBHOOK_AUDIT_DELIVERY:
+                crate::subscriptions::audit_status::delivery().to_signal_json(),
             // #2579 — the deep verdict, with its age. `pending` = no check
             // has completed yet; `stale` = the checker stopped running.
             "fts_integrity": {

@@ -417,6 +417,32 @@ pub fn doctor_webhook_delivery_totals(conn: &Connection) -> Result<(u64, u64)> {
     ))
 }
 
+/// #3659 — how long a `subscription_events` row may stay `pending` before
+/// its missing status transition is evidence of lost bookkeeping. The
+/// retry ladder is 200 ms + 1 s + 5 s plus per-attempt timeouts, so a
+/// delivery settles well inside one minute; a row still `pending` after
+/// this is one whose `ack`/`failed` UPDATE never landed.
+pub const WEBHOOK_AUDIT_SETTLE_SECS: i64 = crate::SECS_PER_MINUTE;
+
+/// #3659 — `(pending_total, pending_stale)` over `subscription_events`:
+/// rows still `pending`, and the subset older than `cutoff_rfc3339`
+/// (RFC 3339 text compares lexically in the writer's fixed format).
+///
+/// # Errors
+/// Propagates the underlying `rusqlite` error (an absent table is one).
+pub fn doctor_webhook_audit_pending(conn: &Connection, cutoff_rfc3339: &str) -> Result<(u64, u64)> {
+    let (pending, stale): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN delivered_at < ?1 THEN 1 ELSE 0 END), 0) \
+         FROM subscription_events WHERE delivery_status = 'pending'",
+        params![cutoff_rfc3339],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((
+        u64::try_from(pending.max(0)).unwrap_or(0),
+        u64::try_from(stale.max(0)).unwrap_or(0),
+    ))
+}
+
 /// Maximum sync-clock skew in seconds across the `sync_state` table —
 /// the largest gap between `last_pulled_at` (when this peer last heard
 /// from a peer) and `last_seen_at` (the peer's own `updated_at` advance).
