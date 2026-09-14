@@ -96,43 +96,23 @@ pub async fn get_inbox(
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(50)
             .min(500);
+        // #3730 — `unread_only` narrows nothing on either backend: the inbox
+        // is the pending set (a message leaves it when its recipient deletes
+        // it), and `access_count` counts touches, not handling. The parameter
+        // is accepted for compatibility and echoed back. #3027 made this arm
+        // derive the marker from `access_count` like the sqlite twin, and
+        // #3463 pushed the narrowing into SQL; both are dissolved, not
+        // reverted — there is no marker to derive and no read rows to page past.
         let unread_only = q.unread_only.unwrap_or(false);
         let filter = crate::store::Filter {
             namespace: Some(ns.clone()),
             limit: cap,
-            // v1.0.0 #3463 — push the unread narrowing into the SQL (`AND
-            // access_count = 0` before `LIMIT`) instead of dropping read rows in
-            // Rust AFTER the limit had already been spent. Pre-fix, an agent
-            // whose newest `cap` inbox rows were all read got `unread_count: 0`
-            // while older unread messages sat in the namespace.
-            unread_only,
             ..Default::default()
         };
         return match app.store.list(&ctx, &filter).await {
             Ok(rows) => {
-                let messages: Vec<serde_json::Value> = rows
-                    .into_iter()
-                    .filter(|m| {
-                        // v1.0.0 #3027 — the unread marker is `access_count`,
-                        // exactly as the sqlite/MCP twin derives it
-                        // (`src/mcp/tools/notify.rs`: `!unread_only ||
-                        // m.access_count == 0`). The pre-fix pg arm filtered on
-                        // `metadata.read == true`, a key NO production writer
-                        // ever sets — so `unread_only=true` filtered NOTHING and
-                        // `unread_count` equalled `messages.len()` forever, while
-                        // the in-code comment claimed sqlite parity. Reading a
-                        // message bumps `access_count`, which is a real column on
-                        // BOTH backends (`memories.access_count`, populated by
-                        // the postgres row mapper), so the two arms now derive the
-                        // SAME fact from the SAME durable field.
-                        //
-                        // #3463 — this is now a belt-and-suspenders re-check of a
-                        // predicate the QUERY already applied (see `unread_only`
-                        // on the `Filter` above); it can only narrow, never widen.
-                        !unread_only || m.access_count == 0
-                    })
-                    .map(|m| crate::mcp::inbox_message(&m))
-                    .collect();
+                let messages: Vec<serde_json::Value> =
+                    rows.iter().map(crate::mcp::inbox_message).collect();
                 (
                     StatusCode::OK,
                     Json(crate::mcp::inbox_envelope(
