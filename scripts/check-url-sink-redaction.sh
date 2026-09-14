@@ -51,6 +51,52 @@ BIND_RE='\{[a-z0-9_.]*(url|uri|dsn|endpoint)[a-z0-9_.]*(:[^}]*)?\}'
 # Redacted alias names and funnel calls that make a hit safe on the same window.
 SAFE_RE='redact_urls_in_message|without_request_url|safe_name|\{display_url|\{peer_log|\{redacted|\{safe_url|screen_dsn|redact_dsn'
 
+
+# #3711 — PROVENANCE recogniser for the crate::url_display allowlisted renderer.
+# A value that ORIGINATES from crate::url_display::* (url_origin / url_origin_and_path
+# / store_url_display / network_failure / TransportFailure) is scheme/host/port only
+# and safe in any sink. We anchor on the MODULE PATH, not the local binding name:
+# a name is a convention that drifts, and renaming the local `let url_display = ...`
+# must not silently re-arm the gate. Given the flagged ident, resolve its nearest
+# `let` binding in the enclosing fn and chase simple aliases (&x, x.as_str(),
+# x.as_ref(), x.to_string(), x.clone(), x.to_owned(), bare x) up to 5 hops to a
+# `url_display::` call. Also accept an inline `url_display::` call in the sink window.
+# Exit 0 = safe (rendered by url_display), 1 = not proven safe.
+url_display_provenance() { # file fnstart sinkline ident
+  python3 - "$1" "$2" "$3" "$4" <<'PYE'
+import sys, re
+path, start, end, ident = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+# inline: a url_display:: render in the sink window (the sink line + its two
+# continuation lines the template can span).
+for l in lines[end-1:end+2]:
+    if "url_display::" in l:
+        sys.exit(0)
+# collect single-line `let [mut] NAME[: T] = RHS;` bindings in the enclosing fn,
+# from the fn header down to (and including) the sink line.
+binding = {}
+letre = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]*)?=\s*(.+?);")
+for l in lines[start-1:end]:
+    m = letre.search(l)
+    if m:
+        binding[m.group(1)] = m.group(2).strip()
+alias = re.compile(r"^&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\.as_str\(\)|\.as_ref\(\)|\.to_string\(\)|\.to_owned\(\)|\.clone\(\))?\s*$")
+cur = ident
+for _ in range(5):
+    rhs = binding.get(cur)
+    if rhs is None:
+        sys.exit(1)                 # a fn param or unresolved local: not proven safe
+    if "url_display::" in rhs:
+        sys.exit(0)                 # provenance reaches the renderer module
+    a = alias.match(rhs)
+    if a:
+        cur = a.group(1); continue  # one alias hop, keep chasing
+    sys.exit(1)
+sys.exit(1)
+PYE
+}
+
+
 scan() { # $1 = root dir; prints "file:line  {binding}" per unredacted sink
   local root=$1; [ "$root" = "." ] && root=""
   grep -rnE "$SINK_RE" "${root:+$root/}src" --include=*.rs 2>/dev/null \
@@ -71,6 +117,10 @@ scan() { # $1 = root dir; prints "file:line  {binding}" per unredacted sink
         # redaction on the same statement (line + 2 lines of context)
         win=$(sed -n "$((line>2?line-2:1)),$((line+2))p" "$file")
         printf '%s' "$win" | grep -qE "$SAFE_RE" && continue
+        # #3711 — spare a value rendered by crate::url_display (provenance, not name).
+        fnline=$(sed -n "1,${line}p" "$file" | grep -nE '^[[:space:]]*(pub(\([a-z]+\))? )?(async )?fn ' | tail -1 | cut -d: -f1)
+        ident=$(printf '%s' "$bind" | sed -E 's/^\{//; s/\}$//; s/:.*$//; s/\..*$//')
+        url_display_provenance "$file" "${fnline:-1}" "$line" "$ident" && continue
         # Sink KIND: a log line (tracing / eprintln / println) versus an error or
         # note string. Echo-direction validators return `error` text to the very
         # caller that supplied the URL; a `log` line discloses it to everyone.
@@ -92,11 +142,30 @@ fn cycle(peer_url: &str, e: &str) {
 }
 fn build(url: &str) -> String { format!("{url}/api/v1/sync/push") }
 fn ok(url: &str) { let peer_log = crate::logging::host_only(url); tracing::info!("peer={peer_log}"); }
+fn rendered(url: &str) {
+    let shown = crate::url_display::url_origin(url);
+    let url_display = shown.as_str();
+    tracing::warn!("SSRF guard rejected {url_display}");
+}
+fn aliased_leak(peer_url: &str) {
+    let endpoint_url = peer_url;
+    tracing::warn!("cannot reach {endpoint_url}");
+}
 RS
   got=$(scan "$T")
   rm -rf "$T"
-  if printf '%s' "$got" | grep -q 'planted.rs:2 ' && ! printf '%s' "$got" | grep -qE 'planted.rs:(4|5) '; then
-    echo "url-sink-redaction self-test: PASS (rejects the #3667 shape, spares construction + redacted alias)"; exit 0
+  # MUST reject: line 2 (#3667 raw peer_url) and the aliased_leak (endpoint_url
+  # chases only to a fn param, never to url_display). MUST spare: construction
+  # (build), the redacted alias (ok), and the url_display-rendered value
+  # (rendered) — the latter proving PROVENANCE across the 2-hop
+  # `shown = url_display::url_origin(url); url_display = shown.as_str()` binding.
+  rej_3667=$(printf '%s' "$got" | grep -c 'planted.rs:2 ')
+  rej_alias=$(printf '%s' "$got" | grep -cE 'planted.rs:1[0-9] .*\{endpoint_url\}')
+  spared_ctor=$(printf '%s' "$got" | grep -cE 'planted.rs:5 ')
+  spared_redact=$(printf '%s' "$got" | grep -cE 'planted.rs:6 ')
+  spared_render=$(printf '%s' "$got" | grep -cE 'planted.rs:9 .*\{url_display\}')
+  if [ "$rej_3667" -ge 1 ] && [ "$rej_alias" -ge 1 ] && [ "$spared_ctor" -eq 0 ] && [ "$spared_redact" -eq 0 ] && [ "$spared_render" -eq 0 ]; then
+    echo "url-sink-redaction self-test: PASS (rejects the #3667 raw-URL shape AND an aliased non-url_display leak; spares construction, the redacted alias, and a crate::url_display-rendered value via provenance)"; exit 0
   fi
   echo "url-sink-redaction self-test: FAIL — got: $got"; exit 1
 fi
@@ -107,7 +176,7 @@ while IFS= read -r hit; do
   loc=${hit%%  *}; key=${hit##*  }
   LIVE=$((LIVE+1))
   [ -f "$ALLOW" ] && grep -qxF "$key" "$ALLOW" && continue
-  echo "  $loc  $key — URL reaches a sink unredacted; render scheme/host/port only (allowlist), or redact_urls_in_message for wrapped foreign errors"
+  echo "  $loc  $key — URL reaches a sink unredacted; render via crate::url_display:: (scheme/host/port), or redact_urls_in_message for wrapped foreign errors"
   FAIL=$((FAIL+1))
 done < <(scan .)
 
@@ -121,8 +190,11 @@ A url / dsn / endpoint / peer URL can carry credentials (DSN password, basic-aut
 userinfo, API key in the query). In a tracing line, an anyhow!/bail! message or
 a doctor note it lands in journald, forensic bundles and DLQ rows.
 
-Fix: interpolate an ALLOWLIST-RENDERED form — scheme/host/port only —
-  let shown = crate::logging::host_only(&url);   // NEVER redact_url_password:
+Fix: interpolate an ALLOWLIST-RENDERED form — scheme/host/port only. The
+accepted renderer is crate::url_display::{url_origin, url_origin_and_path,
+store_url_display, network_failure} (a value chased to a url_display:: call is
+spared regardless of the local binding name), or crate::logging::host_only —
+  let shown = crate::url_display::url_origin(&url);   // NEVER redact_url_password:
   // it masks only the userinfo password and passes a token in the path or
   // query through verbatim, so the gate would go green with the leak intact.
 or drop the URL from the message (errors::without_request_url for reqwest errors).
