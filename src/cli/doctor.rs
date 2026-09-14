@@ -3505,7 +3505,13 @@ fn section_llm_reachability_1146() -> ReportSection {
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
         ("model".into(), resolved.model.clone()),
-        ("base_url".into(), resolved.base_url.clone()),
+        // #3667/#3711 — a doctor fact is a sink (text, --json, pasted reports):
+        // the endpoint an operator needs is the origin; the userinfo/query a
+        // base URL routinely carries is the credential.
+        (
+            "base_url".into(),
+            crate::url_display::url_origin(&resolved.base_url),
+        ),
         ("config_source".into(), resolved.source.as_str().to_string()),
         (
             field_names::KEY_SOURCE.into(),
@@ -3551,7 +3557,10 @@ fn section_llm_reachability_1146() -> ReportSection {
             resolved.api_key().map(str::to_string),
         )
     };
-    facts.push(("probe_url".into(), probe_url.clone()));
+    facts.push((
+        "probe_url".into(),
+        crate::url_display::url_origin_and_path(&probe_url),
+    ));
 
     let started = std::time::Instant::now();
     let client = match reqwest::blocking::Client::builder()
@@ -3617,7 +3626,7 @@ fn section_llm_reachability_1146() -> ReportSection {
                     Some(format!(
                         "unexpected status {} from {} — verify base_url + endpoint shape",
                         status.as_u16(),
-                        probe_url
+                        crate::url_display::url_origin_and_path(&probe_url)
                     )),
                 )
             }
@@ -3704,7 +3713,10 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
         ("model".into(), resolved.model.clone()),
-        ("base_url".into(), resolved.url.clone()),
+        (
+            "base_url".into(),
+            crate::url_display::url_origin(&resolved.url),
+        ),
         ("config_source".into(), resolved.source.as_str().to_string()),
         (
             field_names::KEY_SOURCE.into(),
@@ -3783,7 +3795,10 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         let req = client.get(&url);
         (url, req)
     };
-    facts.push(("probe_url".into(), probe_url.clone()));
+    facts.push((
+        "probe_url".into(),
+        crate::url_display::url_origin_and_path(&probe_url),
+    ));
 
     let (mut severity, mut note) = match req.send() {
         Ok(resp) => {
@@ -3823,7 +3838,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
                     Some(format!(
                         "unexpected status {} from {} — verify base_url + endpoint shape",
                         status.as_u16(),
-                        probe_url
+                        crate::url_display::url_origin_and_path(&probe_url)
                     )),
                 )
             }
