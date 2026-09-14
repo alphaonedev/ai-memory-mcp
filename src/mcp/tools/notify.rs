@@ -959,19 +959,10 @@ mod d1_5_986_tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         let legacy_id = db::insert(&conn, &legacy).unwrap();
-        // A post-#3639 row through the real funnel with the same subject.
-        let receipt = handle_notify(
-            &conn,
-            std::path::Path::new(":memory:"),
-            &json!({
-                "target_agent_id": "ai:bob",
-                "title": "deploy approval",
-                "payload": "new body",
-            }),
-            &crate::config::ResolvedTtl::default(),
-            Some("ai:mallory"),
-        )
-        .unwrap();
+        // A post-#3639 row through the real funnel with the same subject,
+        // sent AS `ai:mallory` (the resolved sender, not an mcp_client label
+        // the resolver would derive into `ai:<sanitised>@<host>`).
+        let receipt = notify_as(&conn, "ai:mallory", "ai:bob", "deploy approval", "new body");
         assert_eq!(
             receipt["title"], "deploy approval",
             "the receipt names the subject"
@@ -1060,16 +1051,26 @@ mod d1_5_986_tests {
         for r in [ra, rb] {
             assert_eq!(r["read"], false);
             assert_eq!(r["subject"], "deploy approval");
-            assert!(
-                r["title"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("deploy approval ["),
-                "stored title carries the uniqueness suffix: {}",
-                r["title"]
-            );
+            // The consumer-facing field is the SUBJECT (review round 2): the
+            // uniqueness tag is internal and never reaches a caller.
+            assert_eq!(r["title"], "deploy approval");
         }
-        assert_ne!(ra["title"], rb["title"]);
+        assert_ne!(ra["id"], rb["id"], "two rows, never one overwritten");
+        // The stored titles are the unique `<subject> [<id8>]` form — read
+        // straight from the rows, not from the rendered listing.
+        let stored_a = db::get(&conn, a["id"].as_str().unwrap()).unwrap().unwrap();
+        let stored_b = db::get(&conn, b["id"].as_str().unwrap()).unwrap().unwrap();
+        assert!(
+            stored_a.title.starts_with("deploy approval ["),
+            "{}",
+            stored_a.title
+        );
+        assert!(
+            stored_b.title.starts_with("deploy approval ["),
+            "{}",
+            stored_b.title
+        );
+        assert_ne!(stored_a.title, stored_b.title, "stored titles stay unique");
     }
 
     #[test]
@@ -1078,13 +1079,12 @@ mod d1_5_986_tests {
         let r = notify_as(&conn, "ai:alice", "ai:bob", "STATUS", "all green");
         let id = r["id"].as_str().unwrap();
         assert_eq!(r["subject"], "STATUS");
-        assert_eq!(r["title"], crate::inbox_stored_title("STATUS", id));
-        assert!(
-            r["title"]
-                .as_str()
-                .unwrap()
-                .ends_with(&format!(" [{}]", &id[..8]))
-        );
+        // Review round 2: the receipt's `title` is the SUBJECT the caller
+        // sent; the unique stored form is on the row, not on the wire.
+        assert_eq!(r["title"], "STATUS");
+        let stored = db::get(&conn, id).unwrap().unwrap();
+        assert_eq!(stored.title, crate::inbox_stored_title("STATUS", id));
+        assert!(stored.title.ends_with(&format!(" [{}]", &id[..8])));
     }
 
     #[test]
