@@ -1114,7 +1114,16 @@ pub async fn delete_memory(
                     )
                     .await;
                 }
-                (StatusCode::OK, Json(json!({"deleted": true, "id": id}))).into_response()
+                // #3730 — the SAL `delete` applied the same namespace
+                // retention policy (`inbox_delete_retains`); report it.
+                let archived = target
+                    .as_ref()
+                    .is_some_and(|m| crate::visibility::inbox_delete_retains(&m.namespace));
+                (
+                    StatusCode::OK,
+                    Json(json!({"deleted": true, "id": id, "archived": archived})),
+                )
+                    .into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -1274,7 +1283,15 @@ pub async fn delete_memory(
         }
     }
 
-    let delete_outcome = db::delete(&lock.0, &target.id);
+    // #3730 — retention policy by namespace (`inbox_delete_retains`): an
+    // inbox message is archived, everything else erased; `archived` is on
+    // the wire so the caller can tell which happened.
+    let archived = crate::visibility::inbox_delete_retains(&target.namespace);
+    let delete_outcome = if archived {
+        db::delete_archive_first(&lock.0, &target.id)
+    } else {
+        db::delete(&lock.0, &target.id)
+    };
     // v0.6.4-017 — G9 HTTP webhook parity. Fire `memory_delete` after
     // the row is gone (mirrors the MCP pattern at mcp.rs:2227). Snapshot
     // fields come from the pre-delete `target`. Best-effort,
@@ -1342,7 +1359,7 @@ pub async fn delete_memory(
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                 return super::under_replicated_response(&payload);
             }
-            Json(json!({"deleted": true})).into_response()
+            Json(json!({"deleted": true, "archived": archived})).into_response()
         }
         _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
     }

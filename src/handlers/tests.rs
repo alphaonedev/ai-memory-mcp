@@ -8620,14 +8620,15 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
         from == "alice" || from.starts_with("ai:alice@"),
         "unexpected sender: {from}",
     );
-    assert_eq!(msg["read"], false);
+    // #3730 — no `read` field: the inbox carries no read marker.
+    assert!(msg.get("read").is_none(), "got {msg}");
 }
 
-/// `unread_only=true` filter omits already-read messages. We bump
-/// `access_count` directly on the seeded row so the filter has
-/// something to skip.
+/// #3730 — `unread_only=true` narrows NOTHING: a touched row (`access_count`
+/// bumped, the old "read" marker) is still listed, because a touch is not a
+/// handling. Was `h8b_get_inbox_unread_only_filter_excludes_read`.
 #[tokio::test]
-async fn h8b_get_inbox_unread_only_filter_excludes_read() {
+async fn h8b_get_inbox_unread_only_still_lists_touched_rows_3730() {
     let state = test_state();
     // Seed two messages — one read, one unread — directly via db::insert.
     {
@@ -8720,8 +8721,11 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["count"], 1);
-    assert_eq!(v["messages"][0]["title"], "unread");
+    assert_eq!(
+        v["count"], 2,
+        "both rows list: touched is not handled; got {v}"
+    );
+    assert_eq!(v["unread_count"], 2);
     assert_eq!(v["unread_only"], true);
 }
 
@@ -12585,6 +12589,102 @@ async fn http_delete_memory_invalid_id_returns_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// #3730 — the inbox's delete RETENTION POLICY on the sqlite HTTP arm: a
+/// message in the recipient's inbox is ARCHIVED (restorable) and the response
+/// says so; an ordinary row deleted the same way is ERASED and the response
+/// says that too. A caller never has to consult documentation to know
+/// whether its data still exists.
+#[tokio::test]
+async fn http_delete_reports_archived_for_inbox_rows_and_erased_otherwise_3730() {
+    let state = test_state();
+    let inbox_ns = crate::inbox_namespace("alice");
+    {
+        let lock = state.lock().await;
+        for (id, ns, meta) in [
+            (
+                "aaaa3730aaaa3730aaaa3730aaaa3730",
+                inbox_ns.as_str(),
+                json!({"agent_id": "bob", "target_agent_id": "alice", "notify": true}),
+            ),
+            (
+                "bbbb3730bbbb3730bbbb3730bbbb3730",
+                "notes-3730",
+                json!({"agent_id": "alice"}),
+            ),
+        ] {
+            let mem = Memory {
+                id: id.to_string(),
+                namespace: ns.to_string(),
+                title: "row".into(),
+                content: "content".into(),
+                metadata: meta,
+                ..Memory::default()
+            };
+            db::insert(&lock.0, &mem).unwrap();
+        }
+    }
+    let app = Router::new()
+        .route(
+            "/api/v1/memories/{id}",
+            axum::routing::delete(delete_memory),
+        )
+        .with_state(test_app_state(state.clone()));
+    let delete = |id: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/v1/memories/{id}"))
+                        .method("DELETE")
+                        .header("x-agent-id", "alice")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+    let inbox = delete("aaaa3730aaaa3730aaaa3730aaaa3730").await;
+    assert_eq!(inbox["deleted"], true, "{inbox}");
+    assert_eq!(
+        inbox["archived"], true,
+        "inbox message is archived: {inbox}"
+    );
+    let note = delete("bbbb3730bbbb3730bbbb3730bbbb3730").await;
+    assert_eq!(note["deleted"], true, "{note}");
+    assert_eq!(note["archived"], false, "ordinary row is erased: {note}");
+
+    let lock = state.lock().await;
+    let archived: Vec<String> = lock
+        .0
+        .prepare("SELECT id FROM archived_memories WHERE id LIKE '%3730%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        archived,
+        vec!["aaaa3730aaaa3730aaaa3730aaaa3730".to_string()],
+        "exactly the inbox row is archived"
+    );
+    let live: i64 = lock
+        .0
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id LIKE '%3730%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0, "both rows left the live set");
 }
 
 #[tokio::test]

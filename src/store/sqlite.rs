@@ -837,7 +837,16 @@ impl MemoryStore for SqliteStore {
             true,
             crate::identity::owner_stamp::funnel::DELETE,
         )?;
-        let removed = db::delete(&conn, id).map_err(box_err)?;
+        // #3730 — retention policy by namespace: an inbox message is archived
+        // (`archive_reason = "delete"`), every other row is erased.
+        let retains = db::get(&conn, id)
+            .map_err(box_err)?
+            .is_some_and(|m| crate::visibility::inbox_delete_retains(&m.namespace));
+        let removed = if retains {
+            db::delete_archive_first(&conn, id).map_err(box_err)?
+        } else {
+            db::delete(&conn, id).map_err(box_err)?
+        };
         if removed {
             Ok(())
         } else {
@@ -887,24 +896,8 @@ impl MemoryStore for SqliteStore {
             // v1.0.0 #1834 — claim-bitemporal AS-OF from the SAL Filter.
             filter.valid_at.as_deref(),
             metadata_eq,
-            // v1.0.0 #3463 — the unread axis rides the SAME `build_list_query`
-            // shape as every other filter, so it narrows BEFORE the SQL `LIMIT`
-            // on this adapter exactly as the `AND access_count = 0` predicate
-            // does on the postgres twin. A post-`LIMIT` Rust filter (what the
-            // inbox surfaces did) can report an empty unread set while older
-            // unread rows exist.
-            filter.unread_only,
         )
         .map_err(box_err)?;
-        // #3463 belt-and-suspenders (the #2580 fail-closed re-check contract):
-        // re-apply the unread marker in-process so a hypothetical drift between
-        // the SQL fragment and the canonical Rust predicate can only ever
-        // NARROW what a caller sees, never widen it. O(returned-rows).
-        let rows: Vec<Memory> = if filter.unread_only {
-            rows.into_iter().filter(|m| m.access_count == 0).collect()
-        } else {
-            rows
-        };
         // #910 SAL-level scope=private gate (see `is_visible_to_caller`
         // contract on the trait). Every query path that returns Memory
         // rows runs the result set through the canonical predicate so
