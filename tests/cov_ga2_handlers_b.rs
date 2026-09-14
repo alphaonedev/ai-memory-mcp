@@ -390,7 +390,8 @@ async fn inbox_populated_via_notify_round_trips() {
         "sender should carry alice; got {from}"
     );
     assert_eq!(body["messages"][0]["title"], json!("hello-bob"));
-    assert_eq!(body["messages"][0]["read"], json!(false));
+    // #3730 — no `read` field on the inbox wire shape.
+    assert!(body["messages"][0].get("read").is_none());
 }
 
 #[tokio::test]
@@ -548,7 +549,6 @@ async fn assert_inbox_contract_3401(sqlite: &axum::Router, postgres_path: &axum:
         "priority",
         "tier",
         "namespace",
-        "read",
         "access_count",
         "target_agent_id",
     ] {

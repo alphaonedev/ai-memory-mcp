@@ -475,6 +475,32 @@ pub fn legacy_owner_admits_read(mem: &Memory, caller: &str, allow_inbox: bool) -
     false
 }
 
+/// #3730 — RETENTION POLICY of `delete` for a row in the agent inbox.
+///
+/// `delete` means one thing on every surface: remove the row from the
+/// caller's view. Whether the substrate RETAINS a copy is a retention policy,
+/// and retention already varies by namespace. This predicate is the single
+/// definition of the inbox's policy: a message in a substrate-owned inbox
+/// namespace (`_inbox/<agent>`, legacy `_messages/<agent>`) is ARCHIVED on
+/// delete (`archive_reason = "delete"`, restorable, listed by
+/// `memory_archive_list`) instead of erased, on every funnel — MCP
+/// `memory_delete`, HTTP `DELETE /api/v1/memories/{id}`, both SAL stores.
+/// The CLI `delete` was already archive-first for every row (#3012); its
+/// `--hard` still erases, and says so on an inbox row.
+///
+/// Why: the inbox is a queue the recipient drains by deleting what it has
+/// handled (there is no read marker — `access_count` counts touches, never
+/// handling). A drain that erased by default would destroy the record of what
+/// the agent was told as the normal path. Every OTHER namespace keeps its
+/// erasure semantics; widening this policy product-wide is a separate
+/// decision (a customer who deletes IN ORDER TO ERASE is owed one), tracked
+/// for v1.0.1, not a ride on this predicate.
+#[must_use]
+pub fn inbox_delete_retains(namespace: &str) -> bool {
+    namespace.starts_with(crate::INBOX_NAMESPACE_PREFIX)
+        || namespace.starts_with(crate::LEGACY_INBOX_NAMESPACE_PREFIX)
+}
+
 /// v1.0.0 #3348 — SUBSTRATE-OWNED namespace prefixes. Rows here are written by
 /// the substrate itself on behalf of a specific agent (a message delivered to
 /// one recipient, a registry entry, a curator self-report) — they are

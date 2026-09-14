@@ -108,7 +108,8 @@ pub struct WakeListenArgs {
     /// normative 60 s wake-plane maximum.
     #[arg(long = "poll-secs", value_name = "SECS")]
     pub poll_secs: Option<u64>,
-    /// Only count messages with `access_count == 0` on each catch-up read.
+    /// Accepted for compatibility; narrows nothing (#3730). Every message
+    /// still in the inbox is unhandled; the catch-up read counts them all.
     #[arg(long = "unread-only")]
     pub unread_only: bool,
     /// Catch-up read page size. Default 50, cap 500.
