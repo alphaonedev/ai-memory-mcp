@@ -105,7 +105,7 @@ async fn walk(store: &PostgresStore, limit: usize) -> Vec<ExportMemoriesPage> {
             .await
             .expect("export page");
         assert!(page.raw_rows() <= limit, "a page never exceeds its limit");
-        cursor = page.next_cursor.clone();
+        cursor.clone_from(&page.next_cursor);
         let done = cursor.is_none();
         pages.push(page);
         if done {
