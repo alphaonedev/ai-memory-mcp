@@ -7191,6 +7191,74 @@ mod tests {
         assert_eq!(action, NagAction::None);
     }
 
+    /// #3393 (required before merge) — the streak is keyed on the CALLER,
+    /// never on a body-claimed `agent_id`: two observations for the same
+    /// caller whose bodies claim DIFFERENT agent ids land on one continuous
+    /// streak, and neither claimed id acquires a streak of its own. Drives
+    /// `observe_capture_nag` directly (its keying), then the real
+    /// `handle_request` path with the claims in the request body (the route
+    /// a client actually has), so the pin holds even if `mcp_client`
+    /// derivation or the null-body resolver changes later.
+    #[test]
+    fn observe_capture_nag_keys_on_caller_not_body_claimed_agent_id_3393() {
+        use crate::recover::nag::{CaptureNagWatcher, NagAction};
+        let _g = crate::audit::sink_test_lock();
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::audit::init_for_test(buf.clone());
+
+        let session = "sess-3393-keying";
+        let client = Some("keyingclient");
+        let caller = resolve_mcp_agent_id(&Value::Null, client);
+        assert!(
+            caller.starts_with("ai:"),
+            "the caller resolves canonically: {caller}"
+        );
+
+        // Direct: the function has no body parameter at all, so the two
+        // calls can only be keyed on the caller. Threshold 5 keeps every
+        // observation below the WARN line so the streak itself is what is
+        // asserted, not an emission.
+        let watcher = CaptureNagWatcher::new(5, 0);
+        let first = observe_capture_nag(Some(&watcher), session, "memory_recall", client);
+        let second = observe_capture_nag(Some(&watcher), session, "memory_recall", client);
+        assert_eq!((first, second), (NagAction::None, NagAction::None));
+        assert_eq!(
+            watcher.streak_for(&caller, session),
+            2,
+            "one continuous streak for the caller"
+        );
+
+        // Through the dispatcher: the same caller, two bodies that each claim
+        // a different agent id. The claims must neither reset nor fork the
+        // caller's streak.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let claim_a = make_tools_call(
+            "memory_recall",
+            json!({"query": "x", "agent_id": "ai:claimed-a"}),
+        );
+        let claim_b = make_tools_call(
+            "memory_recall",
+            json!({"query": "x", "agent_id": "ai:claimed-b"}),
+        );
+        invoke_handle_request_with_nag(&conn, &claim_a, &watcher, session, client);
+        invoke_handle_request_with_nag(&conn, &claim_b, &watcher, session, client);
+        assert_eq!(
+            watcher.streak_for(&caller, session),
+            4,
+            "the caller's streak is continuous across differently-claimed bodies"
+        );
+        assert_eq!(watcher.streak_for("ai:claimed-a", session), 0);
+        assert_eq!(watcher.streak_for("ai:claimed-b", session), 0);
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            0,
+            "below threshold: no emission; the keying alone is under test"
+        );
+
+        crate::audit::shutdown_for_test();
+    }
+
     /// The dispatch loop honours the watcher: N consecutive non-capture
     /// `tools/call`s cross the threshold and emit exactly one
     /// `capture_lag` audit event; a `memory_store`-class call resets the
