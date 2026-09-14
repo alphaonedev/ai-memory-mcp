@@ -211,6 +211,55 @@ fn ledger_writer_without_a_key_it_cannot_generate_refuses_3354() {
     }
 }
 
+/// Review blocker (#3354): the EGRESS verbs — the ones that take the
+/// operator's data OUT — and the remediation verbs stay reachable under the
+/// same condition. A posture that diagnoses an unwritable key dir must never
+/// disable the operator's ability to get their data out; `export` and
+/// `backup` run to completion while `capture-turn` (above) is refused.
+#[cfg(unix)]
+#[test]
+fn egress_verb_without_a_key_it_cannot_generate_still_runs_3354() {
+    let sb = sandbox();
+    let out = capture_turn(&sb, 1);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    std::fs::remove_file(sb.keys.join(format!("{AGENT_ID}.priv"))).expect("lose the key");
+    std::fs::remove_file(sb.keys.join(format!("{AGENT_ID}.pub"))).expect("lose the key");
+    let backups = sb.home.join("backups-3354");
+    chmod(&sb.keys, 0o500);
+    let export = command(&sb).arg("export").output().expect("export");
+    let backup = command(&sb)
+        .args(["backup", "--to"])
+        .arg(&backups)
+        .output()
+        .expect("backup");
+    chmod(&sb.keys, 0o700);
+    assert!(
+        export.status.success(),
+        "`export` is an egress verb and must not be refused for a key it cannot mint: {}",
+        stderr_of(&export)
+    );
+    assert!(
+        !String::from_utf8_lossy(&export.stdout).trim().is_empty(),
+        "`export` still produced the data"
+    );
+    assert!(
+        backup.status.success(),
+        "`backup` is an egress verb and must not be refused for a key it cannot mint: {}",
+        stderr_of(&backup)
+    );
+    assert!(
+        std::fs::read_dir(&backups)
+            .map(|d| d.count() > 0)
+            .unwrap_or(false),
+        "`backup` still wrote a snapshot under {}",
+        backups.display()
+    );
+    assert!(
+        !sb.keys.join(format!("{AGENT_ID}.priv")).exists(),
+        "no key was minted by an egress verb"
+    );
+}
+
 /// Read-only verbs stay reachable under the same condition, so the posture
 /// can be diagnosed and fixed from them (`doctor` itself is untouched by
 /// this change; `stats` stands in for the class).

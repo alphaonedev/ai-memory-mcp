@@ -103,12 +103,7 @@ fn main() -> Result<()> {
     // text OUT and must not be locked behind a config key the daemon refuses:
     // they load with the KNOWN keys applied (so `db` is the configured one,
     // never the relative default) and the refusal text as a loud WARN.
-    let is_egress_verb = matches!(
-        &cli.command,
-        daemon_runtime::Command::Backup(_)
-            | daemon_runtime::Command::Export(_)
-            | daemon_runtime::Command::ExportForensicBundle(_)
-    );
+    let is_egress_verb = is_egress_verb(&cli.command);
     let app_config = match if is_config_verb {
         Ok(config::AppConfig::default())
     } else if is_egress_verb && !config::skip_config() {
@@ -416,6 +411,20 @@ fn hosts_ledger_writers(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
+/// #3715 / the #2445 disposition — the EGRESS verbs: the ones that take the
+/// operator's durable text OUT of the store. This is the single definition
+/// of that set; every posture that must not stand between an operator and
+/// their data (the refused-config loader, the #3354 unsigned-ledger refusal)
+/// reads it from here rather than re-listing the verbs.
+fn is_egress_verb(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Backup(_)
+            | daemon_runtime::Command::Export(_)
+            | daemon_runtime::Command::ExportForensicBundle(_)
+    )
+}
+
 /// v1.0.0 #3354 — every command that can append a `signed_events` row is a
 /// LEDGER WRITER and must not start without a signing key for the resolved
 /// agent id (the key is generated when absent; only a failed generation
@@ -424,28 +433,36 @@ fn hosts_ledger_writers(cmd: &daemon_runtime::Command) -> bool {
 /// fixed from them. An unknown new verb is a writer by default: the safe
 /// side of the default is the signed one.
 fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
-    !matches!(
-        cmd,
-        daemon_runtime::Command::Doctor(_)
-            | daemon_runtime::Command::Config(_)
-            | daemon_runtime::Command::Completions(_)
-            | daemon_runtime::Command::Man
-            | daemon_runtime::Command::Identity(_)
-            | daemon_runtime::Command::Keys(_)
-            | daemon_runtime::Command::Stats
-            | daemon_runtime::Command::Namespaces
-            | daemon_runtime::Command::Get(_)
-            | daemon_runtime::Command::List(_)
-            | daemon_runtime::Command::Recall(_)
-            | daemon_runtime::Command::Search(_)
-            | daemon_runtime::Command::Inbox(_)
-            | daemon_runtime::Command::Logs(_)
-            | daemon_runtime::Command::Features
-            | daemon_runtime::Command::VerifyReflectionChain(_)
-            | daemon_runtime::Command::VerifySignedEventsChain(_)
-            | daemon_runtime::Command::VerifyAuditTrail(_)
-            | daemon_runtime::Command::VerifyForensicBundle(_)
-    )
+    !(is_egress_verb(cmd)
+        || matches!(
+            cmd,
+            // Remediation: the way BACK IN for a broken store. Same
+            // reasoning as egress — a posture that diagnoses an unwritable
+            // key dir must not lock the operator out of restoring / migrating
+            // the data the posture exists to protect.
+            daemon_runtime::Command::Restore(_)
+                | daemon_runtime::Command::Migrate(_)
+                // Read-only and diagnostic verbs: no write funnel.
+                | daemon_runtime::Command::Doctor(_)
+                | daemon_runtime::Command::Config(_)
+                | daemon_runtime::Command::Completions(_)
+                | daemon_runtime::Command::Man
+                | daemon_runtime::Command::Identity(_)
+                | daemon_runtime::Command::Keys(_)
+                | daemon_runtime::Command::Stats
+                | daemon_runtime::Command::Namespaces
+                | daemon_runtime::Command::Get(_)
+                | daemon_runtime::Command::List(_)
+                | daemon_runtime::Command::Recall(_)
+                | daemon_runtime::Command::Search(_)
+                | daemon_runtime::Command::Inbox(_)
+                | daemon_runtime::Command::Logs(_)
+                | daemon_runtime::Command::Features
+                | daemon_runtime::Command::VerifyReflectionChain(_)
+                | daemon_runtime::Command::VerifySignedEventsChain(_)
+                | daemon_runtime::Command::VerifyAuditTrail(_)
+                | daemon_runtime::Command::VerifyForensicBundle(_)
+        ))
 }
 
 /// v0.7.0 #697 — best-effort init for the forensic governance log.
@@ -520,6 +537,49 @@ fn init_forensic_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3354 review — the egress verbs are ONE definition, and the unsigned-
+    /// ledger refusal reads it: an operator whose key dir is unwritable can
+    /// always get their data OUT (and back IN via the remediation verbs),
+    /// while the writers stay behind the posture.
+    #[test]
+    fn egress_and_remediation_verbs_are_never_ledger_writers_3354() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).expect("argv parses").command;
+        for argv in [
+            &["ai-memory", "backup", "--to", "/nonexistent"][..],
+            &["ai-memory", "export"][..],
+            &["ai-memory", "export-forensic-bundle", "--memory-id", "m1"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(is_egress_verb(&cmd), "{argv:?} is an egress verb");
+            assert!(
+                !ledger_writer(&cmd),
+                "{argv:?} is never refused for a key it cannot mint"
+            );
+        }
+        for argv in [
+            &["ai-memory", "restore", "--from", "/nonexistent", "--latest"][..],
+            &["ai-memory", "migrate", "--from", "a", "--to", "b"][..],
+            &["ai-memory", "stats"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(!is_egress_verb(&cmd), "{argv:?} is not egress");
+            assert!(
+                !ledger_writer(&cmd),
+                "{argv:?} is remediation / read-only, never refused"
+            );
+        }
+        for argv in [
+            &["ai-memory", "serve"][..],
+            &["ai-memory", "capture-turn"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(
+                ledger_writer(&cmd),
+                "{argv:?} writes the ledger and stays behind the posture"
+            );
+        }
+    }
 
     #[test]
     fn id_short_truncates() {
