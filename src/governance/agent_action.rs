@@ -1532,11 +1532,15 @@ pub fn gate_read_with_policy(
     // actually went, and let the strict policy refuse instead if the
     // deployment asked for that.
     let chain = emit_check_event(conn, agent_id, action, &decision);
-    let forensic_accepted = emit_forensic_decision(agent_id, action, &decision);
+    // #3660 review D3 — `emit_forensic_decision` reports a writer-QUEUE
+    // accept (`record_decision_checked` returns on the channel send), not a
+    // file write; the residence names it as `forensic_queued`, never as a
+    // delivery.
+    let forensic_queued = emit_forensic_decision(agent_id, action, &decision);
     match chain {
         Ok(()) => read_audit::record_chain_appended(),
         Err(e) => {
-            let residence = read_audit::record_chain_append_failed(forensic_accepted);
+            let residence = read_audit::record_chain_append_failed(forensic_queued);
             if strict_audit {
                 read_audit::record_strict_refusal();
                 tracing::error!(
@@ -1552,7 +1556,9 @@ pub fn gate_read_with_policy(
                 residence = residence.as_str(),
                 "read-gate: governance.check append failed; read proceeds (best-effort \
                  policy). This decision is NOT in signed_events and is NOT queued, spooled \
-                 or retried — its only residence is `{}` (#3660): {e:#}",
+                 or retried for the chain — its only residence is `{}` (forensic_queued = \
+                 accepted onto the best-effort forensic sink's writer queue, not a \
+                 confirmed write) (#3660): {e:#}",
                 residence.as_str()
             );
         }
@@ -3576,7 +3582,7 @@ mod tests {
         assert!(after.last_gap_at_seconds.is_some());
         // The forensic sink is not initialised in this test process (the
         // forensic lock serialises against tests that do), so the residence
-        // must be `none` — NOT `forensic_only`.
+        // must be `none` — NOT `forensic_queued`.
         let none_before = before
             .evidence_gap_by_residence
             .iter()

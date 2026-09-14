@@ -57,8 +57,10 @@ spool retries it** — so a failed append is a permanent hole in
 forensic file). Counters: `/metrics`
 `ai_memory_governance_read_audit_{evaluated,chain_appended,evidence_gap,strict_refusals}_total`
 and `/health` `governance.read_audit_delivery` (`actionable = true` once
-any evidence has been lost). `AI_MEMORY_READ_AUDIT_STRICT=1` (same `1` /
-`true` grammar as the fail-open knob) selects the stricter enterprise
+any evidence has been lost). `AI_MEMORY_READ_AUDIT_STRICT=1` (the shared
+`1` / `true` / `yes` / `on` grammar every `AI_MEMORY_*` boolean knob
+accepts; `0` / `false` / `no` / `off` or unset = best-effort; any other
+token arms it, fail-closed, with a warning) selects the stricter enterprise
 posture: a read whose decision cannot be chain-logged is **refused** with
 a governance-refusal wire shape instead of proceeding. It is not part of
 the `asi-hard` floor — it trades read availability for audit

@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Registry, TextEncoder,
 };
 
 // =====================================================================
@@ -362,7 +362,7 @@ pub struct Metrics {
     /// `signed_events`.
     pub governance_read_audit_chain_appended_total: IntCounter,
     /// #3660 — read decisions whose chain append FAILED, by where the
-    /// evidence ended up (`forensic_only` = best-effort file only; `none` =
+    /// evidence ended up (`forensic_queued` = accepted onto the best-effort forensic sink's writer queue, not a confirmed write; `none` =
     /// gone). Closed label set, pre-touched to 0 at boot. There is no DLQ
     /// behind this append: every increment is a permanent gap in
     /// `signed_events`.
@@ -371,7 +371,10 @@ pub struct Metrics {
     pub governance_read_audit_strict_refusals_total: IntCounter,
     /// #3660 — unix seconds of the most recent read-audit evidence gap;
     /// `0` = none since boot.
-    pub governance_read_audit_last_gap_at_seconds: IntGauge,
+    /// #3660 (review D1) — zero-label family whose single child is created
+    /// by the FIRST evidence gap; ABSENT from a scrape until then. A moment
+    /// in time is never `0` (the `/health` twin renders `null`).
+    pub governance_read_audit_last_gap_at_seconds: IntGaugeVec,
 
     /// #1733 (Pillar-4 4.A) — monotonic counter of HTTP requests shed by
     /// the admission-control layer because the in-flight-request cap
@@ -951,7 +954,7 @@ impl Metrics {
             prometheus::Opts::new(
                 "ai_memory_governance_read_audit_evidence_gap_total",
                 "Read-action decisions whose governance.check append FAILED, \
-                 by residence (forensic_only | none). No DLQ backs this \
+                 by residence (forensic_queued = accepted onto the best-effort forensic sink's writer queue, not a delivery | none). No DLQ backs this \
                  append: every increment is a permanent gap in signed_events.",
             ),
             &["residence"],
@@ -970,10 +973,13 @@ impl Metrics {
         registry.register(Box::new(
             governance_read_audit_strict_refusals_total.clone(),
         ))?;
-        let governance_read_audit_last_gap_at_seconds = IntGauge::new(
-            "ai_memory_governance_read_audit_last_gap_at_seconds",
-            "Unix seconds of the most recent read-audit evidence gap; 0 = \
-             none since boot.",
+        let governance_read_audit_last_gap_at_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_governance_read_audit_last_gap_at_seconds",
+                "Unix seconds of the most recent read-audit evidence gap. \
+                 ABSENT until the first gap since boot (never 0).",
+            ),
+            &[],
         )?;
         registry.register(Box::new(governance_read_audit_last_gap_at_seconds.clone()))?;
 
@@ -1537,6 +1543,12 @@ mod tests {
         registry().hnsw_size_gauge.set(42);
         registry().subscriptions_active_gauge.set(3);
         registry().federation_push_dlq_depth.set(0);
+        // #3660 — the last-gap family has no child until the first gap;
+        // tickle it so the name check below sees it.
+        registry()
+            .governance_read_audit_last_gap_at_seconds
+            .with_label_values(&[])
+            .set(1);
         // FED-P4-e — federation identity SLO surfaces.
         record_federation_cred_verify(true);
         record_federation_inbound_cred(true);
@@ -1567,7 +1579,7 @@ mod tests {
             // #3660 — read-audit delivery evidence.
             "ai_memory_governance_read_audit_evaluated_total",
             "ai_memory_governance_read_audit_chain_appended_total",
-            "ai_memory_governance_read_audit_evidence_gap_total{residence=\"forensic_only\"}",
+            "ai_memory_governance_read_audit_evidence_gap_total{residence=\"forensic_queued\"}",
             "ai_memory_governance_read_audit_evidence_gap_total{residence=\"none\"}",
             "ai_memory_governance_read_audit_strict_refusals_total",
             "ai_memory_governance_read_audit_last_gap_at_seconds",
@@ -1691,6 +1703,35 @@ mod tests {
         let text = render();
         assert!(
             text.contains("ai_memory_autonomy_hook_total{kind=\"contradiction\",result=\"err\"")
+        );
+    }
+
+    /// #3660 (review D1) — `..._last_gap_at_seconds` is a moment in time:
+    /// ABSENT from a scrape until the first gap, never rendered as `0`.
+    /// Pinned on a PRIVATE `Metrics` so no parallel test can create the
+    /// child first.
+    #[test]
+    fn read_audit_last_gap_series_is_absent_until_first_gap_3660() {
+        let m = Metrics::try_new().expect("private metrics");
+        let render = |m: &Metrics| {
+            let mut buf = Vec::new();
+            TextEncoder::new()
+                .encode(&m.registry.gather(), &mut buf)
+                .expect("encode");
+            String::from_utf8(buf).expect("utf8")
+        };
+        let before = render(&m);
+        assert!(
+            !before.contains("ai_memory_governance_read_audit_last_gap_at_seconds"),
+            "no series before the first gap (a moment in time cannot be 0):\n{before}"
+        );
+        m.governance_read_audit_last_gap_at_seconds
+            .with_label_values(&[])
+            .set(1_700_000_000);
+        let after = render(&m);
+        assert!(
+            after.contains("ai_memory_governance_read_audit_last_gap_at_seconds 1700000000"),
+            "the series appears with the measured instant after the first gap:\n{after}"
         );
     }
 

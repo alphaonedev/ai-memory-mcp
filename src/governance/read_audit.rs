@@ -22,7 +22,8 @@
 //!
 //! * process-wide counters of engaged read decisions, chain appends, and
 //!   append failures split by where the evidence ended up
-//!   (`forensic_only` / `none`);
+//!   (`forensic_queued` — the best-effort forensic sink ACCEPTED the row
+//!   onto its writer queue, which is not a delivery — / `none`);
 //! * the same counters on `/metrics` (`ai_memory_governance_read_audit_*`,
 //!   closed `residence` label set) and on `/health` as the
 //!   `governance.read_audit_delivery` signal object (#3646 shape);
@@ -63,10 +64,14 @@ pub const SCOPE: &str = "mcp_sqlite_read_gate";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapResidence {
-    /// The forensic sink accepted the row: the decision exists ONLY in a
-    /// rotated, best-effort file and cannot be reconstructed from
-    /// `signed_events`.
-    ForensicOnly,
+    /// The best-effort forensic sink ACCEPTED the row onto its writer
+    /// queue (`audit::record_decision_checked` returns on the channel
+    /// send, before any file write). That is a queue accept, NOT a
+    /// delivery: the writer can still fail the append and only logs. So
+    /// the most this residence can claim is "queued to a rotated,
+    /// best-effort file"; the decision cannot be reconstructed from
+    /// `signed_events` either way (#3660 review D3).
+    ForensicQueued,
     /// Neither the chain nor the forensic sink holds it: the decision is
     /// gone.
     None,
@@ -77,13 +82,13 @@ impl GapResidence {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ForensicOnly => "forensic_only",
+            Self::ForensicQueued => "forensic_queued",
             Self::None => "none",
         }
     }
 
     /// Every residence, for pre-touching the labelled metric family.
-    pub const ALL: [Self; 2] = [Self::ForensicOnly, Self::None];
+    pub const ALL: [Self; 2] = [Self::ForensicQueued, Self::None];
 }
 
 /// Process-wide counters. Atomics only: the read gate is on the recall
@@ -92,7 +97,7 @@ impl GapResidence {
 pub struct ReadAuditCounters {
     evaluated: AtomicU64,
     chain_appended: AtomicU64,
-    gap_forensic_only: AtomicU64,
+    gap_forensic_queued: AtomicU64,
     gap_none: AtomicU64,
     strict_refusals: AtomicU64,
     last_chain_append_unix: AtomicU64,
@@ -102,7 +107,7 @@ pub struct ReadAuditCounters {
 static COUNTERS: ReadAuditCounters = ReadAuditCounters {
     evaluated: AtomicU64::new(0),
     chain_appended: AtomicU64::new(0),
-    gap_forensic_only: AtomicU64::new(0),
+    gap_forensic_queued: AtomicU64::new(0),
     gap_none: AtomicU64::new(0),
     strict_refusals: AtomicU64::new(0),
     last_chain_append_unix: AtomicU64::new(0),
@@ -135,14 +140,15 @@ pub fn record_chain_appended() {
         .inc();
 }
 
-/// The chain append FAILED. `forensic_accepted` says whether the
-/// best-effort forensic sink took the row (false when the sink is
-/// disabled or its write failed). Returns the residence recorded.
+/// The chain append FAILED. `forensic_queued` says whether the
+/// best-effort forensic sink ACCEPTED the row onto its writer queue
+/// (false when the sink is disabled or the send failed) — a queue accept,
+/// not a delivery. Returns the residence recorded.
 #[must_use = "the residence names where the evidence lives; log it"]
-pub fn record_chain_append_failed(forensic_accepted: bool) -> GapResidence {
-    let residence = if forensic_accepted {
-        COUNTERS.gap_forensic_only.fetch_add(1, Ordering::Relaxed);
-        GapResidence::ForensicOnly
+pub fn record_chain_append_failed(forensic_queued: bool) -> GapResidence {
+    let residence = if forensic_queued {
+        COUNTERS.gap_forensic_queued.fetch_add(1, Ordering::Relaxed);
+        GapResidence::ForensicQueued
     } else {
         COUNTERS.gap_none.fetch_add(1, Ordering::Relaxed);
         GapResidence::None
@@ -153,8 +159,13 @@ pub fn record_chain_append_failed(forensic_accepted: bool) -> GapResidence {
     m.governance_read_audit_evidence_gap_total
         .with_label_values(&[residence.as_str()])
         .inc();
+    // #3660 review D1 — a moment in time is never `0`: the series is a
+    // zero-label family whose child is created by the FIRST gap, so a scrape
+    // carries no `last_gap_at_seconds` until one has happened.
     #[allow(clippy::cast_possible_wrap)]
-    m.governance_read_audit_last_gap_at_seconds.set(now as i64);
+    m.governance_read_audit_last_gap_at_seconds
+        .with_label_values(&[])
+        .set(now as i64);
     residence
 }
 
@@ -175,12 +186,36 @@ pub fn strict_policy_from_env() -> bool {
         .unwrap_or(false)
 }
 
-/// Value grammar — exact `"1"` or case-insensitive `"true"`, the same
-/// grammar as `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` so the two
-/// governance-posture knobs cannot drift.
+/// Value grammar (#3660 review D2) — the SHARED truthy grammar every other
+/// `AI_MEMORY_*` boolean knob accepts (`security_profile::is_truthy`:
+/// `1` / `true` / `yes` / `on`, trimmed, case-insensitive), with the
+/// explicit off-spellings `0` / `false` / `no` / `off` and the empty string
+/// (= unset) resolving to best-effort. This is a RESTRICTIVE knob, so its
+/// failure mode is the inverse of the fail-open hatch's: an operator who
+/// types a synonym the product accepts elsewhere must never get silent
+/// best-effort while believing reads are refused. Any OTHER token is
+/// treated as ARMED (the fail-closed direction) and logged once per read so
+/// the typo is visible rather than silently widening.
 #[must_use]
 pub fn strict_value_enabled(v: &str) -> bool {
-    crate::daemon_runtime::governance_fail_open_value_enabled(v)
+    let t = v.trim();
+    if t.is_empty()
+        || matches!(
+            t.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    {
+        return false;
+    }
+    if crate::security_profile::is_truthy(t) {
+        return true;
+    }
+    tracing::warn!(
+        value = %t,
+        "{ENV_READ_AUDIT_STRICT}: unrecognised value; treated as ARMED (fail-closed). Use \
+         1/true/yes/on or 0/false/no/off (#3660)"
+    );
+    true
 }
 
 /// A fully measured snapshot of read-audit delivery for this process.
@@ -253,18 +288,18 @@ impl ReadAuditDelivery {
 #[must_use]
 pub fn delivery_at(now_unix: u64, strict: bool) -> ReadAuditDelivery {
     let nz = |v: u64| if v == 0 { None } else { Some(v) };
-    let forensic_only = COUNTERS.gap_forensic_only.load(Ordering::Relaxed);
+    let forensic_queued = COUNTERS.gap_forensic_queued.load(Ordering::Relaxed);
     let none = COUNTERS.gap_none.load(Ordering::Relaxed);
     let last_ok = COUNTERS.last_chain_append_unix.load(Ordering::Relaxed);
     let last_gap = COUNTERS.last_gap_unix.load(Ordering::Relaxed);
-    let gap_total = forensic_only + none;
+    let gap_total = forensic_queued + none;
     ReadAuditDelivery {
         scope: SCOPE,
         policy: if strict { "strict" } else { "best_effort" },
         evaluated_total: COUNTERS.evaluated.load(Ordering::Relaxed),
         chain_appended_total: COUNTERS.chain_appended.load(Ordering::Relaxed),
         evidence_gap_by_residence: vec![
-            (GapResidence::ForensicOnly.as_str(), forensic_only),
+            (GapResidence::ForensicQueued.as_str(), forensic_queued),
             (GapResidence::None.as_str(), none),
         ],
         evidence_gap_total: gap_total,
@@ -288,20 +323,32 @@ mod tests {
     use super::{GapResidence, delivery_at, strict_value_enabled};
 
     #[test]
-    fn strict_value_grammar_matches_fail_open_knob_3660() {
-        assert!(strict_value_enabled("1"));
-        assert!(strict_value_enabled("true"));
-        assert!(strict_value_enabled("TRUE"));
-        assert!(!strict_value_enabled("yes"));
-        assert!(!strict_value_enabled("on"));
-        assert!(!strict_value_enabled("0"));
-        assert!(!strict_value_enabled(""));
+    fn strict_value_grammar_is_the_shared_truthy_grammar_and_fails_closed_3660() {
+        // #3660 review D2 — the same spellings every other AI_MEMORY_* bool
+        // knob accepts arm the strict posture; explicit off-spellings and
+        // unset/empty resolve to best-effort; an unrecognised token ARMS
+        // (fail-closed), never silently widens.
+        for v in ["1", "true", "TRUE", "yes", "YES", "on", " on "] {
+            assert!(strict_value_enabled(v), "{v:?} must arm strict");
+        }
+        for v in ["0", "false", "no", "off", "OFF", "", "   "] {
+            assert!(
+                !strict_value_enabled(v),
+                "{v:?} must resolve to best-effort"
+            );
+        }
+        for v in ["garbage", "enabled", "strict"] {
+            assert!(
+                strict_value_enabled(v),
+                "{v:?}: unrecognised must fail CLOSED"
+            );
+        }
     }
 
     #[test]
     fn residence_labels_are_closed_and_stable_3660() {
         let labels: Vec<&str> = GapResidence::ALL.iter().map(|r| r.as_str()).collect();
-        assert_eq!(labels, ["forensic_only", "none"]);
+        assert_eq!(labels, ["forensic_queued", "none"]);
     }
 
     #[test]
@@ -311,7 +358,7 @@ mod tests {
         assert_eq!(j["observed_at_seconds"], 7);
         assert_eq!(j["value"]["scope"], super::SCOPE);
         assert_eq!(j["value"]["policy"], "strict");
-        assert!(j["value"]["evidence_gap_by_residence"]["forensic_only"].is_u64());
+        assert!(j["value"]["evidence_gap_by_residence"]["forensic_queued"].is_u64());
         assert!(j["value"]["evidence_gap_by_residence"]["none"].is_u64());
         assert!(j["value"]["actionable"].is_boolean());
         assert_eq!(delivery_at(7, false).policy, "best_effort");

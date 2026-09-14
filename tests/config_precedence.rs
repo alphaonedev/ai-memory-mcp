@@ -1487,6 +1487,45 @@ fn test_fed_require_server_verify_default_on_grammar_2448() {
 }
 
 // ---------------------------------------------------------------------------
+// AI_MEMORY_READ_AUDIT_STRICT (#3660, env-table row 183) — a RESTRICTIVE
+//     governance-posture knob. Pure runtime env knob (no CLI flag, no
+//     config.toml binding): `env > compiled default (best-effort)`, resolved
+//     through `governance::read_audit::strict_policy_from_env`. Grammar is
+//     the SHARED truthy grammar every AI_MEMORY_* bool knob accepts; the
+//     failure mode is fail-CLOSED: an unrecognised token ARMS the posture.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_read_audit_strict_shared_grammar_fails_closed_3660() {
+    use ai_memory::governance::read_audit::{ENV_READ_AUDIT_STRICT, strict_policy_from_env};
+    let cases: &[(Option<&str>, bool)] = &[
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("false"), false),
+        (Some("no"), false),
+        (Some("off"), false),
+        (Some("  OFF "), false),
+        (Some("1"), true),
+        (Some("true"), true),
+        (Some("TRUE"), true),
+        (Some("yes"), true),
+        (Some("on"), true),
+        // An unrecognised token must never silently leave reads best-effort
+        // while the operator believes they are refused: it arms the posture.
+        (Some("garbage"), true),
+        (Some("strict"), true),
+    ];
+    for &(val, want) in cases {
+        let _g = MultiEnvVarGuard::apply(&[(ENV_READ_AUDIT_STRICT, val)]);
+        assert_eq!(
+            strict_policy_from_env(),
+            want,
+            "AI_MEMORY_READ_AUDIT_STRICT={val:?} must resolve to {want}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 11. AI_MEMORY_VECTORLITE_EXTENSION — opt-in vectorlite ANN backend selector
 //     (#2256; the #1860/#2219 knob). Pure runtime env knob (no CLI flag, no
 //     config.toml binding): the ladder collapses to `env > compiled default
