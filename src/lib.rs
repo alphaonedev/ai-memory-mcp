@@ -1982,3 +1982,7 @@ mod h7_timeout_tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }
+
+// #3723 CI-canceller diagnostic probe (conductor, 2026-09-14). Trivial
+// comment-only change on a throwaway branch: determines whether pull_request
+// runs are cancelled repo-wide or only on #3723 and #3689. Delete after.
