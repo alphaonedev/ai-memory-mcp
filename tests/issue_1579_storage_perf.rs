@@ -127,9 +127,8 @@ fn a2_namespace_list_uses_ns_composite_index_without_sort() {
         None,
         None,
         None,
-        None,  // #1834 valid_at
-        None,  // #2580 metadata_eq
-        false, // #3463 unread_only
+        None, // #1834 valid_at
+        None, // #2580 metadata_eq
         10,
         0,
     );
@@ -158,9 +157,8 @@ fn a2_namespace_tier_minpriority_list_stays_sort_free() {
         None,
         None,
         None,
-        None,  // #1834 valid_at
-        None,  // #2580 metadata_eq
-        false, // #3463 unread_only
+        None, // #1834 valid_at
+        None, // #2580 metadata_eq
         10,
         0,
     );
@@ -189,8 +187,7 @@ fn a2_min_priority_only_list_range_scans_composite_index() {
         None,
         None,
         None,
-        None,  // #2580 metadata_eq
-        false, // #3463 unread_only
+        None, // #2580 metadata_eq
         10,
         0,
     );

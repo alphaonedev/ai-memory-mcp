@@ -66,8 +66,7 @@ fn sql_shape_emits_pushdown_only_when_axis_is_set_2580() {
         None,
         None,
         None,
-        None,  // metadata_eq unset
-        false, // #3463 unread_only
+        None, // metadata_eq unset
         10,
         0,
     );
@@ -89,7 +88,6 @@ fn sql_shape_emits_pushdown_only_when_axis_is_set_2580() {
         None,
         None,
         Some(("family", "core")),
-        false, // #3463 unread_only
         10,
         0,
     );
