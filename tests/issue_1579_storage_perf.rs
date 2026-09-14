@@ -101,7 +101,7 @@ fn a2_bare_list_walks_composite_index_without_sort() {
     let conn = open_test_db();
     let now = chrono::Utc::now().to_rfc3339();
     let (sql, _params) = db::build_list_query(
-        None, None, None, &now, None, None, None, None, None, None, false, 10, 0,
+        None, None, None, &now, None, None, None, None, None, None, 10, 0,
     );
     let plan = explain(&conn, &sql);
     assert!(
