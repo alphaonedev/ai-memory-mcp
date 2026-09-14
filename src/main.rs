@@ -444,7 +444,9 @@ fn is_remediation_verb(cmd: &daemon_runtime::Command) -> bool {
 /// refuses). The read-only and remediation verbs are enumerated instead —
 /// they open no write funnel, so the posture can always be diagnosed and
 /// fixed from them. An unknown new verb is a writer by default: the safe
-/// side of the default is the signed one.
+/// side of the default is the signed one. `boot` stays a writer on purpose:
+/// it recovers memories into the store, so its rows must be signed like any
+/// other writer's.
 fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
     !(is_egress_verb(cmd)
         || is_remediation_verb(cmd)
