@@ -475,25 +475,40 @@ fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
         ))
 }
 
-/// v0.7.0 #697 — best-effort init for the forensic governance log.
-/// Resolves the directory parallel to the flat audit log, loads the
-/// daemon's signing key (when present), and brings up the sink. A
-/// missing key results in unsigned rows — never a fatal error, but since
-/// #3354 never a SILENT one either: `warn_unsigned` prints the one-line
-/// operator warning (with the provisioning command) when the process will
-/// write unsigned `signed_events` rows.
+/// v0.7.0 #697 / v1.0.0 #3647 / v1.0.0 #3354 — init of the forensic log on
+/// the directory parallel to the flat audit log, and of the database audit
+/// signers.
+///
+/// The ORDER of this function is semantic, not cosmetic (#3354 / #3647
+/// reconciliation):
+///
+/// 1. The resolved agent id's signing key is ENSURED first (#3354: loaded,
+///    or generated when absent). A ledger-writing verb whose key cannot be
+///    ensured REFUSES here, before any row can be written — that refusal
+///    is the diagnostic an operator sees, and nothing below runs.
+/// 2. The database audit signers are installed from the ENSURED key
+///    (#3647: they must not depend on the forensic directory resolving or
+///    being creatable). Installing them from a plain load, before the
+///    ensure step, would hand a fresh store an unsigned first row — the
+///    exact #3354 hole through a different door.
+/// 3. Only then is the forensic directory resolved; the sink comes up on
+///    every boot so its content-free integrity rows (the #1850 truncation
+///    watermark, the #3199 unverified-restore record) and the screened
+///    governance decision rows are written by default (Conductor ruling on
+///    #3647). The plaintext-retention diagnostic (#3647) fires here, after
+///    the refusal point: an operator whose writer cannot start sees the
+///    refusal, not a note about a sink that will not start.
+///
+/// A missing key on a NON-writer gives unsigned rows and withheld
+/// commitments — never a fatal error, but since #3354 never a SILENT one
+/// either: the hosts of the ledger writers print the one-line operator
+/// warning (with the provisioning command).
 fn init_forensic_audit(
     app_config: &config::AppConfig,
     hosts_writers: bool,
     ledger_writer: bool,
 ) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
-    // Reuse the flat audit log path resolver — same directory pattern.
-    let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
-    let Some(dir) = log_path.parent() else {
-        eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
-        return Ok(());
-    };
     // Resolve the daemon's agent_id with the standard precedence chain.
     let agent_id = ai_memory::identity::resolve_agent_id(None, None)
         .unwrap_or_else(|_| "ai-memory".to_string());
@@ -538,10 +553,37 @@ fn init_forensic_audit(
             eprintln!("ai-memory: {warning}");
         }
     }
+    // The database audit signers must not depend on the forensic directory
+    // resolving or being creatable (#3647) — and they take the ENSURED key
+    // (#3354), never a plain load that could predate generation.
+    ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
+    let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
+    let Some(dir) = log_path.parent() else {
+        eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
+        return Ok(());
+    };
+    warn_if_plaintext_retention_requested(&audit_cfg);
     if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
         eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
     }
     Ok(())
+}
+
+/// #3647 — `audit.redact_content = false` asks for plaintext retention, which
+/// is unsupported. It is ignored with a diagnostic rather than silently: the
+/// forensic decision rows stay written and stay screened (keyed commitments
+/// only). Removing the operator's evidence is never the answer to a
+/// disclosure concern (Conductor ruling on #3647). Returns whether the
+/// diagnostic fired.
+fn warn_if_plaintext_retention_requested(audit_cfg: &config::AuditConfig) -> bool {
+    if audit_cfg.redact_content != Some(false) {
+        return false;
+    }
+    eprintln!(
+        "ai-memory: audit.redact_content=false (plaintext retention) is unsupported and \
+         ignored: forensic governance decision rows record keyed commitments only (#3647)"
+    );
+    true
 }
 
 #[cfg(test)]
@@ -593,6 +635,120 @@ mod tests {
                 "{argv:?} writes the ledger and stays behind the posture"
             );
         }
+    }
+
+    fn forensic_boot_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    const ISSUE_3647_BOOT_SECRET: &str = "ISSUE_3647_DEFAULT_BOOT_SECRET";
+
+    /// Boot `init_forensic_audit` on a scratch audit directory, then emit one
+    /// sentinel-bearing decision row and one watermark, and return every row
+    /// the real JSONL holds (plus the raw text).
+    fn boot_and_emit_3647(
+        enabled: Option<bool>,
+        redact_content: Option<bool>,
+    ) -> (Vec<ai_memory::governance::audit::ForensicDecision>, String) {
+        let _ = ai_memory::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch audit directory");
+        let app_config = config::AppConfig {
+            audit: Some(config::AuditConfig {
+                path: Some(tmp.path().join("audit.log").to_string_lossy().into_owned()),
+                enabled,
+                redact_content,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ai_memory::governance::audit::shutdown();
+        // A non-writer, non-host boot (#3354 reconciliation): the key is
+        // ENSURED in the installed test key dir, so the sink signs.
+        init_forensic_audit(&app_config, false, false).expect("forensic boot");
+        assert!(
+            ai_memory::governance::audit::is_enabled(),
+            "the sink comes up on every boot (#1850 watermark lane)"
+        );
+        ai_memory::governance::audit::record_decision(
+            "agent:3647",
+            "refuse",
+            "bash",
+            "R3647",
+            ai_memory::governance::audit::ForensicPayload::new()
+                .commit("reason", ISSUE_3647_BOOT_SECRET),
+        );
+        ai_memory::governance::audit::record_audit_watermark(64, &"ab".repeat(32), Some("db3647"));
+        ai_memory::governance::audit::shutdown();
+        let mut body = String::new();
+        for entry in std::fs::read_dir(tmp.path()).expect("directory") {
+            let path = entry.expect("entry").path();
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("forensic-"))
+            {
+                body.push_str(&std::fs::read_to_string(path).expect("JSONL"));
+            }
+        }
+        let rows = body
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("row"))
+            .collect();
+        (rows, body)
+    }
+
+    /// Conductor ruling on #3647: every boot, whatever `audit.enabled` says,
+    /// writes the screened decision row next to the integrity row.
+    #[test]
+    fn issue_3647_every_boot_writes_screened_decision_rows_and_integrity_rows() {
+        let _guard = forensic_boot_lock();
+        for enabled in [None, Some(false), Some(true)] {
+            let (rows, body) = boot_and_emit_3647(enabled, None);
+            assert_screened_decision_then_watermark(&rows, &body);
+        }
+    }
+
+    /// `redact_content = false` is ignored with a diagnostic; the decision row
+    /// is still written, and still screened.
+    #[test]
+    fn issue_3647_plaintext_request_is_ignored_and_rows_stay_screened() {
+        let _guard = forensic_boot_lock();
+        assert!(warn_if_plaintext_retention_requested(
+            &config::AuditConfig {
+                redact_content: Some(false),
+                ..Default::default()
+            }
+        ));
+        assert!(!warn_if_plaintext_retention_requested(
+            &config::AuditConfig::default()
+        ));
+        let (rows, body) = boot_and_emit_3647(Some(true), Some(false));
+        assert_screened_decision_then_watermark(&rows, &body);
+    }
+
+    fn assert_screened_decision_then_watermark(
+        rows: &[ai_memory::governance::audit::ForensicDecision],
+        body: &str,
+    ) {
+        assert!(!body.contains(ISSUE_3647_BOOT_SECRET));
+        assert_eq!(rows.len(), 2, "decision + watermark: {rows:?}");
+        assert_eq!(rows[0].actor, "agent:3647");
+        assert_eq!(rows[0].decision, "refuse");
+        assert_eq!(rows[0].rule_id, "R3647");
+        // Keyed when a daemon key resolves, withheld when unsigned; never text.
+        let reason = rows[0].payload["reason"].as_str().expect("reason");
+        assert!(
+            reason == ai_memory::governance::audit::FORENSIC_COMMITMENT_WITHHELD
+                || reason.starts_with(ai_memory::governance::audit::FORENSIC_COMMITMENT_PREFIX),
+            "reason must be a commitment: {reason}"
+        );
+        assert_eq!(
+            rows[1].kind,
+            ai_memory::governance::audit::AUDIT_WATERMARK_KIND
+        );
+        assert_eq!(rows[1].payload["head_sequence"], 64);
+        assert_eq!(rows[1].payload["db_id"], "db3647");
     }
 
     #[test]
@@ -679,6 +835,7 @@ mod tests {
     /// `governance::audit::init`.
     #[test]
     fn init_forensic_audit_with_temp_dir_does_not_panic() {
+        let _guard = forensic_boot_lock();
         let _ = ai_memory::identity::test_key_dir::install();
         // Scratch under the repo's gitignored .local-runs/ per the
         // project no-/tmp HARD RULE.

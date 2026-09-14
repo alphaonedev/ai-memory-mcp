@@ -412,7 +412,10 @@ fn emit_why_trace_signal(mem: &Memory, refused: bool) {
             disposition,
             "covenant.why_trace",
             REQUIRE_WHY_TRACE_ENV,
-            serde_json::json!({ "title": mem.title, "namespace": mem.namespace }),
+            // #3647 — the title is tenant content: commitment only.
+            crate::governance::audit::ForensicPayload::new()
+                .commit("title", &mem.title)
+                .ident("namespace", &mem.namespace),
         );
     }
 }
@@ -558,10 +561,9 @@ pub fn consult_authorship_immutable_gate(
             disposition,
             "covenant.authorship_immutable",
             REQUIRE_IMMUTABLE_AUTHORSHIP_ENV,
-            serde_json::json!({
-                "existing_agent_id": existing_id,
-                "attempted_agent_id": incoming_id,
-            }),
+            crate::governance::audit::ForensicPayload::new()
+                .ident("existing_agent_id", existing_id)
+                .ident("attempted_agent_id", incoming_id),
         );
         return Err(anyhow::Error::new(GovernanceRefusal {
             reason: format!(

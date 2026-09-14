@@ -203,7 +203,10 @@ pub(super) fn handle_promote(
                 "allow",
                 crate::mcp::registry::tool_names::MEMORY_PROMOTE,
                 to_ns,
-                dest_payload,
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("id", &resolved_id)
+                    .ident(crate::models::field_names::TO_NAMESPACE, to_ns)
+                    .label("mode", "vertical"),
             );
             Some(dest_agent_id)
         } else {

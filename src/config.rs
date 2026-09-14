@@ -7203,7 +7203,10 @@ pub struct LoggingConfig {
 /// trail emitted from every memory mutation call site.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AuditConfig {
-    /// Master toggle. Default `false`.
+    /// Master toggle for the flat audit trail. Default `false`. The forensic
+    /// log is written regardless: its integrity rows (truncation watermark,
+    /// rollback / restore evidence) and its screened governance decision rows
+    /// (#3647 — keyed commitments, never request content).
     pub enabled: Option<bool>,
     /// Audit log path. Either a directory (in which case `audit.log`
     /// is appended) or an explicit file path. Default
@@ -7219,7 +7222,9 @@ pub struct AuditConfig {
     /// Whether to redact `memory.content` from emitted events. **The
     /// only supported value in v1 is `true`** — the audit schema does
     /// not expose a content field at all; this flag is reserved for a
-    /// future per-namespace exception API.
+    /// future per-namespace exception API. Forensic decision rows never carry
+    /// request content or free text, only keyed commitments (#3647); an
+    /// explicit `false` is unsupported and ignored with a boot diagnostic.
     pub redact_content: Option<bool>,
     /// Whether to compute and verify the per-line hash chain. The
     /// cross-row hash chain is MANDATORY (the load-bearing tamper-evidence)
@@ -10355,7 +10360,9 @@ impl AppConfig {
 # When enabled, every memory mutation emits one hash-chained JSON
 # line per event suitable for SOC2 / HIPAA / GDPR / FedRAMP evidence.
 # `ai-memory audit verify` walks the chain; `ai-memory logs tail`
-# streams events.
+# streams events. The forensic log (integrity rows and screened governance
+# decision rows: keyed commitments, never request content) is written
+# regardless. redact_content=false is unsupported and ignored with a warning.
 # [audit]
 # enabled = false
 # path = "~/.local/state/ai-memory/audit/"
