@@ -4263,6 +4263,14 @@ mod tests {
         // function converts to Ok(None) (lines 464-467, 481-484).
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
+        // #3354 — a key dir never inherits the ambient umask (0002 on the
+        // reference host yields 0775, which the #3198 check correctly
+        // refuses — that refusal is the product being right).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let _g = crate::identity::keypair::key_dir_env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
