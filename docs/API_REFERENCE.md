@@ -718,9 +718,26 @@ All fields optional. Tier never downgrades.
 
 ### `DELETE /api/v1/memories/{id}` — delete
 
-Archives before delete when `archive_on_gc=true`.
+`delete` means remove the row from the caller's view. Whether the substrate
+RETAINS a copy is a retention policy, and it varies by namespace
+([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)):
 
-- **200 OK** `{"deleted": true}` or **202** when governance is pending.
+- a message in the caller's agent inbox (`_inbox/<agent>`) is **archived**
+  (`archive_reason = "delete"`, listed by `GET /api/v1/archive`, restorable via
+  `POST /api/v1/archive/{id}/restore`) — the inbox is a queue the recipient
+  drains by deleting what it has handled, and draining must not destroy the
+  record of what the agent was told;
+- every other row is **erased** (no archive copy). The earlier claim on this
+  page that `archive_on_gc=true` archived before delete was wrong: that flag
+  governs `gc` / `forget`, never this route. Archive-first deletion for every
+  namespace is a separate decision (it changes erasure semantics for a caller
+  who deletes in order to erase) and is tracked for v1.0.1.
+
+The response says which happened, so a caller never has to consult this page
+to know whether its data still exists:
+
+- **200 OK** `{"deleted": true, "archived": true|false}` or **202** when
+  governance is pending.
 
 ### `POST /api/v1/memories/bulk` — batch create
 
@@ -1636,7 +1653,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/session/start` | HTTP parity for `memory_session_start` (auto-recall session boot). Near-duplicates are clustered (same as `ai-memory boot`); a representative row may carry `similar_count`. |
 | `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
 | `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. Every delivery is a NEW row (#3639): the stored `title` is `<subject> [<id prefix>]` (unique by construction), the caller's title is kept verbatim as `metadata.subject`, a repeated subject never merges into, overwrites or re-attributes an earlier message, and the receipt carries `id`, `title` and `subject`. |
-| `GET`  | `/api/v1/inbox` | Read the calling agent's inbox. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
+| `GET`  | `/api/v1/inbox` | Read the calling agent's inbox — the messages it has not yet HANDLED. Handled = the recipient deleted the message (`DELETE /api/v1/memories/{id}`, archived on this namespace, see the delete route); reads never mark anything (#1869 purity) and there is no read marker — `access_count` counts touches, never handling ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). `unread_only` is accepted for compatibility and narrows nothing (every listed message is unhandled); `unread_count == count`. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
 | `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent/unreadable `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits. Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
 | `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** `…/export` writes on the daemon host and is **jailed** — see *Skills export root* below. |
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. `memory_subscription_replay` events carry `delivery_status`: `ack` / `failed` are terminal; **`pending` means no terminal status was recorded — including a delivery that settled but whose terminal status write failed** ([#3659](https://github.com/alphaonedev/ai-memory-mcp/issues/3659)), so the field alone cannot separate in-flight from lost; a row still `pending` past the 60 s settle window is the lost case (`doctor` warns; the reliable write is [#3735](https://github.com/alphaonedev/ai-memory-mcp/issues/3735)). **`/api/v1/memory_calibrate_confidence` is a caller-scoped aggregate ([#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507)):** the report's `baselines` NAME namespaces, so the sweep is computed only over rows the caller can read, using the store's own visibility predicates (subtree scopes, owner-keyed `scope=private`, substrate exclusion) on BOTH backends. `X-Agent-Id` is REQUIRED — an absent header answers `403`, never the pre-#3507 corpus-wide sweep, because the shared resolver would otherwise synthesize a per-request `anonymous:req-…` that owns no rows. An admin caller (the existing `is_admin_caller_trusted` gate) keeps the global aggregate; every other caller is scoped, and for a scoped caller the sweep is strictly read-only (the `recall_outcome` backfill is admin-only, so `consumption_utility` may report `null`). |

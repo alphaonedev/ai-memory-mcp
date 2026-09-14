@@ -1762,6 +1762,13 @@ mod d1_6_987_tests {
     //!   delivery settled but its terminal status write FAILED (the #3659
     //!   observed gap), not only in flight. The docs now say so at the field
     //!   the caller reads; the reliable write is #3735 (v1.0.1).
+    //! - 2026-09-14 (#3730): `memory_inbox.docs` advertised `access_count==0`
+    //!   as "the unread marker" — a TOUCH counter that no inbox operation ever
+    //!   advanced (only a namespaced recall plus the periodic fold did), so
+    //!   the marker never meant handled and an inbox drained with `inbox` +
+    //!   `get` re-listed forever. The docs now state the shipped contract:
+    //!   the inbox is the pending set, handled = deleted by the recipient,
+    //!   `unread_only` narrows nothing.
     //! - 2026-09-10 (#3394): `memory_pending_approve` / `memory_pending_reject`
     //!   advertised `remember=forever` progressive trust. Forever cannot be
     //!   honoured durably (process-local `SYNTHETIC_RULES` only; #3580).
@@ -1903,6 +1910,10 @@ mod d1_6_987_tests {
         "memory_export_reflection",
         "memory_forget",
         "memory_gc",
+        // #3730 — advertised `access_count==0` as the unread marker, a touch
+        // counter no inbox operation advanced; the inbox is now the pending
+        // set and the docs say so (handled = deleted by the recipient).
+        "memory_inbox",
         "memory_ingest_multistep",
         "memory_kg_invalidate",
         "memory_lease_release",
