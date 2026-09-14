@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# FROZEN VERBATIM pre-#3711 copy of scripts/check-foreign-text-to-caller.py (gates/3688 @ 3c15a1491), the
+# R-203 control for the block-exit fix: its self-test leg must ACCEPT the laundered block tail the live
+# gate rejects. Never edit; replace only with a newer frozen prefix when the next defect class lands.
 # check-foreign-text-to-caller.py — #3688 gate 7: FOREIGN TEXT CROSSING TO A CALLER.
 #
 # The rule keys on two properties of a VALUE, neither of which is a name:
@@ -24,13 +27,6 @@
 # renders `e.to_string()` unsanitised is walked back through the variant's text fields to their
 # construction sites, which is how a DSN label that reaches a 503 body is found without any
 # name matching.
-#
-# Block bodies are judged by their EXITS (#3711 gate-7 finding): a `.map_err(|e| { ..; format!(..) })`
-# or arm body renders only its tail expression and its `return <x>` payloads, each resolved at its own
-# offset so a `let` inside the block is a binding site. Judging the whole block as one expression let
-# any OWN marker in a preceding statement (`e.classify()`, a validate_*, a parse) launder a `{text}`
-# the tail interpolated; the frozen pre-fix copy at scripts/test/fixtures/foreign-text-prefix-3711.py
-# is the R-203 control that still accepts that shape.
 #
 # Usage:
 #   scripts/check-foreign-text-to-caller.py [ROOT] [--json] [--verbose] [--only=<src/file.rs>]
@@ -460,57 +456,10 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
     CALL_RE = re.compile(r'^\s*((?:[A-Za-z_][A-Za-z0-9_]*::)*)([a-z_][a-z0-9_]*)\s*\((.*)\)\s*(?:\?|\.into\(\)|\.to_string\(\))?\s*$', re.S)
     SERDE_RE = re.compile(r'serde_json::to_|to_string_pretty|serde_json::from_|from_str\(|from_slice\(|from_reader\(|from_value\(')
     DOWNCAST_RE = re.compile(r'downcast_ref::<([A-Za-z0-9_:]+)>')
-    def block_exits(block):
-        """For a `{ ... }` body: the top-level `return <expr>` payloads and the tail expression, each as
-        (offset-within-block, text). Brackets and string literals are respected, so a `;` inside a nested
-        closure or a message literal does not split a statement."""
-        inner = blank_literals(block)
-        depth = 0; start = 1; stmts = []
-        i = 1
-        while i < len(inner) - 1:
-            c = inner[i]
-            if c in '([{': depth += 1
-            elif c in ')]}': depth -= 1
-            elif c == ';' and depth == 0:
-                stmts.append((start, i)); start = i + 1
-            i += 1
-        exits = []
-        # every `return <x>` in the block, at ANY brace depth (a return inside a nested `if { .. }`
-        # still exits the closure); its payload runs to the first `;` at the return's own depth
-        for rm in re.finditer(r'(?<![A-Za-z0-9_])return\b\s*', inner):
-            j = rm.end(); d = 0
-            while j < len(inner) - 1:
-                c = inner[j]
-                if c in '([{': d += 1
-                elif c in ')]}':
-                    if d == 0: break
-                    d -= 1
-                elif c == ';' and d == 0: break
-                j += 1
-            if block[rm.end():j].strip(): exits.append((rm.end(), block[rm.end():j]))
-        tail = block[start:len(block)-1]
-        if tail.strip(): exits.append((start, tail))
-        return exits
-
     def taint_expr(expr, f, at, depth, trail, side='err'):
         if not expr: return CLEAN
         if depth > MAX_DEPTH: state['exhausted'] = True; return CLEAN
         st = expr.strip()
-        # #3688/#3711 gate-7 finding — a BLOCK body (`.map_err(|e| { ...; format!(..) })`, an arm body)
-        # renders only what its exits render: the tail expression and any top-level `return <x>`. The
-        # statements before them are the tail's BINDING SITES, not evidence about what it renders.
-        # Judging the whole block as one expression let a single OWN marker in any statement
-        # (`e.classify()`, a `validate_*`, a `parse`) launder a `{text}` interpolated by the tail —
-        # the shape that hid the peer body in `forward_to_http`'s parse-failure arm. Each exit is
-        # judged at its OWN offset, so a `let` inside the block is still found by resolve_ident.
-        if st.startswith('{') and st.endswith('}') and find_matching(st, 0, '{', '}') == len(st) - 1:
-            base = at + expr.find(st)
-            exits = block_exits(st)
-            if exits:
-                for (off, ex) in exits:
-                    r = taint_expr(ex, f, base + off, depth + 1, trail + ['block-exit'], side)
-                    if r: return r
-                return CLEAN
         mm = re.match(r'match\s+(.+?)\s*\{', st, re.S)
         if mm and st.endswith('}'):
             return taint_expr(mm.group(1), f, at, depth + 1, trail + ['match-subject'], side)
@@ -1285,52 +1234,6 @@ fn only_sanitised(url: &str) -> Result<Value, String> {
     let target = crate::url_display::url_origin_and_path(url);
     Err(format!("forward refused for {target}"))
 }
-fn block_tail_laundered(url: &str) -> Result<Value, String> {
-    // #3711 gate-7 finding (d3f0d9544 probe) — a BLOCK closure body whose TAIL interpolates the peer
-    // body {text} after a statement carrying an OWN marker (`e.classify()`; equally a validate_* /
-    // parse / decode call). The old whole-block judgement let the marker launder the tail: RED.
-    let target = crate::url_display::url_origin_and_path(url);
-    let resp = reqwest::blocking::get(url).map_err(|e| crate::url_display::network_failure(&e))?;
-    let status = resp.status();
-    let text = resp.text().map_err(|e| crate::url_display::network_failure(&e))?;
-    serde_json::from_str::<Value>(&text).map_err(|e| {
-        let (category, line, column) = (e.classify(), e.line(), e.column());
-        format!(
-            "parse body from {target}: {category:?} at line {line} column {column} (raw: {text})"
-        )
-    })
-}
-fn block_return_exit(url: &str) -> Result<Value, String> {
-    // A block whose TAIL is clean but whose early `return` renders the peer body: RED. The
-    // exits of a block are its tail AND every top-level `return`, not the tail alone.
-    let resp = reqwest::blocking::get(url).map_err(|e| crate::url_display::network_failure(&e))?;
-    let text = resp.text().map_err(|e| crate::url_display::network_failure(&e))?;
-    serde_json::from_str::<Value>(&text).map_err(|e| {
-        if text.len() > 4096 {
-            return format!("peer body too long: {text}");
-        }
-        let _ = e.classify();
-        String::from("parse failed")
-    })
-}
-fn block_tail_bound_sanitiser(url: &str) -> Result<Value, String> {
-    // CONTROL (the d3f0d9544 transport.rs shape) — a block whose tail renders a value BOUND from the
-    // url_display sanitiser is CLEAN: the let inside the block is the binding site, and the boundary
-    // holds through it. The own-code serde construction (classify/line/column, never {e}) is CLEAN too.
-    let target = crate::url_display::url_origin_and_path(url);
-    let resp = reqwest::blocking::get(url).map_err(|e| {
-        let reason = crate::url_display::network_failure(&e);
-        format!("POST {target}: {reason}")
-    })?;
-    let text = resp.text().map_err(|e| {
-        let reason = crate::url_display::network_failure(&e);
-        format!("read body from {target}: {reason}")
-    })?;
-    serde_json::from_str::<Value>(&text).map_err(|e| {
-        let (category, line, column) = (e.classify(), e.line(), e.column());
-        format!("parse body from {target}: {category:?} at line {line} column {column}")
-    })
-}
 ''')
     _write(root, 'src/hooks/chain.rs', '''
 async fn fire(executor: &Executor, event: Event) -> ChainResult {
@@ -1413,20 +1316,6 @@ def self_test(scratch):
     expect(has('src/mcp/tools/relay.rs', ':forward_sanitised:mcp-error:http'), '#3711 mixed sink fires on the peer body {text} (http)')
     expect(not has('src/mcp/tools/relay.rs', ':forward_sanitised:mcp-error:dsn'), '#3711 the url_display-sanitised {target} is NOT flagged as dsn (taint stops at the sanitiser, does not walk to the arg)')
     expect(not has('src/mcp/tools/relay.rs', ':only_sanitised:'), '#3711 a sink rendering ONLY a url_display-rendered value is CLEAN')
-    expect(has('src/mcp/tools/relay.rs', ':block_tail_laundered:mcp-error:http'), 'BLOCK-TAIL (d3f0d9544 probe): a closure block whose tail interpolates {text} after an OWN-marker statement (e.classify()) stays RED — the marker does not launder the tail')
-    expect(has('src/mcp/tools/relay.rs', ':block_return_exit:mcp-error:http'), 'BLOCK-RETURN: a clean tail does not hide a top-level `return` that renders the peer body')
-    expect(not has('src/mcp/tools/relay.rs', ':block_tail_bound_sanitiser:'), 'BLOCK CONTROL (the fixed transport.rs shape): a tail rendering a url_display-bound `reason`, or an own-code serde classify/line/column construction, is CLEAN')
-    # R-203 — the FROZEN pre-fix gate must ACCEPT the laundered block tail (reproducing the defect the
-    # d3f0d9544 probe found); a self-test that only proved the live gate rejects it would be tautological.
-    prefix = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3711.py')
-    try:
-        import subprocess
-        out = subprocess.run([sys.executable, prefix, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
-        frozen_fails = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
-        expect(not any(':block_tail_laundered:' in k for k in frozen_fails), 'R-203: the FROZEN pre-fix gate (test/fixtures/foreign-text-prefix-3711.py) ACCEPTS the laundered block tail — the defect reproduces')
-        expect(any(':forward_sanitised:mcp-error:http' in k for k in frozen_fails), 'R-203 sanity: the frozen gate still rejects the single-line {text} sink, so its silence on the block is the defect, not a broken run')
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
-        expect(False, f'R-203: frozen prefix gate could not be run ({ex})')
     expect(has('src/hooks/chain.rs', ':fire:deny-reason:proc'), 'hook subprocess text in Deny.reason (#3704)')
     expect(has('src/errors.rs', ':from:memory-error:db'), 'From<rusqlite::Error> -> MemoryError::DatabaseError(e.to_string())')
     expect(has('src/subscriptions.rs', ':send:dlq-record:http'), "receiver's ack field persisted into subscription_dlq.last_error")
