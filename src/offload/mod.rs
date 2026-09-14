@@ -349,8 +349,10 @@ impl<'a> ContextOffloader<'a> {
         // (`sweep_expired`) deletes by `stored_at + ttl` without ever calling
         // `deref` — so an absence-of-caller exemption would protect nothing
         // and leave the leak open on the CLI path.
+        // `ttl_seconds = 0` is the caller's explicit "expire immediately"
+        // (#3171 admits it; the sweep reaps it on its next pass) — it is not
+        // "no TTL", so there is no `ttl > 0` arm here.
         if let Some(ttl) = ttl_seconds
-            && ttl > 0
             && stored_at.saturating_add(ttl) <= now_unix_seconds()
         {
             return Err(anyhow!(OffloadError::NotFound {
@@ -800,6 +802,44 @@ mod tests {
             .deref(&live.ref_id, None)
             .expect("#3392: unexpired blob served");
         assert_eq!(back.content, "still here");
+    }
+
+    /// #3392 (review flag 2) — an explicitly-zero TTL means "expire
+    /// immediately", exactly as the sweep reads it; the read gate must not
+    /// treat `0` as "no TTL".
+    #[test]
+    fn deref_refuses_zero_ttl_blob_immediately_3392() {
+        let conn = fresh_db();
+        let off = ContextOffloader::new(&conn, None, OffloadConfig::default());
+        let now = now_unix_seconds();
+        conn.execute(
+            "INSERT INTO offloaded_blobs
+                (ref_id, namespace, content_zstd, content_sha256,
+                 stored_at, ttl_seconds, agent_id, signature_b64)
+             VALUES ('zero-ttl', 'ns', X'00', 'deadbeef', ?1, 0, 'ai:alice', '')",
+            params![now],
+        )
+        .expect("seed zero-ttl blob");
+        for caller in [None, Some("ai:alice")] {
+            let err = off
+                .deref("zero-ttl", caller)
+                .expect_err("#3392: ttl_seconds = 0 expires immediately on every caller path");
+            let downcast = err
+                .downcast_ref::<OffloadError>()
+                .expect("OffloadError variant");
+            assert!(
+                matches!(downcast, OffloadError::NotFound { .. }),
+                "leak-resistant NotFound for caller {caller:?}, got {downcast:?}"
+            );
+        }
+        // CONTROL — `ttl_seconds = NULL` (no TTL) stored at the same instant is served.
+        let forever = off
+            .offload("kept", "ns", None, "ai:alice")
+            .expect("offload no-ttl");
+        assert_eq!(
+            off.deref(&forever.ref_id, None).expect("served").content,
+            "kept"
+        );
     }
 
     #[test]
