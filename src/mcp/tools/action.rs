@@ -630,9 +630,15 @@ pub fn handle_lease_get(conn: &rusqlite::Connection, params: &Value) -> Result<V
     // name an action".
     let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
     let found = crate::actions::lease_get(conn, action_id).map_err(|e| e.to_string())?;
+    // #3367 — an EXPIRED lease must not read as LIVE. `lease_get` returns the row
+    // regardless of expiry; a lapsed lease (`expires_at <= now`) is reported as
+    // absent (`null`) — the same view the next frontier/next/acquire sweep produces
+    // once it reclaims the row. Pure read: no state change on a GET (the reclaim
+    // still happens on the allocating paths that piggyback the sweep).
+    let now = chrono::Utc::now().timestamp();
     let lease = match found {
-        Some(l) => serde_json::to_value(&l).map_err(|e| e.to_string())?,
-        None => Value::Null,
+        Some(l) if l.expires_at > now => serde_json::to_value(&l).map_err(|e| e.to_string())?,
+        _ => Value::Null,
     };
     Ok(json!({ "lease": lease }))
 }
@@ -1973,6 +1979,46 @@ mod handler_tests {
         assert_eq!(released["released"].as_bool(), Some(true));
         let absent = handle_lease_get(&conn, &json!({ "action_id": id })).expect("get ok");
         assert!(absent["lease"].is_null());
+    }
+
+    #[test]
+    fn lease_get_reports_expired_lease_as_absent_3367() {
+        // #3367 — an EXPIRED lease must not read as LIVE. `lease_get` returns the
+        // row regardless of expiry; a lapsed lease now reads as `null`.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+        handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id, "holder": "holder-a", "ttl_secs": 120 }),
+        )
+        .expect("acquire ok");
+        // CONTROL — a live lease still reads as held.
+        let live = handle_lease_get(&conn, &json!({ "action_id": id })).expect("get ok");
+        assert_eq!(
+            live["lease"]["holder"].as_str(),
+            Some("holder-a"),
+            "#3367: a live lease still reads as held"
+        );
+        // Expire it in place (deterministic — no sleep).
+        conn.execute(
+            "UPDATE leases SET expires_at = 1 WHERE action_id = ?1",
+            [&id],
+        )
+        .expect("expire the lease");
+        let got = handle_lease_get(&conn, &json!({ "action_id": id })).expect("get ok");
+        assert!(
+            got["lease"].is_null(),
+            "#3367: an EXPIRED lease must read as null, not as a live lease"
+        );
     }
 
     #[test]
