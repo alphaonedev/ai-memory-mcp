@@ -338,8 +338,10 @@ pub fn handle_load_family(
     // form (`""`) because the query has no table alias.
     let lifecycle_vis = crate::models::lifecycle_visible_clause("");
     let sql = format!(
-        "SELECT id, tier, namespace, title, content, tags, priority, confidence, source, \
-                access_count, created_at, updated_at, last_accessed_at, expires_at, metadata \
+        // #3373 — project EVERY column (as `get` does via SELECT *) so `row_to_memory`
+        // reads the REAL confidence_source / cid / version / valid_* etc. row_to_memory
+        // reads by NAME, so `*` is safe; the WHERE/family/lifecycle/ORDER/LIMIT are unchanged.
+        "SELECT * \
          FROM memories \
          WHERE (?1 IS NULL OR namespace = ?1) \
            AND json_extract(metadata, '$.family') = ?2 \
