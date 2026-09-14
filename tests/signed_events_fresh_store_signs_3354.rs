@@ -118,7 +118,7 @@ fn ledger_levels(db: &Path) -> Vec<(String, i64)> {
 }
 
 /// THE regression: an empty key directory, a resolved id nobody
-/// provisioned, one turn — the row is `daemon_signed`, the key was
+/// provisioned, one turn — the row is `self_signed`, the key was
 /// generated (0600) for exactly that id, and NO row is `unsigned`.
 #[test]
 fn fresh_store_signs_the_ledger_from_its_first_row_3354() {
@@ -161,8 +161,8 @@ fn fresh_store_signs_the_ledger_from_its_first_row_3354() {
     assert!(
         levels
             .iter()
-            .any(|(level, n)| level == "daemon_signed" && *n >= 1),
-        "{ISSUE}: the turn's row is daemon_signed: {levels:?}"
+            .any(|(level, n)| level == "self_signed" && *n >= 1),
+        "{ISSUE}: the turn's row is self_signed (L4: the capture-turn row is signed by the resolved agent`s own key): {levels:?}"
     );
 
     // A second turn re-uses the generated key: still signed, still no
