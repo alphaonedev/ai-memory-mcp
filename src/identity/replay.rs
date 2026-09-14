@@ -1276,8 +1276,11 @@ impl FederationNonceCache {
         let m = crate::metrics::registry();
         m.federation_nonce_cache_persistence_state
             .set(i64::from(NoncePersistenceState::Durable as u8));
+        // #3662 (review fold) — the FIRST successful write creates the
+        // series; before that a scrape carries no timestamp at all.
         #[allow(clippy::cast_possible_wrap)]
         m.federation_nonce_cache_last_persisted_at_seconds
+            .with_label_values(&[])
             .set(now as i64);
     }
 
@@ -1297,8 +1300,14 @@ impl FederationNonceCache {
                 .set(FEDERATION_NONCE_MAX_PEERS as i64);
             m.federation_nonce_cache_per_peer_capacity
                 .set(FEDERATION_NONCE_CAPACITY_PER_PEER as i64);
-            m.federation_nonce_cache_last_persisted_at_seconds
-                .set(self.last_persist_ok_unix.load(Ordering::Relaxed) as i64);
+            // #3662 (review fold) — never publish a "0 = never" timestamp:
+            // the series exists only once a successful write has stamped it.
+            let last_ok = self.last_persist_ok_unix.load(Ordering::Relaxed);
+            if last_ok != 0 {
+                m.federation_nonce_cache_last_persisted_at_seconds
+                    .with_label_values(&[])
+                    .set(last_ok as i64);
+            }
         }
         m.federation_nonce_cache_persistence_state
             .set(i64::from(self.persistence_state.load(Ordering::Relaxed)));
@@ -1992,12 +2001,9 @@ mod federation_nonce_cache_tests {
         assert_eq!(cache.persistence_failures(NoncePersistenceOp::Open), 1);
         assert!(h.persistence.last_failure_at_seconds.is_some());
         assert!(h.persistence.degraded_since_at_seconds.is_some());
-        assert_eq!(
-            crate::metrics::registry()
-                .federation_nonce_cache_persistence_state
-                .get(),
-            i64::from(NoncePersistenceState::Degraded as u8)
-        );
+        // (#3662 review) no pin on the process-global state GAUGE here: every
+        // cache instance publishes it, so under parallel tests it is not
+        // this cache's value; the cache-local assertions above are the pin.
 
         // Repair: remove the shadow directory; the next write re-creates the
         // database and the state returns to durable.
@@ -2008,12 +2014,6 @@ mod federation_nonce_cache_tests {
         assert_eq!(h.persistence.restart_protection, RestartProtection::Durable);
         assert_eq!(h.persistence.degraded_since_at_seconds, None);
         assert_eq!(h.persistence.failures_total, 1, "history is kept");
-        assert_eq!(
-            crate::metrics::registry()
-                .federation_nonce_cache_persistence_state
-                .get(),
-            i64::from(NoncePersistenceState::Durable as u8)
-        );
     }
 
     #[test]

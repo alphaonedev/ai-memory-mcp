@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Registry, TextEncoder,
 };
 
 // =====================================================================
@@ -228,7 +228,12 @@ pub struct Metrics {
     /// #3662 — unix seconds of the last fully successful persistence
     /// write; `0` = none since boot (a rehydrated-but-idle daemon reports
     /// `0` honestly rather than inventing a timestamp).
-    pub federation_nonce_cache_last_persisted_at_seconds: IntGauge,
+    /// #3662 (review fold) — a zero-label family whose single child is
+    /// created on the FIRST successful persistence write, so the series is
+    /// ABSENT from a scrape until then: a moment in time cannot be "none",
+    /// and `0` would be indistinguishable from 1970-01-01. The `/health`
+    /// twin renders `null` for the same fact.
+    pub federation_nonce_cache_last_persisted_at_seconds: IntGaugeVec,
 
     /// #1032 (HIGH, 2026-05-21) — monotonic counter for DLQ rows the
     /// replay worker has marked as quarantined (`attempt_count >=
@@ -830,10 +835,14 @@ impl Metrics {
              replay window.",
         )?;
         registry.register(Box::new(federation_nonce_cache_persistence_state.clone()))?;
-        let federation_nonce_cache_last_persisted_at_seconds = IntGauge::new(
-            "ai_memory_federation_nonce_cache_last_persisted_at_seconds",
-            "Unix seconds of the last fully successful federation \
-             nonce-cache persistence write; 0 = none since boot.",
+        let federation_nonce_cache_last_persisted_at_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_nonce_cache_last_persisted_at_seconds",
+                "Unix seconds of the last fully successful federation \
+                 nonce-cache persistence write. ABSENT until the first \
+                 successful write since boot (never 0).",
+            ),
+            &[],
         )?;
         registry.register(Box::new(
             federation_nonce_cache_last_persisted_at_seconds.clone(),
@@ -1606,6 +1615,12 @@ mod tests {
         registry().hnsw_size_gauge.set(42);
         registry().subscriptions_active_gauge.set(3);
         registry().federation_push_dlq_depth.set(0);
+        // #3662 — the timestamp family has no child until a successful
+        // persistence write; tickle it so the name check below sees it.
+        registry()
+            .federation_nonce_cache_last_persisted_at_seconds
+            .with_label_values(&[])
+            .set(1);
         // FED-P4-e — federation identity SLO surfaces.
         record_federation_cred_verify(true);
         record_federation_inbound_cred(true);
@@ -1783,6 +1798,35 @@ mod tests {
         let text = render();
         assert!(
             text.contains("ai_memory_autonomy_hook_total{kind=\"contradiction\",result=\"err\"")
+        );
+    }
+
+    /// #3662 (review fold) — `..._last_persisted_at_seconds` is a moment in
+    /// time: it must be ABSENT from a scrape until the first successful
+    /// persistence write, never rendered as `0`. Pinned on a PRIVATE
+    /// `Metrics` so no parallel test can create the child first.
+    #[test]
+    fn nonce_cache_last_persisted_series_is_absent_until_first_write_3662() {
+        let m = Metrics::try_new().expect("private metrics");
+        let render = |m: &Metrics| {
+            let mut buf = Vec::new();
+            TextEncoder::new()
+                .encode(&m.registry.gather(), &mut buf)
+                .expect("encode");
+            String::from_utf8(buf).expect("utf8")
+        };
+        let before = render(&m);
+        assert!(
+            !before.contains("ai_memory_federation_nonce_cache_last_persisted_at_seconds"),
+            "no series before the first successful write (a moment in time cannot be 0):\n{before}"
+        );
+        m.federation_nonce_cache_last_persisted_at_seconds
+            .with_label_values(&[])
+            .set(1_700_000_000);
+        let after = render(&m);
+        assert!(
+            after.contains("ai_memory_federation_nonce_cache_last_persisted_at_seconds 1700000000"),
+            "the series appears with the measured instant after the first write:\n{after}"
         );
     }
 
