@@ -16,19 +16,15 @@
 #   Still wants `redact_url_password` eventually (a caller may paste the error into
 #   a ticket), but it fails in the safe direction.
 #
-# CRITICAL — disclosure-direction sites, NOT allowlisted, must fail until fixed:
-#   src/daemon_runtime.rs:sync_cycle_once:log:{peer_url}
-#   src/daemon_runtime.rs:run_sync_daemon_with_shutdown_using_client:log:{peer_url}
-#       sync-daemon logs the raw configured peer URL (#3667; fix in flight on
-#       fix/3667-url-query-password-redaction-v2 — this gate goes green there)
-#   src/subscriptions.rs:send:log:{url}                         (3 sites)
-#       registered webhook URL in tracing::warn! — may carry basic-auth
-#       (NEEDS AN ISSUE; not covered by #3667)
-#   src/subscriptions.rs:validate_url_dns_with:log:{url}        (1 site)
-#       the SSRF-guard degrade WARN carries the URL — same class as `send`
-#   src/mcp/tools/store/transport.rs:forward_to_http:error:{url} (4 sites)
-#       the CONFIGURED forward URL in error Strings that surface as MCP error
-#       text and get logged by the tool loop (NEEDS AN ISSUE; not covered by #3667)
+# DISCLOSURE-direction sites are never allowlisted as ECHO. Those still open are held in the
+# PENDING-FIX LEDGER at the bottom of this file (`<key>=pending:#NNNN`): the gate prints them as
+# INFO, counts them live per issue, and reports the entry as a NOTICE once no site matches — that
+# staleness is the issue's acceptance test. History of the baseline set (2026-09-13):
+#   src/mcp/tools/store/transport.rs:forward_to_http:error:{url} (4 sites) — the CONFIGURED forward
+#       URL in MCP error text: closed by #3711 (fix/3711 @ d3f0d9544 lands before this gate).
+#   src/daemon_runtime.rs:{sync_cycle_once,run_sync_daemon_with_shutdown_using_client}:log:{peer_url}
+#   src/subscriptions.rs:{send (3 sites),validate_url_dns_with}:log:{url}
+#       — #3710, ledgered below; a GA blocker, sequenced after the gate lands.
 #
 # ECHO direction — allowlisted with reason:
 #
@@ -45,3 +41,12 @@ src/subscriptions.rs:validate_url_dns_with:error:{url}
 # does not widen exposure. Redact when convenient.
 src/cli/doctor.rs:http_get_json:error:{url}
 src/cli/doctor.rs:section_capabilities_remote:error:{url}
+
+# PENDING-FIX LEDGER (Conductor ruling, #3688 c5660422072, 2026-09-14). Grammar: <key>=pending:#NNNN.
+# A real disclosure-direction sink held under its tracking issue: reported as INFO, counted live,
+# and the entry going STALE (NOTICE) is that issue's acceptance test. #3710 stays a GA blocker —
+# credential-bearing peer/webhook URLs in log lines that ship to an aggregator; this is sequencing.
+src/daemon_runtime.rs:sync_cycle_once:log:{peer_url}=pending:#3710
+src/daemon_runtime.rs:run_sync_daemon_with_shutdown_using_client:log:{peer_url}=pending:#3710
+src/subscriptions.rs:send:log:{url}=pending:#3710
+src/subscriptions.rs:validate_url_dns_with:log:{url}=pending:#3710
