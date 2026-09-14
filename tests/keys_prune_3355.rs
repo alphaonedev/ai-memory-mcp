@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![cfg(unix)]
+// #3733 — key dirs created 0700 (not the ambient umask; the #3198 guard
+// refuses a group-writable key dir at umask 0002).
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -19,7 +24,7 @@ impl Fixture {
         let home = root.join("home");
         let keys = root.join("keys");
         std::fs::create_dir(&home).unwrap();
-        std::fs::create_dir(&keys).unwrap();
+        key_dir_sandbox::mkdir_0700(&keys);
         let db = root.join("registry.db");
         let conn = ai_memory::db::open(&db).unwrap();
         ai_memory::db::register_agent(&conn, "registered-3355", "system", &[]).unwrap();

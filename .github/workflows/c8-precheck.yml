@@ -476,6 +476,22 @@ jobs:
         # process stdin in a #[test]; the gate must reject it.
         run: bash scripts/check-test-stdin-reads.sh --self-test
 
+  test-keydir-mode-gate:
+    # #3733 — a test that creates a directory it uses as a key dir MUST use
+    # tests/common/key_dir_sandbox.rs::mkdir_0700 (create + chmod 0700),
+    # never a bare create_dir[_all]: a bare-created key dir is 0o755 at
+    # umask 022 but 0o775 at umask 0002, and the #3198 key-dir guard
+    # CORRECTLY refuses a group-writable key dir. Three fixtures hit that
+    # shape this release (#3705, #3733, #3582/#3436); this gate keeps the
+    # next one from being mistaken for a product defect.
+    name: Test key-dir mode gate (#3733)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run key-dir mode gate
+        run: bash scripts/check-test-keydir-mode.sh
+
   migration-ladder-gate:
     # v1.0.0 guardrail-D (2x5-vote decision memory b682c76a) — fail-closed
     # migration-ladder-uniqueness gate. Structurally prevents the silent
