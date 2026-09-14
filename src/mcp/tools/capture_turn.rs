@@ -599,9 +599,13 @@ pub(crate) fn prepare_capture_turn(
             // `content_attestation` (a verbatim pass-through of this field)
             // under-reported every captured turn as `claimed` — the stamp was
             // missing at the WRITER, not misread at the reader.
+            // The value passes the OWNER's gate (`identity::verify`): a member
+            // of the closed memory stamp set or a refused write — never an
+            // unlisted fifth value stamped by accident (#3548).
+            let stamped = crate::identity::verify::memory_stamp_value(&attest_level)?;
             obj.insert(
                 field_names::ATTEST_LEVEL.to_string(),
-                Value::String(attest_level.clone()),
+                Value::String(stamped.to_string()),
             );
         }
         // v1.0.0 (#1945, spec §4) — a captured turn's `Observation` kind is
