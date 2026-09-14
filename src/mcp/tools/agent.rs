@@ -3,6 +3,7 @@
 
 //! MCP agent-registration and agent-list handlers.
 
+use crate::mcp::param_guard;
 use crate::mcp::param_names;
 use crate::models::field_names;
 use crate::{db, validate};
@@ -41,14 +42,13 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
     // "refreshes last_seen_at; preserves registered_at". Refuse a type/capability
     // change unless the caller explicitly opts in with `update: true`; when they
     // do, the prior values are recorded in the audit row below.
-    let update = params
-        .get("update")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let existing = db::list_agents(conn)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|a| a.agent_id == agent_id);
+    // `update` is type-strict (#3171 shape): absent → false; a PRESENT
+    // non-boolean (the string "true", or 1) is refused, not read as false.
+    let update = param_guard::optional_bool(params, "update")?.unwrap_or(false);
+    // A targeted single-agent lookup — registration is a boot-path call for
+    // every agent in a fleet, so a full `_agents` scan per register is not
+    // acceptable (review).
+    let existing = db::get_agent(conn, agent_id).map_err(|e| e.to_string())?;
     let identity_change = existing.as_ref().is_some_and(|ex| {
         let (mut had, mut want) = (ex.capabilities.clone(), capabilities.clone());
         had.sort();
@@ -285,6 +285,20 @@ mod tests {
             err.contains("refused") && err.contains("update:true"),
             "#3372: differing re-register must be refused pointing at update:true, got: {err}"
         );
+        // A PRESENT wrong-typed `update` is refused as such, never read as false
+        // (the caller who typed the string "true" learns why, not "pass update:true").
+        for bad in [json!("true"), json!(1)] {
+            let err = handle_agent_register(
+                &conn,
+                &json!({"agent_id": "ai:dup-3372", "agent_type": "ai:worker-v2",
+                        "capabilities": ["recall"], "update": bad}),
+            )
+            .expect_err("#3372: a wrong-typed update must be refused");
+            assert!(
+                err.contains("update must be a boolean"),
+                "#3372: got: {err}"
+            );
+        }
         // the stored identity is UNCHANGED by the refused call.
         let a = crate::db::list_agents(&conn)
             .unwrap()
