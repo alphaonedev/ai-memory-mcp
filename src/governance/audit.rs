@@ -2240,6 +2240,20 @@ pub fn load_enrolled_witness_pubkey() -> Result<Option<VerifyingKey>> {
 /// repeat). Resolve via [`resolve_audit_pubkey`].
 pub const AUDIT_PUBKEY_ENV: &str = "AI_MEMORY_AUDIT_PUBKEY";
 
+/// #3354 / #3479 — the ONE spelling of the require-mode limitation, rendered
+/// by `verify-audit-trail` beside a signature-coverage FAIL and cited by the
+/// `--audit-pubkey` / [`AUDIT_PUBKEY_ENV`] documentation. A customer who ran
+/// unsigned and later provisioned a key cannot bring the historical prefix
+/// under the pin: provisioning the key does not clear the past, and in
+/// v1.0.0 there is no supported in-product remedy (the epoch-seal /
+/// re-anchor of an unsigned prefix is #3479, v1.0.1). Require-mode is for
+/// chains signed from the beginning — which, since #3354, every fresh store
+/// is.
+pub const UNSIGNED_PREFIX_LIMITATION: &str = "rows written before this node's signing key \
+     existed are unsigned and stay unsigned: provisioning the key does not clear the past, \
+     and v1.0.0 has no in-product remedy (epoch-seal / re-anchor is #3479, v1.0.1). The \
+     AI_MEMORY_AUDIT_PUBKEY pin is for chains signed from their first row.";
+
 /// v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin from the `--audit-pubkey`
 /// CLI flag (highest precedence — the universal CLI-flag-wins ladder; the value
 /// is a PUBLIC key, so world-readable argv is not a confidentiality concern) then
