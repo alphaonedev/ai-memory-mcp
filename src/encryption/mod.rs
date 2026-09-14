@@ -541,6 +541,100 @@ impl std::fmt::Display for KeyGenerationGap {
 
 impl std::error::Error for KeyGenerationGap {}
 
+/// #3718 (review) — the SEAL path asked to mint a key for `agent_id`, but
+/// that agent already has sealed rows in the store and no live key: the
+/// key was lost (or the key directory wiped), it is not a fresh agent.
+/// Minting would fork the key generation and strand every existing sealed
+/// row behind a key nobody holds. Refused, same audience split as
+/// [`KeyAbsent`]: the caller gets the class and the count, the operator
+/// line gets the expected path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealRefusedSealedRowsExist {
+    /// The agent whose sealed rows would be stranded.
+    pub agent_id: String,
+    /// How many sealed rows (`encrypted_envelope IS NOT NULL`) that agent has.
+    pub sealed_rows: u64,
+    /// Where the `.x25519.priv` is expected. Operator-log only.
+    pub expected_path: PathBuf,
+}
+
+impl SealRefusedSealedRowsExist {
+    /// The caller-facing failure class.
+    pub const CLASS: &'static str = "seal_refused_sealed_rows_exist";
+
+    /// The operator-log line: names the expected path and the remedy.
+    #[must_use]
+    pub fn operator_line(&self) -> String {
+        format!(
+            "{ISSUE_TAG}: refusing to mint a NEW at-rest key for agent {:?}: that agent already \
+             has {} sealed row(s) and no live key at {} — the key was lost, this is not a fresh \
+             agent; a new key would strand every sealed row. Restore the key from backup (or \
+             the #3717 escrow); nothing was written",
+            self.agent_id,
+            self.sealed_rows,
+            self.expected_path.display()
+        )
+    }
+}
+
+impl std::fmt::Display for SealRefusedSealedRowsExist {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{ISSUE_TAG}: refusing to seal for agent {:?} (class: {}) — {} sealed row(s) already \
+             exist and the key is missing; minting would strand them; the operator log names \
+             the expected path",
+            self.agent_id,
+            Self::CLASS,
+            self.sealed_rows
+        )
+    }
+}
+
+impl std::error::Error for SealRefusedSealedRowsExist {}
+
+/// #3718 (review) — `Some` when `err` is (or wraps) a
+/// [`SealRefusedSealedRowsExist`].
+#[must_use]
+pub fn seal_refused_sealed_rows_exist(err: &anyhow::Error) -> Option<&SealRefusedSealedRowsExist> {
+    err.downcast_ref::<SealRefusedSealedRowsExist>()
+}
+
+/// #3718 (review) — whether sealing for `agent_id` would MINT a key: at-rest
+/// encryption is on, the content is non-empty, the agent id is set, and no
+/// live key is loadable. The store-owning callers probe their sealed-row
+/// count only in this case (the probe is a query; the module has no store).
+///
+/// # Errors
+/// The key directory cannot be resolved, or a present key is unreadable.
+pub fn seal_would_mint(content: &str, agent_id: &str) -> Result<bool> {
+    if !encryption_enabled(None) || content.is_empty() || agent_id.is_empty() {
+        return Ok(false);
+    }
+    Ok(load_keypair(agent_id)?.is_none())
+}
+
+/// #3718 (review) — build the typed refusal for a seal that would strand
+/// `sealed_rows` existing rows, and put the operator line on the log.
+#[must_use]
+pub fn seal_refusal_for_sealed_rows(agent_id: &str, sealed_rows: u64) -> anyhow::Error {
+    let refusal = SealRefusedSealedRowsExist {
+        agent_id: agent_id.to_string(),
+        sealed_rows,
+        expected_path: expected_priv_path(agent_id),
+    };
+    tracing::error!(
+        target: TRACING_TARGET,
+        agent_id = %refusal.agent_id,
+        sealed_rows = refusal.sealed_rows,
+        expected_path = %refusal.expected_path.display(),
+        class = SealRefusedSealedRowsExist::CLASS,
+        "{}",
+        refusal.operator_line()
+    );
+    anyhow::Error::new(refusal)
+}
+
 /// #3718 — `Some` when `err` is (or wraps) a [`KeyAbsent`].
 #[must_use]
 pub fn key_absent(err: &anyhow::Error) -> Option<&KeyAbsent> {
@@ -561,6 +655,8 @@ pub fn key_generation_gap(err: &anyhow::Error) -> Option<&KeyGenerationGap> {
 pub fn read_failure_detail(err: &anyhow::Error) -> String {
     if let Some(absent) = key_absent(err) {
         format!("{}: {absent}", KeyAbsent::CLASS)
+    } else if let Some(refused) = seal_refused_sealed_rows_exist(err) {
+        format!("{}: {refused}", SealRefusedSealedRowsExist::CLASS)
     } else if let Some(gap) = key_generation_gap(err) {
         format!("{}: {gap}", KeyGenerationGap::CLASS)
     } else {

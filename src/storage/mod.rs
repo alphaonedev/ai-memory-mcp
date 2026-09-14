@@ -1439,6 +1439,56 @@ impl UpsertSeal {
 /// Cost: ONE indexed lookup, and ONLY when at-rest encryption is enabled —
 /// the default path returns the incoming id without touching the connection,
 /// so an encryption-off deployment is byte-identical to pre-#2383.
+/// #3718 (review) — seal `content` for `agent_id` WITHOUT forking the key
+/// generation. When at-rest encryption is on and no live key is loadable for
+/// `agent_id`, the seal path is the one place a key may be minted — but only
+/// for a genuinely fresh agent. An agent that already has sealed rows
+/// (`encrypted_envelope IS NOT NULL`) and no key has LOST its key (or the
+/// key directory was wiped); minting a new one would strand every existing
+/// row behind a key nobody holds. This wrapper probes the sealed-row count
+/// for exactly that case and refuses with the typed
+/// [`crate::encryption::SealRefusedSealedRowsExist`] naming the count; the
+/// expected key path goes to the operator log. Every SQLite seal path goes
+/// through here — `crate::encryption::seal_content` is never called
+/// directly from this module or from the importer.
+///
+/// # Errors
+/// The sealed-rows refusal above, the key directory being unreadable, or the
+/// seal itself failing.
+pub(crate) fn seal_content_guarded(
+    conn: &Connection,
+    content: &str,
+    agent_id: &str,
+) -> Result<Option<(Vec<u8>, String)>> {
+    if crate::encryption::seal_would_mint(content, agent_id)? {
+        let sealed_rows = sealed_row_count_for_agent(conn, agent_id)?;
+        if sealed_rows > 0 {
+            return Err(crate::encryption::seal_refusal_for_sealed_rows(
+                agent_id,
+                sealed_rows,
+            ));
+        }
+    }
+    crate::encryption::seal_content(content, agent_id)
+}
+
+/// #3718 (review) — how many rows owned by `agent_id` are sealed at rest.
+/// The owner of an envelope is the row's `metadata.agent_id` (the id the
+/// content was keyed to — see [`retained_agent_id_for_upsert`]).
+///
+/// # Errors
+/// The count query fails.
+pub(crate) fn sealed_row_count_for_agent(conn: &Connection, agent_id: &str) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories \
+         WHERE encrypted_envelope IS NOT NULL \
+           AND json_extract(metadata, '$.agent_id') = ?1",
+        params![agent_id],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
 fn retained_agent_id_for_upsert(conn: &Connection, mem: &Memory) -> Result<String> {
     let incoming = memory_agent_id(mem);
     if !crate::encryption::encryption_enabled(None) {
@@ -1476,7 +1526,7 @@ fn seal_content_for_upsert(conn: &Connection, mem: &Memory) -> Result<UpsertSeal
     // Fail-closed: an enabled gate over a row that will retain NO agent id
     // has no recipient key, and `seal_content` refuses rather than silently
     // storing plaintext.
-    let sealed = crate::encryption::seal_content(&mem.content, &sealed_under)?;
+    let sealed = seal_content_guarded(conn, &mem.content, &sealed_under)?;
     Ok(match sealed {
         Some((envelope, placeholder)) => UpsertSeal {
             content_to_store: placeholder,
@@ -1546,7 +1596,7 @@ fn reconcile_envelope_owner(
     // Re-seal the SAME plaintext under the retained identity. `seal_content`
     // fails closed when the retained id is empty, which rolls the enclosing
     // transaction back rather than leaving an unreadable row on disk.
-    let repaired = crate::encryption::seal_content(plaintext, &retained)?;
+    let repaired = seal_content_guarded(conn, plaintext, &retained)?;
     let Some((repaired_envelope, placeholder)) = repaired else {
         // Encryption was disabled between the seal and this check. Nothing
         // safe to write here; leave the row untouched and surface loudly.
@@ -3059,7 +3109,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // existing-wins overlay here and therefore no identity to
             // reconcile against — adding the pre-read would be a pure cost.
             let agent_id = memory_agent_id(mem);
-            let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+            let sealed = seal_content_guarded(conn, &mem.content, agent_id)?;
             let content_to_store = sealed
                 .as_ref()
                 .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
@@ -4197,7 +4247,7 @@ pub fn update_with_expected_version(
     let update_agent_id = metadata_agent_id_slot(&existing.metadata)
         .or_else(|| metadata_agent_id_slot(metadata))
         .unwrap_or("");
-    let update_sealed = crate::encryption::seal_content(new_content, update_agent_id)?;
+    let update_sealed = seal_content_guarded(conn, new_content, update_agent_id)?;
     let update_content_to_store = update_sealed
         .as_ref()
         .map_or(new_content, |(_, ph)| ph.as_str());
@@ -10466,7 +10516,7 @@ pub fn consolidate(
         // the envelope is NULL — byte-identical to pre-#2301 behaviour.
         // `consolidator_agent_id` is the authoritative NHI owner stamped into
         // `metadata.agent_id` above, so it is the correct seal key.
-        let sealed = crate::encryption::seal_content(summary, consolidator_agent_id)?;
+        let sealed = seal_content_guarded(conn, summary, consolidator_agent_id)?;
         let content_to_store = sealed.as_ref().map_or(summary, |(_, ph)| ph.as_str());
         let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
 
@@ -18096,7 +18146,7 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
         .get("agent_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let merge_sealed = crate::encryption::seal_content(&mem.content, merge_agent_id)?;
+    let merge_sealed = seal_content_guarded(conn, &mem.content, merge_agent_id)?;
     let merge_content_to_store = merge_sealed
         .as_ref()
         .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
