@@ -671,6 +671,19 @@ pub struct SubscriptionEvent {
     pub event_type: String,
     pub payload: String,
     pub delivered_at: String,
+    /// `pending` | `ack` | `failed`. `ack` and `failed` are TERMINAL and
+    /// were written after the retry ladder settled. `pending` means NO
+    /// terminal status was recorded for this delivery — which includes
+    /// the case where the delivery DID settle but the terminal status
+    /// write failed (open error, UPDATE error, or the row was missing at
+    /// settle time; counted at its stage on `/metrics`
+    /// `ai_memory_webhook_audit_update_failed_total{stage}` and surfaced on
+    /// `/health` `webhook_audit_delivery`, #3659). A consumer reading
+    /// `pending` off `memory_subscription_replay` therefore cannot tell
+    /// "in flight" from "the outcome was lost" by this field alone; a row
+    /// still `pending` past the 60 s settle window is the lost case, which
+    /// `doctor` warns on. Making the terminal write reliable is #3735
+    /// (v1.0.1).
     pub delivery_status: String,
 }
 
