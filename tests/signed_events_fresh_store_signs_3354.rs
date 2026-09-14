@@ -173,8 +173,11 @@ fn fresh_store_generates_the_signing_key_at_boot_3354() {
 
 /// THE regression (review round 3): the property #3354 delivers is that a
 /// fresh store's first DAEMON-SIGNED row is actually signed under the key
-/// ensured at boot. `delete` is such a writer: its forget tombstone is signed
-/// through `try_sign_audit_payload` with the daemon audit key. On the pre-fix
+/// ensured at boot. `delete --hard` is such a writer: its forget tombstone is
+/// signed through `try_sign_audit_payload` with the daemon audit key. The
+/// plain `delete <id>` is ARCHIVE-FIRST since #3012 (`delete_archive_first`
+/// snapshots into `archived_memories` and writes NO tombstone), so it is not
+/// a tombstone writer and would leave nothing to verify (review round 4). On the pre-fix
 /// head the key was never generated, so the tombstone's `signature` was NULL
 /// and the receipt verified as `unsigned`. Now: `signature IS NOT NULL`, it
 /// verifies under `<id>.pub` (raw Ed25519 verification over the canonical
@@ -202,8 +205,11 @@ fn fresh_store_daemon_signs_its_first_tombstone_3354() {
     let stored: serde_json::Value = serde_json::from_slice(&out.stdout).expect("store json");
     let id = stored["id"].as_str().expect("id").to_string();
 
-    let out = command(&sb).args(["delete", &id]).output().expect("delete");
-    assert!(out.status.success(), "delete: {}", stderr_of(&out));
+    let out = command(&sb)
+        .args(["delete", "--hard", &id])
+        .output()
+        .expect("delete --hard");
+    assert!(out.status.success(), "delete --hard: {}", stderr_of(&out));
 
     let pub_path = sb.keys.join(format!("{AGENT_ID}.pub"));
     assert!(pub_path.is_file(), "the signing key was generated at boot");
