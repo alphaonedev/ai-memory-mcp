@@ -498,7 +498,11 @@ export interface InboxMessage {
   tier: Tier;
   namespace: string;
   metadata: Record<string, unknown>;
-  read: boolean;
+  /**
+   * Touch counter (a recall landed by the fold). NOT a read/handled marker:
+   * the inbox carries none (#3730). Handled = the recipient deleted the
+   * message (archived on this namespace); every listed message is unhandled.
+   */
   access_count: number;
   agent_id: string;
   from_agent_id: string;
@@ -518,7 +522,10 @@ export interface InboxResponse {
 
 export interface InboxQuery {
   agent_id?: string;
-  /** Filter before applying the page limit. */
+  /**
+   * Accepted for compatibility; narrows NOTHING (#3730): every message still
+   * in the inbox is unhandled. Echoed back as sent.
+   */
   unread_only?: boolean;
   limit?: number;
 }
