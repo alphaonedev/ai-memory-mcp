@@ -255,9 +255,32 @@ if [ "$SELF_TEST" -eq 1 ]; then
     echo "stale-contract-assertions self-test: FAIL — flagged the repair commit: $pos"; rm -rf "$T"; exit 1
   fi
   rm -rf "$T"
-  echo "stale-contract-assertions self-test: PASS (flags a stale pin; passes its repair; fixtures synthesised, no history dependency)"; exit 0
+  # REFUSAL LEGS (Conductor ruling, #3688 c5660422072): "clean" must mean examined-and-found-nothing,
+  # never could-not-look. Re-invoke this script with (a) a range whose start does not resolve and
+  # (b) GIT_DIR pointed at a non-repository (the git-less-export shape): both must REFUSE, exit 2,
+  # and neither may print "clean".
+  SELF_PATH=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  r_out=$(bash "$SELF_PATH" --range nosuch-3688..HEAD 2>&1); r_rc=$?
+  g_out=$(GIT_DIR=/nonexistent-3688 bash "$SELF_PATH" 2>&1); g_rc=$?
+  refuse_ok=1
+  { [ "$r_rc" -eq 2 ] && printf '%s' "$r_out" | grep -q REFUSED && ! printf '%s' "$r_out" | grep -q ': clean'; } || refuse_ok=0
+  { [ "$g_rc" -eq 2 ] && printf '%s' "$g_out" | grep -q REFUSED && ! printf '%s' "$g_out" | grep -q ': clean'; } || refuse_ok=0
+  [ "$refuse_ok" -eq 1 ] || { echo "stale-contract-assertions self-test: FAIL — an uncomputable range or a non-repository did not REFUSE (rc=$r_rc/$g_rc): $r_out | $g_out"; exit 1; }
+  echo "stale-contract-assertions self-test: PASS (flags a stale pin; passes its repair; fixtures synthesised, no history dependency; an uncomputable range or a non-repository is REFUSED, never clean)"; exit 0
 fi
 
+GATE=stale-contract-assertions
+# CLEAN MUST MEAN EXAMINED AND FOUND NOTHING, NEVER "COULD NOT LOOK" (Conductor ruling, #3688
+# c5660422072): outside a git checkout, or with a range whose ends do not resolve, `git diff` /
+# `git rev-list` print an error and an EMPTY diff, and the gate used to print `clean` over it.
+# Refuse instead, with a non-zero exit, before anything is examined.
+refuse_unless_range_computable() { # $1 = A..B
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "$GATE: REFUSED — not inside a git checkout; the range $1 cannot be computed (run from the repo root, not an export)" >&2; exit 2; }
+  case "$1" in *..*) ;; *) echo "$GATE: REFUSED — range '$1' is not of the form A..B" >&2; exit 2;; esac
+  git rev-parse --verify --quiet "${1%%..*}^{commit}" >/dev/null || { echo "$GATE: REFUSED — range start '${1%%..*}' does not resolve to a commit" >&2; exit 2; }
+  git rev-parse --verify --quiet "${1##*..}^{commit}" >/dev/null || { echo "$GATE: REFUSED — range end '${1##*..}' does not resolve to a commit" >&2; exit 2; }
+}
+if [ "$STAGED" -eq 1 ]; then git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "$GATE: REFUSED — not inside a git checkout; --staged has nothing to diff" >&2; exit 2; }; else refuse_unless_range_computable "$RANGE"; fi
 if [ "$STAGED" -eq 1 ]; then out=$(git diff --cached | run_check WORKTREE WORKTREE); rc=$?
 else out=$(git diff "$RANGE" | run_check "${RANGE##*..}" "${RANGE%%..*}"); rc=$?; fi
 if [ $rc -ne 0 ]; then

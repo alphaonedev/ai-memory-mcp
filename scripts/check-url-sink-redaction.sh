@@ -131,6 +131,40 @@ scan() { # $1 = root dir; prints "file:line  {binding}" per unredacted sink
       done
 }
 
+judge() { # $1 = allowlist path; reads "file:line  key" lines on stdin; sets LIVE/PENDING/NOTICE/FAIL
+  local ALLOW=$1
+  LIVE=0; PENDING=0; NOTICE=0
+  # #3688/7-shape ledger for gate 2 (Conductor ruling on #3688): `<key>=pending:#NNNN` holds a REAL
+  # disclosure-direction sink under a tracked issue. It prints as INFO (never folded into clean), is
+  # counted LIVE per issue, and an entry that no longer matches any live site is a NOTICE (stale) —
+  # so the issue's acceptance test is "the specific key stops matching", not a count dropping.
+  # A bare key line is still the ECHO allowlist (a `log` sink is never allowlistable that way).
+  SEEN_PENDING=$(mktemp "${TMPDIR:-.local-runs}/url-sink-seen.XXXXXX")
+  PER_ISSUE=""
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    loc=${hit%%  *}; key=${hit##*  }
+    LIVE=$((LIVE+1))
+    [ -f "$ALLOW" ] && grep -qxF "$key" "$ALLOW" && continue
+    if [ -f "$ALLOW" ] && issue=$(grep -E "^$(printf '%s' "$key" | sed 's/[][\.*^$?+(){}|]/\\&/g')=pending:#[0-9]+\s*$" "$ALLOW" | head -1 | sed -E 's/.*=pending:(#[0-9]+).*/\1/') && [ -n "$issue" ]; then
+      echo "  [INFO] $loc  $key — PENDING FIX under $issue: still an unredacted sink, tracked, not yet closed"
+      echo "$key" >> "$SEEN_PENDING"; PENDING=$((PENDING+1)); PER_ISSUE="$PER_ISSUE $issue"
+      continue
+    fi
+    echo "  $loc  $key — URL reaches a sink unredacted; render via crate::url_display:: (scheme/host/port), or redact_urls_in_message for wrapped foreign errors"
+    FAIL=$((FAIL+1))
+  done
+  # stale ledger entries: a pending key with no live site is fixed or moved — say so, never pass silently
+  if [ -f "$ALLOW" ]; then
+    while IFS= read -r lk; do
+      [ -z "$lk" ] && continue
+      grep -qxF "$lk" "$SEEN_PENDING" || { echo "  [NOTICE] $lk — ledger entry no longer matches a live site (fixed or moved): remove it"; NOTICE=$((NOTICE+1)); }
+    done < <(grep -E '^[^#].*=pending:#[0-9]+\s*$' "$ALLOW" | sed -E 's/=pending:#[0-9]+\s*$//')
+  fi
+  rm -f "$SEEN_PENDING"
+  [ "$PENDING" -gt 0 ] && echo "  LIVE unredacted sinks held by the ledger: $PENDING ($(printf '%s\n' $PER_ISSUE | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}'| sed 's/ $//'))"
+}
+
 if [ "$SELF_TEST" -eq 1 ]; then
   # Negative control (#3667): the sync-daemon peer-URL log line as it stood
   # before the redaction landed. Plant it in a throwaway copy under the repo's
@@ -159,26 +193,36 @@ RS
   # (build), the redacted alias (ok), and the url_display-rendered value
   # (rendered) — the latter proving PROVENANCE across the 2-hop
   # `shown = url_display::url_origin(url); url_display = shown.as_str()` binding.
+  # LEDGER LEGS (Conductor ruling on #3688): a `key=pending:#N` entry holds a live sink as INFO
+  # (never FAIL, never folded into clean); a stale entry is a NOTICE, never a silent pass.
+  T2=.local-runs/url-sink-selftest-ledger; rm -rf "$T2"; mkdir -p "$T2/src"
+  cat > "$T2/src/planted.rs" <<'RS'
+fn cycle(peer_url: &str, e: &str) {
+    tracing::warn!("sync-daemon: peer {peer_url} cycle failed: {e}");
+}
+RS
+  printf '%s\n' 'src/planted.rs:cycle:log:{peer_url}=pending:#1' 'src/gone.rs:x:log:{url}=pending:#2' > "$T2/allow.txt"
+  LIVE=0; PENDING=0; NOTICE=0; FAIL=0
+  ledger_out=$(judge "$T2/allow.txt" < <(scan "$T2" | sed "s#^$T2/##; s#  $T2/#  #"))
+  rm -rf "$T2"
+  ledger_ok=1
+  printf '%s' "$ledger_out" | grep -qE '^\s*\[INFO\] src/planted.rs:2 .*PENDING FIX under #1' || ledger_ok=0
+  printf '%s' "$ledger_out" | grep -qE '^\s*\[NOTICE\] src/gone.rs:x:log:\{url\}' || ledger_ok=0
+  printf '%s' "$ledger_out" | grep -qE 'planted.rs:2 .*URL reaches a sink unredacted' && ledger_ok=0
+  FAIL=0
   rej_3667=$(printf '%s' "$got" | grep -c 'planted.rs:2 ')
   rej_alias=$(printf '%s' "$got" | grep -cE 'planted.rs:1[0-9] .*\{endpoint_url\}')
   spared_ctor=$(printf '%s' "$got" | grep -cE 'planted.rs:5 ')
   spared_redact=$(printf '%s' "$got" | grep -cE 'planted.rs:6 ')
   spared_render=$(printf '%s' "$got" | grep -cE 'planted.rs:9 .*\{url_display\}')
-  if [ "$rej_3667" -ge 1 ] && [ "$rej_alias" -ge 1 ] && [ "$spared_ctor" -eq 0 ] && [ "$spared_redact" -eq 0 ] && [ "$spared_render" -eq 0 ]; then
-    echo "url-sink-redaction self-test: PASS (rejects the #3667 raw-URL shape AND an aliased non-url_display leak; spares construction, the redacted alias, and a crate::url_display-rendered value via provenance)"; exit 0
+  if [ "$rej_3667" -ge 1 ] && [ "$rej_alias" -ge 1 ] && [ "$spared_ctor" -eq 0 ] && [ "$spared_redact" -eq 0 ] && [ "$spared_render" -eq 0 ] && [ "$ledger_ok" -eq 1 ]; then
+    echo "url-sink-redaction self-test: PASS (rejects the #3667 raw-URL shape AND an aliased non-url_display leak; spares construction, the redacted alias, and a crate::url_display-rendered value via provenance; a pending ledger entry holds a live sink as INFO and a stale entry is a NOTICE)"; exit 0
   fi
-  echo "url-sink-redaction self-test: FAIL — got: $got"; exit 1
+  echo "url-sink-redaction self-test: FAIL — got: $got"; echo "ledger legs (ok=$ledger_ok): $ledger_out"; exit 1
 fi
 
-LIVE=0
-while IFS= read -r hit; do
-  [ -z "$hit" ] && continue
-  loc=${hit%%  *}; key=${hit##*  }
-  LIVE=$((LIVE+1))
-  [ -f "$ALLOW" ] && grep -qxF "$key" "$ALLOW" && continue
-  echo "  $loc  $key — URL reaches a sink unredacted; render via crate::url_display:: (scheme/host/port), or redact_urls_in_message for wrapped foreign errors"
-  FAIL=$((FAIL+1))
-done < <(scan .)
+LIVE=0; PENDING=0; NOTICE=0
+judge "$ALLOW" < <(scan .)
 
 if [ "$FAIL" -ne 0 ]; then
   cat <<MSG
@@ -205,4 +249,4 @@ config-sourced URL is never allowlistable.
 MSG
   exit 1
 fi
-echo "url-sink-redaction: clean ($LIVE sink interpolations, all redacted or allowlisted)"
+echo "url-sink-redaction: clean ($LIVE sink interpolations examined: $((LIVE-PENDING)) redacted or allowlisted, $PENDING ledgered pending, $NOTICE stale ledger entries)"
