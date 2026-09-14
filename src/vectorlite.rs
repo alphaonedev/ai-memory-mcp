@@ -167,6 +167,9 @@ pub fn from_env(capacity: usize, hard_fail_at_cap: bool) -> Option<VectorliteInd
             Some(idx)
         }
         Err(e) => {
+            crate::vector_index_rejections::record_index_failure(
+                crate::vector_index_rejections::IndexFailure::ExtensionLoad,
+            );
             tracing::error!(
                 extension = %path,
                 error = %e,
@@ -310,6 +313,9 @@ impl VectorliteIndex {
         };
         let entries = std::mem::take(&mut vl.entries);
         let retained = entries.len();
+        crate::vector_index_rejections::record_index_failure(
+            crate::vector_index_rejections::IndexFailure::BackendDegraded,
+        );
         tracing::error!(
             op,
             error = %err,
@@ -367,11 +373,14 @@ impl VectorliteIndex {
         let dim = match vl.dim {
             Some(d) => {
                 if d != embedding.len() {
-                    tracing::error!(
-                        memory_id = %id,
-                        expected_dim = d,
-                        actual_dim = embedding.len(),
-                        "vectorlite: rejecting mismatched-dim insert (strict-dim boundary, #1860)"
+                    // #3665 — invalid input: WARN + `cause="invalid_dim"`.
+                    crate::vector_index_rejections::record_rejection(
+                        crate::vector_index_rejections::BACKEND_VECTORLITE,
+                        id,
+                        crate::vector_index_rejections::InsertRejection::InvalidDim {
+                            expected: d,
+                            actual: embedding.len(),
+                        },
                     );
                     return Ok(false);
                 }
@@ -380,9 +389,11 @@ impl VectorliteIndex {
             None => {
                 let d = embedding.len();
                 if d == 0 {
-                    tracing::error!(
-                        memory_id = %id,
-                        "vectorlite: rejecting empty embedding (#1860)"
+                    // #3665 — invalid input: WARN + `cause="empty_embedding"`.
+                    crate::vector_index_rejections::record_rejection(
+                        crate::vector_index_rejections::BACKEND_VECTORLITE,
+                        id,
+                        crate::vector_index_rejections::InsertRejection::EmptyEmbedding,
                     );
                     return Ok(false);
                 }
@@ -403,11 +414,13 @@ impl VectorliteIndex {
         // the eviction sink.
         if vl.entries.len() >= self.capacity {
             if self.hard_fail_at_cap {
-                tracing::error!(
-                    memory_id = %id,
-                    max_entries = self.capacity,
-                    "vectorlite index at capacity: rejecting insert \
-                     (hard-fail-at-cap mode, #1005 G2)"
+                // #3665 — actionable: ERROR + `cause="capacity"`.
+                crate::vector_index_rejections::record_rejection(
+                    crate::vector_index_rejections::BACKEND_VECTORLITE,
+                    id,
+                    crate::vector_index_rejections::InsertRejection::Capacity {
+                        max_entries: self.capacity,
+                    },
                 );
                 return Ok(false);
             }

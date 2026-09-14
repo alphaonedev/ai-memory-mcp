@@ -820,6 +820,9 @@ pub mod handlers;
 // based on whether the harness supports deferred-tool registration.
 pub mod harness;
 pub mod hnsw;
+// #3665 — vector-index insert rejections classified (invalid input vs
+// actionable) with counters and a sustained-drift escalation.
+pub mod vector_index_rejections;
 // v1.0.0 #1860 — opt-in vectorlite ANN backend scaffolding behind the
 // OFF-by-default `vectorlite` feature (runtime-loaded operator-acquired
 // SQLite extension; fails closed to the default HNSW backend).

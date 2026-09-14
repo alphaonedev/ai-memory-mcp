@@ -943,16 +943,20 @@ impl VectorIndex {
                 && let Some((_, first)) = state.all_entries.first()
                 && first.len() != embedding.len()
             {
+                // #3665 — invalid INPUT, not an index fault: WARN + counter
+                // (`cause="invalid_dim"`), escalating to one ERROR only when
+                // sustained (embedder dimension drift).
                 let mismatch = EmbeddingDimMismatch {
                     expected: first.len(),
                     actual: embedding.len(),
                 };
-                tracing::error!(
-                    memory_id = %id,
-                    expected_dim = mismatch.expected,
-                    actual_dim = mismatch.actual,
-                    flag = ENV_REQUIRE_DIM_MATCH,
-                    "strict-dim mode: rejecting vector-index insert — {mismatch} (#1005 G4)"
+                crate::vector_index_rejections::record_rejection(
+                    crate::vector_index_rejections::BACKEND_HNSW,
+                    &id,
+                    crate::vector_index_rejections::InsertRejection::InvalidDim {
+                        expected: mismatch.expected,
+                        actual: mismatch.actual,
+                    },
                 );
                 return;
             }
@@ -963,12 +967,14 @@ impl VectorIndex {
             // entries. Legacy default: fall through to the
             // evict-oldest edge below, byte-identical.
             if state.hard_fail_at_cap && state.all_entries.len() >= state.max_entries {
-                tracing::error!(
-                    target: EVICTION_TRACE_TARGET,
-                    memory_id = %id,
-                    max_entries = state.max_entries,
-                    "vector index at capacity: rejecting insert (hard-fail-at-cap mode); \
-                     increase vector_index_capacity or move to dedicated vector DB (#1005 G2)"
+                // #3665 — ACTIONABLE (the index cannot take a valid vector):
+                // ERROR as before, plus `cause="capacity"` on the counter.
+                crate::vector_index_rejections::record_rejection(
+                    crate::vector_index_rejections::BACKEND_HNSW,
+                    &id,
+                    crate::vector_index_rejections::InsertRejection::Capacity {
+                        max_entries: state.max_entries,
+                    },
                 );
                 return;
             }
@@ -2940,6 +2946,93 @@ mod v1005_tests {
     /// collapsed to `f32::MAX` (ranks last) and the index write
     /// boundary rejects mismatched-dimension inserts; the tolerant
     /// default keeps the legacy truncating behavior byte-identically.
+    /// Buffer-backed `MakeWriter` so the rejection line's SEVERITY can be
+    /// asserted (thread-scoped subscriber; the insert path is synchronous).
+    #[derive(Clone)]
+    struct VecWriter3665(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for VecWriter3665 {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter3665 {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_tracing_3665<F: FnOnce()>(f: F) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(VecWriter3665(buf.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+
+    #[test]
+    fn strict_dim_rejection_logs_warn_not_error_3665() {
+        // #3665 — a caller's mismatched-dimension vector is INVALID INPUT:
+        // the index is healthy, so the per-item line is WARN. Pre-#3665 it
+        // was ERROR, indistinguishable from index loss.
+        let _g = StrictDimGuard::on();
+        let idx = VectorIndex::empty_with_capacity(10, false);
+        idx.insert("ok".into(), make_embedding(&[1.0, 0.0, 0.0, 0.0]));
+        let out = capture_tracing_3665(|| {
+            idx.insert("bad-3665".into(), make_embedding(&[1.0, 0.0, 0.0]));
+        });
+        assert_eq!(idx.len(), 1, "strict-dim mismatch must be rejected");
+        let line = out
+            .lines()
+            .find(|l| l.contains("memory_id=bad-3665"))
+            .unwrap_or_else(|| panic!("#3665: no rejection line for the refused id in:\n{out}"));
+        assert!(
+            line.contains("WARN") && !line.contains("ERROR"),
+            "#3665: invalid input must be WARN, not ERROR: {line}"
+        );
+    }
+
+    #[test]
+    fn strict_dim_rejection_is_invalid_input_not_index_fault_3665() {
+        let _g = StrictDimGuard::on();
+        let idx = VectorIndex::empty_with_capacity(10, false);
+        idx.insert("ok".into(), make_embedding(&[1.0, 0.0, 0.0, 0.0]));
+        let dim_before = crate::metrics::registry()
+            .vector_index_insert_rejected_total
+            .with_label_values(&["invalid_dim"])
+            .get();
+        let invalid_before = crate::vector_index_rejections::invalid_input_total();
+        // Three dims against a four-dim index: rejected, index unchanged,
+        // counted as INVALID INPUT (not capacity, not a backend failure).
+        idx.insert("bad".into(), make_embedding(&[1.0, 0.0, 0.0]));
+        assert_eq!(idx.len(), 1, "strict-dim mismatch must be rejected");
+        // Global series (other tests drive them in parallel): at-least bounds.
+        assert!(
+            crate::metrics::registry()
+                .vector_index_insert_rejected_total
+                .with_label_values(&["invalid_dim"])
+                .get()
+                >= dim_before + 1
+        );
+        assert!(crate::vector_index_rejections::invalid_input_total() > invalid_before);
+    }
+
     #[test]
     fn strict_dim_guard_g4_1005() {
         // Tolerant (default) — zip truncation compares the shared
@@ -3011,8 +3104,21 @@ mod v1005_tests {
             idx.insert(format!("keep-{i}"), unit(i));
         }
         assert_eq!(idx.len(), 3);
+        // #3665 — the at-cap rejection is counted under `cause="capacity"`.
+        let cap_before = crate::metrics::registry()
+            .vector_index_insert_rejected_total
+            .with_label_values(&["capacity"])
+            .get();
         idx.insert("rejected".into(), unit(3));
         assert_eq!(idx.len(), 3, "hard-fail mode must reject the at-cap insert");
+        assert!(
+            crate::metrics::registry()
+                .vector_index_insert_rejected_total
+                .with_label_values(&["capacity"])
+                .get()
+                >= cap_before + 1,
+            "#3665: capacity rejection counted as actionable"
+        );
         let hits = idx.search(&unit(0), 10);
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert!(

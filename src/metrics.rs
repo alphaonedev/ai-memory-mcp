@@ -290,6 +290,14 @@ pub struct Metrics {
     /// from this with a 60s rolling window. Surfaced as an `IntGauge`
     /// so the value is also readable via Prometheus scraping.
     pub hnsw_last_eviction_at_nanos: IntGauge,
+    /// #3665 — vector-index inserts refused, by cause (`invalid_dim` |
+    /// `empty_embedding` = caller/embedder data, WARN-class; `capacity` =
+    /// actionable, ERROR-class). Closed set, pre-touched to 0. Rate on
+    /// the invalid causes: sustained means embedder dimension drift.
+    pub vector_index_insert_rejected_total: IntCounterVec,
+    /// #3665 — vector-index backend failures, by kind (`extension_load` |
+    /// `backend_degraded`). Any increment is an index-loss event.
+    pub vector_index_failure_total: IntCounterVec,
 
     /// #1253 (MED, 2026-05-25) — monotonic counter for subscription
     /// DLQ insert attempts that were refused because the per-
@@ -838,6 +846,37 @@ impl Metrics {
         )?;
         registry.register(Box::new(hnsw_last_eviction_at_nanos.clone()))?;
 
+        // #3665 — classified vector-index rejections + backend failures.
+        let vector_index_insert_rejected_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_vector_index_insert_rejected_total",
+                "Vector-index inserts refused, by cause: invalid_dim and \
+                 empty_embedding are caller/embedder data (WARN class); \
+                 capacity is actionable (ERROR class).",
+            ),
+            &["cause"],
+        )?;
+        registry.register(Box::new(vector_index_insert_rejected_total.clone()))?;
+        for cause in crate::vector_index_rejections::InsertRejection::ALL_CAUSES {
+            vector_index_insert_rejected_total
+                .with_label_values(&[cause])
+                .reset();
+        }
+        let vector_index_failure_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_vector_index_failure_total",
+                "Vector-index backend failures, by kind (extension_load | \
+                 backend_degraded). Any increment is an index-loss event.",
+            ),
+            &["kind"],
+        )?;
+        registry.register(Box::new(vector_index_failure_total.clone()))?;
+        for kind in crate::vector_index_rejections::IndexFailure::ALL_KINDS {
+            vector_index_failure_total
+                .with_label_values(&[kind])
+                .reset();
+        }
+
         // #1253 (MED, 2026-05-25) — subscription DLQ overflow counter.
         let subscription_dlq_overflow_total = IntCounter::new(
             "ai_memory_subscription_dlq_overflow_total",
@@ -1101,6 +1140,8 @@ impl Metrics {
             operator_dequarantined,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
+            vector_index_insert_rejected_total,
+            vector_index_failure_total,
             subscription_dlq_overflow_total,
             subscription_dispatch_truncated_total,
             federation_cred_verify_total,
@@ -1489,6 +1530,10 @@ mod tests {
             // v1.0.0 #2583 — the freshness twin of the pre-computed count.
             "ai_memory_memories_refreshed_at_seconds",
             "ai_memory_hnsw_size",
+            // #3665 — classified vector-index rejections.
+            "ai_memory_vector_index_insert_rejected_total{cause=\"invalid_dim\"}",
+            "ai_memory_vector_index_insert_rejected_total{cause=\"capacity\"}",
+            "ai_memory_vector_index_failure_total{kind=\"backend_degraded\"}",
             "ai_memory_subscriptions_active",
             // v0.7.0 Track D #933 — federation push DLQ depth gauge.
             "ai_memory_federation_push_dlq_depth",
