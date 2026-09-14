@@ -744,18 +744,18 @@ pub fn decorate_memory_many(
             obj.insert("link_attestation".to_string(), json!(link_attestation));
             obj.insert("provenance_tier".to_string(), json!(link_attestation));
             // #3548 Part A (rework) — `content_attestation` is the row's OWN write
-            // attestation, read VERBATIM from the `metadata.attest_level` stamp the
-            // write path sets (`identity::attest::stamp_attestation`): `claimed`
-            // for an unsigned write, `agent_attested` for a verified agent
-            // signature (`operator_signed` / `loader_observed` on the governance /
-            // model paths). This is a DIFFERENT concept and a DIFFERENT vocabulary
-            // from `link_attestation` (an edge signature, `models::link::AttestLevel`
-            // = unsigned/self_signed/peer_attested/…) and MUST NOT be parsed with
-            // the link enum: their value sets are DISJOINT, so the link
-            // `from_str` returned `None` for every real row and an agent_attested
-            // row read identically to an unsigned one (the reviewer-f2r finding).
-            // Absent stamp ⇒ `claimed`, the write path's own insert-if-absent
-            // default (`identity::attest::stamp_claimed_if_absent`).
+            // attestation: a VERBATIM pass-through of the memory's top-level
+            // `metadata.attest_level`, whose CLOSED value set is owned by
+            // `identity::verify::ATTEST_LEVEL_MEMORY_STAMP_VALUES` — `claimed` /
+            // `agent_attested` from the identity and store paths, `self_signed` /
+            // `signed_by_peer` from the L4 capture channel (its host-key
+            // attestation, kept distinct from the agent key on purpose). It is
+            // NOT parsed with any enum: parsing it with the link enum returned
+            // `None` for every stored row and read an agent_attested row as
+            // unsigned (the reviewer-f2r finding); it is a different concept from
+            // `link_attestation` (the strongest incident EDGE) even where a
+            // spelling coincides. Absent stamp ⇒ `claimed`, the write path's own
+            // insert-if-absent default (`identity::attest::stamp_claimed_if_absent`).
             let content_attestation = mem
                 .metadata
                 .get(crate::models::field_names::ATTEST_LEVEL)
