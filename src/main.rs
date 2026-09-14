@@ -425,6 +425,19 @@ fn is_egress_verb(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
+/// #3354 review — the REMEDIATION verbs: the way BACK IN for a broken store.
+/// Same reasoning as [`is_egress_verb`] — a posture that diagnoses an
+/// unwritable key dir must not lock the operator out of restoring / migrating
+/// the data the posture exists to protect. `migrate` only exists under the
+/// `sal` feature, hence the split arm.
+fn is_remediation_verb(cmd: &daemon_runtime::Command) -> bool {
+    #[cfg(feature = "sal")]
+    if matches!(cmd, daemon_runtime::Command::Migrate(_)) {
+        return true;
+    }
+    matches!(cmd, daemon_runtime::Command::Restore(_))
+}
+
 /// v1.0.0 #3354 — every command that can append a `signed_events` row is a
 /// LEDGER WRITER and must not start without a signing key for the resolved
 /// agent id (the key is generated when absent; only a failed generation
@@ -434,16 +447,11 @@ fn is_egress_verb(cmd: &daemon_runtime::Command) -> bool {
 /// side of the default is the signed one.
 fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
     !(is_egress_verb(cmd)
+        || is_remediation_verb(cmd)
         || matches!(
             cmd,
-            // Remediation: the way BACK IN for a broken store. Same
-            // reasoning as egress — a posture that diagnoses an unwritable
-            // key dir must not lock the operator out of restoring / migrating
-            // the data the posture exists to protect.
-            daemon_runtime::Command::Restore(_)
-                | daemon_runtime::Command::Migrate(_)
-                // Read-only and diagnostic verbs: no write funnel.
-                | daemon_runtime::Command::Doctor(_)
+            // Read-only and diagnostic verbs: no write funnel.
+            daemon_runtime::Command::Doctor(_)
                 | daemon_runtime::Command::Config(_)
                 | daemon_runtime::Command::Completions(_)
                 | daemon_runtime::Command::Man
@@ -557,11 +565,15 @@ mod tests {
                 "{argv:?} is never refused for a key it cannot mint"
             );
         }
-        for argv in [
+        #[cfg(feature = "sal")]
+        let migrate = Some(&["ai-memory", "migrate", "--from", "a", "--to", "b"][..]);
+        #[cfg(not(feature = "sal"))]
+        let migrate: Option<&[&str]> = None;
+        let non_writers = [
             &["ai-memory", "restore", "--from", "/nonexistent", "--latest"][..],
-            &["ai-memory", "migrate", "--from", "a", "--to", "b"][..],
             &["ai-memory", "stats"][..],
-        ] {
+        ];
+        for argv in non_writers.into_iter().chain(migrate) {
             let cmd = parse(argv);
             assert!(!is_egress_verb(&cmd), "{argv:?} is not egress");
             assert!(
