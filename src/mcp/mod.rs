@@ -293,14 +293,18 @@ fn observe_capture_nag(
     nag_watcher: Option<&crate::recover::nag::CaptureNagWatcher>,
     session_id: &str,
     tool_name: &str,
-    arguments: &Value,
     mcp_client: Option<&str>,
 ) -> crate::recover::nag::NagAction {
     use crate::recover::nag::{NagAction, classify_tool};
     let Some(watcher) = nag_watcher else {
         return NagAction::None;
     };
-    let agent_id = resolve_mcp_agent_id(arguments, mcp_client);
+    // #3393 — the streak is keyed on the CALLER (env identity, else the
+    // canonical `ai:<client>@<host>` derivation), never on a body-claimed
+    // `agent_id`: a store that claims some other id must not reset or fork
+    // the caller's own capture streak. Pre-#3393 the raw `ai:<client>`
+    // stamp happened to coincide with such claims, which is what hid this.
+    let agent_id = resolve_mcp_agent_id(&Value::Null, mcp_client);
     let action = watcher.observe_tool_call(&agent_id, session_id, classify_tool(tool_name));
     match action {
         NagAction::None => {}
@@ -3617,13 +3621,7 @@ fn handle_request(
             // consecutive-non-capture-tool-call threshold. Strictly
             // observation-only: the returned action does not gate or
             // alter the dispatch below.
-            observe_capture_nag(
-                nag_watcher,
-                nag_session_id,
-                tool_name,
-                arguments,
-                mcp_client,
-            );
+            observe_capture_nag(nag_watcher, nag_session_id, tool_name, mcp_client);
 
             // v1.0.0 #3549 — THE caller-authority chokepoint: resolve ONCE,
             // before the table lookup; an unusable configured identity refuses
@@ -7189,7 +7187,7 @@ mod tests {
     #[test]
     fn observe_capture_nag_none_watcher_is_noop() {
         use crate::recover::nag::NagAction;
-        let action = observe_capture_nag(None, "s", "memory_recall", &json!({}), Some("c"));
+        let action = observe_capture_nag(None, "s", "memory_recall", Some("c"));
         assert_eq!(action, NagAction::None);
     }
 
