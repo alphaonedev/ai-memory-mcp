@@ -1756,6 +1756,12 @@ mod d1_6_987_tests {
     //!   string understated the tool's real surface to every MCP client.
     //!   Corrected to list all 9 plus the `derived_from` /
     //!   `derives_from` directionality footgun.
+    //! - 2026-09-14 (#3659): `memory_subscription_replay.docs` said only
+    //!   "replay events ordered by delivered_at asc"; each replayed event
+    //!   carries `delivery_status`, and `pending` there can mean the
+    //!   delivery settled but its terminal status write FAILED (the #3659
+    //!   observed gap), not only in flight. The docs now say so at the field
+    //!   the caller reads; the reliable write is #3735 (v1.0.1).
     //! - 2026-09-10 (#3394): `memory_pending_approve` / `memory_pending_reject`
     //!   advertised `remember=forever` progressive trust. Forever cannot be
     //!   honoured durably (process-local `SYNTHETIC_RULES` only; #3580).
@@ -1911,6 +1917,10 @@ mod d1_6_987_tests {
         // #3551: source admission replaces missing-source stubs before promotion.
         "memory_skill_promote_from_reflection",
         "memory_stats",
+        // #3659 — `delivery_status` on replayed events: `pending` can mean
+        // the terminal status write failed, not only in flight; the docs
+        // now say so at the field a caller reads.
+        "memory_subscription_replay",
     ];
 
     /// #3171 — tools whose short `description()` was deliberately CORRECTED.
