@@ -392,3 +392,121 @@ fn fx4_decorate_memory_many_surfaces_link_attestation() {
         );
     }
 }
+
+#[test]
+fn attestation_split_content_vs_link_3548() {
+    // #3548 Part A — content_attestation (the row's OWN write attestation, read
+    // from metadata.attest_level) must be reported SEPARATELY from
+    // link_attestation (the strongest incident EDGE). A self-signed row reached
+    // by a peer-attested link now names both truthfully: the memory is
+    // self_signed; the path to it is signed_peer. Before #3548 the single
+    // provenance_tier field silently reported the edge value as if it were a
+    // property of the memory.
+    use ai_memory::mcp::decorate_memory_many;
+    use ai_memory::models::Memory;
+
+    let conn = fresh_db();
+    let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+    seed_memory_with_embedding(&conn, "m-3548-a", "s3548", "alpha", "alpha content", &emb);
+    seed_memory_with_embedding(&conn, "m-3548-b", "s3548", "beta", "beta content", &emb);
+    // The row's OWN write attestation is stamped in metadata.attest_level.
+    conn.execute(
+        "UPDATE memories SET metadata = ?1 WHERE id = 'm-3548-a'",
+        params![r#"{"attest_level":"self_signed"}"#],
+    )
+    .expect("stamp content attest_level");
+    // A peer-attested incident EDGE (the CHECK requires a 64-byte signature for
+    // any attest_level other than unsigned; the payload is opaque here).
+    let now = chrono::Utc::now().to_rfc3339();
+    let fake_sig: Vec<u8> = (0u8..64u8).collect();
+    conn.execute(
+        "INSERT INTO memory_links \
+            (source_id, target_id, relation, created_at, attest_level, signature) \
+         VALUES ('m-3548-a', 'm-3548-b', 'related_to', ?1, 'peer_attested', ?2)",
+        params![now, fake_sig],
+    )
+    .expect("seed peer-attested link");
+
+    let fetched = ai_memory::db::get_many(&conn, &["m-3548-a".to_string()]).expect("get_many ok");
+    let rows: Vec<(Memory, f64)> = vec![(fetched["m-3548-a"].clone(), 0.9)];
+    let verbose = decorate_memory_many(&rows, true, &conn);
+    let obj = verbose[0].as_object().expect("row is object");
+
+    let content = obj.get("content_attestation").and_then(|v| v.as_str());
+    let link = obj.get("link_attestation").and_then(|v| v.as_str());
+    assert_eq!(
+        content,
+        Some("self_signed"),
+        "content_attestation must read the row's OWN metadata attest_level, got {content:?}"
+    );
+    assert_eq!(
+        link,
+        Some("signed_peer"),
+        "link_attestation must read the strongest incident EDGE, got {link:?}"
+    );
+    assert_ne!(
+        content, link,
+        "#3548: the memory's own attestation and the edge attestation must be reported apart"
+    );
+    // provenance_tier is kept as a one-release ALIAS of link_attestation.
+    assert_eq!(
+        obj.get("provenance_tier").and_then(|v| v.as_str()),
+        link,
+        "provenance_tier must alias link_attestation for one-release back-compat"
+    );
+}
+
+#[test]
+fn confidence_claim_additive_3548() {
+    // #3548 Part B (additive half) — recall surfaces confidence_value beside
+    // confidence_tier so a consumer sees the raw claim. v1.0.0 does NOT redefine
+    // the tier: it stays NUMERIC-ONLY, so a caller-asserted 1.0 still reads
+    // "confirmed". The honesty is that the raw value + source travel with the
+    // tier, not that the tier is re-gated (that is the deferred v1.0.1 vote).
+    use ai_memory::mcp::decorate_memory_many;
+    use ai_memory::models::Memory;
+
+    let conn = fresh_db();
+    let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+    seed_memory_with_embedding(&conn, "m-3548-c", "s3548c", "gamma", "gamma content", &emb);
+    conn.execute(
+        "UPDATE memories SET confidence = 1.0 WHERE id = 'm-3548-c'",
+        [],
+    )
+    .expect("set caller confidence 1.0");
+
+    let fetched = ai_memory::db::get_many(&conn, &["m-3548-c".to_string()]).expect("get_many ok");
+    let rows: Vec<(Memory, f64)> = vec![(fetched["m-3548-c"].clone(), 0.9)];
+
+    // verbose=true: the additive claim fields ride beside the tier.
+    let verbose = decorate_memory_many(&rows, true, &conn);
+    let obj = verbose[0].as_object().expect("row is object");
+    assert_eq!(
+        obj.get("confidence_value")
+            .and_then(serde_json::Value::as_f64),
+        Some(1.0),
+        "confidence_value must surface the raw stored claim"
+    );
+    assert!(
+        obj.get("confidence_source")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "confidence_source rides on the Memory serialization"
+    );
+    assert_eq!(
+        obj.get("confidence_tier").and_then(|v| v.as_str()),
+        Some("confirmed"),
+        "v1.0.0 confidence_tier stays NUMERIC-ONLY: 1.0 => confirmed (NOT redefined by #3548)"
+    );
+
+    // verbose=false: the additive decoration fields are absent (verbose-only).
+    let bare = decorate_memory_many(&rows, false, &conn);
+    let bobj = bare[0].as_object().expect("row is object");
+    for k in [
+        "content_attestation",
+        "link_attestation",
+        "confidence_value",
+    ] {
+        assert!(!bobj.contains_key(k), "verbose=false must NOT carry {k}");
+    }
+}
