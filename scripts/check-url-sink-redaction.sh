@@ -200,7 +200,7 @@ spared regardless of the local binding name), or crate::logging::host_only —
 or drop the URL from the message (errors::without_request_url for reqwest errors).
 If a site is ECHO-direction (the caller's own input refused back to that caller),
 add its key \`<file>:<fn>:<log|error>:{binding}\` to
-scripts/qc-allowlists/url-sink-redaction.txt WITH the reason. A `log` sink of a
+scripts/qc-allowlists/url-sink-redaction.txt WITH the reason. A \`log\` sink of a
 config-sourced URL is never allowlistable.
 MSG
   exit 1
