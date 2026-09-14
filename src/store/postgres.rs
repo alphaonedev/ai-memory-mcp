@@ -23766,8 +23766,23 @@ impl MemoryStore for PostgresStore {
         // `bypass_visibility`, tenant-facing handlers MUST NOT bypass).
         // #1628 refactor — shared caller-owns gate (byte-equal wire
         // errors; see assert_caller_owns_for_mutation).
-        self.assert_caller_owns_for_mutation(ctx, id, "delete", REASON_UNSTAMPED_TENANT_DELETE)
-            .await?;
+        // #3730 — PARITY with the sqlite adapter (store/sqlite.rs `delete`
+        // passes `allow_inbox = true`, "mirroring HTTP delete_memory / MCP
+        // memory_delete"): the ADDRESSED RECIPIENT may delete a message sent to
+        // it. The wrapper hard-coded `allow_inbox = false` for every action, so
+        // on postgres a recipient draining its inbox got PermissionDenied (403)
+        // while the same call succeeded on sqlite — measured by the
+        // bucket_b_inbox_recipient_delete_archives_and_drains_3730 pin. `update`
+        // keeps `false` on both backends.
+        Self::assert_caller_owns_for_mutation_on(
+            &self.pool,
+            ctx,
+            id,
+            "delete",
+            REASON_UNSTAMPED_TENANT_DELETE,
+            true,
+        )
+        .await?;
 
         // #3730 — retention policy by namespace, the twin of the sqlite
         // adapter: an inbox message is ARCHIVED through the existing
