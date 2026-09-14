@@ -362,11 +362,14 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724(
     {
         let conn = Connection::open(&db).expect("open");
         dispatch_event(&conn, "memory_store", "evt-3711", "ns-3711", None, &db);
-        // The retry ladder is ~6.2 s of sleeps; both deliveries run
-        // concurrently. Poll for both DLQ rows.
+        // A failed delivery may consume four ACK windows plus the retry
+        // backoffs (~26.2 s, `subscriptions.rs`), and under the #3705 TLS
+        // floor each attempt also pays a handshake; both deliveries run
+        // concurrently. Poll for both DLQ rows past that worst case (40 s):
+        // on a loaded host the 20 s bound this used to carry landed 1 row.
         let db_poll = db.clone();
         let rows = tokio::task::spawn_blocking(move || {
-            for _ in 0..200 {
+            for _ in 0..400 {
                 let conn = Connection::open(&db_poll).expect("open");
                 let all = list_dlq(&conn, None).expect("dlq");
                 if all.len() >= 2 {
