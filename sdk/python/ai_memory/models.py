@@ -391,7 +391,10 @@ class InboxMessage(_Base):
     subject: str
     body: str
     received_at: str
-    read: bool = False
+    # #3730 — no ``read`` field: the inbox carries no read/handled marker.
+    # Handled = the recipient deleted the message (archived on this
+    # namespace); ``unread_only`` is accepted for compatibility and narrows
+    # nothing.
 
 
 class BulkCreateResponse(_Base):
