@@ -123,12 +123,28 @@ const NOMIC_CANONICAL_ALIASES: &[&str] = &[
 /// Canonical name strings for the legacy v1 flat config keys (plus the
 /// `[embeddings]` section name) that appear on multiple production
 /// sites (#1558). Shared between the `AppConfig` surface in this file
-/// (the manual `Debug` impl + `warn_unknown_top_level_keys`) and the
+/// (the manual `Debug` impl + `config::unknown_keys`) and the
 /// `ai-memory config migrate` rewriter in
 /// `src/cli/commands/config.rs`, so each key spelling has one source
 /// of truth. The serde wire names themselves derive from the
 /// `AppConfig` field identifiers (no `#[serde(rename)]`), so serde
 /// needs no literal at all.
+/// #3714 — the deployment shape and everything it derives (ONE definition).
+pub mod shape;
+pub use shape::{
+    AtRestPolicy, DeploymentSection, DeploymentShape, Requirement, ShapeBootReport, ShapeDerived,
+    StorageBackend,
+};
+/// #3715 — unknown-key refusal at the loader, schema-derived.
+pub mod unknown_keys;
+
+/// The ONE "reading config <path>" error context (three read sites;
+/// pm-v3.1 hardcoded-literal gate).
+#[must_use]
+pub fn reading_config_context(path: &Path) -> String {
+    format!("reading config {}", path.display())
+}
+
 pub mod config_keys {
     /// Legacy flat `archive_max_days` key (v2: `[storage].archive_max_days`).
     pub const ARCHIVE_MAX_DAYS: &str = "archive_max_days";
@@ -441,6 +457,7 @@ impl TierConfig {
             // Capabilities schema v2 — see `Capabilities` doc comment.
             schema_version: "2".to_string(),
             federation_security: None,
+            deployment_shape: None,
             tier: self.tier.as_str().to_string(),
             version: crate::PKG_VERSION.to_string(),
             features: CapabilityFeatures {
@@ -595,6 +612,11 @@ pub struct Capabilities {
     /// MCP/HTTP. Absent when this process has not evaluated federation boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_security: Option<crate::federation::peer_posture::Report>,
+    /// #3700: the daemon's deployment-shape / posture boot snapshot (fleet
+    /// vs singleton, posture, origin, whether they match). Absent when this
+    /// process has not evaluated its shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
     /// Schema-version discriminator. Always `"2"` since v0.6.3.
     pub schema_version: String,
     pub tier: String,
@@ -2013,6 +2035,7 @@ impl Capabilities {
         CapabilitiesV3 {
             schema_version: "3".to_string(),
             federation_security: self.federation_security.clone(),
+            deployment_shape: self.deployment_shape.clone(),
             summary,
             to_describe_to_user,
             tools,
@@ -2133,6 +2156,9 @@ pub struct CapabilitiesV3 {
     /// #3582: same daemon boot snapshot as the v2 projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_security: Option<crate::federation::peer_posture::Report>,
+    /// #3700: same deployment-shape snapshot as the v2 projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
     /// Schema-version discriminator. Always `"3"` in v0.7.0.
     pub schema_version: String,
 
@@ -2373,7 +2399,7 @@ pub fn default_capability_provenance_substrate_layer() -> CapabilityProvenanceSu
 
 /// Per-tier TTL overrides loaded from `[ttl]` section of config.toml.
 #[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TtlConfig {
     /// Short-tier default TTL in seconds (default: 21600 = 6 hours)
     pub short_ttl_secs: Option<i64>,
@@ -2503,7 +2529,7 @@ const MAX_TRANSCRIPT_LIFECYCLE_SECS: i64 = 315_360_000;
 /// override (with literal `"*"` patterns last), falls back to the
 /// global `default_ttl_secs` / `archive_grace_secs` on this struct,
 /// and finally to the compiled defaults above.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptsConfig {
     /// Global default seconds-since-creation before the sweeper
     /// considers a transcript archive-eligible. `None` → compiled
@@ -2532,7 +2558,7 @@ pub struct TranscriptsConfig {
 /// `[transcripts.namespaces."<pattern>"]`. Each field independently
 /// overrides the [`TranscriptsConfig`] global default; an unset field
 /// inherits.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptNamespaceConfig {
     /// Namespace-specific TTL override.
     pub default_ttl_secs: Option<i64>,
@@ -2737,7 +2763,7 @@ impl TranscriptsConfig {
 /// Setting `legacy_scoring = true` disables the decay multiplier entirely,
 /// restoring the pre-v0.6.0.0 blended-score behavior for A/B comparison or
 /// if a recall-quality regression is reported.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RecallScoringConfig {
     /// Half-life for `short`-tier memories, in days (default 7).
     pub half_life_days_short: Option<f64>,
@@ -3149,7 +3175,7 @@ fn resolve_config_path_choice(
 ///
 /// All fields are optional — CLI flags override file values, which override
 /// compiled defaults.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AppConfig {
     /// Feature tier: keyword, semantic, smart, autonomous
     pub tier: Option<String>,
@@ -3549,6 +3575,12 @@ pub struct AppConfig {
     /// engages [`crate::encryption::encryption_enabled`]. Default off.
     /// Seeded at boot via [`crate::encryption::set_config_at_rest`].
     pub encryption: Option<EncryptionSection>,
+    /// #3714 — `[deployment]` block: the shape this node is deployed in,
+    /// the primary input from which posture / transit / at-rest / storage
+    /// requirements derive (see [`DeploymentShape::derive`]). Absent =
+    /// `singleton`; an upgrade never promotes a node to a stricter shape.
+    #[serde(default)]
+    pub deployment: Option<DeploymentSection>,
 }
 
 // #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
@@ -3625,6 +3657,7 @@ impl std::fmt::Debug for AppConfig {
             .field("storage", &self.storage)
             .field("limits", &self.limits)
             .field("encryption", &self.encryption)
+            .field("deployment", &self.deployment)
             .finish()
     }
 }
@@ -3656,7 +3689,7 @@ impl AppConfig {
 /// [encryption]
 /// at_rest = true
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EncryptionSection {
     /// When `true`, seal memory `content` at rest under ChaCha20-Poly1305.
     /// Whole-DB SQLCipher still requires `--features sqlcipher` + a passphrase.
@@ -3674,7 +3707,7 @@ pub struct EncryptionSection {
 /// [governance]
 /// require_operator_pubkey = true
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct GovernanceConfig {
     /// SEC-2 fail-closed switch. When `true`, the daemon refuses to
     /// start if the `governance_rules` table contains any
@@ -3727,7 +3760,7 @@ pub struct GovernanceConfig {
 /// AND the role gate runs on top of it. The two layers compose:
 /// `api_key_auth` answers "is the request authenticated?" and the
 /// admin gate answers "is the authenticated caller an admin?".
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AdminConfig {
     /// Explicit list of `agent_id` strings whose authenticated
     /// requests are treated as admin-class. Default `vec![]`
@@ -3808,7 +3841,7 @@ impl AdminConfig {
 /// `[llm]` section > legacy flat fields (`llm_model`, `ollama_url`) >
 /// compiled default (warn-logged once on the resolver's `CompiledDefault`
 /// arm).
-#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LlmSection {
     /// Backend selector. One of: `ollama` (native `/api/chat` +
     /// `/api/embed`, no auth), `openai-compatible` (generic; requires
@@ -3890,7 +3923,7 @@ impl std::fmt::Debug for LlmSection {
 /// section field-by-field when unset; commonly only `model` is
 /// overridden to point at a faster model (default `gemma3:4b`,
 /// ~0.7s p50 vs ~15s p50 for thinking-mode Gemma 4 per L15 patch).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LlmAutoTagSection {
     /// Backend override. Unset = inherit `[llm].backend`.
     pub backend: Option<String>,
@@ -3927,7 +3960,7 @@ pub struct LlmAutoTagSection {
 /// backfill_batch = 100                         # 1-10000 (env override:
 ///                                              # AI_MEMORY_EMBED_BACKFILL_BATCH)
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EmbeddingsSection {
     /// Embedding backend. `ollama` (the default — local `/api/embed`
     /// wire shape) or, since #1598, any #1067 OpenAI-compatible alias
@@ -4070,7 +4103,7 @@ impl BackfillOnBoot {
 /// (via `ai-memory config migrate`) writes the explicit `enabled` +
 /// `model` fold; the legacy field continues to be honored at parse
 /// time until v0.8.0.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct RerankerSection {
     /// Whether the cross-encoder rerank stage runs in the recall
     /// pipeline. Folded from `cross_encoder: Option<bool>` at the
@@ -4121,7 +4154,7 @@ pub struct RerankerSection {
 /// [curator.confidence_decay_half_life_days]
 /// "team/eng" = 14.0
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CuratorSection {
     /// #1671 — per-namespace reflection-pass overrides keyed by
     /// namespace. `curator --reflect --all-namespaces` participates ONLY
@@ -4180,7 +4213,7 @@ pub struct CuratorSection {
 /// knob is still intentionally NOT exposed — when it is, it must get its own
 /// dedicated `[curator.size_gc]` switch rather than ride under this block
 /// (#1750 5-agent vote, memory `a9b2fe09`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct CuratorCompactionSection {
     /// When `true`, the curator runs the SAL `ConsolidationPass` live. Default
     /// `false`. Env override: `AI_MEMORY_COMPACTION_ENABLED` (see
@@ -4210,7 +4243,7 @@ pub struct CuratorCompactionSection {
 /// `archive_on_gc`, `archive_max_days`, `max_memory_mb`. The `db`
 /// path stays top-level per the #1146 I4 carve-out (path expansion
 /// semantics pinned by #507).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct StorageSection {
     /// Default namespace for new memories when the caller's request
     /// omits one. Folded from the previously-flat top-level
@@ -4297,7 +4330,7 @@ pub struct StorageSection {
 /// Raise it for bulk verification of a known-small corpus; for
 /// genuinely large datasets paginate with `?offset=` / `?since=` rather
 /// than removing the bound.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LimitsSection {
     /// Per-(agent, namespace) daily memory-write ceiling stamped at
     /// quota-row auto-insert. Folds nothing legacy; new at v0.7.x.
@@ -5095,7 +5128,7 @@ pub fn allow_lineage_regression() -> bool {
 }
 
 /// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SecurityConfig {
     /// Pre-write credential-screen disposition for caller-origin writes
     /// (`off` / `redact` / `refuse`). `None` / omitted → compiled default
@@ -5601,7 +5634,7 @@ impl ResolvedModels {
 /// tier = "long"
 /// limit = 50
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentsConfig {
     /// `[agents.defaults]` sub-block. `None` keeps recall semantics
     /// exactly as v0.6.x — every cross-session `memory_recall` requires
@@ -5615,7 +5648,7 @@ pub struct AgentsConfig {
 /// v0.7.0 (issue #518) — `[agents.defaults]` sub-block. Today exposes a
 /// single field: `recall_scope`. Future expansion (per-call timeouts,
 /// per-call tag filters, …) lives here.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentDefaults {
     /// `[agents.defaults.recall_scope]` — default filter set spliced
     /// into recall calls that pass `session_default=true` and omit
@@ -5643,7 +5676,7 @@ pub struct AgentDefaults {
 /// tier = "long"                     # "short" / "mid" / "long"
 /// limit = 50                        # default cap
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RecallScope {
     /// Default namespace filter applied when the request omits its
     /// own `namespace` field. The current recall handlers accept a
@@ -5692,7 +5725,7 @@ pub struct RecallScope {
 /// applies. Set to `0` or a negative value to disable the sweep
 /// (matches the audit-honest "do-nothing-on-zero" convention used by
 /// `archive_max_days`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ConfidenceConfig {
     /// Retention window (in days) for shadow-mode observation rows.
     /// Rows whose `observed_at` is older than `now - N days` are
@@ -5739,7 +5772,7 @@ pub const DEFAULT_LLM_CALL_TIMEOUT_SECS: u64 = 30;
 /// The override applies even to subscriptions that did not register a
 /// per-subscription secret. When both are set, the per-subscription
 /// secret wins (subscription-scoped trust beats server-scoped trust).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HooksConfig {
     /// `[hooks.subscription]` sub-block. Optional — when omitted, no
     /// server-wide HMAC override applies.
@@ -5766,7 +5799,7 @@ pub struct HooksConfig {
 /// #1262 — `Debug` is implemented manually to redact `hmac_secret` so
 /// accidental `{:?}` prints never leak the signing key. #1258 — the
 /// manual `Drop` impl zeroizes the secret on scope exit.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HooksSubscriptionConfig {
     /// Server-wide HMAC secret. Plaintext on disk — operators are
     /// expected to chmod 600 the config file (same posture as the
@@ -5835,7 +5868,7 @@ impl Drop for HooksSubscriptionConfig {
 /// still allows it through. When `true`, missing nonces are rejected
 /// with 409 Conflict and the operator's audit trail receives every
 /// attempted reuse.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct VerifyConfig {
     /// When `true`, `POST /api/v1/links/verify` requires every
     /// request body to include a `verification_nonce` field. Missing
@@ -5864,13 +5897,20 @@ pub struct VerifyConfig {
 /// Loopback hosts are reachable from the daemon process itself, so
 /// permitting them by default exposes any locally-bound service
 /// (database, internal admin sockets) to authenticated SSRF.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SubscriptionsConfig {
     /// Re-enable loopback webhook URLs. Default `false` (loopback
     /// rejected). Operators who need to point a webhook at a local
     /// listener (CI, dev) set this to `true` explicitly.
     #[serde(default)]
     pub allow_loopback_webhooks: bool,
+    /// v1.0.0 #3705 — a PEM certificate (or CA) the webhook dispatcher
+    /// trusts IN ADDITION to the public roots, so a receiver behind a
+    /// private PKI can be reached over https:// (plaintext webhooks are
+    /// refused everywhere). A configured file that cannot be read or parsed
+    /// refuses boot — never silently ignored.
+    #[serde(default)]
+    pub ca_cert: Option<std::path::PathBuf>,
 }
 
 /// v1.0.0 #3467 (EPIC #3466) — `[wake_hub]` config block.
@@ -5900,7 +5940,7 @@ pub struct SubscriptionsConfig {
 /// hard config error rather than a silently-ignored line, so an operator who
 /// believes they tightened a limit cannot be wrong about it (#3166 fail-closed
 /// config posture).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WakeHubConfig {
     /// Unix socket to listen on. Its parent directory must be owner-only
@@ -6173,7 +6213,7 @@ pub fn allow_loopback_webhooks() -> bool {
 /// [permissions]
 /// mode = "advisory"   # or "enforce" / "off"
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionsMode {
     /// Block on policy violation. `Deny`/`Pending` decisions returned
@@ -6343,7 +6383,7 @@ pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
 /// table) binds that key-derived principal against the self-asserted header, and
 /// whether the IDOR-sensitive read/mutate + admin gates REQUIRE a key-derived
 /// principal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub enum HttpIdentityMode {
     /// No binding — legacy self-asserted `X-Agent-Id` (byte-identical to
     /// pre-#2044). The escape hatch for operators who front the daemon with a
@@ -6710,7 +6750,7 @@ pub fn compaction_enabled() -> bool {
 /// Rules are deny-first and longest-pattern-wins; see
 /// [`crate::permissions`] module docs for the full combination
 /// rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PermissionsConfig {
     /// Enforcement mode. `None` when the operator declared a
     /// `[permissions]` block but omitted `mode = ` — this is the
@@ -6910,7 +6950,7 @@ pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
 /// broad `db::agent_pubkey` registry — EXCEPT the reserved zero-config
 /// `owner` issuer (#1960), which is auto-enrolled from on-disk custody
 /// (`owner.priv`/`.pub` + `owner.caproot`) with an Admin ceiling.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CapabilitiesConfig {
     /// Master switch. `None`/absent ⇒ the compiled default
     /// [`crate::governance::capability::DEFAULT_CAPABILITIES_ENABLED`] (true
@@ -6932,7 +6972,7 @@ pub struct CapabilitiesConfig {
 /// ceiling. `max_op` is REQUIRED (`none`/`read`/`write`/`admin`) — an
 /// unparseable value skips the issuer entirely (fail closed; never
 /// defaults up).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CapabilityIssuerEntry {
     /// Maximum op level this issuer may ever grant.
     pub max_op: String,
@@ -7122,7 +7162,7 @@ pub fn reset_permissions_decision_counts_for_test() {
 
 /// `[logging]` block in `config.toml`. Every field is `Option`; missing
 /// fields fall back to the documented defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LoggingConfig {
     /// Master toggle. Default `false`.
     pub enabled: Option<bool>,
@@ -7178,7 +7218,7 @@ pub struct LoggingConfig {
 
 /// `[audit]` block in `config.toml`. Drives the hash-chained audit
 /// trail emitted from every memory mutation call site.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AuditConfig {
     /// Master toggle. Default `false`.
     pub enabled: Option<bool>,
@@ -7282,7 +7322,7 @@ impl AuditConfig {
 /// Precedence for `enabled`:
 ///   `AI_MEMORY_BOOT_ENABLED=0` env var (truthy "0/false/no/off") >
 ///   `[boot] enabled` config value > compiled default `true`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BootConfig {
     /// Master toggle. Default `true`. When set to `false`, `ai-memory
     /// boot` exits 0 with **empty stdout AND empty stderr** — the
@@ -7333,7 +7373,7 @@ impl BootConfig {
 ///
 /// Resolution for `profile`: CLI flag > `AI_MEMORY_PROFILE` env (both
 /// merged by clap) > this config field > compiled default `"core"`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct McpConfig {
     /// Named tool profile. One of `core`, `graph`, `admin`, `power`,
     /// `full`, or a comma-separated custom list (e.g.,
@@ -7457,7 +7497,7 @@ pub enum AllowlistDecision {
     Deny,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AuditComplianceConfig {
     pub soc2: Option<CompliancePreset>,
     pub hipaa: Option<CompliancePreset>,
@@ -7606,7 +7646,7 @@ pub struct UnenforcedComplianceClaim {
     pub remediation: &'static str,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CompliancePreset {
     pub applied: Option<bool>,
     pub retention_days: Option<u32>,
@@ -7638,7 +7678,7 @@ pub struct CompliancePreset {
 /// fallback when no explicit `agent_id` is supplied. `anonymize_default = true`
 /// swaps the hostname-revealing default for `anonymous:pid-<pid>-<uuid8>`,
 /// matching what the `AI_MEMORY_ANONYMIZE=1` env var does ephemerally.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IdentityConfig {
     /// When true, the "no flag, no env, no MCP clientInfo" fallback uses
     /// `anonymous:pid-<pid>-<uuid8>` instead of the hostname-revealing
@@ -8257,9 +8297,7 @@ impl AppConfig {
         match std::fs::read_to_string(path) {
             Ok(contents) => Self::from_toml_contents(path, &contents),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("reading config {}", path.display())))
-            }
+            Err(e) => Err(anyhow::Error::new(e).context(reading_config_context(path))),
         }
     }
 
@@ -8278,7 +8316,13 @@ impl AppConfig {
                 // continues to succeed so a typo or stale Plan C section
                 // (`[memory]`, `[autonomous]`, `[governance]`, `[federation]`)
                 // can no longer silently neutralise an operator's intent.
-                Self::warn_unknown_top_level_keys(path, &contents);
+                // #3715 — unknown keys REFUSE (see `from_toml_contents`);
+                // this fail-open loader takes its existing parse-failure
+                // arm (compiled defaults) rather than a silent load.
+                if let Err(reason) = Self::refuse_unknown_keys(path, &contents) {
+                    eprintln!("ai-memory: {reason}");
+                    return Self::default();
+                }
                 match toml::from_str::<Self>(&contents) {
                     Ok(cfg) => match cfg.validate_secret_handling() {
                         Ok(()) => {
@@ -8364,8 +8408,8 @@ impl AppConfig {
     /// parse, or `validate_secret_handling` rejects the resolved config.
     pub fn try_load_from(path: &Path) -> anyhow::Result<Self> {
         use anyhow::Context as _;
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
+        let contents =
+            std::fs::read_to_string(path).with_context(|| reading_config_context(path))?;
         Self::from_toml_contents(path, &contents)
     }
 
@@ -8402,9 +8446,11 @@ impl AppConfig {
     /// Returns an error when the TOML fails to parse or the secret-handling
     /// validation rejects the resolved config.
     fn from_toml_contents(path: &Path, contents: &str) -> anyhow::Result<Self> {
-        // Mirror `load_from`'s L1 unknown-top-level-key WARN (best-effort;
-        // does not fail the load).
-        Self::warn_unknown_top_level_keys(path, contents);
+        // #3715 — unknown keys REFUSE the load (every nesting level). The
+        // repair tools (`config check`, `config migrate`,
+        // `governance migrate-to-permissions`) parse through `toml::Value`
+        // and never cross this funnel, so the refused state is repairable.
+        Self::refuse_unknown_keys(path, contents)?;
         // #3277 / #3197 — toml 0.8 Display echoes the offending source
         // line (caret-underlined). A malformed `api_key = "…"` therefore
         // lands in stderr/journald if we chain the toml error through
@@ -8588,91 +8634,31 @@ impl AppConfig {
         Ok(())
     }
 
-    /// L1 fix (v0.7.0): enumerate top-level keys in `contents` and emit a
-    /// `tracing::warn!` for every key that is not a recognised `AppConfig`
-    /// field. Malformed TOML is silently skipped here — the existing
-    /// `toml::from_str::<AppConfig>` parse in `load_from` will surface the
-    /// real parse error to the operator on the next line.
-    fn warn_unknown_top_level_keys(path: &Path, contents: &str) {
-        // Canonical list of `AppConfig` top-level fields. Keep in sync with
-        // the struct definition above; verified verbatim against the v0.7.0
-        // L1 spec.
-        const EXPECTED_KEYS: &[&str] = &[
-            "tier",
-            "db",
-            config_keys::OLLAMA_URL,
-            "embed_url",
-            config_keys::EMBEDDING_MODEL,
-            "llm_model",
-            config_keys::AUTO_TAG_MODEL,
-            config_keys::CROSS_ENCODER,
-            config_keys::DEFAULT_NAMESPACE,
-            config_keys::MAX_MEMORY_MB,
-            "ttl",
-            config_keys::ARCHIVE_ON_GC,
-            "api_key",
-            config_keys::ARCHIVE_MAX_DAYS,
-            "identity",
-            "scoring",
-            "autonomous_hooks",
-            "logging",
-            "audit",
-            "boot",
-            "mcp",
-            "permissions",
-            // v0.9.0 G10.1 (#1827) — [capabilities] block.
-            crate::models::field_names::CAPABILITIES,
-            "transcripts",
-            "hooks",
-            "security",
-            "subscriptions",
-            "postgres_statement_timeout_secs",
-            "postgres_pool_max_connections",
-            "postgres_pool_min_connections",
-            "postgres_acquire_timeout_secs",
-            "request_timeout_secs",
-            "llm_call_timeout_secs",
-            "verify",
-            "wake_hub",
-            "mcp_federation_forward_url",
-            "agents",
-            "governance",
-            "confidence",
-            "admin",
-            "monitoring",
-            // v0.7.x (#1146) — enterprise configuration sections.
-            "schema_version",
-            "llm",
-            config_keys::SECTION_EMBEDDINGS,
-            "reranker",
-            "curator",
-            "storage",
-            "limits",
-            "encryption",
-        ];
-
-        let value: toml::Value = match toml::from_str(contents) {
-            Ok(v) => v,
-            // Malformed TOML — defer to the strongly-typed parse in the
-            // caller, which produces the operator-facing error message.
-            Err(_) => return,
+    /// #3715 — refuse a config document that carries a key `AppConfig`
+    /// would silently drop, at ANY nesting level. Replaces the v0.7.0 L1
+    /// `warn_unknown_top_level_keys` (top level only, WARN only): a typo
+    /// or a stale section (`[memory]`, `[autonomous]`, `[federation]`,
+    /// `[[governance.policy]]`) used to neutralise an operator's intent
+    /// with nothing louder than a `tracing::warn!` nobody had a
+    /// subscriber for.
+    ///
+    /// Malformed TOML is deliberately NOT an error here — the
+    /// strongly-typed parse in the caller owns that message (redacted,
+    /// #3277 / #3197).
+    ///
+    /// # Errors
+    /// Returns the full refusal text (every unknown path, the nearest
+    /// accepted sibling, and the exact repair command) when at least one
+    /// unknown key is present.
+    fn refuse_unknown_keys(path: &Path, contents: &str) -> anyhow::Result<()> {
+        let Ok(value) = toml::from_str::<toml::Value>(contents) else {
+            return Ok(());
         };
-
-        let Some(table) = value.as_table() else {
-            return;
-        };
-
-        let expected_list = EXPECTED_KEYS.join(", ");
-        for key in table.keys() {
-            if !EXPECTED_KEYS.contains(&key.as_str()) {
-                tracing::warn!(
-                    "[config] unknown key '{key}' in {path} — top-level AppConfig fields are: {expected_keys}. This key is silently ignored (no behavior change).",
-                    key = key,
-                    path = path.display(),
-                    expected_keys = expected_list,
-                );
-            }
+        let unknown = unknown_keys::find_unknown_keys(&value);
+        if unknown.is_empty() {
+            return Ok(());
         }
+        anyhow::bail!("{}", unknown_keys::refusal_message(path, &unknown))
     }
 
     /// v1.0.0 §5.3 cutline ruling — hoisted to a named const (was a bare
@@ -8694,6 +8680,18 @@ impl AppConfig {
             "off" => Some(PermissionsMode::Off),
             _ => None,
         }
+    }
+
+    /// #3714 — the deployment shape. Absent block or absent `shape` key
+    /// resolves to [`DeploymentShape::Singleton`]; there is no env
+    /// spelling (containers render `config.toml`), and nothing infers a
+    /// stricter shape from any other setting.
+    #[must_use]
+    pub fn effective_shape(&self) -> DeploymentShape {
+        self.deployment
+            .as_ref()
+            .and_then(|d| d.shape)
+            .unwrap_or_default()
     }
 
     /// v0.7.0 K3 — resolve the effective [`PermissionsMode`] consulted
@@ -12385,55 +12383,64 @@ legacy_scoring = false
     // `[governance]`, `[federation]` tables in the operator's
     // config.toml — none of them are real `AppConfig` fields, so serde
     // silently dropped them and the operator's intent never reached the
-    // daemon. The fix warns on every unknown top-level key while still
-    // loading the config gracefully.
+    // daemon. v0.7.0 L1 WARNed on the top level only; #3715 REFUSES at
+    // every level. This is the one deliberate ignore-unknown pin the
+    // corpus census found, flipped to the refusal it now guards.
 
-    /// Top-level key not in `AppConfig` is reported via `tracing::warn!`
-    /// AND the config still loads with recognised fields intact.
+    /// #3715 — an unknown key (top-level or nested) REFUSES the boot
+    /// loader with a message naming the path, the nearest accepted
+    /// sibling and the repair command; the fail-open `load_from` takes
+    /// its compiled-defaults arm instead of loading the rest silently.
     #[test]
-    fn load_from_warns_on_unknown_top_level_key_but_still_loads() {
-        // Construct a config that mixes a real key (`tier`) with the
-        // unknown `[memory]` table from the Plan C bug. The recognised
-        // `tier = "autonomous"` at the top level must survive (i.e. the
-        // unknown `[memory] tier = "ignored"` does NOT shadow it —
-        // top-level wins because `[memory]` is a different namespace
-        // entirely from `AppConfig.tier`).
-        let toml_src = "tier = \"autonomous\"\n\n[memory]\ntier = \"ignored\"\n";
-
+    fn unknown_keys_refuse_the_boot_loader_at_every_level() {
+        let toml_src = "tier = \"autonomous\"\n\n[memory]\ntier = \"ignored\"\n\n[storage]\ndb_mmap_size_byte = 1\n";
         let tmp = tempfile::NamedTempFile::new().expect("create temp file");
         std::fs::write(tmp.path(), toml_src).expect("write temp config");
 
-        // We do NOT install a tracing subscriber here — `tracing-test`
-        // is not a dev-dep, and the spec explicitly allows skipping the
-        // "warn-was-emitted" assertion when capturing is awkward. The
-        // important contract is:
-        //   (a) load_from returns a populated AppConfig (no panic),
-        //   (b) the recognised top-level `tier` survives,
-        //   (c) the unknown `[memory]` table did NOT block the load.
-        // The warn itself is exercised at runtime — verify it fires by
-        // running `RUST_LOG=warn AI_MEMORY_NO_CONFIG=0 ai-memory ...`
-        // against a config with a stray section.
-        let cfg = AppConfig::load_from(tmp.path());
-
-        assert_eq!(
-            cfg.tier.as_deref(),
-            Some("autonomous"),
-            "top-level `tier` must survive even when an unknown `[memory]` table is present",
+        let err = AppConfig::try_load_from_optional(tmp.path())
+            .expect_err("unknown keys must refuse the boot loader")
+            .to_string();
+        assert!(err.contains("`memory`"), "{err}");
+        assert!(err.contains("`storage.db_mmap_size_byte`"), "{err}");
+        assert!(
+            err.contains("db_mmap_size_bytes"),
+            "nearest sibling named: {err}"
         );
+        assert!(
+            err.contains("config check --file"),
+            "repair command named: {err}"
+        );
+
+        // The fail-open loader must not load HALF the file either.
+        let cfg = AppConfig::load_from(tmp.path());
+        assert_eq!(cfg.tier, None, "load_from falls back to compiled defaults");
+
+        // Carve-out 1: the same document parses through `toml::Value` for
+        // the repair tools — refusal lives ONLY in the AppConfig funnel.
+        assert!(toml::from_str::<toml::Value>(toml_src).is_ok());
     }
 
-    /// Every field in `AppConfig` is enumerated in the expected-key
-    /// set, so renaming a struct field will not silently start
-    /// emitting bogus warnings for the new name.
-    ///
-    /// Regression guard: if you add a new top-level field to
-    /// `AppConfig`, you MUST also add it to the `EXPECTED_KEYS` const
-    /// inside `AppConfig::warn_unknown_top_level_keys`. This test
-    /// enforces parity by serialising a fully-populated `AppConfig` to
-    /// TOML and asserting that every emitted top-level key is in the
-    /// expected set.
+    /// #3715 — a clean config (every key accepted, secrets included)
+    /// still loads through both loaders.
     #[test]
-    fn warn_unknown_top_level_keys_covers_every_appconfig_field() {
+    fn clean_config_loads_unchanged_under_unknown_key_refusal() {
+        let toml_src = "schema_version = 2\ntier = \"autonomous\"\napi_key = \"k\"\n\n[deployment]\nshape = \"team\"\n\n[storage]\ndb_mmap_size_bytes = 1\n";
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), toml_src).expect("write temp config");
+        let cfg = AppConfig::try_load_from_optional(tmp.path()).expect("clean config loads");
+        assert_eq!(cfg.tier.as_deref(), Some("autonomous"));
+        assert_eq!(cfg.effective_shape(), DeploymentShape::Team);
+        let cfg = AppConfig::load_from(tmp.path());
+        assert_eq!(cfg.tier.as_deref(), Some("autonomous"));
+    }
+
+    /// Every field in `AppConfig` is in the schema-derived accepted set
+    /// (#3715), so a field whose type forgot `schemars::JsonSchema` cannot
+    /// make the loader refuse a legitimate key. Serialises a
+    /// fully-populated `AppConfig` and asserts every emitted top-level key
+    /// is a prefix of an accepted leaf.
+    #[test]
+    fn schema_derived_accepted_keys_cover_every_appconfig_field() {
         // Build an AppConfig with every Option populated so serde emits
         // every field. We only need the keys, not the values, so
         // default placeholder sub-structs are fine.
@@ -12488,6 +12495,7 @@ legacy_scoring = false
             storage: Some(StorageSection::default()),
             limits: Some(LimitsSection::default()),
             encryption: Some(EncryptionSection::default()),
+            deployment: Some(DeploymentSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -12495,67 +12503,16 @@ legacy_scoring = false
             toml::from_str(&serialised).expect("re-parse serialised AppConfig");
         let table = value.as_table().expect("serialised AppConfig is a table");
 
-        // Mirror the const in `warn_unknown_top_level_keys`. Keep in
-        // sync — if this assertion fires, you forgot to update the
-        // expected-keys list when adding a new AppConfig field.
-        const EXPECTED_KEYS: &[&str] = &[
-            "tier",
-            "db",
-            "ollama_url",
-            "embed_url",
-            "embedding_model",
-            "llm_model",
-            "auto_tag_model",
-            "cross_encoder",
-            "default_namespace",
-            "max_memory_mb",
-            "ttl",
-            "archive_on_gc",
-            "api_key",
-            "archive_max_days",
-            "identity",
-            "scoring",
-            "autonomous_hooks",
-            "logging",
-            "audit",
-            "boot",
-            "mcp",
-            "permissions",
-            crate::models::field_names::CAPABILITIES,
-            "transcripts",
-            "hooks",
-            "security",
-            "subscriptions",
-            "postgres_statement_timeout_secs",
-            "postgres_pool_max_connections",
-            "postgres_pool_min_connections",
-            "postgres_acquire_timeout_secs",
-            "request_timeout_secs",
-            "llm_call_timeout_secs",
-            "verify",
-            "wake_hub",
-            "mcp_federation_forward_url",
-            "agents",
-            "governance",
-            "confidence",
-            "admin",
-            "monitoring",
-            // v0.7.x (#1146) — enterprise configuration sections.
-            "schema_version",
-            "llm",
-            "embeddings",
-            "reranker",
-            "curator",
-            "storage",
-            "limits",
-            "encryption",
-        ];
-
+        // #3715 — the accepted set is derived from the schema, so parity is
+        // "every serialised top-level field is a prefix of an accepted leaf".
+        let leaves = unknown_keys::accepted_leaf_keys();
         for key in table.keys() {
             assert!(
-                EXPECTED_KEYS.contains(&key.as_str()),
-                "AppConfig field `{key}` is not in EXPECTED_KEYS — \
-                 update `warn_unknown_top_level_keys` to keep parity",
+                leaves
+                    .iter()
+                    .any(|l| l == key || l.starts_with(&format!("{key}."))),
+                "AppConfig field `{key}` is missing from the schema-derived accepted set — \
+                 does its type derive `schemars::JsonSchema`?",
             );
         }
     }

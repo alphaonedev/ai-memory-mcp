@@ -27,7 +27,7 @@ pub use super::routes::{MONITORING_METRICS as METRICS_PATH, MONITORING_STATUS as
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Operator-assigned health-only scope on existing identities. No secrets.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MonitoringConfig {
     /// Ordinary enrolled agent principals restricted to health routes.

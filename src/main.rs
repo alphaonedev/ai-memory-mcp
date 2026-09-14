@@ -93,7 +93,17 @@ fn main() -> Result<()> {
     // (`AppConfig::load_for_boot` matches `ErrorKind::NotFound` explicitly),
     // and `AI_MEMORY_NO_CONFIG=1` still short-circuits to defaults, so CI and
     // the test suite are byte-identical.
-    let app_config = match config::AppConfig::load_for_boot() {
+    // #3715 carve-out 1 — the `config` verbs (`check` / `migrate` / `show`)
+    // are the repair tools for a refused config: they read the file through
+    // `toml::Value` themselves and never depend on the boot loader, so they
+    // do not run it (running it would print the refusal they exist to
+    // explain, ahead of their own report).
+    let is_config_verb = matches!(&cli.command, daemon_runtime::Command::Config(_));
+    let app_config = match if is_config_verb {
+        Ok(config::AppConfig::default())
+    } else {
+        config::AppConfig::load_for_boot()
+    } {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("ai-memory: config is UNUSABLE — {e:#}");
@@ -145,6 +155,42 @@ fn main() -> Result<()> {
     // token aborts the boot right here, before anything else starts. The
     // async body logs the stashed pin report via the READ-ONLY
     // `security_profile::runtime_boot_report`.
+    // #3714 — the deployment shape derives the posture: under a hardened
+    // shape an unset `AI_MEMORY_SECURITY_PROFILE` is pinned to `asi-hard`
+    // (same `set_var` pre-runtime contract as the KNOBS pins below) and a
+    // `standard` override refuses; the at-rest floor is checked here too.
+    // MUST precede `security_profile::enforce_at_boot_pre_runtime` so the
+    // posture enforcement observes the pin. `doctor` still runs so it can
+    // report a shape refusal.
+    match ai_memory::config::shape::enforce_at_boot_pre_runtime(&app_config) {
+        Ok(_) => {}
+        // `doctor` reports a shape refusal in its "Deployment shape"
+        // section instead of dying on it (the pin is simply not applied).
+        Err(e) if is_doctor => eprintln!("ai-memory: WARN shape enforcement: {e:#}"),
+        Err(e) => return Err(e),
+    }
+
+    // v1.0.0 #3700 — the deployment-shape DETECTOR (read-only): holds the
+    // configured signals (peers, bindings, allowlist, forward URL, wake hub,
+    // monitoring scopes) against the DECLARED shape. A hardened declared
+    // shape with any pinned knob below its floor refuses here, naming EVERY
+    // disabled knob; configuration that looks like a stricter shape than
+    // declared is WARNED and recorded, never re-postured (promotion is an
+    // operator act). `doctor` never refuses — it reports the detector.
+    if !is_doctor {
+        let argv = match &cli.command {
+            daemon_runtime::Command::Serve(args) => Some((
+                !args.quorum_peers.is_empty(),
+                args.mtls_allowlist.as_deref(),
+            )),
+            daemon_runtime::Command::SyncDaemon(args) => Some((!args.peers.is_empty(), None)),
+            _ => None,
+        };
+        // Daemon entry points announce an undeclared promotion on stderr;
+        // one-shot verbs stay quiet (hooks capture stderr).
+        let announce = argv.is_some();
+        ai_memory::config::shape::detector::assess_pre_runtime(&app_config, argv, announce)?;
+    }
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
     // v1.0.0 #3124 — the unstamped-row mutation posture is a mandate-class
@@ -155,6 +201,16 @@ fn main() -> Result<()> {
         ai_memory::identity::owner_stamp::validate_boot_token()?;
     }
 
+    // v1.0.0 #3705 — "only encrypted data in transit": the selector token
+    // (one grammar; falsy or unrecognised REFUSES, never proceeds in
+    // cleartext), the removed downgrade paths (a set hatch refuses) and the
+    // config-carried outbound URLs. Read-only. `doctor` never refuses — it
+    // reports the transit posture of every surface instead.
+    if !is_doctor {
+        ai_memory::transit_encryption::enforce_process_floor()?;
+        ai_memory::transit_encryption::enforce_config_urls(&app_config)?;
+    }
+
     // #3582: evaluate the argv peer lists even with quorum_writes=0, before
     // workers or stores start. Doctor must remain able to diagnose refusal.
     match &cli.command {
@@ -163,9 +219,19 @@ fn main() -> Result<()> {
                 !args.quorum_peers.is_empty(),
                 args.mtls_allowlist.as_deref(),
             )?;
+            // v1.0.0 #3705 — a plaintext peer URL is refused pre-runtime, even
+            // with quorum_writes=0 (where FederationConfig::build never runs).
+            for peer in &args.quorum_peers {
+                ai_memory::tls::validate_peer_url_scheme(peer)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
         }
         daemon_runtime::Command::SyncDaemon(args) => {
             ai_memory::federation::peer_posture::enforce_at_boot(!args.peers.is_empty(), None)?;
+            for peer in &args.peers {
+                ai_memory::tls::validate_peer_url_scheme(peer)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
         }
         _ => {}
     }
@@ -229,6 +295,22 @@ fn main() -> Result<()> {
     // operators who need to point a webhook at a local listener (CI,
     // dev) set `[subscriptions] allow_loopback_webhooks = true`.
     config::set_allow_loopback_webhooks(app_config.effective_allow_loopback_webhooks());
+    // v1.0.0 #3705 — the webhook dispatcher's extra root certificate
+    // (`[subscriptions] ca_cert`): a configured file that cannot be read or
+    // parsed refuses boot — an unreachable receiver is loud, never silent.
+    if let Some(path) = app_config
+        .subscriptions
+        .as_ref()
+        .and_then(|s| s.ca_cert.as_deref())
+    {
+        let pem = std::fs::read(path).map_err(|e| {
+            anyhow::anyhow!(
+                "[subscriptions] ca_cert {}: cannot read: {e} (#3705)",
+                path.display()
+            )
+        })?;
+        ai_memory::subscriptions::install_dispatch_root_certificate(&pem)?;
+    }
 
     // v0.7.0 K9 — load `[[permissions.rules]]` into the process-wide
     // registry consulted by `Permissions::evaluate`. Empty by default
@@ -332,6 +414,14 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
             | daemon_runtime::Command::Config(_)
             | daemon_runtime::Command::Completions(_)
             | daemon_runtime::Command::Man
+            // #3715 carve-out 1 — the K11 `[[governance.policy]]` translator
+            // is a config REPAIR tool (parses via `toml::Value`); a
+            // fail-closed loader whose repair path sits behind the same
+            // gate is a lockout, not a control.
+            | daemon_runtime::Command::Governance(daemon_runtime::GovernanceCliArgs {
+                action: daemon_runtime::GovernanceAction::MigrateToPermissions(_),
+                ..
+            })
     )
 }
 
