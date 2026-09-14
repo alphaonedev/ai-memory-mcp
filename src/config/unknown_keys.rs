@@ -438,8 +438,10 @@ mod tests {
         // The #3716 surface count. Derived from the schema, never typed by
         // hand: this assertion exists so a change in the number is a
         // change someone reviewed. Corpus census at 8b4f65a22 measured 173
-        // leaves; #3714 added `deployment.shape`.
-        assert_eq!(accepted_leaf_count(), 174, "{:#?}", accepted_leaf_keys());
+        // leaves; #3714 added `deployment.shape` (174); #3705 added
+        // `subscriptions.ca_cert` — the operator-installed root the webhook
+        // dispatcher trusts under the encrypted-transit floor (175).
+        assert_eq!(accepted_leaf_count(), 175, "{:#?}", accepted_leaf_keys());
     }
 
     #[test]

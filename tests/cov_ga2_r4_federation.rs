@@ -544,7 +544,7 @@ async fn bulk_catchup_push_unreachable_peer_is_collected() {
     // of bulk_catchup_push. Tight client timeout keeps the test fast.
     let cfg = quorum_config_w2(vec![peer(
         "peer-catchup-unreachable",
-        "http://127.0.0.1:1/api/v1/sync/push".to_string(),
+        "https://127.0.0.1:1/api/v1/sync/push".to_string(),
     )]);
     let memories = vec![r4_memory("catchup-net-err")];
     let errs = ai_memory::federation::sync::bulk_catchup_push(&cfg, &memories).await;

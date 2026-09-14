@@ -21,19 +21,21 @@ three-container fleet on a user-defined bridge network `ic-mesh`:
 
 Each container's daemon listens internally on `19077`; the host-side
 publish maps to a unique external port to avoid host-side conflicts.
-**Peer URLs are container-DNS form** (e.g. `http://ic-bob:19077`) so
+**Peer URLs are container-DNS form** (e.g. `https://ic-bob:19077`) so
 the mesh routes entirely through the bridge — see issue #878 for the
 history.
 
-The compose file sets `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS=1` on each
-container (issue #2477). Since v1.0.0 the substrate REFUSES a plaintext
-(`http://`) federation peer that is not literal loopback, and a
-container-bridge hostname like `ic-bob` is not loopback — it crosses a
-virtual NIC. The Plan-C fleet is a private, single-host Docker network
-used only for parity/chaos testing, so the acknowledgement is baked into
-the compose recipe. **Do NOT copy that line into any deployment whose
-peers cross a real network** — use `https://` peer URLs (or pin server
-certs via `AI_MEMORY_FED_PEER_FINGERPRINTS`) there instead.
+**Every hop is TLS (#3705).** Since v1.0.0 the substrate refuses every
+plaintext hop — loopback and container bridges included — and the former
+`AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS=1` acknowledgement (issue #2477) is a
+removed downgrade path: a truthy value refuses boot. The compose recipe
+therefore runs a one-shot `ic-tls-provisioner` (the shared
+`infra/lan-parity-test/provision-tls.sh`) that mints a fleet CA and, per
+daemon, a listener pair plus a quorum-client pair into the `ic-tls`
+volume; `entrypoint.plan-c.sh` turns them into `--tls-cert/--tls-key` and
+`--quorum-client-cert/-key/--quorum-ca-cert`. The operator-supplied
+`AI_MEMORY_STORE_URL` must pin `sslmode=verify-full&sslrootcert=<ca>`
+(as seen inside the container) or the daemon refuses the store at connect.
 
 Required environment for `docker compose up`:
 

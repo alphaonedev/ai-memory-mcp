@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn load_missing_private_key_is_error() {
         // A public-only keypair on disk must surface MissingPrivateKey.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::identity::test_key_dir::private_tempdir();
         let kp = crate::identity::keypair::generate("some-ca").expect("gen");
         crate::identity::keypair::save_public_only(&kp, tmp.path()).expect("save pub");
         let err = FederationIssuer::load(IssuerConfig::new("some-ca", "fleet.example"), tmp.path())
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn load_reads_signing_key_and_issues() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::identity::test_key_dir::private_tempdir();
         let kp = crate::identity::keypair::generate("disk-ca").expect("gen");
         crate::identity::keypair::save(&kp, tmp.path()).expect("save");
         let iss = FederationIssuer::load(IssuerConfig::new("disk-ca", "fleet.example"), tmp.path())

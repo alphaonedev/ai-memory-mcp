@@ -25,8 +25,10 @@
 //!
 //! ## Pre-W6 helpers retained
 //!
-//! - [`serve_http_with_shutdown`], [`serve_http_with_shutdown_future`] —
-//!   the in-process HTTP harness the integration suite drives.
+//! - `serve_http_with_shutdown`, `serve_http_with_shutdown_future` —
+//!   the in-process PLAINTEXT harness the test suite drives; since #3705
+//!   compiled only under `cfg(test)` / the `test-support` feature — the
+//!   product has no plaintext listener API.
 //! - [`run_sync_daemon_with_shutdown`],
 //!   [`run_sync_daemon_with_shutdown_using_client`],
 //!   [`sync_cycle_once`] — the sync-daemon body.
@@ -4823,6 +4825,12 @@ pub fn build_router(app_state: AppState, api_key_state: ApiKeyState) -> Router {
 
 /// Aggregated state produced by [`bootstrap_serve`].
 pub struct ServeBootstrap {
+    /// v1.0.0 #3705/#3709 — the TLS material the listener MUST use: the
+    /// operator's `--tls-cert/--tls-key` pair, or the local CA-issued
+    /// certificate generated into the key directory on first boot
+    /// (`managed = true`, renewed automatically). Never `None`: a listener
+    /// without TLS is refused before this struct exists.
+    pub tls_material: TlsMaterial,
     pub app_state: AppState,
     pub api_key_state: ApiKeyState,
     pub db_state: Db,
@@ -5881,25 +5889,25 @@ pub const ENV_ALLOW_PLAINTEXT_NONLOOPBACK: &str = "AI_MEMORY_ALLOW_PLAINTEXT_NON
 /// `--tls-cert` / `--tls-key` pair is refused (fail-closed-now).
 pub const ENV_REQUIRE_TLS: &str = "AI_MEMORY_REQUIRE_TLS";
 
-/// #2032 M2 — resolve the `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` escape
-/// hatch (default `false`). Mirrors the truthy grammar of
-/// [`require_api_key_strict`] (`1` / `true`, case-insensitive). Consumed by
-/// [`tls_bind_guard`].
+/// #2032 M2 → #3705 — the `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` hatch is a
+/// REMOVED downgrade path: it can never open a plaintext bind again. A
+/// truthy value refuses boot
+/// ([`crate::transit_encryption::enforce_no_downgrade_paths`]); this
+/// resolver therefore always answers `false`.
 #[must_use]
 pub fn allow_plaintext_nonloopback_enabled() -> bool {
-    std::env::var(ENV_ALLOW_PLAINTEXT_NONLOOPBACK)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    false
 }
 
-/// #2032 M2 — resolve the `AI_MEMORY_REQUIRE_TLS` fail-closed opt-in
-/// (default `false`). Mirrors the truthy grammar of
-/// [`require_api_key_strict`]. Consumed by [`tls_bind_guard`].
+/// #2032 M2 → #3705 — in-process TLS is a FLOOR on every bind, so the
+/// requirement is always in force. The `AI_MEMORY_REQUIRE_TLS` token is
+/// validated through the ONE truthy grammar by
+/// [`crate::transit_encryption::enforce_require_tls_token`]: unset and every
+/// canonical truthy token affirm the floor; a falsy or unrecognised token
+/// refuses boot instead of silently leaving TLS optional.
 #[must_use]
 pub fn require_tls_enabled() -> bool {
-    std::env::var(ENV_REQUIRE_TLS)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    true
 }
 
 /// #1458 (SEC, MED) — decide whether the daemon may bind given the
@@ -6010,70 +6018,25 @@ fn boot_security_posture_warnings(
     warnings
 }
 
-/// #2032 M2 (v1.0.0, 5-agent vote `4d3ea1c5`) — decide the TLS posture of a
-/// bind. The M2 finding: a keyed non-loopback bind still serves the api-key
-/// + memory content in CLEARTEXT unless TLS terminates somewhere, so an
-/// exposure-recon (`ai_osint`-class) scan can discover AND sniff it. This
-/// guard turns that into a loud, contained posture signal without breaking
-/// the reverse-proxy deployment shape.
-///
-/// `tls_present` is in-process TLS (`--tls-cert` + `--tls-key` both set).
-///
-/// Returns:
-///   - `Ok(None)` — nothing to say: in-process TLS is on, OR a loopback
-///     plaintext bind (same-host reverse-proxy / single-tenant default),
-///     OR the operator acknowledged upstream TLS termination via
-///     `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK`;
-///   - `Ok(Some(warning))` — bind permitted but emit a HARD boot WARN
-///     (an unacknowledged plaintext non-loopback bind, the default posture);
-///   - `Err(reason)` — refuse to bind: `AI_MEMORY_REQUIRE_TLS=1` demands
-///     in-process TLS and none is configured (fail-closed-now).
-///
-/// A future release (v1.1.0) promotes the non-loopback plaintext WARN to a
-/// refusal (the `ALLOW_PLAINTEXT_NONLOOPBACK` ack remains the escape path);
-/// this release only warns so the reverse-proxy shape is not broken (the
-/// #1985 surface-scoping lesson — do not ship an unsatisfiable default).
+/// #2032 M2 → #3705 — decide whether a bind may proceed. Since the
+/// "only encrypted data in transit" mandate the decision has ONE input:
+/// in-process TLS (`--tls-cert` + `--tls-key` both set) is present, or the
+/// bind is refused. There is no loopback exemption (loopback is shared by
+/// every local process on a multi-agent host — *peer is loopback* is not
+/// *peer is trusted*, the #2502 ruling), no upstream-termination
+/// acknowledgement, and no opt-in: the pre-#3705 `AI_MEMORY_REQUIRE_TLS`
+/// opt-in that defaulted OFF was fail-OPEN with respect to the mandate.
 ///
 /// Pulled out of `bootstrap_serve` (the [`api_key_bind_guard`] precedent) so
-/// all three outcomes are unit-testable without standing up a daemon.
-fn tls_bind_guard(
-    tls_present: bool,
-    host: &str,
-    allow_plaintext_nonloopback: bool,
-    require_tls: bool,
-) -> std::result::Result<Option<String>, String> {
+/// the outcome is unit-testable without standing up a daemon. The refusal
+/// names the plaintext path being refused.
+fn tls_bind_guard(tls_present: bool, host: &str, port: u16) -> std::result::Result<(), String> {
     if tls_present {
-        return Ok(None);
+        return Ok(());
     }
-    // Plaintext bind from here down.
-    if require_tls {
-        return Err(format!(
-            "refusing to start without in-process TLS: AI_MEMORY_REQUIRE_TLS is set, which \
-             mandates TLS on every bind (requested host {host:?}), but no --tls-cert / --tls-key \
-             pair was configured. Provide the cert+key pair for in-process TLS, or unset \
-             AI_MEMORY_REQUIRE_TLS to fall back to the plaintext-posture WARN. (#2032 M2)"
-        ));
-    }
-    if host_is_loopback(host) {
-        // Same-host reverse-proxy / single-tenant default — off-host
-        // reachability is not in play, so plaintext loopback is fine.
-        return Ok(None);
-    }
-    if allow_plaintext_nonloopback {
-        // Operator asserted a reverse proxy / service-mesh sidecar
-        // terminates TLS upstream — accept the plaintext daemon bind.
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "SECURITY POSTURE (#2032 M2): daemon bound to non-loopback {host:?} WITHOUT in-process \
-         TLS — the API key and all memory content are served in CLEARTEXT and are trivially \
-         sniffable off-host (exposure-recon / `ai_osint`-class discovery). Terminate TLS in \
-         front of the daemon (reverse proxy / service mesh) and set \
-         AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK=1 to acknowledge + silence this, OR pass \
-         --tls-cert / --tls-key for in-process TLS, OR set AI_MEMORY_REQUIRE_TLS=1 to \
-         hard-refuse a plaintext bind now. A future release (v1.1.0) will PROMOTE this WARN to \
-         a refusal for unacknowledged plaintext non-loopback binds."
-    )))
+    Err(crate::transit_encryption::plaintext_listener_refusal(
+        host, port,
+    ))
 }
 
 /// #2045 L6 — boot-time posture warnings for the mTLS cert↔X-Peer-Id
@@ -6125,6 +6088,115 @@ fn cert_peer_binding_boot_warnings(
     out
 }
 
+/// v1.0.0 #3705/#3709 — the certificate + key a listener serves with.
+#[derive(Clone, Debug)]
+pub struct TlsMaterial {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    /// `true` when the material is the installation's own local CA-issued
+    /// certificate (zero-config first boot): the daemon renews it.
+    pub managed: bool,
+    /// The local CA certificate path when `managed` (for operators and the
+    /// bundled clients); `None` for operator-supplied material.
+    pub ca_cert_path: Option<PathBuf>,
+}
+
+/// v1.0.0 #3709 item 1 — resolve the listener's TLS material: the operator's
+/// pair when both flags are given; otherwise the local CA-issued certificate
+/// in the key directory, generated on first boot and renewed inside the
+/// window. A half-configured pair, or any generation/renewal failure, is a
+/// refusal that names its fix — never a plaintext fallback.
+///
+/// # Errors
+/// A half-configured `--tls-cert`/`--tls-key` pair, or the key directory /
+/// generation / renewal failing.
+pub fn resolve_tls_material(
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+    bind_host: &str,
+    port: u16,
+    declared: crate::config::shape::DeploymentShape,
+) -> Result<TlsMaterial> {
+    // #3709 (3x7 audit ruling, #3700 ruling): the local CA is for the
+    // DECLARED singleton shape only. Every other declared shape (team,
+    // production, federated, hive) without operator material is refused with
+    // the bring-your-own-certificate flow; nothing is minted. The shape is
+    // the operator's declaration (`[deployment] shape`), never something the
+    // node observed at runtime — promotion is an operator act.
+    if tls_cert.is_none()
+        && tls_key.is_none()
+        && declared != crate::config::shape::DeploymentShape::Singleton
+    {
+        anyhow::bail!(
+            crate::transit_encryption::fleet_needs_enterprise_pki_refusal(
+                bind_host, port, declared
+            )
+        );
+    }
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => Ok(TlsMaterial {
+            cert_path: cert.to_path_buf(),
+            key_path: key.to_path_buf(),
+            managed: false,
+            ca_cert_path: None,
+        }),
+        (None, None) => {
+            let key_dir = crate::identity::keypair::default_key_dir().with_context(|| {
+                format!(
+                    "{}: no --tls-cert/--tls-key given and the key directory for the local \
+                     certificate is unusable. Fix: {}",
+                    crate::transit_encryption::ISSUE_TAG,
+                    crate::transit_encryption::REMEDY_SUPPLY_TLS
+                )
+            })?;
+            let local =
+                crate::tls_bootstrap::ensure_local_tls(&key_dir, bind_host).with_context(|| {
+                    format!(
+                        "{}: could not generate or renew the local TLS certificate in {} — \
+                         refusing to bind rather than serve plaintext. Fix: {}",
+                        crate::transit_encryption::ISSUE_TAG,
+                        key_dir.join(crate::tls_bootstrap::TLS_SUBDIR).display(),
+                        crate::transit_encryption::REMEDY_SUPPLY_TLS
+                    )
+                })?;
+            match &local.outcome {
+                crate::tls_bootstrap::Outcome::Generated => tracing::warn!(
+                    target: crate::transit_encryption::TRACING_TARGET,
+                    ca = %local.ca_cert_path.display(),
+                    cert = %local.cert_path.display(),
+                    days_valid = local.leaf_days_remaining,
+                    "#3709: first boot — generated a local CA and server certificate; \
+                     the bundled clients trust this CA; federation peers never do (peer \
+                     trust is explicit)"
+                ),
+                crate::tls_bootstrap::Outcome::Renewed { reason } => tracing::warn!(
+                    target: crate::transit_encryption::TRACING_TARGET,
+                    reason = %reason,
+                    days_valid = local.leaf_days_remaining,
+                    "#3709: renewed the local server certificate"
+                ),
+                crate::tls_bootstrap::Outcome::Reused => tracing::info!(
+                    target: crate::transit_encryption::TRACING_TARGET,
+                    days_remaining = local.leaf_days_remaining,
+                    "#3709: using the local CA-issued server certificate"
+                ),
+            }
+            Ok(TlsMaterial {
+                cert_path: local.cert_path,
+                key_path: local.key_path,
+                managed: true,
+                ca_cert_path: Some(local.ca_cert_path),
+            })
+        }
+        _ => anyhow::bail!(
+            "{}: refusing to bind on {bind_host}: only one of --tls-cert/--tls-key was given \
+             (both are needed). Fix: {}",
+            crate::transit_encryption::ISSUE_TAG,
+            crate::transit_encryption::REMEDY_SUPPLY_TLS
+        ),
+    }
+}
+
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
 /// The peer-posture gate also protects library callers; CLI serve already ran
@@ -6151,6 +6223,34 @@ pub async fn bootstrap_serve(
         !args.quorum_peers.is_empty(),
         args.mtls_allowlist.as_deref(),
     )?;
+    // v1.0.0 #3700 — SECOND: the deployment-shape detector. Uses the
+    // pre-runtime assessment when the process booted through the binary; a
+    // direct library caller is assessed here. Configuration that looks like
+    // a stricter shape than declared is warned and recorded, never
+    // re-postured; the registry signal is folded in after the store opens.
+    let shape_assessment = crate::config::shape::detector::enforce_pre_open(
+        Some(app_config),
+        Some((
+            !args.quorum_peers.is_empty(),
+            args.mtls_allowlist.as_deref(),
+        )),
+    )?;
+    tracing::info!(
+        target: crate::config::shape::detector::TRACING_TARGET,
+        declared = shape_assessment.declared.as_str(),
+        observed_floor = shape_assessment.observed.observed_floor.as_str(),
+        undeclared_promotion = shape_assessment.undeclared_promotion,
+        posture = %shape_assessment.posture,
+        origin = shape_assessment.origin.as_str(),
+        "deployment shape assessed (#3700)"
+    );
+    // v1.0.0 #3705 — every configured peer URL meets the encrypted-transit
+    // floor HERE, before anything else uses it and regardless of
+    // `--quorum-writes`: `FederationConfig::build` is skipped at 0, so a
+    // plaintext peer would otherwise ride along unrefused (loopback included).
+    for peer in &args.quorum_peers {
+        crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     if let Some(scopes) = &app_config.monitoring
         && !scopes.peer_ids.is_empty()
     {
@@ -6235,19 +6335,24 @@ pub async fn bootstrap_serve(
         }
     }
 
-    // #2032 M2 (v1.0.0) — cleartext off-host bind posture. A keyed
-    // non-loopback bind still serves the api-key + memory content in
-    // cleartext absent TLS; emit a hard WARN naming the escape hatches (or
-    // refuse under AI_MEMORY_REQUIRE_TLS). Loopback binds are exempt.
-    match tls_bind_guard(
-        args.tls_cert.is_some() && args.tls_key.is_some(),
+    // v1.0.0 #3705 — "only encrypted data in transit": the selector token
+    // and the removed downgrade paths (read-only; the binary already ran
+    // this pre-runtime, library callers get it here), then the bind
+    // decision itself — in-process TLS or no listener, loopback included.
+    crate::transit_encryption::enforce_process_floor()?;
+    crate::transit_encryption::enforce_config_urls(app_config)?;
+    // v1.0.0 #3709 item 1 — zero-config TLS: with no flags the listener
+    // serves the local CA-issued certificate generated into the key
+    // directory. Any failure here is a refusal that names its fix.
+    let tls_material = resolve_tls_material(
+        args.tls_cert.as_deref(),
+        args.tls_key.as_deref(),
         args.host.as_str(),
-        allow_plaintext_nonloopback_enabled(),
-        require_tls_enabled(),
-    ) {
-        Ok(None) => {}
-        Ok(Some(warning)) => tracing::warn!("{warning}"),
-        Err(reason) => anyhow::bail!("{reason}"),
+        args.port,
+        shape_assessment.declared,
+    )?;
+    if let Err(reason) = tls_bind_guard(true, args.host.as_str(), args.port) {
+        anyhow::bail!("{reason}");
     }
 
     // v1.0.0 #3474 — record whether THIS listener may carry a freshly minted
@@ -6259,10 +6364,10 @@ pub async fn bootstrap_serve(
     // because refusing a revocation is strictly worse than performing one over
     // a channel the operator already accepted. Default is `false` (refuse), so
     // a router built outside this bootstrap never mints.
-    crate::handlers::agent_api_key::mark_credential_transport_confidential(
-        (args.tls_cert.is_some() && args.tls_key.is_some())
-            || crate::tls::host_is_loopback(args.host.as_str()),
-    );
+    // #3705/#3709 — a listener exists only with in-process TLS (operator
+    // material or the local certificate), so the transport is confidential;
+    // loopback no longer counts on its own.
+    crate::handlers::agent_api_key::mark_credential_transport_confidential(true);
 
     // #2032 LM3 (v1.0.0) — WARN-carrier for the `[verify] require_nonce`
     // secure-default flip. Fires only when the knob is still at the
@@ -6283,6 +6388,13 @@ pub async fn bootstrap_serve(
     let resolved_ttl = app_config.effective_ttl();
     let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(db_path)?;
+    // v1.0.0 #3700 — read the sqlite agent registry while the connection is
+    // still ours (it moves into the shared `Db` state below); the shape gate
+    // consumes it after the SAL handle is built. A registry that cannot be
+    // read refuses (fail closed: an unobserved fleet is not a singleton).
+    let sqlite_registered_agents = db::list_agents(&conn)
+        .context("#3700: agent registry could not be read")?
+        .len();
 
     // v0.7.0 SEC-2 (Cluster D, issue #767) — fail-OPEN diagnostic + the
     // operator-opt-in fail-CLOSED knob. When `governance_rules` has any
@@ -6847,6 +6959,30 @@ pub async fn bootstrap_serve(
     .context("build SAL store handle")?;
     #[cfg(not(feature = "sal"))]
     let storage_backend = crate::handlers::StorageBackend::Sqlite;
+
+    // v1.0.0 #3700 — the store-derived shape signal: a registry of
+    // `FLEET_REGISTRY_MIN_AGENTS` or more agents is multi-agent by
+    // declaration. Read from the REAL store of this deployment (the SAL
+    // handle on postgres, the local connection on sqlite). A registry that
+    // cannot be read refuses (fail closed: an unobserved fleet is not a
+    // singleton).
+    {
+        #[cfg(feature = "sal")]
+        let registered_agents =
+            if matches!(storage_backend, crate::handlers::StorageBackend::Sqlite) {
+                sqlite_registered_agents
+            } else {
+                crate::store::MemoryStore::list_agents(&*store_handle)
+                    .await
+                    .context("#3700: agent registry could not be read from the store")?
+                    .len()
+            };
+        #[cfg(not(feature = "sal"))]
+        let registered_agents = sqlite_registered_agents;
+        // A registry-raised observed floor is a WARN and a recorded mismatch —
+        // never a refusal and never a re-posture (promotion is an operator act).
+        let _ = crate::config::shape::detector::assess_post_open(registered_agents);
+    }
 
     // v1.0.0 #2167 §5/§6 pg twin — on a POSTGRES-backed daemon the sqlite
     // boot-maintenance above ran against the LOCAL (empty) sqlite file, so
@@ -7737,6 +7873,7 @@ pub async fn bootstrap_serve(
     app_config.warn_if_archive_on_gc_disabled();
 
     Ok(ServeBootstrap {
+        tls_material,
         app_state,
         api_key_state,
         db_state,
@@ -8026,15 +8163,18 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     let api_key_state = bootstrap.api_key_state;
     let app_state = bootstrap.app_state;
     let request_timeout = bootstrap.request_timeout;
+    let tls_material = bootstrap.tls_material.clone();
     let server_aux_tasks = Arc::new(std::sync::Mutex::new(Vec::<JoinHandle<()>>::new()));
     let server_aux_tasks_for_run = Arc::clone(&server_aux_tasks);
 
-    // Native TLS (Layer 1): if both --tls-cert and --tls-key are provided,
-    // bind via axum-server + rustls. Plain HTTP otherwise — backward
-    // compatible with every prior release. The `requires = …` clap
-    // attributes prevent the half-configured case.
+    // v1.0.0 #3705/#3709 — TLS always: the operator's pair, or the local
+    // CA-issued certificate `bootstrap_serve` resolved (generated on first
+    // boot, renewed by the task below). The plaintext branch is unreachable.
     let server_result: Result<()> = async move {
-        if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        let material = tls_material;
+        let cert = &material.cert_path;
+        let key = &material.key_path;
+        {
             // rustls 0.23 needs an explicit CryptoProvider; install ring
             // before any TLS setup. Idempotent — second install is a
             // harmless no-op via ignore.
@@ -8090,6 +8230,88 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             // injected into request extensions for the `/sync/*` cross-check.
             // Only meaningful under mTLS (peer certs exist only there); with no
             // map the byte-identical `serve_rustls_acceptor` path is kept.
+            // v1.0.0 #3709 — renewal automation for the managed certificate:
+            // a daily tick re-checks the leaf, re-issues it inside the
+            // renewal window and hot-reloads the listener. A failed renewal
+            // is loud and leaves the current certificate serving — it never
+            // downgrades — and names the command that fixes it.
+            if material.managed {
+                let reload = tls_config.clone();
+                let host = args.host.clone();
+                let renewal_task = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(
+                            crate::tls_bootstrap::RENEWAL_CHECK_INTERVAL_SECS,
+                        ))
+                        .await;
+                        let key_dir = match crate::identity::keypair::default_key_dir() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::error!(
+                                    target: crate::transit_encryption::TRACING_TARGET,
+                                    error = %e,
+                                    "#3709: certificate renewal check FAILED (key directory); \
+                                     the listener keeps its current certificate — fix before it \
+                                     expires: {}",
+                                    crate::transit_encryption::REMEDY_TLS_RENEW
+                                );
+                                continue;
+                            }
+                        };
+                        match crate::tls_bootstrap::ensure_local_tls(&key_dir, &host) {
+                            Ok(local) => {
+                                let reissued = matches!(
+                                    local.outcome,
+                                    crate::tls_bootstrap::Outcome::Renewed { .. }
+                                        | crate::tls_bootstrap::Outcome::Generated
+                                );
+                                if reissued {
+                                    match reload
+                                        .reload_from_pem_file(&local.cert_path, &local.key_path)
+                                        .await
+                                    {
+                                        Ok(()) => tracing::warn!(
+                                            target: crate::transit_encryption::TRACING_TARGET,
+                                            days_valid = local.leaf_days_remaining,
+                                            "#3709: renewed the local server certificate and \
+                                             reloaded the listener"
+                                        ),
+                                        Err(e) => tracing::error!(
+                                            target: crate::transit_encryption::TRACING_TARGET,
+                                            error = %e,
+                                            "#3709: renewed the certificate but the listener \
+                                             could not reload it; restart the daemon or {}",
+                                            crate::transit_encryption::REMEDY_TLS_RENEW
+                                        ),
+                                    }
+                                } else if local.leaf_days_remaining
+                                    <= crate::tls_bootstrap::RENEWAL_WINDOW_DAYS
+                                {
+                                    tracing::warn!(
+                                        target: crate::transit_encryption::TRACING_TARGET,
+                                        days_remaining = local.leaf_days_remaining,
+                                        "#3709: the local server certificate is inside its \
+                                         renewal window; {}",
+                                        crate::transit_encryption::REMEDY_TLS_RENEW
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::error!(
+                                target: crate::transit_encryption::TRACING_TARGET,
+                                error = %e,
+                                "#3709: certificate renewal FAILED; the listener keeps its \
+                                 current certificate and will REFUSE at the next boot once it \
+                                 expires — fix now: {}",
+                                crate::transit_encryption::REMEDY_TLS_RENEW
+                            ),
+                        }
+                    }
+                });
+                server_aux_tasks_for_run
+                    .lock()
+                    .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
+                    .push(renewal_task);
+            }
             let cert_peer_bindings = if args.mtls_allowlist.is_some() {
                 tls::cert_peer_binding_map_from_env()?
             } else {
@@ -8127,35 +8349,6 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                     .serve(app.into_make_service())
                     .await?;
             }
-        } else {
-            tracing::warn!(
-                "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
-             /api/v1/sync/since) accept any caller over plain HTTP. \
-             Set --tls-cert + --tls-key + --mtls-allowlist for production \
-             peer-mesh deployments (red-team #231)."
-            );
-            tracing::info!("ai-memory listening on http://{addr}");
-            // Production plain HTTP uses the same bounded graceful-shutdown
-            // handle as TLS. The generic axum test helper intentionally keeps
-            // its caller-controlled future, but has no grace deadline of its
-            // own and therefore is not suitable for the service-manager path.
-            let socket_addr: std::net::SocketAddr = addr.parse()?;
-            let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
-            let grace = Duration::from_secs(args.shutdown_grace_secs);
-            let handle = axum_server::Handle::new();
-            let handle_clone = handle.clone();
-            let signal_task = tokio::spawn(async move {
-                shutdown.await;
-                handle_clone.graceful_shutdown(Some(grace));
-            });
-            server_aux_tasks_for_run
-                .lock()
-                .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
-                .push(signal_task);
-            axum_server::bind(socket_addr)
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await?;
         }
         Ok(())
     }
@@ -8492,6 +8685,11 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
 
 /// Run the HTTP daemon (plain HTTP, no TLS) with a programmable shutdown.
 ///
+/// #3705 — TEST HARNESS ONLY. The product never binds a plaintext listener
+/// ("only encrypted data in transit"); this and its two variants exist for
+/// in-process tests of the router and are compiled out of the production
+/// library (`cfg(any(test, feature = "test-support"))`).
+///
 /// Mirrors the `else` branch of `serve()` in pre-W6 `main.rs` (the non-TLS
 /// path). Builds the production `Router` via `build_router`, binds a
 /// `TcpListener` to `addr`, and runs `axum::serve` with a graceful-shutdown
@@ -8500,6 +8698,7 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
 /// Tests pass a known port (pick one via `free_port()` and pass
 /// `127.0.0.1:<port>`). The function returns when shutdown completes;
 /// callers can `tokio::spawn` it and `notify` to stop.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn serve_http_with_shutdown(
     addr: &str,
     api_key_state: ApiKeyState,
@@ -8516,6 +8715,7 @@ pub async fn serve_http_with_shutdown(
 /// future. This is an in-process harness surface; production [`serve`] uses
 /// `axum_server::Handle` for a bounded grace period and performs writer drains
 /// plus final certification only after the listener has quiesced.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn serve_http_with_shutdown_future<F>(
     addr: &str,
     api_key_state: ApiKeyState,
@@ -8538,6 +8738,7 @@ where
 /// v0.7.0 H7 (round-2) — variant of [`serve_http_with_shutdown_future`]
 /// that accepts an explicit per-request timeout. Used by tests to
 /// drive the slow-POST edge directly.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn serve_http_with_shutdown_future_and_timeout<F>(
     addr: &str,
     api_key_state: ApiKeyState,
@@ -8942,6 +9143,14 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     crate::federation::peer_posture::enforce_at_boot(!peers.is_empty(), None)?;
+    // v1.0.0 #3700 — the sync daemon is federation by construction when it
+    // has peers: same shape-vs-posture gate as `bootstrap_serve`.
+    crate::config::shape::detector::enforce_pre_open(None, Some((!peers.is_empty(), None)))?;
+    // v1.0.0 #3705 — the library entry validates peer schemes too (the CLI
+    // did already): no plaintext peer, loopback included, on any path.
+    for peer in &peers {
+        crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     let interval = interval_secs.max(1);
     let batch_size = batch_size.max(1);
 
@@ -9709,67 +9918,49 @@ mod tests {
         assert!(err.contains("refusing to bind to non-loopback"), "{err}");
     }
 
-    // ----- #2032 M2 tls_bind_guard (cleartext off-host bind posture) -----
+    // ----- #2032 M2 → #3705 tls_bind_guard (transit encryption floor) -----
 
-    /// In-process TLS present => silent on any host (nothing to warn about).
+    /// In-process TLS present => the bind proceeds on any host.
     #[test]
-    fn tls_bind_guard_tls_present_silent_2032_m2() {
-        assert_eq!(tls_bind_guard(true, "0.0.0.0", false, false).unwrap(), None);
-        // TLS present satisfies REQUIRE_TLS too.
-        assert_eq!(tls_bind_guard(true, "0.0.0.0", false, true).unwrap(), None);
-    }
-
-    /// Plaintext loopback bind is exempt (same-host reverse-proxy default).
-    #[test]
-    fn tls_bind_guard_plaintext_loopback_silent_2032_m2() {
-        for host in ["127.0.0.1", "::1", "localhost", "[::1]", "0:0:0:0:0:0:0:1"] {
-            assert_eq!(
-                tls_bind_guard(false, host, false, false).unwrap(),
-                None,
-                "plaintext loopback {host} must be silent"
-            );
+    fn tls_bind_guard_tls_present_binds_3705() {
+        for host in ["0.0.0.0", "127.0.0.1", "::1", "localhost"] {
+            assert_eq!(tls_bind_guard(true, host, 9077), Ok(()), "{host}");
         }
     }
 
-    /// Plaintext non-loopback bind WITHOUT the ack emits the hard M2 WARN
-    /// (permitted, not refused, this release) naming the escape hatches.
+    /// No in-process TLS => refused on EVERY host, loopback included; the
+    /// refusal names the plaintext path, the issue and no escape hatch.
     #[test]
-    fn tls_bind_guard_plaintext_nonloopback_warns_2032_m2() {
-        let warning = tls_bind_guard(false, "0.0.0.0", false, false)
-            .unwrap()
-            .expect("plaintext non-loopback bind must WARN, not bind silently");
-        assert!(
-            warning.contains("CLEARTEXT")
-                && warning.contains("AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK")
-                && warning.contains("AI_MEMORY_REQUIRE_TLS"),
-            "M2 WARN must name cleartext + both escape hatches: {warning}"
-        );
-    }
-
-    /// The upstream-TLS acknowledgement silences the non-loopback WARN.
-    #[test]
-    fn tls_bind_guard_plaintext_nonloopback_acked_silent_2032_m2() {
-        assert_eq!(
-            tls_bind_guard(false, "0.0.0.0", true, false).unwrap(),
-            None,
-            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK must silence the M2 WARN"
-        );
-    }
-
-    /// REQUIRE_TLS with no in-process TLS is refused (fail-closed-now) on any
-    /// host, INCLUDING loopback — the operator demanded TLS everywhere.
-    #[test]
-    fn tls_bind_guard_require_tls_refuses_plaintext_2032_m2() {
-        for host in ["0.0.0.0", "127.0.0.1"] {
-            let err = tls_bind_guard(false, host, false, true)
-                .expect_err("REQUIRE_TLS + plaintext MUST be refused");
+    fn tls_bind_guard_plaintext_refused_everywhere_3705() {
+        for host in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "[::1]",
+            "10.0.0.7",
+        ] {
+            let err = tls_bind_guard(false, host, 9077)
+                .expect_err("a plaintext bind must be refused on every host (#3705)");
             assert!(
-                err.contains("AI_MEMORY_REQUIRE_TLS") && err.contains("in-process TLS"),
-                "refusal must name the knob for {host}: {err}"
+                err.contains(crate::transit_encryption::ISSUE_TAG)
+                    && err.contains(&format!("http://{host}:9077"))
+                    && err.contains("--tls-cert"),
+                "refusal must name the plaintext path for {host}: {err}"
+            );
+            assert!(
+                !err.contains("AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK")
+                    && !err.contains("AI_MEMORY_REQUIRE_TLS"),
+                "no downgrade path may be offered: {err}"
             );
         }
-        // Even the ack does not override an explicit REQUIRE_TLS demand.
-        assert!(tls_bind_guard(false, "0.0.0.0", true, true).is_err());
+    }
+
+    /// The former opt-in / hatch resolvers are pinned to the floor.
+    #[test]
+    fn require_tls_is_a_floor_and_the_hatch_is_closed_3705() {
+        assert!(require_tls_enabled());
+        assert!(!allow_plaintext_nonloopback_enabled());
     }
 
     // ----- #2045 L6 cert-peer-binding boot posture warnings --------------
@@ -9951,11 +10142,15 @@ mod tests {
     // ----- helpers -------------------------------------------------------
 
     fn args_with_db(_db: &Path) -> ServeArgs {
+        // #3705 — a listener without in-process TLS is refused, loopback
+        // included; the checked-in fixture pair satisfies the bind guard
+        // (these tests never bind a socket, so the leaf's SAN is moot).
+        let (tls_cert, tls_key) = crate::test_support::tls_fixture_paths();
         ServeArgs {
             host: "127.0.0.1".to_string(),
             port: 0,
-            tls_cert: None,
-            tls_key: None,
+            tls_cert: Some(tls_cert),
+            tls_key: Some(tls_key),
             mtls_allowlist: None,
             shutdown_grace_secs: 30,
             quorum_writes: 0,
@@ -11319,6 +11514,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_enabled_attaches_config() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_federation_enabled_attaches_config",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
@@ -11331,7 +11541,7 @@ mod tests {
         cfg.tier = Some("keyword".to_string());
         let mut args = args_with_db(&env.db_path);
         args.quorum_writes = 1;
-        args.quorum_peers = vec!["http://127.0.0.1:65530".to_string()];
+        args.quorum_peers = vec!["https://127.0.0.1:65530".to_string()];
         args.quorum_timeout_ms = 100;
         args.catchup_interval_secs = 0;
         let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
@@ -11343,6 +11553,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_enabled_with_catchup_loop() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_federation_enabled_with_catchup_loop",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
@@ -11356,7 +11581,7 @@ mod tests {
         cfg.tier = Some("keyword".to_string());
         let mut args = args_with_db(&env.db_path);
         args.quorum_writes = 1;
-        args.quorum_peers = vec!["http://127.0.0.1:65531".to_string()];
+        args.quorum_peers = vec!["https://127.0.0.1:65531".to_string()];
         args.quorum_timeout_ms = 100;
         args.catchup_interval_secs = crate::SECS_PER_HOUR as u64; // long enough not to fire
         let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
@@ -11368,6 +11593,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_invalid_peer_errors() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_federation_invalid_peer_errors",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
@@ -11380,8 +11620,8 @@ mod tests {
         let mut args = args_with_db(&env.db_path);
         args.quorum_writes = 1;
         args.quorum_peers = vec![
-            "http://127.0.0.1:65532".to_string(),
-            "http://127.0.0.1:65532/".to_string(), // duplicate after trim
+            "https://127.0.0.1:65532".to_string(),
+            "https://127.0.0.1:65532/".to_string(), // duplicate after trim
         ];
         let res = bootstrap_serve(&env.db_path, &args, &cfg).await;
         let err = match res {
@@ -12445,6 +12685,12 @@ mod tests {
         let env = TestEnv::fresh();
         let key_dir = env.db_path.parent().unwrap().join("keys");
         std::fs::create_dir_all(&key_dir).unwrap();
+        // #3705 review — a key dir never inherits the ambient umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from([
             "ai-memory",
@@ -12504,6 +12750,12 @@ mod tests {
         drop(crate::db::open(&env.db_path).expect("db::open"));
         let key_dir = env.db_path.parent().unwrap().join("keys");
         std::fs::create_dir_all(&key_dir).unwrap();
+        // #3705 review — a key dir never inherits the ambient umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from([
             "ai-memory",
@@ -12658,26 +12910,34 @@ decision = "allow"
     }
 
     #[tokio::test]
-    async fn test_bootstrap_serve_mtls_enforced_false_when_only_allowlist_set() {
+    async fn test_bootstrap_serve_mtls_enforced_only_with_allowlist_3705() {
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
-        // Covers the AND short-circuit: cert/key None, allowlist Some →
-        // false. (clap's `requires = "tls_cert"` would block this combo
-        // at the CLI surface, but we're constructing `ServeArgs`
-        // directly here so the inner predicate is the only gate. This
-        // pins the predicate behaviour even if a refactor moves the
-        // validation back to the call site.)
+        // #3705 — every listener carries in-process TLS (the fixture pair
+        // in `args_with_db`; a listener without it is refused), so the
+        // pre-#3705 premise "allowlist set but no --tls-cert" is no longer
+        // constructible even by hand. What remains of the predicate:
+        // mTLS is enforced exactly when an allowlist is configured.
         let env = TestEnv::fresh();
         let mut cfg = AppConfig::default();
         cfg.tier = Some("keyword".to_string());
-        let mut args = args_with_db(&env.db_path);
-        args.mtls_allowlist = Some(env.db_path.parent().unwrap().join("allowlist.json"));
-        // tls_cert and tls_key intentionally None.
+        let args = args_with_db(&env.db_path);
         let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
         assert!(
             !bs.api_key_state.mtls_enforced,
-            "mtls_enforced should be false without --tls-cert"
+            "no allowlist → mTLS not enforced (TLS alone is transport, not client auth)"
+        );
+        for h in bs.task_handles {
+            h.abort();
+        }
+        let env = TestEnv::fresh();
+        let mut args = args_with_db(&env.db_path);
+        args.mtls_allowlist = Some(env.db_path.parent().unwrap().join("allowlist.json"));
+        let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
+        assert!(
+            bs.api_key_state.mtls_enforced,
+            "allowlist + the mandatory TLS pair → mTLS enforced (#3705)"
         );
         for h in bs.task_handles {
             h.abort();
@@ -12686,6 +12946,21 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_bootstrap_serve_mtls_enforced_with_federation_threads_api_key() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_mtls_enforced_with_federation_threads_api_key",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
@@ -12705,7 +12980,7 @@ decision = "allow"
         args.tls_key = Some(env.db_path.parent().unwrap().join("key.pem"));
         args.mtls_allowlist = Some(env.db_path.parent().unwrap().join("allowlist.json"));
         args.quorum_writes = 1;
-        args.quorum_peers = vec!["http://127.0.0.1:65520".to_string()];
+        args.quorum_peers = vec!["https://127.0.0.1:65520".to_string()];
         args.quorum_timeout_ms = 100;
         let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
         assert!(bs.api_key_state.mtls_enforced);

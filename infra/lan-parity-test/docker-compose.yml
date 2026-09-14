@@ -31,9 +31,17 @@
 #   # enroll alice<->bob (#1803 — no manual peer-key step needed; see
 #   # provision-peer-keys.sh for what it does and why)
 #   docker compose -f infra/lan-parity-test/docker-compose.yml ps
-#   AI_MEMORY_TEST_POSTGRES_URL='postgres://ai_memory:ai_memory_test@127.0.0.1:15432/ai_memory_test' \
+#   # #3705 — every hop is TLS. The host-side cargo run must trust the fleet
+#   # CA the one-shot `ic-parity-tls` provisioner minted into the
+#   # `ic-parity-tls` volume (compose names it <project>_ic-parity-tls):
+#   docker run --rm -v ai-memory-lan-parity_ic-parity-tls:/t:ro \
+#     ai-memory-pg-age-vector:latest cat /t/ca.pem > .local-runs/lan-parity-ca.pem
+#   AI_MEMORY_TEST_POSTGRES_URL="postgres://ai_memory:ai_memory_test@127.0.0.1:15432/ai_memory_test?sslmode=verify-full&sslrootcert=$PWD/.local-runs/lan-parity-ca.pem" \
 #   AI_MEMORY_NO_CONFIG=1 \
 #   cargo test --features sal,sal-postgres --release 2>&1 | tee .local-runs/lan-parity-2026-05-19.log
+#   # (a DSN without sslmode=verify-full is REFUSED at the connect funnel —
+#   # the pg server certificate carries SAN IP:127.0.0.1 + DNS:localhost so
+#   # verify-full holds from the host loopback mapping too)
 #
 # Teardown (preserves images, drops volumes):
 #
@@ -57,6 +65,22 @@ services:
     container_name: ai-memory-lan-parity-pg-age
     hostname: pg-age
     restart: unless-stopped
+    # #3705 — TLS on the wire: the daemons connect with
+    # sslmode=verify-full&sslrootcert=/tls/ca.pem (a plaintext DSN is
+    # refused at the connect funnel), so the server presents the pair the
+    # `ic-parity-tls` provisioner minted (SAN pg-age / localhost /
+    # 127.0.0.1; key owned by the in-image `postgres` uid, mode 0600).
+    command:
+      - "postgres"
+      - "-c"
+      - "ssl=on"
+      - "-c"
+      - "ssl_cert_file=/tls/pg/server.crt"
+      - "-c"
+      - "ssl_key_file=/tls/pg/server.key"
+    depends_on:
+      ic-parity-tls-provisioner:
+        condition: service_completed_successfully
     environment:
       POSTGRES_USER: ai_memory
       POSTGRES_PASSWORD: ai_memory_test
@@ -70,6 +94,7 @@ services:
     volumes:
       - pg-age-data:/var/lib/postgresql/data
       - ./init-age.sql:/docker-entrypoint-initdb.d/01-init-age.sql:ro
+      - ic-parity-tls:/tls:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory_test"]
       interval: 3s
@@ -101,6 +126,8 @@ services:
     depends_on:
       pg-age:
         condition: service_healthy
+      ic-parity-tls-provisioner:
+        condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -129,15 +156,17 @@ services:
       # Intra-bridge hostname `pg-age` resolves via Docker's embedded
       # DNS. Per-IronClaw schema in search_path keeps alice+bob data
       # cleanly separated even though they share the same database.
-      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_alice%2Cag_catalog%2Cpublic&sslmode=disable"
+      # #3705 — the DSN pins sslmode=verify-full against the fleet CA; a DSN
+      # without it is refused at the connect funnel (no downgrade exists).
+      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_alice%2Cag_catalog%2Cpublic&sslmode=verify-full&sslrootcert=/tls/ca.pem"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
-      AI_MEMORY_PEER_URLS: "http://ic-parity-bob:19077"
-      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
-      # peers (a container bridge is NOT loopback), which the peer-scheme guard
-      # refuses by default. Acknowledged here because the bridge is a private,
-      # single-host Docker network used for parity/chaos testing only. Do NOT
-      # copy this line into a deployment whose peers cross a real network.
-      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
+      # #3705 — peers are https:// (the former AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS
+      # acknowledgement is a REMOVED downgrade path: a truthy value refuses boot).
+      # entrypoint.plan-c.sh turns the pair under AI_MEMORY_TLS_DIR into
+      # --tls-cert/--tls-key (listener) and --quorum-client-cert/-key +
+      # --quorum-ca-cert (outbound peer trust against the fleet CA).
+      AI_MEMORY_PEER_URLS: "https://ic-parity-bob:19077"
+      AI_MEMORY_TLS_DIR: "/tls/ic-parity-alice"
       # Enterprise-cert campaign 2026-08-08 (supersedes the 2026-05-31
       # OpenRouter Gemma 4 26B cost-optimization for THIS certified
       # enterprise-federated round): IronClaw containers run Grok 4.5 via
@@ -173,6 +202,7 @@ services:
     volumes:
       - ic-parity-alice-keys:/root/.config/ai-memory/keys
       - ic-parity-alice-audit:/var/log/ai-memory/audit
+      - ic-parity-tls:/tls:ro
     ports:
       - "127.0.0.1:19180:19077"
     networks:
@@ -186,7 +216,9 @@ services:
       # uses the env-injected value (passed via the AI_MEMORY_API_KEY
       # env var above so the in-container `curl` reads the same value
       # the daemon authenticates against).
-      test: ["CMD-SHELL", "curl -f -sS --max-time 3 -H \"X-API-Key: $$AI_MEMORY_API_KEY\" http://127.0.0.1:19077/api/v1/capabilities"]
+      # #3705 — the listener is TLS-only; probe it by the hostname the
+      # certificate names, trusting the fleet CA (never `-k`).
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 --cacert /tls/ca.pem -H \"X-API-Key: $$AI_MEMORY_API_KEY\" https://ic-parity-alice:19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -202,6 +234,8 @@ services:
         condition: service_healthy
       ic-parity-alice:
         condition: service_started
+      ic-parity-tls-provisioner:
+        condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -215,15 +249,12 @@ services:
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
       AI_MEMORY_LISTEN_PORT: "19077"
-      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_bob%2Cag_catalog%2Cpublic&sslmode=disable"
+      # #3705 — see alice's block: verify-full against the fleet CA.
+      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_bob%2Cag_catalog%2Cpublic&sslmode=verify-full&sslrootcert=/tls/ca.pem"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
-      AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
-      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
-      # peers (a container bridge is NOT loopback), which the peer-scheme guard
-      # refuses by default. Acknowledged here because the bridge is a private,
-      # single-host Docker network used for parity/chaos testing only. Do NOT
-      # copy this line into a deployment whose peers cross a real network.
-      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
+      # #3705 — https:// peer; see alice's block.
+      AI_MEMORY_PEER_URLS: "https://ic-parity-alice:19077"
+      AI_MEMORY_TLS_DIR: "/tls/ic-parity-bob"
       # See alice's block for the 2026-08-08 enterprise-cert Grok 4.5
       # rationale (`x-ai/grok-4.5` via OpenRouter; supersedes the
       # 2026-05-31 Gemma 4 26B cost-optimization for this cert round).
@@ -237,17 +268,47 @@ services:
     volumes:
       - ic-parity-bob-keys:/root/.config/ai-memory/keys
       - ic-parity-bob-audit:/var/log/ai-memory/audit
+      - ic-parity-tls:/tls:ro
     ports:
       - "127.0.0.1:19181:19077"
     networks:
       - ic-parity-mesh
     healthcheck:
-      # See alice's block for the X-API-Key healthcheck rationale.
-      test: ["CMD-SHELL", "curl -f -sS --max-time 3 -H \"X-API-Key: $$AI_MEMORY_API_KEY\" http://127.0.0.1:19077/api/v1/capabilities"]
+      # See alice's block for the X-API-Key healthcheck rationale; #3705 —
+      # TLS-only listener, probed by certificate hostname against the CA.
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 --cacert /tls/ca.pem -H \"X-API-Key: $$AI_MEMORY_API_KEY\" https://ic-parity-bob:19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
       start_period: 30s
+
+  ic-parity-tls-provisioner:
+    # #3705 — one-shot fleet-CA + certificate provisioner (see
+    # infra/lan-parity-test/provision-tls.sh for the layout and why):
+    # every hop in this stack is TLS — the pg DSNs pin verify-full, the
+    # listeners serve TLS only, peers are https://. Runs BEFORE pg-age and
+    # both daemons (they `depends_on` its successful completion) in the
+    # pg image (which carries `openssl`), writing into the shared
+    # `ic-parity-tls` volume that the others mount read-only at /tls.
+    # Idempotent across `compose up` runs (an existing CA is reused).
+    build:
+      context: .
+      dockerfile: Dockerfile.pg-age-vector
+    image: ai-memory-pg-age-vector:latest
+    container_name: ai-memory-lan-parity-tls-provisioner
+    entrypoint: ["/bin/sh", "/usr/local/lib/ai-memory/provision-tls.sh"]
+    user: "0:0"
+    environment:
+      TLS_OUT_DIR: "/tls"
+      TLS_DAEMONS: "ic-parity-alice ic-parity-bob"
+      TLS_PG_HOST: "pg-age"
+      TLS_PG_UID: "999"
+    volumes:
+      - ./provision-tls.sh:/usr/local/lib/ai-memory/provision-tls.sh:ro
+      - ic-parity-tls:/tls
+    networks:
+      - ic-parity-mesh
+    restart: "no"
 
   ic-parity-peer-key-provisioner:
     # #1803 — auto-provisions the alice<->bob federation peer-key
@@ -298,6 +359,8 @@ networks:
 
 volumes:
   pg-age-data:
+  # #3705 — fleet CA + per-service certificates (provision-tls.sh).
+  ic-parity-tls:
   ic-parity-alice-keys:
   ic-parity-alice-audit:
   ic-parity-bob-keys:

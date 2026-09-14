@@ -1071,7 +1071,7 @@ fn store_federation_forward_unreachable_is_err() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"),
+        Some("https://127.0.0.1:1"),
     )
     .expect_err("forward to a closed port must error");
     assert!(

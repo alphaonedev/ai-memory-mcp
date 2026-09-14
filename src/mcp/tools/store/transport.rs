@@ -44,8 +44,18 @@ pub(crate) fn forward_to_http(
     body: Option<&Value>,
     extra_headers: &[(&str, String)],
 ) -> Result<Value, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+    // v1.0.0 #3709 — the bundled MCP → daemon client trusts the local CA
+    // this installation wrote (zero-config TLS). Only the local CA: this is
+    // the same-installation trust, never a peer's certificate. A CA file
+    // that exists but does not parse is an error, not silently ignored.
+    let mut builder =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15));
+    if let Some(ca) = crate::tls_bootstrap::local_ca_certificate()
+        .map_err(|e| format!("federation_forward: local CA: {e}"))?
+    {
+        builder = builder.add_root_certificate(ca);
+    }
+    let client = builder
         .build()
         .map_err(|e| format!("federation_forward: build client: {e}"))?;
     let mut req = client.request(method, url);
