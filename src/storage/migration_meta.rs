@@ -439,16 +439,25 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
     // the whole batch re-runnable, so a crash mid-arm self-heals on the next
     // open — idempotent. No full-table rebuild. Settled literal rung;
-    // v98 now owns the moving tip.
+    // v100 now owns the moving tip.
     // Postgres twin is `PostgresStore::migrate_v97`.
     meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
     // v98: live/archive namespace alias view; rollback drops the view, NoLoss.
-    // Settled literal rung; v99 now owns the moving tip.
+    // Settled literal rung; v100 now owns the moving tip.
     meta(98, "CANONICAL_INBOX_NAMESPACE", true, true, NoLoss, Sqlite),
     // v99 (#3655): additive `sync_peer_contact` table (durable per-peer
     // contact, apart from the data watermark); rollback drops the table,
     // NoLoss. Postgres twin is `PostgresStore::migrate_v99` (parity mirror).
     meta(99, "SYNC_PEER_CONTACT", true, true, NoLoss, Sqlite),
+    // v100 (#3690 / #3695 / #3699, v1.0.0, data-integrity): the (title,
+    // namespace) unique index is rebuilt PARTIAL (`WHERE lifecycle_state <>
+    // 'tombstoned'`) under the same name, so a consolidation tombstone gives
+    // up its slot and a later store of that title is a fresh visible row, not
+    // a write into the hidden one. No row is touched (NoLoss); DROP IF EXISTS
+    // + CREATE is re-runnable (idempotent); revert recreates the full index,
+    // which succeeds once no live row shares a title with a tombstone.
+    // Postgres twin is `PostgresStore::migrate_v100`.
+    meta(100, "TITLE_SLOT_LIVE_ROWS", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

@@ -1013,6 +1013,38 @@ pub fn preserve_provenance_keys(
     merged
 }
 
+/// #3626 — [`preserve_provenance_keys`] for a MERGE ONTO AN EXISTING ROW
+/// (the `memory_store` dedup update and the Form-1 synthesis merge /
+/// supersede pool): the narrow 3-key immutable set (so a signed re-store may
+/// still upgrade `claimed` → `agent_attested`, unlike the UPDATE funnel's
+/// [`preserve_update_provenance_keys`]) PLUS the #3124 R3 missing-key rule —
+/// an existing row that carries NO `metadata.agent_id` is not claimed by the
+/// merging caller's id. Pre-#3626 only the UPDATE funnels applied that rule,
+/// so a dedup / synthesis merge was a silent first-writer claim of a
+/// legacy-unowned row (claiming stays `ai-memory reown`). The SQL upsert
+/// arms apply the same rule in-statement
+/// (`owner_stamp::sqlite_upsert_unstamped_owner_patch` /
+/// `pg_upsert_unstamped_owner_drop`).
+#[must_use]
+pub fn preserve_provenance_keys_for_merge(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = preserve_provenance_keys(existing, incoming);
+    if owner_stamp::OwnerStamp::of(existing).is_unstamped()
+        && let Some(obj) = merged.as_object_mut()
+        && let Some(claimed) = obj.remove(crate::META_KEY_AGENT_ID)
+    {
+        tracing::warn!(
+            target: owner_stamp::TRACE_TARGET,
+            claimed = %claimed,
+            "merge tried to stamp an owner onto an UNSTAMPED row; the caller-supplied \
+             metadata.agent_id was dropped (claiming an unowned row is `ai-memory reown` only)"
+        );
+    }
+    merged
+}
+
 /// Substrate-stamped attestation / federation-state provenance keys preserved
 /// through an UPDATE-funnel metadata overwrite ON TOP OF
 /// [`IMMUTABLE_PROVENANCE_KEYS`] (#3015).

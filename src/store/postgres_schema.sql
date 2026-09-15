@@ -282,6 +282,13 @@ CREATE TABLE IF NOT EXISTS memories (
 -- SQLite enforces this with `CREATE UNIQUE INDEX idx_memories_title_ns`
 -- (crate::storage (schema bootstrap)); Postgres matches here so both adapters agree on
 -- upsert semantics.
+-- v100 (#3690): the SHIPPED index is PARTIAL (`WHERE lifecycle_state <>
+-- 'tombstoned'`, `models::TITLE_SLOT_INDEX_PREDICATE`), rebuilt by
+-- `migrate_v100` — NOT here, because `lifecycle_state` is a ladder-added
+-- column (v64) and a bootstrap index referencing it would crash the open of a
+-- legacy database (guardrail-D rule (f), the #2424 class; see the v94 note
+-- below). This full form is what a fresh database gets until the ladder,
+-- which runs on every connect, rebuilds it under the same name.
 CREATE UNIQUE INDEX IF NOT EXISTS memories_title_ns_uidx
     ON memories (title, namespace);
 
