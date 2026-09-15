@@ -582,6 +582,108 @@ pub fn lifecycle_visible_clause(table_alias: &str) -> String {
     format!("AND ({col} IS NULL OR {col} IN ({list}))")
 }
 
+/// v1.0.0 #3690 / #3695 / #3699 — the `(title, namespace)` slot belongs to
+/// LIVE rows only: the predicate of the PARTIAL unique index both adapters
+/// carry from schema v100 (`idx_memories_title_ns` on sqlite,
+/// `memories_title_ns_uidx` on postgres). A consolidation tombstone gives
+/// its slot up, so a later store of the same title is a fresh, visible row
+/// and never a write INTO the hidden one (#3690: the CLI printed an id and
+/// `get`/`list`/`recall` never showed the text).
+///
+/// The text is spelled verbatim at every `ON CONFLICT (title, namespace)`
+/// target — an upsert only matches a partial index whose predicate it
+/// repeats — and in both v100 migration rungs; a structural test pins every
+/// target to this ONE const so a future target cannot drift back to the
+/// full form. Deliberately `<> 'tombstoned'` and NOT the recall allow-list
+/// (the #3690 vote, Q4): a quarantined or contaminated row KEEPS its slot,
+/// and the write funnels refuse to write into it with a typed conflict
+/// instead ([`LifecycleState::title_slot_admission`]) — widening the index
+/// would let a quarantine route-in insert beside a live row and diverge
+/// replicas, and would make dequarantine-on-attest collide with a live key
+/// holder. NULL-safe: the column is `NOT NULL DEFAULT 'open'`.
+pub const TITLE_SLOT_INDEX_PREDICATE: &str = "lifecycle_state <> 'tombstoned'";
+
+/// #3690 — what a write funnel may do when a row already holds the
+/// `(title, namespace)` it is about to claim. Derived ONCE from the row's
+/// [`LifecycleState`] and consulted by every create / federation funnel on
+/// both adapters BEFORE its statement runs, so the admission and the
+/// disposition read the same value (the #3730 rule: a gate that runs before
+/// the lookup that qualifies it is not a gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleSlotAdmission {
+    /// The occupant is a live, caller-visible row: the funnel's ordinary
+    /// arm applies (merge / refuse / same-id CAS).
+    Occupied,
+    /// The occupant is a consolidation tombstone: it holds NO slot (the v100
+    /// partial index excludes it), so the write lands as a fresh row beside
+    /// it. Nothing is written into the tombstone.
+    Free,
+    /// The occupant is hidden for a SECURITY reason (`quarantined` /
+    /// `contaminated`) or an unknown future state: it keeps its slot, and
+    /// the write is refused with a typed conflict that does NOT name the
+    /// hidden row (#3695). Writing into it would launder the quarantine and
+    /// hand a peer-attributed row the local author's text.
+    Refused,
+}
+
+impl LifecycleState {
+    /// #3690 — the ONE admission predicate for a `(title, namespace)`
+    /// occupant, see [`TitleSlotAdmission`].
+    #[must_use]
+    pub fn title_slot_admission(self) -> TitleSlotAdmission {
+        if self == Self::Tombstoned {
+            TitleSlotAdmission::Free
+        } else if self.is_recall_visible() {
+            TitleSlotAdmission::Occupied
+        } else {
+            TitleSlotAdmission::Refused
+        }
+    }
+
+    /// #3690 — [`Self::title_slot_admission`] over the RAW column text a
+    /// write funnel just read. An unrecognised value (a state a newer binary
+    /// wrote) is NOT a live occupant the funnel may merge into and NOT a
+    /// tombstone that gave its slot up: it is [`TitleSlotAdmission::Refused`]
+    /// (fail-closed), so an older binary refuses rather than writes into a
+    /// row whose hiding reason it cannot read.
+    #[must_use]
+    pub fn title_slot_admission_for(raw: &str) -> TitleSlotAdmission {
+        Self::from_str(raw).map_or(TitleSlotAdmission::Refused, Self::title_slot_admission)
+    }
+}
+
+/// #3690 — the ONE upsert conflict target for the `(title, namespace)` slot,
+/// on both adapters: an upsert matches a PARTIAL unique index only when its
+/// conflict target repeats the index predicate, so every
+/// `INSERT … ON CONFLICT` funnel that claims a title spells THIS (built from
+/// [`TITLE_SLOT_INDEX_PREDICATE`], pinned equal by a unit test) and never
+/// the bare `ON CONFLICT (title, namespace)` form, which would target an
+/// index that no longer exists at v100 and fail every upsert. The structural
+/// pin `tests/title_slot_conflict_targets_3690.rs` refuses a bare target
+/// anywhere under `src/`.
+pub const TITLE_SLOT_CONFLICT_TARGET: &str =
+    "ON CONFLICT (title, namespace) WHERE lifecycle_state <> 'tombstoned'";
+
+/// #3690 — the DO-UPDATE backstop every merge arm appends: the merge fires
+/// only when the occupant is caller-VISIBLE, so a `quarantined` /
+/// `contaminated` occupant makes the statement update nothing (zero
+/// `RETURNING` rows → the funnel's typed, non-naming conflict) even when a
+/// concurrent quarantine landed between the funnel's admission probe and
+/// its statement. Same allow-list as [`lifecycle_visible_clause`]; the
+/// tombstone case never reaches the arm because the index excludes it.
+#[must_use]
+pub fn title_slot_merge_backstop(table_alias: &str) -> String {
+    format!(
+        "{TITLE_SLOT_MERGE_BACKSTOP_HEAD} {}",
+        lifecycle_visible_clause(table_alias)
+    )
+}
+
+/// #3690 — the fixed head of [`title_slot_merge_backstop`]; a funnel that
+/// must DROP the backstop (the same-id tombstone restore, which re-targets
+/// the merge arm at the PRIMARY KEY) splits its literal here.
+pub const TITLE_SLOT_MERGE_BACKSTOP_HEAD: &str = "WHERE 1 = 1";
+
 /// Exclude quarantined rows from invalidation review queues (#3614).
 ///
 /// These queues must retain contaminated dependents for curator review (#3324),
@@ -2492,6 +2594,52 @@ pub struct NamespaceCount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3690 — the conflict target is the index predicate, verbatim: the two
+    /// consts cannot drift apart (an upsert that spells a different predicate
+    /// than the partial index carries fails at runtime, on every store).
+    #[test]
+    fn title_slot_conflict_target_repeats_the_index_predicate_3690() {
+        assert_eq!(
+            TITLE_SLOT_CONFLICT_TARGET,
+            format!("ON CONFLICT (title, namespace) WHERE {TITLE_SLOT_INDEX_PREDICATE}")
+        );
+        assert!(title_slot_merge_backstop("memories").contains("memories.lifecycle_state IN ("));
+    }
+
+    /// #3690 — the ONE admission predicate: visible → Occupied, tombstoned →
+    /// Free, every hidden or unknown state → Refused (fail-closed).
+    #[test]
+    fn title_slot_admission_partitions_every_state_3690() {
+        for state in RECALL_VISIBLE_LIFECYCLE_STATES {
+            assert_eq!(
+                state.title_slot_admission(),
+                TitleSlotAdmission::Occupied,
+                "{state:?}"
+            );
+            assert_eq!(
+                LifecycleState::title_slot_admission_for(state.as_str()),
+                TitleSlotAdmission::Occupied
+            );
+        }
+        assert_eq!(
+            LifecycleState::Tombstoned.title_slot_admission(),
+            TitleSlotAdmission::Free
+        );
+        assert_eq!(
+            LifecycleState::Quarantined.title_slot_admission(),
+            TitleSlotAdmission::Refused
+        );
+        assert_eq!(
+            LifecycleState::Contaminated.title_slot_admission(),
+            TitleSlotAdmission::Refused
+        );
+        assert_eq!(
+            LifecycleState::title_slot_admission_for("some-future-state"),
+            TitleSlotAdmission::Refused,
+            "an unreadable hiding reason is never a merge target"
+        );
+    }
 
     #[test]
     fn tier_round_trips_strings() {

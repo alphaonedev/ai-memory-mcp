@@ -1628,6 +1628,12 @@ const MIGRATION_V97_AGENT_PUBKEY_HISTORY: &str =
 const MIGRATION_V98_CANONICAL_INBOX_NAMESPACE: &str =
     include_str!("../../migrations/postgres/0055_v98_canonical_inbox_namespace.sql");
 
+/// v100 (#3690 / #3695 / #3699): the `(title, namespace)` unique index becomes
+/// PARTIAL — tombstoned rows give up their slot. The sqlite twin is
+/// `MIGRATION_V100_SQLITE` (`migrations/sqlite/0084_v100_title_slot_live_rows.sql`).
+const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
+    include_str!("../../migrations/postgres/0057_v100_title_slot_live_rows.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2018,7 +2024,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 98;
+const CURRENT_SCHEMA_VERSION: i32 = 100;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4150,8 +4156,11 @@ impl PostgresStore {
         if current_version < 97 {
             self.migrate_v97().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 98 {
             self.migrate_v98().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v100().await?;
         }
 
         Ok(())
@@ -7294,6 +7303,40 @@ impl PostgresStore {
     /// v1.0.0 #3401 — schema v98: alias legacy live and archived
     /// `_messages/<agent>` rows to the canonical `_inbox/<agent>` namespace.
     /// The view preserves every signed byte and follows imports and restores.
+    /// v100 (#3690 / #3695 / #3699) — the `(title, namespace)` slot belongs to
+    /// LIVE rows only: the unique index is rebuilt PARTIAL, excluding
+    /// `tombstoned`, under the same name inside the migration transaction.
+    /// Every `ON CONFLICT (title, namespace)` target in this adapter spells
+    /// `models::TITLE_SLOT_INDEX_PREDICATE` so it keeps matching this index.
+    async fn migrate_v100(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V100_TITLE_SLOT_LIVE_ROWS.contains(crate::models::TITLE_SLOT_INDEX_PREDICATE),
+            "#3690: the v100 DDL doc twin must carry the ONE index predicate"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v100 title-slot migration tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V100_TITLE_SLOT_LIVE_ROWS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v100 title-slot migration", e))?;
+
+        record_schema_version(&mut tx, 100).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v100 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v100 applied (#3690: the (title, namespace) unique index \
+             is partial — tombstoned rows no longer hold a title slot)"
+        );
+        Ok(())
+    }
+
     async fn migrate_v98(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V98_CANONICAL_INBOX_NAMESPACE.contains("archived_memories"),
@@ -14770,6 +14813,17 @@ impl PostgresStore {
         // `agent_id` (#1784) while taking the incoming envelope, so an
         // incoming-keyed seal left the durable row unreadable. Same tx as the
         // upsert, so the pre-read + write are one atomic unit.
+        // #3690 / #3695 — TITLE-SLOT ADMISSION for the reflection row (the
+        // sqlite twin funnels through `storage::insert`, which probes the same
+        // predicate): a hidden holder of the reflection's title is a typed,
+        // unnamed refusal, never a merge into it.
+        let _reflect_verdict = pg_title_slot_admission(
+            &mut tx,
+            &candidate,
+            crate::storage::InsertConflictArm::Merge,
+        )
+        .await
+        .map_err(|e| ReflectError::Database(e.to_string()))?;
         let reflect_seal = seal_content_for_upsert(&mut *tx, &candidate)
             .await
             .map_err(|e| ReflectError::Database(e.to_string()))?;
@@ -14777,6 +14831,7 @@ impl PostgresStore {
 
         // Insert the reflection memory inside the tx.
         let actual_id: String = sqlx::query(
+            &format!(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
@@ -14784,7 +14839,7 @@ impl PostgresStore {
                 cid, cid_genesis, encrypted_envelope, kind_provenance
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15, $16,
                       $17, $18, $19, $20)
-            ON CONFLICT (title, namespace) DO UPDATE SET
+            {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store() parity).
                 encrypted_envelope = EXCLUDED.encrypted_envelope,
@@ -14803,11 +14858,11 @@ impl PostgresStore {
                     -- from the existing row through the metadata overwrite.
                     -- `||` overlays them on top of EXCLUDED so existing wins
                     -- (the superset of the pre-#1784 agent_id-only CASE).
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                     WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                )),
+                )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    ELSE EXCLUDED.memory_kind END,
@@ -14829,7 +14884,13 @@ impl PostgresStore {
                                        WHEN memories.memory_kind = 'reflection'
                                             THEN memories.kind_provenance
                                        ELSE EXCLUDED.kind_provenance END
+            {merge_backstop}
             RETURNING id",
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        )
         )
         .bind(&new_id)
         .bind(input.tier.as_str())
@@ -14857,9 +14918,12 @@ impl PostgresStore {
         // `storage::insert`, which binds this column, so omitting it here
         // landed NULL on postgres for every synthesized reflection.
         .bind(crate::storage::extract_kind_provenance(&candidate))
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ReflectError::Database(format!("insert reflection memory: {e}")))?
+        // #3690 — no RETURNING row: the merge backstop fired on a HIDDEN
+        // occupant that landed after the admission probe (typed, unnamed).
+        .ok_or_else(|| ReflectError::Database(StoreError::Conflict { id: String::new() }.to_string()))?
         .try_get::<String, _>("id")
         .map_err(|e| ReflectError::Database(format!("read returned id: {e}")))?;
 
@@ -16903,11 +16967,166 @@ async fn pg_probe_upsert_prior_version(
     // #2954 — serialize concurrent same-key create-funnel upserts so a
     // fresh-insert race cannot make the loser overwrite content with no leaf.
     pg_advisory_lock_title_namespace(tx, title, namespace).await?;
-    sqlx::query_scalar::<_, i64>("SELECT version FROM memories WHERE title = $1 AND namespace = $2")
-        .bind(title)
-        .bind(namespace)
-        .fetch_optional(&mut **tx)
+    // #3690 — the row a conflict-merge overwrites is the LIVE slot holder (the
+    // v100 partial index excludes tombstones), so only its version is a
+    // pre-image; a tombstone beside the key is never merged into.
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT version FROM memories WHERE title = $1 AND namespace = $2 AND {}",
+        crate::models::TITLE_SLOT_INDEX_PREDICATE
+    ))
+    .bind(title)
+    .bind(namespace)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// #3690 — postgres twin of `crate::storage::title_slot_holder`: the LIVE
+/// occupant of `(title, namespace)` (the row the v100 partial unique index
+/// knows about), with its admission derived ONCE from the lifecycle text it
+/// carries. `None` when the slot is free, which includes "held only by a
+/// tombstone".
+struct PgTitleSlotHolder {
+    id: String,
+    version: i64,
+    admission: crate::models::TitleSlotAdmission,
+}
+
+async fn pg_title_slot_holder(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    title: &str,
+    namespace: &str,
+) -> Result<Option<PgTitleSlotHolder>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT id, version, lifecycle_state FROM memories \
+         WHERE title = $1 AND namespace = $2 AND {} LIMIT 1",
+        crate::models::TITLE_SLOT_INDEX_PREDICATE
+    ))
+    .bind(title)
+    .bind(namespace)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|r| {
+        let state: String = r.try_get("lifecycle_state")?;
+        Ok(PgTitleSlotHolder {
+            id: r.try_get("id")?,
+            version: r.try_get("version")?,
+            admission: crate::models::LifecycleState::title_slot_admission_for(&state),
+        })
+    })
+    .transpose()
+}
+
+/// #3690 — postgres twin of `crate::storage::same_id_hidden_row_under_key`:
+/// the row already stored under the INCOMING id when it carries the SAME
+/// `(title, namespace)` but is not the slot holder (so it is hidden — a
+/// tombstone, or a quarantined / contaminated row). `None` when no row
+/// carries the id, or when it carries the id under a different key (the
+/// pre-#3690 PRIMARY KEY error stands there).
+struct PgSameIdHiddenRow {
+    version: i64,
+    admission: crate::models::TitleSlotAdmission,
+}
+
+async fn pg_same_id_hidden_row_under_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    memory: &Memory,
+) -> Result<Option<PgSameIdHiddenRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT title, namespace, version, lifecycle_state FROM memories WHERE id = $1",
+    )
+    .bind(&memory.id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|r| {
+        let title: String = r.try_get("title")?;
+        let namespace: String = r.try_get("namespace")?;
+        let version: i64 = r.try_get("version")?;
+        let state: String = r.try_get("lifecycle_state")?;
+        Ok(
+            (title == memory.title && namespace == memory.namespace).then(|| PgSameIdHiddenRow {
+                version,
+                admission: crate::models::LifecycleState::title_slot_admission_for(&state),
+            }),
+        )
+    })
+    .transpose()
+    .map(Option::flatten)
+}
+
+/// #3690 — what a create funnel learned about the `(title, namespace)` slot
+/// BEFORE its statement, from the ONE predicate
+/// (`LifecycleState::title_slot_admission`) the statement's conflict target
+/// and merge backstop also encode. Mirrors the sqlite `insert_inner`
+/// pre-probe exactly.
+struct PgTitleSlotVerdict {
+    /// The LIVE, caller-visible occupant (a merge target), if any.
+    holder: Option<PgTitleSlotHolder>,
+    /// `RestoreSameId` found the caller's OWN tombstone under this key and no
+    /// live holder: the merge arm is re-targeted at the PRIMARY KEY (vote Q3).
+    restore_tombstone_by_id: bool,
+    /// The append-only SUPERSEDE pre-image version, when the spine is armed.
+    prior_version: Option<i64>,
+}
+
+/// #3690 / #3695 / #3626 — TITLE-SLOT ADMISSION for the postgres create
+/// funnels. A hidden-for-security holder (`quarantined` / `contaminated` /
+/// unreadable) keeps its slot and REFUSES every arm with a typed conflict
+/// whose id is EMPTY (the hidden row is never named); a `RestoreSameId` whose
+/// key a DIFFERENT live row holds is refused naming that row; a same-id row
+/// hidden under this key admits only a restore of a TOMBSTONE (in place,
+/// stays tombstoned) and refuses everything else unnamed. `prior_version` is
+/// read under the #2954 advisory lock so it cannot race the upsert.
+async fn pg_title_slot_admission(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    memory: &Memory,
+    conflict_arm: crate::storage::InsertConflictArm,
+) -> StoreResult<PgTitleSlotVerdict> {
+    use crate::models::TitleSlotAdmission;
+    use crate::storage::InsertConflictArm;
+    let refused = || StoreError::Conflict { id: String::new() };
+    let prior_version = pg_probe_upsert_prior_version(tx, &memory.title, &memory.namespace)
         .await
+        .map_err(|e| to_store_err("probe upsert prior version", e))?;
+    let holder = pg_title_slot_holder(tx, &memory.title, &memory.namespace)
+        .await
+        .map_err(|e| to_store_err("title-slot admission probe", e))?;
+    if holder
+        .as_ref()
+        .is_some_and(|h| h.admission == TitleSlotAdmission::Refused)
+    {
+        return Err(refused());
+    }
+    if let (InsertConflictArm::RestoreSameId, Some(h)) = (conflict_arm, &holder)
+        && h.id != memory.id
+    {
+        return Err(StoreError::Conflict { id: h.id.clone() });
+    }
+    let same_id_hidden = if holder.is_none() {
+        pg_same_id_hidden_row_under_key(tx, memory)
+            .await
+            .map_err(|e| to_store_err("same-id hidden-row probe", e))?
+    } else {
+        None
+    };
+    let restore_tombstone_by_id = match (&same_id_hidden, conflict_arm) {
+        (None, _) => false,
+        (Some(row), InsertConflictArm::RestoreSameId)
+            if row.admission == TitleSlotAdmission::Free =>
+        {
+            true
+        }
+        (Some(_), _) => return Err(refused()),
+    };
+    let prior_version = prior_version.or_else(|| {
+        crate::config::append_only_enabled()
+            .then(|| same_id_hidden.as_ref().map(|r| r.version))
+            .flatten()
+    });
+    Ok(PgTitleSlotVerdict {
+        holder,
+        restore_tombstone_by_id,
+        prior_version,
+    })
 }
 
 /// v1.0.0 #2954 — the pre-merge image of the `(title, namespace)` row the
@@ -17267,8 +17486,13 @@ async fn retained_agent_id_for_upsert(
     // `?` operator, so no driver placeholder ambiguity). Mirrors the sqlite
     // `metadata_agent_id_slot` Option semantics exactly.
     let existing: Option<(bool, Option<String>)> = sqlx::query_as(
-        "SELECT jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
-         FROM memories WHERE title = $1 AND namespace = $2",
+        // #3690 — the surviving row is the LIVE slot holder (the v100 partial
+        // index excludes tombstones), never a tombstone the write lands beside.
+        &format!(
+            "SELECT jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
+             FROM memories WHERE title = $1 AND namespace = $2 AND {}",
+            crate::models::TITLE_SLOT_INDEX_PREDICATE
+        ),
     )
     .bind(&memory.title)
     .bind(&memory.namespace)
@@ -17278,8 +17502,11 @@ async fn retained_agent_id_for_upsert(
     Ok(match existing {
         // No conflict target — the incoming row IS the surviving row.
         None => incoming.to_string(),
-        // Key ABSENT on the existing row ⇒ the overlay keeps the incoming id.
-        Some((false, _)) => incoming.to_string(),
+        // Key ABSENT on the existing row ⇒ #3626: the arm DROPS the incoming
+        // id (an unstamped row is claimed only by `ai-memory reown`), so the
+        // surviving row retains NO owner and there is no recipient key — the
+        // empty id lets the seal gate refuse fail-closed.
+        Some((false, _)) => String::new(),
         // Key PRESENT ⇒ that is what the surviving row will carry (a json-null
         // or non-string value reads back as the empty id).
         Some((true, retained)) => retained.unwrap_or_default(),
@@ -17342,19 +17569,36 @@ async fn seal_content_for_upsert_batch(
     // empty id) — see `retained_agent_id_for_upsert`. Rows whose key is absent
     // are simply omitted from the map so the per-row fallback below applies.
     let existing: Vec<(String, String, bool, Option<String>)> = sqlx::query_as(
-        "SELECT title, namespace, jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
-         FROM memories \
-         WHERE (title, namespace) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
+        // #3690 — LIVE slot holders only (see `retained_agent_id_for_upsert`).
+        &format!(
+            "SELECT title, namespace, jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
+             FROM memories \
+             WHERE (title, namespace) IN (SELECT * FROM UNNEST($1::text[], $2::text[])) \
+               AND {}",
+            crate::models::TITLE_SLOT_INDEX_PREDICATE
+        ),
     )
     .bind(&titles)
     .bind(&namespaces)
     .fetch_all(&mut *conn)
     .await
     .map_err(|e| to_store_err("resolve retained agent_ids for batch upsert", e))?;
+    // #3626 — an existing row with the key ABSENT retains NO owner after the
+    // merge (the arm drops the incoming id), so it maps to the empty id like a
+    // present json-null does; only a key-less KEY (no existing row) falls
+    // through to the incoming id below.
     let retained_by_key: std::collections::HashMap<(String, String), String> = existing
         .into_iter()
-        .filter(|(_, _, has_key, _)| *has_key)
-        .map(|(title, namespace, _, agent)| ((title, namespace), agent.unwrap_or_default()))
+        .map(|(title, namespace, has_key, agent)| {
+            (
+                (title, namespace),
+                if has_key {
+                    agent.unwrap_or_default()
+                } else {
+                    String::new()
+                },
+            )
+        })
         .collect();
     let mut seals = Vec::with_capacity(memories.len());
     for memory in memories {
@@ -21082,10 +21326,12 @@ impl MemoryStore for PostgresStore {
         // conflict-merge that overwrites durable content in place (`content =
         // EXCLUDED.content` below) appends ONE identity-only SUPERSEDE leaf. `None`
         // when the spine is OFF or on a fresh INSERT (no prior row). Same tx.
-        let prior_version =
-            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
-                .await
-                .map_err(|e| to_store_err("probe upsert prior version", e))?;
+        // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
+        // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
+        let store_verdict =
+            pg_title_slot_admission(&mut tx, memory, crate::storage::InsertConflictArm::Merge)
+                .await?;
+        let prior_version = store_verdict.prior_version;
 
         // Upsert contract matches SQLite: `ON CONFLICT (title, namespace)`.
         // Backed by the UNIQUE INDEX `memories_title_ns_uidx` in
@@ -21166,6 +21412,7 @@ impl MemoryStore for PostgresStore {
         let store_cid = crate::identity::cid::stamp_memory_cid(memory);
 
         let id: String = sqlx::query(
+            &format!(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
@@ -21181,7 +21428,7 @@ impl MemoryStore for PostgresStore {
                       $21, $22, $23,
                       $24, $25,
                       $26, $27, $28, $29, $30, $31, $32, $33)
-            ON CONFLICT (title, namespace) DO UPDATE SET
+            {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #228 Commit B — content + envelope move together on upsert
                 -- so a re-store replaces both the placeholder and ciphertext
@@ -21229,11 +21476,11 @@ impl MemoryStore for PostgresStore {
                     -- from the existing row through the metadata overwrite.
                     -- `||` overlays them on top of EXCLUDED so existing wins
                     -- (the superset of the pre-#1784 agent_id-only CASE).
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                     WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                )),
+                )) {unstamped_owner_drop},
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
                 -- newer reflection at higher depth doesn't lose its provenance
                 -- signal when re-stored at the same (title, namespace).
@@ -21323,7 +21570,13 @@ impl MemoryStore for PostgresStore {
                 -- (COALESCE takes a fresh upper bound, else keeps existing).
                 valid_from = memories.valid_from,
                 valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until)
+            {merge_backstop}
             RETURNING id",
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        )
         )
         .bind(&memory.id)
         .bind(memory.tier.as_str())
@@ -21364,9 +21617,12 @@ impl MemoryStore for PostgresStore {
         // (pre-ship 3x7) so the TEXT predicates compare instants correctly.
         .bind(crate::validate::canonical_valid_time_opt(memory.valid_from.as_deref()))
         .bind(crate::validate::canonical_valid_time_opt(memory.valid_until.as_deref()))
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
+        // #3690 — no RETURNING row: the merge backstop fired on a HIDDEN
+        // occupant that landed after the admission probe (typed, unnamed).
+        .ok_or_else(|| StoreError::Conflict { id: String::new() })?
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
 
@@ -21581,6 +21837,28 @@ impl MemoryStore for PostgresStore {
         // ciphertext, so the bulk path stays byte-identical to pre-#2383.
         let batch_seals = seal_content_for_upsert_batch(&mut *tx, memories).await?;
 
+        // #3690 / #3695 — TITLE-SLOT ADMISSION per distinct key, in the same
+        // sorted key order as the probe loop above (one advisory-lock order
+        // across batches). A hidden-for-security holder refuses the WHOLE
+        // batch, typed and unnamed, BEFORE any row lands (the batch is one
+        // statement, so a per-row skip would mis-align the return vector);
+        // the merge backstop in the statement re-asserts it atomically.
+        {
+            let mut admission_order: Vec<usize> = keep.clone();
+            admission_order.sort_by(|&a, &b| {
+                (memories[a].title.as_str(), memories[a].namespace.as_str())
+                    .cmp(&(memories[b].title.as_str(), memories[b].namespace.as_str()))
+            });
+            for idx in admission_order {
+                let _verdict = pg_title_slot_admission(
+                    &mut tx,
+                    &memories[idx],
+                    crate::storage::InsertConflictArm::Merge,
+                )
+                .await?;
+            }
+        }
+
         let mut builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -21743,7 +22021,8 @@ impl MemoryStore for PostgresStore {
         }
 
         builder.push(
-            " ON CONFLICT (title, namespace) DO UPDATE SET
+            &format!(
+            " {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2288 — content + envelope move together on upsert (sqlite +
                 -- `store()` parity): a re-store replaces both the placeholder
@@ -21786,11 +22065,11 @@ impl MemoryStore for PostgresStore {
                     -- from the existing row through the metadata overwrite.
                     -- `||` overlays them on top of EXCLUDED so existing wins
                     -- (the superset of the pre-#1784 agent_id-only CASE).
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                     WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                )),
+                )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -21870,8 +22149,13 @@ impl MemoryStore for PostgresStore {
             -- the existing-wins provenance overlay above) rides back on the
             -- SAME statement, so the envelope-owner reconcile below costs
             -- zero extra round trips and is race-free by construction.
+            {merge_backstop}
             RETURNING id, title, namespace, metadata->>'agent_id' AS retained_agent_id",
-        );
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        ));
 
         let rows = builder
             .build()
@@ -21990,15 +22274,13 @@ impl MemoryStore for PostgresStore {
         let mut ids = Vec::with_capacity(memories.len());
         for memory in memories {
             let key = (memory.title.clone(), memory.namespace.clone());
+            // #3690 — a key with no RETURNING row is the merge backstop firing
+            // on a HIDDEN occupant that landed after the admission pass above:
+            // the typed, unnamed conflict (the whole tx rolls back).
             let id = id_by_key
                 .get(&key)
                 .cloned()
-                .ok_or_else(|| StoreError::IntegrityFailed {
-                    detail: format!(
-                        "store_batch: no RETURNING id for (title, namespace) of memory {}",
-                        memory.id
-                    ),
-                })?;
+                .ok_or_else(|| StoreError::Conflict { id: String::new() })?;
             ids.push(id);
         }
         Ok(ids)
@@ -22162,10 +22444,12 @@ impl MemoryStore for PostgresStore {
         // conflict-merge that overwrites durable content in place appends ONE
         // identity-only SUPERSEDE leaf below. `None` when the spine is OFF or on
         // a fresh INSERT. Same tx as the upsert.
-        let prior_version =
-            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
-                .await
-                .map_err(|e| to_store_err("probe capture_turn prior version", e))?;
+        // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
+        // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
+        let capture_verdict =
+            pg_title_slot_admission(&mut tx, memory, crate::storage::InsertConflictArm::Merge)
+                .await?;
+        let prior_version = capture_verdict.prior_version;
 
         // v0.9.0 G8 (#1825) — the L4 capture mints a genesis row, so it stamps
         // its own content-id from the (plaintext) memory identity. OMITTED
@@ -22186,6 +22470,7 @@ impl MemoryStore for PostgresStore {
         let (capture_content, capture_envelope) = (capture_seal.content(), capture_seal.envelope());
 
         let inserted_id: String = sqlx::query(
+            &format!(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
@@ -22198,7 +22483,7 @@ impl MemoryStore for PostgresStore {
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26, $27, $28)
-            ON CONFLICT (title, namespace) DO UPDATE SET
+            {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store()/store_batch
                 -- parity); an encryption-off re-store clears any stale envelope.
@@ -22239,11 +22524,11 @@ impl MemoryStore for PostgresStore {
                     -- from the existing row through the metadata overwrite.
                     -- `||` overlays them on top of EXCLUDED so existing wins
                     -- (the superset of the pre-#1784 agent_id-only CASE).
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                     WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                )),
+                )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -22302,7 +22587,13 @@ impl MemoryStore for PostgresStore {
                                        WHEN memories.memory_kind IN ('reflection', 'persona')
                                             THEN memories.kind_provenance
                                        ELSE EXCLUDED.kind_provenance END
+            {merge_backstop}
             RETURNING id",
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        )
         )
         .bind(&memory.id)
         .bind(memory.tier.as_str())
@@ -22338,9 +22629,12 @@ impl MemoryStore for PostgresStore {
         // through `storage::insert`, which binds this column, so omitting it
         // here landed NULL on postgres for every captured turn.
         .bind(crate::storage::extract_kind_provenance(memory))
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| to_store_err("capture_turn insert memory", e))?
+        // #3690 — no RETURNING row: the merge backstop fired on a HIDDEN
+        // occupant that landed after the admission probe (typed, unnamed).
+        .ok_or_else(|| StoreError::Conflict { id: String::new() })?
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err("capture_turn read returned id", e))?;
 
@@ -22542,10 +22836,12 @@ impl MemoryStore for PostgresStore {
         // conflict-merge that overwrites durable content in place appends ONE
         // identity-only SUPERSEDE leaf below. `None` when the spine is OFF or on
         // a fresh INSERT. Same tx as the upsert.
-        let prior_version =
-            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
-                .await
-                .map_err(|e| to_store_err("probe recover_turn prior version", e))?;
+        // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
+        // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
+        let recover_verdict =
+            pg_title_slot_admission(&mut tx, memory, crate::storage::InsertConflictArm::Merge)
+                .await?;
+        let prior_version = recover_verdict.prior_version;
 
         // v0.9.0 G8 (#1825) — the L2 recovery mints a genesis row, so it
         // stamps its own content-id from the (plaintext) memory identity.
@@ -22565,6 +22861,7 @@ impl MemoryStore for PostgresStore {
         let (recover_content, recover_envelope) = (recover_seal.content(), recover_seal.envelope());
 
         let inserted_id: String = sqlx::query(
+            &format!(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
@@ -22577,7 +22874,7 @@ impl MemoryStore for PostgresStore {
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26, $27, $28)
-            ON CONFLICT (title, namespace) DO UPDATE SET
+            {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store() parity).
                 encrypted_envelope = EXCLUDED.encrypted_envelope,
@@ -22615,11 +22912,11 @@ impl MemoryStore for PostgresStore {
                     -- from the existing row through the metadata overwrite.
                     -- `||` overlays them on top of EXCLUDED so existing wins
                     -- (the superset of the pre-#1784 agent_id-only CASE).
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                     WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                )),
+                )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -22677,7 +22974,13 @@ impl MemoryStore for PostgresStore {
                                        WHEN memories.memory_kind IN ('reflection', 'persona')
                                             THEN memories.kind_provenance
                                        ELSE EXCLUDED.kind_provenance END
+            {merge_backstop}
             RETURNING id",
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        )
         )
         .bind(&memory.id)
         .bind(memory.tier.as_str())
@@ -22713,9 +23016,12 @@ impl MemoryStore for PostgresStore {
         // through `storage::insert`, which binds this column, so omitting it
         // here landed NULL on postgres for every transcript-recovered turn.
         .bind(crate::storage::extract_kind_provenance(memory))
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| to_store_err("recover_turn insert memory", e))?
+        // #3690 — no RETURNING row: the merge backstop fired on a HIDDEN
+        // occupant that landed after the admission probe (typed, unnamed).
+        .ok_or_else(|| StoreError::Conflict { id: String::new() })?
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err("recover_turn read returned id", e))?;
 
@@ -24801,6 +25107,7 @@ impl MemoryStore for PostgresStore {
         let remote_seal = seal_content_for_upsert(&mut *tx, memory).await?;
         let (remote_content, remote_envelope) = (remote_seal.content(), remote_seal.envelope());
         let row = sqlx::query(
+            &format!(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
@@ -24816,7 +25123,7 @@ impl MemoryStore for PostgresStore {
                 $18, $19, $20, $21, $22, $23, $24, $25, $26,
                 $27, $28, $29, $30, $31, $32, $33, $34
             )
-            ON CONFLICT (title, namespace) DO UPDATE SET
+            {conflict_target} DO UPDATE SET
                 -- #1631 — every newer-wins arm carries the sqlite
                 -- `insert_if_newer` equal-timestamp id tiebreak
                 -- (src/storage/mod.rs:7320-7321) so two peers that wrote
@@ -24893,11 +25200,11 @@ impl MemoryStore for PostgresStore {
                         -- consolidation derived_from / consolidated_from_agents)
                         -- on top of EXCLUDED so they survive the merge.
                         (EXCLUDED.metadata || (
-                            SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                            SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                             FROM jsonb_each(memories.metadata) AS prov(k, v)
                             -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                             WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                        ))
+                        )) {unstamped_owner_drop}
                     ELSE memories.metadata
                 END,
                 -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
@@ -25035,6 +25342,10 @@ impl MemoryStore for PostgresStore {
                 -- SET: the surviving local row keeps its genesis cid on a
                 -- federation-merge (preserves the local genesis pre-image).
             RETURNING id",
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        )
         )
         .bind(&memory.id)
         .bind(memory.tier.as_str())
@@ -28295,10 +28606,20 @@ impl MemoryStore for PostgresStore {
         let dest_prior_version = pg_probe_upsert_prior_version(&mut tx, title, namespace)
             .await
             .map_err(|e| to_store_err("probe consolidate dest prior version", e))?;
+        // #3690 / #3695 — TITLE-SLOT ADMISSION for the summary row: a hidden
+        // holder of the summary's title refuses the consolidation typed and
+        // unnamed BEFORE any source is tombstoned or deleted.
+        let _consolidate_verdict = pg_title_slot_admission(
+            &mut tx,
+            &candidate,
+            crate::storage::InsertConflictArm::Merge,
+        )
+        .await?;
         let consolidate_seal = seal_content_for_upsert(&mut *tx, &candidate).await?;
         let (consolidate_content, consolidate_envelope) =
             (consolidate_seal.content(), consolidate_seal.envelope());
         let inserted_id: String = sqlx::query_scalar(
+            &format!(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, expires_at, metadata,
@@ -28308,7 +28629,7 @@ impl MemoryStore for PostgresStore {
             -- confidences, captured above), NOT the former hardcoded 1.0; the
             -- ON CONFLICT arm's `confidence = EXCLUDED.confidence` re-uses it.
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $17, $8, $9, $10, $10, $11, $12, $13, $14, $15, $16, $18)
-            ON CONFLICT (title, namespace) DO UPDATE SET
+            {conflict_target} DO UPDATE SET
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -28330,18 +28651,24 @@ impl MemoryStore for PostgresStore {
                     -- consolidation derived_from / consolidated_from_agents)
                     -- from the existing row (existing-wins) so a re-consolidation
                     -- onto a colliding (title, namespace) can't drop provenance.
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                     WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                ))
+                )) {unstamped_owner_drop}
                 -- reflection_depth intentionally not surfaced here: the
                 -- consolidate path mints a fresh memory and the DB column
                 -- DEFAULT 0 applies. The UPSERT branch preserves the
                 -- existing row's reflection_depth (no SET clause = keep).
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis likewise OMITTED from
                 -- DO UPDATE SET: surviving row keeps its genesis.
+            {merge_backstop}
             RETURNING id",
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        )
         )
         .bind(&new_id)
         .bind(tier.as_str())
@@ -28373,9 +28700,12 @@ impl MemoryStore for PostgresStore {
         // v1.0.0 #2935 — $18: derived kind (Claim, vote 4d3ea1c5); the pre-fix
         // INSERT omitted memory_kind so the row fell to the schema default.
         .bind(candidate.memory_kind.as_str())
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| to_store_err("consolidate upsert", e))?;
+        .map_err(|e| to_store_err("consolidate upsert", e))?
+        // #3690 — no RETURNING row: the merge backstop fired on a HIDDEN
+        // occupant that landed after the admission probe (typed, unnamed).
+        .ok_or_else(|| StoreError::Conflict { id: String::new() })?;
         // #2383 (N1) — invariant backstop, same tx: a non-NULL
         // `encrypted_envelope` MUST open under the row's persisted
         // `metadata.agent_id`. Repairs the concurrent-first-creation race the
@@ -28491,15 +28821,26 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?;
-                sqlx::query(
-                    "UPDATE memories SET lifecycle_state = $1, updated_at = $2 WHERE id = $3",
-                )
+                // #3691 — GUARDED tombstone (sqlite twin in `storage::consolidate`):
+                // a source quarantined / contaminated since the snapshot read keeps
+                // its security state; zero rows affected aborts the whole cluster
+                // (the error drops `tx` → rollback: no summary, no edges).
+                let tombstoned = sqlx::query(&format!(
+                    "UPDATE memories SET lifecycle_state = $1, updated_at = $2 WHERE id = $3 {}",
+                    crate::models::lifecycle_visible_clause("")
+                ))
                 .bind(crate::models::LifecycleState::Tombstoned.as_str())
                 .bind(now)
                 .bind(id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("consolidate tombstone source", e))?;
+                .map_err(|e| to_store_err("consolidate tombstone source", e))?
+                .rows_affected();
+                if tombstoned != 1 {
+                    return Err(StoreError::InvalidTransition {
+                        detail: crate::storage::consolidate_source_hidden(id).to_string(),
+                    });
+                }
                 // Project the new edge into AGE (mirroring `link_internal`'s
                 // discipline) so the lineage Cypher path sees it: deferred
                 // mode enqueues to the outbox in this tx; sync mode rides a
@@ -33765,7 +34106,13 @@ impl MemoryStore for PostgresStore {
         // SAL contract is "no live row matches" → `Ok(None)`, not an
         // error — `fetch_optional` is the right primitive.
         let id: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM memories WHERE title = $1 AND namespace = $2 LIMIT 1",
+            // #3690 / #3695 — the caller-VISIBLE occupant only (sqlite twin
+            // `storage::find_by_title_namespace`): a tombstone holds no slot
+            // and a hidden occupant is never named to the caller.
+            &format!(
+                "SELECT id FROM memories WHERE title = $1 AND namespace = $2 {} LIMIT 1",
+                crate::models::lifecycle_visible_clause("")
+            ),
         )
         .bind(title)
         .bind(namespace)
@@ -33850,13 +34197,18 @@ impl MemoryStore for PostgresStore {
         // schema v57) + `plainto_tsquery`, mirroring the SQLite
         // `memories_fts MATCH` semantics — top 5 candidates in the
         // same namespace, ranked by relevance.
-        let rows = sqlx::query(
+        // #3693 — fail-closed lifecycle allow-list (sqlite twin
+        // `storage::find_similar_title_candidates`): a hidden row's id is never
+        // reported as a contradiction candidate.
+        let rows = sqlx::query(&format!(
             "SELECT m.* FROM memories m
              WHERE m.namespace = $2
                AND m.tsv @@ plainto_tsquery('english', $1)
+               {lifecycle_vis}
              ORDER BY ts_rank(m.tsv, plainto_tsquery('english', $1)) DESC
              LIMIT 5",
-        )
+            lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        ))
         .bind(title)
         .bind(namespace)
         .fetch_all(&self.pool)
@@ -34708,10 +35060,10 @@ impl PostgresStore {
         // RestoreSameId arms return the typed Conflict below WITHOUT overwriting,
         // so they never reach the leaf emit. `None` when the spine is OFF or on a
         // fresh INSERT. Same tx.
-        let prior_version =
-            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
-                .await
-                .map_err(|e| to_store_err("probe upsert prior version", e))?;
+        // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
+        // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
+        let slot_verdict = pg_title_slot_admission(&mut tx, memory, conflict_arm).await?;
+        let prior_version = slot_verdict.prior_version;
 
         // #1383 — same denormalisation rationale as the regular
         // `store()` path above. Reflection-kind rows passed through
@@ -34738,7 +35090,8 @@ impl PostgresStore {
         let embed_seal = seal_content_for_upsert(&mut *tx, memory).await?;
         let (embed_content, embed_envelope) = (embed_seal.content(), embed_seal.envelope());
 
-        let embed_upsert_sql = "INSERT INTO memories (
+        let embed_upsert_sql: String = format!(
+            "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, metadata, reflection_depth, memory_kind,
@@ -34754,7 +35107,7 @@ impl PostgresStore {
                       $24, $25, $26,
                       $27, $28, $29, $30, $31,
                       $32, $33, $34, $35)
-            ON CONFLICT (title, namespace) DO UPDATE SET
+            {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together on upsert so a
                 -- re-store replaces both the placeholder and the ciphertext
@@ -34797,11 +35150,11 @@ impl PostgresStore {
                     -- from the existing row through the metadata overwrite.
                     -- `||` overlays them on top of EXCLUDED so existing wins
                     -- (the superset of the pre-#1784 agent_id-only CASE).
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
                     WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                )),
+                )) {unstamped_owner_drop},
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky (reflection AND persona, #1629).
@@ -34888,7 +35241,14 @@ impl PostgresStore {
                                        WHEN memories.memory_kind IN ('reflection', 'persona')
                                             THEN memories.kind_provenance
                                        ELSE EXCLUDED.kind_provenance END
-            RETURNING id";
+{merge_backstop}
+            RETURNING id",
+            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            unstamped_owner_drop =
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+        );
+        let embed_upsert_sql: &str = &embed_upsert_sql;
         // #2771/#2887 — single-source the column list + binds + the whole DO
         // UPDATE SET arm across every disposition; only the ON CONFLICT
         // resolution differs, derived from the ONE upsert literal so a future
@@ -34906,13 +35266,29 @@ impl PostgresStore {
                     .split("ON CONFLICT")
                     .next()
                     .unwrap_or(embed_upsert_sql);
-                std::borrow::Cow::Owned(
-                    [
-                        head,
-                        "ON CONFLICT (title, namespace) DO NOTHING\n            RETURNING id",
-                    ]
-                    .concat(),
-                )
+                std::borrow::Cow::Owned(format!(
+                    "{head}{} DO NOTHING\n            RETURNING id",
+                    crate::models::TITLE_SLOT_CONFLICT_TARGET
+                ))
+            }
+            // #3690 (vote Q3) — a same-id restore of the caller's OWN tombstone:
+            // the tombstone is not in the v100 partial index, so the key does
+            // not conflict; re-target the SAME arm at the PRIMARY KEY with the
+            // visible-only backstop removed (the sqlite `insert_inner` twin).
+            crate::storage::InsertConflictArm::RestoreSameId
+                if slot_verdict.restore_tombstone_by_id =>
+            {
+                let body = embed_upsert_sql
+                    .rsplit_once(crate::models::TITLE_SLOT_MERGE_BACKSTOP_HEAD)
+                    .map_or(embed_upsert_sql, |(head, _)| head);
+                std::borrow::Cow::Owned(format!(
+                    "{}\n            RETURNING id",
+                    body.replacen(
+                        crate::models::TITLE_SLOT_CONFLICT_TARGET,
+                        "ON CONFLICT (id)",
+                        1
+                    )
+                ))
             }
             crate::storage::InsertConflictArm::RestoreSameId => {
                 let body = embed_upsert_sql
@@ -34921,7 +35297,7 @@ impl PostgresStore {
                 std::borrow::Cow::Owned(
                     [
                         body,
-                        "WHERE memories.id = EXCLUDED.id\n            RETURNING id",
+                        "AND memories.id = EXCLUDED.id\n            RETURNING id",
                     ]
                     .concat(),
                 )
@@ -34993,9 +35369,12 @@ impl PostgresStore {
         let id = match id {
             Some(id) => id,
             None => {
-                let existing = sqlx::query_scalar::<_, String>(
-                    "SELECT id FROM memories WHERE title = $1 AND namespace = $2",
-                )
+                // #3695 — name only a VISIBLE occupant (a hidden one, which the
+                // merge backstop or `DO NOTHING` just refused, stays unnamed).
+                let existing = sqlx::query_scalar::<_, String>(&format!(
+                    "SELECT id FROM memories WHERE title = $1 AND namespace = $2 {}",
+                    crate::models::lifecycle_visible_clause("")
+                ))
                 .bind(&memory.title)
                 .bind(&memory.namespace)
                 .fetch_optional(&mut *tx)

@@ -903,7 +903,7 @@ fn handle_store_inner(
         // existing memory's metadata.agent_id wins over anything in the
         // incoming store.
         let preserved_metadata =
-            crate::identity::preserve_provenance_keys(&dup.metadata, &mem.metadata);
+            crate::identity::preserve_provenance_keys_for_merge(&dup.metadata, &mem.metadata);
         let (_found, content_changed) = db::update(
             conn,
             &dup.id,

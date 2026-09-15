@@ -298,16 +298,17 @@ fn cross_agent_upsert_preserves_authorship_and_new_content_2383() {
     );
 }
 
+/// #3626 (Consolidation Unit 1) INVERTED this cell's contract. It used to pin
+/// that "an ABSENT existing `agent_id` key lets the INCOMING agent_id survive
+/// the overlay" — which is the #3626 defect verbatim: a silent first-writer
+/// CLAIM of a legacy-unowned row. Every `(title, namespace)` merge arm now
+/// leaves an UNSTAMPED row unstamped (claiming stays `ai-memory reown`), so
+/// under at-rest encryption there is NO recipient key for the merged content
+/// and the seal gate refuses FAIL-CLOSED — the write is refused, the legacy
+/// row is byte-identical (still plaintext, still owner-less), nothing is
+/// stored in the clear. The remedy is `ai-memory reown` before re-storing.
 #[test]
-fn upsert_onto_agentless_legacy_row_seals_to_the_incoming_id_2383() {
-    // A row written while encryption was OFF can legitimately carry NO
-    // `agent_id` key at all. The conflict arm's provenance overlay only
-    // carries keys the existing row actually HAS, so an ABSENT key leaves the
-    // INCOMING writer's agent_id in place — the retained-identity resolver
-    // must fall back to the incoming id, NOT to the empty id (which has no
-    // recipient key and would fail the write closed). This is the case that
-    // distinguishes "key absent" from "key present but null"; the postgres
-    // twin needs `jsonb_exists` to tell them apart.
+fn upsert_onto_agentless_legacy_row_is_refused_fail_closed_never_claimed_2383_3626() {
     let gate = EncryptGate::off();
     let conn = fresh_conn();
     let ns = "n2383-agentless";
@@ -324,20 +325,32 @@ fn upsert_onto_agentless_legacy_row_seals_to_the_incoming_id_2383() {
 
     let _on = EncryptGate::on();
     let incoming = make_mem("legacy", "encrypted rewrite", ns, "agent-legacy-2383");
-    assert_eq!(
-        db::insert(&conn, &incoming).expect("upsert under encryption"),
-        id
+    let err = db::insert(&conn, &incoming).expect_err(
+        "#3626: the merge would leave the row owner-less, so there is no recipient key",
     );
-
-    assert_eq!(
-        persisted_agent_id(&conn, &id).as_deref(),
-        Some("agent-legacy-2383"),
-        "an ABSENT existing key lets the incoming agent_id survive the overlay"
+    assert!(
+        err.to_string().contains("no agent_id to key encryption to"),
+        "the seal gate refuses fail-closed, got: {err:#}"
     );
     assert_eq!(
-        db::get(&conn, &id).expect("read").expect("row").content,
-        "encrypted rewrite",
-        "the row must be sealed to (and readable under) the surviving agent_id"
+        persisted_agent_id(&conn, &id),
+        None,
+        "#3626: the incoming agent_id never claims the legacy row"
+    );
+    let (raw_content, envelope): (String, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT content, encrypted_envelope FROM memories WHERE id = ?1",
+            params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("raw read");
+    assert_eq!(
+        raw_content, "plaintext legacy content",
+        "the refused write touched nothing"
+    );
+    assert!(
+        envelope.is_none(),
+        "no envelope was minted for a write that did not land"
     );
 }
 
