@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use super::DeploymentShape;
 use crate::config::AppConfig;
 use crate::federation::peer_posture::{self, Allowlist, Observation};
+use crate::governance::audit::ForensicPayload;
 use crate::security_profile::{
     self, ASI_HARD_REFUSAL_PREFIX, ENV_SECURITY_PROFILE, SecurityPosture,
 };
@@ -497,15 +498,28 @@ fn record_mismatch(assessment: &ShapeAssessment) {
         "boot",
         AUDIT_KIND_UNDECLARED_SHAPE,
         ISSUE_TAG,
-        serde_json::json!({
-            "declared": assessment.declared.as_str(),
-            "observed_floor": assessment.observed.observed_floor.as_str(),
-            "signals": assessment.observed.present(),
-            "registered_agents": assessment.observed.registered_agents,
-            "posture": assessment.posture,
-            "origin": assessment.origin.as_str(),
-            "promotion_line": assessment.promotion_line(),
-        }),
+        // #3647 — every field is classified by WHAT IT IS, because the
+        // payload type decides what a row discloses and what it commits to.
+        // `declared` / `observed_floor` / `origin` are compile-time tokens
+        // from closed vocabularies (`label`). `signals` are the `SIGNAL_*`
+        // tokens, identifier-shaped and borrowed from the report's owned
+        // names (`idents`: verbatim). `registered_agents` is a count. `posture`
+        // is a `SecurityPosture` token carried as a `String` on the
+        // assessment (`ident`: verbatim, the same bytes a label would write).
+        // `promotion_line` is RENDERED free text — the operator's config line,
+        // derivable from `observed_floor` — so it is a commitment, never
+        // verbatim (`commit`).
+        ForensicPayload::new()
+            .label("declared", assessment.declared.as_str())
+            .label(
+                "observed_floor",
+                assessment.observed.observed_floor.as_str(),
+            )
+            .idents("signals", assessment.observed.present())
+            .opt_number("registered_agents", assessment.observed.registered_agents)
+            .ident("posture", &assessment.posture)
+            .label("origin", assessment.origin.as_str())
+            .commit("promotion_line", &assessment.promotion_line()),
     );
     tracing::warn!(
         target: TRACING_TARGET,
@@ -785,5 +799,84 @@ mod tests {
         assert_eq!(json["origin"], "explicit");
         let back: ShapeAssessment = serde_json::from_value(json).unwrap();
         assert_eq!(back, a);
+    }
+
+    /// #3700 x #3647 — the recorded mismatch row is a `ForensicPayload`
+    /// whose every field is classified by what it is: the closed-vocabulary
+    /// tokens (`declared`, `observed_floor`, `origin`, `posture`) and the
+    /// `SIGNAL_*` names render VERBATIM, the registry count is a number
+    /// (`null` when the store was never opened), and the RENDERED promotion
+    /// line — free text — is a keyed commitment that never reaches the row
+    /// in the clear. A conversion that merely compiles could misclassify a
+    /// field and quietly change what an audit row reveals; this pins the
+    /// disclosure of each one.
+    #[test]
+    fn recorded_mismatch_row_classifies_every_field_3700_3647() {
+        use crate::governance::audit::{self, ForensicDecision, forensic_commitment};
+        let _g = audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        audit::shutdown();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        audit::init(tmp.path(), Some(key.clone())).unwrap();
+        let explicit = assess_with(
+            DeploymentShape::Singleton,
+            report(&[SIGNAL_OUTBOUND_PEERS, SIGNAL_WAKE_HUB]).with_registry(3),
+            Some(SecurityPosture::AsiHard),
+        );
+        let pre_open = assess_with(
+            DeploymentShape::Team,
+            report(&[SIGNAL_INBOUND_BINDINGS]),
+            None,
+        );
+        record_mismatch(&explicit);
+        record_mismatch(&pre_open);
+        audit::shutdown();
+
+        let mut text = String::new();
+        for e in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            text.push_str(&std::fs::read_to_string(e.path()).unwrap());
+        }
+        let rows: Vec<ForensicDecision> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("forensic row"))
+            .collect();
+        assert_eq!(rows.len(), 2, "{text}");
+        let row = &rows[0];
+        assert_eq!(row.kind, AUDIT_KIND_UNDECLARED_SHAPE);
+        assert_eq!(row.rule_id, ISSUE_TAG);
+        let p = &row.payload;
+        assert_eq!(p["declared"], "singleton");
+        assert_eq!(p["observed_floor"], "federated");
+        assert_eq!(p["origin"], "explicit");
+        assert_eq!(p["posture"], "asi-hard");
+        assert_eq!(
+            p["signals"],
+            serde_json::json!([
+                SIGNAL_OUTBOUND_PEERS,
+                SIGNAL_WAKE_HUB,
+                SIGNAL_AGENT_REGISTRY
+            ])
+        );
+        assert_eq!(p["registered_agents"], 3);
+        assert_eq!(
+            p["promotion_line"],
+            forensic_commitment(&key, b"[deployment] shape = \"federated\"")
+        );
+        let p = &rows[1].payload;
+        assert_eq!(p["declared"], "team");
+        assert_eq!(p["origin"], "compiled_default");
+        assert_eq!(p["posture"], "standard");
+        assert!(
+            p.get("registered_agents").is_some(),
+            "the key renders even pre-open: {p}"
+        );
+        assert_eq!(p["registered_agents"], serde_json::Value::Null);
+        assert!(
+            !text.contains("[deployment] shape = "),
+            "free text never reaches the audit row verbatim: {text}"
+        );
     }
 }
