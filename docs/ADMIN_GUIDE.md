@@ -754,7 +754,8 @@ CREATE EXTENSION IF NOT EXISTS age;
 # schema-init enumerates the target store's catalog, including
 # installed extensions — AGE present ⇒ Cypher path; absent ⇒ the
 # recursive-CTE fallback stays in place (see docs/kg-backend-fallback.md).
-ai-memory schema-init --store-url postgres://… 
+# (#3705) the DSN must pin sslmode=verify-full&sslrootcert=<ca> or it is refused at connect
+ai-memory schema-init --store-url 'postgres://…?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
 
 **Acceptance gate:** AGE p95 must beat CTE p95 by ≥30% at depth=5 to ship in a given build — the bench gate (`feat/v0.7-j-8-age-bench-gate`) enforces it. If AGE isn't faster on your Postgres + hardware combination, stay on the CTE path; the substrate is happy with either. See [MIGRATION § Apache AGE acceleration](MIGRATION_v0.7.html#apache-age-acceleration-opt-in) and the [`attested-cortex` RFC § Decision 3](v0.7/rfc-attested-cortex.html#decision-3--why-age-behind-a-feature-flag-vs-hard-dependency) for why AGE ships behind a feature flag instead of as a hard dependency.
@@ -846,12 +847,12 @@ Set `remember: "session"` on a decide call to remember the decision **for this p
 
 ## Subscriptions & Webhooks
 
-The HTTP daemon exposes **HMAC-signed webhook subscriptions** that turn the memory store into a message bus. Subscribers register a URL + filter (namespace, agent_id, event type), the daemon POSTs JSON payloads on matching events, and every payload carries an `X-AI-Memory-Signature: sha256=<hex>` header (HMAC-SHA256 over the body using the shared secret).
+The HTTP daemon exposes **HMAC-signed webhook subscriptions** that turn the memory store into a message bus. Subscribers register a URL + filter (namespace, agent_id, event type), the daemon POSTs JSON payloads on matching events, and every payload carries an `X-AI-Memory-Signature: sha256=<hex>` header (HMAC-SHA256 over the body using the shared secret). The URL must be `https://` — a plaintext target is refused at create and at dispatch, loopback included (#3705); a receiver behind a private PKI is trusted by naming its certificate or CA in `config.toml` as `[subscriptions] ca_cert = "<PEM>"` (added to the public roots at boot; an unreadable or unparseable file refuses boot).
 
 ```bash
 # Register a subscription (`events` is a comma-separated string;
 # default "*" = every event type)
-curl -X POST http://127.0.0.1:9077/api/v1/subscriptions \
+curl -X POST https://127.0.0.1:9077/api/v1/subscriptions \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://my-app.local/webhook",
@@ -1040,6 +1041,40 @@ will reach, without refusing anything. Then declare the shape the node
 is — promotion is an operator act. See
 [`SECURITY.md`](SECURITY.html) "The deployment-shape detector (#3700)".
 
+**Before upgrading to v1.0.0: transit encryption becomes a floor (#3705).**
+From v1.0.0 the daemon serves TLS only, on every host, loopback included.
+A SINGLETON with no `--tls-cert`/`--tls-key` generates and renews an
+installation-local certificate under `<key_dir>/tls/` (#3709 item 1;
+clients trust `<key_dir>/tls/local-ca.pem`); a deployment whose DECLARED shape
+is not `singleton` (`[deployment] shape` = team / production / federated /
+hive, #3714) must bring enterprise PKI —
+`--tls-cert <fullchain.pem> --tls-key <key.pem>` — and is refused without
+it (3x7 audit ruling: an unmanaged CA in an enterprise estate is an audit
+finding); a plaintext listener is refused everywhere; every `http://`
+federation peer and
+webhook target is refused (loopback included); a PostgreSQL DSN must pin
+`sslmode=verify-full`; an `http://` `mcp_federation_forward_url` refuses
+boot; and the former `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` /
+`AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` acknowledgements refuse boot when set.
+`AI_MEMORY_REQUIRE_TLS` accepts `1`/`true`/`yes`/`on` (or unset); a falsy or
+unrecognised token refuses. Run the detector first:
+
+```bash
+ai-memory doctor            # third section: "Transit encryption (#3705)"
+ai-memory doctor --json | jq '.sections[2]'
+```
+
+It lists the selector token, armed downgrade paths, the forward-URL scheme,
+the store DSN `sslmode`, the plaintext webhook targets already stored, and
+the boot verdict, without refusing anything. Prepare the listener's
+material by shape — a singleton needs nothing (first boot generates the
+local certificate); a fleet brings its PKI via `--tls-cert`/`--tls-key`
+(see [`SECURITY.md`](SECURITY.html) "Bring your own certificate") — moving
+peers and webhooks to `https://`, and appending
+`?sslmode=verify-full&sslrootcert=<ca.crt>` to the DSN. All `curl` examples
+in this guide assume the daemon's certificate is trusted
+(`--cacert <key_dir>/tls/local-ca.pem` for the zero-config certificate).
+
 ### Database Maintenance
 
 Manually trigger garbage collection:
@@ -1049,23 +1084,23 @@ Manually trigger garbage collection:
 ai-memory gc
 
 # Via API
-curl -X POST http://127.0.0.1:9077/api/v1/gc
+curl -X POST https://127.0.0.1:9077/api/v1/gc
 ```
 
 By default, GC archives expired memories before deleting them. To disable archiving and permanently delete instead, set `archive_on_gc = false` in `config.toml`. Archived memories are moved to a separate archive table and can be listed, restored, or purged:
 
 ```bash
 # List archived memories
-curl http://127.0.0.1:9077/api/v1/archive
+curl https://127.0.0.1:9077/api/v1/archive
 
 # Restore an archived memory
-curl -X POST http://127.0.0.1:9077/api/v1/archive/<id>/restore
+curl -X POST https://127.0.0.1:9077/api/v1/archive/<id>/restore
 
 # Purge all archived memories permanently (optional: ?older_than_days=N)
-curl -X DELETE http://127.0.0.1:9077/api/v1/archive
+curl -X DELETE https://127.0.0.1:9077/api/v1/archive
 
 # View archive statistics
-curl http://127.0.0.1:9077/api/v1/archive/stats
+curl https://127.0.0.1:9077/api/v1/archive/stats
 ```
 
 **Disk space guidance:** Approximate database growth: ~2KB per memory (keyword tier), ~3.5KB per memory (semantic tier, 384-dim embeddings), ~5KB per memory (768-dim embeddings). WAL file may grow up to ~50MB during heavy write bursts; checkpoint occurs on graceful shutdown. Archive table grows unboundedly -- use `ai-memory archive purge` periodically.
@@ -1671,14 +1706,14 @@ The HTTP daemon exposes **100 production `.route(...)` registrations / 86 unique
 
 ### HTTP API Request/Response Examples
 
-Below are curl examples showing the exact JSON request bodies and response formats for the most important endpoints. The base URL is `http://127.0.0.1:9077/api/v1`.
+Below are curl examples showing the exact JSON request bodies and response formats for the most important endpoints. The base URL is `https://127.0.0.1:9077/api/v1` — the daemon serves TLS only (#3705), so pass `--cacert <key_dir>/tls/local-ca.pem` (the zero-config local CA, #3709) or trust the CA that issued the daemon's `--tls-cert`.
 
 #### POST /memories (Store)
 
 Create a new memory. Only `title` and `content` are required; all other fields have defaults.
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{
     "title": "Project uses PostgreSQL 16",
@@ -1743,7 +1778,7 @@ Deduplication: if a memory with the same title+namespace already exists, it is u
 **Minimal example (defaults applied):**
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{"title": "Quick note", "content": "Something to remember."}'
 ```
@@ -1755,7 +1790,7 @@ Response: `{"id": "...", "tier": "mid", "namespace": "global", "title": "Quick n
 Retrieve a single memory by ID, including its links to other memories.
 
 ```bash
-curl http://127.0.0.1:9077/api/v1/memories/a1b2c3d4-e5f6-7890-abcd-ef1234567890
+curl https://127.0.0.1:9077/api/v1/memories/a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
 **Response (200 OK):**
@@ -1798,7 +1833,7 @@ Note: `last_accessed_at` and `expires_at` are omitted from the JSON when null.
 Fuzzy OR search with ranked results. Automatically bumps access count, extends TTL, and auto-promotes frequently accessed mid-tier memories to long-term.
 
 ```bash
-curl "http://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&namespace=infra&limit=5"
+curl "https://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&namespace=infra&limit=5"
 ```
 
 **Query parameters:**
@@ -1842,7 +1877,7 @@ Each memory in the response includes a `score` field (float, rounded to 3 decima
 Recall is also available via POST for larger query bodies:
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{
     "context": "database migration postgres",
@@ -1858,7 +1893,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/recall \
 Partial update -- only provided fields are modified. All fields are optional.
 
 ```bash
-curl -X PUT http://127.0.0.1:9077/api/v1/memories/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
+curl -X PUT https://127.0.0.1:9077/api/v1/memories/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
   -H "Content-Type: application/json" \
   -d '{
     "content": "PostgreSQL 16.2 with pgvector 0.7 for embeddings. Upgraded 2026-04-10.",
@@ -1907,7 +1942,7 @@ curl -X PUT http://127.0.0.1:9077/api/v1/memories/a1b2c3d4-e5f6-7890-abcd-ef1234
 List memories that were archived by garbage collection.
 
 ```bash
-curl "http://127.0.0.1:9077/api/v1/archive?namespace=infra&limit=20&offset=0"
+curl "https://127.0.0.1:9077/api/v1/archive?namespace=infra&limit=20&offset=0"
 ```
 
 **Query parameters:**
@@ -1949,7 +1984,7 @@ curl "http://127.0.0.1:9077/api/v1/archive?namespace=infra&limit=20&offset=0"
 Restore an archived memory back to the active memories table. The archived row's `original_tier` and `original_expires_at` are re-applied where present (legacy archive rows restore as `long` with no expiry).
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/archive/expired-memory-id/restore
+curl -X POST https://127.0.0.1:9077/api/v1/archive/expired-memory-id/restore
 ```
 
 **Response (200 OK):**
@@ -1968,7 +2003,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/archive/expired-memory-id/restore
 ### Health Endpoint (Deep Check)
 
 ```bash
-curl http://127.0.0.1:9077/api/v1/health
+curl https://127.0.0.1:9077/api/v1/health
 ```
 
 The health check performs a **deep verification**:
@@ -1981,7 +2016,7 @@ Returns `503 Service Unavailable` with `{"status": "error", "service": "ai-memor
 ### Stats Endpoint
 
 ```bash
-curl http://127.0.0.1:9077/api/v1/stats
+curl https://127.0.0.1:9077/api/v1/stats
 ```
 
 Returns:
@@ -2032,7 +2067,7 @@ sudo journalctl -u ai-memory --since "1 hour ago"
 
 ```bash
 #!/bin/bash
-HEALTH=$(curl -sf http://127.0.0.1:9077/api/v1/health | jq -r '.status')
+HEALTH=$(curl -sf https://127.0.0.1:9077/api/v1/health | jq -r '.status')
 if [ "$HEALTH" != "ok" ]; then
     echo "ai-memory health check failed"
     systemctl restart ai-memory

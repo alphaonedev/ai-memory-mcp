@@ -211,20 +211,10 @@ fn is_truthy(v: &str) -> bool {
 /// occurrence, so this mirrors that precedence and fails closed on a
 /// malformed / absent query (returns `false`), never opening the control.
 fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
-    let Some((_, query)) = dsn.split_once('?') else {
-        return false;
-    };
-    // libpq uses the LAST occurrence of a repeated key — take it, so a
-    // trailing `&sslmode=require` cannot be masked by an earlier verify-full.
-    let mut last_sslmode: Option<&str> = None;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("sslmode") {
-                last_sslmode = Some(v.trim());
-            }
-        }
-    }
-    last_sslmode.is_some_and(|v| v.eq_ignore_ascii_case("verify-full"))
+    // #3705 — the parser is shared with the connect-funnel FLOOR
+    // (`store::postgres`) and doctor, so the posture check and the
+    // enforcement cannot disagree about what `verify-full` means.
+    crate::transit_encryption::dsn_pins_sslmode_verify_full(dsn)
 }
 
 /// The RESOLVED security-posture token, for the #2923 pins-row `actual`.
@@ -1703,14 +1693,28 @@ mod tests {
             std::env::set_var(crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV, "1");
         }
         let checks = evaluate(&AppConfig::default());
-        // #2477's KNOB is ALSO one of the 22 asi-hard pins, so BOTH
-        // the aggregate knobs row and the dedicated https-only row must
-        // go red — never silently absorbed into only one.
+        // #2477's KNOB is one of the asi-hard pins, so the aggregate knobs
+        // row goes red on a truthy value.
         let knobs_row = find(&checks, "asi-hard pinned knobs");
         assert!(!knobs_row.pass);
+        // #3705 — the hatch is a REMOVED downgrade path: it can no longer
+        // open plaintext peers (the https-only row stays green because
+        // `plaintext_peers_allowed()` is pinned to `false`), and a truthy
+        // value refuses boot outright, naming the variable.
         let https_row = find(&checks, crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV);
-        assert!(!https_row.pass);
         assert!(https_row.control.contains("https-only peers"));
+        assert!(
+            https_row.pass,
+            "the removed hatch cannot open plaintext peers"
+        );
+        let refusal = crate::transit_encryption::enforce_no_downgrade_paths()
+            .expect_err("a truthy AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS must refuse boot (#3705)")
+            .to_string();
+        assert!(
+            refusal.contains(crate::transit_encryption::ISSUE_TAG)
+                && refusal.contains(crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV),
+            "{refusal}"
+        );
     }
 
     // ------------------------------------------------------------------

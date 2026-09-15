@@ -5691,7 +5691,7 @@ mod tests {
 
     #[test]
     fn issue_811_load_active_keypair_for_mcp_picks_agent_specific_when_present() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let kp = crate::identity::keypair::generate("ai:alice").unwrap();
         crate::identity::keypair::save(&kp, dir.path()).unwrap();
         let loaded = super::load_active_keypair_for_mcp_in(dir.path(), Some("ai:alice"))
@@ -5710,7 +5710,7 @@ mod tests {
         // ever exists; the substrate-managed `daemon` key sat on disk
         // unused. This asserts the fallback so the persona pipeline
         // signs end-to-end even without a per-NHI keypair enrolled.
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let daemon_kp = crate::identity::keypair::generate("daemon").unwrap();
         crate::identity::keypair::save(&daemon_kp, dir.path()).unwrap();
         let loaded =
@@ -5725,7 +5725,7 @@ mod tests {
 
     #[test]
     fn issue_811_load_active_keypair_for_mcp_returns_none_when_neither_present() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let loaded = super::load_active_keypair_for_mcp_in(dir.path(), Some("ai:none"));
         assert!(
             loaded.is_none(),
@@ -5737,7 +5737,7 @@ mod tests {
     fn issue_811_load_active_keypair_for_mcp_falls_back_when_agent_id_unresolvable() {
         // `agent_id = None` simulates `resolve_agent_id` failing entirely;
         // daemon fallback must still engage.
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let daemon_kp = crate::identity::keypair::generate("daemon").unwrap();
         crate::identity::keypair::save(&daemon_kp, dir.path()).unwrap();
         let loaded = super::load_active_keypair_for_mcp_in(dir.path(), None)
@@ -14024,7 +14024,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("AI_MEMORY_KEY_DIR").ok();
-        let key_tmp = tempfile::TempDir::new().expect("key tempdir");
+        let key_tmp = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: lock acquired above; env writes serialised.
         unsafe {
             std::env::set_var("AI_MEMORY_KEY_DIR", key_tmp.path());
@@ -14123,7 +14123,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("AI_MEMORY_KEY_DIR").ok();
-        let key_tmp = tempfile::TempDir::new().expect("key tempdir");
+        let key_tmp = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: lock acquired above; env writes serialised.
         unsafe {
             std::env::set_var("AI_MEMORY_KEY_DIR", key_tmp.path());

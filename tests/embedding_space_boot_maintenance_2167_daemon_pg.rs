@@ -34,6 +34,8 @@
 use ai_memory::config::{AppConfig, EmbeddingsSection};
 use ai_memory::daemon_runtime::{ServeArgs, bootstrap_serve};
 
+mod common;
+
 fn pg_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .ok()
@@ -43,12 +45,13 @@ fn pg_url() -> Option<String> {
 /// A loopback `ServeArgs` pointed at the live postgres store. Loopback + no
 /// api_key boots with a WARN (the single-tenant dev convention pinned by
 /// `tests/v070_a1_authn.rs`), so bootstrap returns `Ok` without binding.
-fn serve_args(url: &str) -> ServeArgs {
+fn serve_args(url: &str, tls: &common::tls::TestTls) -> ServeArgs {
     ServeArgs {
         host: "127.0.0.1".to_string(),
         port: 0,
-        tls_cert: None,
-        tls_key: None,
+        // #3705 — bootstrap refuses a plaintext bind; a per-test leaf.
+        tls_cert: Some(tls.cert_path.clone()),
+        tls_key: Some(tls.key_path.clone()),
         mtls_allowlist: None,
         shutdown_grace_secs: 30,
         quorum_writes: 0,
@@ -102,8 +105,9 @@ async fn daemon_bootstrap_runs_pg_embedding_space_boot_maintenance_2179() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
+    let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
-    let args = serve_args(&url);
+    let args = serve_args(&url, &tls);
     let cfg = app_config_with_offline_api_embedder();
 
     let result = bootstrap_serve(&path, &args, &cfg).await;
@@ -144,12 +148,14 @@ async fn daemon_bootstrap_skips_pg_boot_maintenance_on_sqlite_backend() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
+    let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
     let args = ServeArgs {
         host: "127.0.0.1".to_string(),
         port: 0,
-        tls_cert: None,
-        tls_key: None,
+        // #3705 — bootstrap refuses a plaintext bind; a per-test leaf.
+        tls_cert: Some(tls.cert_path.clone()),
+        tls_key: Some(tls.key_path.clone()),
         mtls_allowlist: None,
         shutdown_grace_secs: 30,
         quorum_writes: 0,

@@ -589,7 +589,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 client.toolgroups.register(
     provider_id="model-context-protocol",
     toolgroup_id="mcp::memory",
-    mcp_endpoint={"uri": "http://localhost:9077/sse"}
+    mcp_endpoint={"uri": "https://localhost:9077/sse"}
 )
 ```
 
@@ -600,7 +600,7 @@ tool_groups:
   - toolgroup_id: mcp::memory
     provider_id: model-context-protocol
     mcp_endpoint:
-      uri: "http://localhost:9077/sse"
+      uri: "https://localhost:9077/sse"
 ```
 
 > **Notes:** Supports `${env.VAR_NAME}` interpolation in run.yaml. Transport is migrating from SSE to Streamable HTTP. See [Llama Stack Tools docs](https://llama-stack.readthedocs.io/en/latest/building_applications/tools.html).
@@ -648,8 +648,8 @@ args: ["--db", "/path/to/ai-memory.db", "mcp"]
 For HTTP-only clients, start the REST API:
 
 ```bash
-ai-memory serve
-# 100 REST route registrations (86 unique URL paths) at http://127.0.0.1:9077/api/v1/
+ai-memory serve   # TLS only (#3705): first boot generates <key_dir>/tls/ and renews it (#3709)
+# 100 REST route registrations (86 unique URL paths) at https://127.0.0.1:9077/api/v1/
 ```
 
 </details>
@@ -747,7 +747,7 @@ pip install ai-memory-mcp
 ```python
 from ai_memory import AiMemoryClient, require_profile
 
-with AiMemoryClient(base_url="http://127.0.0.1:9077", api_key="...") as client:
+with AiMemoryClient(base_url="https://127.0.0.1:9077", api_key="...") as client:
     require_profile(client, "graph")  # raises ProfileNotLoaded on miss
 ```
 
@@ -965,8 +965,8 @@ MCP is the recommended integration. Your AI gets **8 entries advertised by defau
 Start the HTTP server for REST API access. Any AI, script, or automation that can make HTTP calls can use this:
 
 ```bash
-ai-memory serve
-# 100 REST route registrations (86 unique URL paths) at http://127.0.0.1:9077/api/v1/
+ai-memory serve   # TLS only (#3705): first boot generates <key_dir>/tls/ and renews it (#3709)
+# 100 REST route registrations (86 unique URL paths) at https://127.0.0.1:9077/api/v1/
 ```
 
 ### CLI (Universal -- for scripting and direct use)

@@ -278,7 +278,7 @@ request_timeout_secs  = 60    # axum middleware ceiling (slowloris guard)
 llm_call_timeout_secs = 30    # wraps every spawn_blocking LLM call in tokio timeout
 
 # MCP-stdio → HTTP daemon write forwarder (federation fanout).
-mcp_federation_forward_url = "http://localhost:9077"
+mcp_federation_forward_url = "https://localhost:9077"
 ```
 
 | Field | Type | Default | Purpose |
@@ -402,12 +402,20 @@ max_decompressed_bytes = 16777216    # 16 MiB decompression-bomb cap (per fetch 
 `<redacted>` in `Debug`, and zeroized on drop. Keep the config file
 `chmod 600`. When unset, only per-subscription secrets apply.
 
-### `[subscriptions]` — webhook SSRF guard (H11, #628)
+### `[subscriptions]` — webhook SSRF guard (H11, #628) and private-PKI trust (#3705)
 
 ```toml
 [subscriptions]
 allow_loopback_webhooks = false   # default false closes an authenticated SSRF gadget
+ca_cert = "/etc/ai-memory/webhook-ca.pem"   # optional: PEM certificate/CA trusted IN ADDITION to the public roots
 ```
+
+`ca_cert` (v1.0.0 #3705) — webhook targets are `https://` only (plaintext
+is refused everywhere, loopback included), so a receiver behind a private
+PKI is reached by naming its certificate or CA here; the dispatcher trusts
+it in addition to the public roots (explicit trust, never a downgrade). It
+is installed once at boot; a configured file that cannot be read or parsed
+REFUSES boot — never silently ignored. Unset keeps the public roots only.
 
 Default-OFF rejects webhook URLs resolving to `127.0.0.0/8` /
 `localhost` / `::1` (which are reachable from the daemon and would

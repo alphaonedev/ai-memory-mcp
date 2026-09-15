@@ -244,7 +244,13 @@ fn doctor_remote_queries_capabilities_endpoint() {
     let serve = spawn_serve(&db);
 
     let assert = ai_memory(&db)
-        .args(["doctor", "--remote", &serve.base_url()])
+        .args([
+            "doctor",
+            "--remote",
+            &serve.base_url(),
+            "--ca-cert",
+            serve.tls.cert_path.to_str().unwrap(),
+        ])
         .assert();
     let output = assert.get_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -275,7 +281,14 @@ fn doctor_remote_queries_capabilities_endpoint() {
 
     // JSON mode parses cleanly.
     let json_out = ai_memory(&db)
-        .args(["doctor", "--remote", &serve.base_url(), "--json"])
+        .args([
+            "doctor",
+            "--remote",
+            &serve.base_url(),
+            "--ca-cert",
+            serve.tls.cert_path.to_str().unwrap(),
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()
@@ -380,11 +393,13 @@ fn doctor_sync_flags_stale_peer_and_unreadable_table_3655() {
 struct ServeChild {
     child: Option<Child>,
     port: u16,
+    /// #3705 — the leaf the daemon serves; clients trust exactly it.
+    tls: common::tls::TestTls,
 }
 
 impl ServeChild {
     fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        common::tls::TestTls::base_url(self.port)
     }
 }
 
@@ -443,6 +458,11 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
         .expect("db lives in a tempdir")
         .join("keys-3198");
     std::fs::create_dir_all(&keys).ok();
+    // #3705 — the daemon refuses every plaintext bind; mint a per-spawn
+    // leaf next to the db and verify against it from the probe client.
+    let tls = common::tls::TestTls::generate(
+        &db.parent().expect("db lives in a tempdir").join("tls-3705"),
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -459,6 +479,7 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
             "--port",
             &port_s,
         ])
+        .args(tls.serve_arg_strs())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn ai-memory serve");
@@ -487,11 +508,8 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
         stderr_buf.lock().unwrap().clone()
     };
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(READINESS_PROBE_TIMEOUT)
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let client = tls.client_with_timeout(READINESS_PROBE_TIMEOUT);
+    let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(resp) = client.get(&url).send()
@@ -500,6 +518,7 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
             return Ok(ServeChild {
                 child: Some(child),
                 port,
+                tls,
             });
         }
         if let Ok(Some(status)) = child.try_wait() {

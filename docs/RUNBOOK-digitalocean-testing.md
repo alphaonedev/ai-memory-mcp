@@ -244,7 +244,8 @@ wait
 # Migrate to Postgres
 ai-memory migrate \
   --from sqlite:///var/lib/ai-memory/ai-memory.db \
-  --to "postgres://ai_memory:${DB_PASS}@${DB_HOST}:25060/defaultdb?sslmode=require" \
+  --to "postgres://ai_memory:${DB_PASS}@${DB_HOST}:25060/defaultdb?sslmode=verify-full&sslrootcert=/etc/ai-memory/do-ca.crt" \
+  # (#3705: sslmode=require is refused at connect — download the managed-database CA from the DO console to /etc/ai-memory/do-ca.crt)
   --batch 500 --json > /tmp/migrate-report.json
 
 # Verify
