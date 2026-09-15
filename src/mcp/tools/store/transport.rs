@@ -44,20 +44,37 @@ pub(crate) fn forward_to_http(
     body: Option<&Value>,
     extra_headers: &[(&str, String)],
 ) -> Result<Value, String> {
+    // #3711 — the forward URL is operator config and may carry userinfo
+    // (`https://user:pw@host/…`); every rendering of it is the allowlist
+    // origin+path, and every reqwest failure is its transport CLASS, never
+    // the crate's Display (which repeats the full URL). The peer's response
+    // `text` is withheld from the caller below (#3698).
+    let target = crate::url_display::url_origin_and_path(url);
     // v1.0.0 #3709 — the bundled MCP → daemon client trusts the local CA
     // this installation wrote (zero-config TLS). Only the local CA: this is
     // the same-installation trust, never a peer's certificate. A CA file
     // that exists but does not parse is an error, not silently ignored.
     let mut builder =
         reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15));
-    if let Some(ca) = crate::tls_bootstrap::local_ca_certificate()
-        .map_err(|e| format!("federation_forward: local CA: {e}"))?
-    {
+    // The load error names the key directory on disk (an operator path):
+    // that belongs in the operator log, never in the MCP caller's error
+    // text (gate 7, #3688/7 — surfaced on the #3705+#3711 resolved tree).
+    if let Some(ca) = crate::tls_bootstrap::local_ca_certificate().map_err(|e| {
+        tracing::warn!(
+            target: "federation.forward",
+            error = %e,
+            "federation_forward: the local CA certificate could not be loaded"
+        );
+        String::from(
+            "federation_forward: local CA certificate could not be loaded (see the operator log)",
+        )
+    })? {
         builder = builder.add_root_certificate(ca);
     }
-    let client = builder
-        .build()
-        .map_err(|e| format!("federation_forward: build client: {e}"))?;
+    let client = builder.build().map_err(|e| {
+        let reason = crate::url_display::network_failure(&e);
+        format!("federation_forward: build client: {reason}")
+    })?;
     let mut req = client.request(method, url);
     for (k, v) in extra_headers {
         req = req.header(*k, v);
@@ -65,20 +82,50 @@ pub(crate) fn forward_to_http(
     if let Some(b) = body {
         req = req.json(b);
     }
-    let resp = req
-        .send()
-        .map_err(|e| format!("federation_forward: POST {url}: {e}"))?;
+    let resp = req.send().map_err(|e| {
+        let reason = crate::url_display::network_failure(&e);
+        format!("federation_forward: POST {target}: {reason}")
+    })?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| format!("federation_forward: read body from {url}: {e}"))?;
+    let text = resp.text().map_err(|e| {
+        let reason = crate::url_display::network_failure(&e);
+        format!("federation_forward: read body from {target}: {reason}")
+    })?;
+    // #3698 — the peer's response body is FOREIGN TEXT: whatever it replied
+    // with (an auth challenge, a stack trace, another tenant's data) must not
+    // be handed back to the MCP caller as error text. The caller gets the
+    // status and a static reason; the operator log gets the body's SIZE and
+    // digest, which is enough to correlate against the peer's own logs
+    // without repeating the bytes on this side of the boundary either.
     if !status.is_success() {
-        return Err(format!(
-            "federation_forward: {url} returned {status}: {text}"
-        ));
+        log_foreign_body("peer returned non-success", &target, status, &text);
+        return Err(format!("federation_forward: {target} returned {status}"));
     }
-    serde_json::from_str::<Value>(&text)
-        .map_err(|e| format!("federation_forward: parse body from {url}: {e} (raw: {text})"))
+    serde_json::from_str::<Value>(&text).map_err(|e| {
+        log_foreign_body("peer body is not JSON", &target, status, &text);
+        // Own-code construction: the error's CATEGORY and position, never
+        // its Display (which is position-only today, but the caller-facing
+        // string must not depend on that staying true).
+        let (category, line, column) = (e.classify(), e.line(), e.column());
+        format!(
+            "federation_forward: parse body from {target}: {category:?} at line {line} column {column}"
+        )
+    })
+}
+
+/// #3698 — operator-side record of a peer body that was withheld from the
+/// caller: length + SHA-256, never the bytes.
+fn log_foreign_body(what: &str, target: &str, status: reqwest::StatusCode, body: &str) {
+    use sha2::Digest as _;
+    let digest = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+    tracing::warn!(
+        target: "federation.forward",
+        %target,
+        %status,
+        body_bytes = body.len(),
+        body_sha256 = %&digest[..16],
+        "federation_forward: {what}; body withheld from the caller"
+    );
 }
 
 /// MCP `memory_store` → HTTP `POST {forward_url}/api/v1/memories`.
@@ -223,5 +270,103 @@ mod coordination_forward_tests {
         .expect_err("dead URL must error");
         assert!(err.contains("federation_forward"), "got: {err}");
         assert!(err.contains("/api/v1/signals"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod credential_to_sink_3711_tests {
+    use super::*;
+
+    /// #3711 — a forward URL carrying userinfo never reaches the MCP error
+    /// string: neither through the rendered target nor through reqwest's
+    /// URL-bearing Display. A closed loopback port makes the send fail.
+    #[test]
+    fn forward_to_http_error_renders_the_target_from_the_allowlist_3711() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let url =
+            format!("http://svc:s3cr3t-3711@127.0.0.1:{port}/api/v1/memories?api_key=q-t0ken-3711");
+        let err = forward_to_http(
+            reqwest::Method::POST,
+            &url,
+            Some(&serde_json::json!({})),
+            &[],
+        )
+        .expect_err("a closed port refuses the connection");
+        assert!(!err.contains("s3cr3t-3711"), "{err}");
+        assert!(!err.contains("q-t0ken-3711"), "{err}");
+        assert!(!err.contains("svc:"), "{err}");
+        assert!(
+            err.starts_with(&format!(
+                "federation_forward: POST http://127.0.0.1:{port}/api/v1/memories: "
+            )),
+            "{err}"
+        );
+    }
+
+    /// Serve exactly one HTTP response on a loopback listener and return
+    /// the URL to hit. The body is the foreign text under test.
+    fn one_shot_server(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = write!(
+                sock,
+                "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.flush();
+        });
+        format!("http://127.0.0.1:{port}/api/v1/memories")
+    }
+
+    /// #3698 — a non-2xx peer body never reaches the caller: only the
+    /// target and the status do.
+    #[test]
+    fn forward_to_http_non_success_withholds_the_peer_body_3698() {
+        let url = one_shot_server(
+            "502 Bad Gateway",
+            "upstream said: Bearer peer-t0ken-3698 for tenant acme",
+        );
+        let err = forward_to_http(
+            reqwest::Method::POST,
+            &url,
+            Some(&serde_json::json!({})),
+            &[],
+        )
+        .expect_err("502 is an error");
+        assert!(!err.contains("peer-t0ken-3698"), "{err}");
+        assert!(!err.contains("acme"), "{err}");
+        assert_eq!(
+            err,
+            format!("federation_forward: {url} returned 502 Bad Gateway")
+        );
+    }
+
+    /// #3698 — a 2xx body that is not JSON is reported by position, never
+    /// by content.
+    #[test]
+    fn forward_to_http_parse_failure_withholds_the_peer_body_3698() {
+        let url = one_shot_server("200 OK", "<html>session=peer-c00kie-3698</html>");
+        let err = forward_to_http(
+            reqwest::Method::POST,
+            &url,
+            Some(&serde_json::json!({})),
+            &[],
+        )
+        .expect_err("html is not JSON");
+        assert!(!err.contains("peer-c00kie-3698"), "{err}");
+        assert!(!err.contains("<html>"), "{err}");
+        assert!(
+            err.starts_with(&format!("federation_forward: parse body from {url}: ")),
+            "{err}"
+        );
     }
 }

@@ -338,9 +338,14 @@ async fn post_once_unobserved(
         // #2672 — a transport failure carries no HTTP status; class it
         // structurally as `network` rather than letting the reqwest error's
         // text (which can embed a port number like `:4001`) be substring-read
-        // as a `400`-class permanent failure.
+        // as a `400`-class permanent failure. #3710 — the reqwest error is
+        // CLASSIFIED at this origin (`timeout` / `connect` / `http_<n>` / …)
+        // and never rendered: its Display names the full request URL, and
+        // this string reaches 28 log lines and the stored
+        // `federation_push_dlq.last_error`.
         Err(e) => AckOutcome::Fail(
-            super::dlq_class::DlqErrorClass::Network.stamp(&crate::errors::msg::network(e)),
+            super::dlq_class::DlqErrorClass::Network
+                .stamp(&crate::url_display::network_failure(&e)),
         ),
     }
 }
@@ -2587,7 +2592,7 @@ pub async fn bulk_catchup_push(
                     )
                 }
                 Err(e) => (
-                    Err(crate::errors::msg::network(e)),
+                    Err(crate::url_display::network_failure(&e)),
                     Observation::Failure(FailureClass::Unreachable),
                 ),
             };

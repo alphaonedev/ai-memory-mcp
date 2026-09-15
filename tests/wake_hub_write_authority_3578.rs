@@ -520,10 +520,27 @@ fn exercise_mcp(
         body["delegation"] = json!(f.delegation());
         let err = mcp_store(conn, &body, forward)
             .expect_err("hub/delegate signature has no write authority");
-        assert!(
-            err.contains("attestation") || err.contains("signature"),
-            "{err}"
-        );
+        if forward.is_some() {
+            // #3698 (folded into #3711) — the daemon's refusal reaches the
+            // MCP caller as the HTTP status and a static reason only; the
+            // peer's response body, which is where `ATTESTATION_FAILED` and
+            // the attestation reason travelled, is foreign text and is
+            // withheld (size + digest go to the operator log). The refusal
+            // itself is pinned by the status and the untouched snapshot.
+            assert!(
+                err.contains("federation_forward") && err.contains("403"),
+                "the forwarded refusal names the status: {err}"
+            );
+            assert!(
+                !err.contains("attestation") && !err.contains("ATTESTATION_FAILED"),
+                "#3698: the peer's body must never reach the caller: {err}"
+            );
+        } else {
+            assert!(
+                err.contains("attestation") || err.contains("signature"),
+                "{err}"
+            );
+        }
         assert_eq!(rt.block_on(f.snapshot()), before);
     }
     for claim in [FORGED, A2A_HUB_SCOPE, "a2a-hub/join/v1"] {

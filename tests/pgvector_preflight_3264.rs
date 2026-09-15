@@ -309,12 +309,14 @@ fn doctor_reports_the_postgres_extensions_section_3264() {
     ] {
         assert!(facts.contains_key(key), "missing fact {key}: {section}");
     }
-    // The DSN reaches the report ONLY through the shared redactor, so a
-    // password can never land in a pasted doctor report (#1893 / #1579 A3).
+    // The DSN reaches the report ONLY through the allowlist renderer
+    // (scheme / host / port / database, #3711), so neither a userinfo
+    // password nor a query-string secret can land in a pasted doctor report
+    // (#1893 / #1579 A3).
     assert_eq!(
         facts.get("store").map(String::as_str),
-        Some(ai_memory::logging::redact_url_password(&url).as_str()),
-        "the store fact must be the redacted DSN, verbatim"
+        Some(ai_memory::url_display::store_url_display(&url).as_str()),
+        "the store fact must be the allowlist-rendered DSN, verbatim"
     );
 
     let installed = facts.get("pgvector_installed").map(String::as_str) == Some("true");
