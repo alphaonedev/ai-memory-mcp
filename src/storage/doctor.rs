@@ -606,9 +606,25 @@ pub fn doctor_sync_peer_watermarks(
                 continue;
             }
         };
-        // Redact at construction: a peer id of URL shape may carry
-        // credentials, and every fact / note downstream renders this string.
-        let peer_id = peer_id.map(|p| crate::logging::redact_url_password(&p));
+        // A peer id is POLYMORPHIC: usually a plain name (`peer-1`), sometimes
+        // a URL that may carry credentials. Every fact / note downstream renders
+        // this string, and it is part of the fact KEY.
+        //
+        // Only the URL-shaped case goes through the allowlist renderer.
+        // `redact_url_password` was too weak for it — it strips `user:pw@` and
+        // nothing else, so a token in the QUERY survived (REDACTION IS A WEAKER
+        // CONTROL THAN RENDERING FROM A CLOSED VOCABULARY, #3711) — but applying
+        // the renderer UNCONDITIONALLY is worse: `url_origin_and_path` sentinels
+        // anything it cannot parse (`unparseable()` -> `<scheme>://…`), which
+        // would erase the identity of every plain-named peer and collapse their
+        // distinct fact keys into one.
+        let peer_id = peer_id.map(|p| {
+            if p.contains("://") {
+                crate::url_display::url_origin_and_path(&p)
+            } else {
+                p
+            }
+        });
         let label = format!(
             "{}/{}",
             agent_id.as_deref().unwrap_or(SYNC_ROW_UNLABELLED),
