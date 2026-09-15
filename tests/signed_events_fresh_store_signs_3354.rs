@@ -278,6 +278,12 @@ fn ledger_writer_without_a_key_it_cannot_generate_refuses_3354() {
         err.contains(REMEDY),
         "the remedy names the real verb: {err}"
     );
+    // #3743 — and, before it, the thing that is actionable in THIS state:
+    // the verb fails the same way while the directory is unwritable.
+    assert!(
+        err.contains("make the key directory writable"),
+        "the remedy names the writable-directory fix: {err}"
+    );
     assert!(err.contains("refusing to start"), "{err}");
     assert!(!sb.keys.join(format!("{AGENT_ID}.priv")).exists());
     if sb.db.exists() {
