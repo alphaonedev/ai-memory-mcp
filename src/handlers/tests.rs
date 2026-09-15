@@ -8383,7 +8383,15 @@ async fn h8b_notify_happy_path_creates_message() {
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].title, "Hi bob");
+    // #3639 — the stored title is `<subject> [<id8>]` (unique per delivery,
+    // so a repeated subject can never overwrite); the subject itself is
+    // carried verbatim in metadata.
+    assert!(
+        rows[0].title.starts_with("Hi bob ["),
+        "stored title is the subject plus the row-id tag: {}",
+        rows[0].title
+    );
+    assert_eq!(rows[0].metadata["subject"], "Hi bob");
 }
 
 /// `target_agent_id` is a required field on `NotifyBody`. Omitting it
@@ -8609,6 +8617,8 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["count"], 1);
     let msg = &v["messages"][0];
+    // #3639 — a caller reads the SUBJECT in `title` (the unique stored form is
+    // internal): this assertion is the head's, unchanged.
     assert_eq!(msg["title"], "ping");
     // `from` is the resolved sender — `handle_notify` calls
     // `identity::resolve_agent_id(None, mcp_client)` which synthesizes the

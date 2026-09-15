@@ -244,6 +244,7 @@ pub async fn notify(
                 &namespace,
                 receipt_mem.map_or(&fallback_tier, |m| &m.tier),
                 receipt_mem.map_or(fallback_delivered_at.as_str(), |m| m.created_at.as_str()),
+                &body.title,
             )),
         )
             .into_response();

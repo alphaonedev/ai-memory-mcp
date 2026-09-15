@@ -31446,10 +31446,15 @@ impl MemoryStore for PostgresStore {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
+        // #3639 — unique stored title + verbatim subject (see
+        // `crate::inbox_stored_title`); inserted refuse-on-conflict below.
+        let row_id = uuid::Uuid::new_v4().to_string();
+        let stored_title = crate::inbox_stored_title(title, &row_id);
         let mut metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
             (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
+            (crate::INBOX_SUBJECT_META_KEY): title,
         });
         // #2122 — caller-supplied covenant clause-1 rationale (the payload
         // is verbatim caller content, so the substrate never stamps its own
@@ -31458,10 +31463,10 @@ impl MemoryStore for PostgresStore {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
         }
         let mem = Memory {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: row_id,
             tier: resolved_tier,
             namespace: crate::inbox_namespace(target_agent),
-            title: title.to_string(),
+            title: stored_title,
             content: payload.to_string(),
             tags: vec!["notify".to_string()],
             priority,
@@ -31489,7 +31494,12 @@ impl MemoryStore for PostgresStore {
             valid_from: None,
             valid_until: None,
         };
-        let new_id = self.store(ctx, &mem).await?;
+        // #3639 — refuse-on-conflict: a delivery never merges into a row that
+        // already holds the key (the minted title makes that unreachable; a
+        // collision is a visible error, never a silent overwrite).
+        let new_id = self
+            .store_with_embedding_no_overwrite(ctx, &mem, None, None)
+            .await?;
         // #3465 — the row is durable: wake the recipient on the
         // in-process bus. Only the WAKE half fires here; the webhook
         // half needs the `AppState`-scoped `_subscriptions/<agent>` SAL
