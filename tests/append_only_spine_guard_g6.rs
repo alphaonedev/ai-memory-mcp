@@ -138,16 +138,29 @@ fn is_fn_decl_line(line: &str) -> bool {
     before_ok && ident_ok && line.contains('(')
 }
 
+/// Does the line open a module-scope `static` / `const` item (`static NAME:`
+/// after optional `pub` qualifiers)? #3690 — the sqlite `memories` upsert
+/// statements are `LazyLock<String>` STATICS built once per process, so the
+/// SQL text no longer sits inside the fn that executes it. The static is an
+/// enclosing item in its own right: it carries the sanction marker for the
+/// statement it IS, and the fn that runs it carries its own.
+fn is_static_decl_line(line: &str) -> bool {
+    let t = line.trim_start();
+    let t = t.strip_prefix("pub ").unwrap_or(t);
+    let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
+    (t.starts_with("static ") || t.starts_with("const ")) && t.contains(':')
+}
+
 /// Walk backward from `hit_line` (0-based) to the nearest enclosing `fn`
-/// declaration, brace-count to its end, and report whether the
-/// `// APPEND-ONLY-SANCTIONED` marker appears anywhere in that fn's RAW
-/// span. Returns `false` when no enclosing fn is found (module-scope
-/// item — never sanctioned).
+/// declaration (or, since #3690, a module-scope `static` / `const` item),
+/// brace-count to its end, and report whether the
+/// `// APPEND-ONLY-SANCTIONED` marker appears anywhere in that item's RAW
+/// span. Returns `false` when no enclosing item is found (never sanctioned).
 fn enclosing_fn_has_marker(raw_lines: &[&str], hit_line: usize) -> bool {
     const MARKER: &str = "APPEND-ONLY-SANCTIONED";
     let mut fn_start = None;
     for i in (0..=hit_line.min(raw_lines.len().saturating_sub(1))).rev() {
-        if is_fn_decl_line(raw_lines[i]) {
+        if is_fn_decl_line(raw_lines[i]) || is_static_decl_line(raw_lines[i]) {
             fn_start = Some(i);
             break;
         }
@@ -340,6 +353,18 @@ fn column_takes_excluded_value(stmt: &str, column: &str) -> bool {
 ///    this SAME P4 invariant — it is no longer a carved-out separate class.
 ///
 /// Returns the byte offsets of each matching `ON CONFLICT`.
+/// #3690 (Unit 1) — every production `memories` upsert now spells its
+/// conflict target through the ONE const `models::TITLE_SLOT_CONFLICT_TARGET`
+/// (`ON CONFLICT (title, namespace) WHERE lifecycle_state <> 'tombstoned'`),
+/// interpolated into a `format!` statement as `{conflict_target}`. The
+/// literal `ON CONFLICT (title, namespace)` therefore no longer appears in a
+/// statement body, and a detector keyed on the literal alone went BLIND on
+/// all ten sites while the routing test stayed green — which is precisely
+/// what `p4_matches_the_real_insert_inner_and_pg_store_are_sanctioned`
+/// exists to catch. The placeholder IS the memories conflict target, so it
+/// is matched as one.
+const P4_CONFLICT_TARGET_PLACEHOLDER: &str = "{conflict_target}";
+
 fn p4_on_conflict_do_update_durable_text(stripped: &str) -> Vec<usize> {
     let mut hits = Vec::new();
     let hay = stripped;
@@ -362,15 +387,29 @@ fn p4_on_conflict_do_update_durable_text(stripped: &str) -> Vec<usize> {
         if target != "title,namespace" {
             continue;
         }
-        // Within this statement (to the Rust `;` that terminates the SQL
-        // string literal — SQL upsert bodies carry no `;`), is a durable-TEXT
-        // column UNCONDITIONALLY overwritten from `excluded.…`?
-        let stmt_end = rest.find(';').unwrap_or(rest.len());
-        if stmt_overwrites_durable_text_from_excluded(&rest[..stmt_end]) {
+        if p4_stmt_hits(rest) {
             hits.push(start);
         }
     }
+    // #3690 — the interpolated spelling of the same target.
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(P4_CONFLICT_TARGET_PLACEHOLDER) {
+        let start = from + rel;
+        from = start + P4_CONFLICT_TARGET_PLACEHOLDER.len();
+        if p4_stmt_hits(&hay[start..]) {
+            hits.push(start);
+        }
+    }
+    hits.sort_unstable();
     hits
+}
+
+/// Within this statement (to the Rust `;` that terminates the SQL string
+/// literal — SQL upsert bodies carry no `;`), is a durable-TEXT column
+/// UNCONDITIONALLY overwritten from `excluded.…`?
+fn p4_stmt_hits(rest: &str) -> bool {
+    let stmt_end = rest.find(';').unwrap_or(rest.len());
+    stmt_overwrites_durable_text_from_excluded(&rest[..stmt_end])
 }
 
 /// Brace-counted line spans (`[start, end]`, 0-based, inclusive) of every
@@ -665,6 +704,22 @@ fn p4_flags_federation_newer_wins_case_merge() {
         p4_on_conflict_do_update_durable_text(derived).is_empty(),
         "a newer-wins CASE on a derived column is out of the durable-text scope"
     );
+}
+
+#[test]
+fn p4_flags_the_interpolated_conflict_target_spelling_3690() {
+    // The Unit 1 shape: the target rides a `{conflict_target}` placeholder
+    // inside a `format!` statement. Same durable-text overwrite, same hit.
+    let interpolated = "INSERT INTO memories (id, title) VALUES (?1, ?2) \
+                        {conflict_target} DO UPDATE SET content = excluded.content;";
+    assert_eq!(
+        p4_on_conflict_do_update_durable_text(interpolated).len(),
+        1,
+        "P4 must see the `{{conflict_target}}` spelling of the memories upsert (#3690)"
+    );
+    // The placeholder with a self-preserving arm is still not flagged.
+    let keep = "{conflict_target} DO UPDATE SET content = memories.content;";
+    assert!(p4_on_conflict_do_update_durable_text(keep).is_empty());
 }
 
 #[test]
