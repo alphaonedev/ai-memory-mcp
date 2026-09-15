@@ -14248,6 +14248,74 @@ pub fn register_agent(
 
 /// List every registered agent. Rows are drawn from the `_agents` namespace
 /// and parsed out of each memory's metadata.
+/// #3372 — one agent row's `metadata` JSON → [`AgentRegistration`]. Shared
+/// by [`list_agents`] and the targeted [`get_agent`] so the two cannot drift.
+fn agent_registration_from_metadata(raw: &str) -> Result<AgentRegistration> {
+    let meta: serde_json::Value =
+        serde_json::from_str(raw).context("failed to parse agent metadata as JSON")?;
+    let agent_id = meta
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let agent_type = meta
+        .get(field_names::AGENT_TYPE)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let capabilities: Vec<String> = meta
+        .get(field_names::CAPABILITIES)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let registered_at = meta
+        .get(field_names::REGISTERED_AT)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let last_seen_at = meta
+        .get(field_names::LAST_SEEN_AT)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(AgentRegistration {
+        agent_id,
+        agent_type,
+        capabilities,
+        registered_at,
+        last_seen_at,
+    })
+}
+
+/// #3372 — the ONE live registration for `agent_id`, or `None`. A targeted
+/// lookup on the `(title, namespace)` key the registry already writes
+/// (`agent_registration_title`), with the same expiry predicate
+/// [`list_agents`] applies — never a scan of the `_agents` namespace.
+///
+/// # Errors
+/// The row's metadata is not valid JSON, or the query fails.
+pub fn get_agent(conn: &Connection, agent_id: &str) -> Result<Option<AgentRegistration>> {
+    use rusqlite::OptionalExtension;
+    let title = crate::models::agent_registration_title(agent_id);
+    let now = Utc::now().to_rfc3339();
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM memories
+             WHERE namespace = ?1 AND title = ?2
+               AND (expires_at IS NULL OR expires_at > ?3)",
+            params![AGENTS_NAMESPACE, &title, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    raw.as_deref()
+        .map(agent_registration_from_metadata)
+        .transpose()
+}
+
 pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
@@ -14262,45 +14330,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
 
     let mut agents = Vec::new();
     for r in rows {
-        let raw = r?;
-        let meta: serde_json::Value =
-            serde_json::from_str(&raw).context("failed to parse agent metadata as JSON")?;
-        let agent_id = meta
-            .get("agent_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let agent_type = meta
-            .get(field_names::AGENT_TYPE)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let capabilities: Vec<String> = meta
-            .get(field_names::CAPABILITIES)
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let registered_at = meta
-            .get(field_names::REGISTERED_AT)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let last_seen_at = meta
-            .get(field_names::LAST_SEEN_AT)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        agents.push(AgentRegistration {
-            agent_id,
-            agent_type,
-            capabilities,
-            registered_at,
-            last_seen_at,
-        });
+        agents.push(agent_registration_from_metadata(&r?)?);
     }
     Ok(agents)
 }
