@@ -79,7 +79,12 @@ fn run_bin(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (bool, String, St
 /// loopback discard port so the probe fails before any credential could be
 /// sent. The doctor's LLM section must still name `https://127.0.0.1:9`
 /// (the endpoint the operator needs) in BOTH renderings, and nothing else
-/// of the URL.
+/// of the URL — across the WHOLE sink: stdout, stderr and the `--json`
+/// document, including the connect-error `error` fact and the note.
+///
+/// The store is created first (`doctor` is read-only, #3434, and stops at
+/// the Storage section when the file does not exist) so the run REACHES the
+/// LLM section; a fixture that bails before the section proves nothing.
 #[test]
 fn doctor_llm_facts_render_the_base_url_from_the_allowlist_3667() {
     let dir = scratch("doctor-llm");
@@ -88,6 +93,21 @@ fn doctor_llm_facts_render_the_base_url_from_the_allowlist_3667() {
     let url = format!(
         "https://svc:{USERINFO_PW}@127.0.0.1:9/v1?%70assword={QUERY_PW}&password={SECOND_PW}"
     );
+    let (ok, out, err) = run_bin(
+        dir.path(),
+        &[
+            "--db",
+            db_s.as_str(),
+            "store",
+            "-T",
+            "seed",
+            "--content",
+            "one row so doctor has a store to read (#3667)",
+        ],
+        &[],
+    );
+    assert!(ok, "seed store must succeed:\n{out}\n{err}");
+    assert!(db.is_file(), "the seed created the store");
     for json in [false, true] {
         let mut args = vec!["--db", db_s.as_str(), "doctor"];
         if json {
@@ -106,6 +126,10 @@ fn doctor_llm_facts_render_the_base_url_from_the_allowlist_3667() {
             out.contains("LLM Reachability"),
             "doctor must reach the LLM section (json={json}):\n{out}\n{err}"
         );
+        // Absence over the WHOLE sink first — both credential shapes, both
+        // streams — so a leak fails as a leak, not as a rendering nit.
+        assert_clean(&out, "doctor stdout");
+        assert_clean(&err, "doctor stderr");
         assert!(
             out.contains("https://127.0.0.1:9"),
             "#3667: the LLM section must NAME the endpoint origin (json={json}):\n{out}"
@@ -114,13 +138,24 @@ fn doctor_llm_facts_render_the_base_url_from_the_allowlist_3667() {
             let parsed: serde_json::Value =
                 serde_json::from_str(&out).expect("doctor --json is one JSON document");
             let facts = parsed.to_string();
+            // The probe is `<base_url>/models` (the client's own join); a
+            // base URL carrying a query puts `/models` after it, so the
+            // allowlist rendering is the origin + the base path.
             assert!(
-                facts.contains("\"probe_url\"") && facts.contains("https://127.0.0.1:9/v1/models"),
+                facts.contains("\"probe_url\"") && facts.contains("https://127.0.0.1:9/v1"),
                 "#3667: probe_url renders origin + path only:\n{facts}"
             );
+            assert!(
+                facts.contains("\"error\"") && facts.contains("network"),
+                "the connect failure is reported as a classified fact:\n{facts}"
+            );
+            assert_clean(&facts, "doctor --json document");
+        } else {
+            assert!(
+                out.contains("error contacting https://127.0.0.1:9/v1"),
+                "the note names the probe from the allowlist:\n{out}"
+            );
         }
-        assert_clean(&out, "doctor stdout");
-        assert_clean(&err, "doctor stderr");
     }
 }
 

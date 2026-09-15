@@ -190,6 +190,25 @@ fn first_peer_id_collision<'a>(ids: &[(&'a str, &'a str)]) -> Option<(&'a str, &
     None
 }
 
+/// #3667 in the #3711 idiom — the peer-id collision refusal, rendered from
+/// the allowlist: each peer as its origin + path (the #3675 identity),
+/// never its userinfo or query. Pure so the RENDERING is pinned directly;
+/// the collision itself is a 128-bit SHA-256 prefix collision that no
+/// caller-reachable pair of URLs can drive (two spellings that normalise
+/// identically are caught by the duplicate check first), so there is no
+/// honest end-to-end pin for it — only for what it would say.
+#[must_use]
+fn peer_id_collision_refusal(first_raw: &str, duplicate_raw: &str, id: &str) -> String {
+    let first = crate::url_display::url_origin_and_path(first_raw);
+    let duplicate = crate::url_display::url_origin_and_path(duplicate_raw);
+    format!(
+        "federation peer-id collision in --quorum-peers: {first} and {duplicate} both \
+         derive the stable peer id {id} — refusing to start, because a shared routing \
+         key would merge the two peers' federation_push_dlq rows and deliver queued \
+         writes to the wrong host (#2442). Change one peer's URL spelling."
+    )
+}
+
 /// #2442 — true when `peer_id` carries the pre-#2442 POSITIONAL shape
 /// `peer-<decimal digits>`.
 ///
@@ -373,13 +392,9 @@ impl FederationConfig {
             .map(|(peer, raw)| (peer.id.as_str(), raw.as_str()))
             .collect();
         if let Some((first, duplicate, id)) = first_peer_id_collision(&id_url_pairs) {
-            let first = crate::url_display::url_origin_and_path(first);
-            let duplicate = crate::url_display::url_origin_and_path(duplicate);
             return Err(anyhow::anyhow!(
-                "federation peer-id collision in --quorum-peers: {first} and {duplicate} both \
-                 derive the stable peer id {id} — refusing to start, because a shared routing \
-                 key would merge the two peers' federation_push_dlq rows and deliver queued \
-                 writes to the wrong host (#2442). Change one peer's URL spelling."
+                "{}",
+                peer_id_collision_refusal(first, duplicate, id)
             ));
         }
 
@@ -629,32 +644,31 @@ mod build_pinning_tests {
     }
 
     /// #3667 — the peer-id collision refusal renders both spellings from
-    /// the allowlist. Two URLs that differ only by userinfo derive the same
-    /// stable id and collide; the refusal must name the origin + path and
-    /// neither password.
+    /// the allowlist. The collision cannot be driven through
+    /// `FederationConfig::build` (the stable id hashes the NORMALISED URL,
+    /// userinfo included, so two spellings either normalise identically —
+    /// and hit the duplicate check first — or hash to distinct 128-bit
+    /// prefixes); the renderer is therefore pinned directly.
     #[test]
     fn peer_id_collision_refusal_renders_the_peers_from_the_allowlist_3667() {
-        let a = "https://alice:FIRST_CANARY@peer.example:8443/m".to_string();
-        let b = "https://bob:SECOND_CANARY@peer.example:8443/m".to_string();
-        let err = match FederationConfig::build(
-            1,
-            &[a, b],
-            Duration::from_secs(1),
-            None,
-            None,
-            None,
-            "test-agent".into(),
-            None,
-        ) {
-            Ok(_) => panic!("colliding peer ids must fail before client construction"),
-            Err(err) => err,
-        };
-        let text = err.to_string();
+        let a = "https://alice:FIRST_CANARY@peer.example:8443/m?%70assword=Q1_CANARY";
+        let b = "https://bob:SECOND_CANARY@peer.example:8443/n?password=Q2_CANARY";
+        let text = super::peer_id_collision_refusal(a, b, "peer-0123456789abcdef");
+        assert!(text.contains("peer-id collision"), "{text}");
         assert!(
-            text.contains("https://peer.example:8443/m"),
-            "the refusal must NAME the peer's origin + path: {text}"
+            text.contains("https://peer.example:8443/m")
+                && text.contains("https://peer.example:8443/n"),
+            "the refusal must NAME each peer's origin + path: {text}"
         );
-        for leaked in ["FIRST_CANARY", "SECOND_CANARY", "alice", "bob"] {
+        for leaked in [
+            "FIRST_CANARY",
+            "SECOND_CANARY",
+            "Q1_CANARY",
+            "Q2_CANARY",
+            "alice",
+            "bob",
+            "assword=",
+        ] {
             assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
         }
     }
