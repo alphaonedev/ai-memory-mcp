@@ -115,9 +115,31 @@ sections.
 
 ### Sync
 
-- `peer_count` — distinct `(agent_id, peer_id)` rows in `sync_state`.
-- `max_skew_secs` — max `|last_seen_at - last_pulled_at|` across peers.
-  **Critical** when > 600s.
+- `probed_at` — the RFC 3339 instant every age below is measured against.
+- `peer_count` — physical rows in `sync_state` (valid + invalid);
+  `invalid_rows` — rows whose cursors are NULL or not RFC 3339, each named
+  as `peer::<agent>/<peer>::invalid = <column and reason>`. **Warning** when
+  > 0: an invalid row is neither healthy nor absent (#3655).
+- Per peer (`peer::<agent>/<peer>::…`, #3655):
+  - `observed_age_secs` — seconds since this node last observed the peer
+    (`last_pulled_at`, this node's clock). **Critical** when > 600s: the
+    peer is stale no matter what its data says. This is the case the old
+    `|last_seen_at - last_pulled_at|` skew could never see — two equal but
+    hours-old cursors reported as healthy.
+  - `data_age_secs` — seconds since the newest peer data seen
+    (`last_seen_at`, the peer's clock). Old is legitimate for a quiet peer.
+  - `pushed_age_secs` — seconds since the last local watermark the peer
+    accepted, or `never_pushed`.
+  - `clock_lead_secs` — signed `last_seen_at - last_pulled_at`. **Critical**
+    when it exceeds the sync daemon's pull-cursor future bound (300s): the
+    peer stamps data in this node's future, so its cursors will be refused.
+    Negative is the quiet-peer case and is not a finding.
+- `stale_peers`, `max_observed_age_secs`, `max_data_age_secs` — measured
+  maxima over valid rows; `max_skew_secs` (the largest `|clock_lead_secs|`)
+  is kept for existing consumers and no longer drives severity.
+- **Critical** with `sync_state = unreadable` and `sync_query_error` when the
+  table cannot be queried — peer health is unknown, which is not the same as
+  a single node (#3655).
 - `N/A` when no peers are registered (single-node deployment).
 
 ### Webhook
@@ -211,8 +233,8 @@ able to hang against a wedged hub.
 
 | Severity | Trigger |
 |----------|---------|
-| **Critical** | `dim_violations > 0`; pending action older than 24h; sync skew > 600s; HNSW evictions > 0; a live wake-hub socket that is not owner-only (#3471) |
-| **Warning**  | Capabilities v2 reports a silent-degrade flag (`recall_mode_active != hybrid` on a capable tier); subscription delivery success < 95% |
+| **Critical** | `dim_violations > 0`; pending action older than 24h; a sync peer not observed for > 600s, a peer clock leading this node beyond the 300s pull-cursor bound, or an unreadable `sync_state` (#3655); HNSW evictions > 0; a live wake-hub socket that is not owner-only (#3471) |
+| **Warning**  | Capabilities v2 reports a silent-degrade flag (`recall_mode_active != hybrid` on a capable tier); subscription delivery success < 95%; a `sync_state` row with an unreadable cursor (#3655) |
 | **Info**     | Anything else worth surfacing |
 | **N/A**      | The section can't be queried in this mode (raw SQL section in `--remote`, P2/P3-only fields on a pre-P2/P3 schema) |
 

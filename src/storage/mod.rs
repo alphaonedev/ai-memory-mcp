@@ -906,13 +906,14 @@ pub mod sqlite_integrity;
 // (M-NO-GLOB-REEXPORTS: explicit list, so any accidental visibility
 // widening or loss is visible in review).
 pub use doctor::{
-    CapabilityExpansionRow, ReflectionDepthRow, count_active_governance_rules,
-    count_pending_actions_by_status, count_subscriptions, doctor_dim_violations,
-    doctor_governance_coverage, doctor_governance_depth_distribution, doctor_max_sync_skew_secs,
+    CapabilityExpansionRow, ReflectionDepthRow, SyncPeerWatermark, SyncWatermarks,
+    count_active_governance_rules, count_pending_actions_by_status, count_subscriptions,
+    doctor_dim_violations, doctor_governance_coverage, doctor_governance_depth_distribution,
     doctor_oldest_pending_age_secs, doctor_reflection_depth_distribution,
     doctor_reflection_depth_exceeded_count, doctor_reflection_totals_by_namespace,
-    doctor_webhook_delivery_totals, is_namespace_standard, list_active_governance_policies,
-    list_capability_expansions, record_capability_expansion, sweep_pending_action_timeouts,
+    doctor_sync_peer_watermarks, doctor_webhook_delivery_totals, is_namespace_standard,
+    list_active_governance_policies, list_capability_expansions, record_capability_expansion,
+    sweep_pending_action_timeouts,
 };
 
 // Re-exports — every `pub` item that previously lived in `src/db.rs`
@@ -31360,10 +31361,57 @@ mod tests {
     }
 
     #[test]
-    fn doctor_max_sync_skew_secs_empty() {
+    fn doctor_sync_peer_watermarks_empty_3655() {
         let conn = test_db();
-        let skew = doctor_max_sync_skew_secs(&conn).unwrap();
-        assert_eq!(skew, None);
+        let w = doctor_sync_peer_watermarks(&conn, Utc::now()).unwrap();
+        assert_eq!(w, SyncWatermarks::default());
+        assert_eq!(w.row_count(), 0);
+    }
+
+    /// #3655 — a missing table is a FAILED probe, never `Ok(empty)`.
+    #[test]
+    fn doctor_sync_peer_watermarks_absent_table_is_err_3655() {
+        let conn = test_db();
+        conn.execute_batch("DROP TABLE sync_state;").unwrap();
+        assert!(doctor_sync_peer_watermarks(&conn, Utc::now()).is_err());
+    }
+
+    /// #3655 — malformed cursors are COUNTED and named, not skipped; equal
+    /// but old cursors age against `now`; a never-pushed peer stays `None`.
+    #[test]
+    fn doctor_sync_peer_watermarks_ages_rows_and_names_invalid_ones_3655() {
+        let conn = test_db();
+        let now = Utc::now();
+        let old = (now - chrono::Duration::seconds(2 * crate::SECS_PER_HOUR)).to_rfc3339();
+        let fresh = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let ahead = (now + chrono::Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339();
+        conn.execute_batch(&format!(
+            "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at) VALUES \
+             ('me', 'quiet-old', '{old}', '{old}', NULL), \
+             ('me', 'fresh', '{fresh}', '{fresh}', '{fresh}'), \
+             ('me', 'ahead', '{ahead}', '{fresh}', NULL), \
+             ('me', 'broken', 'not-a-timestamp', '{fresh}', NULL);"
+        ))
+        .unwrap();
+        let w = doctor_sync_peer_watermarks(&conn, now).unwrap();
+        assert_eq!(w.row_count(), 4);
+        assert_eq!(w.invalid.len(), 1);
+        assert_eq!(w.invalid[0].0, "me/broken");
+        assert!(w.invalid[0].1.contains("last_seen_at"), "{:?}", w.invalid);
+        let by_peer = |id: &str| w.peers.iter().find(|p| p.peer_id == id).unwrap();
+        let quiet = by_peer("quiet-old");
+        assert!(quiet.observed_age_secs >= 2 * crate::SECS_PER_HOUR);
+        assert_eq!(quiet.clock_lead_secs, 0, "equal cursors are not skew");
+        assert_eq!(quiet.pushed_age_secs, None);
+        let fresh_peer = by_peer("fresh");
+        assert!((30..60).contains(&fresh_peer.observed_age_secs));
+        assert!(fresh_peer.pushed_age_secs.is_some());
+        let ahead_peer = by_peer("ahead");
+        assert!(ahead_peer.clock_lead_secs >= crate::SECS_PER_HOUR - 1);
+        assert!(
+            ahead_peer.data_age_secs < 0,
+            "data stamped in the future ages negative"
+        );
     }
 
     // ---- v0.6.4-009 — capability-expansion audit log ----

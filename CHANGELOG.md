@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed response instead of being skipped silently. The `peer`
   label is the minted `peer-h1…` id; an id of any other shape is hashed
   first, since a legacy id can be a credential-bearing URL.
+### Fixed (#3655 — doctor no longer masks sync failures or stale peers)
+
+- **#3655 (observability, HIGH; audit #3645 F09) — the local doctor's `Sync`
+  section kept four states distinct and ages every cursor against the probe
+  time.** An unreadable `sync_state` is **Critical** (`sync_state =
+  unreadable` + `sync_query_error`), never `peer_count = 0` / "single-node";
+  rows with NULL or non-RFC 3339 cursors are counted and named
+  (`invalid_rows`, `peer::<agent>/<peer>::invalid`) as a **Warning** instead
+  of being skipped; each valid peer renders `observed_age_secs`
+  (`last_pulled_at` vs now — **Critical** > 600s, which catches cursors that
+  are equal but hours old), `data_age_secs`, `pushed_age_secs` /
+  `never_pushed`, and signed `clock_lead_secs` (**Critical** beyond the sync
+  daemon's 300s pull-cursor future bound; a quiet peer's negative lead is no
+  longer a false Critical). `probed_at`, `stale_peers`, `max_observed_age_secs`
+  and `max_data_age_secs` are new; `max_skew_secs` is kept for consumers but
+  no longer drives severity. `storage::doctor_max_sync_skew_secs` (which
+  turned a failed `prepare` into "not observed") is replaced by
+  `doctor_sync_peer_watermarks`, which propagates the failure.
 
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
