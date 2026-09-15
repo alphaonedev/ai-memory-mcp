@@ -402,19 +402,13 @@ async fn unstamped_row_is_allowed_through_sqlite_sal_gate() {
         .expect("an UNSTAMPED row must stay deletable at the SAL layer");
 }
 
-/// The inbox carve-out is wired per-verb exactly as HTTP/MCP wire it:
-/// DELETE passes `allow_inbox = true` (the addressed recipient may delete a
-/// message sent to it after consuming it) while UPDATE passes `false` (the
-/// recipient must NOT rewrite the sender's row).
-#[tokio::test]
-async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
-    let (_guard, db_path) = fresh_db_path();
-    let conn = db::open(&db_path).expect("db::open");
+/// A row Alice authored, addressed to Bob, in `namespace`.
+fn addressed_to_bob(namespace: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
-    let mem = Memory {
+    Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
-        namespace: "parity/ns7".to_string(),
+        namespace: namespace.to_string(),
         title: "inbox-msg".to_string(),
         content: "message addressed to bob".to_string(),
         priority: 5,
@@ -426,8 +420,28 @@ async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
         memory_kind: MemoryKind::Observation,
         version: 1,
         ..Memory::default()
-    };
-    let id = db::insert(&conn, &mem).expect("insert inbox row");
+    }
+}
+
+/// The inbox carve-out is wired per-verb exactly as HTTP/MCP wire it:
+/// DELETE admits the addressed recipient (the message is one sent to it, and
+/// it is ARCHIVED, not erased — #3730's retention policy) while UPDATE
+/// refuses it (the recipient must NOT rewrite the sender's row).
+///
+/// #3730 — until 2026-09-15 this fixture lived in `parity/ns7`, NOT an inbox
+/// namespace, and asserted the delete was ALLOWED. That was the #3730 hole
+/// written down as a requirement: a recipient could hard-delete any row
+/// merely addressed to it, and this cell defended the defect for as long as
+/// it existed (the full sweep on the fixed tree found it, 7/8). The row now
+/// lives where the carve-out is genuinely exercised, and
+/// `sqlite_sal_recipient_cannot_delete_a_non_inbox_row_addressed_to_it`
+/// below keeps the forbidden path forbidden.
+#[tokio::test]
+async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
+    let (_guard, db_path) = fresh_db_path();
+    let conn = db::open(&db_path).expect("db::open");
+    let ns = ai_memory::inbox_namespace("ai:bob");
+    let id = db::insert(&conn, &addressed_to_bob(&ns)).expect("insert inbox row");
     drop(conn);
 
     let store = SqliteStore::open(&db_path).expect("SqliteStore::open");
@@ -447,11 +461,57 @@ async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
         "expected PermissionDenied on update, got {err:?}"
     );
 
-    // DELETE: inbox carve-out ENABLED -> allowed.
+    // DELETE: inbox carve-out -> allowed, and the message is ARCHIVED.
     store
         .delete(&bob, &id)
         .await
-        .expect("the addressed recipient MAY delete a message sent to it");
+        .expect("the addressed recipient MAY delete a message sent to its inbox");
+    let admin = CallerContext::for_admin("ai:operator");
+    assert!(
+        store.get(&admin, &id).await.is_err(),
+        "drained from the live set"
+    );
+    let archived = store
+        .list_archived(Some(ns.as_str()), 50, 0)
+        .await
+        .expect("list_archived");
+    assert!(
+        archived
+            .iter()
+            .any(|m| m["id"].as_str() == Some(id.as_str())),
+        "#3730: an inbox drain archives, it does not erase: {archived:?}"
+    );
+}
+
+/// #3730 — the recipient's admission is DERIVED from the namespace: a row
+/// addressed to Bob that lives OUTSIDE an inbox namespace is not Bob's to
+/// delete. This is the cell the file lacked while the one above asserted
+/// the opposite; it is RED on `14748e776` (#3730-r4) and green on the fix.
+#[tokio::test]
+async fn sqlite_sal_recipient_cannot_delete_a_non_inbox_row_addressed_to_it() {
+    let (_guard, db_path) = fresh_db_path();
+    let conn = db::open(&db_path).expect("db::open");
+    let id = db::insert(&conn, &addressed_to_bob("parity/ns7")).expect("insert addressed row");
+    drop(conn);
+
+    let store = SqliteStore::open(&db_path).expect("SqliteStore::open");
+    let bob = CallerContext::for_agent("ai:bob");
+    let err = store
+        .delete(&bob, &id)
+        .await
+        .expect_err("a recipient must NOT delete a non-inbox row merely addressed to it");
+    assert!(
+        matches!(err, StoreError::PermissionDenied { .. }),
+        "expected PermissionDenied on delete, got {err:?}"
+    );
+    let admin = CallerContext::for_admin("ai:operator");
+    assert!(store.get(&admin, &id).await.is_ok(), "the row still exists");
+    // The owner still can.
+    let alice = CallerContext::for_agent("ai:alice");
+    store
+        .delete(&alice, &id)
+        .await
+        .expect("the owner deletes its own row");
 }
 
 // ─────────────────────────────────────────────────────────────────────
