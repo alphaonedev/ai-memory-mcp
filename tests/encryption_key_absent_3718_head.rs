@@ -8,7 +8,18 @@
 //! and without touching the row.
 //!
 //! FAILS ON THE PARENT: the read mints a new `<agent>.x25519.{priv,pub}`
-//! before failing ("no new file" is the assertion that catches it).
+//! before failing ("no new x25519 file" is the assertion that catches it).
+//!
+//! SCOPE (ruling on #3354 × #3718): the contract here is ENCRYPTION key
+//! material — a refused read or seal must not mint a fresh x25519 seal key
+//! that forks the key generation and strands every row sealed under the
+//! first one. The listing assertions therefore compare the x25519 material
+//! only (`seal_material`). #3354 mints the resolved agent's Ed25519 *audit
+//! signing* pair on the first ledger-writing verb so the refusal's audit row
+//! is signed rather than silently unsigned; that pair is a different key for
+//! a different purpose, cannot strand a sealed row, and is permitted here.
+//! The precise `!priv_path.exists()` assertion is the one that pins the
+//! forked generation and is deliberately untouched.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -16,6 +27,7 @@ use std::process::Command;
 
 const AGENT: &str = "agent-3718-head";
 const PRIV_SUFFIX: &str = ".x25519.priv";
+const PUB_SUFFIX: &str = ".x25519.pub";
 
 fn key_dir_0700(root: &Path) -> std::path::PathBuf {
     let dir = root.join("keys");
@@ -49,6 +61,18 @@ fn listing(dir: &Path) -> BTreeSet<String> {
     std::fs::read_dir(dir)
         .expect("list key dir")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The x25519 seal material under the key dir — the ONLY material #3718's
+/// contract is about. The Ed25519 audit signing pair #3354 mints on a
+/// ledger-writing verb (`<agent>.priv` / `<agent>.pub`, no `.x25519`
+/// infix) is deliberately excluded: it records the refusal, it does not
+/// seal anything, and it cannot fork the seal-key generation.
+fn seal_material(dir: &Path) -> BTreeSet<String> {
+    listing(dir)
+        .into_iter()
+        .filter(|name| name.ends_with(PRIV_SUFFIX) || name.ends_with(PUB_SUFFIX))
         .collect()
 }
 
@@ -92,7 +116,7 @@ fn cli_read_with_absent_key_creates_no_file_and_leaves_the_row_3718() {
     let (env_before, content_before) = raw_row(&db, &id);
     assert!(env_before.is_some(), "the row is sealed");
     std::fs::remove_file(&priv_path).expect("delete .priv");
-    let before = listing(&key_dir);
+    let before = seal_material(&key_dir);
 
     let out = cmd(root.path(), &db)
         .args(["get", &id])
@@ -109,9 +133,10 @@ fn cli_read_with_absent_key_creates_no_file_and_leaves_the_row_3718() {
     );
 
     assert_eq!(
-        listing(&key_dir),
+        seal_material(&key_dir),
         before,
-        "#3718: the read must not create key material under the key dir"
+        "#3718: the read must not create seal key material under the key dir \
+         (the Ed25519 audit signing pair #3354 may mint is not seal material)"
     );
     assert!(!priv_path.exists(), "no impostor .priv minted");
     assert_eq!(
@@ -163,7 +188,7 @@ fn cli_store_over_sealed_rows_with_wiped_key_dir_refuses_and_mints_nothing_3718(
             std::fs::remove_file(key_dir.join(name)).expect("wipe key material");
         }
     }
-    let before = listing(&key_dir);
+    let before = seal_material(&key_dir);
 
     let out = cmd(root.path(), &db)
         .args([
@@ -186,9 +211,12 @@ fn cli_store_over_sealed_rows_with_wiped_key_dir_refuses_and_mints_nothing_3718(
         "the caller never sees the key path: {err}"
     );
     assert_eq!(
-        listing(&key_dir),
+        seal_material(&key_dir),
         before,
-        "#3718: the refused seal minted no key material"
+        "#3718: the refused seal minted no seal key material (the Ed25519 \
+         audit signing pair #3354 mints to sign the refusal's ledger row is \
+         permitted: a different key for a different purpose, it cannot \
+         strand a sealed row)"
     );
     assert!(!priv_path.exists(), "no impostor .priv minted");
     let conn = rusqlite::Connection::open(&db).expect("open db");
