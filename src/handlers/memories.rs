@@ -1189,14 +1189,19 @@ pub async fn delete_memory(
         // PROMOTE (commit 49739bb46) and #938 / #940 / #939+#941.
         //
         // #954 (Track A QC sweep, 2026-05-20) — delegated to the
-        // canonical DRY helper. Inbox carve-out enabled: the
-        // recipient of an inbox message (`metadata.target_agent_id`)
-        // IS permitted to delete that message after consuming it,
-        // per the pre-#954 inline behaviour.
+        // canonical DRY helper. Inbox carve-out: the recipient of an
+        // inbox message (`metadata.target_agent_id`) IS permitted to
+        // delete that message after consuming it, per the pre-#954
+        // inline behaviour — #3730: ONLY for a row `inbox_delete_retains`
+        // archives on delete (the disposition below). The admission is
+        // derived from the namespace, never asserted beside it: a bare
+        // `true` let a non-owner erase any row addressed to it outside an
+        // inbox namespace (pinned by
+        // recipient_gate_derived_from_namespace_3730).
         if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
             &target,
             &agent_id,
-            true,
+            crate::visibility::inbox_delete_retains(&target.namespace),
             crate::identity::owner_stamp::MutationSite::sqlite(
                 crate::identity::owner_stamp::funnel::DELETE,
             ),

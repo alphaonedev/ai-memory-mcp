@@ -23766,21 +23766,37 @@ impl MemoryStore for PostgresStore {
         // `bypass_visibility`, tenant-facing handlers MUST NOT bypass).
         // #1628 refactor — shared caller-owns gate (byte-equal wire
         // errors; see assert_caller_owns_for_mutation).
-        // #3730 — PARITY with the sqlite adapter (store/sqlite.rs `delete`
-        // passes `allow_inbox = true`, "mirroring HTTP delete_memory / MCP
-        // memory_delete"): the ADDRESSED RECIPIENT may delete a message sent to
-        // it. The wrapper hard-coded `allow_inbox = false` for every action, so
-        // on postgres a recipient draining its inbox got PermissionDenied (403)
-        // while the same call succeeded on sqlite — measured by the
-        // bucket_b_inbox_recipient_delete_archives_and_drains_3730 pin. `update`
-        // keeps `false` on both backends.
+        // #3730 — the ADDRESSED RECIPIENT may delete a message sent to it
+        // (parity with the sqlite adapter; the wrapper hard-coded
+        // `allow_inbox = false` for every action, so a recipient draining its
+        // inbox on postgres got PermissionDenied while the same call succeeded
+        // on sqlite — measured by bucket_b_inbox_recipient_delete_archives_and_
+        // drains_3730). THE ADMISSION IS DERIVED FROM THE NAMESPACE, NOT
+        // ASSERTED BESIDE IT: the namespace is looked up FIRST, and the
+        // recipient is admitted ONLY when `inbox_delete_retains` says this row
+        // is archived on delete — the one path that keeps the record. A gate
+        // that ran before the lookup admitted the recipient for EVERY
+        // action-delete while the routing below retained only inbox rows, so a
+        // non-owner who merely had a row addressed to it could sever, tombstone
+        // and crypto-erase that row in any other namespace (reviewer probe,
+        // 2026-09-15; pinned by recipient_gate_derived_from_namespace_3730).
+        // `update` keeps `false` on both backends.
+        let namespace: Option<String> =
+            sqlx::query_scalar("SELECT namespace FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("delete namespace lookup", e))?;
+        let retains = namespace
+            .as_deref()
+            .is_some_and(crate::visibility::inbox_delete_retains);
         Self::assert_caller_owns_for_mutation_on(
             &self.pool,
             ctx,
             id,
             "delete",
             REASON_UNSTAMPED_TENANT_DELETE,
-            true,
+            retains,
         )
         .await?;
 
@@ -23788,14 +23804,8 @@ impl MemoryStore for PostgresStore {
         // adapter: an inbox message is ARCHIVED through the existing
         // `archive_by_ids` path (`archive_reason = "delete"`, same owner /
         // recipient predicate, same AGE unprojection), every other row is
-        // erased below.
-        let namespace: Option<String> =
-            sqlx::query_scalar("SELECT namespace FROM memories WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("delete namespace lookup", e))?;
-        if namespace.is_some_and(|ns| crate::visibility::inbox_delete_retains(&ns)) {
+        // erased below. Same predicate as the gate above, by construction.
+        if retains {
             let moved = self
                 .archive_by_ids(
                     ctx,
