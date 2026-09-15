@@ -103,12 +103,7 @@ fn main() -> Result<()> {
     // text OUT and must not be locked behind a config key the daemon refuses:
     // they load with the KNOWN keys applied (so `db` is the configured one,
     // never the relative default) and the refusal text as a loud WARN.
-    let is_egress_verb = matches!(
-        &cli.command,
-        daemon_runtime::Command::Backup(_)
-            | daemon_runtime::Command::Export(_)
-            | daemon_runtime::Command::ExportForensicBundle(_)
-    );
+    let is_egress_verb = is_egress_verb(&cli.command);
     let app_config = match if is_config_verb {
         Ok(config::AppConfig::default())
     } else if is_egress_verb && !config::skip_config() {
@@ -377,7 +372,13 @@ fn main() -> Result<()> {
     // files chained + signed by the daemon's Ed25519 key (when one is
     // enrolled). The sink is process-wide; failures here are logged
     // and swallowed so a missing key never blocks daemon startup.
-    init_forensic_audit(&app_config);
+    // #3354 — the WRITE PATH: a ledger-writing command gets its signing key
+    // ensured (generated when absent) before its first row, or does not start.
+    init_forensic_audit(
+        &app_config,
+        hosts_ledger_writers(&cli.command),
+        ledger_writer(&cli.command),
+    )?;
 
     // v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin HERE, in the same
     // SYNCHRONOUS pre-runtime phase as the posture enforcement above (the #1889
@@ -452,31 +453,178 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
-/// v0.7.0 #697 / v1.0.0 #3647 — best-effort init of the forensic log on the
-/// directory parallel to the flat audit log. The sink comes up on every boot,
-/// so its content-free integrity rows (the #1850 truncation watermark the
-/// `verify-audit-trail` lanes read, the #3199 unverified-restore record) are
-/// written by default, and so are the screened governance decision rows
-/// (Conductor ruling on #3647). A missing key gives unsigned rows and withheld
-/// commitments — never a fatal error.
-fn init_forensic_audit(app_config: &config::AppConfig) {
+/// v1.0.0 #3354 — the long-running entry points that HOST the ledger
+/// writers (the HTTP daemon, the MCP stdio server, the sync daemon) print
+/// the one-line unsigned-ledger warning at boot. One-shot verbs stay quiet
+/// on stderr (hook-driven `boot` / `capture-turn --quiet` pin an empty
+/// stderr; the diagnostics report the state instead): the caller-visible
+/// surfaces are `memory_session_start.signing`, capabilities
+/// `signing_key_installed`, `/health.signed_events_signing` and `doctor`.
+fn hosts_ledger_writers(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Serve(_)
+            | daemon_runtime::Command::Mcp { .. }
+            | daemon_runtime::Command::SyncDaemon(_)
+    )
+}
+
+/// #3715 / the #2445 disposition — the EGRESS verbs: the ones that take the
+/// operator's durable text OUT of the store. This is the single definition
+/// of that set; every posture that must not stand between an operator and
+/// their data (the refused-config loader, the #3354 unsigned-ledger refusal)
+/// reads it from here rather than re-listing the verbs.
+fn is_egress_verb(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Backup(_)
+            | daemon_runtime::Command::Export(_)
+            | daemon_runtime::Command::ExportForensicBundle(_)
+    )
+}
+
+/// #3354 review — the REMEDIATION verbs: the way BACK IN for a broken store.
+/// Same reasoning as [`is_egress_verb`] — a posture that diagnoses an
+/// unwritable key dir must not lock the operator out of restoring / migrating
+/// the data the posture exists to protect. `migrate` only exists under the
+/// `sal` feature, hence the split arm.
+fn is_remediation_verb(cmd: &daemon_runtime::Command) -> bool {
+    #[cfg(feature = "sal")]
+    if matches!(cmd, daemon_runtime::Command::Migrate(_)) {
+        return true;
+    }
+    matches!(cmd, daemon_runtime::Command::Restore(_))
+}
+
+/// v1.0.0 #3354 — every command that can append a `signed_events` row is a
+/// LEDGER WRITER and must not start without a signing key for the resolved
+/// agent id (the key is generated when absent; only a failed generation
+/// refuses). The read-only and remediation verbs are enumerated instead —
+/// they open no write funnel, so the posture can always be diagnosed and
+/// fixed from them. An unknown new verb is a writer by default: the safe
+/// side of the default is the signed one. `boot` stays a writer on purpose:
+/// it recovers memories into the store, so its rows must be signed like any
+/// other writer's.
+fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
+    !(is_egress_verb(cmd)
+        || is_remediation_verb(cmd)
+        || matches!(
+            cmd,
+            // Read-only and diagnostic verbs: no write funnel.
+            daemon_runtime::Command::Doctor(_)
+                | daemon_runtime::Command::Config(_)
+                | daemon_runtime::Command::Completions(_)
+                | daemon_runtime::Command::Man
+                | daemon_runtime::Command::Identity(_)
+                | daemon_runtime::Command::Keys(_)
+                | daemon_runtime::Command::Stats
+                | daemon_runtime::Command::Namespaces
+                | daemon_runtime::Command::Get(_)
+                | daemon_runtime::Command::List(_)
+                | daemon_runtime::Command::Recall(_)
+                | daemon_runtime::Command::Search(_)
+                | daemon_runtime::Command::Inbox(_)
+                | daemon_runtime::Command::Logs(_)
+                | daemon_runtime::Command::Features
+                | daemon_runtime::Command::VerifyReflectionChain(_)
+                | daemon_runtime::Command::VerifySignedEventsChain(_)
+                | daemon_runtime::Command::VerifyAuditTrail(_)
+                | daemon_runtime::Command::VerifyForensicBundle(_)
+        ))
+}
+
+/// v0.7.0 #697 / v1.0.0 #3647 / v1.0.0 #3354 — init of the forensic log on
+/// the directory parallel to the flat audit log, and of the database audit
+/// signers.
+///
+/// The ORDER of this function is semantic, not cosmetic (#3354 / #3647
+/// reconciliation):
+///
+/// 1. The resolved agent id's signing key is ENSURED first (#3354: loaded,
+///    or generated when absent). A ledger-writing verb whose key cannot be
+///    ensured REFUSES here, before any row can be written — that refusal
+///    is the diagnostic an operator sees, and nothing below runs.
+/// 2. The database audit signers are installed from the ENSURED key
+///    (#3647: they must not depend on the forensic directory resolving or
+///    being creatable). Installing them from a plain load, before the
+///    ensure step, would hand a fresh store an unsigned first row — the
+///    exact #3354 hole through a different door.
+/// 3. Only then is the forensic directory resolved; the sink comes up on
+///    every boot so its content-free integrity rows (the #1850 truncation
+///    watermark, the #3199 unverified-restore record) and the screened
+///    governance decision rows are written by default (Conductor ruling on
+///    #3647). The plaintext-retention diagnostic (#3647) fires here, after
+///    the refusal point: an operator whose writer cannot start sees the
+///    refusal, not a note about a sink that will not start.
+///
+/// A missing key on a NON-writer gives unsigned rows and withheld
+/// commitments — never a fatal error, but since #3354 never a SILENT one
+/// either: the hosts of the ledger writers print the one-line operator
+/// warning (with the provisioning command).
+fn init_forensic_audit(
+    app_config: &config::AppConfig,
+    hosts_writers: bool,
+    ledger_writer: bool,
+) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
+    // Resolve the daemon's agent_id with the standard precedence chain.
     let agent_id = ai_memory::identity::resolve_agent_id(None, None)
         .unwrap_or_else(|_| "ai-memory".to_string());
-    let signing_key =
-        ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None);
+    // #3354 — the WRITE PATH never accepts an unsigned append: the resolved
+    // id gets its key ENSURED here (loaded, or generated when absent — the
+    // `daemon` label has always been generated at boot; this closes the gap
+    // for a resolved id that differs from it). Only a ledger writer whose
+    // key cannot be ensured refuses to start; read-only verbs carry on so
+    // the posture can be diagnosed and fixed.
+    let (signing_key, generated) =
+        match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if ledger_writer {
+                    anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+                        &agent_id,
+                        &format!("{e:#}")
+                    ));
+                }
+                (None, None)
+            }
+        };
+    if let Some(ai_memory::identity::keypair::EnsureOutcome::Generated { pub_path }) = &generated {
+        let notice =
+            ai_memory::governance::audit::signing_key_generated_notice(&agent_id, pub_path);
+        if hosts_writers {
+            eprintln!("ai-memory: {notice}");
+        } else {
+            tracing::info!("{notice}");
+        }
+    }
+    if signing_key.is_none() {
+        if ledger_writer {
+            anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+                &agent_id,
+                "no key was loadable after the ensure step"
+            ));
+        }
+        if hosts_writers
+            && let Some(warning) = ai_memory::governance::audit::ledger_signing_status().warning
+        {
+            eprintln!("ai-memory: {warning}");
+        }
+    }
     // The database audit signers must not depend on the forensic directory
-    // resolving or being creatable (#3647).
+    // resolving or being creatable (#3647) — and they take the ENSURED key
+    // (#3354), never a plain load that could predate generation.
     ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
     let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
     let Some(dir) = log_path.parent() else {
         eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
-        return;
+        return Ok(());
     };
     warn_if_plaintext_retention_requested(&audit_cfg);
     if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
         eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
     }
+    Ok(())
 }
 
 /// #3647 — `audit.redact_content = false` asks for plaintext retention, which
@@ -499,6 +647,53 @@ fn warn_if_plaintext_retention_requested(audit_cfg: &config::AuditConfig) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3354 review — the egress verbs are ONE definition, and the unsigned-
+    /// ledger refusal reads it: an operator whose key dir is unwritable can
+    /// always get their data OUT (and back IN via the remediation verbs),
+    /// while the writers stay behind the posture.
+    #[test]
+    fn egress_and_remediation_verbs_are_never_ledger_writers_3354() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).expect("argv parses").command;
+        for argv in [
+            &["ai-memory", "backup", "--to", "/nonexistent"][..],
+            &["ai-memory", "export"][..],
+            &["ai-memory", "export-forensic-bundle", "--memory-id", "m1"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(is_egress_verb(&cmd), "{argv:?} is an egress verb");
+            assert!(
+                !ledger_writer(&cmd),
+                "{argv:?} is never refused for a key it cannot mint"
+            );
+        }
+        #[cfg(feature = "sal")]
+        let migrate = Some(&["ai-memory", "migrate", "--from", "a", "--to", "b"][..]);
+        #[cfg(not(feature = "sal"))]
+        let migrate: Option<&[&str]> = None;
+        let non_writers = [
+            &["ai-memory", "restore", "--from", "/nonexistent", "--latest"][..],
+            &["ai-memory", "stats"][..],
+        ];
+        for argv in non_writers.into_iter().chain(migrate) {
+            let cmd = parse(argv);
+            assert!(!is_egress_verb(&cmd), "{argv:?} is not egress");
+            assert!(
+                !ledger_writer(&cmd),
+                "{argv:?} is remediation / read-only, never refused"
+            );
+        }
+        for argv in [
+            &["ai-memory", "serve"][..],
+            &["ai-memory", "capture-turn"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(
+                ledger_writer(&cmd),
+                "{argv:?} writes the ledger and stays behind the posture"
+            );
+        }
+    }
 
     fn forensic_boot_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -527,7 +722,9 @@ mod tests {
             ..Default::default()
         };
         ai_memory::governance::audit::shutdown();
-        init_forensic_audit(&app_config);
+        // A non-writer, non-host boot (#3354 reconciliation): the key is
+        // ENSURED in the installed test key dir, so the sink signs.
+        init_forensic_audit(&app_config, false, false).expect("forensic boot");
         assert!(
             ai_memory::governance::audit::is_enabled(),
             "the sink comes up on every boot (#1850 watermark lane)"
@@ -712,7 +909,7 @@ mod tests {
 
         let app_config = config::AppConfig::default();
         // Must not panic and must leave the process bootable (unsigned).
-        init_forensic_audit(&app_config);
+        init_forensic_audit(&app_config, false, false).expect("init");
 
         match prev {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },
