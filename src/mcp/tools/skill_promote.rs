@@ -254,10 +254,9 @@ pub(crate) fn handle_skill_promote_for_caller(
         "allow",
         "skill_promote_from_reflection",
         "",
-        serde_json::json!({
-            (field_names::REFLECTION_ID): reflection_id,
-            (field_names::SKILL_NAME): skill_name,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident(field_names::REFLECTION_ID, reflection_id)
+            .ident(field_names::SKILL_NAME, skill_name),
     );
     let mut resources: Vec<(String, String, Vec<u8>)> = Vec::with_capacity(sources.len());
     for (i, m) in sources.iter().enumerate() {

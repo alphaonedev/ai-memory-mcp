@@ -164,7 +164,7 @@ pub async fn restore_archive(
         "allow",
         crate::governance::action_labels::ARCHIVE_RESTORE,
         "",
-        json!({ "id": &id }),
+        crate::governance::audit::ForensicPayload::new().ident("id", &id),
     );
     // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
     // route through the SAL `archive_restore` trait method. Federation
@@ -348,10 +348,12 @@ pub async fn purge_archive(
         "allow",
         crate::governance::action_labels::ARCHIVE_PURGE,
         "",
-        json!({
-            (field_names::OLDER_THAN_DAYS): q.older_than_days,
-            (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .opt_number(field_names::OLDER_THAN_DAYS, q.older_than_days)
+            .label(
+                field_names::OWNER_SCOPE,
+                if is_admin { "admin" } else { "caller" },
+            ),
     );
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
@@ -526,10 +528,10 @@ pub async fn archive_by_ids(
         "allow",
         "archive_by_ids",
         "",
-        json!({
-            "id_count": body.ids.len(),
-            "reason": &reason,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .number("id_count", body.ids.len())
+            // Caller-supplied free text: commitment only.
+            .commit("reason", &reason),
     );
     let mut archived: Vec<String> = Vec::new();
     let mut missing: Vec<String> = Vec::new();

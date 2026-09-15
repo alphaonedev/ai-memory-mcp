@@ -95,10 +95,9 @@ pub(super) fn handle_archive_purge(
                 "refuse",
                 crate::governance::action_labels::ARCHIVE_PURGE,
                 "",
-                json!({
-                    (field_names::OLDER_THAN_DAYS): older_than_days,
-                    "reason": e.to_string(),
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .opt_number(field_names::OLDER_THAN_DAYS, older_than_days)
+                    .commit("reason", &e.to_string()),
             );
             return Err(e.to_string());
         }
@@ -113,12 +112,14 @@ pub(super) fn handle_archive_purge(
             "refuse",
             crate::governance::action_labels::ARCHIVE_PURGE,
             "",
-            json!({
-                (field_names::OLDER_THAN_DAYS): older_than_days,
-                (field_names::OWNER_SCOPE): "admin",
-                "reason": "as_admin requires membership of the operator-configured \
-                           [admin].agent_ids allowlist",
-            }),
+            crate::governance::audit::ForensicPayload::new()
+                .opt_number(field_names::OLDER_THAN_DAYS, older_than_days)
+                .label(field_names::OWNER_SCOPE, "admin")
+                .label(
+                    "reason",
+                    "as_admin requires membership of the operator-configured \
+                     [admin].agent_ids allowlist",
+                ),
         );
         return Err(crate::governance::deny_message(
             "archive",
@@ -133,10 +134,12 @@ pub(super) fn handle_archive_purge(
         "allow",
         crate::governance::action_labels::ARCHIVE_PURGE,
         "",
-        json!({
-            (field_names::OLDER_THAN_DAYS): older_than_days,
-            (field_names::OWNER_SCOPE): if as_admin { "admin" } else { "caller" },
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .opt_number(field_names::OLDER_THAN_DAYS, older_than_days)
+            .label(
+                field_names::OWNER_SCOPE,
+                if as_admin { "admin" } else { "caller" },
+            ),
     );
 
     // v0.7.0 K9 — unified permission pipeline (archive-side).
@@ -285,7 +288,9 @@ fn gate_gc_sweep(
             "allow",
             crate::mcp::registry::tool_names::MEMORY_GC,
             "",
-            json!({ "archived": true, (field_names::OWNER_SCOPE): owner }),
+            crate::governance::audit::ForensicPayload::new()
+                .flag("archived", true)
+                .opt_ident(field_names::OWNER_SCOPE, owner),
         );
         return Ok(());
     }
@@ -310,7 +315,7 @@ fn gate_gc_sweep(
                 "refuse",
                 crate::mcp::registry::tool_names::MEMORY_GC,
                 ns,
-                json!({ "archived": archive }),
+                crate::governance::audit::ForensicPayload::new().flag("archived", archive),
             );
             return Err(crate::governance::deny_message(
                 "gc",
@@ -329,7 +334,10 @@ fn gate_gc_sweep(
         "allow",
         crate::mcp::registry::tool_names::MEMORY_GC,
         "",
-        json!({ "archived": archive, (field_names::OWNER_SCOPE): owner, "governed_namespaces_checked": namespaces.len() }),
+        crate::governance::audit::ForensicPayload::new()
+            .flag("archived", archive)
+            .opt_ident(field_names::OWNER_SCOPE, owner)
+            .number("governed_namespaces_checked", namespaces.len()),
     );
     Ok(())
 }

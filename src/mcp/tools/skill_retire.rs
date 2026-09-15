@@ -141,12 +141,11 @@ pub fn handle_skill_retire(
             "skill_retire"
         },
         "",
-        json!({
-            "namespace": namespace,
-            "name": name,
-            "skill_id": single_id,
-            "reason": reason,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("namespace", &namespace)
+            .ident("name", &name)
+            .opt_ident("skill_id", single_id.as_deref())
+            .opt_commit("reason", reason),
     );
 
     // All mutations inside ONE BEGIN IMMEDIATE tx (mirrors register_core):
@@ -364,12 +363,11 @@ pub fn handle_skill_delete(
         "allow",
         "skill_delete",
         "",
-        json!({
-            "namespace": namespace,
-            "name": name,
-            "skill_ids": skill_ids,
-            "force": force,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("namespace", &namespace)
+            .ident("name", &name)
+            .idents("skill_ids", &skill_ids)
+            .flag("force", force),
     );
 
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
