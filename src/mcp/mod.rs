@@ -276,9 +276,12 @@ fn resolve_mcp_agent_id(arguments: &Value, mcp_client: Option<&str>) -> String {
         .filter(|id| crate::validate::validate_agent_id(id).is_ok())
         .map(str::to_string)
         .unwrap_or_else(|| {
-            mcp_client
-                .map(|c| format!("ai:{c}"))
-                .unwrap_or_else(|| "anonymous".into())
+            // #3393 — the fallback is the canonical durable derivation
+            // (`ai:<sanitised client>@<hostname>`, env first), never a raw
+            // client-chosen string prefixed with `ai:`: the audit actor
+            // must be an identity, not a label the client typed.
+            crate::identity::resolve_agent_id(None, mcp_client)
+                .unwrap_or_else(|_| "anonymous".into())
         })
 }
 
@@ -293,14 +296,18 @@ fn observe_capture_nag(
     nag_watcher: Option<&crate::recover::nag::CaptureNagWatcher>,
     session_id: &str,
     tool_name: &str,
-    arguments: &Value,
     mcp_client: Option<&str>,
 ) -> crate::recover::nag::NagAction {
     use crate::recover::nag::{NagAction, classify_tool};
     let Some(watcher) = nag_watcher else {
         return NagAction::None;
     };
-    let agent_id = resolve_mcp_agent_id(arguments, mcp_client);
+    // #3393 — the streak is keyed on the CALLER (env identity, else the
+    // canonical `ai:<client>@<host>` derivation), never on a body-claimed
+    // `agent_id`: a store that claims some other id must not reset or fork
+    // the caller's own capture streak. Pre-#3393 the raw `ai:<client>`
+    // stamp happened to coincide with such claims, which is what hid this.
+    let agent_id = resolve_mcp_agent_id(&Value::Null, mcp_client);
     let action = watcher.observe_tool_call(&agent_id, session_id, classify_tool(tool_name));
     match action {
         NagAction::None => {}
@@ -2830,7 +2837,12 @@ fn dispatch_memory_quota_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 /// #1415 signed_events row carry the authenticated-via-MCP-
 /// handshake caller identity rather than a body-claimed one.
 fn dispatch_memory_capture_turn(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_capture_turn(ctx.conn, ctx.arguments, ctx.mcp_client)
+    // #3393 — the RESOLVED authority principal, never the raw handshake
+    // `clientInfo.name` (which the row could then never be read back by).
+    // The handler is `anyhow`-typed (QUAL-6); the legacy envelope's String
+    // error is rendered here, at the dispatch boundary, via `Display`.
+    capture_turn::handle_capture_turn_mcp(ctx.conn, ctx.arguments, ctx.authority)
+        .map_err(|e| e.to_string())
 }
 
 fn dispatch_memory_check_agent_action(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -3615,13 +3627,7 @@ fn handle_request(
             // consecutive-non-capture-tool-call threshold. Strictly
             // observation-only: the returned action does not gate or
             // alter the dispatch below.
-            observe_capture_nag(
-                nag_watcher,
-                nag_session_id,
-                tool_name,
-                arguments,
-                mcp_client,
-            );
+            observe_capture_nag(nag_watcher, nag_session_id, tool_name, mcp_client);
 
             // v1.0.0 #3549 — THE caller-authority chokepoint: resolve ONCE,
             // before the table lookup; an unusable configured identity refuses
@@ -7190,8 +7196,76 @@ mod tests {
     #[test]
     fn observe_capture_nag_none_watcher_is_noop() {
         use crate::recover::nag::NagAction;
-        let action = observe_capture_nag(None, "s", "memory_recall", &json!({}), Some("c"));
+        let action = observe_capture_nag(None, "s", "memory_recall", Some("c"));
         assert_eq!(action, NagAction::None);
+    }
+
+    /// #3393 (required before merge) — the streak is keyed on the CALLER,
+    /// never on a body-claimed `agent_id`: two observations for the same
+    /// caller whose bodies claim DIFFERENT agent ids land on one continuous
+    /// streak, and neither claimed id acquires a streak of its own. Drives
+    /// `observe_capture_nag` directly (its keying), then the real
+    /// `handle_request` path with the claims in the request body (the route
+    /// a client actually has), so the pin holds even if `mcp_client`
+    /// derivation or the null-body resolver changes later.
+    #[test]
+    fn observe_capture_nag_keys_on_caller_not_body_claimed_agent_id_3393() {
+        use crate::recover::nag::{CaptureNagWatcher, NagAction};
+        let _g = crate::audit::sink_test_lock();
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::audit::init_for_test(buf.clone());
+
+        let session = "sess-3393-keying";
+        let client = Some("keyingclient");
+        let caller = resolve_mcp_agent_id(&Value::Null, client);
+        assert!(
+            caller.starts_with("ai:"),
+            "the caller resolves canonically: {caller}"
+        );
+
+        // Direct: the function has no body parameter at all, so the two
+        // calls can only be keyed on the caller. Threshold 5 keeps every
+        // observation below the WARN line so the streak itself is what is
+        // asserted, not an emission.
+        let watcher = CaptureNagWatcher::new(5, 0);
+        let first = observe_capture_nag(Some(&watcher), session, "memory_recall", client);
+        let second = observe_capture_nag(Some(&watcher), session, "memory_recall", client);
+        assert_eq!((first, second), (NagAction::None, NagAction::None));
+        assert_eq!(
+            watcher.streak_for(&caller, session),
+            2,
+            "one continuous streak for the caller"
+        );
+
+        // Through the dispatcher: the same caller, two bodies that each claim
+        // a different agent id. The claims must neither reset nor fork the
+        // caller's streak.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let claim_a = make_tools_call(
+            "memory_recall",
+            json!({"query": "x", "agent_id": "ai:claimed-a"}),
+        );
+        let claim_b = make_tools_call(
+            "memory_recall",
+            json!({"query": "x", "agent_id": "ai:claimed-b"}),
+        );
+        invoke_handle_request_with_nag(&conn, &claim_a, &watcher, session, client);
+        invoke_handle_request_with_nag(&conn, &claim_b, &watcher, session, client);
+        assert_eq!(
+            watcher.streak_for(&caller, session),
+            4,
+            "the caller's streak is continuous across differently-claimed bodies"
+        );
+        assert_eq!(watcher.streak_for("ai:claimed-a", session), 0);
+        assert_eq!(watcher.streak_for("ai:claimed-b", session), 0);
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            0,
+            "below threshold: no emission; the keying alone is under test"
+        );
+
+        crate::audit::shutdown_for_test();
     }
 
     /// The dispatch loop honours the watcher: N consecutive non-capture
@@ -8492,15 +8566,33 @@ mod tests {
     /// #3204 item 4 — a reserved sentinel must not stamp the audit actor.
     #[test]
     fn resolve_mcp_agent_id_rejects_reserved_sentinel_3204() {
+        // #3393 — the synthesized fallback is the canonical durable
+        // `ai:<client>@<hostname>` derivation, never the raw `ai:<client>`.
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
         let forged = resolve_mcp_agent_id(&json!({"agent_id": "daemon"}), Some("claude"));
-        assert_eq!(
-            forged, "ai:claude",
-            "reserved sentinel must fall through to the synthesized client id"
+        assert!(
+            forged.starts_with("ai:claude@"),
+            "reserved sentinel must fall through to the synthesized client id: {forged}"
         );
+        crate::validate::validate_agent_id(&forged).expect("synthesized id is valid");
         let ok = resolve_mcp_agent_id(&json!({"agent_id": "alice"}), None);
         assert_eq!(ok, "alice");
         let newline = resolve_mcp_agent_id(&json!({"agent_id": "a\nb"}), Some("claude"));
-        assert_eq!(newline, "ai:claude");
+        assert!(newline.starts_with("ai:claude@"), "{newline}");
+    }
+
+    /// #3393 — a client name the id grammar forbids never reaches the audit
+    /// actor raw (control characters were a log-injection vector, #3204).
+    #[test]
+    fn resolve_mcp_agent_id_never_stamps_raw_client_name_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let actor = resolve_mcp_agent_id(&json!({}), Some("bad name\nwith newline"));
+        assert!(!actor.contains('\n') && !actor.contains(' '), "{actor}");
+        crate::validate::validate_agent_id(&actor).expect("actor is a valid id");
+        let env = crate::identity::test_agent_id::AgentIdOverride::set("ai:env-owner");
+        let actor = resolve_mcp_agent_id(&json!({}), Some("claude"));
+        assert_eq!(actor, "ai:env-owner", "the configured identity wins");
+        drop(env);
     }
 
     #[test]
