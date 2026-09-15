@@ -106,3 +106,14 @@ src/storage/schema_guard.rs	render_poisoned
 # EXECUTES no SQL. The B7 boundary heuristic mis-attributes the adjacent
 # module-scope WRITE_UPSERT_SQL const. Reviewed false positive.
 src/cost/mod.rs	usd_string
+# #3659 — webhook delivery-audit bookkeeping, moved out of src/subscriptions.rs
+# (a file this gate EXCLUDES as the dispatch / delivery-audit plane) into the
+# new src/subscriptions/audit_status.rs so its failures are observed, not
+# dropped. Same SQL, same class as before the move: `subscription_events.
+# delivery_status` and `subscriptions.dispatch_count/failure_count` are the
+# audit of a delivery that already happened, never record-plane content; a
+# record stop must not lose the record of what was dispatched. The gate now
+# walks the directory the file lives in, so the exemption the excluded parent
+# file carried implicitly is made explicit and reviewed here.
+src/subscriptions/audit_status.rs	persist_event_status
+src/subscriptions/audit_status.rs	persist_dispatch_counter
