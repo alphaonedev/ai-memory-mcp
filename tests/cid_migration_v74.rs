@@ -60,10 +60,11 @@ fn v74_columns_and_version_both_backends() {
         db::migrations::current_schema_version_for_tests(),
         "fresh open reaches the current schema tip"
     );
-    // Tip pin: the ladder head advanced to v98 (#3401 canonical inbox namespace).
+    // Tip pin: the ladder head advanced to v99 (#3655 durable per-peer contact;
+    // previously v98, #3401 canonical inbox namespace).
     // The v74 cid columns asserted below still exist; only the tip moved
     // (was v97 = #3464 append-only agent key ledger).
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 98);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 99);
     // The additive columns exist and are queryable.
     assert!(
         conn.prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")

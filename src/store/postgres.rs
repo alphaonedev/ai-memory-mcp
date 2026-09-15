@@ -1620,6 +1620,11 @@ const MIGRATION_V97_AGENT_PUBKEY_HISTORY: &str =
 const MIGRATION_V98_CANONICAL_INBOX_NAMESPACE: &str =
     include_str!("../../migrations/postgres/0055_v98_canonical_inbox_namespace.sql");
 
+/// v99 (#3655): durable per-peer contact mirror (parity twin of the sqlite
+/// `sync_peer_contact` table; the sync daemon itself is sqlite-bound).
+const MIGRATION_V99_SYNC_PEER_CONTACT: &str =
+    include_str!("../../migrations/postgres/0056_v99_sync_peer_contact.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2010,7 +2015,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 98;
+const CURRENT_SCHEMA_VERSION: i32 = 99;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4132,8 +4137,11 @@ impl PostgresStore {
         if current_version < 97 {
             self.migrate_v97().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 98 {
             self.migrate_v98().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v99().await?;
         }
 
         Ok(())
@@ -7301,6 +7309,33 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v98 applied (#3401: `_messages/<agent>` rows aliased \
              to canonical `_inbox/<agent>` in live and archived storage)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #3655 — schema v99: the `sync_peer_contact` parity mirror
+    /// (durable per-peer contact, stored apart from the data watermark). The
+    /// sync daemon and its `sync_state` live on the sqlite file, so this
+    /// table holds no rows on a postgres deployment; it exists so the two
+    /// ladders stay at schema parity. CURRENT_SCHEMA_VERSION stays pinned in
+    /// lockstep.
+    async fn migrate_v99(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v99 sync-peer-contact migration tx", e))?;
+        sqlx::raw_sql(MIGRATION_V99_SYNC_PEER_CONTACT)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v99 sync-peer-contact migration", e))?;
+        record_schema_version(&mut tx, 99).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v99 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v99 applied (#3655: sync_peer_contact parity mirror)"
         );
         Ok(())
     }

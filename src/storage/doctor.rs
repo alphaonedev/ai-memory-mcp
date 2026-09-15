@@ -417,15 +417,241 @@ pub fn doctor_webhook_delivery_totals(conn: &Connection) -> Result<(u64, u64)> {
     ))
 }
 
-/// Maximum sync-clock skew in seconds across the `sync_state` table —
-/// the largest gap between `last_pulled_at` (when this peer last heard
-/// from a peer) and `last_seen_at` (the peer's own `updated_at` advance).
-/// Returns `Ok(None)` when `sync_state` is empty or the columns are
-/// missing on a pre-T3 schema.
+/// v1.0.0 #3655 — one `sync_state` row aged against the probe time, joined
+/// with the peer's durable CONTACT stamp (`sync_peer_contact`, v99).
+///
+/// The cursors mean different things, and the doctor renders each against
+/// `now` rather than against each other:
+/// - `contact_age_secs` — seconds since the peer last ANSWERED a pull
+///   (`sync_peer_contact.last_contact_at`, this node's clock), stamped on
+///   every answered pull — empty window included. `None` = no contact has
+///   been recorded for this row, which is reported as unknown, never as 0.
+///   This is the reachability signal (review rework: `last_pulled_at` is a
+///   DATA watermark stamp, not a contact time).
+/// - `catchup_interval_secs` — the cadence of the loop that made that
+///   contact, so the reachability window is the same one the live daemon
+///   uses (#3654: stale after `REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS`
+///   cadences). `None` = the writer did not know its cadence.
+/// - `advanced_age_secs` — seconds since the data watermark last ADVANCED
+///   (`last_pulled_at`, this node's clock). Old is legitimate for a quiet
+///   peer; it is NOT a liveness signal. `None` = this peer has never
+///   delivered data (it has only ever answered empty windows): there is no
+///   `sync_state` row, and that is reported as never-pulled, not as 0.
+/// - `data_age_secs` — seconds since the newest peer data this node has seen
+///   (`last_seen_at`, the peer's own `updated_at`, i.e. the PEER's clock).
+///   `None` for the same reason.
+/// - `pushed_age_secs` — seconds since the last local watermark the peer
+///   accepted (`last_pushed_at`); `None` when this node never pushed.
+/// - `clock_lead_secs` — signed `last_seen_at - last_pulled_at`. Positive
+///   means the peer stamped data in this node's future: a clock disagreement,
+///   which the pre-#3655 probe folded into an unsigned "skew" together with
+///   the harmless quiet-peer case. `None` without a data watermark.
+///
+/// Rows are enumerated from the UNION of `sync_state` and
+/// `sync_peer_contact` (v3 review): contact is the more fundamental fact — a
+/// peer can be contacted without ever delivering data, never the reverse —
+/// so a peer that has only ever answered empty windows is visible here.
+/// `peer_id` is REDACTED at construction (`logging::redact_url_password`):
+/// a legacy peer id may be a URL and a URL may embed credentials, and this
+/// struct feeds every doctor fact and note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncPeerWatermark {
+    pub agent_id: String,
+    pub peer_id: String,
+    pub contact_age_secs: Option<i64>,
+    pub catchup_interval_secs: Option<u64>,
+    pub advanced_age_secs: Option<i64>,
+    pub data_age_secs: Option<i64>,
+    pub pushed_age_secs: Option<i64>,
+    pub clock_lead_secs: Option<i64>,
+}
+
+/// v1.0.0 #3655 — every `sync_state` row, split into the rows whose
+/// cursors parsed and the rows that did not.
+///
+/// `invalid` carries `(row label, reason)`; an invalid row is neither
+/// healthy nor absent, and the doctor renders it as its own finding.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncWatermarks {
+    pub peers: Vec<SyncPeerWatermark>,
+    pub invalid: Vec<(String, String)>,
+}
+
+impl SyncWatermarks {
+    /// Physical rows in `sync_state` — valid and invalid together.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.peers.len().saturating_add(self.invalid.len())
+    }
+}
+
+/// Label an unparsable row without a `(agent_id, peer_id)` of its own.
+const SYNC_ROW_UNLABELLED: &str = "?";
+
+/// Parse one RFC 3339 cursor into "seconds before `now`", naming the
+/// column in the error so an operator knows which cursor to repair.
+fn cursor_age_secs(
+    now: chrono::DateTime<Utc>,
+    column: &str,
+    value: Option<&str>,
+) -> std::result::Result<i64, String> {
+    let raw = value.ok_or_else(|| format!("{column} is NULL"))?;
+    let stamp = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| format!("{column} is not RFC 3339 ({e}): {raw:?}"))?;
+    Ok(now
+        .signed_duration_since(stamp.with_timezone(&Utc))
+        .num_seconds())
+}
+
+/// v1.0.0 #3655 — read every `sync_state` row and age its cursors against
+/// `now`.
+///
+/// Replaces the pre-#3655 `doctor_max_sync_skew_secs`, which turned a
+/// failed `prepare` into `Ok(None)` ("not observed"), silently skipped rows
+/// whose timestamps did not parse, and compared `last_seen_at` to
+/// `last_pulled_at` instead of either to the clock — so a mesh whose every
+/// cursor was equal but hours old reported as healthy, and a missing table
+/// reported as a single node.
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures.
+/// Propagates the `prepare` / `query` failure: an unreadable `sync_state`
+/// (absent table, wrong shape, I/O fault) is a failed probe, and the caller
+/// must render it as one — never as "no peers".
+pub fn doctor_sync_peer_watermarks(
+    conn: &Connection,
+    now: chrono::DateTime<Utc>,
+) -> Result<SyncWatermarks> {
+    // #3655 (review rework) — contact lives in its own table (v99). A database
+    // this doctor opened is migrated, so the table exists; a read-only or
+    // foreign file may predate it, and then contact is UNKNOWN for every row
+    // (reported as such), not a query failure that hides the cursors.
+    let contact_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
+         AND name = 'sync_peer_contact')",
+        [],
+        |r| r.get(0),
+    )?;
+    // v3 review — enumerate the UNION of both tables so a peer that has only
+    // ever answered EMPTY windows (a contact row, no `sync_state` row) is
+    // visible: contact without data is normal; data without contact is not
+    // possible.
+    let sql = if contact_table {
+        "SELECT k.agent_id, k.peer_id, s.last_seen_at, s.last_pulled_at, s.last_pushed_at, \
+                c.last_contact_at, c.catchup_interval_secs \
+         FROM (SELECT agent_id, peer_id FROM sync_state \
+               UNION SELECT agent_id, peer_id FROM sync_peer_contact) k \
+         LEFT JOIN sync_state s ON s.agent_id = k.agent_id AND s.peer_id = k.peer_id \
+         LEFT JOIN sync_peer_contact c ON c.agent_id = k.agent_id AND c.peer_id = k.peer_id \
+         ORDER BY k.agent_id, k.peer_id"
+    } else {
+        "SELECT agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at, \
+                NULL, NULL \
+         FROM sync_state ORDER BY agent_id, peer_id"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+        ))
+    })?;
+    let mut out = SyncWatermarks::default();
+    for row in rows {
+        let (agent_id, peer_id, seen, pulled, pushed, contact, cadence) = match row {
+            Ok(r) => r,
+            Err(e) => {
+                // A row the driver could not decode is an invalid row, not a
+                // skipped one: it is counted and named.
+                out.invalid.push((
+                    SYNC_ROW_UNLABELLED.to_string(),
+                    format!("row unreadable: {e}"),
+                ));
+                continue;
+            }
+        };
+        // Redact at construction: a peer id of URL shape may carry
+        // credentials, and every fact / note downstream renders this string.
+        let peer_id = peer_id.map(|p| crate::logging::redact_url_password(&p));
+        let label = format!(
+            "{}/{}",
+            agent_id.as_deref().unwrap_or(SYNC_ROW_UNLABELLED),
+            peer_id.as_deref().unwrap_or(SYNC_ROW_UNLABELLED)
+        );
+        // `sync_state` columns are NOT NULL, so a NULL here means the row is
+        // ABSENT (contact-only peer): never pulled, which is not an error.
+        let advanced = match pulled.as_deref() {
+            None => Ok(None),
+            Some(p) => cursor_age_secs(now, "last_pulled_at", Some(p)).map(Some),
+        };
+        let data = match seen.as_deref() {
+            None => Ok(None),
+            Some(s) => cursor_age_secs(now, "last_seen_at", Some(s)).map(Some),
+        };
+        let pushed_age = match pushed.as_deref() {
+            None => Ok(None),
+            Some(p) => cursor_age_secs(now, "last_pushed_at", Some(p)).map(Some),
+        };
+        let contact_age = match contact.as_deref() {
+            None => Ok(None),
+            Some(c) => cursor_age_secs(now, "last_contact_at", Some(c)).map(Some),
+        };
+        // A negative cadence cannot have been written by this crate; treat it
+        // as unknown rather than as a window of zero.
+        let catchup_interval_secs = cadence.and_then(|c| u64::try_from(c).ok());
+        match (advanced, data, pushed_age, contact_age, agent_id, peer_id) {
+            (
+                Ok(advanced_age_secs),
+                Ok(data_age_secs),
+                Ok(pushed_age_secs),
+                Ok(contact_age_secs),
+                Some(a),
+                Some(p),
+            ) => {
+                out.peers.push(SyncPeerWatermark {
+                    agent_id: a,
+                    peer_id: p,
+                    contact_age_secs,
+                    catchup_interval_secs,
+                    advanced_age_secs,
+                    data_age_secs,
+                    pushed_age_secs,
+                    // seen - pulled == (now - pulled) - (now - seen); only
+                    // meaningful when both cursors exist.
+                    clock_lead_secs: match (advanced_age_secs, data_age_secs) {
+                        (Some(adv), Some(dat)) => Some(adv.saturating_sub(dat)),
+                        _ => None,
+                    },
+                });
+            }
+            (advanced, data, pushed_age, contact_age, _, _) => {
+                let reason = [
+                    advanced.err(),
+                    data.err(),
+                    pushed_age.err(),
+                    contact_age.err(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+                let reason = if reason.is_empty() {
+                    "agent_id or peer_id is NULL".to_string()
+                } else {
+                    reason
+                };
+                out.invalid.push((label, reason));
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------
 // v0.6.4-009 — capability-expansion audit log
 // ---------------------------------------------------------------------
@@ -522,31 +748,6 @@ pub fn list_capability_expansions(
         let rows = stmt.query_map(rusqlite::params![n], map_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
-}
-
-pub fn doctor_max_sync_skew_secs(conn: &Connection) -> Result<Option<i64>> {
-    let mut stmt = match conn.prepare(
-        "SELECT last_seen_at, last_pulled_at FROM sync_state WHERE last_pulled_at IS NOT NULL",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
-    };
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    let mut max_skew: Option<i64> = None;
-    for row in rows {
-        let Ok((seen, pulled)) = row else { continue };
-        let Ok(s) = chrono::DateTime::parse_from_rfc3339(&seen) else {
-            continue;
-        };
-        let Ok(p) = chrono::DateTime::parse_from_rfc3339(&pulled) else {
-            continue;
-        };
-        let skew = (s.with_timezone(&Utc) - p.with_timezone(&Utc))
-            .num_seconds()
-            .abs();
-        max_skew = Some(max_skew.map_or(skew, |m| m.max(skew)));
-    }
-    Ok(max_skew)
 }
 
 // ---------------------------------------------------------------------------

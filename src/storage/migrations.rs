@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 98).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 99).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -992,7 +992,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// for schema reporting and compatibility checks. Settled ladder arms still
 /// gate on their own literal rung so adding v98 cannot make a v96 database
 /// skip v97.
-const CURRENT_SCHEMA_VERSION: i64 = 98;
+const CURRENT_SCHEMA_VERSION: i64 = 99;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1802,6 +1802,24 @@ fn migrate_v98(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_V98_SQLITE)?;
     conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
     conn.execute("INSERT INTO schema_version (version) VALUES (98)", [])?;
+    Ok(())
+}
+
+// v99 (#3655): durable per-peer CONTACT, stored apart from the data
+// watermark. `sync_state.last_pulled_at` moves only when a pull advanced the
+// watermark; `sync_peer_contact.last_contact_at` moves on every answered
+// pull, empty window included, together with the catch-up cadence so the
+// offline doctor applies the same reachability window as the live daemon.
+// Additive `CREATE TABLE IF NOT EXISTS`, idempotent, reversible. The
+// postgres twin is `PostgresStore::migrate_v99` (a parity mirror of the
+// table; the sync daemon and its `sync_state` live on the sqlite file).
+const MIGRATION_V99_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0083_v99_sync_peer_contact.sql");
+
+fn migrate_v99(conn: &Connection) -> Result<()> {
+    conn.execute_batch(MIGRATION_V99_SQLITE)?;
+    conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
+    conn.execute("INSERT INTO schema_version (version) VALUES (99)", [])?;
     Ok(())
 }
 
@@ -4492,9 +4510,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V97_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 98 {
             // v98 (#3401): alias legacy inbox rows without rewriting signed data.
             migrate_v98(conn)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v99 (#3655): durable per-peer contact, apart from the data watermark.
+            migrate_v99(conn)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
@@ -7279,6 +7302,8 @@ mod tests {
         let archives =
             crate::storage::list_archived(&conn, Some("_inbox/ai:carol"), 10, 0).unwrap();
         assert_eq!(archives[0]["id"], "legacy-archive");
-        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+        // v99 (#3655) moved the tip: this test exercises the v98 rung, whose
+        // stamp is the literal 98 (the ladder continues to the tip on open).
+        assert_eq!(current_version(&conn), 98);
     }
 }

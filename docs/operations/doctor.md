@@ -115,9 +115,50 @@ sections.
 
 ### Sync
 
-- `peer_count` — distinct `(agent_id, peer_id)` rows in `sync_state`.
-- `max_skew_secs` — max `|last_seen_at - last_pulled_at|` across peers.
-  **Critical** when > 600s.
+- `probed_at` — the RFC 3339 instant every age below is measured against.
+- Rows are enumerated from the UNION of `sync_state` and `sync_peer_contact`
+  (#3655 v3): a peer that has only ever answered empty windows has a contact
+  row and no `sync_state` row, and is still listed — its data cursors read
+  `never_pulled`, never `0`. Contact without data is normal; data without
+  contact cannot happen. Peer ids of URL shape are redacted (credentials
+  never reach a fact or note).
+- `peer_count` — physical rows in that union (valid + invalid);
+  `invalid_rows` — rows whose cursors are NULL or not RFC 3339, each named
+  as `peer::<agent>/<peer>::invalid = <column and reason>`. **Warning** when
+  > 0: an invalid row is neither healthy nor absent (#3655).
+- Per peer (`peer::<agent>/<peer>::…`, #3655):
+  - `reachability` — `reachable`, or `unknown:<reason>` using the SAME
+    definition the live daemon's `/health` uses (#3654): a peer's last
+    ANSWERED pull older than 3 × its catch-up cadence is
+    `unknown:pull_observation_stale` → **Critical** (the mesh is not
+    converging through this node); a row with no recorded contact is
+    `unknown:no_pull_observation`, and one whose contact carries no cadence
+    is `unknown:no_catchup_loop` → **Warning**, counted in `unknown_peers`
+    — neither healthy nor stale, and never rendered as an age of 0.
+  - `contact_age_secs` / `catchup_interval_secs` — seconds since the peer
+    last answered a pull (`sync_peer_contact.last_contact_at`, this node's
+    clock; stamped on every answered pull, EMPTY window included) and the
+    cadence of the loop that pulled; `not_observed` when absent.
+  - `advanced_age_secs` — seconds since the data watermark last advanced
+    (`last_pulled_at`, this node's clock). `last_pulled_at` only moves when
+    a pull carried rows, so it is a data-watermark stamp, not a contact
+    time: old is the normal state of a quiet peer and is not a finding.
+  - `data_age_secs` — seconds since the newest peer data seen
+    (`last_seen_at`, the peer's clock). Old is legitimate for a quiet peer.
+  - `pushed_age_secs` — seconds since the last local watermark the peer
+    accepted, or `never_pushed`.
+  - `clock_lead_secs` — signed `last_seen_at - last_pulled_at`. **Critical**
+    when it exceeds the sync daemon's pull-cursor future bound (300s): the
+    peer stamps data in this node's future, so its cursors will be refused.
+    Negative is the quiet-peer case and is not a finding.
+- `stale_peers`, `unknown_peers`, `max_contact_age_secs`,
+  `max_advanced_age_secs`, `max_data_age_secs` — measured counts and maxima
+  over valid rows (`not_observed` when nothing was measured);
+  `max_skew_secs` (the largest `|clock_lead_secs|`) is kept for existing
+  consumers and no longer drives severity.
+- **Critical** with `sync_state = unreadable` and `sync_query_error` when the
+  table cannot be queried — peer health is unknown, which is not the same as
+  a single node (#3655).
 - `N/A` when no peers are registered (single-node deployment).
 
 ### Webhook
@@ -211,8 +252,8 @@ able to hang against a wedged hub.
 
 | Severity | Trigger |
 |----------|---------|
-| **Critical** | `dim_violations > 0`; pending action older than 24h; sync skew > 600s; HNSW evictions > 0; a live wake-hub socket that is not owner-only (#3471) |
-| **Warning**  | Capabilities v2 reports a silent-degrade flag (`recall_mode_active != hybrid` on a capable tier); subscription delivery success < 95% |
+| **Critical** | `dim_violations > 0`; pending action older than 24h; a sync peer not observed for > 600s, a peer clock leading this node beyond the 300s pull-cursor bound, or an unreadable `sync_state` (#3655); HNSW evictions > 0; a live wake-hub socket that is not owner-only (#3471) |
+| **Warning**  | Capabilities v2 reports a silent-degrade flag (`recall_mode_active != hybrid` on a capable tier); subscription delivery success < 95%; a `sync_state` row with an unreadable cursor (#3655) |
 | **Info**     | Anything else worth surfacing |
 | **N/A**      | The section can't be queried in this mode (raw SQL section in `--remote`, P2/P3-only fields on a pre-P2/P3 schema) |
 
