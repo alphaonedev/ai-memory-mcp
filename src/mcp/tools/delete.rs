@@ -266,13 +266,18 @@ pub(super) fn handle_delete(
     // fires ONLY when `AI_MEMORY_AGENT_ID` is set (the multi-tenant opt-in),
     // matching the read-path ownership posture (#1468/#1720 B1) so the
     // single-operator trust-all default is byte-unchanged. Lenient (unstamped /
-    // self-owned / daemon / inbox-target pass); `allow_inbox = true` mirrors the
-    // HTTP delete-side gate.
+    // self-owned / daemon / inbox-target pass). #3730 — the inbox-target
+    // admission is DERIVED from the namespace: the recipient is admitted only
+    // for a row `inbox_delete_retains` archives on delete (the disposition
+    // below), never for one it would erase — a bare `true` here let a
+    // non-owner erase any row addressed to it outside an inbox namespace
+    // (pinned by recipient_gate_derived_from_namespace_3730). Mirrors the HTTP
+    // delete-side gate and both SAL stores.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
         if !crate::visibility::caller_owns_for_mutation(
             &target,
             &caller,
-            true,
+            crate::visibility::inbox_delete_retains(&target.namespace),
             crate::identity::owner_stamp::MutationSite::sqlite(
                 crate::identity::owner_stamp::funnel::DELETE,
             ),
