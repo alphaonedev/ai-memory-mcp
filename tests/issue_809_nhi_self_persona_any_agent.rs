@@ -324,7 +324,7 @@ fn nhi_self_persona_any_agent_substrate_resident() {
     // recipe to one model. The test agent_id is "fictional-test-bot" so
     // none of these substrings should appear.
     for forbidden in [
-        "claude", "gpt", "gemini", "llama", "grok", "qwen", "mistral", "phi", "deepseek",
+        "claude", "gpt", "gemini", "llama", "grok", "qwen", "mistral", "phi",
     ] {
         assert!(
             !agent_id.to_lowercase().contains(forbidden),

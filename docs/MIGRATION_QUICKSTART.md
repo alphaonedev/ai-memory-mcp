@@ -40,7 +40,7 @@ action required for the database itself.
 
 | Area | v0.6.4 | v0.7.0 |
 |---|---|---|
-| **LLM backends** | Local Ollama only | **15 vendor aliases** + generic OpenAI-compatible (#1067): ollama, openai, xai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, openai-compatible |
+| **LLM backends** | Local Ollama only | **14 vendor aliases** + generic OpenAI-compatible (#1067): ollama, openai, xai, anthropic, gemini, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, openai-compatible |
 | **Config schema** | Flat fields (`llm_model`, `ollama_url`, ...) | **Sectioned v2** (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`) — see [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html). Legacy v1 continues to work with deprecation WARN; removed in v0.8.0. |
 | **Secret handling** | Inline `api_key = "..."` accepted | **REJECTED at parse time** (#1146). Use `api_key_env` (env var reference) or `api_key_file` (mode 0400 enforced). |
 | **DB schema** | v20 | v57 (37 version bumps bridge the gap, auto-applied on first open) |

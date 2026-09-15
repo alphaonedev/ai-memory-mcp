@@ -7,7 +7,7 @@ layout: doc
 
 `ai-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
 
-**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
+**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
 
 > **Maturity framing (v0.7).** The single-machine primitive (T1/T2 in the [architectures matrix](https://alphaonedev.github.io/ai-memory-mcp/architectures.html)) is **production-ready**. Federation (T3 multi-node quorum cluster) is **beta** — the code is shipped and tested but not recommended for unattended production fleets. The Postgres+pgvector backend reaches **GA in v0.7** (with optional **Apache AGE acceleration** for KG ops behind a bench gate). Ed25519 attestation, the hook pipeline, sidechain transcripts, and the permissions/A2A surfaces are all **opt-in** — a v0.7.0 install with no `hooks.toml`, no keypair, and no `[transcripts]` config behaves identically to v0.6.4 at the lifecycle layer. Multi-region distributed consensus (T5 "global hive") is **vision** at v1.0+. See the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) for the canonical maturity labels — use those labels in all customer-facing materials.
 
@@ -142,7 +142,7 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 |------|-------|----------------|--------------|----------------|
 | `keyword` | keyword subset | No | No | Minimal |
 | `semantic` (default) | semantic subset | Yes (HuggingFace) | No | ~256 MB |
-| `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
+| `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
 | `autonomous` | full 103-entry surface (v1.0.0; 102 callable memory tools + the always-on `memory_capabilities` bootstrap) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
 
 Set the tier when starting the MCP server or running per-invocation
@@ -173,7 +173,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 ### LLM Backend Setup (Smart & Autonomous Tiers)
 
-The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
+The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
 
 #### Recommended path — `[llm]` section in `config.toml` (#1146)
 
@@ -188,7 +188,7 @@ db   = "/Users/<you>/.claude/ai-memory.db"
 
 [llm]
 backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
-                                       # deepseek | kimi | qwen | mistral | groq |
+                                       # kimi | qwen | mistral | groq |
                                        # together | cerebras | openrouter |
                                        # fireworks | lmstudio | openai-compatible
 model       = "grok-4.3"               # vendor-specific identifier
@@ -235,7 +235,7 @@ max_seq_tokens = 256                   # rerank input-sequence cap (#1604);
 **API-key resolution chain.** For non-Ollama backends, the resolver consults (in order):
 
 1. `AI_MEMORY_LLM_API_KEY` (process env) — universal escape hatch.
-2. Per-vendor process env-var fallback: `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` (or `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`), `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
+2. Per-vendor process env-var fallback: `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `MOONSHOT_API_KEY` (or `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`), `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
 3. `[llm].api_key_env = "<NAME>"` — config-pointed env var.
 4. `[llm].api_key_file = "/path/to/key"` — file (mode 0400 enforced via `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` escape hatch per [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)).
 
@@ -269,7 +269,7 @@ Env vars take precedence over `[llm]` in `config.toml`. Useful for CI / per-sess
 >
 > If you DO use the env-block override, the same `AI_MEMORY_LLM_BACKEND` / `AI_MEMORY_LLM_API_KEY` / `AI_MEMORY_LLM_MODEL` variables must live inside the MCP server config's `env:` block. Copy-pasteable per-backend recipes: [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
-**Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
+**Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
 
 ```bash
 # Example 1: xAI Grok 4.3 (remote, no GPU required) — v0.7.0 compiled default for xai backend
@@ -294,7 +294,7 @@ export AI_MEMORY_LLM_MODEL=your-model
 export AI_MEMORY_LLM_API_KEY=…
 ```
 
-**Per-vendor fallback API-key env vars** are honoured (so the operator doesn't need to set `AI_MEMORY_LLM_API_KEY` separately if they're already using the vendor's canonical env var): `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` (or `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`), `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
+**Per-vendor fallback API-key env vars** are honoured (so the operator doesn't need to set `AI_MEMORY_LLM_API_KEY` separately if they're already using the vendor's canonical env var): `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `MOONSHOT_API_KEY` (or `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`), `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
 
 ### Ollama Setup (local LLM, v0.6.4 default — still supported)
 
@@ -350,10 +350,10 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 |----------|---------|-------------|
 | `AI_MEMORY_DB` | `ai-memory.db` | Database path (overridden by `--db`) |
 | `AI_MEMORY_AGENT_ID` | (auto) | Default `agent_id` stamped on memories this process writes. Used when no `--agent-id` flag is passed. See §Agent Identity below. |
-| `AI_MEMORY_LLM_BACKEND` | `ollama` (legacy default) | **[#1067, v0.7.0]** LLM backend selector. Accepts `ollama`, `openai-compatible`, or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`). When set, the LLM client is tier-independent. |
+| `AI_MEMORY_LLM_BACKEND` | `ollama` (legacy default) | **[#1067, v0.7.0]** LLM backend selector. Accepts `ollama`, `openai-compatible`, or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`). When set, the LLM client is tier-independent. |
 | `AI_MEMORY_LLM_BASE_URL` | per-alias default; `http://localhost:11434` for `ollama` | **[#1067, v0.7.0]** Overrides default per-backend URL. REQUIRED with `AI_MEMORY_LLM_BACKEND=openai-compatible`. Legacy `OLLAMA_BASE_URL` still honoured when `BACKEND=ollama`. |
-| `AI_MEMORY_LLM_API_KEY` | unset | **[#1067, v0.7.0, secret]** Bearer secret for OpenAI-compatible backends. Per-vendor fallback env vars honoured (`OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` or `KIMI_API_KEY`, `DASHSCOPE_API_KEY` or `QWEN_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`). Never echoed in capabilities / banners / audit. |
-| `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4.3` for xAI, `gpt-5` for OpenAI, `deepseek-chat` for DeepSeek, `gemma3:4b` for Ollama). |
+| `AI_MEMORY_LLM_API_KEY` | unset | **[#1067, v0.7.0, secret]** Bearer secret for OpenAI-compatible backends. Per-vendor fallback env vars honoured (`OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `MOONSHOT_API_KEY` or `KIMI_API_KEY`, `DASHSCOPE_API_KEY` or `QWEN_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`). Never echoed in capabilities / banners / audit. |
+| `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4.3` for xAI, `gpt-5` for OpenAI for `gemma3:4b` for Ollama). |
 | `OLLAMA_BASE_URL` | unset | Legacy escape hatch honoured ONLY when `AI_MEMORY_LLM_BACKEND` is unset or `ollama`. Pre-#1067 callers using the old env var keep working. |
 | `AI_MEMORY_MAX_MEMORIES_PER_DAY` | `1000` | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** daily memory-write quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is [#3209](https://github.com/alphaonedev/ai-memory-mcp/issues/3209))**. (#1156 / schema v50 extended the `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)`; pre-v50 rows backfill to the `_global` sentinel, and a caller that supplies no namespace still lands on `_global`.) Precedence: env > `[limits].max_memories_per_day` > compiled default. Non-positive / unparseable falls through. |
 | `AI_MEMORY_MAX_STORAGE_BYTES` | `104857600` (100 MiB) | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** storage-byte quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_storage_bytes`). |
@@ -385,7 +385,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `ollama_url` | String | `"http://localhost:11434"` | Any URL | **[LEGACY]** Ollama base URL for LLM generation. Canonical v2: `[llm].base_url`. |
 | `embed_url` | String | Value of `ollama_url` | Any URL | **[LEGACY]** Separate embedder URL. Canonical v2: `[embeddings].url`. |
 | `embedding_model` | String | `"nomic-embed-text-v1.5"` | `"mini_lm_l6_v2"` (384-dim, ~90 MB), `"nomic-embed-text-v1.5"` (768-dim, ~280 MB) | **[LEGACY]** Sentence-transformer / Ollama embedder model. Canonical v2: `[embeddings].model`. |
-| `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"deepseek-chat"`, `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
+| `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
 | `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | **[LEGACY]** Enable neural cross-encoder reranking. Canonical v2: `[reranker].enabled`. |
 | `default_namespace` | String | `"global"` | Any valid namespace (max 512 chars; `/` hierarchy delimiter allowed; no spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
 | `max_memory_mb` | Integer | Tier-dependent | Any positive integer | **[LEGACY — PARSED BUT NOT ENFORCED (FBL-13)]** It has **no runtime consumer**: it does not cap memory or storage and is NOT an auto-tier-selection input on any live path. `resolve_storage` emits a one-shot WARN when it is set (`src/config.rs:145-149`). For an actual storage ceiling use `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES`. |
@@ -530,7 +530,7 @@ Below is a complete example showing every supported field with explanatory comme
 # the full env-var matrix.
 #
 #   AI_MEMORY_LLM_BACKEND   — selector: ollama | openai-compatible |
-#                             openai | xai | anthropic | gemini | deepseek |
+#                             openai | xai | anthropic | gemini |
 #                             kimi | qwen | mistral | groq | together |
 #                             cerebras | openrouter | fireworks | lmstudio
 #   AI_MEMORY_LLM_BASE_URL  — override per-alias default URL
@@ -554,7 +554,6 @@ Below is a complete example showing every supported field with explanatory comme
 #   "gpt-5"             — OpenAI
 #   "claude-opus-4.7"   — Anthropic (via OpenAI shim)
 #   "gemini-2.0-flash"  — Google Gemini
-#   "deepseek-chat"     — DeepSeek
 #   "moonshot-v1-8k"    — Kimi / Moonshot
 #   "qwen-max"          — Qwen / Dashscope
 #   "mistral-large-latest" — Mistral
