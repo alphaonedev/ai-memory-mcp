@@ -397,7 +397,7 @@ impl HookChain {
             .map(|h| (h.clone(), registry.get(h)))
             .collect();
 
-        for (cfg, executor) in prepared {
+        for (hook_index, (cfg, executor)) in prepared.into_iter().enumerate() {
             // FBL-29 — skip a hook whose configured `namespace` pattern does
             // not cover the in-flight namespace. A `*`/empty pattern (the
             // schema default) matches everything, so configs that don't scope
@@ -515,8 +515,13 @@ impl HookChain {
                             // `tracing::warn!` above keeps all of it for the
                             // operator.
                             return ChainResult::Deny {
+                                // #3708 — NAME the failing hook by its INDEX in
+                                // the chain, never by `cfg.command` (a filesystem
+                                // path that is operator config). An operator can
+                                // map an index to a hook from their own config;
+                                // a caller learns nothing they did not supply.
                                 reason: format!(
-                                    "a hook errored under fail_mode=closed: {}",
+                                    "hook #{hook_index} errored under fail_mode=closed: {}",
                                     crate::hooks::executor::caller_safe_kind(&e)
                                 ),
                                 code: 503,
@@ -1110,7 +1115,7 @@ mod tests {
         let mut modified = false;
         let mut askuser_queue: Vec<AskUserPrompt> = Vec::new();
 
-        for (cfg, executor) in sorted {
+        for (hook_index, (cfg, executor)) in sorted.into_iter().enumerate() {
             let fire_result = executor.fire(event, current_payload.clone()).await;
             let decision = match fire_result {
                 Ok(d) => d.degrade_modify_for_post_event(event),
@@ -1130,8 +1135,9 @@ mod tests {
                             "hooks: post-event chain hook errored; fail_mode=closed, denying"
                         );
                         return ChainResult::Deny {
+                            // #3708 — index, not the operator's command path.
                             reason: format!(
-                                "a hook errored under fail_mode=closed: {}",
+                                "hook #{hook_index} errored under fail_mode=closed: {}",
                                 crate::hooks::executor::caller_safe_kind(&e)
                             ),
                             code: 503,
@@ -1428,9 +1434,19 @@ mod tests {
         match result {
             ChainResult::Deny { reason, code } => {
                 assert_eq!(code, 503);
+                // #3708 — this used to assert the reason CONTAINS "/bin/strict",
+                // i.e. it required the operator's command PATH in a caller-facing
+                // string. That encoded the defect as a requirement. The intent
+                // (name the failing hook) is legitimate and is now served by the
+                // chain INDEX, which an operator can map from their own config
+                // and which tells a caller nothing they did not supply.
                 assert!(
-                    reason.contains("/bin/strict"),
-                    "deny reason should name the failing hook: {reason}"
+                    reason.contains("hook #"),
+                    "deny reason should name the failing hook by index: {reason}"
+                );
+                assert!(
+                    !reason.contains("/bin/strict"),
+                    "#3708: the operator command path must NOT reach the caller: {reason}"
                 );
                 assert!(
                     reason.contains("fail_mode=closed"),
