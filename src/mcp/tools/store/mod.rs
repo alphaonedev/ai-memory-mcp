@@ -941,10 +941,15 @@ fn handle_store_inner(
         // the response reported "short" while the row stayed "long".
         // Echo-read failures must not turn the already-committed write
         // into an error; fall back to the request values.
-        let (echo_tier, echo_namespace) = db::get(conn, &dup.id).ok().flatten().map_or_else(
-            || (mem.tier.clone(), mem.namespace.clone()),
-            |post| (post.tier, post.namespace),
-        );
+        // #3496 → Unit 1: the request-value default is EAGER (no fallback
+        // closure) — the only in-process vehicle that ever executed the lazy
+        // arm was a write into a quarantined row, which #3695 refuses, and a
+        // branch no honest test can reach must not exist as a branch.
+        let requested = (mem.tier.clone(), mem.namespace.clone());
+        let (echo_tier, echo_namespace) = db::get(conn, &dup.id)
+            .ok()
+            .flatten()
+            .map_or(requested, |post| (post.tier, post.namespace));
         return Ok(json!({
             "id": dup.id,
             "tier": echo_tier,
@@ -1272,10 +1277,12 @@ fn handle_store_inner(
     // so echo the post-write row's tier rather than the requested one.
     // Fallback to the request values when the row is no longer
     // readable (e.g. the synchronous atomise pass archived it above).
+    // #3496 → Unit 1: eager request-value default, see the dedup echo above.
+    let requested_tier = mem.tier.clone();
     let echo_tier = db::get(conn, &actual_id)
         .ok()
         .flatten()
-        .map_or_else(|| mem.tier.clone(), |post| post.tier);
+        .map_or(requested_tier, |post| post.tier);
     let mut response = json!({
         "id": actual_id,
         "tier": echo_tier,
