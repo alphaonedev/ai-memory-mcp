@@ -138,6 +138,12 @@ const SECTION_EMBEDDINGS_REACHABILITY: &str = "Embeddings Reachability (#1598)";
 /// #3147 / #3155 — operator-visible identity health. Named to match the
 /// daemon WARN "See `ai-memory doctor` -> Identity".
 const SECTION_IDENTITY: &str = "Identity";
+/// v1.0.0 #3700 — the deployment-shape DETECTOR section, right after the
+/// declared shape (#3714) and before any database work: the signals this
+/// configuration shows versus the shape it declares, so a node configured
+/// like a fleet but declared `singleton` is reported unprompted, at the top.
+/// This is the pre-upgrade detector; it never re-postures.
+pub const SECTION_DEPLOYMENT_SHAPE_DETECTOR: &str = "Deployment shape detector (#3700)";
 /// v1.0.0 #2972 — doctor fact naming the model this binary will ACTUALLY
 /// load, emitted only when it differs from the configured `model` fact.
 const EFFECTIVE_MODEL_FACT: &str = "effective_model";
@@ -1054,6 +1060,158 @@ fn snapshot_before_repair(
 // Local (--db) mode
 // ---------------------------------------------------------------------------
 
+/// v1.0.0 #3700 — the deployment-shape DETECTOR.
+///
+/// Read-only: observes the argv-free shape signals (env + config, and the
+/// agent registry when `registered_agents` is known), compares their floor
+/// with the DECLARED `[deployment] shape` (#3714) and reports the boot
+/// verdict that comparison implies. Promotion is an operator act — the
+/// daemon WARNS (and records) an undeclared promotion, it never re-postures
+/// — so the one thing this section must never do is claim a posture the
+/// node does not run. A hardened DECLARED shape with knobs below its floor
+/// is the refusal case. Doctor itself never refuses.
+fn section_deployment_shape_detector_3700(registered_agents: Option<usize>) -> ReportSection {
+    use crate::config::shape::detector::{self, ISSUE_TAG};
+    use crate::security_profile::SecurityPosture;
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    let mut observed = detector::observe(Some(&app_config), None);
+    if let Some(n) = registered_agents {
+        observed = observed.with_registry(n);
+    }
+    let assessment = match detector::assess(&app_config, observed) {
+        Ok(a) => a,
+        Err(e) => {
+            return ReportSection {
+                name: SECTION_DEPLOYMENT_SHAPE_DETECTOR.into(),
+                severity: Severity::Critical,
+                facts: vec![
+                    ("posture".into(), "unresolvable".into()),
+                    ("error".into(), e.to_string()),
+                ],
+                note: Some(format!(
+                    "{ISSUE_TAG}: the posture selector carries an unrecognised token; the \
+                     daemon refuses to boot on it (fail-loud). Set it to `standard` or \
+                     `asi-hard`, or unset it so the declared shape's floor applies."
+                )),
+            };
+        }
+    };
+    let list = |names: Vec<&str>| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    let below = crate::security_profile::asi_hard_below_floor();
+    let mut off: Vec<&str> = below.iter().map(|(env, _, _)| *env).collect();
+    if assessment.posture() == SecurityPosture::Standard {
+        off.extend(
+            crate::security_profile::pinned_knobs()
+                .into_iter()
+                .filter(|(env, _)| std::env::var_os(env).is_none())
+                .map(|(env, _)| env),
+        );
+    }
+    let line = assessment.promotion_line();
+    let hardened_below = assessment.declared.is_hardened() && !below.is_empty();
+    let (verdict, severity) = if hardened_below {
+        (
+            "REFUSES at next boot (hardened declared shape with knobs below floor)".to_string(),
+            Severity::Critical,
+        )
+    } else if assessment.unprotected_fleet() {
+        (
+            format!(
+                "boots UNPROTECTED — configuration looks like {}; declare {line}",
+                assessment.observed.observed_floor
+            ),
+            Severity::Critical,
+        )
+    } else if assessment.undeclared_promotion {
+        (
+            format!("boots — signals exceed the declared shape (declare {line})"),
+            Severity::Warning,
+        )
+    } else {
+        ("boots".to_string(), Severity::Info)
+    };
+    let facts = vec![
+        ("declared_shape".into(), assessment.declared.as_str().into()),
+        (
+            "observed_floor".into(),
+            assessment.observed.observed_floor.as_str().into(),
+        ),
+        (
+            "signals_present".into(),
+            list(assessment.observed.present()),
+        ),
+        (
+            "signals_unobservable".into(),
+            list(assessment.observed.unobservable()),
+        ),
+        (
+            "registered_agents".into(),
+            assessment
+                .observed
+                .registered_agents
+                .map_or_else(|| "unobservable".to_string(), |n| n.to_string()),
+        ),
+        (
+            "undeclared_promotion".into(),
+            assessment.undeclared_promotion.to_string(),
+        ),
+        (
+            "promotion_line".into(),
+            if assessment.undeclared_promotion {
+                line.clone()
+            } else {
+                "none".to_string()
+            },
+        ),
+        ("posture".into(), assessment.posture.clone()),
+        ("posture_origin".into(), assessment.origin.as_str().into()),
+        ("protections_off".into(), off.len().to_string()),
+        ("protections_off_list".into(), list(off)),
+        ("boot_verdict".into(), verdict),
+    ];
+    let note = match severity {
+        Severity::Info => None,
+        _ if hardened_below => Some(format!(
+            "{ISSUE_TAG}: {} declares a shape whose floor is asi-hard, and {} protection(s) \
+             are set BELOW that floor ({}); the daemon refuses to boot until each is raised \
+             or unset (so the shape pins it). `ai-memory doctor` is the pre-upgrade \
+             detector.",
+            assessment.declared.config_line(),
+            below.len(),
+            below
+                .iter()
+                .map(|(env, _, _)| *env)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => Some(format!(
+            "{ISSUE_TAG}: this node declares `{}` but its configuration looks like `{}` \
+             (signals: {}). Promotion is an operator act: nothing is re-postured; declare \
+             {line} to run it as what it is (the shape then pins the hardened posture). \
+             `ai-memory doctor` is the pre-upgrade detector.",
+            assessment.declared,
+            assessment.observed.observed_floor,
+            list(assessment.observed.present())
+        )),
+    };
+    ReportSection {
+        name: SECTION_DEPLOYMENT_SHAPE_DETECTOR.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
 fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report) -> ReportSection {
     use crate::federation::peer_posture::Verdict;
     let severity = match report.verdict {
@@ -1138,6 +1296,12 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     if let Some(section) = section_deployment_shape_3714() {
         sections.push(section);
     }
+    // v1.0.0 #3700 — the DETECTOR, immediately after the declared shape
+    // (#3714) and before the database open: the signals this configuration
+    // shows versus the shape it declares. Detection warns, never
+    // re-postures. The registry signal is folded in once the connection is
+    // open (below); until then it is reported as unobservable, never absent.
+    sections.push(section_deployment_shape_detector_3700(None));
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -1278,6 +1442,17 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
         }
     };
 
+    // v1.0.0 #3700 — fold the store-derived registry signal into the shape
+    // section at index 1 (a fleet by registry alone is invisible pre-open).
+    // A registry that cannot be read stays `unobservable` in the section
+    // rather than being reported as an empty registry.
+    if let Some(slot) = sections
+        .iter_mut()
+        .find(|s| s.name == SECTION_DEPLOYMENT_SHAPE_DETECTOR)
+    {
+        *slot =
+            section_deployment_shape_detector_3700(db::list_agents(&conn).ok().map(|a| a.len()));
+    }
     sections.push(section_identity_3147(Some(&conn), db_path, caller_agent_id));
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
@@ -4436,7 +4611,10 @@ mod tests {
         // "Federation peer authorization" before the database open and
         // Identity — total is now 18; #3124 added the unconditional
         // "Unstamped owners (#3124)" census after "Corpus Lifecycle (#1965)"
-        // — total is now 19.
+        // — total is now 19; #3700 inserted "Deployment shape detector
+        // (#3700)" after Configuration (the #3714 declared-shape section
+        // that precedes it is CONDITIONAL and absent under skip_config, which
+        // `run_local_collect` sets) — total is now 20.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -4446,18 +4624,19 @@ mod tests {
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
-        // DSN under that same lock. The count stays 19 on a SQLite
+        // DSN under that same lock. The count stays 20 on a SQLite
         // deployment, which is the invariant this test pins.
         //
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 19);
+        assert_eq!(report.sections.len(), 20);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Configuration",
+                SECTION_DEPLOYMENT_SHAPE_DETECTOR,
                 "Federation peer authorization",
                 "Identity",
                 "Storage",
@@ -4543,6 +4722,53 @@ mod tests {
         }
         // The resolved key value itself must NEVER appear as a fact key.
         assert!(emb.facts.iter().all(|(k, _)| k != "api_key"));
+    }
+
+    /// v1.0.0 #3700 — the detector section renders right after Configuration
+    /// (the #3714 declared-shape section is absent under skip_config),
+    /// carries the store-derived registry count once the store is open, and
+    /// keeps the argv-only signals `unobservable` (doctor cannot see the
+    /// daemon's command line) rather than reporting them absent.
+    #[test]
+    fn local_run_deployment_shape_detector_is_second_and_registry_aware_3700() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
+        let shape = find(&report, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
+        let keys: Vec<&str> = shape.facts.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "declared_shape",
+                "observed_floor",
+                "signals_present",
+                "signals_unobservable",
+                "registered_agents",
+                "undeclared_promotion",
+                "promotion_line",
+                "posture",
+                "posture_origin",
+                "protections_off",
+                "protections_off_list",
+                "boot_verdict",
+            ]
+        );
+        assert_eq!(fact(shape, "registered_agents"), "0");
+        let unobservable = fact(shape, "signals_unobservable");
+        for argv_only in [
+            crate::config::shape::detector::SIGNAL_OUTBOUND_PEERS,
+            crate::config::shape::detector::SIGNAL_LISTENER_MTLS,
+        ] {
+            assert!(
+                unobservable.contains(argv_only),
+                "{argv_only} must be unobservable from doctor, got {unobservable:?}"
+            );
+        }
+        assert!(
+            !fact(shape, "signals_present")
+                .contains(crate::config::shape::detector::SIGNAL_AGENT_REGISTRY),
+            "an empty registry is not a fleet signal"
+        );
     }
 
     #[test]
@@ -5598,13 +5824,22 @@ mod tests {
         let report = run_local_collect(&bad);
         // #3166 — Configuration always renders; #3147 — Identity still
         // renders (the keystore is independent of the database); #3582
-        // peer authorization renders before the database open and Identity.
+        // peer authorization renders before the database open and Identity;
+        // #3700 the deployment-shape detector renders second (the #3714
+        // declared-shape section is absent under skip_config), with the
+        // registry signal left `unobservable` because the store never opened.
         // Storage is the Critical failure.
-        assert_eq!(report.sections.len(), 4);
+        assert_eq!(report.sections.len(), 5);
         assert_eq!(report.sections[0].name, "Configuration");
-        assert_eq!(report.sections[1].name, "Federation peer authorization");
-        assert_eq!(report.sections[2].name, SECTION_IDENTITY);
-        let storage = &report.sections[3];
+        assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
+        assert_eq!(
+            fact(&report.sections[1], "registered_agents"),
+            "unobservable",
+            "#3700: an unopened store is unobservable, never an empty registry"
+        );
+        assert_eq!(report.sections[2].name, "Federation peer authorization");
+        assert_eq!(report.sections[3].name, SECTION_IDENTITY);
+        let storage = &report.sections[4];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
