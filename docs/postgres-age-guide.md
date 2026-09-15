@@ -51,9 +51,9 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends are at **schema parity at v98**
-(`CURRENT_SCHEMA_VERSION = 98` on both ladders — the postgres upgrade
-ladder ends at `migrate_v98()`).
+The two backends are at **schema parity at v100**
+(`CURRENT_SCHEMA_VERSION = 100` on both ladders — the postgres upgrade
+ladder ends at `migrate_v100()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
