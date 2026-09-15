@@ -67,21 +67,26 @@ fn signed_chain_records_and_verifies() {
         "allow",
         "bash",
         "",
-        serde_json::json!({"command": "ls"}),
+        forensic::ForensicPayload::content(&serde_json::json!({"command": "ls"}))
+            .expect("commitment"),
     );
     forensic::record_decision(
         "ai:test-author",
         "refuse",
         "bash",
         "R042",
-        serde_json::json!({"command": "rm -rf /", "reason": "matches deny-rule R042"}),
+        forensic::ForensicPayload::content(
+            &serde_json::json!({"command": "rm -rf /", "reason": "matches deny-rule R042"}),
+        )
+        .expect("commitment"),
     );
     forensic::record_decision(
         "ai:test-author",
         "warn",
         "network_request",
         "R055",
-        serde_json::json!({"host": "evil.example.com"}),
+        forensic::ForensicPayload::content(&serde_json::json!({"host": "evil.example.com"}))
+            .expect("commitment"),
     );
     forensic::shutdown();
 
@@ -112,14 +117,16 @@ fn tampered_line_fails_verify() {
         "refuse",
         "bash",
         "R001",
-        serde_json::json!({"command": "shutdown now"}),
+        forensic::ForensicPayload::content(&serde_json::json!({"command": "shutdown now"}))
+            .expect("commitment"),
     );
     forensic::record_decision(
         "ai:author-b",
         "allow",
         "bash",
         "",
-        serde_json::json!({"command": "ls"}),
+        forensic::ForensicPayload::content(&serde_json::json!({"command": "ls"}))
+            .expect("commitment"),
     );
     forensic::shutdown();
 
@@ -150,7 +157,13 @@ fn unsigned_chain_verifies_with_no_key_required() {
     forensic::shutdown();
     forensic::init(dir.path(), None).expect("init unsigned");
     for i in 0..3 {
-        forensic::record_decision("ai:nokey", "allow", "bash", "", serde_json::json!({"i": i}));
+        forensic::record_decision(
+            "ai:nokey",
+            "allow",
+            "bash",
+            "",
+            forensic::ForensicPayload::new().number("i", i),
+        );
     }
     forensic::shutdown();
 

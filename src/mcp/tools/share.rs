@@ -87,11 +87,10 @@ pub fn handle_share(
                 "refuse",
                 crate::mcp::registry::tool_names::MEMORY_SHARE,
                 "",
-                json!({
-                    (field_names::SOURCE_MEMORY_ID): source_memory_id,
-                    (field_names::TARGET_AGENT_ID): target_agent_id,
-                    "reason": "source memory is not readable on this query",
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident(field_names::SOURCE_MEMORY_ID, source_memory_id)
+                    .ident(field_names::TARGET_AGENT_ID, target_agent_id)
+                    .label("reason", "source memory is not readable on this query"),
             );
         }
         return Err(format!("source memory {source_memory_id} not found"));
@@ -105,11 +104,10 @@ pub fn handle_share(
             "refuse",
             crate::mcp::registry::tool_names::MEMORY_SHARE,
             "",
-            json!({
-                (field_names::SOURCE_MEMORY_ID): source_memory_id,
-                (field_names::TARGET_AGENT_ID): target_agent_id,
-                "reason": crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
-            }),
+            crate::governance::audit::ForensicPayload::new()
+                .ident(field_names::SOURCE_MEMORY_ID, source_memory_id)
+                .ident(field_names::TARGET_AGENT_ID, target_agent_id)
+                .label("reason", crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY),
         );
         return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string());
     }
@@ -199,12 +197,11 @@ pub fn handle_share(
             "allow",
             crate::mcp::registry::tool_names::MEMORY_SHARE,
             "",
-            json!({
-                (field_names::SOURCE_MEMORY_ID): source_memory_id,
-                (field_names::TARGET_AGENT_ID): target_agent_id,
-                (field_names::FROM_AGENT_ID): &from_agent_id,
-                (field_names::TARGET_NAMESPACE): &target_namespace,
-            }),
+            crate::governance::audit::ForensicPayload::new()
+                .ident(field_names::SOURCE_MEMORY_ID, source_memory_id)
+                .ident(field_names::TARGET_AGENT_ID, target_agent_id)
+                .ident(field_names::FROM_AGENT_ID, &from_agent_id)
+                .ident(field_names::TARGET_NAMESPACE, &target_namespace),
         );
     }
 

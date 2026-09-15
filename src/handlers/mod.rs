@@ -243,7 +243,9 @@ pub(crate) fn capability_from_headers(
                     "deny",
                     crate::governance::capability::AUDIT_KIND_REJECT,
                     crate::governance::capability::CapReject::Malformed.code(),
-                    serde_json::json!({ "stage": "edge-parse", "cause": "non-utf8-header" }),
+                    crate::governance::audit::ForensicPayload::new()
+                        .label("stage", "edge-parse")
+                        .label("cause", "non-utf8-header"),
                 );
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,
