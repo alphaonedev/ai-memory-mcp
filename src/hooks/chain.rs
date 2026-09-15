@@ -508,10 +508,16 @@ impl HookChain {
                                 error = %e,
                                 "hooks: chain hook errored; fail_mode=closed, denying"
                             );
+                            // #3708 — the caller gets a CLOSED VOCABULARY. The
+                            // hook's own stdout (via `Decode.reason`), its
+                            // stderr (via `ChildExit`) and the operator's
+                            // command PATH must not cross to a caller. The
+                            // `tracing::warn!` above keeps all of it for the
+                            // operator.
                             return ChainResult::Deny {
                                 reason: format!(
-                                    "hook {} errored under fail_mode=closed: {e}",
-                                    cfg.command.display()
+                                    "a hook errored under fail_mode=closed: {}",
+                                    crate::hooks::executor::caller_safe_kind(&e)
                                 ),
                                 code: 503,
                             };
@@ -1111,10 +1117,22 @@ mod tests {
                 Err(e) => match cfg.fail_mode {
                     FailMode::Open => HookDecision::Allow,
                     FailMode::Closed => {
+                        // #3708 — this POST-EVENT arm had NO operator log line,
+                        // so the caller-facing `reason` was the ONLY place the
+                        // error text went. Redacting it without adding the log
+                        // would make a post-event hook failure undiagnosable,
+                        // so the `warn!` lands together with the closed
+                        // vocabulary, matching the pre-event arm above.
+                        tracing::warn!(
+                            command = %cfg.command.display(),
+                            event = ?event,
+                            error = %e,
+                            "hooks: post-event chain hook errored; fail_mode=closed, denying"
+                        );
                         return ChainResult::Deny {
                             reason: format!(
-                                "hook {} errored under fail_mode=closed: {e}",
-                                cfg.command.display()
+                                "a hook errored under fail_mode=closed: {}",
+                                crate::hooks::executor::caller_safe_kind(&e)
                             ),
                             code: 503,
                         };
