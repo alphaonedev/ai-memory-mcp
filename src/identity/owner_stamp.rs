@@ -493,6 +493,31 @@ pub fn sqlite_malformed_predicate(col: &str) -> String {
     format!("(COALESCE(json_type({col},'$.agent_id'),'null') NOT IN ('text','null'))")
 }
 
+/// #3626 — postgres: a `jsonb - text[]` key-drop SUFFIX appended to the
+/// merged metadata expression of every `(title, namespace)` upsert arm.
+/// Drops `agent_id` when the EXISTING row (`col`) is UNSTAMPED per
+/// [`pg_unstamped_predicate_for`] (missing / JSON null / `''`), and is the
+/// no-op `- ARRAY[]::text[]` otherwise — so a dedup / upsert / synthesis
+/// re-store onto a legacy-unowned row leaves it unowned (claiming stays
+/// `ai-memory reown`, the #3124 R3 rule the UPDATE funnels already apply in
+/// Rust via `identity::preserve_update_provenance_keys`). The sqlite arms
+/// spell the same rule as `CASE WHEN <sqlite_unstamped_predicate> THEN
+/// json_remove(<patch>, '$.agent_id') ELSE <patch> END`.
+#[must_use]
+pub fn pg_upsert_unstamped_owner_drop(col: &str) -> String {
+    format!(
+        "- CASE WHEN {} THEN ARRAY['agent_id'] ELSE ARRAY[]::text[] END",
+        pg_unstamped_predicate_for(col)
+    )
+}
+
+/// postgres predicate: `col`'s `metadata.agent_id` is UNSTAMPED (missing /
+/// JSON null / `''`) — the column-qualified form of [`PG_UNSTAMPED_PREDICATE`].
+#[must_use]
+pub fn pg_unstamped_predicate_for(col: &str) -> String {
+    format!("({col}->>'agent_id' IS NULL OR {col}->>'agent_id' = '')")
+}
+
 /// postgres SELECT-list pair feeding [`OwnerStamp::of_pg`]:
 /// `jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id'`.
 pub const PG_OWNER_TYPE_SQL: &str = "jsonb_typeof(metadata->'agent_id')";

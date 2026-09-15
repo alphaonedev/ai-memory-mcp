@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 99).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 100).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -219,6 +219,14 @@ CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at);
 -- ladder arm, not this bootstrap.
 CREATE INDEX IF NOT EXISTS idx_memories_list_order ON memories(priority DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_ns_list_order ON memories(namespace, priority DESC, updated_at DESC);
+-- v100 (#3690): the SHIPPED index is PARTIAL (`WHERE lifecycle_state <>
+-- 'tombstoned'`, `models::TITLE_SLOT_INDEX_PREDICATE`) so a consolidation
+-- tombstone gives its slot up. It is rebuilt by the v100 LADDER arm, not here:
+-- `lifecycle_state` is a ladder-added column (v64), and a bootstrap index
+-- that references it would crash the open of a pre-v64 database (guardrail-D
+-- rule (f), the #2424 class). This full form is what a fresh database gets
+-- until the ladder — which runs on every open, fresh ones included — rebuilds
+-- it under the same name before any write.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_title_ns ON memories(title, namespace);
 -- Partial indexes referencing v36+ columns (`atom_of`, `atomised_into`,
 -- `source_uri`, `confidence_source`, `mentioned_entity_id`) and the v41
@@ -992,7 +1000,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// for schema reporting and compatibility checks. Settled ladder arms still
 /// gate on their own literal rung so adding v98 cannot make a v96 database
 /// skip v97.
-const CURRENT_SCHEMA_VERSION: i64 = 99;
+const CURRENT_SCHEMA_VERSION: i64 = 100;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1796,6 +1804,13 @@ const MIGRATION_V97_SQLITE: &str =
 const MIGRATION_V98_SQLITE: &str =
     include_str!("../../migrations/sqlite/0082_v98_canonical_inbox_namespace.sql");
 
+// v100 (#3690 / #3695 / #3699): the (title, namespace) unique index becomes
+// PARTIAL — tombstoned rows give up their slot so a later store of the same
+// title lands as a fresh, visible row instead of inside the hidden one. The
+// postgres twin is `PostgresStore::migrate_v100`.
+const MIGRATION_V100_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0084_v100_title_slot_live_rows.sql");
+
 const SQL_CLEAR_SCHEMA_VERSION: &str = "DELETE FROM schema_version";
 
 fn migrate_v98(conn: &Connection) -> Result<()> {
@@ -1820,6 +1835,13 @@ fn migrate_v99(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_V99_SQLITE)?;
     conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
     conn.execute("INSERT INTO schema_version (version) VALUES (99)", [])?;
+    Ok(())
+}
+
+fn migrate_v100(conn: &Connection) -> Result<()> {
+    conn.execute_batch(MIGRATION_V100_SQLITE)?;
+    conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
+    conn.execute("INSERT INTO schema_version (version) VALUES (100)", [])?;
     Ok(())
 }
 
@@ -4515,9 +4537,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             migrate_v98(conn)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 99 {
             // v99 (#3655): durable per-peer contact, apart from the data watermark.
             migrate_v99(conn)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v100 (#3690): the (title, namespace) slot belongs to live rows only.
+            migrate_v100(conn)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

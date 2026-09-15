@@ -1508,9 +1508,15 @@ fn retained_agent_id_for_upsert(conn: &Connection, mem: &Memory) -> Result<Strin
         return Ok(incoming.to_string());
     }
     use rusqlite::OptionalExtension;
+    // #3690 — the surviving row is the LIVE slot holder: a tombstone holds no
+    // slot (the v100 partial index excludes it), so its metadata must not
+    // pick the seal recipient for a row that will land BESIDE it.
     let existing_metadata: Option<String> = conn
         .query_row(
-            "SELECT metadata FROM memories WHERE title = ?1 AND namespace = ?2",
+            &format!(
+                "SELECT metadata FROM memories WHERE title = ?1 AND namespace = ?2 AND {}",
+                crate::models::TITLE_SLOT_INDEX_PREDICATE
+            ),
             params![mem.title, mem.namespace],
             |r| r.get(0),
         )
@@ -1526,8 +1532,12 @@ fn retained_agent_id_for_upsert(conn: &Connection, mem: &Memory) -> Result<Strin
         // rather than guessing here.
         return Ok(incoming.to_string());
     };
+    // #3626 — an UNSTAMPED surviving row retains NO owner after the merge
+    // (the arm drops the incoming id), so there is no recipient key: return
+    // the empty id and let the seal gate refuse fail-closed rather than seal
+    // to an identity the row will never carry.
     Ok(metadata_agent_id_slot(&parsed)
-        .unwrap_or(incoming)
+        .unwrap_or_default()
         .to_string())
 }
 
@@ -1858,8 +1868,11 @@ fn probe_federation_merge_preimage(
         return Ok(None);
     }
     conn.query_row(
-        "SELECT updated_at, id, version, content, encrypted_envelope \
-         FROM memories WHERE title = ?1 AND namespace = ?2",
+        &format!(
+            "SELECT updated_at, id, version, content, encrypted_envelope \
+             FROM memories WHERE title = ?1 AND namespace = ?2 AND {}",
+            crate::models::TITLE_SLOT_INDEX_PREDICATE
+        ),
         params![title, namespace],
         |r| {
             Ok(FederationMergePreimage {
@@ -1942,6 +1955,235 @@ fn emit_federation_newer_wins_supersede_leaf_if_enabled(
         &mem.updated_at,
     )
 }
+
+/// #1579 B6 / #3690 — the ONE `insert` upsert literal, built ONCE: the
+/// conflict target is [`crate::models::TITLE_SLOT_CONFLICT_TARGET`] (the v100
+/// partial index — a tombstone holds no slot, so a re-store beside it is a
+/// fresh row and never a write into the hidden one) and the DO UPDATE arm
+/// carries [`crate::models::title_slot_merge_backstop`] (a hidden occupant
+/// makes the merge update NOTHING, atomically, so the funnel's typed
+/// non-naming conflict holds even against a quarantine that raced the
+/// admission probe). `prepare_cached` keys on this text, so the format runs
+/// once per process and the statement is re-parsed once per connection.
+static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+             {conflict_target} DO UPDATE SET
+                -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
+                -- content-id + pre-image (self-assign, never the excluded
+                -- value): an upsert-merge mutates content but the memory's
+                -- GENESIS identity is fixed at creation.
+                cid = memories.cid,
+                cid_genesis = memories.cid_genesis,
+                content = excluded.content,
+                -- #228 Commit B — content + envelope move together on upsert so
+                -- a re-store under encryption replaces both the placeholder and
+                -- the ciphertext (and a re-store under encryption-off writes the
+                -- plaintext + NULL envelope, clearing any stale ciphertext).
+                encrypted_envelope = excluded.encrypted_envelope,
+                tags = excluded.tags,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = excluded.source,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = excluded.updated_at,
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(excluded.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap; under the v70 auto-eviction
+                -- posture that ALSO meant permanent link-edge loss — #3161 has
+                -- since closed that half, but a premature reap is still a
+                -- reap). Mirrors EXACTLY the shipped
+                -- #2335 federation extension-FLOOR lattice join (scalar MAX over
+                -- the COALESCE'd pair, both operands funnel-canonical per #2332):
+                -- the merge converges on the LATER expiry regardless of store
+                -- order. Long⇒NULL keeps the #1626 immortality coupling. EXPLICIT
+                -- shortening stays ONLY on the memory_update / db::update path.
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
+                -- #1784 — preserve immutable provenance keys (agent_id + the
+                -- consolidation derived_from / consolidated_from_agents arrays)
+                -- across upsert. json_patch overlays the existing row's
+                -- provenance object on top of excluded (existing-wins) and
+                -- preserves nested array values that the prior agent_id-only
+                -- json_set handled but the array keys would have double-encoded.
+                -- v1.0.0 #2941 — reserved set, lockstep-gated across all 13
+                -- preserve-sites on `crate::RESERVED_UPSERT_METADATA_KEYS`. Now
+                -- covers the agent-registration pubkey PAIR, whose absence let
+                -- an idempotent re-register silently unbind an agent's key and
+                -- downgrade every later signed write to `claimed`.
+                -- #3626 — and an UNSTAMPED existing row (missing / null / empty
+                -- agent_id, `owner_stamp::sqlite_unstamped_predicate`) stays
+                -- unstamped: the merged object has `agent_id` REMOVED, so the
+                -- incoming caller's id never claims a legacy-unowned row
+                -- (claiming stays `ai-memory reown`). The patch expression is
+                -- spelled twice because SQLite evaluates one CASE arm only.
+                metadata = CASE WHEN {unstamped_owner}
+                    THEN json_remove(json_patch(
+                        excluded.metadata,
+                        COALESCE(
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ), '$.agent_id')
+                    ELSE json_patch(
+                        excluded.metadata,
+                        COALESCE(
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ) END,
+                -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
+                -- so a subsequent reflection at higher depth doesn't lose its
+                -- provenance signal when re-stored at the same (title, namespace).
+                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+                -- v0.7.0 L1-1 — kind is sticky: once Reflection, always Reflection.
+                -- An upsert of an observation onto an existing reflection row must
+                -- not downgrade the kind (reflect is not reversible by re-store).
+                -- v0.7.0 QW-2 — Persona is also sticky once set; the engine
+                -- writes new versions via fresh rows under a unique
+                -- `__persona_<entity>_v<n>` title rather than upsert.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE excluded.memory_kind END,
+                -- v0.7.0 QW-2 — entity_id + persona_version stay attached to
+                -- the row they were minted with (Persona-kind upserts use
+                -- versioned titles so the conflict path is exercised only
+                -- on accidental same-title collisions).
+                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
+                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
+                -- v0.7.0 Form 4 — fact-provenance: when the incoming row
+                -- carries a non-empty citations array, replace the stored
+                -- value (caller re-asserted provenance); otherwise keep
+                -- the existing value (silent merge would lose freshly-cited
+                -- evidence). source_uri / source_span follow COALESCE
+                -- semantics so a new write that omits them does not blank
+                -- out existing provenance pointers.
+                citations = CASE WHEN excluded.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE excluded.citations END,
+                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
+                source_span = COALESCE(excluded.source_span, memories.source_span),
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC. `confidence` merges by MAX (above), so the
+                -- calibration record that DESCRIBES that number —
+                -- `confidence_source`, `confidence_signals`,
+                -- `confidence_decayed_at` — must come from the SAME operand
+                -- that won the MAX. Pre-#2395 the three provenance columns
+                -- used a DIFFERENT selector (explicit-non-default replaces /
+                -- COALESCE), so merging a stored (0.9, auto_derived, S1) with
+                -- an incoming (0.4, calibrated, S2) durably produced
+                -- `confidence = 0.9` labelled `calibrated` carrying S2 — a
+                -- value from one operand wearing another operand's label and
+                -- evidence. That is a self-inconsistent calibration record on
+                -- the durable tier (Form-5 semantics corrupted), and it is
+                -- silent: every downstream consumer of the pair reads it as
+                -- fact.
+                --
+                -- The selector below IS the MAX winner, applied as a unit:
+                --   * excluded.confidence > memories.confidence -> incoming tuple
+                --   * excluded.confidence < memories.confidence -> stored tuple
+                --   * EQUAL -> the pre-#2395 tie rule verbatim (an incoming
+                --     explicit non-`caller_provided` source replaces; a
+                --     default `caller_provided` keeps the stored provenance so
+                --     a plain re-store never blanks an auto-derived or
+                --     calibrated value) — except that it now carries the WHOLE
+                --     tuple rather than one column, which is the fix.
+                -- The `=`/`<`/`>` comparisons form a total order on the pair;
+                -- exact equality is only the tie BRANCH (if the two REALs are
+                -- not bit-identical, one is strictly greater), never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_source
+                                         WHEN excluded.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_source
+                                         ELSE memories.confidence_source END,
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_signals
+                                          WHEN excluded.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_decayed_at
+                                             WHEN excluded.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
+                -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
+                -- COALESCE keeps any pre-existing tag (re-write that
+                -- omits the structured entity_id metadata should NOT
+                -- blank out the indexed column) while letting a fresh
+                -- extraction populate previously-NULL rows.
+                mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
+                -- a plain re-store: the stored value wins so a re-store of an
+                -- already-`active`/`done` row does NOT reset it to the incoming
+                -- (typically `open`) initial state. Lifecycle ADVANCES go
+                -- through the typed `memory_update` transition gate, never a
+                -- silent upsert.
+                lifecycle_state = memories.lifecycle_state,
+                -- #1632 — upsert-merge IS a mutation (content/tags/priority
+                -- can change), so the Gap-1 optimistic-concurrency counter
+                -- bumps here exactly like db::update. Pre-#1632 a re-store
+                -- rewrote content while version stood still, so a stale
+                -- If-Match could overwrite the merge invisibly. The decay
+                -- sweep remains the only documented non-bumping mutator
+                -- (tests/non_version_bumping_sites_1036.rs).
+                version = memories.version + 1,
+                -- v1.0.0 (#1945) + v1.0.0 #2394 — the epistemic-typing
+                -- provenance FOLLOWS THE KIND THAT ACTUALLY WON. `memory_kind`
+                -- above is STICKY (a stored `reflection` / `persona` is never
+                -- downgraded), but the bare
+                -- `COALESCE(excluded.kind_provenance, memories.kind_provenance)`
+                -- adopted the incoming provenance unconditionally: a row stored
+                -- as `reflection` (kind_provenance = `declared`) that received
+                -- an upsert claiming `observation` via `llm` kept kind
+                -- `reflection` while relabelling its provenance `llm` — the
+                -- stored provenance then described a kind the merge REJECTED.
+                -- Downstream consumers (decorrelation, typed-cognition
+                -- analytics) read that as fact, so it is durable metadata
+                -- corruption, not a cosmetic skew.
+                --
+                -- The CASE mirrors the `memory_kind` CASE above exactly:
+                --   * kind UNCHANGED -> COALESCE (the #1945 rule: an incoming
+                --     carrier wins, an omitted one must not blank the marker);
+                --   * kind changed and the STORED kind survived (sticky
+                --     reflection / persona) -> keep the stored provenance;
+                --   * otherwise the INCOMING kind was adopted -> take its
+                --     provenance verbatim, NULL included (a provenance
+                --     describing the superseded kind would be a lie).
+                -- NULL-safe by construction: a NULL `memory_kind` fails both
+                -- WHENs and lands on the ELSE, which is the same operand the
+                -- `memory_kind` CASE picks.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
+                -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
+                -- IMMUTABLE once set (a correction is a supersede, not a mutation),
+                -- so the stored value always wins on upsert. `valid_until` is the
+                -- one caller-updatable bound (closing a claim), so a re-store that
+                -- carries a non-NULL upper bound sets it; else the existing value
+                -- is kept (COALESCE, matching the Form-4/5 provenance columns).
+                valid_from = memories.valid_from,
+                valid_until = COALESCE(excluded.valid_until, memories.valid_until)
+             {merge_backstop}
+             RETURNING id",
+        conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+        merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+        unstamped_owner =
+            crate::identity::owner_stamp::sqlite_unstamped_predicate("memories.metadata"),
+    )
+});
 
 fn insert_inner(
     conn: &Connection,
@@ -2113,13 +2355,82 @@ fn insert_inner(
         // `v` is the pre-supersede `version` the leaf records as `prior_version`
         // (the `db::update` convention). Under the `BEGIN IMMEDIATE` write lock
         // this read cannot race the upsert.
+        //
+        // #3690 / #3695 / #3626 — TITLE-SLOT ADMISSION, read BEFORE the
+        // statement from the ONE predicate (`LifecycleState::
+        // title_slot_admission`) the statement's conflict target and merge
+        // backstop also encode. `slot_holder` is the LIVE occupant of
+        // `(title, namespace)` (the v100 partial index excludes tombstones,
+        // so a tombstone is not a holder and the write lands beside it as a
+        // fresh, visible row — the #3690 fix). A holder that is hidden for a
+        // SECURITY reason (`quarantined` / `contaminated`, or a state this
+        // binary cannot read) keeps its slot and REFUSES every arm with a
+        // typed conflict whose `existing_id` is EMPTY — the funnel never
+        // names the hidden row (#3695), and never writes the local author's
+        // text into a peer-attributed row (#3626's laundering half). The
+        // statement re-asserts this atomically (`title_slot_merge_backstop`),
+        // so a quarantine that lands between this read and the write still
+        // updates nothing.
+        let slot_holder = title_slot_holder(conn, &mem.title, &mem.namespace)?;
+        if slot_holder
+            .as_ref()
+            .is_some_and(|h| h.admission == crate::models::TitleSlotAdmission::Refused)
+        {
+            return Err(ConflictError {
+                existing_id: String::new(),
+                title: mem.title.clone(),
+                namespace: mem.namespace.clone(),
+            }
+            .into());
+        }
+        // #2887 / #3690 (vote Q3) — a restore whose key is held by a DIFFERENT
+        // live row is refused up front, NAMING the visible holder (the CAS
+        // `AND memories.id = excluded.id` below is the atomic backstop for a
+        // holder that lands between this read and the write).
+        if let (InsertConflictArm::RestoreSameId, Some(holder)) = (conflict_arm, &slot_holder)
+            && holder.id != mem.id
+        {
+            return Err(ConflictError {
+                existing_id: holder.id.clone(),
+                title: mem.title.clone(),
+                namespace: mem.namespace.clone(),
+            }
+            .into());
+        }
+        // A row ALREADY stored under the incoming id, under this same key,
+        // that is not the holder — hidden. Only a RESTORE may write into a
+        // TOMBSTONE in place (the #2887 idempotent same-id restore, which
+        // keeps the row tombstoned: lifecycle advances go through the typed
+        // gate, never a re-store); a Merge / Refuse write into it is the
+        // #3690 defect shape (a store that lands in a hidden row and is never
+        // seen again) and is refused typed, and a hidden-for-security row is
+        // refused on every arm.
+        let same_id_hidden = if slot_holder.is_none() {
+            same_id_hidden_row_under_key(conn, mem)?
+        } else {
+            None
+        };
+        let restore_tombstone_by_id = match (&same_id_hidden, conflict_arm) {
+            (None, _) => false,
+            (Some(row), InsertConflictArm::RestoreSameId)
+                if row.admission == crate::models::TitleSlotAdmission::Free =>
+            {
+                true
+            }
+            (Some(_), _) => {
+                return Err(ConflictError {
+                    existing_id: String::new(),
+                    title: mem.title.clone(),
+                    namespace: mem.namespace.clone(),
+                }
+                .into());
+            }
+        };
         let prior_version_on_conflict: Option<i64> = if crate::config::append_only_enabled() {
-            conn.query_row(
-                "SELECT version FROM memories WHERE title = ?1 AND namespace = ?2",
-                params![mem.title, mem.namespace],
-                |r| r.get(0),
-            )
-            .optional()?
+            slot_holder
+                .as_ref()
+                .map(|h| h.version)
+                .or_else(|| same_id_hidden.as_ref().map(|r| r.version))
         } else {
             None
         };
@@ -2155,201 +2466,7 @@ fn insert_inner(
         // substrate (every store / upsert / capture-turn / federation push
         // lands here). `prepare_cached` skips the re-parse of this ~60-line
         // upsert on every call after the first.
-        let upsert_sql =
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
-             ON CONFLICT(title, namespace) DO UPDATE SET
-                -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
-                -- content-id + pre-image (self-assign, never the excluded
-                -- value): an upsert-merge mutates content but the memory's
-                -- GENESIS identity is fixed at creation.
-                cid = memories.cid,
-                cid_genesis = memories.cid_genesis,
-                content = excluded.content,
-                -- #228 Commit B — content + envelope move together on upsert so
-                -- a re-store under encryption replaces both the placeholder and
-                -- the ciphertext (and a re-store under encryption-off writes the
-                -- plaintext + NULL envelope, clearing any stale ciphertext).
-                encrypted_envelope = excluded.encrypted_envelope,
-                tags = excluded.tags,
-                priority = MAX(memories.priority, excluded.priority),
-                confidence = MAX(memories.confidence, excluded.confidence),
-                source = excluded.source,
-                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                            WHEN memories.tier = 'long' THEN 'long'
-                            WHEN excluded.tier = 'mid' THEN 'mid'
-                            ELSE memories.tier END,
-                updated_at = excluded.updated_at,
-                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
-                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
-                -- COALESCE(excluded.expires_at, memories.expires_at) adopted the
-                -- incoming row's expiry verbatim, so re-storing the same
-                -- (title, namespace) with an EARLIER expiry silently rolled a
-                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
-                -- violation (premature GC reap; under the v70 auto-eviction
-                -- posture that ALSO meant permanent link-edge loss — #3161 has
-                -- since closed that half, but a premature reap is still a
-                -- reap). Mirrors EXACTLY the shipped
-                -- #2335 federation extension-FLOOR lattice join (scalar MAX over
-                -- the COALESCE'd pair, both operands funnel-canonical per #2332):
-                -- the merge converges on the LATER expiry regardless of store
-                -- order. Long⇒NULL keeps the #1626 immortality coupling. EXPLICIT
-                -- shortening stays ONLY on the memory_update / db::update path.
-                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
-                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
-                -- #1784 — preserve immutable provenance keys (agent_id + the
-                -- consolidation derived_from / consolidated_from_agents arrays)
-                -- across upsert. json_patch overlays the existing row's
-                -- provenance object on top of excluded (existing-wins) and
-                -- preserves nested array values that the prior agent_id-only
-                -- json_set handled but the array keys would have double-encoded.
-                -- v1.0.0 #2941 — reserved set, lockstep-gated across all 13
-                -- preserve-sites on `crate::RESERVED_UPSERT_METADATA_KEYS`. Now
-                -- covers the agent-registration pubkey PAIR, whose absence let
-                -- an idempotent re-register silently unbind an agent's key and
-                -- downgrade every later signed write to `claimed`.
-                metadata = json_patch(
-                    excluded.metadata,
-                    COALESCE(
-                        (SELECT json_group_object(key, value)
-                         FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
-                        '{}'
-                    )
-                ),
-                -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
-                -- so a subsequent reflection at higher depth doesn't lose its
-                -- provenance signal when re-stored at the same (title, namespace).
-                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
-                -- v0.7.0 L1-1 — kind is sticky: once Reflection, always Reflection.
-                -- An upsert of an observation onto an existing reflection row must
-                -- not downgrade the kind (reflect is not reversible by re-store).
-                -- v0.7.0 QW-2 — Persona is also sticky once set; the engine
-                -- writes new versions via fresh rows under a unique
-                -- `__persona_<entity>_v<n>` title rather than upsert.
-                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
-                                   ELSE excluded.memory_kind END,
-                -- v0.7.0 QW-2 — entity_id + persona_version stay attached to
-                -- the row they were minted with (Persona-kind upserts use
-                -- versioned titles so the conflict path is exercised only
-                -- on accidental same-title collisions).
-                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
-                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
-                -- v0.7.0 Form 4 — fact-provenance: when the incoming row
-                -- carries a non-empty citations array, replace the stored
-                -- value (caller re-asserted provenance); otherwise keep
-                -- the existing value (silent merge would lose freshly-cited
-                -- evidence). source_uri / source_span follow COALESCE
-                -- semantics so a new write that omits them does not blank
-                -- out existing provenance pointers.
-                citations = CASE WHEN excluded.citations = '[]'
-                                 THEN memories.citations
-                                 ELSE excluded.citations END,
-                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
-                source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
-                -- ATOMIC. `confidence` merges by MAX (above), so the
-                -- calibration record that DESCRIBES that number —
-                -- `confidence_source`, `confidence_signals`,
-                -- `confidence_decayed_at` — must come from the SAME operand
-                -- that won the MAX. Pre-#2395 the three provenance columns
-                -- used a DIFFERENT selector (explicit-non-default replaces /
-                -- COALESCE), so merging a stored (0.9, auto_derived, S1) with
-                -- an incoming (0.4, calibrated, S2) durably produced
-                -- `confidence = 0.9` labelled `calibrated` carrying S2 — a
-                -- value from one operand wearing another operand's label and
-                -- evidence. That is a self-inconsistent calibration record on
-                -- the durable tier (Form-5 semantics corrupted), and it is
-                -- silent: every downstream consumer of the pair reads it as
-                -- fact.
-                --
-                -- The selector below IS the MAX winner, applied as a unit:
-                --   * excluded.confidence > memories.confidence -> incoming tuple
-                --   * excluded.confidence < memories.confidence -> stored tuple
-                --   * EQUAL -> the pre-#2395 tie rule verbatim (an incoming
-                --     explicit non-`caller_provided` source replaces; a
-                --     default `caller_provided` keeps the stored provenance so
-                --     a plain re-store never blanks an auto-derived or
-                --     calibrated value) — except that it now carries the WHOLE
-                --     tuple rather than one column, which is the fix.
-                -- The `=`/`<`/`>` comparisons form a total order on the pair;
-                -- exact equality is only the tie BRANCH (if the two REALs are
-                -- not bit-identical, one is strictly greater), never a logical
-                -- float-equality test.
-                confidence_source = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_source
-                                         WHEN excluded.confidence < memories.confidence THEN memories.confidence_source
-                                         WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_source
-                                         ELSE memories.confidence_source END,
-                confidence_signals = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_signals
-                                          WHEN excluded.confidence < memories.confidence THEN memories.confidence_signals
-                                          WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_signals
-                                          ELSE memories.confidence_signals END,
-                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_decayed_at
-                                             WHEN excluded.confidence < memories.confidence THEN memories.confidence_decayed_at
-                                             WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_decayed_at
-                                             ELSE memories.confidence_decayed_at END,
-                -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
-                -- COALESCE keeps any pre-existing tag (re-write that
-                -- omits the structured entity_id metadata should NOT
-                -- blank out the indexed column) while letting a fresh
-                -- extraction populate previously-NULL rows.
-                mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
-                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
-                -- a plain re-store: the stored value wins so a re-store of an
-                -- already-`active`/`done` row does NOT reset it to the incoming
-                -- (typically `open`) initial state. Lifecycle ADVANCES go
-                -- through the typed `memory_update` transition gate, never a
-                -- silent upsert.
-                lifecycle_state = memories.lifecycle_state,
-                -- #1632 — upsert-merge IS a mutation (content/tags/priority
-                -- can change), so the Gap-1 optimistic-concurrency counter
-                -- bumps here exactly like db::update. Pre-#1632 a re-store
-                -- rewrote content while version stood still, so a stale
-                -- If-Match could overwrite the merge invisibly. The decay
-                -- sweep remains the only documented non-bumping mutator
-                -- (tests/non_version_bumping_sites_1036.rs).
-                version = memories.version + 1,
-                -- v1.0.0 (#1945) + v1.0.0 #2394 — the epistemic-typing
-                -- provenance FOLLOWS THE KIND THAT ACTUALLY WON. `memory_kind`
-                -- above is STICKY (a stored `reflection` / `persona` is never
-                -- downgraded), but the bare
-                -- `COALESCE(excluded.kind_provenance, memories.kind_provenance)`
-                -- adopted the incoming provenance unconditionally: a row stored
-                -- as `reflection` (kind_provenance = `declared`) that received
-                -- an upsert claiming `observation` via `llm` kept kind
-                -- `reflection` while relabelling its provenance `llm` — the
-                -- stored provenance then described a kind the merge REJECTED.
-                -- Downstream consumers (decorrelation, typed-cognition
-                -- analytics) read that as fact, so it is durable metadata
-                -- corruption, not a cosmetic skew.
-                --
-                -- The CASE mirrors the `memory_kind` CASE above exactly:
-                --   * kind UNCHANGED -> COALESCE (the #1945 rule: an incoming
-                --     carrier wins, an omitted one must not blank the marker);
-                --   * kind changed and the STORED kind survived (sticky
-                --     reflection / persona) -> keep the stored provenance;
-                --   * otherwise the INCOMING kind was adopted -> take its
-                --     provenance verbatim, NULL included (a provenance
-                --     describing the superseded kind would be a lie).
-                -- NULL-safe by construction: a NULL `memory_kind` fails both
-                -- WHENs and lands on the ELSE, which is the same operand the
-                -- `memory_kind` CASE picks.
-                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
-                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
-                                       WHEN memories.memory_kind IN ('reflection', 'persona')
-                                            THEN memories.kind_provenance
-                                       ELSE excluded.kind_provenance END,
-                -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
-                -- IMMUTABLE once set (a correction is a supersede, not a mutation),
-                -- so the stored value always wins on upsert. `valid_until` is the
-                -- one caller-updatable bound (closing a claim), so a re-store that
-                -- carries a non-NULL upper bound sets it; else the existing value
-                -- is kept (COALESCE, matching the Form-4/5 provenance columns).
-                valid_from = memories.valid_from,
-                valid_until = COALESCE(excluded.valid_until, memories.valid_until)
-             RETURNING id";
+        let upsert_sql: &str = &INSERT_UPSERT_SQL;
         // #2771/#2887 — the column list + VALUES head + the whole DO UPDATE SET
         // arm are single-sourced from the ONE `upsert_sql` literal (above): each
         // non-`Merge` disposition is DERIVED from it, so a future column add lands
@@ -2367,17 +2484,35 @@ fn insert_inner(
         //     nothing (documented upsert semantics — the DO-NOTHING analogue) →
         //     the same typed ConflictError below, leaving the foreign row
         //     byte-identical. Closes the rollback probe-then-store lost-update.
+        //   * `RestoreSameId` against a same-id TOMBSTONE (#3690, vote Q3) —
+        //     the tombstone is NOT in the v100 partial index, so the key does
+        //     not conflict; the row conflicts on its PRIMARY KEY instead. The
+        //     SAME `DO UPDATE SET` arm is re-targeted `ON CONFLICT (id)` with
+        //     the visible-only merge backstop removed (the occupant is, by
+        //     construction, the caller's own tombstone), so the restore
+        //     merges in place exactly as before v100 and the row stays
+        //     tombstoned. Reached only when NO live row holds the key.
         let sql: std::borrow::Cow<'_, str> = match conflict_arm {
             InsertConflictArm::Merge => std::borrow::Cow::Borrowed(upsert_sql),
             InsertConflictArm::Refuse => {
                 let head = upsert_sql.split("ON CONFLICT").next().unwrap_or(upsert_sql);
-                std::borrow::Cow::Owned(
-                    [
-                        head,
-                        "ON CONFLICT(title, namespace) DO NOTHING\n             RETURNING id",
-                    ]
-                    .concat(),
-                )
+                std::borrow::Cow::Owned(format!(
+                    "{head}{} DO NOTHING\n             RETURNING id",
+                    crate::models::TITLE_SLOT_CONFLICT_TARGET
+                ))
+            }
+            InsertConflictArm::RestoreSameId if restore_tombstone_by_id => {
+                let body = upsert_sql
+                    .rsplit_once(crate::models::TITLE_SLOT_MERGE_BACKSTOP_HEAD)
+                    .map_or(upsert_sql, |(head, _)| head);
+                std::borrow::Cow::Owned(format!(
+                    "{}\n             RETURNING id",
+                    body.replacen(
+                        crate::models::TITLE_SLOT_CONFLICT_TARGET,
+                        "ON CONFLICT (id)",
+                        1
+                    )
+                ))
             }
             InsertConflictArm::RestoreSameId => {
                 let body = upsert_sql
@@ -2386,7 +2521,7 @@ fn insert_inner(
                 std::borrow::Cow::Owned(
                     [
                         body,
-                        "WHERE memories.id = excluded.id\n             RETURNING id",
+                        "AND memories.id = excluded.id\n             RETURNING id",
                     ]
                     .concat(),
                 )
@@ -2444,8 +2579,11 @@ fn insert_inner(
                 // RETURNed row). Refuse fail-closed with the typed conflict —
                 // NEVER overwrite. Re-probe for the occupant's id best-effort; a
                 // TOCTOU gap (winner deleted between the conflict and this read)
-                // degrades to an empty id, never a retry-as-create. `Merge` always
-                // RETURNs a row, so this branch is unreachable under it.
+                // degrades to an empty id, never a retry-as-create. #3690: `Merge`
+                // reaches here too when the occupant is HIDDEN (the
+                // `title_slot_merge_backstop` made the DO UPDATE fire on no
+                // row), and `find_by_title_namespace` answers only with a
+                // VISIBLE occupant, so the hidden row is never named (#3695).
                 let existing_id =
                     find_by_title_namespace(conn, &mem.title, &mem.namespace)?.unwrap_or_default();
                 return Err(ConflictError {
@@ -3752,6 +3890,22 @@ impl std::fmt::Display for InvalidTransition {
 }
 
 impl std::error::Error for InvalidTransition {}
+
+/// #3691 — a consolidation SOURCE stopped being caller-visible (quarantined
+/// / contaminated / tombstoned by another writer) between the curator's
+/// snapshot read and the tombstone write. Rendered as the SAME
+/// [`InvalidTransition`] shape both adapters already map to the HTTP 409
+/// CONFLICT body (`StoreError::InvalidTransition` on postgres), because that
+/// is what it is: a system move out of a hidden state is not a permitted
+/// transition. The cluster is aborted; every source stays as it is.
+#[must_use]
+pub fn consolidate_source_hidden(id: &str) -> InvalidTransition {
+    InvalidTransition {
+        id: id.to_string(),
+        from: crate::models::LifecycleState::Quarantined,
+        to: crate::models::LifecycleState::Tombstoned,
+    }
+}
 
 /// v0.8.0 Pillar 2 (#1709 / #1726) — persist a lifecycle-state transition
 /// on a single memory, ENFORCING the transition machine
@@ -8902,14 +9056,93 @@ pub fn find_by_title_namespace(
     namespace: &str,
 ) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
+    // #3690 / #3695 — answer with the caller-VISIBLE occupant only. A
+    // tombstone holds no slot at v100 (a store lands beside it), and a
+    // hidden `quarantined` / `contaminated` occupant is never NAMED to the
+    // caller: the write funnels refuse it with an empty `existing_id`, and
+    // this is the probe those funnels (and the `on_conflict` pre-checks)
+    // read it from, so it must not hand the hidden id back either.
     let id: Option<String> = conn
         .query_row(
-            "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 LIMIT 1",
+            &format!(
+                "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 {} LIMIT 1",
+                crate::models::lifecycle_visible_clause("")
+            ),
             params![title, namespace],
             |r| r.get(0),
         )
         .optional()?;
     Ok(id)
+}
+
+/// #3690 — the row that HOLDS the `(title, namespace)` slot (the occupant the
+/// v100 partial unique index knows about), with its admission derived ONCE
+/// from the lifecycle text the row carries. `None` when the slot is free —
+/// which includes "held only by a tombstone".
+struct TitleSlotHolder {
+    id: String,
+    version: i64,
+    admission: crate::models::TitleSlotAdmission,
+}
+
+fn title_slot_holder(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+) -> Result<Option<TitleSlotHolder>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        &format!(
+            "SELECT id, version, lifecycle_state FROM memories \
+             WHERE title = ?1 AND namespace = ?2 AND {} LIMIT 1",
+            crate::models::TITLE_SLOT_INDEX_PREDICATE
+        ),
+        params![title, namespace],
+        |r| {
+            let state: String = r.get(2)?;
+            Ok(TitleSlotHolder {
+                id: r.get(0)?,
+                version: r.get(1)?,
+                admission: crate::models::LifecycleState::title_slot_admission_for(&state),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// #3690 — the row already stored under the INCOMING id, when it holds the
+/// same `(title, namespace)` key the write is about to claim but is NOT the
+/// slot holder (so it is hidden: a tombstone, or a quarantined /
+/// contaminated row). A same-id write cannot land beside it (PRIMARY KEY),
+/// so the funnel decides by admission: a restore updates a tombstone IN
+/// PLACE ([`InsertConflictArm::RestoreSameId`], the #2887 idempotent
+/// restore), and every other disposition is a typed conflict that does not
+/// name the row. `None` when no row carries the id, or when the row carries
+/// the id under a DIFFERENT key (the pre-#3690 PRIMARY KEY error stands).
+struct SameIdHiddenRow {
+    version: i64,
+    admission: crate::models::TitleSlotAdmission,
+}
+
+fn same_id_hidden_row_under_key(
+    conn: &Connection,
+    mem: &Memory,
+) -> Result<Option<SameIdHiddenRow>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, String, i64, String)> = conn
+        .query_row(
+            "SELECT title, namespace, version, lifecycle_state FROM memories WHERE id = ?1",
+            params![mem.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(title, namespace, version, state)| {
+        (title == mem.title && namespace == mem.namespace).then(|| SameIdHiddenRow {
+            version,
+            admission: crate::models::LifecycleState::title_slot_admission_for(&state),
+        })
+    }))
 }
 
 /// v0.6.3.1 P2 (G6) — pick a title that does not collide with an existing
@@ -9026,7 +9259,12 @@ fn find_similar_title_candidates(
     limit: usize,
 ) -> Result<Vec<Memory>> {
     let fts_query = sanitize_fts_query(title, true);
-    let mut stmt = conn.prepare(
+    // #3693 — the fail-closed lifecycle allow-list (the #2600 precedent): a
+    // quarantined / contaminated / tombstoned row must reach neither the
+    // contradiction warning (its id would be reported to the caller) nor the
+    // Form-1 synthesis curator (its text would be merged into a visible
+    // memory, laundering the quarantine).
+    let mut stmt = conn.prepare(&format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
@@ -9036,10 +9274,11 @@ fn find_similar_title_candidates(
                 m.encrypted_envelope
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ?1 AND m.namespace = ?2
+         WHERE memories_fts MATCH ?1 AND m.namespace = ?2 {lifecycle_vis}
          ORDER BY fts.rank
          LIMIT ?3",
-    )?;
+        lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+    ))?;
     let rows = stmt.query_map(
         params![fts_query, namespace, i64::try_from(limit).unwrap_or(20)],
         // v1.0.0 #2383 (N1) — discovery scan: skip undecryptable rows.
@@ -10685,10 +10924,25 @@ pub fn consolidate(
                 // while keeping the row (and its cid) reachable as a lineage
                 // ancestor. Raw UPDATE — this is a system transition, not a
                 // caller-reachable `LifecycleState::can_transition_to` edge.
-                conn.execute(
-                    "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2 WHERE id = ?3",
+                // #3691 — the tombstone is GUARDED by the visible allow-list
+                // (built from `RECALL_VISIBLE_LIFECYCLE_STATES`, never hand-typed):
+                // a source that was quarantined / contaminated between the
+                // snapshot read above and this write keeps its security state
+                // — overwriting it with `tombstoned` would lose the taint and let
+                // a later rollback (#2894) make the row visible again. Zero
+                // rows affected aborts the WHOLE cluster: the error unwinds the
+                // enclosing transaction, so no summary row and no edge commit.
+                let tombstoned = conn.execute(
+                    &format!(
+                        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2 \
+                         WHERE id = ?3 {}",
+                        crate::models::lifecycle_visible_clause("")
+                    ),
                     params![crate::models::LifecycleState::Tombstoned.as_str(), now, id],
                 )?;
+                if tombstoned != 1 {
+                    return Err(consolidate_source_hidden(id).into());
+                }
             }
         } else {
             // LEGACY hard-DELETE path. We intentionally do NOT create
@@ -11542,15 +11796,19 @@ pub fn proactive_conflict_check(
     // gate (see the comment there) rather than relying on this one
     // transitively.
     let active_space = crate::embeddings::active_embedding_space();
-    let mut stmt = conn.prepare(
+    // #3693 — a hidden (quarantined / contaminated / tombstoned) row is never
+    // a conflict advisory's subject: its id would be named to the caller.
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, title, content, embedding FROM memories
          WHERE embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?1)
            AND namespace = ?2
            AND (?4 IS NULL OR embedding_space = ?4)
+           {lifecycle_vis}
          ORDER BY updated_at DESC
          LIMIT ?3",
-    )?;
+        lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+    ))?;
     let rows: Vec<(String, String, String, Vec<u8>)> = stmt
         .query_map(
             params![
@@ -11690,10 +11948,14 @@ pub fn proactive_conflict_check_candidates(
            AND embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?{p_now})
            AND namespace = ?{p_ns}
-           AND (?{p_space} IS NULL OR embedding_space = ?{p_space})",
+           AND (?{p_space} IS NULL OR embedding_space = ?{p_space})
+           {lifecycle_vis}",
         p_now = candidate_ids.len() + 1,
         p_ns = candidate_ids.len() + 2,
         p_space = candidate_ids.len() + 3,
+        // #3693 — the ANN index may still hold a row that was hidden after
+        // it was indexed; the row-side allow-list is the fail-closed gate.
+        lifecycle_vis = crate::models::lifecycle_visible_clause(""),
     );
     let mut stmt = conn.prepare(&sql)?;
     // Heterogeneous bind types (candidate ids + now + namespace are
@@ -17646,6 +17908,221 @@ pub(crate) fn export_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<
     })
 }
 
+/// #3690 — the ONE federation newer-wins literal, built ONCE: its conflict
+/// target is [`crate::models::TITLE_SLOT_CONFLICT_TARGET`] (the v100 partial
+/// index), so a local consolidation tombstone is not a merge target for an
+/// inbound row of a different id — the row lands beside it, visible. What
+/// the lane does with a HIDDEN holder, and with an inbound row whose ID is
+/// already local under a tombstone, is #3699's by-id newer-wins ruling.
+static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+             {conflict_target} DO UPDATE SET
+                -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
+                -- surviving local row's genesis content-id: keep the local
+                -- `cid` / `cid_genesis` (self-assign, not excluded) so
+                -- `federation_merge_preserves_local_cid` holds.
+                cid = memories.cid,
+                cid_genesis = memories.cid_genesis,
+                content = CASE WHEN excluded.updated_at > memories.updated_at
+                                 OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                               THEN excluded.content ELSE memories.content END,
+                -- #228 Commit B — the at-rest ciphertext envelope moves with
+                -- `content` under the IDENTICAL newer-wins tiebreak so the
+                -- placeholder and its ciphertext are never split across the
+                -- winner boundary (a winner's placeholder with the loser's
+                -- ciphertext would be undecryptable).
+                encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
+                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                          THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
+                tags = CASE WHEN excluded.updated_at > memories.updated_at
+                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                            THEN excluded.tags ELSE memories.tags END,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = CASE WHEN excluded.updated_at > memories.updated_at
+                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                              THEN excluded.source ELSE memories.source END,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = MAX(memories.updated_at, excluded.updated_at),
+                access_count = MAX(memories.access_count, excluded.access_count),
+                -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
+                -- column with NO newer-wins guard: the bare
+                -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
+                -- STALE losing peer's expiry verbatim, silently shortening a
+                -- live row's TTL (recall fold-extensions raise expires_at
+                -- WITHOUT bumping updated_at, so routine bidirectional sync
+                -- rolled local extensions back and GC reaped early — under the
+                -- v70 auto-eviction posture that ALSO meant permanent link-edge
+                -- loss, closed by #3161; the premature reap itself remains).
+                -- The merge is now the extension-FLOOR lattice join (scalar
+                -- MAX, both operands funnel-canonicalized per #2332 so byte
+                -- order is chronological): both replicas converge to the LATER
+                -- expiry regardless of push order (MAX is commutative /
+                -- idempotent — a true CRDT join, strictly stronger than the
+                -- updated_at tiebreak for this column), and the #1596
+                -- never-move-expiry-earlier contract holds across federation.
+                -- The long⇒NULL arm keeps the #1626 immortality coupling.
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
+                -- #1784 — preserve immutable provenance keys (agent_id + the
+                -- consolidation derived_from / consolidated_from_agents arrays)
+                -- across a newer-wins merge: json_patch overlays the existing
+                -- row's provenance object (existing-wins, array-safe) on top of
+                -- the newer-wins base (excluded if newer, else the existing row).
+                -- #3626 — an UNSTAMPED local row stays unstamped even when the
+                -- inbound row wins (same rule as the create funnel: the merged
+                -- object has `agent_id` removed; one CASE arm evaluates).
+                metadata = CASE WHEN {unstamped_owner}
+                    THEN json_remove(json_patch(
+                        CASE WHEN excluded.updated_at > memories.updated_at
+                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                             THEN excluded.metadata
+                             ELSE memories.metadata END,
+                        COALESCE(
+                            -- #2941 — same reserved set: a newer-wins federation
+                            -- merge must not unbind a locally-bound key.
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ), '$.agent_id')
+                    ELSE json_patch(
+                        CASE WHEN excluded.updated_at > memories.updated_at
+                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                             THEN excluded.metadata
+                             ELSE memories.metadata END,
+                        COALESCE(
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ) END,
+                -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
+                -- signal isn't lost on newer-wins federation merges.
+                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+                -- v0.7.0 L1-1 — kind is sticky across federation merges: a
+                -- reflection row must not be downgraded to observation by a
+                -- newer-wins merge from a peer that doesn't know about the kind.
+                -- v0.7.0 QW-2 — Persona is similarly sticky.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE excluded.memory_kind END,
+                -- v0.7.0 QW-2 — entity_id + persona_version are immutable
+                -- once set so a federation merge can't drop the persona
+                -- discriminator off a `memory_kind = 'persona'` row.
+                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
+                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
+                -- v0.7.0 Form 4 — fact-provenance: replace the stored
+                -- citations array only when the incoming row wins the
+                -- newer-wins tiebreak; source_uri / source_span follow
+                -- COALESCE semantics so a federation merge that lacks
+                -- provenance does not blank out a value the local row
+                -- already had.
+                citations = CASE WHEN excluded.updated_at > memories.updated_at
+                                      OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                 THEN excluded.citations ELSE memories.citations END,
+                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
+                source_span = COALESCE(excluded.source_span, memories.source_span),
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC on the federation lane too. `confidence` merges by
+                -- MAX (a commutative lattice join, above) while the three
+                -- provenance columns merged on the updated_at/id NEWER-WINS
+                -- tiebreak — a DIFFERENT selector, so a peer whose row lost
+                -- the MAX but won the timestamp durably relabelled the local
+                -- row: `confidence` from one replica, `confidence_source` /
+                -- `confidence_signals` / `confidence_decayed_at` from the
+                -- other. A self-inconsistent calibration record, converged to
+                -- identically on every peer, i.e. permanent.
+                --
+                -- The tuple now moves with the operand that wins the
+                -- LEXICOGRAPHIC order (confidence, updated_at, id) — whose
+                -- first component is exactly the MAX above, so the surviving
+                -- number and its calibration record always describe the same
+                -- write. The order is total and deterministic on both sides of
+                -- a bidirectional sync, so the merge stays commutative /
+                -- idempotent (a true CRDT join): both replicas converge on the
+                -- SAME tuple regardless of push order. Exact `=` on the REAL
+                -- is only the tie BRANCH of that total order, never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence
+                                              OR (excluded.confidence = memories.confidence
+                                                  AND (excluded.updated_at > memories.updated_at
+                                                       OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
+                                         THEN excluded.confidence_source ELSE memories.confidence_source END,
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence
+                                               OR (excluded.confidence = memories.confidence
+                                                   AND (excluded.updated_at > memories.updated_at
+                                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
+                                          THEN excluded.confidence_signals ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence
+                                                  OR (excluded.confidence = memories.confidence
+                                                      AND (excluded.updated_at > memories.updated_at
+                                                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
+                                             THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
+                -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
+                -- tag (the winning row's content is the one a future matcher
+                -- query expects to find); otherwise preserve the local tag
+                -- so a stale peer that lacks the structured entity_id
+                -- metadata cannot blank out a value the index serves.
+                mentioned_entity_id = CASE WHEN excluded.updated_at > memories.updated_at
+                                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                           THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
+                                           ELSE memories.mentioned_entity_id END,
+                -- #1631 (decide-once, #1029 contract) — `version` IS
+                -- replicated state on the federation merge path: merge via
+                -- MAX(local, remote) so an out-of-order peer push can't
+                -- roll the Gap-1 optimistic-concurrency counter backwards.
+                -- Matches the pg `apply_remote_memory` GREATEST arm.
+                version = MAX(memories.version, excluded.version),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
+                -- federation merge: the timestamp winner's state is adopted so
+                -- a peer that advanced a Goal open→done replicates that state;
+                -- a stale peer push (loses the tiebreak) preserves the local
+                -- lifecycle. Transition legality is enforced at the originating
+                -- update site, so the replicated value is already-validated.
+                lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
+                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                       THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+                -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
+                -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
+                -- federation lane too. `memory_kind` above is sticky (a local
+                -- `reflection` / `persona` is never downgraded by a peer that
+                -- does not know the kind), but the bare COALESCE adopted the
+                -- peer's provenance unconditionally — so a stale peer pushing
+                -- `observation`/`llm` relabelled a surviving local `reflection`
+                -- as `llm`-provenanced. The CASE mirrors the `memory_kind`
+                -- CASE exactly (kind unchanged -> COALESCE per FBL-03; stored
+                -- sticky kind survived -> keep the local provenance; incoming
+                -- kind adopted -> take its provenance verbatim), and is
+                -- NULL-safe by construction.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
+                -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
+                -- `valid_from` is immutable (local genesis wins, like `cid`);
+                -- `valid_until` follows the newer-wins tiebreak so a peer that
+                -- CLOSED a claim (set the upper bound) replicates that close.
+                valid_from = memories.valid_from,
+                valid_until = CASE WHEN excluded.updated_at > memories.updated_at
+                                     OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                   THEN excluded.valid_until ELSE memories.valid_until END
+             RETURNING id",
+        conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+        unstamped_owner =
+            crate::identity::owner_stamp::sqlite_unstamped_predicate("memories.metadata"),
+    )
+});
+
 /// Insert with timestamp-aware conflict resolution for sync.
 /// Only overwrites if the incoming memory is newer (by `updated_at`,
 /// tiebroken by memory.id for a total order across peers —
@@ -17800,193 +18277,13 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // #1579 B6 — federation catch-up replays this newer-wins upsert
         // once per pulled row; `prepare_cached` amortises the parse of the
         // largest SQL statement in the file across the whole batch.
-        let mut newer_wins_stmt = conn.prepare_cached(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
-             ON CONFLICT(title, namespace) DO UPDATE SET
-                -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
-                -- surviving local row's genesis content-id: keep the local
-                -- `cid` / `cid_genesis` (self-assign, not excluded) so
-                -- `federation_merge_preserves_local_cid` holds.
-                cid = memories.cid,
-                cid_genesis = memories.cid_genesis,
-                content = CASE WHEN excluded.updated_at > memories.updated_at
-                                 OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                               THEN excluded.content ELSE memories.content END,
-                -- #228 Commit B — the at-rest ciphertext envelope moves with
-                -- `content` under the IDENTICAL newer-wins tiebreak so the
-                -- placeholder and its ciphertext are never split across the
-                -- winner boundary (a winner's placeholder with the loser's
-                -- ciphertext would be undecryptable).
-                encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
-                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                          THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
-                tags = CASE WHEN excluded.updated_at > memories.updated_at
-                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                            THEN excluded.tags ELSE memories.tags END,
-                priority = MAX(memories.priority, excluded.priority),
-                confidence = MAX(memories.confidence, excluded.confidence),
-                source = CASE WHEN excluded.updated_at > memories.updated_at
-                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                              THEN excluded.source ELSE memories.source END,
-                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                            WHEN memories.tier = 'long' THEN 'long'
-                            WHEN excluded.tier = 'mid' THEN 'mid'
-                            ELSE memories.tier END,
-                updated_at = MAX(memories.updated_at, excluded.updated_at),
-                access_count = MAX(memories.access_count, excluded.access_count),
-                -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
-                -- column with NO newer-wins guard: the bare
-                -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
-                -- STALE losing peer's expiry verbatim, silently shortening a
-                -- live row's TTL (recall fold-extensions raise expires_at
-                -- WITHOUT bumping updated_at, so routine bidirectional sync
-                -- rolled local extensions back and GC reaped early — under the
-                -- v70 auto-eviction posture that ALSO meant permanent link-edge
-                -- loss, closed by #3161; the premature reap itself remains).
-                -- The merge is now the extension-FLOOR lattice join (scalar
-                -- MAX, both operands funnel-canonicalized per #2332 so byte
-                -- order is chronological): both replicas converge to the LATER
-                -- expiry regardless of push order (MAX is commutative /
-                -- idempotent — a true CRDT join, strictly stronger than the
-                -- updated_at tiebreak for this column), and the #1596
-                -- never-move-expiry-earlier contract holds across federation.
-                -- The long⇒NULL arm keeps the #1626 immortality coupling.
-                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
-                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
-                -- #1784 — preserve immutable provenance keys (agent_id + the
-                -- consolidation derived_from / consolidated_from_agents arrays)
-                -- across a newer-wins merge: json_patch overlays the existing
-                -- row's provenance object (existing-wins, array-safe) on top of
-                -- the newer-wins base (excluded if newer, else the existing row).
-                metadata = json_patch(
-                    CASE WHEN excluded.updated_at > memories.updated_at
-                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                         THEN excluded.metadata
-                         ELSE memories.metadata END,
-                    COALESCE(
-                        -- #2941 — same reserved set: a newer-wins federation
-                        -- merge must not unbind a locally-bound key.
-                        (SELECT json_group_object(key, value)
-                         FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
-                        '{}'
-                    )
-                ),
-                -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
-                -- signal isn't lost on newer-wins federation merges.
-                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
-                -- v0.7.0 L1-1 — kind is sticky across federation merges: a
-                -- reflection row must not be downgraded to observation by a
-                -- newer-wins merge from a peer that doesn't know about the kind.
-                -- v0.7.0 QW-2 — Persona is similarly sticky.
-                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
-                                   ELSE excluded.memory_kind END,
-                -- v0.7.0 QW-2 — entity_id + persona_version are immutable
-                -- once set so a federation merge can't drop the persona
-                -- discriminator off a `memory_kind = 'persona'` row.
-                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
-                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
-                -- v0.7.0 Form 4 — fact-provenance: replace the stored
-                -- citations array only when the incoming row wins the
-                -- newer-wins tiebreak; source_uri / source_span follow
-                -- COALESCE semantics so a federation merge that lacks
-                -- provenance does not blank out a value the local row
-                -- already had.
-                citations = CASE WHEN excluded.updated_at > memories.updated_at
-                                      OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                 THEN excluded.citations ELSE memories.citations END,
-                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
-                source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
-                -- ATOMIC on the federation lane too. `confidence` merges by
-                -- MAX (a commutative lattice join, above) while the three
-                -- provenance columns merged on the updated_at/id NEWER-WINS
-                -- tiebreak — a DIFFERENT selector, so a peer whose row lost
-                -- the MAX but won the timestamp durably relabelled the local
-                -- row: `confidence` from one replica, `confidence_source` /
-                -- `confidence_signals` / `confidence_decayed_at` from the
-                -- other. A self-inconsistent calibration record, converged to
-                -- identically on every peer, i.e. permanent.
-                --
-                -- The tuple now moves with the operand that wins the
-                -- LEXICOGRAPHIC order (confidence, updated_at, id) — whose
-                -- first component is exactly the MAX above, so the surviving
-                -- number and its calibration record always describe the same
-                -- write. The order is total and deterministic on both sides of
-                -- a bidirectional sync, so the merge stays commutative /
-                -- idempotent (a true CRDT join): both replicas converge on the
-                -- SAME tuple regardless of push order. Exact `=` on the REAL
-                -- is only the tie BRANCH of that total order, never a logical
-                -- float-equality test.
-                confidence_source = CASE WHEN excluded.confidence > memories.confidence
-                                              OR (excluded.confidence = memories.confidence
-                                                  AND (excluded.updated_at > memories.updated_at
-                                                       OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
-                                         THEN excluded.confidence_source ELSE memories.confidence_source END,
-                confidence_signals = CASE WHEN excluded.confidence > memories.confidence
-                                               OR (excluded.confidence = memories.confidence
-                                                   AND (excluded.updated_at > memories.updated_at
-                                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
-                                          THEN excluded.confidence_signals ELSE memories.confidence_signals END,
-                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence
-                                                  OR (excluded.confidence = memories.confidence
-                                                      AND (excluded.updated_at > memories.updated_at
-                                                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
-                                             THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
-                -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
-                -- tag (the winning row's content is the one a future matcher
-                -- query expects to find); otherwise preserve the local tag
-                -- so a stale peer that lacks the structured entity_id
-                -- metadata cannot blank out a value the index serves.
-                mentioned_entity_id = CASE WHEN excluded.updated_at > memories.updated_at
-                                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                           THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
-                                           ELSE memories.mentioned_entity_id END,
-                -- #1631 (decide-once, #1029 contract) — `version` IS
-                -- replicated state on the federation merge path: merge via
-                -- MAX(local, remote) so an out-of-order peer push can't
-                -- roll the Gap-1 optimistic-concurrency counter backwards.
-                -- Matches the pg `apply_remote_memory` GREATEST arm.
-                version = MAX(memories.version, excluded.version),
-                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
-                -- federation merge: the timestamp winner's state is adopted so
-                -- a peer that advanced a Goal open→done replicates that state;
-                -- a stale peer push (loses the tiebreak) preserves the local
-                -- lifecycle. Transition legality is enforced at the originating
-                -- update site, so the replicated value is already-validated.
-                lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
-                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                       THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
-                -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
-                -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
-                -- federation lane too. `memory_kind` above is sticky (a local
-                -- `reflection` / `persona` is never downgraded by a peer that
-                -- does not know the kind), but the bare COALESCE adopted the
-                -- peer's provenance unconditionally — so a stale peer pushing
-                -- `observation`/`llm` relabelled a surviving local `reflection`
-                -- as `llm`-provenanced. The CASE mirrors the `memory_kind`
-                -- CASE exactly (kind unchanged -> COALESCE per FBL-03; stored
-                -- sticky kind survived -> keep the local provenance; incoming
-                -- kind adopted -> take its provenance verbatim), and is
-                -- NULL-safe by construction.
-                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
-                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
-                                       WHEN memories.memory_kind IN ('reflection', 'persona')
-                                            THEN memories.kind_provenance
-                                       ELSE excluded.kind_provenance END,
-                -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
-                -- `valid_from` is immutable (local genesis wins, like `cid`);
-                -- `valid_until` follows the newer-wins tiebreak so a peer that
-                -- CLOSED a claim (set the upper bound) replicates that close.
-                valid_from = memories.valid_from,
-                valid_until = CASE WHEN excluded.updated_at > memories.updated_at
-                                     OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                   THEN excluded.valid_until ELSE memories.valid_until END
-             RETURNING id",
-        )?;
+        // #3690 — the conflict target is the v100 PARTIAL index
+        // (`TITLE_SLOT_CONFLICT_TARGET`): a local tombstone holds no slot, so
+        // an inbound row of a different id lands beside it instead of being
+        // merged into a row nothing can see. The federation-lane admission of
+        // a HIDDEN holder and the same-id-under-a-tombstone case are #3699's
+        // (the by-id newer-wins vote), not this arm's.
+        let mut newer_wins_stmt = conn.prepare_cached(&INSERT_IF_NEWER_SQL)?;
         let actual_id: String = newer_wins_stmt.query_row(
             params![
                 mem.id,
