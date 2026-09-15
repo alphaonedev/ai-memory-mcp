@@ -264,7 +264,10 @@ fn sqlite_notify_insert_failure_keeps_wire_errors_and_refunds_quota_3579() {
     let _identity = AgentIdOverride::set(CALLER);
     let err = ai_memory::mcp::handle_notify(&conn, &path, &body(), &ResolvedTtl::default(), None)
         .expect_err("insert must fail");
-    assert_eq!(err, "notify insert refused 3579");
+    // #3713 — the trigger's RAISE text is driver text: the MCP caller sees the
+    // storage class, exactly as the HTTP twin below already sees
+    // `invalid request`; the rollback + refund assertions are the contract.
+    assert_eq!(err, ai_memory::mcp::error_text::DB_ERROR_TEXT);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

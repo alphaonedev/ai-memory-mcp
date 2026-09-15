@@ -315,7 +315,8 @@ pub fn handle_capture_turn(
     // auto-index surface adds NO legacy String-typed handler signature
     // (QUAL-6 ratchet: new handlers must use `anyhow`/`MemoryError`). The
     // legacy MCP envelope keeps its `String` error via `Display`.
-    handle_capture_turn_inner(conn, params, caller_agent_id, false).map_err(|e| e.to_string())
+    handle_capture_turn_inner(conn, params, caller_agent_id, false)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_capture_turn_inner", e))
 }
 
 /// v1.0.0 #3587 U4 — auto-index twin of [`handle_capture_turn`] for the
@@ -358,7 +359,7 @@ fn capture_turn_write(
 ) -> anyhow::Result<Value> {
     let start = Instant::now();
     let req: MemoryCaptureTurnRequest = serde_json::from_value(params.clone())
-        .map_err(|e| anyhow::anyhow!("INVALID_INPUT: {e}"))?;
+        .map_err(|e| crate::errors::invalid_input(format!("INVALID_INPUT: {e}")))?;
 
     // v0.7.0 #1413 → v1.0.0 #3393 — the caller is the RESOLVED principal,
     // never a client-chosen string. MCP dispatch hands in the #3549
@@ -371,18 +372,18 @@ fn capture_turn_write(
     let resolved_caller: String = match caller_agent_id {
         Some(id) => {
             crate::validate::validate_agent_id_shape(id).map_err(|e| {
-                anyhow::anyhow!(
+                crate::errors::invalid_input(format!(
                     "INVALID_INPUT: caller {id:?} is not a usable agent identity ({e}); set \
                      AI_MEMORY_AGENT_ID (#3393)"
-                )
+                ))
             })?;
             id.to_string()
         }
         None => crate::identity::resolve_agent_id(None, None).map_err(|e| {
-            anyhow::anyhow!(
+            crate::errors::invalid_input(format!(
                 "INVALID_INPUT: caller identity could not be resolved ({e}); set \
                  AI_MEMORY_AGENT_ID (#3393)"
-            )
+            ))
         })?,
     };
     let caller = resolved_caller.as_str();
@@ -393,7 +394,9 @@ fn capture_turn_write(
     // dedup-lookup + atomic three-row transaction is the sqlite SSOT
     // `crate::storage::capture_turn_idempotent` (also reached by
     // `SqliteStore::capture_turn_idempotent` through the SAL trait).
-    let write = prepare_capture_turn(&req, caller).map_err(anyhow::Error::msg)?;
+    // #3713 — `prepare_capture_turn`'s errors are OUR slugs (`INVALID_INPUT:`,
+    // `HOST_PUBKEY_NOT_ENROLLED:`); a typed root keeps them on the wire.
+    let write = prepare_capture_turn(&req, caller).map_err(crate::errors::invalid_input)?;
     let attest_level = write.signed_event.attest_level.clone();
 
     // v0.7.0 H1 (HIGH) — write-gate parity for the mutating
@@ -447,7 +450,7 @@ fn capture_turn_write(
         let capability =
             crate::governance::capability::parse_presented_token(req.capability.as_deref(), caller)
                 .map_err(|rej| {
-                    anyhow::Error::msg(crate::governance::capability::edge_reject_message(&rej))
+                    crate::errors::refusal(crate::governance::capability::edge_reject_message(&rej))
                 })?;
         // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
         // consult BEFORE the governance decision dispatches.
@@ -457,7 +460,7 @@ fn capture_turn_write(
             caller,
             Some(&write.memory.id),
         )
-        .map_err(anyhow::Error::msg)?;
+        .map_err(crate::errors::refusal)?;
         match crate::db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -475,7 +478,7 @@ fn capture_turn_write(
                 // #3292 M7 — unowned-standard remedy: Owner + no resolvable
                 // ns owner must not lock capture_turn for every caller.
                 if !refusal.is_unowned_owner_lock() {
-                    return Err(anyhow::Error::msg(crate::governance::deny_message(
+                    return Err(crate::errors::refusal(crate::governance::deny_message(
                         ACTION_CAPTURE_TURN,
                         crate::governance::DenyGate::Governance,
                         &refusal.reason,

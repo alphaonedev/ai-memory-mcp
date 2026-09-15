@@ -105,7 +105,8 @@ pub fn handle_routine_create(conn: &rusqlite::Connection, params: &Value) -> Res
         metadata,
     };
 
-    crate::routines::routine_insert(conn, &r).map_err(|e| e.to_string())?;
+    crate::routines::routine_insert(conn, &r)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_insert", e))?;
 
     // #1722 — coordination observability: best-effort audit row for the
     // create, attributed to the creating agent (`created_by`, "" when
@@ -144,8 +145,8 @@ pub fn handle_routine_freeze(
         .ok_or_else(|| "id is required".to_string())?;
     let now = chrono::Utc::now().timestamp();
 
-    let frozen =
-        crate::routines::routine_freeze(conn, id, now, keypair).map_err(|e| e.to_string())?;
+    let frozen = crate::routines::routine_freeze(conn, id, now, keypair)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_freeze", e))?;
     match frozen {
         None => Err(format!("routine not found: {id}")),
         Some(r) => {
@@ -200,7 +201,7 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
 
     // (1) Load the routine; it must exist AND be frozen before a run.
     let routine = crate::routines::routine_get(conn, routine_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_get", e))?
         .ok_or_else(|| format!("routine not found: {routine_id}"))?;
     if routine.state != RoutineState::Frozen {
         return Err(crate::routines::ROUTINE_NOT_FROZEN.to_string());
@@ -223,7 +224,8 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         error: None,
         metadata: json!({"agent_id": actor}),
     };
-    let run_id = crate::routines::run_insert(conn, &run).map_err(|e| e.to_string())?;
+    let run_id = crate::routines::run_insert(conn, &run)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("run_insert", e))?;
 
     // #1722 — coordination observability: best-effort audit row for the run,
     // attributed to the admitted caller, also used for actions and quota.
@@ -248,9 +250,9 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
                 None,
                 Some(&err),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?;
             Ok(json!({
-                (RESP_RUN): serde_json::to_value(&failed).map_err(|e| e.to_string())?,
+                (RESP_RUN): serde_json::to_value(&failed).map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?,
                 "error": err,
             }))
         }
@@ -264,9 +266,9 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
                 Some(&ids_json),
                 None,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?;
             Ok(json!({
-                (RESP_RUN): serde_json::to_value(&completed).map_err(|e| e.to_string())?,
+                (RESP_RUN): serde_json::to_value(&completed).map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?,
                 "created_action_ids": ids_json,
             }))
         }
@@ -288,7 +290,8 @@ pub fn handle_routine_status(conn: &rusqlite::Connection, params: &Value) -> Res
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "run_id is required".to_string())?;
-    let found = crate::routines::run_get(conn, run_id).map_err(|e| e.to_string())?;
+    let found = crate::routines::run_get(conn, run_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("run_get", e))?;
     Ok(json!({
         (RESP_RUN): match found {
             Some(r) => serde_json::to_value(&r).map_err(|e| e.to_string())?,
@@ -317,8 +320,8 @@ pub fn handle_routine_list(conn: &rusqlite::Connection, params: &Value) -> Resul
         .unwrap_or(50);
     let limit = usize::try_from(limit).unwrap_or(50);
 
-    let routines =
-        crate::routines::routine_list(conn, namespace, state, limit).map_err(|e| e.to_string())?;
+    let routines = crate::routines::routine_list(conn, namespace, state, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_list", e))?;
     Ok(json!({
         "routines": serde_json::to_value(&routines).map_err(|e| e.to_string())?,
     }))

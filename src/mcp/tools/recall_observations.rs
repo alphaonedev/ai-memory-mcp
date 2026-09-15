@@ -41,7 +41,7 @@ pub fn handle_recall_observations(
         .map_or(DEFAULT_LIMIT, |n| n.min(MAX_LIMIT));
 
     let rows = observations::list_observations(conn, recall_id, consumed, since, until, limit)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_observations", e))?;
     let count = rows.len();
     Ok(json!({
         (crate::models::field_names::OBSERVATIONS): rows,

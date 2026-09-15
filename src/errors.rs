@@ -65,6 +65,16 @@ pub mod error_codes {
     /// matched no allowlisted classifier arm. Paired with the #851 sanitized
     /// `"internal error"` label so no raw substrate text reaches the wire.
     pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+    /// #3713 — the three FOREIGN-CLASS `MemoryError` variants (a filesystem
+    /// op, an LLM / curator call, a codec) whose payload is OPERATOR-ONLY
+    /// detail: the MCP funnel renders each as a constant, never its text.
+    pub const FILESYSTEM_ERROR: &str = "FILESYSTEM_ERROR";
+    pub const LLM_ERROR: &str = "LLM_ERROR";
+    pub const CODEC_ERROR: &str = "CODEC_ERROR";
+    /// #3713 — an own-vocabulary refusal that already carries its wire slug
+    /// in its text (`ATTESTATION_FAILED: …`, a governance deny message, an
+    /// offload integrity verdict). Passes through every surface verbatim.
+    pub const REFUSED: &str = "REFUSED";
 
     // ---- StorageError-side (substrate-facing) -------------------------------
     pub const PENDING_ACTION_NOT_FOUND: &str = "PENDING_ACTION_NOT_FOUND";
@@ -732,9 +742,51 @@ pub enum MemoryError {
     /// (`"<action> denied by governance: <reason>"`), byte-identical to
     /// the pre-#963 free-form `Deny(String)` wire shape.
     RefusedByGovernanceGate(crate::governance::GovernanceRefusal),
+    /// #3713 — a `std::fs` / `std::io` failure (skill import/export,
+    /// transcript reads). The payload is the io error's text and is
+    /// OPERATOR-ONLY: the MCP funnel (`crate::mcp::error_text`) renders this
+    /// variant as a constant, because an io message can name the operator's
+    /// resolved path.
+    Filesystem(String),
+    /// #3713 — an LLM / curator round-trip failed (auto-tag, consolidate
+    /// summarisation, atomise). The payload is BOUNDED OWN text, not foreign:
+    /// the LLM client never retains a provider body or an arbitrary
+    /// downstream error source (#3648, `llm::ProviderError`), and the curator
+    /// wraps only that client's text or a serde line/column diagnostic. So
+    /// the MCP funnel passes it through — a caller told "provider X: http
+    /// 401" can act on it; a constant would be a flatten (property 3).
+    Llm(String),
+    /// #3713 — a codec failure (zstd, serde). OPERATOR-ONLY payload.
+    Codec(String),
+    /// #3713 — an OWN-VOCABULARY refusal whose text already carries its wire
+    /// slug (`ATTESTATION_FAILED: …`, `<action> denied by governance: …`, an
+    /// offload integrity / signature verdict). It exists so a refusal that
+    /// used to ride an `anyhow` chain as a bare string has a TYPED ROOT the
+    /// `From<anyhow>` classifier can see — otherwise the MCP funnel would
+    /// flatten it to the storage constant (property 3 of the #3713 ruling).
+    /// Build one with [`refusal`].
+    Refused(String),
+    /// #3713 — a per-agent quota refusal (`QuotaCheckError::Quota`). OUR OWN
+    /// closed vocabulary: the caller needs the limit name and the numbers, so
+    /// the MCP funnel passes it through unchanged (wire slug
+    /// `QUOTA_EXCEEDED`, the same code the HTTP 429 envelope carries).
+    QuotaExceeded(crate::quotas::QuotaError),
 }
 
 impl MemoryError {
+    /// #3713 — is this a FOREIGN-CLASS variant, i.e. one whose payload is a
+    /// driver / io / codec `Display` that belongs to the OPERATOR and must
+    /// never be rendered to a caller? The other variants — including `Llm`,
+    /// whose text is bounded at the client boundary (#3648) — carry our own
+    /// closed vocabulary and pass through the MCP funnel unchanged.
+    #[must_use]
+    pub fn is_foreign_class(&self) -> bool {
+        matches!(
+            self,
+            Self::DatabaseError(_) | Self::Filesystem(_) | Self::Codec(_)
+        )
+    }
+
     pub fn code(&self) -> &'static str {
         // ARCH-9 (FX-C4-batch2, 2026-05-26): each arm returns a slug
         // from the shared `error_codes` const set so cross-surface
@@ -751,6 +803,11 @@ impl MemoryError {
             Self::RefusedByGovernance(_) | Self::RefusedByGovernanceGate(_) => {
                 error_codes::GOVERNANCE_REFUSED
             }
+            Self::Filesystem(_) => error_codes::FILESYSTEM_ERROR,
+            Self::Llm(_) => error_codes::LLM_ERROR,
+            Self::Codec(_) => error_codes::CODEC_ERROR,
+            Self::QuotaExceeded(_) => error_codes::QUOTA_EXCEEDED,
+            Self::Refused(_) => error_codes::REFUSED,
         }
     }
 
@@ -758,7 +815,9 @@ impl MemoryError {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::ValidationFailed(_) => StatusCode::BAD_REQUEST,
-            Self::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::DatabaseError(_) | Self::Filesystem(_) | Self::Llm(_) | Self::Codec(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             // The substrate refusal is a policy-conflict (caller asked
             // for an action the configured cap forbids); CONFLICT matches
             // the rest of governance-style refusals.
@@ -775,6 +834,8 @@ impl MemoryError {
             Self::RefusedByGovernance(_) | Self::RefusedByGovernanceGate(_) => {
                 StatusCode::FORBIDDEN
             }
+            Self::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::Refused(_) => StatusCode::FORBIDDEN,
         }
     }
 
@@ -783,7 +844,11 @@ impl MemoryError {
             Self::NotFound(m)
             | Self::ValidationFailed(m)
             | Self::DatabaseError(m)
-            | Self::Conflict(m) => m.clone(),
+            | Self::Conflict(m)
+            | Self::Filesystem(m)
+            | Self::Llm(m)
+            | Self::Codec(m)
+            | Self::Refused(m) => m.clone(),
             Self::ReflectionDepthExceeded {
                 attempted,
                 cap,
@@ -818,6 +883,7 @@ impl MemoryError {
             // directly so the HTTP / MCP / CLI surfaces emit the same
             // wire string they did before the typed envelope landed.
             Self::RefusedByGovernanceGate(refusal) => refusal.to_string(),
+            Self::QuotaExceeded(q) => q.to_string(),
         }
     }
 }
@@ -838,8 +904,74 @@ impl std::fmt::Display for MemoryError {
     }
 }
 
+/// #3713 — give an own-vocabulary refusal a TYPED ROOT on an `anyhow` chain.
+///
+/// `anyhow::anyhow!("ATTESTATION_FAILED: …")` produces a string error the
+/// [`MemoryError`] classifier cannot tell from a driver's text, so the MCP
+/// funnel would flatten it. `Err(refusal("…"))` keeps the same `Display`
+/// (`{e}` and `{e:#}` are byte-identical) and classifies as
+/// [`MemoryError::Refused`], which passes through verbatim.
+pub fn refusal(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(OwnText::Refusal(msg.into()))
+}
+
+/// #3713 — the [`refusal`] twin for the caller's OWN bad input
+/// (`INVALID_INPUT: …`): classifies as [`MemoryError::ValidationFailed`].
+pub fn invalid_input(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(OwnText::InvalidInput(msg.into()))
+}
+
+/// #3713 — the typed root [`refusal`] / [`invalid_input`] plant on an `anyhow`
+/// chain. Its `Display` is the bare message, so a chain that used to be
+/// `anyhow!("…")` renders byte-identically everywhere it is still rendered
+/// as text (CLI, logs); only the classifier below reads the variant.
+#[derive(Debug)]
+pub enum OwnText {
+    /// An own-vocabulary refusal → [`MemoryError::Refused`].
+    Refusal(String),
+    /// The caller's own bad input → [`MemoryError::ValidationFailed`].
+    InvalidInput(String),
+}
+
+impl std::fmt::Display for OwnText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refusal(m) | Self::InvalidInput(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for OwnText {}
+
 impl From<anyhow::Error> for MemoryError {
     fn from(e: anyhow::Error) -> Self {
+        // #3713 — a chain whose root was planted by `refusal` /
+        // `invalid_input` is our own text; nothing to classify.
+        if let Some(own) = e.downcast_ref::<OwnText>() {
+            return match own {
+                OwnText::Refusal(m) => Self::Refused(m.clone()),
+                OwnText::InvalidInput(m) => Self::ValidationFailed(m.clone()),
+            };
+        }
+        // #3713 — the optimistic-concurrency conflict (`memory_update`'s
+        // `expected_version`) is our own typed root; keep its text.
+        if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {
+            return Self::Conflict(vc.to_string());
+        }
+        // #3713 — the offload store's typed verdicts (`anyhow!(OffloadError)`
+        // keeps the concrete type downcastable): not-found stays a
+        // not-found, the policy cap is the caller's input, and a failed
+        // integrity / signature check is a refusal — all our own text.
+        if let Some(oe) = e.downcast_ref::<crate::offload::OffloadError>() {
+            use crate::offload::OffloadError as OE;
+            return match oe {
+                OE::NotFound { .. } => Self::NotFound(oe.to_string()),
+                OE::SizeLimitExceeded { .. } => Self::ValidationFailed(oe.to_string()),
+                OE::IntegrityFailed { .. } | OE::SignatureFailed { .. } => {
+                    Self::Refused(oe.to_string())
+                }
+            };
+        }
         // v0.7.0 L1-6 Deliverable E — promote a substrate-layer
         // `GovernanceRefusal` wrapped in `anyhow::Error` (the shape
         // emitted by `storage::insert*` when the pre-write hook fires)
@@ -905,6 +1037,42 @@ impl From<anyhow::Error> for MemoryError {
 impl From<rusqlite::Error> for MemoryError {
     fn from(e: rusqlite::Error) -> Self {
         Self::DatabaseError(e.to_string())
+    }
+}
+
+/// #3713 — a filesystem failure lands in the OPERATOR-ONLY `Filesystem`
+/// class (never `DatabaseError`, so the MCP funnel's constant names the
+/// right subsystem and an io message can never be mistaken for a store one).
+impl From<std::io::Error> for MemoryError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Filesystem(e.to_string())
+    }
+}
+
+/// #3713 — a serde failure is a codec failure (OPERATOR-ONLY class).
+impl From<serde_json::Error> for MemoryError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Codec(e.to_string())
+    }
+}
+
+/// #3713 — a quota check splits into OUR refusal (pass-through) and the
+/// substrate read that failed underneath it (foreign, classified like any
+/// other `anyhow` chain).
+impl From<crate::quotas::QuotaCheckError> for MemoryError {
+    fn from(e: crate::quotas::QuotaCheckError) -> Self {
+        match e {
+            crate::quotas::QuotaCheckError::Quota(q) => Self::QuotaExceeded(q),
+            crate::quotas::QuotaCheckError::Sql(inner) => Self::from(inner),
+        }
+    }
+}
+
+/// #3713 — a content-patch shape error is the CALLER'S own input rejected in
+/// our own words (`Empty` / `MultipleOps` / `ReplaceIncomplete`).
+impl From<crate::content_patch::PatchError> for MemoryError {
+    fn from(e: crate::content_patch::PatchError) -> Self {
+        Self::ValidationFailed(e.to_string())
     }
 }
 

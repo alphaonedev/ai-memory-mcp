@@ -1383,7 +1383,7 @@ pub fn handle_recall_dto(
                     // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
                     valid_at,
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_recall_dto", e))?;
                 let results = crate::cli::recall::apply_form4_recall_filters(
                     results,
                     has_citations_filter,
@@ -1506,7 +1506,7 @@ pub fn handle_recall_dto(
         caller,
         valid_at,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_recall_dto", e))?;
     let results = crate::cli::recall::apply_form4_recall_filters(
         results,
         has_citations_filter,

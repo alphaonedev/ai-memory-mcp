@@ -108,7 +108,7 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
 
     Ok(json!({
         (param_names::ID): id,
-        "action": serde_json::to_value(&action).map_err(|e| e.to_string())?,
+        "action": serde_json::to_value(&action).map_err(|e| crate::mcp::error_text::mcp_foreign_err("to_value", e))?,
     }))
 }
 
@@ -127,7 +127,8 @@ pub fn handle_action_get(conn: &rusqlite::Connection, params: &Value) -> Result<
     // id" was indistinguishable from "no such action". Refuse (ERRORS-08); a
     // well-formed id that names no row still reports `null`.
     let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
-    let found = crate::actions::get(conn, id).map_err(|e| e.to_string())?;
+    let found = crate::actions::get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
     let action = match found {
         Some(a) => serde_json::to_value(&a).map_err(|e| e.to_string())?,
         None => Value::Null,
@@ -186,11 +187,12 @@ pub fn handle_action_transition(
     // (`transition` writes the literal `SET claimed_by = ?`). The lease is now
     // consulted UNCONDITIONALLY and the shared control decides — it takes
     // `Option<&str>` precisely so no funnel can forget to ask.
-    let lease = crate::actions::lease_get(conn, id).map_err(|e| e.to_string())?;
+    let lease = crate::actions::lease_get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lease_get", e))?;
     crate::actions::authorize_claimed_by(claimed_by.as_deref(), lease.as_ref(), now, id)?;
 
     match crate::actions::transition(conn, id, to, claimed_by.as_deref(), now)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
     {
         crate::actions::TransitionOutcome::NotFound => Err(format!("action not found: {id}")),
         crate::actions::TransitionOutcome::Illegal { from, to } => {
@@ -243,7 +245,8 @@ pub fn handle_action_list(conn: &rusqlite::Connection, params: &Value) -> Result
         .unwrap_or(50);
     let limit = usize::try_from(limit).unwrap_or(50);
 
-    let actions = crate::actions::list(conn, namespace, state, limit).map_err(|e| e.to_string())?;
+    let actions = crate::actions::list(conn, namespace, state, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list", e))?;
     Ok(json!({
         "actions": serde_json::to_value(&actions).map_err(|e| e.to_string())?,
     }))
@@ -279,7 +282,7 @@ pub fn handle_action_add_edge(
     // #3008 — refuse a self-edge / ordering-cycle edge (both permanently wedge
     // the frontier) instead of silently accepting it.
     match crate::actions::add_edge(conn, from_action, to_action, edge_type, now)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("add_edge", e))?
     {
         crate::actions::AddEdgeOutcome::SelfEdge => {
             return Err(format!(
@@ -323,7 +326,8 @@ pub fn handle_action_edges(conn: &rusqlite::Connection, params: &Value) -> Resul
     // "this action has no dependencies" — the one answer a DAG scheduler must
     // never be given wrongly. Refuse instead.
     let action_id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
-    let edges = crate::actions::edges_for(conn, action_id).map_err(|e| e.to_string())?;
+    let edges = crate::actions::edges_for(conn, action_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("edges_for", e))?;
     Ok(json!({
         "edges": serde_json::to_value(&edges).map_err(|e| e.to_string())?,
     }))
@@ -367,7 +371,8 @@ pub fn handle_action_frontier(
         .and_then(Value::as_i64)
         .unwrap_or(20);
     let limit = usize::try_from(limit).unwrap_or(20);
-    let actions = crate::actions::frontier(conn, namespace, limit).map_err(|e| e.to_string())?;
+    let actions = crate::actions::frontier(conn, namespace, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("frontier", e))?;
     Ok(json!({
         "actions": serde_json::to_value(&actions).map_err(|e| e.to_string())?,
     }))
@@ -395,8 +400,8 @@ pub fn handle_action_next(conn: &rusqlite::Connection, params: &Value) -> Result
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let found =
-        crate::actions::next_action(conn, namespace, agent_id).map_err(|e| e.to_string())?;
+    let found = crate::actions::next_action(conn, namespace, agent_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("next_action", e))?;
     let action = match found {
         Some(a) => serde_json::to_value(&a).map_err(|e| e.to_string())?,
         None => Value::Null,
@@ -502,7 +507,7 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
     // raw `leases.action_id` FK-constraint violation; return the typed
     // not-found instead (mirrors `handle_action_transition`'s not-found shape).
     if crate::actions::get(conn, action_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
         .is_none()
     {
         return Err(format!("action not found: {action_id}"));
@@ -512,7 +517,7 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
         .checked_add(ttl_secs)
         .ok_or_else(|| crate::coordination_guard::TTL_SECS_OVERFLOW.to_string())?;
     match crate::actions::lease_acquire(conn, action_id, holder, now, expires_at)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lease_acquire", e))?
     {
         crate::actions::LeaseAcquire::Conflict => Err(format!(
             "lease conflict: {action_id} held by another holder"
@@ -563,7 +568,7 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
         .checked_add(ttl_secs)
         .ok_or_else(|| crate::coordination_guard::TTL_SECS_OVERFLOW.to_string())?;
     match crate::actions::lease_renew(conn, action_id, holder, now, expires_at)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lease_renew", e))?
     {
         None => Err(format!("no lease held by {holder} on {action_id}")),
         Some(l) => {
@@ -599,8 +604,8 @@ pub fn handle_lease_release(conn: &rusqlite::Connection, params: &Value) -> Resu
     // exclusive lease. Bind it to the caller principal.
     let holder = resolve_lease_holder(params, "release a lease")?;
     let holder = holder.as_str();
-    let released =
-        crate::actions::lease_release(conn, action_id, holder).map_err(|e| e.to_string())?;
+    let released = crate::actions::lease_release(conn, action_id, holder)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lease_release", e))?;
 
     // #1722 — coordination observability: best-effort audit row for the
     // release, attributed to the lease `holder`. Only emit when a row was
@@ -629,7 +634,8 @@ pub fn handle_lease_get(conn: &rusqlite::Connection, params: &Value) -> Result<V
     // no lease on that action", which is a different claim from "you did not
     // name an action".
     let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
-    let found = crate::actions::lease_get(conn, action_id).map_err(|e| e.to_string())?;
+    let found = crate::actions::lease_get(conn, action_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lease_get", e))?;
     // #3367 — an EXPIRED lease must not read as LIVE. `lease_get` returns the row
     // regardless of expiry; a lapsed lease (`expires_at <= now`) is reported as
     // absent (`null`) — the same view the next frontier/next/acquire sweep produces

@@ -203,8 +203,13 @@ pub(super) fn handle_link(
         // during the cycle walk. Propagate the rusqlite err as a
         // refusal envelope so the caller surfaces the failure instead
         // of silently landing a possibly-cycle-creating edge.
-        let check = would_create_reflection_cycle(conn, source_id, target_id, max_depth)
-            .map_err(|e| format!("reflection cycle check failed (#1090 fail-CLOSED): {e}"))?;
+        let check =
+            would_create_reflection_cycle(conn, source_id, target_id, max_depth).map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err(
+                    "reflection cycle check failed (#1090 fail-CLOSED)",
+                    e,
+                )
+            })?;
         if check.would_cycle {
             // Append refusal to signed_events (best-effort; log on failure).
             let refusal_payload = serde_json::json!({
@@ -330,7 +335,7 @@ pub(super) fn handle_link(
             &link_namespace,
             crate::quotas::QuotaOp::Link,
         ) {
-            return Err(e.to_string());
+            return Err(crate::mcp::error_text::mcp_foreign_err("handle_link", e));
         }
     }
 
@@ -356,7 +361,7 @@ pub(super) fn handle_link(
                         crate::quotas::log_refund_op_failed(aid, &re);
                     }
                 }
-                return Err(e.to_string());
+                return Err(crate::mcp::error_text::mcp_foreign_err("handle_link", e));
             }
         };
 
@@ -518,14 +523,16 @@ pub(super) fn handle_get_links(
     // shape an unknown id yields when the caller cannot see the anchor — so it
     // cannot confirm a private row's existence or enumerate its neighbors.
     // #3498: the anchor is explicit; other endpoints are ambient reads.
-    let resolved = db::resolve_id(conn, id).map_err(|e| e.to_string())?;
+    let resolved = db::resolve_id(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_id", e))?;
     if let Some(mem) = resolved.as_ref() {
         if !crate::visibility::is_readable_on_query(mem, caller, Some(&mem.namespace)) {
             return Ok(json!({"links": [], "count": 0}));
         }
     }
     let anchor = resolved.as_ref().map_or(id, |m| m.id.as_str());
-    let mut links = db::get_links(conn, anchor).map_err(|e| e.to_string())?;
+    let mut links = db::get_links(conn, anchor)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get_links", e))?;
     links.retain(|link| {
         [&link.source_id, &link.target_id].into_iter().all(|id| {
             matches!(db::get_any(conn, id), Ok(Some(mem))

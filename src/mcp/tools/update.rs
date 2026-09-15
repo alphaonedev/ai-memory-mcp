@@ -173,7 +173,7 @@ pub(super) fn handle_update(
     let mut receipt = handle_update_inner(conn, params, embedder, vector_index, mcp_client)?;
     crate::write_receipt::WriteDurability::sqlite(conn)
         .and_then(|durability| durability.attach(&mut receipt))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| crate::mcp::error_text::mcp_foreign_err("attach", error))?;
     Ok(receipt)
 }
 
@@ -190,9 +190,14 @@ fn handle_update_inner(
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     // Resolve prefix if exact ID not found
-    let resolved_id = if db::get(conn, id).map_err(|e| e.to_string())?.is_some() {
+    let resolved_id = if db::get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("validate_id", e))?
+        .is_some()
+    {
         id.to_string()
-    } else if let Some(mem) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
+    } else if let Some(mem) = db::get_by_prefix(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    {
         mem.id
     } else {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
@@ -250,19 +255,23 @@ fn handle_update_inner(
             return Err("content cannot be combined with content_append/content_replace_* (full replacement and patch are mutually exclusive)".into());
         }
         let current = db::get(conn, &resolved_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
         if let Some(expected) = expected_version
             && expected != current.version
         {
-            return Err(conflict_or_string(&anyhow::Error::new(VersionConflict {
+            return Err(conflict_or_string(anyhow::Error::new(VersionConflict {
                 id: resolved_id.clone(),
                 expected,
                 current: current.version,
             })));
         }
         expected_version = Some(current.version);
-        Some(patch.apply(&current.content).map_err(|e| e.to_string())?)
+        Some(
+            patch
+                .apply(&current.content)
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("apply", e))?,
+        )
     } else {
         None
     };
@@ -298,7 +307,7 @@ fn handle_update_inner(
     // mirrors the HTTP `PUT /memories/{id}` gate (#954).
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
         let target = db::get(conn, &resolved_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
         if !crate::visibility::caller_owns_for_mutation(
             &target,
@@ -377,7 +386,7 @@ fn handle_update_inner(
         // Preserve existing metadata.agent_id — provenance is immutable.
         // Without this, any MCP caller could rewrite the author of any memory.
         let existing = db::get(conn, &resolved_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .map_or_else(|| serde_json::json!({}), |m| m.metadata);
         let mut merged = crate::identity::preserve_update_provenance_keys(&existing, &m);
         // v0.9.0 §25.3 S1 (D3-012, #1870) — a caller mutating metadata
@@ -405,7 +414,7 @@ fn handle_update_inner(
     // a governed namespace is gated by that destination's policy.
     {
         let existing = db::get(conn, &resolved_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
         let effective_namespace = namespace.unwrap_or(existing.namespace.as_str()).to_string();
         // #1600 — `agent_id` was hoisted above (it also drives the
@@ -473,7 +482,7 @@ fn handle_update_inner(
             &gate_payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
@@ -522,11 +531,12 @@ fn handle_update_inner(
             expected_version,
             edit_source,
         )
-        .map_err(|e| conflict_or_string(&e))?;
+        .map_err(conflict_or_string)?;
         // Re-embed the NEW row when content changed.
         if let Some(emb) = embedder {
             let new_id = &result.new_id;
-            let mem = db::get(conn, new_id).map_err(|e| e.to_string())?;
+            let mem = db::get(conn, new_id)
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
             if let Some(ref m) = mem {
                 let text = crate::embeddings::embedding_document(&m.title, &m.content);
                 if let Ok(embedding) = emb.embed(&text) {
@@ -538,7 +548,8 @@ fn handle_update_inner(
                 }
             }
         }
-        let new_mem = db::get(conn, &result.new_id).map_err(|e| e.to_string())?;
+        let new_mem = db::get(conn, &result.new_id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
         return Ok(json!({
             "updated": true,
             "edit_source": edit_source.as_str(),
@@ -561,7 +572,7 @@ fn handle_update_inner(
     // uncharged, mirroring the insert path's `if !agent_id.is_empty()`.
     let quota_charge: Option<(String, String, i64)> = {
         let existing = db::get(conn, &resolved_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
         let owner = existing
             .metadata
@@ -620,7 +631,7 @@ fn handle_update_inner(
             if let Some((ref owner, ref ns, delta)) = quota_charge {
                 let _ = crate::quotas::refund_storage_only(conn, owner, ns, delta);
             }
-            return Err(conflict_or_string(&e));
+            return Err(conflict_or_string(e));
         }
     };
 
@@ -643,7 +654,7 @@ fn handle_update_inner(
     // load-bearing rather than inert.
     if let Some(requested) = requested_lifecycle {
         let current = db::get(conn, &resolved_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?
             .lifecycle_state;
         if requested != current {
@@ -660,13 +671,15 @@ fn handle_update_inner(
                         .join("|"),
                 ));
             }
-            db::set_lifecycle_state(conn, &resolved_id, requested).map_err(|e| e.to_string())?;
+            db::set_lifecycle_state(conn, &resolved_id, requested)
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("set_lifecycle_state", e))?;
         }
     }
 
     // Regenerate embedding when title or content changed
     if content_changed && let Some(emb) = embedder {
-        let mem = db::get(conn, &resolved_id).map_err(|e| e.to_string())?;
+        let mem = db::get(conn, &resolved_id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
         if let Some(ref m) = mem {
             let text = crate::embeddings::embedding_document(&m.title, &m.content);
             if let Ok(embedding) = emb.embed(&text) {
@@ -679,7 +692,8 @@ fn handle_update_inner(
         }
     }
 
-    let mem = db::get(conn, &resolved_id).map_err(|e| e.to_string())?;
+    let mem = db::get(conn, &resolved_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
     Ok(json!({
         "updated": true,
         "edit_source": edit_source.as_str(),
@@ -692,7 +706,7 @@ fn handle_update_inner(
 /// returns a typed [`VersionConflict`]. Other errors stringify
 /// verbatim so existing callers and tests continue to see the
 /// historic error text.
-fn conflict_or_string(e: &anyhow::Error) -> String {
+fn conflict_or_string(e: anyhow::Error) -> String {
     if let Some(vc) = e.downcast_ref::<VersionConflict>() {
         json!({
             "status": "conflict",
@@ -702,7 +716,10 @@ fn conflict_or_string(e: &anyhow::Error) -> String {
         })
         .to_string()
     } else {
-        e.to_string()
+        // #3713 — anything that is not the typed conflict goes through the
+        // ONE funnel: a typed `StorageError` / governance refusal keeps its
+        // message, a driver chain is logged and rendered as the class.
+        crate::mcp::error_text::mcp_foreign_err("update", e)
     }
 }
 

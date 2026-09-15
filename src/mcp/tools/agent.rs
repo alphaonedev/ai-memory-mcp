@@ -48,7 +48,8 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
     // A targeted single-agent lookup — registration is a boot-path call for
     // every agent in a fleet, so a full `_agents` scan per register is not
     // acceptable (review).
-    let existing = db::get_agent(conn, agent_id).map_err(|e| e.to_string())?;
+    let existing = db::get_agent(conn, agent_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get_agent", e))?;
     let identity_change = existing.as_ref().is_some_and(|ex| {
         let (mut had, mut want) = (ex.capabilities.clone(), capabilities.clone());
         had.sort();
@@ -112,8 +113,8 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
             ),
     );
 
-    let id =
-        db::register_agent(conn, agent_id, agent_type, &capabilities).map_err(|e| e.to_string())?;
+    let id = db::register_agent(conn, agent_id, agent_type, &capabilities)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("register_agent", e))?;
 
     Ok(json!({
         (field_names::REGISTERED): true,
@@ -125,7 +126,8 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
 }
 
 pub(super) fn handle_agent_list(conn: &rusqlite::Connection) -> Result<Value, String> {
-    let agents = db::list_agents(conn).map_err(|e| e.to_string())?;
+    let agents = db::list_agents(conn)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_agents", e))?;
     Ok(json!({
         "count": agents.len(),
         "agents": agents,

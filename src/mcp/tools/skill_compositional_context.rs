@@ -163,7 +163,9 @@ pub fn handle_skill_compositional_context(
                    AND (expires_at IS NULL OR expires_at > ?4) \
                  ORDER BY created_at DESC",
             )
-            .map_err(|e| format!("reflections SELECT prepare: {e}"))?;
+            .map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err("reflections SELECT prepare", e)
+            })?;
 
         let now_iso = chrono::Utc::now().to_rfc3339();
         let rows = stmt
@@ -187,11 +189,11 @@ pub fn handle_skill_compositional_context(
                     ))
                 },
             )
-            .map_err(|e| format!("reflections SELECT exec: {e}"))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections SELECT exec", e))?;
 
         for row in rows {
             let (id, ns, title, content, created_at, access_count, depth, kind) =
-                row.map_err(|e| format!("reflections row: {e}"))?;
+                row.map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections row", e))?;
             let recency = recency_score(&created_at, now_epoch);
             let recall = recall_score(access_count);
             let score = recency + recall;

@@ -92,7 +92,7 @@ pub fn handle_offload(
     let off = ContextOffloader::new(conn, None, OffloadConfig::default());
     let result = off
         .offload(content, &namespace, ttl_seconds, agent_id)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("offload", e))?;
     Ok(json!({
         "ref_id": result.ref_id,
         (crate::models::field_names::CONTENT_SHA256): result.content_sha256,
@@ -121,7 +121,7 @@ pub fn handle_deref(
     let off = ContextOffloader::new(conn, None, OffloadConfig::default());
     let result = off
         .deref(ref_id, Some(agent_id))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("deref", e))?;
     Ok(json!({
         "ref_id": ref_id,
         "content": result.content,

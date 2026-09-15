@@ -66,8 +66,9 @@ pub fn handle_calibrate_confidence(
         ));
     }
 
-    let report = calibrate_from_shadow(conn, days, chrono::Utc::now(), audience)
-        .map_err(|e| format!("memory_calibrate_confidence substrate error: {e}"))?;
+    let report = calibrate_from_shadow(conn, days, chrono::Utc::now(), audience).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("memory_calibrate_confidence substrate error", e)
+    })?;
 
     Ok(json!({ "report": report }))
 }
