@@ -929,6 +929,47 @@ For heterogeneous trust,
 §8.8 of `docs/enterprise-deployment.md` gives the correct answer:
 **use multiple disjoint swarms**, not one mesh with scopes.
 
+## Per-peer freshness (#3654)
+
+Before #3654 a catch-up failure (a non-2xx answer or an unreachable peer)
+was logged at DEBUG and no series said which peer had stopped
+converging, so a quiet peer, a partitioned one, a dead worker and a peer
+that silently rejects our pushes all looked the same. The registry in
+`src/federation/freshness.rs` now records, per configured peer and per
+direction (`pull` = our catch-up of the peer, `push` = our writes to it),
+the last attempt, the last success, the failure streak and the class of
+the last failure, plus the peer's clock offset and its push-DLQ backlog.
+The series are listed in `docs/API_REFERENCE.md`.
+
+Every timestamp comes from this node's clock at the moment it observed
+the outcome; a peer's own clock is measured (`clock_skew_seconds`) but
+never used as a freshness value, so a skewed peer cannot look fresh. A
+series appears only after its first observation: a peer we have never
+pushed to has no push timestamp at all, not a `0`.
+
+| Symptom | What the series show |
+|---|---|
+| Quiet but healthy | Pull attempts and successes advance every catch-up interval; push attempts advance only when there is something to push, and each one succeeds. |
+| Stopped accepting our pushes | `last_attempt{direction="push"}` newer than `last_success{direction="push"}`; `consecutive_failures{direction="push"}` climbing; the class says why (`unauthorized`, `server_error`, `not_applied`, ...). |
+| Unreachable or partitioned | The same shape on `pull`, class `unreachable`. |
+| Catch-up worker stalled | `last_attempt{direction="pull"}` stops advancing; alert when `time() - last_attempt` exceeds a few multiples of `ai_memory_federation_catchup_interval_seconds`. |
+
+Logging stays quiet for transients and speaks up for sustained failure: a
+single failed attempt is still a DEBUG line, the third consecutive
+failure in one direction logs a WARN under the
+`federation.peer_freshness` target, and the WARN repeats only when the
+streak doubles (3, 6, 12, 24, ...), so a peer that is down for a day
+costs a dozen lines. The first success after an escalated streak logs
+one INFO naming how long the peer was failing. A fan-out task that
+panics is now attributed to its peer instead of being reported as an
+anonymous join error.
+
+The `peer` label is the minted `peer-h1…` id, the same key the push DLQ
+and the boot `registered peer` log line use. An id of any other shape is
+hashed before it can reach a label or a log field, because older and
+test configurations have used the peer URL itself as the id and a URL
+can carry credentials.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Diagnostic recipe |

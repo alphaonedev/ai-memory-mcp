@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (#3654 — per-peer federation freshness)
+
+- **#3654 (observability) — a peer that stops converging is now visible
+  per peer, and sustained failure is no longer DEBUG-only.** New registry
+  `src/federation/freshness.rs` records, per configured peer and per
+  direction (`pull` catch-up / `push` writes), the last attempt, the last
+  success (a push counts only when the peer applied it, #2341), the
+  failure streak and its closed-set class, the peer's clock offset from
+  its HTTP `Date` header, and the per-peer push-DLQ backlog. Nine new
+  Prometheus series (`ai_memory_federation_peer_*` and
+  `ai_memory_federation_catchup_interval_seconds`) expose them; a series
+  appears only after its first observation, never as a fake `0`, and
+  every timestamp is taken from the local clock so a skewed peer cannot
+  look fresh. Catch-up failures stay at DEBUG for a transient and
+  escalate to a WARN (`federation.peer_freshness`) at 3 consecutive
+  failures, then only when the streak doubles; recovery logs one INFO.
+  A fan-out task that panics is now attributed to its peer
+  (`PeerTasks`), where every lane previously logged an anonymous join
+  error and `bulk_catchup_push` reported the peer as `"unknown"`. A 2xx
+  catch-up envelope with no `memories` array is now recorded as a
+  malformed response instead of being skipped silently. The `peer`
+  label is the minted `peer-h1…` id; an id of any other shape is hashed
+  first, since a legacy id can be a credential-bearing URL.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`
