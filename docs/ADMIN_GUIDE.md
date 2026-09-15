@@ -1016,6 +1016,30 @@ A missed step fails loudly rather than corrupting data: the substrate refuses to
 
 Schema migrations run automatically on startup. No manual migration steps are required.
 
+**Before upgrading to v1.0.0: check your deployment shape (#3700).** From
+v1.0.0 the security posture floor comes from the DECLARED `[deployment]
+shape` (#3714): `production`, `federated` and `hive` pin `asi-hard` and
+every anti-cascade protection, and such a declared shape with a protection
+knob set below its floor REFUSES to boot. A node whose configuration looks
+like a fleet (peers, a peer allowlist, inbound certificate bindings,
+`mcp_federation_forward_url`, `[wake_hub]`, or two or more registered
+agents) but still declares `singleton` is NOT re-postured: the boot warns
+once, records it, and names the line to declare. Run the detector first,
+with the new binary against the existing database and environment:
+
+```bash
+ai-memory doctor            # "Deployment shape detector (#3700)"
+ai-memory doctor --json | jq '.sections[] | select(.name | startswith("Deployment shape"))'
+ai-memory config show       # the declared shape's derivation table (#3714)
+```
+
+It reports the declared shape, the observed floor and its signals, the
+exact `[deployment] shape = "…"` line to declare, the posture and its
+origin, the protections that are off, and the boot verdict the next boot
+will reach, without refusing anything. Then declare the shape the node
+is — promotion is an operator act. See
+[`SECURITY.md`](SECURITY.html) "The deployment-shape detector (#3700)".
+
 ### Database Maintenance
 
 Manually trigger garbage collection:
