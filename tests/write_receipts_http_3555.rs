@@ -232,7 +232,9 @@ async fn exercise_local(app: AppState, fsync: &str) {
 
 #[test]
 fn sqlite_http_write_receipts_3555() {
-    let root = std::env::var("CARGO_TARGET_DIR").expect("lane target directory");
+    // `CARGO_TARGET_DIR` is an input to cargo, not exported to tests: default
+    // to the standard target directory (the `capture_turn_cli_3587` shape).
+    let root = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let scratch = tempfile::tempdir_in(root).expect("scratch");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     for (sync, fsync) in [("NORMAL", "per-checkpoint"), ("FULL", "per-commit")] {
@@ -364,7 +366,7 @@ async fn exercise_quorum(mut app: AppState) {
 
 #[test]
 fn sqlite_http_quorum_and_backup_receipts_3555() {
-    let root = std::env::var("CARGO_TARGET_DIR").expect("lane target directory");
+    let root = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let scratch = tempfile::tempdir_in(root).expect("scratch");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_| Ok(())));
