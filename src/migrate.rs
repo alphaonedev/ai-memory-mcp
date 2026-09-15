@@ -142,9 +142,19 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
 
     #[cfg(feature = "sal-postgres")]
     if is_postgres_url(url) {
+        // #3711 — the connect refusal names the store it could not reach,
+        // rendered from the allowlist (scheme://host:port/db, never the
+        // credentials): a caller reading "pool timed out" alone cannot tell
+        // WHICH destination was unreachable, and the raw DSN must never be
+        // the thing that tells them.
         let store = crate::store::postgres::PostgresStore::connect(url)
             .await
-            .context("connect postgres adapter")?;
+            .with_context(|| {
+                format!(
+                    "connect postgres adapter {}",
+                    crate::url_display::store_url_display(url)
+                )
+            })?;
         return Ok(Box::new(store));
     }
 
