@@ -1369,7 +1369,7 @@ impl OllamaClient {
             "LLM client construction via #1146 resolver — backend={}, model={}, base_url={}, key_source={}, source={}",
             resolved.backend,
             resolved.model,
-            resolved.base_url,
+            crate::url_display::url_origin(&resolved.base_url),
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
@@ -1427,7 +1427,7 @@ impl OllamaClient {
             "LLM client construction via #1146 resolver (async, FX-D1) — backend={}, model={}, base_url={}, key_source={}, source={}",
             resolved.backend,
             resolved.model,
-            resolved.base_url,
+            crate::url_display::url_origin(&resolved.base_url),
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
@@ -1540,7 +1540,7 @@ impl OllamaClient {
             return Err(anyhow!(
                 "Ollama is not running or not reachable at {}. \
                  Start it with: ollama serve",
-                instance.base_url
+                crate::url_display::url_origin(&instance.base_url)
             ));
         }
 
@@ -1705,7 +1705,11 @@ impl OllamaClient {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("Failed to list Ollama models")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to list Ollama models")
+            })?;
 
         let body: Value = read_capped_json(resp)
             .await
@@ -1742,7 +1746,11 @@ impl OllamaClient {
             .json(&json!({ "name": self.model }))
             .send()
             .await
-            .context("Failed to pull model from Ollama")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to pull model from Ollama")
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -2336,7 +2344,7 @@ impl OllamaClient {
         let host = url
             .as_ref()
             .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| self.base_url.clone());
+            .unwrap_or_else(|| crate::url_display::url_origin(&self.base_url));
         let scheme = url
             .as_ref()
             .map(|u| u.scheme().to_string())
@@ -2843,7 +2851,11 @@ impl OllamaClient {
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .context("Failed to list Ollama models")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to list Ollama models")
+            })?;
 
         let body: Value = read_capped_json(resp)
             .await
@@ -2872,7 +2884,11 @@ impl OllamaClient {
             .json(&json!({ "name": model }))
             .send()
             .await
-            .context("Failed to pull embedding model from Ollama")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to pull embedding model from Ollama")
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
