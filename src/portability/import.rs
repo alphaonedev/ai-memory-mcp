@@ -694,7 +694,7 @@ fn apply_all_classes(
         // CLOBBERED an existing destination row's content whenever an
         // imported memory (different id) collided on `(title, namespace)`.
         let collision =
-            crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace)
+            crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace, None)
                 .with_context(|| format!("import: collision probe for memory {}", staged.id))?;
         // #2878 — whether the write below must be ATOMICALLY fail-closed
         // (`insert_imported_no_overwrite`, `INSERT … ON CONFLICT DO NOTHING`).

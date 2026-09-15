@@ -1128,10 +1128,16 @@ async fn bulk_create_sqlite(
             }
             let key = (row.mem.title.clone(), row.mem.namespace.clone());
             if let std::collections::hash_map::Entry::Vacant(slot) = pre_existing.entry(key) {
-                let existing =
-                    db::find_by_title_namespace(&lock.0, &row.mem.title, &row.mem.namespace)
-                        .ok()
-                        .flatten();
+                // #3696 — as the bulk caller: an occupant it cannot read is
+                // never named (the write's admission refuses it unnamed).
+                let existing = db::find_by_title_namespace(
+                    &lock.0,
+                    &row.mem.title,
+                    &row.mem.namespace,
+                    Some(caller).filter(|c| !c.is_empty()),
+                )
+                .ok()
+                .flatten();
                 slot.insert(existing);
             }
         }
@@ -1332,10 +1338,11 @@ async fn bulk_create_sqlite(
             let key = (row.mem.title.clone(), row.mem.namespace.clone());
             let fail_closed =
                 row.on_conflict == OnConflictMode::Error && !landed_this_batch.contains(&key);
+            let bulk_viewer = Some(caller).filter(|c| !c.is_empty());
             let insert_result = if fail_closed {
-                db::insert_no_overwrite(&lock.0, &row.mem)
+                db::insert_no_overwrite_as(&lock.0, &row.mem, bulk_viewer)
             } else {
-                db::insert(&lock.0, &row.mem)
+                db::insert_as(&lock.0, &row.mem, bulk_viewer)
             };
             match insert_result {
                 Ok(returned_id) => {
@@ -1525,7 +1532,11 @@ async fn bulk_create_postgres(
             OnConflictMode::Error => {
                 match app
                     .store
-                    .find_by_title_namespace(&row.mem.title, &row.mem.namespace)
+                    .find_by_title_namespace(
+                        &row.mem.title,
+                        &row.mem.namespace,
+                        Some(caller).filter(|c| !c.is_empty()),
+                    )
                     .await
                 {
                     Ok(Some(existing_id)) => {

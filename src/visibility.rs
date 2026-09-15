@@ -188,6 +188,160 @@ pub fn is_visible_by_fields(
     }
 }
 
+/// v1.0.0 Consolidation Unit 1 (#3690 / #3695 / #3696 / #3712) — the row that
+/// currently HOLDS a `(title, namespace)` slot, as a write funnel read it
+/// (`SELECT id, namespace, metadata, lifecycle_state`), for
+/// [`title_slot_admission`]. `lifecycle_state` is the raw column text so an
+/// unknown value (a state a newer binary wrote) can be refused fail-closed.
+#[derive(Debug, Clone, Copy)]
+pub struct TitleSlotOccupant<'a> {
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub metadata: &'a serde_json::Value,
+    pub lifecycle_state: &'a str,
+}
+
+/// THE ONE admission predicate every create funnel consults before its
+/// `ON CONFLICT (title, namespace)` statement, on both adapters — answering
+/// BOTH visibility axes (the Conductor's Unit 1 arity ruling):
+///
+/// * the LIFECYCLE axis, [`crate::models::LifecycleState::title_slot_admission_for`]:
+///   a tombstone holds no slot ([`TitleSlotAdmission::Free`] — the store lands
+///   beside it, #3690); `quarantined` / `contaminated` / unknown keeps its
+///   slot and refuses (#3695);
+/// * the SCOPE axis, [`is_visible_by_fields`] (the public predicate every
+///   read lane already applies — NOT a fourth copy of it): a live occupant
+///   the `viewer` cannot read (another agent's `scope=private` row) is
+///   [`TitleSlotAdmission::Refused`] exactly like a hidden one, because the
+///   only other outcomes are writing the caller's text into a row they
+///   cannot read or inserting beside it, which the live-unique index forbids
+///   (#3696).
+///
+/// `viewer` is the SAME value the read lanes resolve — MCP
+/// `identity::resolve_read_visibility_caller()`, HTTP the resolved request
+/// agent, SAL `CallerContext` (`None` under `bypass_visibility`) — so a write
+/// is never refused on a row the same caller could read; `None` is the
+/// documented single-tenant trust-all posture, which decides on the lifecycle
+/// axis only. A `Refused` verdict is rendered by every funnel as the typed
+/// conflict with an EMPTY id: the row is never named or described.
+///
+/// The SQL partial index and the in-statement merge backstop stay
+/// lifecycle-only on purpose: uniqueness among live rows is a column-level
+/// fact; the scope axis is decided here, in Rust, before the statement.
+#[must_use]
+pub fn title_slot_admission(
+    occupant: &TitleSlotOccupant<'_>,
+    viewer: Option<&str>,
+) -> crate::models::TitleSlotAdmission {
+    use crate::models::TitleSlotAdmission;
+    match crate::models::LifecycleState::title_slot_admission_for(occupant.lifecycle_state) {
+        TitleSlotAdmission::Occupied => match viewer {
+            None => TitleSlotAdmission::Occupied,
+            Some(caller)
+                if is_visible_by_fields(
+                    occupant.id,
+                    occupant.namespace,
+                    occupant.metadata,
+                    caller,
+                ) =>
+            {
+                TitleSlotAdmission::Occupied
+            }
+            Some(_) => TitleSlotAdmission::Refused,
+        },
+        other => other,
+    }
+}
+
+/// Consolidation Unit 1 — what a create funnel DOES with its
+/// `(title, namespace)` statement, decided ONCE for all THREE
+/// [`crate::storage::InsertConflictArm`]s on BOTH adapters by
+/// [`title_slot_disposition`]. Every funnel's routing is a match on this
+/// value; no adapter re-derives the arm × occupant matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleSlotDisposition {
+    /// Run the arm's statement as written (`ON CONFLICT (title, namespace)
+    /// WHERE <live>`): a fresh insert, a merge into / a no-overwrite refusal
+    /// of / a same-id CAS onto the LIVE occupant the viewer may read.
+    Proceed,
+    /// `RestoreSameId` onto the caller's OWN tombstone (#2887 / #2894): the
+    /// tombstone is NOT in the partial index, so the key does not conflict;
+    /// the SAME `DO UPDATE` arm is re-targeted at the PRIMARY KEY so the
+    /// restore merges IN PLACE and the row stays tombstoned — never a second
+    /// live row beside it.
+    ProceedByPrimaryKey,
+    /// Refuse with the typed conflict. `named` is the occupant's id ONLY when
+    /// the viewer may read it (a `RestoreSameId` whose key a DIFFERENT live,
+    /// visible row holds — vote Q3); `None` renders the EMPTY id: an occupant
+    /// hidden on either axis is never named (#3695 / #3696).
+    Refuse { named: Option<String> },
+}
+
+/// The occupant facts [`title_slot_disposition`] decides on: the LIVE holder
+/// of the key (if any) and the row already stored under the INCOMING id when
+/// that row carries the same key but is NOT the holder (a tombstone, or a
+/// hidden row) — both with their [`title_slot_admission`] verdict.
+#[derive(Debug, Clone)]
+pub struct TitleSlotFacts {
+    /// `(id, admission)` of the live `(title, namespace)` holder.
+    pub holder: Option<(String, crate::models::TitleSlotAdmission)>,
+    /// Admission of the same-id, same-key row that is not the holder.
+    pub same_id_hidden: Option<crate::models::TitleSlotAdmission>,
+}
+
+/// THE ONE arm × occupant matrix (the Conductor's Unit 1 ruling: a same-id
+/// occupant must have an EXPLICIT verdict, and no adapter may build a second
+/// source of truth for it):
+///
+/// | occupant                                   | Merge         | Refuse        | RestoreSameId          |
+/// |--------------------------------------------|---------------|---------------|------------------------|
+/// | none (free slot)                           | Proceed       | Proceed       | Proceed                |
+/// | live holder, visible, SAME id              | Proceed(merge)| Proceed(DO NOTHING → typed, own id) | Proceed (CAS merges) |
+/// | live holder, visible, DIFFERENT id         | Proceed(merge)| Proceed(DO NOTHING → typed, named)  | Refuse { named }     |
+/// | live holder hidden on either axis          | Refuse{None}  | Refuse{None}  | Refuse{None}           |
+/// | no holder; own TOMBSTONE under this key    | Refuse{None}  | Refuse{None}  | ProceedByPrimaryKey    |
+/// | no holder; own HIDDEN row under this key   | Refuse{None}  | Refuse{None}  | Refuse{None}           |
+///
+/// `Proceed` on the Refuse arm still refuses at the statement (`DO NOTHING`
+/// returns no row) — that refusal is typed and names the occupant only when
+/// the funnel's viewer-scoped probe may (the funnel re-probes with the same
+/// viewer). A Merge / Refuse write reusing a tombstone's OWN id is the #3690
+/// defect shape (a store that lands in a hidden row) and is refused; only a
+/// RESTORE may write into an own tombstone, in place.
+#[must_use]
+pub fn title_slot_disposition(
+    arm: crate::storage::InsertConflictArm,
+    incoming_id: &str,
+    facts: &TitleSlotFacts,
+) -> TitleSlotDisposition {
+    use crate::models::TitleSlotAdmission;
+    use crate::storage::InsertConflictArm;
+    if let Some((holder_id, admission)) = &facts.holder {
+        return match admission {
+            TitleSlotAdmission::Refused => TitleSlotDisposition::Refuse { named: None },
+            // A tombstone is never the holder (the index excludes it); a
+            // future predicate that answered `Free` for a holder would be a
+            // hole, so it is treated as occupied by construction.
+            TitleSlotAdmission::Occupied | TitleSlotAdmission::Free => {
+                if arm == InsertConflictArm::RestoreSameId && holder_id != incoming_id {
+                    TitleSlotDisposition::Refuse {
+                        named: Some(holder_id.clone()),
+                    }
+                } else {
+                    TitleSlotDisposition::Proceed
+                }
+            }
+        };
+    }
+    match (facts.same_id_hidden, arm) {
+        (None, _) => TitleSlotDisposition::Proceed,
+        (Some(TitleSlotAdmission::Free), InsertConflictArm::RestoreSameId) => {
+            TitleSlotDisposition::ProceedByPrimaryKey
+        }
+        (Some(_), _) => TitleSlotDisposition::Refuse { named: None },
+    }
+}
+
 /// #3386 — which arm of the visibility rule a row's `metadata.scope` selects.
 ///
 /// Extracted so the scope classification lives at exactly ONE site. Before

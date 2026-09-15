@@ -471,7 +471,10 @@ impl MemoryStore for SqliteStore {
             crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
             db::insert(&conn, &stamped).map_err(box_err)
         } else {
-            db::insert(&conn, memory).map_err(box_err)
+            // #3696 — the admission runs as THIS caller (the read-visibility
+            // identity the SAL read lanes use), so a `(title, namespace)`
+            // holder it cannot read is refused typed and unnamed.
+            db::insert_as(&conn, memory, Some(ctx.agent_id.as_str())).map_err(box_err)
         }
     }
 
@@ -3832,9 +3835,10 @@ impl MemoryStore for SqliteStore {
         &self,
         title: &str,
         namespace: &str,
+        viewer: Option<&str>,
     ) -> StoreResult<Option<String>> {
         let conn = self.state.lock().await;
-        db::find_by_title_namespace(&conn, title, namespace).map_err(box_err)
+        db::find_by_title_namespace(&conn, title, namespace, viewer).map_err(box_err)
     }
 
     async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
@@ -6426,7 +6430,7 @@ mod tests {
         let mem = test_memory("conflict-target", "find_by_title body");
         let id = store.store(&ctx, &mem).await.expect("store");
         let found = store
-            .find_by_title_namespace(&mem.title, &mem.namespace)
+            .find_by_title_namespace(&mem.title, &mem.namespace, None)
             .await
             .expect("find_by_title_namespace");
         assert_eq!(found.as_deref(), Some(id.as_str()));
@@ -6436,7 +6440,7 @@ mod tests {
     async fn find_by_title_namespace_returns_none_for_unknown() {
         let store = fresh_store();
         let found = store
-            .find_by_title_namespace("never-stored", "alphaone")
+            .find_by_title_namespace("never-stored", "alphaone", None)
             .await
             .expect("find_by_title_namespace miss");
         assert!(found.is_none());

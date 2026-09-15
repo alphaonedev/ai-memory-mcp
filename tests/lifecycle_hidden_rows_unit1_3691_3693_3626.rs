@@ -270,24 +270,24 @@ fn proactive_conflict_scan_skips_hidden_rows_3693() {
     );
     let ids = ["hid".to_string(), "vis".to_string()];
     assert!(
-        db::proactive_conflict_check(&conn, &probe, &emb)
+        db::proactive_conflict_check(&conn, &probe, &emb, None)
             .expect("scan")
             .is_none(),
         "a hidden row is never the subject of a conflict advisory"
     );
     assert!(
-        db::proactive_conflict_check_candidates(&conn, &probe, &emb, &ids)
+        db::proactive_conflict_check_candidates(&conn, &probe, &emb, &ids, None)
             .expect("ann")
             .is_none(),
         "the ANN-routed lane never names a hidden row"
     );
     db::insert(&conn, &mem("vis", "team/ops", "conflict-vis", claim)).expect("seed");
     db::set_embedding(&conn, "vis", &emb, "test#none").expect("embed");
-    let hit = db::proactive_conflict_check(&conn, &probe, &emb)
+    let hit = db::proactive_conflict_check(&conn, &probe, &emb, None)
         .expect("scan")
         .expect("visible twin conflicts");
     assert_eq!(hit.existing_id, "vis");
-    let hit = db::proactive_conflict_check_candidates(&conn, &probe, &emb, &ids)
+    let hit = db::proactive_conflict_check_candidates(&conn, &probe, &emb, &ids, None)
         .expect("ann")
         .expect("visible twin conflicts");
     assert_eq!(hit.existing_id, "vis");
