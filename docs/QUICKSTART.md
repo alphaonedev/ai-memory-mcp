@@ -104,7 +104,7 @@ Args: mcp --tier semantic
 ```
 
 **Smart / autonomous tier with a cloud LLM** (any of xAI Grok, OpenAI,
-Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together,
 Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server) —
 the recommended path is the `[llm]` section in
 `~/.config/ai-memory/config.toml` ([#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)).

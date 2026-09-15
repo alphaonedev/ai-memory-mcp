@@ -120,7 +120,7 @@ layout: doc
    }
    ```
 
-   **`smart` / `autonomous` tier with a cloud LLM backend** (xAI Grok shown; same shape for OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp server):
+   **`smart` / `autonomous` tier with a cloud LLM backend** (xAI Grok shown; same shape for OpenAI / Anthropic / Gemini / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp server):
 
    ### Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` ([#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146))
 
@@ -135,7 +135,7 @@ layout: doc
 
    [llm]
    backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
-                                          # deepseek | kimi | qwen | mistral | groq |
+                                          # kimi | qwen | mistral | groq |
                                           # together | cerebras | openrouter |
                                           # fireworks | lmstudio | vllm | openai-compatible
    model       = "grok-4.3"               # vendor-specific identifier
@@ -189,7 +189,7 @@ layout: doc
 
    > **`~` in `--db` args.** The binary uses a CLI `--db` value verbatim — tilde expansion happens in your shell (or in some MCP hosts), NOT inside ai-memory. Only a `db = "~/..."` line in `config.toml` is tilde-expanded by ai-memory itself (#507). If memories land in a literal `./~` directory, replace `~/.claude/ai-memory.db` in the args with the absolute path (e.g. `/Users/you/.claude/ai-memory.db`) or move the path into `config.toml`.
 
-   > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args — the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), any of: local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selected via `AI_MEMORY_LLM_BACKEND` env var. Full env-var matrix in [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers); MCP-config recipes in [`integrations/llm-backends.md`](integrations/llm-backends.html).
+   > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args — the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), any of: local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic, Google Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selected via `AI_MEMORY_LLM_BACKEND` env var. Full env-var matrix in [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers); MCP-config recipes in [`integrations/llm-backends.md`](integrations/llm-backends.html).
    > **Other AI platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.) have their own MCP configuration locations. Consult your platform's documentation for where to add MCP server entries. The server command and args are the same — only the config file location differs.
 
 3. **Restart your AI client.**
@@ -289,7 +289,7 @@ sudo mv ai-memory /usr/local/bin/
 ## Network Requirements
 
 - **First run with `semantic` tier (or above)**: Downloads a ~100MB embedding model from HuggingFace. No account or API key is required. The model is cached in `~/.cache/huggingface/` for subsequent runs. After the initial download, no network access is needed for keyword or semantic tiers.
-- **Smart/autonomous tiers**: Require an LLM backend. Post-#1067 (v0.7.0) any of 15 OpenAI-compatible vendors (xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) or local Ollama works — selected via `AI_MEMORY_LLM_BACKEND`. Local Ollama is the default for zero-network installs; cloud backends require their respective API key.
+- **Smart/autonomous tiers**: Require an LLM backend. Post-#1067 (v0.7.0) any of 15 OpenAI-compatible vendors (xAI, OpenAI, Anthropic, Gemini, Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) or local Ollama works — selected via `AI_MEMORY_LLM_BACKEND`. Local Ollama is the default for zero-network installs; cloud backends require their respective API key.
 
 ## Disk Space
 
@@ -866,7 +866,7 @@ ai-memory completions fish > ~/.config/fish/completions/ai-memory.fish
 Smart and autonomous tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from:
 
 - **Local LLM:** [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), [vLLM](https://docs.vllm.ai), or llama.cpp server (any OpenAI-compatible local endpoint).
-- **Cloud LLM:** xAI Grok, OpenAI, Anthropic (via OpenAI shim), Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks.
+- **Cloud LLM:** xAI Grok, OpenAI, Anthropic (via OpenAI shim), Google Gemini, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks.
 
 The `keyword` and `semantic` tiers do **not** require any LLM backend.
 

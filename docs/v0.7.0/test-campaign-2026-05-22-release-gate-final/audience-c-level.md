@@ -22,7 +22,7 @@ Highlights:
 
 - **Provider-agnostic LLM client.** ai-memory now connects to any of
   17 LLM providers (Ollama, OpenAI, xAI, Anthropic, Gemini,
-  DeepSeek, Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together,
+  Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together,
   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp
   server). Tier no longer dictates vendor.
 - **Recursive-learning primitive.** The substrate-native
@@ -135,7 +135,7 @@ close that gap.
 | Federation cross-peer replay | very low | high | #791 + #922 (Ed25519 sig + per-message nonce, both fail-CLOSED by default); A2A-1 + A2A-8 GREEN. |
 | Governance fail-open under transient errors | very low | high | #1054 makes fail-CLOSED the v0.7.0 default; escape hatch is operator-advisory. |
 | SSRF on webhook dispatch | very low | medium | #1053 DNS-fail = fail-CLOSED; private-range guard intact. |
-| Provider-LLM downtime cascades | low | medium | #1067 backend-selector keeps fallbacks per-vendor; the 15 vendor aliases mean operators can swap providers without code changes. |
+| Provider-LLM downtime cascades | low | medium | #1067 backend-selector keeps fallbacks per-vendor; the 14 vendor aliases mean operators can swap providers without code changes. |
 | Mobile FFI surface gaps | medium | low | Cross-compile CI on every PR; runtime tests on `release/**`. FFI items themselves land in v0.7.x follow-up (documented). |
 | Track D cross-node routing | n/a | n/a | Operator-action gated; not a code defect. |
 

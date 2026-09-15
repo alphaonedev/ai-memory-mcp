@@ -13660,7 +13660,6 @@ decision = "allow"
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
-            "DEEPSEEK_API_KEY",
             "MOONSHOT_API_KEY",
             "KIMI_API_KEY",
             "DASHSCOPE_API_KEY",
