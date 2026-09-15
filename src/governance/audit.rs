@@ -421,16 +421,26 @@ pub fn ensure_daemon_signing_key(
 /// #3354 — the refusal for a ledger-writing process whose resolved agent
 /// id has no signing key and could not be given one: the process must not
 /// append an unsigned row, so it does not start. Names the id, the cause
-/// and the real provisioning verb.
+/// and the remedy.
+///
+/// #3743 — the remedy is what is ACTIONABLE. This refusal fires only when
+/// the boot ensure could not write the key directory (the resolved id's key
+/// is generated automatically otherwise), so "run `identity generate`"
+/// would fail the same way; the fix is to make the key directory writable
+/// (or point `AI_MEMORY_KEY_DIR` at one that is) and retry — the next start
+/// generates the key — with `identity generate` named only as the explicit
+/// alternative once the directory is writable. A refusal whose remedy is a
+/// fiction is worse than one with no remedy (the #3709 item-five class).
 #[must_use]
 pub fn unsigned_ledger_refusal(agent_id: &str, cause: &str) -> String {
     format!(
         "{UNSIGNED_LEDGER_ISSUE}: refusing to start a ledger-writing command as `{agent_id}`: \
          no signing key for that id is loadable and one could not be generated ({cause}). \
          An unsigned signed_events row is a guarantee the ledger did not provide, so none is \
-         written. Fix: run `{}` (or make the key directory writable so the key can be \
-         generated), then retry. Read-only verbs (`doctor`, `stats`, `recall`, the \
-         `verify-*` family) stay reachable.",
+         written. Fix: make the key directory writable by this user (or set \
+         AI_MEMORY_KEY_DIR to a directory that is), then retry — the key is generated on the \
+         next start; or, once the directory is writable, provision it explicitly with `{}`. \
+         Read-only verbs (`doctor`, `stats`, `recall`, the `verify-*` family) stay reachable.",
         signing_key_provisioning_command(agent_id)
     )
 }

@@ -320,6 +320,7 @@ fn main() -> Result<()> {
         &app_config,
         hosts_ledger_writers(&cli.command),
         ledger_writer(&cli.command),
+        is_key_provisioning_verb(&cli.command),
     )?;
 
     // v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin HERE, in the same
@@ -447,6 +448,29 @@ fn is_remediation_verb(cmd: &daemon_runtime::Command) -> bool {
 /// side of the default is the signed one. `boot` stays a writer on purpose:
 /// it recovers memories into the store, so its rows must be signed like any
 /// other writer's.
+/// #3743 — the key-PROVISIONING verbs: `identity generate` (mint a keypair)
+/// and `identity import` (bring one in from disk). They ARE the provisioning
+/// the #3354 boot ensure exists to make unnecessary, so running the ensure
+/// ahead of them is the defect: with the resolved id, the boot minted the
+/// key first and `identity generate` then refused to overwrite it — the very
+/// command the #3354 refusal names as the remedy could never succeed, and
+/// its own `--force` suggestion would ROTATE a key that was already signing.
+///
+/// Skipping the ensure here cannot reopen #3354: `src/cli/identity.rs`
+/// emits no forensic or audit row (zero `record_decision` / `audit::`
+/// sites), so these verbs have nothing that could land unsigned. Every
+/// other verb — every ledger writer in particular — still ensures.
+fn is_key_provisioning_verb(cmd: &daemon_runtime::Command) -> bool {
+    use ai_memory::cli::identity::IdentityAction;
+    matches!(
+        cmd,
+        daemon_runtime::Command::Identity(ai_memory::cli::identity::IdentityArgs {
+            action: IdentityAction::Generate { .. } | IdentityAction::Import { .. },
+            ..
+        })
+    )
+}
+
 fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
     !(is_egress_verb(cmd)
         || is_remediation_verb(cmd)
@@ -507,6 +531,7 @@ fn init_forensic_audit(
     app_config: &config::AppConfig,
     hosts_writers: bool,
     ledger_writer: bool,
+    key_provisioning: bool,
 ) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
     // Resolve the daemon's agent_id with the standard precedence chain.
@@ -518,7 +543,17 @@ fn init_forensic_audit(
     // for a resolved id that differs from it). Only a ledger writer whose
     // key cannot be ensured refuses to start; read-only verbs carry on so
     // the posture can be diagnosed and fixed.
-    let (signing_key, generated) =
+    // #3743 — a key-PROVISIONING verb (`identity generate` / `identity
+    // import`) is the provisioning; it must find the key directory as the
+    // operator left it, never pre-empted by a boot-minted pair. Load only,
+    // generate nothing: these verbs write no ledger row (see
+    // `is_key_provisioning_verb`), so there is nothing here to sign.
+    let (signing_key, generated) = if key_provisioning {
+        (
+            ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None),
+            None,
+        )
+    } else {
         match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {
             Ok(pair) => pair,
             Err(e) => {
@@ -530,7 +565,8 @@ fn init_forensic_audit(
                 }
                 (None, None)
             }
-        };
+        }
+    };
     if let Some(ai_memory::identity::keypair::EnsureOutcome::Generated { pub_path }) = &generated {
         let notice =
             ai_memory::governance::audit::signing_key_generated_notice(&agent_id, pub_path);
@@ -634,6 +670,41 @@ mod tests {
                 ledger_writer(&cmd),
                 "{argv:?} writes the ledger and stays behind the posture"
             );
+            assert!(
+                !is_key_provisioning_verb(&cmd),
+                "{argv:?} is not provisioning: the boot ensure still runs for it (#3743)"
+            );
+        }
+        // #3743 — exactly the two provisioning verbs skip the boot ensure;
+        // their siblings under `identity` (which include the audited
+        // `hub-cache`) do not.
+        for argv in [
+            &["ai-memory", "identity", "generate", "--agent-id", "ai:x"][..],
+            &[
+                "ai-memory",
+                "identity",
+                "import",
+                "--agent-id",
+                "ai:x",
+                "--pub",
+                "/p",
+            ][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(
+                is_key_provisioning_verb(&cmd),
+                "{argv:?} IS the provisioning"
+            );
+        }
+        for argv in [
+            &["ai-memory", "identity", "list"][..],
+            &["ai-memory", "identity", "export-pub", "--agent-id", "ai:x"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(
+                !is_key_provisioning_verb(&cmd),
+                "{argv:?} is not provisioning (#3743)"
+            );
         }
     }
 
@@ -666,7 +737,7 @@ mod tests {
         ai_memory::governance::audit::shutdown();
         // A non-writer, non-host boot (#3354 reconciliation): the key is
         // ENSURED in the installed test key dir, so the sink signs.
-        init_forensic_audit(&app_config, false, false).expect("forensic boot");
+        init_forensic_audit(&app_config, false, false, false).expect("forensic boot");
         assert!(
             ai_memory::governance::audit::is_enabled(),
             "the sink comes up on every boot (#1850 watermark lane)"
@@ -851,7 +922,7 @@ mod tests {
 
         let app_config = config::AppConfig::default();
         // Must not panic and must leave the process bootable (unsigned).
-        init_forensic_audit(&app_config, false, false).expect("init");
+        init_forensic_audit(&app_config, false, false, false).expect("init");
 
         match prev {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },
