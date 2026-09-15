@@ -2836,7 +2836,10 @@ fn dispatch_memory_quota_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 fn dispatch_memory_capture_turn(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #3393 — the RESOLVED authority principal, never the raw handshake
     // `clientInfo.name` (which the row could then never be read back by).
+    // The handler is `anyhow`-typed (QUAL-6); the legacy envelope's String
+    // error is rendered here, at the dispatch boundary, via `Display`.
     capture_turn::handle_capture_turn_mcp(ctx.conn, ctx.arguments, ctx.authority)
+        .map_err(|e| e.to_string())
 }
 
 fn dispatch_memory_check_agent_action(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

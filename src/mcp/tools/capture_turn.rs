@@ -540,13 +540,17 @@ fn handle_capture_turn_inner(
 /// handshake string.
 ///
 /// # Errors
-/// Same contract as [`handle_capture_turn`].
+/// Same contract as [`handle_capture_turn`], typed: this entry returns the
+/// `anyhow`-typed inner result directly (the #3587 U4 shape — a new handler
+/// adds NO legacy String-typed signature, QUAL-6); the MCP dispatcher in
+/// `src/mcp/mod.rs` renders it into the legacy envelope via `Display` at
+/// the one String-typed boundary.
 pub(crate) fn handle_capture_turn_mcp(
     conn: &rusqlite::Connection,
     params: &Value,
     authority: &crate::identity::authority::Authority,
-) -> Result<Value, String> {
-    handle_capture_turn(conn, params, Some(authority.principal()))
+) -> anyhow::Result<Value> {
+    handle_capture_turn_inner(conn, params, Some(authority.principal()), false)
 }
 
 /// v0.7.0 #1416 — backend-agnostic preparation of an L4 capture write.
@@ -1348,7 +1352,8 @@ mod handler_tests {
             }),
             &authority,
         )
-        .expect_err("the raw handshake name must not agree with the resolved caller");
+        .expect_err("the raw handshake name must not agree with the resolved caller")
+        .to_string();
         assert!(err.contains("does not match resolved caller"), "{err}");
         let resp = handle_capture_turn_mcp(
             &conn,
