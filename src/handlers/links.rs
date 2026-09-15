@@ -694,16 +694,15 @@ pub async fn create_link(
             target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/links 403: caller {caller} != source owner {source_owner} (source_id={source_id})"
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
-                "owner": source_owner,
-                "caller": caller,
-                "source_id": source_id,
-            })),
-        )
-            .into_response();
+        // #3426 — leak-resistant refusal: the source row's owning agent id
+        // stays in the AUTHZ trace line above and never reaches the refused
+        // caller. Converges the sqlite branch onto the postgres SAL link
+        // gate, which already refused with the bare SSOT message.
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
+            Some(caller.as_str()),
+            crate::handlers::parity::RefusedResource::SourceMemory(&source_id),
+        );
     }
 
     // #1621 — K8 link-quota parity with the MCP path
@@ -1031,18 +1030,16 @@ pub async fn delete_link(
                         "DELETE /api/v1/links 403 (postgres): caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
                         target_mem_owner.as_deref().unwrap_or("")
                     );
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": "caller does not own either endpoint of this link",
-                            "source_owner": source_owner,
-                            "target_owner": target_mem_owner.unwrap_or_default(),
-                            "caller": caller,
-                            "source_id": source_id,
-                            "target_id": target_id,
-                        })),
-                    )
-                        .into_response();
+                    // #3426 — leak-resistant refusal: both endpoint owners
+                    // stay in the AUTHZ trace line above, never on the wire.
+                    return crate::handlers::parity::owner_gate_refusal(
+                        crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
+                        Some(caller.as_str()),
+                        crate::handlers::parity::RefusedResource::Link {
+                            source_id: &source_id,
+                            target_id: &target_id,
+                        },
+                    );
                 }
             }
             Err(crate::store::StoreError::NotFound { .. }) => {}
@@ -1131,18 +1128,16 @@ pub async fn delete_link(
             "DELETE /api/v1/links 403: caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
             target_mem_owner.as_deref().unwrap_or("")
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "caller does not own either endpoint of this link",
-                "source_owner": source_owner,
-                "target_owner": target_mem_owner.unwrap_or_default(),
-                "caller": caller,
-                "source_id": source_id,
-                "target_id": target_id,
-            })),
-        )
-            .into_response();
+        // #3426 — leak-resistant refusal: both endpoint owners stay in the
+        // AUTHZ trace line above, never on the wire.
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
+            Some(caller.as_str()),
+            crate::handlers::parity::RefusedResource::Link {
+                source_id: &source_id,
+                target_id: &target_id,
+            },
+        );
     }
 
     let delete_result = db::delete_link(&lock.0, &source_id, &target_id);

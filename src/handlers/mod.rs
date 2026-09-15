@@ -50,7 +50,7 @@
 /// Tracing target for HTTP-layer authorization (ownership-gate /
 /// caller-resolution) denials, shared across the handler sub-modules
 /// (#1558 tracing-target SSOT).
-pub(crate) const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
+pub const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
 
 /// `tracing` target for HTTP authentication events (`api_key_auth` middleware,
 /// #2044 per-agent-key boot-seed). One SSOT const per the pm-v3.1 no-hardcoded-
