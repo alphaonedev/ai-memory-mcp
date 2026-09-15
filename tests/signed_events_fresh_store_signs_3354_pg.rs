@@ -9,6 +9,16 @@
 //!
 //! FAILS ON THE PARENT: the postgres row lands `unsigned` and no key is
 //! generated for the resolved id.
+//!
+//! TRANSPORT: the daemon is spawned with `--tls-cert` / `--tls-key` (a leaf
+//! minted here with `rcgen`, trusted exactly — no verification bypass) and
+//! probed over `https://`. Explicit TLS is accepted on this branch's own
+//! base (where a plaintext loopback bind would also have booted) and is the
+//! ONLY posture the daemon accepts once #3705 ("only encrypted data in
+//! transit") is in the tree, so the same test measures the same claim on
+//! both. The mint is inlined rather than taken from #3705's
+//! `tests/common/tls.rs` because that helper does not exist on this
+//! branch's base.
 
 #![cfg(feature = "sal-postgres")]
 
@@ -37,6 +47,57 @@ struct Sandbox {
     home: PathBuf,
     keys: PathBuf,
     db: PathBuf,
+    tls_cert: PathBuf,
+    tls_key: PathBuf,
+    tls_cert_pem: String,
+}
+
+/// Mint a self-signed leaf for `localhost` / `127.0.0.1` / `::1` into `dir`
+/// (key 0600). The daemon serves it; the test client trusts exactly it.
+fn mint_tls_leaf(dir: &std::path::Path) -> (PathBuf, PathBuf, String) {
+    std::fs::create_dir_all(dir).expect("tls scratch dir");
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("generate ECDSA P-256 keypair");
+    let mut params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("certificate params");
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V6(
+            std::net::Ipv6Addr::LOCALHOST,
+        )));
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "ai-memory test leaf (#3354 pg)");
+    params.distinguished_name = dn;
+    let cert = params.self_signed(&key).expect("self-signed leaf");
+    let cert_pem = cert.pem();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, &cert_pem).expect("write cert.pem");
+    std::fs::write(&key_path, key.serialize_pem()).expect("write key.pem");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 key.pem");
+    }
+    (cert_path, key_path, cert_pem)
+}
+
+/// A blocking client that trusts exactly the minted leaf (full verification).
+fn tls_client(sb: &Sandbox, timeout: Duration) -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(sb.tls_cert_pem.as_bytes()).expect("parse leaf PEM"),
+        )
+        .timeout(timeout)
+        .build()
+        .expect("trusting blocking client")
 }
 
 fn sandbox() -> Sandbox {
@@ -51,11 +112,15 @@ fn sandbox() -> Sandbox {
         std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).expect("0700");
     }
     let db = root.path().join("sidecar.db");
+    let (tls_cert, tls_key, tls_cert_pem) = mint_tls_leaf(&root.path().join("tls"));
     Sandbox {
         _root: root,
         home,
         keys,
         db,
+        tls_cert,
+        tls_key,
+        tls_cert_pem,
     }
 }
 
@@ -85,21 +150,22 @@ impl Drop for Daemon {
     }
 }
 
-/// Boot a postgres-backed daemon and wait for `/health`.
+/// Boot a postgres-backed daemon over TLS and wait for `/health` over
+/// `https://`.
 fn serve(sb: &Sandbox, url: &str) -> (Daemon, u16) {
     let port = free_port();
     let child = command(sb, url)
-        .args(["serve", "--port", &port.to_string()])
+        .args(["serve", "--port", &port.to_string(), "--tls-cert"])
+        .arg(&sb.tls_cert)
+        .arg("--tls-key")
+        .arg(&sb.tls_key)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn serve");
     let mut daemon = Daemon { child };
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client");
-    let health_url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let client = tls_client(sb, Duration::from_secs(2));
+    let health_url = format!("{}/api/v1/health", base_url(port));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(resp) = client.get(&health_url).send()
@@ -119,6 +185,11 @@ fn serve(sb: &Sandbox, url: &str) -> (Daemon, u16) {
         std::thread::sleep(Duration::from_millis(200));
     }
     (daemon, port)
+}
+
+/// `https://127.0.0.1:{port}`.
+fn base_url(port: u16) -> String {
+    format!("https://127.0.0.1:{port}")
 }
 
 /// `(agent_id, attest_level, count)` over the whole `signed_events` ledger.
@@ -167,13 +238,10 @@ fn pg_daemon_generates_the_key_at_boot_and_signs_the_first_tombstone_3354() {
     // row's attestation level, which is the host's, not the daemon's.
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let before = ledger_levels(&rt, &url);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("client");
+    let client = tls_client(&sb, Duration::from_secs(10));
     let session = format!("sess-3354-pg-{}", uuid::Uuid::new_v4().simple());
     let resp = client
-        .post(format!("http://127.0.0.1:{port}/api/v1/capture_turn"))
+        .post(format!("{}/api/v1/capture_turn", base_url(port)))
         .json(&serde_json::json!({
             "host_session_id": session,
             "host_turn_index": 1,
@@ -197,7 +265,7 @@ fn pg_daemon_generates_the_key_at_boot_and_signs_the_first_tombstone_3354() {
     // A daemon-signing writer: create, then DELETE — the forget tombstone is
     // signed with the key ensured at boot.
     let resp = client
-        .post(format!("http://127.0.0.1:{port}/api/v1/memories"))
+        .post(format!("{}/api/v1/memories", base_url(port)))
         .header("x-agent-id", AGENT_ID)
         .json(&serde_json::json!({
             "title": format!("row to forget {}", uuid::Uuid::new_v4().simple()),
@@ -214,7 +282,7 @@ fn pg_daemon_generates_the_key_at_boot_and_signs_the_first_tombstone_3354() {
     let created: serde_json::Value = resp.json().expect("create json");
     let id = created["id"].as_str().expect("id").to_string();
     let resp = client
-        .delete(format!("http://127.0.0.1:{port}/api/v1/memories/{id}"))
+        .delete(format!("{}/api/v1/memories/{id}", base_url(port)))
         .header("x-agent-id", AGENT_ID)
         .send()
         .expect("delete request");
