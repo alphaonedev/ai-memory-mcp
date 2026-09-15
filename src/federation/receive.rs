@@ -147,6 +147,12 @@ fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Displa
     tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
 }
 
+/// #3655 — the durable contact stamp could not be written. The pull itself
+/// succeeded; only the offline evidence of it is missing, so WARN and go on.
+fn log_catchup_contact_stamp_failed(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!("catchup: sync_peer_record_contact failed for {peer_id}: {e}");
+}
+
 /// Gate 1 / #2480 / #3195 — may this catchup-pulled memory be applied from `peer_id`?
 ///
 /// Admin `CallerContext` bypasses SAL *visibility* so the peer snapshot can
@@ -541,6 +547,18 @@ pub(super) async fn catchup_once_with_store(
         // pinned by the regression test in
         // `tests/federation_catchup_api_key.rs`.
         log_catchup_pull_ok(&peer.id, memories.len());
+        // #3655 — durable CONTACT stamp, apart from the data watermark below:
+        // an empty window is still an answered pull. Carries this loop's
+        // cadence so `doctor` applies the same reachability window (#3654).
+        {
+            let lock = db.lock().await;
+            let cadence = super::freshness::catchup_interval().map(|d| d.as_secs());
+            if let Err(e) =
+                crate::db::sync_peer_record_contact(&lock.0, &local_id, &peer.id, cadence)
+            {
+                log_catchup_contact_stamp_failed(&peer.id, e);
+            }
+        }
         // #2441 — NO `if memories.is_empty() { continue }` early-out: an empty
         // window must still fall through to consume `next_since` below so an
         // all-out-of-scope window converges. The apply loops no-op on empty.
@@ -862,6 +880,17 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         // #935 — emit the canonical "pull: <peer> ok" success line
         // pinned by `tests/federation_catchup_api_key.rs`.
         log_catchup_pull_ok(&peer.id, memories.len());
+        // #3655 — durable CONTACT stamp, apart from the data watermark (see
+        // the SAL twin above): an empty window is still an answered pull.
+        {
+            let lock = db.lock().await;
+            let cadence = super::freshness::catchup_interval().map(|d| d.as_secs());
+            if let Err(e) =
+                crate::db::sync_peer_record_contact(&lock.0, &local_id, &peer.id, cadence)
+            {
+                log_catchup_contact_stamp_failed(&peer.id, e);
+            }
+        }
         // #2441 — no `if memories.is_empty() { continue }`: an empty window still
         // consumes `next_since`. The apply loop no-ops on empty.
 

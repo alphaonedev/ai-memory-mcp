@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships a 97-step migration ladder (v2 → v98) whose
+//! The substrate ships a 98-step migration ladder (v2 → v99) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -443,7 +443,12 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // Postgres twin is `PostgresStore::migrate_v97`.
     meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
     // v98: live/archive namespace alias view; rollback drops the view, NoLoss.
+    // Settled literal rung; v99 now owns the moving tip.
     meta(98, "CANONICAL_INBOX_NAMESPACE", true, true, NoLoss, Sqlite),
+    // v99 (#3655): additive `sync_peer_contact` table (durable per-peer
+    // contact, apart from the data watermark); rollback drops the table,
+    // NoLoss. Postgres twin is `PostgresStore::migrate_v99` (parity mirror).
+    meta(99, "SYNC_PEER_CONTACT", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

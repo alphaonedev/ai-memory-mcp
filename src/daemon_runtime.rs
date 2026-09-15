@@ -8675,6 +8675,17 @@ pub async fn sync_cycle_once(
         anyhow::bail!("sync-daemon: pull status {}", resp.status());
     }
     let pulled: SyncSinceResponse = resp.json().await?;
+    // #3655 — CONTACT is recorded the moment the peer answered, before and
+    // apart from the data watermark below: an empty window is a successful
+    // exchange with a reachable peer, and `sync_state_observe` (which moves
+    // `last_pulled_at`) will not run for it. The cadence rides along so the
+    // offline doctor applies the same reachability window as #3654's live
+    // registry; when no loop published one it is stored as NULL, not guessed.
+    {
+        let conn = db::open(db_path)?;
+        let cadence = crate::federation::freshness::catchup_interval().map(|d| d.as_secs());
+        db::sync_peer_record_contact(&conn, local_agent_id, peer_url, cadence)?;
+    }
     let pull_count = pulled.memories.len();
     // #2441 — advance the cursor on rows the peer EXAMINED, not on the
     // rows it projected. The peer applies its per-peer namespace
@@ -8942,6 +8953,11 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     crate::federation::peer_posture::enforce_at_boot(!peers.is_empty(), None)?;
     let interval = interval_secs.max(1);
     let batch_size = batch_size.max(1);
+    // #3655 — publish this loop's cadence (the #3654 guard: the series and
+    // the in-process value live exactly as long as the loop) so every
+    // contact stamp written by `sync_cycle_once` carries it.
+    let _cadence =
+        crate::federation::freshness::publish_catchup_interval(Duration::from_secs(interval));
 
     let db_path_owned: Arc<Path> = Arc::from(db_path.as_path());
     let local_agent_id_arc: Arc<str> = Arc::from(local_agent_id.as_str());
