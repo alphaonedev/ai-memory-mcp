@@ -2818,6 +2818,11 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "update": {
+            "default": false,
+            "title": "3372 — allow a re-registration that changes `agent_type` or",
+            "type": "boolean"
           }
         },
         "required": [
