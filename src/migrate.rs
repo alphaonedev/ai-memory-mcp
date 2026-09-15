@@ -142,9 +142,20 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
 
     #[cfg(feature = "sal-postgres")]
     if is_postgres_url(url) {
+        // #3711 — the connect refusal names the store it could not reach,
+        // rendered from the allowlist (scheme://host:port/db, never the
+        // credentials): a caller reading "pool timed out" alone cannot tell
+        // WHICH destination was unreachable, and the raw DSN must never be
+        // the thing that tells them.
         let store = crate::store::postgres::PostgresStore::connect(url)
             .await
-            .context(crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER)?;
+            .with_context(|| {
+                format!(
+                    "{} {}",
+                    crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER,
+                    crate::url_display::store_url_display(url)
+                )
+            })?;
         return Ok(Box::new(store));
     }
 
@@ -152,7 +163,7 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     // credentials in the userinfo; redact before echoing.
     anyhow::bail!(
         "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-        crate::logging::redact_url_password(url)
+        crate::url_display::store_url_display(url)
     )
 }
 
@@ -187,7 +198,13 @@ pub async fn open_source_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     if is_postgres_url(url) {
         let store = crate::store::postgres::PostgresStore::connect(url)
             .await
-            .context(crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER)?;
+            .with_context(|| {
+                format!(
+                    "{} {}",
+                    crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER,
+                    crate::url_display::store_url_display(url)
+                )
+            })?;
         return Ok(Box::new(store));
     }
 

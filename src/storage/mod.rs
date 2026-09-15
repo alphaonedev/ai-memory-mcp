@@ -907,6 +907,9 @@ pub mod schema_integrity;
 /// accounting SQLite then skips, so every surface that asks "is this database
 /// sound?" gets the same fail-closed answer.
 pub mod sqlite_integrity;
+/// v1.0.0 #3675 — moves a `sync_state` row keyed by a RAW (credential-bearing)
+/// peer URL onto its allowlist-rendered key, cursors preserved, raw row deleted.
+pub mod sync_state_rekey;
 
 // #1802 S1 — itemized re-export shim for the extracted doctor module
 // (M-NO-GLOB-REEXPORTS: explicit list, so any accidental visibility

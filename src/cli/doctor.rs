@@ -1845,10 +1845,7 @@ fn section_unstamped_owners_3124(
     let c = match census {
         Ok(c) => c,
         Err(e) => {
-            facts.push((
-                "error".into(),
-                crate::logging::redact_urls_in_message(&format!("{e:#}")),
-            ));
+            facts.push(("error".into(), format!("{e:#}")));
             return ReportSection {
                 name: SECTION_UNSTAMPED_OWNERS.into(),
                 severity: Severity::Critical,
@@ -1969,10 +1966,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
             return Some(ReportSection {
                 name: SECTION_POSTGRES_EXTENSIONS.into(),
                 severity: Severity::Critical,
-                facts: vec![(
-                    "error".into(),
-                    crate::logging::redact_urls_in_message(&format!("{e:#}")),
-                )],
+                facts: vec![("error".into(), format!("{e:#}"))],
                 note: Some(MSG_PG_STORE_URL_UNRESOLVED.into()),
             });
         }
@@ -1982,7 +1976,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
     }
     // Never echo the DSN credential into a report an operator pastes into a
     // ticket (#1893 / #1579 A3 discipline).
-    let redacted = crate::logging::redact_url_password(&url);
+    let redacted = crate::url_display::store_url_display(&url);
 
     type Probe = (PgvectorPreflightFacts, Option<String>, Option<String>);
     let probed: Result<Probe> = run_pg_probe(|| async move {
@@ -2018,10 +2012,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
                 severity: Severity::Critical,
                 facts: vec![
                     ("store".into(), redacted),
-                    (
-                        "error".into(),
-                        crate::logging::redact_urls_in_message(&format!("{e:#}")),
-                    ),
+                    ("error".into(), format!("{e:#}")),
                 ],
                 note: Some(
                     "could not probe the configured postgres store for pgvector / AGE — the \
@@ -2519,9 +2510,7 @@ fn section_identity_3147(
             severity = severity_max(severity, Severity::Warning);
             facts.push(("orphan_key_files".into(), "unknown".into()));
             facts.push(("enrolled_public_keys".into(), "unknown".into()));
-            notes.push(crate::logging::redact_urls_in_message(&format!(
-                "key registry inspection failed: {e:#}"
-            )));
+            notes.push(format!("key registry inspection failed: {e:#}"));
         }
     }
     let mode = crate::config::http_attested_identity_mode();
