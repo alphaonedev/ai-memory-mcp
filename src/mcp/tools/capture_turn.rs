@@ -360,12 +360,32 @@ fn capture_turn_write(
     let req: MemoryCaptureTurnRequest = serde_json::from_value(params.clone())
         .map_err(|e| anyhow::anyhow!("INVALID_INPUT: {e}"))?;
 
-    // v0.7.0 #1413 — resolve effective caller for the agent_id agreement
-    // check + signed_events row attribution. MCP stdio captures the host
-    // identity at `initialize.clientInfo.name`; when present, the
-    // dispatcher threads it via `ctx.mcp_client`. When absent, we still
-    // mint a per-request fallback so audit attribution is never empty.
-    let caller = caller_agent_id.unwrap_or("anonymous:mcp-unknown");
+    // v0.7.0 #1413 → v1.0.0 #3393 — the caller is the RESOLVED principal,
+    // never a client-chosen string. MCP dispatch hands in the #3549
+    // authority principal (env/config first; the handshake
+    // `clientInfo.name` only through the canonical durable derivation);
+    // the CLI hands in its clap/env-resolved id. A caller that is not a
+    // valid agent id is REFUSED, never stamped; an absent caller resolves
+    // through the same canonical ladder (env > host > anonymous) instead of
+    // a sentinel that no identity can ever read back.
+    let resolved_caller: String = match caller_agent_id {
+        Some(id) => {
+            crate::validate::validate_agent_id_shape(id).map_err(|e| {
+                anyhow::anyhow!(
+                    "INVALID_INPUT: caller {id:?} is not a usable agent identity ({e}); set \
+                     AI_MEMORY_AGENT_ID (#3393)"
+                )
+            })?;
+            id.to_string()
+        }
+        None => crate::identity::resolve_agent_id(None, None).map_err(|e| {
+            anyhow::anyhow!(
+                "INVALID_INPUT: caller identity could not be resolved ({e}); set \
+                 AI_MEMORY_AGENT_ID (#3393)"
+            )
+        })?,
+    };
+    let caller = resolved_caller.as_str();
 
     // v0.7.0 #1416 — all validation (agent_id agreement #1413,
     // signature verification #1414) + Memory/SignedEvent construction
@@ -503,11 +523,14 @@ fn capture_turn_write(
     };
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    // #3393 — the envelope names the identity the row was attributed to,
+    // so a caller can SEE what was stamped instead of trusting it.
     if result.dedup_hit {
         Ok(json!({
             "memory_id": result.memory_id,
             "dedup_hit": true,
             "layer": "L4",
+            (param_names::AGENT_ID): caller,
             (field_names::ELAPSED_MS): elapsed_ms,
         }))
     } else {
@@ -515,10 +538,31 @@ fn capture_turn_write(
             "memory_id": result.memory_id,
             "dedup_hit": false,
             "layer": "L4",
+            (param_names::AGENT_ID): caller,
             (field_names::ATTEST_LEVEL): attest_level,
             (field_names::ELAPSED_MS): elapsed_ms,
         }))
     }
+}
+
+/// v1.0.0 #3393 — the MCP `tools/call` entry: the caller is the #3549
+/// authority principal (`AI_MEMORY_AGENT_ID` first; the handshake
+/// `clientInfo.name` only through the canonical `ai:<client>@<hostname>`
+/// derivation), exactly like every other write tool — never the raw
+/// handshake string.
+///
+/// # Errors
+/// Same contract as [`handle_capture_turn`], typed: this entry returns the
+/// `anyhow`-typed inner result directly (the #3587 U4 shape — a new handler
+/// adds NO legacy String-typed signature, QUAL-6); the MCP dispatcher in
+/// `src/mcp/mod.rs` renders it into the legacy envelope via `Display` at
+/// the one String-typed boundary.
+pub(crate) fn handle_capture_turn_mcp(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    authority: &crate::identity::authority::Authority,
+) -> anyhow::Result<Value> {
+    handle_capture_turn_inner(conn, params, Some(authority.principal()), false)
 }
 
 /// v0.7.0 #1416 — backend-agnostic preparation of an L4 capture write.
@@ -1160,6 +1204,182 @@ mod handler_tests {
         });
         let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("wrong len");
         assert!(err.contains("must decode to 32 bytes"), "got: {err}");
+    }
+
+    /// #3393 — an absent caller resolves through the canonical ladder (env
+    /// first), never the pre-#3393 `anonymous:mcp-unknown` sentinel, and
+    /// the envelope + the stored row + the signed_events row all carry it.
+    /// FAILS ON HEAD: the row is stamped `anonymous:mcp-unknown`.
+    #[test]
+    fn capture_turn_none_caller_resolves_canonically_not_sentinel_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::set("ai:env-owner");
+        let conn = fresh_conn();
+        let resp = handle_capture_turn(
+            &conn,
+            &json!({
+                "host_session_id": "s3393-none",
+                "host_turn_index": 0,
+                "role": "user",
+                "content": "env identity wins"
+            }),
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["agent_id"].as_str(), Some("ai:env-owner"));
+        let id = resp["memory_id"].as_str().expect("memory_id");
+        let mem = crate::db::get(&conn, id).expect("get").expect("stored");
+        assert_eq!(mem.metadata["agent_id"].as_str(), Some("ai:env-owner"));
+        let attributed: String = conn
+            .query_row(
+                "SELECT agent_id FROM signed_events WHERE event_type = 'memory_capture_turn' \
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("signed_events row");
+        assert_eq!(attributed, "ai:env-owner");
+    }
+
+    /// #3393 — a caller string that is not a valid agent id is REFUSED,
+    /// not stamped. FAILS ON HEAD: the raw string lands in `metadata.agent_id`.
+    #[test]
+    fn capture_turn_invalid_raw_caller_is_refused_not_stamped_3393() {
+        let conn = fresh_conn();
+        let err = handle_capture_turn(
+            &conn,
+            &json!({
+                "host_session_id": "s3393-raw",
+                "host_turn_index": 0,
+                "role": "user",
+                "content": "raw handshake name"
+            }),
+            Some("Claude Code (beta)!"),
+        )
+        .expect_err("a non-identity caller must be refused");
+        assert!(err.contains("INVALID_INPUT"), "{err}");
+        assert!(err.contains("AI_MEMORY_AGENT_ID"), "{err}");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 0, "nothing may be stamped on refusal");
+    }
+
+    /// #3393 — the MCP entry resolves through the #3549 authority: the
+    /// configured env identity wins over the handshake name.
+    #[test]
+    fn capture_turn_mcp_uses_env_identity_over_client_info_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::set("ai:env-owner");
+        let authority = crate::identity::authority::Authority::resolve_mcp(Some("claude-code"))
+            .expect("authority");
+        let conn = fresh_conn();
+        let resp = handle_capture_turn_mcp(
+            &conn,
+            &json!({
+                "host_session_id": "s3393-env",
+                "host_turn_index": 1,
+                "role": "assistant",
+                "content": "env over clientInfo"
+            }),
+            &authority,
+        )
+        .expect("ok");
+        assert_eq!(resp["agent_id"].as_str(), Some("ai:env-owner"));
+        let id = resp["memory_id"].as_str().expect("memory_id");
+        let mem = crate::db::get(&conn, id).expect("get").expect("stored");
+        assert_eq!(mem.metadata["agent_id"].as_str(), Some("ai:env-owner"));
+    }
+
+    /// #3393 — with no configured identity the handshake name is only a
+    /// VALIDATED, `ai:`-prefixed durable derivation, never the raw string.
+    #[test]
+    fn capture_turn_mcp_client_info_fallback_is_prefixed_and_valid_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let authority = crate::identity::authority::Authority::resolve_mcp(Some("claude-code"))
+            .expect("authority");
+        let conn = fresh_conn();
+        let resp = handle_capture_turn_mcp(
+            &conn,
+            &json!({
+                "host_session_id": "s3393-fallback",
+                "host_turn_index": 2,
+                "role": "user",
+                "content": "derived identity"
+            }),
+            &authority,
+        )
+        .expect("ok");
+        let stamped = resp["agent_id"].as_str().expect("agent_id in envelope");
+        assert!(stamped.starts_with("ai:claude-code@"), "{stamped}");
+        assert_ne!(stamped, "claude-code");
+        crate::validate::validate_agent_id(stamped).expect("derived id is valid");
+        let id = resp["memory_id"].as_str().expect("memory_id");
+        let mem = crate::db::get(&conn, id).expect("get").expect("stored");
+        assert_eq!(mem.metadata["agent_id"].as_str(), Some(stamped));
+    }
+
+    /// #3393 — a handshake name the id grammar forbids does not reach the
+    /// row raw: the canonical derivation sanitises it into a VALID durable
+    /// id (the contract `identity::resolve_agent_id` already implements).
+    #[test]
+    fn capture_turn_mcp_invalid_client_info_is_never_stamped_raw_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let raw = "Claude Code (beta)!";
+        let authority =
+            crate::identity::authority::Authority::resolve_mcp(Some(raw)).expect("authority");
+        let conn = fresh_conn();
+        let resp = handle_capture_turn_mcp(
+            &conn,
+            &json!({
+                "host_session_id": "s3393-invalid",
+                "host_turn_index": 3,
+                "role": "user",
+                "content": "sanitised identity"
+            }),
+            &authority,
+        )
+        .expect("ok");
+        let stamped = resp["agent_id"].as_str().expect("agent_id in envelope");
+        assert_ne!(stamped, raw);
+        assert!(stamped.starts_with("ai:"), "{stamped}");
+        crate::validate::validate_agent_id(stamped).expect("derived id is valid");
+    }
+
+    /// #3393 — the #1413 agreement check compares `metadata.agent_id` with
+    /// the RESOLVED principal: the raw handshake name no longer agrees with
+    /// itself. FAILS ON HEAD: raw == raw passed.
+    #[test]
+    fn capture_turn_mcp_agreement_check_uses_resolved_id_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let authority = crate::identity::authority::Authority::resolve_mcp(Some("claude-code"))
+            .expect("authority");
+        let conn = fresh_conn();
+        let err = handle_capture_turn_mcp(
+            &conn,
+            &json!({
+                "host_session_id": "s3393-agree",
+                "host_turn_index": 4,
+                "role": "user",
+                "content": "raw name claimed",
+                "metadata": {"agent_id": "claude-code"}
+            }),
+            &authority,
+        )
+        .expect_err("the raw handshake name must not agree with the resolved caller")
+        .to_string();
+        assert!(err.contains("does not match resolved caller"), "{err}");
+        let resp = handle_capture_turn_mcp(
+            &conn,
+            &json!({
+                "host_session_id": "s3393-agree",
+                "host_turn_index": 5,
+                "role": "user",
+                "content": "resolved name claimed",
+                "metadata": {"agent_id": authority.principal()}
+            }),
+            &authority,
+        )
+        .expect("the resolved principal agrees");
+        assert_eq!(resp["agent_id"].as_str(), Some(authority.principal()));
     }
 
     #[test]
