@@ -155,6 +155,19 @@ pub mod error_codes {
     /// action is the opposite of ahead ("migrate this database / start the
     /// daemon", not "run a newer binary").
     pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str = "SCHEMA_BEHIND_READ_ONLY_REFUSAL";
+
+    /// v1.0.0 #3288 — `GET /api/v1/export` without paging parameters over a
+    /// corpus larger than the page ceiling. Refused rather than truncated: a
+    /// client that predates paging would store a partial body as a complete
+    /// backup. The remedy is `?limit=N` and following `next_cursor`.
+    pub const EXPORT_PAGING_REQUIRED: &str = "EXPORT_PAGING_REQUIRED";
+
+    /// v1.0.0 #3288 — an export `cursor` this server could not have minted.
+    pub const EXPORT_CURSOR_INVALID: &str = "EXPORT_CURSOR_INVALID";
+
+    /// v1.0.0 #3288 — an export `limit` outside `1..=max_page_size`. Refused
+    /// rather than clamped so the caller learns the real ceiling.
+    pub const EXPORT_LIMIT_OUT_OF_RANGE: &str = "EXPORT_LIMIT_OUT_OF_RANGE";
 }
 
 // ---------------------------------------------------------------------------
