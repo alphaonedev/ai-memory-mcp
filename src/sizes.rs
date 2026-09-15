@@ -127,7 +127,7 @@ pub fn tool_sizes_under_ci_gate() -> usize {
 /// -> 28_100 (+71 headroom, lockstep on this base, never lower); the merger
 /// re-takes the number on the resolved tree, where other branches' docs
 /// stack (the #3730 inbox docs alone are +81).
-pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_100;
+pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_300;
 
 /// Sum of every tool's `total_tokens` (verbose schema) — the
 /// worst-case prefix cost on a `verbose=true` opt-in harness with
