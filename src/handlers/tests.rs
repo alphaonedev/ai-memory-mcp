@@ -12341,12 +12341,24 @@ async fn http_health_route_returns_200_with_status_ok() {
 
 #[tokio::test]
 async fn http_prometheus_metrics_returns_text_body() {
+    // ISOLATION FIX — `/metrics` renders the PROCESS-GLOBAL prometheus registry
+    // (`crate::metrics::render`), which every prior federation/subscription test
+    // in this lib binary has populated. Reading the live body here asserted on
+    // test ORDERING, not the endpoint, and in a full-binary run the accumulated
+    // per-peer #3654 series pushed the body past the `64 * 1024` `to_bytes` cap
+    // (LengthLimitError). The cap is DELIBERATELY NOT RAISED: a larger number
+    // would still be a property of whatever ran before this test. Instead:
+    // (1) assert the ROUTE answers 200 with the exposition content-type WITHOUT
+    //     reading the shared body (no ordering / size coupling); and
+    // (2) assert the exposition SHAPE by calling `crate::metrics::render()`
+    //     DIRECTLY — the same function the endpoint serves as its body — so the
+    //     assertion lands on OUR renderer, not on a fresh test-owned Registry
+    //     (which would only exercise the prometheus crate).
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/metrics", axum_get(prometheus_metrics))
-        // v1.0.0 #2621 — prometheus_metrics now takes `State<AppState>` so the
-        // cold prime can dispatch on the active backend; wrap the `Db` in a
-        // test AppState (the list_namespaces test pattern).
+        // v1.0.0 #2621 — prometheus_metrics takes `State<AppState>` so the cold
+        // prime can dispatch on the active backend.
         .with_state(test_app_state(state));
     let resp = app
         .oneshot(
@@ -12358,12 +12370,30 @@ async fn http_prometheus_metrics_returns_text_body() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // Prometheus exposition starts with a `#` comment line; whatever
-    // the renderer emits, we just confirm the body is non-empty.
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    assert!(!bytes.is_empty());
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8"),
+    );
+
+    // Assert the exposition SHAPE on OUR OWN render path. `crate::metrics::render`
+    // is exactly what `prometheus_metrics` serves as the body
+    // (src/handlers/transport.rs). Calling it directly has no HTTP body and no
+    // `to_bytes` cap, so the size / test-ordering coupling that broke the old
+    // assertion is structurally gone — and, unlike a fresh test-owned Registry
+    // (which can only fail if the prometheus crate itself breaks and so pins
+    // nothing of ours), this pins the renderer THIS endpoint uses: it fails for
+    // any defect that empties or malforms our process-global exposition.
+    let rendered = crate::metrics::render();
+    assert!(
+        !rendered.is_empty(),
+        "render() must produce a non-empty exposition body"
+    );
+    assert!(
+        rendered.contains("# TYPE "),
+        "render() output must carry at least one Prometheus TYPE line"
+    );
 }
 
 // ---- list_namespaces with seeded data ----
