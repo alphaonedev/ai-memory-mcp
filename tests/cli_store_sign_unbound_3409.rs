@@ -41,6 +41,23 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Construct the state #3409 is about — a local keypair that EXISTS and is
+/// NOT BOUND in the store — deliberately, on both trees this test runs on.
+///
+/// EXISTS: `<key_dir>/<agent>.priv` + `.pub`. On this branch's own base
+/// `identity generate` mints it here. On any tree carrying #3354 the
+/// process's OWN boot ensures the resolved id's key before the verb
+/// dispatches (`main.rs::init_forensic_audit` →
+/// `ensure_daemon_signing_key`), so `identity generate` then correctly
+/// refuses to overwrite it ("already exists … pass --force"); that refusal
+/// is accepted here because the key the boot minted is exactly the key this
+/// fixture wants (rotating it with `--force` would be a different fixture).
+/// Either way the `.priv` is asserted present afterwards.
+///
+/// NOT BOUND: #3354 writes files only; the binding is the
+/// `metadata.agent_pubkey` row `agents bind-key` writes, read through
+/// `db::agent_pubkey`. Asserted absent explicitly, so the unbound half of
+/// the premise is stated rather than assumed.
 fn generate_key(root: &Path) {
     std::fs::create_dir_all(root.join("keys")).unwrap();
     #[cfg(unix)]
@@ -53,7 +70,21 @@ fn generate_key(root: &Path) {
         .args(["identity", "generate", "--agent-id", AGENT])
         .output()
         .unwrap();
-    assert!(out.status.success(), "identity generate: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        out.status.success() || err.contains("already exists"),
+        "identity generate must mint the key or find the boot-ensured one (#3354): {err}"
+    );
+    assert!(
+        root.join("keys").join(format!("{AGENT}.priv")).is_file(),
+        "the local keypair EXISTS"
+    );
+    let conn = ai_memory::db::open(&root.join("store.db")).unwrap();
+    assert_eq!(
+        ai_memory::db::agent_pubkey(&conn, AGENT).unwrap(),
+        None,
+        "the key is NOT BOUND in the store — the state #3409 refuses --sign in"
+    );
 }
 
 fn store_signed(root: &Path, extra: &[&str]) -> Output {
