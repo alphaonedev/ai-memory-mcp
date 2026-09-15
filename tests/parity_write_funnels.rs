@@ -525,9 +525,88 @@ async fn sqlite_sal_recipient_cannot_delete_a_non_inbox_row_addressed_to_it() {
 
 #[cfg(feature = "sal-postgres")]
 mod pg {
-    use super::{Memory, MemoryKind, Tier, json};
+    use super::{Memory, MemoryKind, Tier, addressed_to_bob, json};
     use ai_memory::store::postgres::PostgresStore;
-    use ai_memory::store::{CallerContext, MemoryStore};
+    use ai_memory::store::{CallerContext, MemoryStore, StoreError};
+
+    /// #3730 — the postgres twin of `sqlite_sal_recipient_cannot_delete_a_
+    /// non_inbox_row_addressed_to_it` above: the gate moved on BOTH SAL
+    /// funnels (and this file's own standard is that a sqlite assertion
+    /// alone cannot catch a regression on the backend that moved), so the
+    /// forbidden path is pinned here too — refused, row intact, the owner
+    /// still admitted — beside the inbox drain that IS admitted and archives.
+    /// The four-funnel pin `tests/recipient_gate_derived_from_namespace_3730.rs`
+    /// carries the same postgres cell; this one is the parity file's own.
+    #[tokio::test]
+    async fn pg_recipient_cannot_delete_a_non_inbox_row_addressed_to_it_3730() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres");
+        let alice = CallerContext::for_agent("ai:alice");
+        let bob = CallerContext::for_agent("ai:bob");
+        let admin = CallerContext::for_admin("ai:parity-operator");
+        let ns = format!("parity/pg-{}", uuid::Uuid::new_v4().simple());
+
+        // Forbidden path: a row addressed to Bob OUTSIDE an inbox namespace.
+        let outside = store
+            .store(&alice, &addressed_to_bob(&ns))
+            .await
+            .expect("alice stores the addressed row");
+        let refused = store.delete(&bob, &outside).await;
+        let still_live = store.get(&admin, &outside).await.is_ok();
+        let owner_deletes = store.delete(&alice, &outside).await;
+
+        // Permitted path: the same row shape delivered to Bob's inbox.
+        let inbox_ns = ai_memory::inbox_namespace("ai:bob");
+        let inside = store
+            .store(&alice, &addressed_to_bob(&inbox_ns))
+            .await
+            .expect("alice delivers to bob's inbox");
+        let drained = store.delete(&bob, &inside).await;
+        let archived = store
+            .list_archived(Some(inbox_ns.as_str()), 50, 0)
+            .await
+            .expect("list_archived")
+            .iter()
+            .any(|m| m["id"].as_str() == Some(inside.as_str()));
+
+        // Teardown BEFORE asserting (#2287) so a failure never strands rows.
+        for id in [&outside, &inside] {
+            let _ = sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+                .bind(id)
+                .execute(store.pool())
+                .await;
+            let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+                .bind(id)
+                .execute(store.pool())
+                .await;
+        }
+
+        assert!(
+            matches!(refused, Err(StoreError::PermissionDenied { .. })),
+            "#3730 pg: a recipient must NOT delete a non-inbox row merely addressed to it: {refused:?}"
+        );
+        assert!(
+            still_live,
+            "#3730 pg: the row still exists after the refusal"
+        );
+        assert!(
+            owner_deletes.is_ok(),
+            "#3730 pg: the owner still deletes its own row: {owner_deletes:?}"
+        );
+        assert!(
+            drained.is_ok(),
+            "#3730 pg: the recipient drains its inbox: {drained:?}"
+        );
+        assert!(
+            archived,
+            "#3730 pg: the drained message is archived, not erased"
+        );
+    }
 
     #[tokio::test]
     async fn pg_archive_by_ids_reason_less_default_matches_the_sqlite_funnel() {
