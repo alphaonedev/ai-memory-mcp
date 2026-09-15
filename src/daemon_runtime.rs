@@ -6151,6 +6151,27 @@ pub async fn bootstrap_serve(
         !args.quorum_peers.is_empty(),
         args.mtls_allowlist.as_deref(),
     )?;
+    // v1.0.0 #3700 — SECOND: the deployment-shape detector. Uses the
+    // pre-runtime assessment when the process booted through the binary; a
+    // direct library caller is assessed here. Configuration that looks like
+    // a stricter shape than declared is warned and recorded, never
+    // re-postured; the registry signal is folded in after the store opens.
+    let shape_assessment = crate::config::shape::detector::enforce_pre_open(
+        Some(app_config),
+        Some((
+            !args.quorum_peers.is_empty(),
+            args.mtls_allowlist.as_deref(),
+        )),
+    )?;
+    tracing::info!(
+        target: crate::config::shape::detector::TRACING_TARGET,
+        declared = shape_assessment.declared.as_str(),
+        observed_floor = shape_assessment.observed.observed_floor.as_str(),
+        undeclared_promotion = shape_assessment.undeclared_promotion,
+        posture = %shape_assessment.posture,
+        origin = shape_assessment.origin.as_str(),
+        "deployment shape assessed (#3700)"
+    );
     if let Some(scopes) = &app_config.monitoring
         && !scopes.peer_ids.is_empty()
     {
@@ -6283,6 +6304,13 @@ pub async fn bootstrap_serve(
     let resolved_ttl = app_config.effective_ttl();
     let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(db_path)?;
+    // v1.0.0 #3700 — read the sqlite agent registry while the connection is
+    // still ours (it moves into the shared `Db` state below); the shape gate
+    // consumes it after the SAL handle is built. A registry that cannot be
+    // read refuses (fail closed: an unobserved fleet is not a singleton).
+    let sqlite_registered_agents = db::list_agents(&conn)
+        .context("#3700: agent registry could not be read")?
+        .len();
 
     // v0.7.0 SEC-2 (Cluster D, issue #767) — fail-OPEN diagnostic + the
     // operator-opt-in fail-CLOSED knob. When `governance_rules` has any
@@ -6847,6 +6875,30 @@ pub async fn bootstrap_serve(
     .context("build SAL store handle")?;
     #[cfg(not(feature = "sal"))]
     let storage_backend = crate::handlers::StorageBackend::Sqlite;
+
+    // v1.0.0 #3700 — the store-derived shape signal: a registry of
+    // `FLEET_REGISTRY_MIN_AGENTS` or more agents is multi-agent by
+    // declaration. Read from the REAL store of this deployment (the SAL
+    // handle on postgres, the local connection on sqlite). A registry that
+    // cannot be read refuses (fail closed: an unobserved fleet is not a
+    // singleton).
+    {
+        #[cfg(feature = "sal")]
+        let registered_agents =
+            if matches!(storage_backend, crate::handlers::StorageBackend::Sqlite) {
+                sqlite_registered_agents
+            } else {
+                crate::store::MemoryStore::list_agents(&*store_handle)
+                    .await
+                    .context("#3700: agent registry could not be read from the store")?
+                    .len()
+            };
+        #[cfg(not(feature = "sal"))]
+        let registered_agents = sqlite_registered_agents;
+        // A registry-raised observed floor is a WARN and a recorded mismatch —
+        // never a refusal and never a re-posture (promotion is an operator act).
+        let _ = crate::config::shape::detector::assess_post_open(registered_agents);
+    }
 
     // v1.0.0 #2167 §5/§6 pg twin — on a POSTGRES-backed daemon the sqlite
     // boot-maintenance above ran against the LOCAL (empty) sqlite file, so
@@ -8953,6 +9005,9 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     crate::federation::peer_posture::enforce_at_boot(!peers.is_empty(), None)?;
+    // v1.0.0 #3700 — the sync daemon is federation by construction when it
+    // has peers: same shape-vs-posture gate as `bootstrap_serve`.
+    crate::config::shape::detector::enforce_pre_open(None, Some((!peers.is_empty(), None)))?;
     let interval = interval_secs.max(1);
     let batch_size = batch_size.max(1);
     // #3655 — publish this loop's cadence (the #3654 guard: the series and
@@ -11335,6 +11390,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_enabled_attaches_config() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_federation_enabled_attaches_config",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
@@ -11359,6 +11429,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_enabled_with_catchup_loop() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_federation_enabled_with_catchup_loop",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
@@ -11384,6 +11469,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_serve_federation_invalid_peer_errors() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_federation_invalid_peer_errors",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();
@@ -12702,6 +12802,21 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_bootstrap_serve_mtls_enforced_with_federation_threads_api_key() {
+        // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
+        // the pre-runtime derivation cannot pin from the async runtime, so
+        // this lab states the deliberate `standard` exception explicitly.
+        // SAFETY: env write only in the isolated child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_bootstrap_serve_mtls_enforced_with_federation_threads_api_key",
+        ) {
+            return;
+        }
+        // No env lock here: this body runs alone in the isolated child, and
+        // `no_passphrase_guard` below takes the crate env lock itself (a
+        // second acquisition on this thread would deadlock).
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "standard");
+        }
         // #3539 — plain-sqlite boot: hold the passphrase window (see
         // `test_bootstrap_serve_keyword_tier_no_embedder`).
         let _no_pass = crate::test_support::no_passphrase_guard();

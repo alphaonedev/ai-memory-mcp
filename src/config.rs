@@ -457,6 +457,7 @@ impl TierConfig {
             // Capabilities schema v2 — see `Capabilities` doc comment.
             schema_version: "2".to_string(),
             federation_security: None,
+            deployment_shape: None,
             tier: self.tier.as_str().to_string(),
             version: crate::PKG_VERSION.to_string(),
             features: CapabilityFeatures {
@@ -611,6 +612,11 @@ pub struct Capabilities {
     /// MCP/HTTP. Absent when this process has not evaluated federation boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_security: Option<crate::federation::peer_posture::Report>,
+    /// #3700: the daemon's deployment-shape / posture boot snapshot (fleet
+    /// vs singleton, posture, origin, whether they match). Absent when this
+    /// process has not evaluated its shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
     /// Schema-version discriminator. Always `"2"` since v0.6.3.
     pub schema_version: String,
     pub tier: String,
@@ -2029,6 +2035,7 @@ impl Capabilities {
         CapabilitiesV3 {
             schema_version: "3".to_string(),
             federation_security: self.federation_security.clone(),
+            deployment_shape: self.deployment_shape.clone(),
             summary,
             to_describe_to_user,
             tools,
@@ -2149,6 +2156,9 @@ pub struct CapabilitiesV3 {
     /// #3582: same daemon boot snapshot as the v2 projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_security: Option<crate::federation::peer_posture::Report>,
+    /// #3700: same deployment-shape snapshot as the v2 projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
     /// Schema-version discriminator. Always `"3"` in v0.7.0.
     pub schema_version: String,
 

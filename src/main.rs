@@ -196,6 +196,28 @@ fn main() -> Result<()> {
         Err(e) if is_doctor => eprintln!("ai-memory: WARN shape enforcement: {e:#}"),
         Err(e) => return Err(e),
     }
+
+    // v1.0.0 #3700 — the deployment-shape DETECTOR (read-only): holds the
+    // configured signals (peers, bindings, allowlist, forward URL, wake hub,
+    // monitoring scopes) against the DECLARED shape. A hardened declared
+    // shape with any pinned knob below its floor refuses here, naming EVERY
+    // disabled knob; configuration that looks like a stricter shape than
+    // declared is WARNED and recorded, never re-postured (promotion is an
+    // operator act). `doctor` never refuses — it reports the detector.
+    if !is_doctor {
+        let argv = match &cli.command {
+            daemon_runtime::Command::Serve(args) => Some((
+                !args.quorum_peers.is_empty(),
+                args.mtls_allowlist.as_deref(),
+            )),
+            daemon_runtime::Command::SyncDaemon(args) => Some((!args.peers.is_empty(), None)),
+            _ => None,
+        };
+        // Daemon entry points announce an undeclared promotion on stderr;
+        // one-shot verbs stay quiet (hooks capture stderr).
+        let announce = argv.is_some();
+        ai_memory::config::shape::detector::assess_pre_runtime(&app_config, argv, announce)?;
+    }
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
     // v1.0.0 #3124 — the unstamped-row mutation posture is a mandate-class
