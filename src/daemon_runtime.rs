@@ -5094,7 +5094,7 @@ async fn build_store_handle(
                             pool,
                         )
                         .await
-                        .context("connect postgres adapter")?
+                        .context(crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER)?
                     };
                     Ok((StorageBackend::Postgres, Arc::new(store)))
                 }
@@ -8622,20 +8622,31 @@ fn cmd_bench_relevance(args: &BenchArgs) -> Result<()> {
 
 #[cfg(feature = "sal")]
 async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
-    let src = migrate::open_store(&args.from)
+    // v1.0.0 #3435 — the SOURCE is opened through the read-only,
+    // never-creating funnel: a mistyped `--from` is a typed refusal, not a
+    // freshly-created empty store reported as a `memories_read: 0` success.
+    let src = migrate::open_source_store(&args.from)
         .await
         .context("open source store")?;
-    let dst = migrate::open_store(&args.to)
+    let report = if args.dry_run {
+        // v1.0.0 #3435 — a dry run has NO destination in scope at all.
+        // `open_store` would `Connection::open` (CREATE) a missing `--to`
+        // path and replay the schema ladder over it; sizing a migration must
+        // leave the filesystem exactly as it found it.
+        migrate::plan(src.as_ref(), args.batch, args.namespace.clone()).await
+    } else {
+        let dst = migrate::open_store(&args.to)
+            .await
+            .context("open destination store")?;
+        migrate::migrate(
+            src.as_ref(),
+            dst.as_ref(),
+            args.batch,
+            args.namespace.clone(),
+            false,
+        )
         .await
-        .context("open destination store")?;
-    let report = migrate::migrate(
-        src.as_ref(),
-        dst.as_ref(),
-        args.batch,
-        args.namespace.clone(),
-        args.dry_run,
-    )
-    .await;
+    };
     // #1579 A3 (SECURITY) — the migrate report echoes both store URLs;
     // mask the userinfo password so credentials never land in stdout /
     // captured CI logs.
@@ -8653,6 +8664,13 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
             // the destination re-derives them from the durable text on its
             // own backfill sweep.
             "embeddings_unattributed": report.embeddings_unattributed,
+            // #3435 — the `memory_links` tallies (F6 Gap 2) were on the
+            // `MigrationReport` and in `docs/migration-v0.7.0-postgres.md`
+            // but never on the wire; an operator sizing a lineage-heavy
+            // migrate needs them.
+            "links_read": report.links_read,
+            "links_written": report.links_written,
+            "links_skipped": report.links_skipped,
             "batches": report.batches,
             "errors": report.errors,
             "dry_run": report.dry_run,
@@ -8669,6 +8687,9 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
             "  embeddings_unattributed: {}",
             report.embeddings_unattributed
         );
+        println!("  links_read:        {}", report.links_read);
+        println!("  links_written:     {}", report.links_written);
+        println!("  links_skipped:     {}", report.links_skipped);
         println!("  batches:           {}", report.batches);
         println!("  dry_run:           {}", report.dry_run);
         println!("  errors:            {}", report.errors.len());

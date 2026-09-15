@@ -740,6 +740,11 @@ pub(crate) const SQL_CREATE_AGE_GRAPH: &str = "SELECT create_graph('memory_graph
 /// Postgres duplicate-object message fragment — the idempotent-create guard,
 /// shared with `ai-memory schema-init`.
 pub(crate) const PG_ERR_ALREADY_EXISTS: &str = "already exists";
+/// The ONE `anyhow` context every production caller attaches when the
+/// postgres adapter's connect funnel fails (daemon boot, `migrate` source and
+/// destination) — one const so the literal cannot drift across the three
+/// sites (hardcoded-literal ratchet, pm-v3.1).
+pub const CTX_CONNECT_POSTGRES_ADAPTER: &str = "connect postgres adapter";
 
 // ── v1.0.0 #3264 — pgvector bootstrap preflight (fail-closed, classified) ──
 //
