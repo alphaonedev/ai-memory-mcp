@@ -7485,9 +7485,22 @@ enabled = true
             assert_eq!(section.severity, Severity::Info, "{section:?}");
             assert_eq!(fact(&section, FACT_PEER_COUNT), "1");
             assert_eq!(fact(&section, FACT_INVALID_ROWS), "0");
-            let redacted =
-                crate::logging::redact_url_password("https://alice:hunter2@peer.example/api");
+            // #3711 — the fact key is built by the ALLOWLIST renderer, not the
+            // userinfo redactor. Pin BOTH halves on the same sink: the secret
+            // is absent AND the host+path that identify the peer are present,
+            // so this cannot pass by the key collapsing to an empty string.
+            let redacted = crate::url_display::url_origin_and_path(
+                "https://alice:hunter2@peer.example/api?token=s3cr3t",
+            );
             assert!(!redacted.contains("hunter2"), "{redacted}");
+            assert!(
+                !redacted.contains("s3cr3t"),
+                "query token must not survive: {redacted}"
+            );
+            assert!(
+                redacted.contains("peer.example"),
+                "the peer must stay identifiable: {redacted}"
+            );
             let key = |suffix: &str| format!("peer::me/{redacted}::{suffix}");
             assert_eq!(fact(&section, &key("reachability")), REACHABLE);
             assert_eq!(fact(&section, &key("contact_age_secs")), "4");
