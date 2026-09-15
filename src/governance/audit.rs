@@ -518,6 +518,27 @@ impl ForensicPayload {
         self.push(key, ForensicField::Array(items))
     }
 
+    /// An optional list of identifiers; `None` renders `null`, `Some(list)`
+    /// renders as [`Self::idents`] would (an empty list renders `[]`).
+    ///
+    /// #3372 — the optional twin of [`Self::idents`], so a row that records a
+    /// prior value only when something changed can render the key EVERY
+    /// time: `null` for "nothing was replaced" and `[]` for "the prior list
+    /// was empty" are distinct, and neither is confusable with a row written
+    /// before the key existed (which has no key at all). Its scalar sibling is
+    /// [`Self::opt_ident`]; a payload that carries one optional prior field
+    /// as `null` and omits the other cannot be read by a compliance reader.
+    pub fn opt_idents<I, S>(self, key: &'static str, ids: Option<I>) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        match ids {
+            Some(ids) => self.idents(key, ids),
+            None => self.push(key, ForensicField::Value(serde_json::Value::Null)),
+        }
+    }
+
     /// An operator filesystem path, rendered lossily with every detected
     /// credential span masked.
     pub fn path(self, key: &'static str, path: &Path) -> Self {
@@ -3914,6 +3935,54 @@ mod tests {
         );
         let text = serde_json::to_string(row).unwrap();
         assert!(!text.contains(token) && !text.contains("free text") && !text.contains("rm -rf"));
+    }
+
+    /// #3372 — `opt_idents` is the optional twin of `idents`: `None` renders
+    /// `null` (the key is PRESENT), `Some([])` renders `[]`, and `Some(list)`
+    /// sanitises each item exactly as `idents` does (identifier-shaped values
+    /// verbatim, everything else a keyed commitment). The three renderings
+    /// are pairwise distinct, which is what lets a reader tell "nothing was
+    /// replaced" from "the prior list was empty" from "field did not exist".
+    #[test]
+    fn issue_3372_opt_idents_renders_null_empty_and_sanitised_list() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key = fresh_key();
+        fresh_init(tmp.path(), Some(key.clone()));
+        let none: Option<Vec<&str>> = None;
+        record_decision(
+            "ai:t",
+            "allow",
+            "bash",
+            "",
+            ForensicPayload::new()
+                .opt_idents("absent", none)
+                .opt_idents("empty", Some(Vec::<&str>::new()))
+                .opt_idents("present", Some(["ai:worker", "not ok"]))
+                .opt_ident("scalar_absent", None)
+                .opt_ident("scalar_present", Some("ai:admin")),
+        );
+        shutdown();
+        let rows = rows_3647(tmp.path());
+        assert_eq!(rows.len(), 1);
+        let payload = &rows[0].payload;
+        assert!(
+            payload.get("absent").is_some(),
+            "a None list must render the KEY, not omit it: {payload}"
+        );
+        assert_eq!(payload["absent"], serde_json::Value::Null);
+        assert_eq!(payload["empty"], serde_json::json!([]));
+        assert_eq!(
+            payload["present"],
+            serde_json::json!(["ai:worker", forensic_commitment(&key, b"not ok")])
+        );
+        assert_eq!(payload["scalar_absent"], serde_json::Value::Null);
+        assert_eq!(payload["scalar_present"], "ai:admin");
+        let text = serde_json::to_string(&rows[0]).unwrap();
+        assert!(
+            !text.contains("not ok"),
+            "free text never reaches the row: {text}"
+        );
     }
 
     #[test]
