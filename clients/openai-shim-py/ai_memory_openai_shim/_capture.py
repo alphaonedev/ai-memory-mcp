@@ -17,7 +17,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any
+from typing import Any, TypedDict
 
 _ENV_BIN = "AI_MEMORY_BIN"
 _DEFAULT_BIN = "ai-memory"
@@ -151,3 +151,19 @@ def capture_turn(
         print("WARN ai-memory-openai-shim: substrate returned isError:true", file=sys.stderr)
         return False
     return True
+
+
+class _CaptureDurability(TypedDict):
+    durability_class: str
+    fsync: str
+
+
+class CaptureTurnReceipt(_CaptureDurability, total=False):
+    """#3555 MCP capture or pending-approval receipt."""
+
+    memory_id: str
+    dedup_hit: bool
+    status: str
+    pending_id: str
+    quorum_acks: int
+    quorum_n: int

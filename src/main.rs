@@ -93,7 +93,44 @@ fn main() -> Result<()> {
     // (`AppConfig::load_for_boot` matches `ErrorKind::NotFound` explicitly),
     // and `AI_MEMORY_NO_CONFIG=1` still short-circuits to defaults, so CI and
     // the test suite are byte-identical.
-    let app_config = match config::AppConfig::load_for_boot() {
+    // #3715 carve-out 1 — the `config` verbs (`check` / `migrate` / `show`)
+    // are the repair tools for a refused config: they read the file through
+    // `toml::Value` themselves and never depend on the boot loader, so they
+    // do not run it (running it would print the refusal they exist to
+    // explain, ahead of their own report).
+    let is_config_verb = matches!(&cli.command, daemon_runtime::Command::Config(_));
+    // #3715 / the #2445 disposition — `backup` / `export` take the durable
+    // text OUT and must not be locked behind a config key the daemon refuses:
+    // they load with the KNOWN keys applied (so `db` is the configured one,
+    // never the relative default) and the refusal text as a loud WARN.
+    let is_egress_verb = matches!(
+        &cli.command,
+        daemon_runtime::Command::Backup(_)
+            | daemon_runtime::Command::Export(_)
+            | daemon_runtime::Command::ExportForensicBundle(_)
+    );
+    let app_config = match if is_config_verb {
+        Ok(config::AppConfig::default())
+    } else if is_egress_verb && !config::skip_config() {
+        config::AppConfig::config_path().map_or_else(
+            || Ok(config::AppConfig::default()),
+            |p| {
+                config::AppConfig::try_load_from_optional_for_egress(&p).map(|(cfg, warn)| {
+                    if let Some(w) = warn {
+                        eprintln!(
+                            "ai-memory: WARN {w}\nai-memory: continuing for this EGRESS verb with \
+                             the KNOWN keys applied (#3715 / #2445 disposition): your durable \
+                             text is taken from the CONFIGURED `db`, but `serve` / `mcp` and \
+                             every writing verb REFUSE this config until the key is fixed."
+                        );
+                    }
+                    cfg
+                })
+            },
+        )
+    } else {
+        config::AppConfig::load_for_boot()
+    } {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("ai-memory: config is UNUSABLE — {e:#}");
@@ -145,7 +182,29 @@ fn main() -> Result<()> {
     // token aborts the boot right here, before anything else starts. The
     // async body logs the stashed pin report via the READ-ONLY
     // `security_profile::runtime_boot_report`.
+    // #3714 — the deployment shape derives the posture: under a hardened
+    // shape an unset `AI_MEMORY_SECURITY_PROFILE` is pinned to `asi-hard`
+    // (same `set_var` pre-runtime contract as the KNOBS pins below) and a
+    // `standard` override refuses; the at-rest floor is checked here too.
+    // MUST precede `security_profile::enforce_at_boot_pre_runtime` so the
+    // posture enforcement observes the pin. `doctor` still runs so it can
+    // report a shape refusal.
+    match ai_memory::config::shape::enforce_at_boot_pre_runtime(&app_config) {
+        Ok(_) => {}
+        // `doctor` reports a shape refusal in its "Deployment shape"
+        // section instead of dying on it (the pin is simply not applied).
+        Err(e) if is_doctor => eprintln!("ai-memory: WARN shape enforcement: {e:#}"),
+        Err(e) => return Err(e),
+    }
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
+
+    // v1.0.0 #3124 — the unstamped-row mutation posture is a mandate-class
+    // knob: an unrecognised token refuses boot (naming the knob, the token and
+    // the grammar) instead of being guessed. `doctor` stays runnable so it can
+    // report the bad value.
+    if !is_doctor {
+        ai_memory::identity::owner_stamp::validate_boot_token()?;
+    }
 
     // #3582: evaluate the argv peer lists even with quorum_writes=0, before
     // workers or stores start. Doctor must remain able to diagnose refusal.
@@ -324,6 +383,14 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
             | daemon_runtime::Command::Config(_)
             | daemon_runtime::Command::Completions(_)
             | daemon_runtime::Command::Man
+            // #3715 carve-out 1 — the K11 `[[governance.policy]]` translator
+            // is a config REPAIR tool (parses via `toml::Value`); a
+            // fail-closed loader whose repair path sits behind the same
+            // gate is a lockout, not a control.
+            | daemon_runtime::Command::Governance(daemon_runtime::GovernanceCliArgs {
+                action: daemon_runtime::GovernanceAction::MigrateToPermissions(_),
+                ..
+            })
     )
 }
 

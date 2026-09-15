@@ -1230,6 +1230,16 @@ pub trait MemoryStore: Send + Sync {
     /// process lifetime.
     fn capabilities(&self) -> Capabilities;
 
+    /// Observe the active writer's commit durability for a receipt (#3555).
+    ///
+    /// # Errors
+    /// Unsupported adapters fail closed; concrete adapters propagate observation errors.
+    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "write_durability".to_owned(),
+        })
+    }
+
     /// v0.7.0.1 S75 — return the highest applied DB schema-migration
     /// version (the integer recorded in `schema_version.MAX(version)`)
     /// from the underlying store. Surfaced through
@@ -1586,13 +1596,19 @@ pub trait MemoryStore: Send + Sync {
     /// namespace BEFORE enabling `scope=private` visibility filtering
     /// (avoiding a self-lockout from legacy / foreign-owned rows).
     ///
-    /// Default rewrites every OWNED row (any present `agent_id`);
-    /// `claim_unowned` additionally covers rows with a NULL/empty
-    /// `agent_id`. `dry_run` counts the matched rows and writes nothing.
-    /// Only the single `agent_id` metadata key is rewritten — every
-    /// other key is preserved and the `agent_id_idx` generated column
-    /// re-projects the new owner (no schema change). `to_id` is
-    /// validated; a malformed owner is rejected before any write.
+    /// `namespace = None` sweeps every namespace (`--all-namespaces`,
+    /// #3124 R4). `select` ([`crate::storage::ReownSelect`]) names the rows
+    /// in scope: `Owned` (default) rewrites rows with a present `agent_id`,
+    /// `OnlyUnowned` ONLY unstamped rows (never an owned one), `All` every
+    /// row. `dry_run` counts the matched rows and writes nothing. Only the
+    /// single `agent_id` metadata key is rewritten — every other key is
+    /// preserved and the `agent_id_idx` generated column re-projects the new
+    /// owner. #3124 R4: rewritten rows get `version + 1` and a fresh
+    /// `updated_at`, and ONE `memory.reowned` signed-chain row attributed to
+    /// `ctx.agent_id` is appended in the same transaction; the write is
+    /// refused under record-stop. `to_id` is validated; a malformed owner is
+    /// rejected before any write. Operator-only: callers pass an admin
+    /// context (the CLI verb is the only surface).
     ///
     /// Mirrors [`crate::storage::reown`] on the SQLite path. Default
     /// returns `UnsupportedCapability` so an in-memory/test adapter
@@ -1604,9 +1620,9 @@ pub trait MemoryStore: Send + Sync {
     async fn reown(
         &self,
         _ctx: &CallerContext,
-        _namespace: &str,
+        _namespace: Option<&str>,
         _to_id: &str,
-        _claim_unowned: bool,
+        _select: crate::storage::ReownSelect,
         _dry_run: bool,
     ) -> StoreResult<crate::storage::ReownReport> {
         Err(StoreError::UnsupportedCapability {

@@ -42,7 +42,14 @@ pub(super) fn handle_auto_tag(
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
     if let Some(c) = caller
-        && !crate::visibility::caller_owns_for_mutation(&mem, c, false)
+        && !crate::visibility::caller_owns_for_mutation(
+            &mem,
+            c,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::AUTO_TAG,
+            ),
+        )
     {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }

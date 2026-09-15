@@ -284,6 +284,24 @@ pub async fn update_memory(
     headers: HeaderMap,
     Json(body): Json<UpdateMemory>,
 ) -> impl IntoResponse {
+    let response = update_memory_write(State(app.clone()), Path(id), headers, Json(body))
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn update_memory_write(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateMemory>,
+) -> impl IntoResponse {
     let state = app.db.clone();
     if let Err(e) = validate::validate_id(&id) {
         return (
@@ -631,9 +649,14 @@ pub async fn update_memory(
         // same 403 wire shape. Inbox carve-out disabled here: the
         // inbox target should NOT be able to mutate an out-of-band
         // sender's row via PUT.
-        if let Some(resp) =
-            crate::handlers::parity::require_caller_owns_memory(existing, &caller, false)
-        {
+        if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+            existing,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::UPDATE,
+            ),
+        ) {
             return resp;
         }
     }
@@ -803,15 +826,23 @@ pub async fn update_memory(
             // v0.6.0.1: fan out the mutation to peers so remote readers
             // see the update, not the pre-update row. insert_if_newer on
             // peers sees a newer updated_at and applies.
+            let mut receipt = json!(mem);
             if let (Some(fed), Some(m)) = (app.federation.as_ref(), mem.as_ref())
                 && let Ok(tracker) = crate::federation::broadcast_store_quorum(fed, m).await
-                && let Err(err) = crate::federation::finalise_quorum(&tracker)
             {
-                // #869 — typed 503 envelope via the shared helper.
-                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::under_replicated_response(&payload);
+                match crate::federation::finalise_quorum(&tracker) {
+                    Ok(got) => {
+                        receipt[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
+                        receipt[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
+                        receipt[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
+                    }
+                    Err(err) => {
+                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                        return super::under_replicated_response(&payload);
+                    }
+                }
             }
-            Json(json!(mem)).into_response()
+            Json(receipt).into_response()
         }
         Ok((false, _)) => {
             // FBL-12 — refund the growth charge when the row vanished
@@ -1153,9 +1184,14 @@ pub async fn delete_memory(
         // recipient of an inbox message (`metadata.target_agent_id`)
         // IS permitted to delete that message after consuming it,
         // per the pre-#954 inline behaviour.
-        if let Some(resp) =
-            crate::handlers::parity::require_caller_owns_memory(&target, &agent_id, true)
-        {
+        if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+            &target,
+            &agent_id,
+            true,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::DELETE,
+            ),
+        ) {
             return resp;
         }
         let payload = json!({"id": target.id, "title": target.title});
@@ -1646,9 +1682,14 @@ pub async fn promote_memory(
         // canonical DRY helper at `parity::require_caller_owns_memory`.
         // Inbox carve-out disabled: the inbox target should not be
         // able to promote / TTL-change the sender's row.
-        if let Some(resp) =
-            crate::handlers::parity::require_caller_owns_memory(&target, &agent_id, false)
-        {
+        if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+            &target,
+            &agent_id,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::PROMOTE,
+            ),
+        ) {
             return resp;
         }
         let payload = json!({"id": target.id});

@@ -213,7 +213,17 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // Result<Value, String> boundary; the split makes the shared input filters
 // explicit above both traversal paths. Preserve the earlier lane counts.
 // 2026-09-09 chain 3 (Conductor lockstep, updated): + #3386 (+2) => merged tree measures 132.
-const QUAL_6_CEILING: usize = 132;
+// 2026-09-12 chain 12 (Conductor lockstep): 132 => 134. #3555 split
+// `handle_store` and `handle_update` into a thin wrapper plus an `_inner`
+// half so a write receipt can be decorated after the handler releases its
+// connection lock. NO new legacy-typed handler was introduced: the two new
+// occurrences are the wrapper halves of two PRE-EXISTING handlers, and the
+// wrapper MUST keep `Result<Value, String>` because the MCP dispatch
+// contract collapses tool errors to a string (documented as intentional and
+// load-bearing in `src/mcp/mod.rs`). The `_inner` halves SHOULD be typed and
+// are tracked as debt; typing them is a ~110-site refactor across two large
+// functions and does not belong in a merge commit.
+const QUAL_6_CEILING: usize = 134;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

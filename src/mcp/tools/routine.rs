@@ -960,3 +960,7 @@ mod handler_tests {
         assert_eq!(all["routines"].as_array().expect("array").len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "routine/freeze_3616.rs"]
+mod freeze_3616;

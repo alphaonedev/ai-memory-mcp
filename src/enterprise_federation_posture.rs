@@ -28,7 +28,7 @@
 //!
 //! The certified posture is the UNION of:
 //!
-//! 1. The existing 27-knob `asi-hard` hardened set
+//! 1. The existing 28-knob `asi-hard` hardened set
 //!    ([`crate::security_profile::KNOBS`], reused via
 //!    [`crate::security_profile::is_asi_hard`] +
 //!    [`crate::security_profile::asi_hard_below_floor`] — no knob name
@@ -975,7 +975,7 @@ mod tests {
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
         }
-        // Pins the 27 asi-hard knobs via the REAL enforcement fn — the
+        // Pins the 28 asi-hard knobs via the REAL enforcement fn — the
         // single source of truth for what "compliant" means for that set.
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
 

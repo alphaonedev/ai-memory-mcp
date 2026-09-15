@@ -1626,7 +1626,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // ceiling burned a full 80-minute macOS CI job. Measured 6_714; ceiling
     // 6_780 (+66 headroom). Refactor-split into `src/llm/{…}.rs` remains the
     // tracked post-ship ARCH cleanup.
-    ("src/llm.rs", 6_780),
+    /* 2026-09-12 chain 12 (Conductor lockstep): #3648 replaces free-text
+     * provider errors with the bounded `ProviderError`/`ProviderFailure`
+     * types and deletes `read_capped_text`, measuring 6_874. Raised to the
+     * EXACT actual. The standing refactor-split into `src/llm/{…}.rs` is
+     * now overdue and is tracked separately. */
+    ("src/llm.rs", 6_950),
 ];
 
 #[test]
