@@ -2212,7 +2212,9 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
         merge_backstop = crate::models::title_slot_merge_backstop("memories"),
         unstamped_owner =
-            crate::identity::owner_stamp::sqlite_unstamped_predicate("memories.metadata"),
+            crate::identity::owner_stamp::sqlite_unstamped_predicate(
+                crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+            ),
     )
 });
 
@@ -18194,7 +18196,9 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
              RETURNING id",
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
         unstamped_owner =
-            crate::identity::owner_stamp::sqlite_unstamped_predicate("memories.metadata"),
+            crate::identity::owner_stamp::sqlite_unstamped_predicate(
+                crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+            ),
     )
 });
 
