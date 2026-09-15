@@ -72,6 +72,7 @@ pub mod postgres_env;
 // #3705 — "only encrypted data in transit": the per-test TLS leaf every
 // daemon-spawning suite uses (the daemon refuses every plaintext bind).
 pub mod tls;
+pub mod tls_receiver;
 
 use std::path::PathBuf;
 use std::sync::Mutex;

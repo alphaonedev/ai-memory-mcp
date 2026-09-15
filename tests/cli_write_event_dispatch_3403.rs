@@ -51,16 +51,18 @@ use ai_memory::cli::CliOutput;
 use ai_memory::subscriptions::{self, NewSubscription};
 use rusqlite::Connection;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer};
+
+mod common;
+use common::tls_receiver::{Respond, TlsReceiver};
 
 // ---------------------------------------------------------------------------
 // harness (mirrors tests/webhook_coverage.rs)
 // ---------------------------------------------------------------------------
 
 fn fresh_env() -> (TempDir, PathBuf) {
-    // H11 (#628) — loopback webhook URLs are rejected by default; wiremock
-    // binds 127.0.0.1, so opt in for this test process.
+    // H11 (#628) — loopback webhook URLs are rejected by default; the
+    // receiver binds 127.0.0.1, so opt in for this test process (an SSRF
+    // control; #3705's plaintext refusal is met by serving TLS).
     ai_memory::config::set_allow_loopback_webhooks(true);
     ai_memory::subscriptions::prewarm_dispatch_tls();
     let dir = TempDir::new().expect("tempdir");
@@ -69,33 +71,13 @@ fn fresh_env() -> (TempDir, PathBuf) {
     (dir, db_path)
 }
 
-fn fresh_mock_listener() -> std::net::TcpListener {
-    let mut last_err = None;
-    for _ in 0..5 {
-        match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(l) => return l,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-    panic!("#1201: failed to bind an ephemeral port for the mock: {last_err:?}");
-}
-
-/// Per-test listener + UUID-anchored path, so a straggler POST from a
-/// concurrent test on a recycled port can never be miscounted (#1201).
-async fn fresh_mock() -> (MockServer, String, String) {
-    let server = MockServer::builder()
-        .listener(fresh_mock_listener())
-        .start()
-        .await;
+/// Per-test TLS receiver (#3705 — every `http://` webhook target is
+/// refused, loopback included) + UUID-anchored path, so a straggler POST
+/// from a concurrent test can never be miscounted (#1201).
+async fn fresh_mock() -> (TlsReceiver, String, String) {
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = TlsReceiver::start(tls, Respond::ok()).await;
     let path_str = format!("/hook/{}", uuid::Uuid::new_v4().simple());
-    Mock::given(method("POST"))
-        .and(path(path_str.clone()))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
     let url = format!("{}{}", server.uri(), path_str);
     (server, path_str, url)
 }
@@ -129,7 +111,7 @@ async fn drain() {
     );
 }
 
-async fn bodies_at(server: &MockServer, expected_path: &str) -> Vec<serde_json::Value> {
+async fn bodies_at(server: &TlsReceiver, expected_path: &str) -> Vec<serde_json::Value> {
     server
         .received_requests()
         .await

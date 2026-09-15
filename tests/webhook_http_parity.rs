@@ -50,8 +50,9 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod common;
+use common::tls_receiver::{Recorded, Respond, TlsReceiver};
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
@@ -222,11 +223,11 @@ fn subscribe_all(db_path: &Path, mock_url: &str) -> String {
 /// UUID path + the dedicated listener pin in `fresh_mock` together
 /// ensure stragglers cannot pollute the count.
 async fn wait_for_event(
-    mock: &MockServer,
+    mock: &TlsReceiver,
     expected_event: &str,
     expected_path: &str,
     total: Duration,
-) -> Option<wiremock::Request> {
+) -> Option<Recorded> {
     let deadline = std::time::Instant::now() + total;
     loop {
         let received = mock.received_requests().await.unwrap_or_default();
@@ -247,37 +248,15 @@ async fn wait_for_event(
     }
 }
 
-/// Stand up a wiremock that always returns 200 OK on POST `/hook/<uuid>`.
-///
-/// #1201 — every test gets a dedicated `TcpListener` (bypassing the
-/// `MOCK_SERVER_POOL`) AND a unique per-test path. Both layers
-/// independently prevent the cross-test bleed surfaced under
-/// full-suite parallel-binary load.
-fn fresh_mock_listener() -> std::net::TcpListener {
-    // bind retries on EADDRINUSE (5 attempts, 50 ms backoff).
-    let mut last_err = None;
-    for _ in 0..5 {
-        match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(l) => return l,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
-}
-
-async fn fresh_mock() -> (MockServer, String, String) {
-    let listener = fresh_mock_listener();
-    let mock = MockServer::builder().listener(listener).start().await;
+/// Stand up a TLS receiver (#3705 — every `http://` webhook target is
+/// refused, loopback included) that always returns 200 OK, on a
+/// per-test UUID path (`/hook/<uuid>`, #1201) so a foreign POST cannot be
+/// mis-counted as this test's event.
+async fn fresh_mock() -> (TlsReceiver, String, String) {
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let mock = TlsReceiver::start(tls, Respond::ok()).await;
     let unique = uuid::Uuid::new_v4().simple().to_string();
     let path_str = format!("/hook/{unique}");
-    Mock::given(method("POST"))
-        .and(path(path_str.clone()))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock)
-        .await;
     let url = format!("{}{}", mock.uri(), path_str);
     (mock, path_str, url)
 }
