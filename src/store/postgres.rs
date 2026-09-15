@@ -14925,7 +14925,9 @@ impl PostgresStore {
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         )
         )
         .bind(&new_id)
@@ -17051,7 +17053,7 @@ where
     .await?;
     row.map(|r| {
         let id: String = r.try_get("id")?;
-        let state: String = r.try_get("lifecycle_state")?;
+        let state: String = r.try_get(crate::models::field_names::LIFECYCLE_STATE)?;
         let ns: String = r.try_get("namespace")?;
         let metadata: serde_json::Value = r.try_get("metadata")?;
         let admission = crate::visibility::title_slot_admission(
@@ -17104,7 +17106,7 @@ async fn pg_same_id_hidden_row_under_key(
         let title: String = r.try_get("title")?;
         let namespace: String = r.try_get("namespace")?;
         let version: i64 = r.try_get("version")?;
-        let state: String = r.try_get("lifecycle_state")?;
+        let state: String = r.try_get(crate::models::field_names::LIFECYCLE_STATE)?;
         Ok(
             (title == memory.title && namespace == memory.namespace).then(|| PgSameIdHiddenRow {
                 version,
@@ -21638,7 +21640,9 @@ impl MemoryStore for PostgresStore {
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         )
         )
         .bind(&memory.id)
@@ -22218,7 +22222,9 @@ impl MemoryStore for PostgresStore {
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         ));
 
         let rows = builder
@@ -22660,7 +22666,9 @@ impl MemoryStore for PostgresStore {
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         )
         )
         .bind(&memory.id)
@@ -23051,7 +23059,9 @@ impl MemoryStore for PostgresStore {
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         )
         )
         .bind(&memory.id)
@@ -25416,7 +25426,9 @@ impl MemoryStore for PostgresStore {
             RETURNING id",
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         )
         )
         .bind(&memory.id)
@@ -28754,7 +28766,9 @@ impl MemoryStore for PostgresStore {
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         )
         )
         .bind(&new_id)
@@ -35325,7 +35339,9 @@ impl PostgresStore {
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
             unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop("memories.metadata"),
+                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+                ),
         );
         let embed_upsert_sql: &str = &embed_upsert_sql;
         // #2771/#2887 — single-source the column list + binds + the whole DO
