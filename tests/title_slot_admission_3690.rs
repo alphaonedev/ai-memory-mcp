@@ -523,3 +523,67 @@ fn proactive_conflict_never_refuses_on_another_agents_private_row_3712() {
         assert_eq!(hit.existing_id, "id-a");
     }
 }
+
+/// The Conductor's #3696 pin requirement: `Refused` renders `existing_id`
+/// EMPTY but the typed conflict shape is still PRODUCED (title + namespace
+/// carried), and a VISIBLE occupant still returns its REAL id through the
+/// SAME funnel and arm — paired on one sink, so an absent id cannot pass
+/// because the whole payload silently stopped being built.
+#[test]
+fn refused_conflict_keeps_its_typed_shape_and_a_visible_occupant_keeps_its_id_3696() {
+    let (_dir, conn) = open();
+    ai_memory::db::insert(
+        &conn,
+        &private_row_of("ai:alice", "id-a", "slot", "alice's text"),
+    )
+    .expect("seed");
+    let attempt = |viewer: Option<&str>, id: &str| {
+        ai_memory::db::insert_no_overwrite_as(
+            &conn,
+            &private_row_of("ai:bob", id, "slot", "bob's text"),
+            viewer,
+        )
+        .expect_err("the slot is taken either way")
+    };
+    // hidden to bob: refused, typed shape present, id EMPTY
+    let hidden = attempt(Some("ai:bob"), "id-b");
+    let c = conflict(&hidden);
+    assert_eq!(
+        (
+            c.title.as_str(),
+            c.namespace.as_str(),
+            c.existing_id.as_str()
+        ),
+        ("slot", "team/ops", "")
+    );
+    assert!(
+        hidden.to_string().starts_with("CONFLICT:"),
+        "the typed message is still rendered: {hidden}"
+    );
+    // visible to the owner (and to trust-all): the SAME arm names the real id
+    for viewer in [Some("ai:alice"), None] {
+        let visible = attempt(viewer, "id-c");
+        let c = conflict(&visible);
+        assert_eq!(
+            (
+                c.title.as_str(),
+                c.namespace.as_str(),
+                c.existing_id.as_str()
+            ),
+            ("slot", "team/ops", "id-a"),
+            "viewer {viewer:?}: a visible occupant is named through the same code path"
+        );
+    }
+    // lifecycle axis through the same arm: quarantined → empty id, typed shape kept
+    set_state(&conn, "id-a", "quarantined");
+    let hidden = attempt(Some("ai:alice"), "id-d");
+    let c = conflict(&hidden);
+    assert_eq!(
+        (
+            c.title.as_str(),
+            c.namespace.as_str(),
+            c.existing_id.as_str()
+        ),
+        ("slot", "team/ops", "")
+    );
+}
