@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# FROZEN VERBATIM pre-#3713 copy of scripts/check-foreign-text-to-caller.py (a59072a6c), the R-203
+# control for the S5 pattern-vs-expression fix: its self-test leg must FLAG the log-only
+# `if let Err(e) = <db call> { warn!(..) }` shape the live gate accepts. Never edit; replace only with a
+# newer frozen prefix when the next defect class lands.
 # check-foreign-text-to-caller.py — #3688 gate 7: FOREIGN TEXT CROSSING TO A CALLER.
 #
 # The rule keys on two properties of a VALUE, neither of which is a name:
@@ -867,11 +871,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
                 # skip patterns (Err(e) =>), and skip if this is inside a From impl (covered by S4)
                 after = text[e+1:e+4]
                 if after.lstrip().startswith('=>') or re.match(r'^[a-z_][a-z0-9_]*$', inner) and after.lstrip().startswith('=>'): continue
-                # #3713 — `let Err(e) = ..` / `if let Err(e) = ..` / `while let Err(e) = ..` is a PATTERN too,
-                # not a re-raise expression: the ident it binds goes wherever the block sends it (usually a
-                # tracing line). Reading it as `Err(e)`-the-value made six log-only sites under src/mcp
-                # FAIL with "expr: e" while the value never reached a caller. `==` stays an expression.
-                if after.lstrip().startswith('=') and not after.lstrip().startswith('=='): continue
                 if re.match(r'^[a-z_][a-z0-9_]*$', inner):
                     # Err(e) as an expression (re-raise) — trace the ident
                     yield ('mcp-error', inner, m.start()); continue
@@ -993,14 +992,9 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         for l in open(ALLOWF):
             l = l.strip()
             if not l or l.startswith('#'): continue
-            if '=' in l: k, v = l.split('=', 1); k, v = k.strip(), v.strip()
-            else: k, v = l, ''
-            # #3713 — `mapper=` is a SET, not a slot: the dict used to key every declaration on the
-            # bare word `mapper`, so only the LAST `mapper=` line survived and the ones above it
-            # were silently undeclared (a second funnel un-declared the first). Keyed per name.
-            if k == 'mapper': k = f'mapper={v}'
-            allow[k] = v
-    EXTRA_MAPPERS = [v for k, v in allow.items() if k.startswith('mapper=')]
+            if '=' in l: k, v = l.split('=', 1); allow[k.strip()] = v.strip()
+            else: allow[l] = ''
+    EXTRA_MAPPERS = [v for k, v in allow.items() if k == 'mapper']
 
     def disposition(key):
         """The ledger's answer for a live foreign render: an INFO text for an `echo:` or `pending:#N`
@@ -1044,7 +1038,7 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
     funnel_findings()
     live_keys = {x['key'] for x in findings}
     for k, v in allow.items():
-        if k.startswith('mapper='): continue
+        if k == 'mapper': continue
         if k not in live_keys: add('NOTICE', k, '(allowlist)', 0, '-', f'ledger entry no longer matches a live site (fixed or moved): {k}={v}')
 
 
@@ -1290,26 +1284,6 @@ fn forward_sanitised(url: &str) -> Result<Value, String> {
     }
     Ok(json!({"ok": true}))
 }
-fn log_only_if_let(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
-    // #3713 — the exact consolidate.rs shape: an EARLIER `Err(e) =>` arm sends a db error through a
-    // declared mapper (clean), then a LATER `if let Err(e) = <db call>` PATTERN re-binds the same
-    // name and only logs it. The pre-fix gate read the second `Err(e)` as a re-raise EXPRESSION,
-    // resolved the name to the first arm's foreign binding, and FAILED a site whose value never
-    // reached a caller.
-    let mem = match db::get(conn, id) {
-        Ok(m) => m,
-        Err(e) => return Err(map_to_wire(e)),
-    };
-    if let Err(e) = db::set_embedding(conn, id, &mem) {
-        tracing::warn!(error = %e, "embedding store failed (operator log)");
-    }
-    Ok(json!({"ok": true}))
-}
-fn reraise_ident(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
-    // #3713 POSITIVE — a bare `Err(e)` EXPRESSION re-raising db text is still a sink.
-    let e = db::get(conn, id).map_err(|e| e.to_string()).unwrap_err();
-    Err(e)
-}
 fn only_sanitised(url: &str) -> Result<Value, String> {
     // SPARE — a sink rendering ONLY a url_display-rendered value is CLEAN.
     let target = crate::url_display::url_origin_and_path(url);
@@ -1457,17 +1431,6 @@ def self_test(scratch):
         expect(any(':forward_sanitised:mcp-error:http' in k for k in frozen_fails), 'R-203 sanity: the frozen gate still rejects the single-line {text} sink, so its silence on the block is the defect, not a broken run')
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
         expect(False, f'R-203: frozen prefix gate could not be run ({ex})')
-    expect(not has('src/mcp/tools/relay.rs', ':log_only_if_let:'), '#3713: `if let Err(e) = <db call>` is a PATTERN, not a re-raise — a log-only arm is CLEAN')
-    expect(has('src/mcp/tools/relay.rs', ':reraise_ident:mcp-error:db'), '#3713 POSITIVE: a bare `Err(e)` expression re-raising db text is still RED')
-    prefix_3713 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3713.py')
-    try:
-        import subprocess
-        out = subprocess.run([sys.executable, prefix_3713, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
-        frozen_3713 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
-        expect(any(':log_only_if_let:' in k for k in frozen_3713), 'R-203: the FROZEN pre-#3713 gate (test/fixtures/foreign-text-prefix-3713.py) FLAGS the log-only pattern — the defect reproduces')
-        expect(any(':reraise_ident:mcp-error:db' in k for k in frozen_3713), 'R-203 sanity: the frozen gate rejects the bare re-raise too, so its verdict on the pattern is the defect, not a broken run')
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
-        expect(False, f'R-203 (#3713): frozen prefix gate could not be run ({ex})')
     expect(has('src/hooks/chain.rs', ':fire:deny-reason:proc'), 'hook subprocess text in Deny.reason (#3704)')
     expect(has('src/errors.rs', ':from:memory-error:db'), 'From<rusqlite::Error> -> MemoryError::DatabaseError(e.to_string())')
     expect(has('src/subscriptions.rs', ':send:dlq-record:http'), "receiver's ack field persisted into subscription_dlq.last_error")
@@ -1502,10 +1465,6 @@ def self_test(scratch):
     with open(allowf, 'w') as fh: fh.write(f'{key}=echo: fixture ack\n')
     f3, _ = analyze(root, ALLOWF=allowf)
     expect(not any(x['key'] == key and x['sev'] == 'FAIL' for x in f3), 'ALLOWLIST CONTROL: an echo acknowledgement downgrades that key to INFO')
-    # #3713 — TWO `mapper=` declarations must BOTH take effect (the second used to un-declare the first).
-    with open(allowf, 'w') as fh: fh.write('mapper=map_to_wire\nmapper=second_mapper_never_called\n')
-    f5, _ = analyze(root, ALLOWF=allowf)
-    expect(not any('map_to_wire' in x['text'] for x in f5 if x['sev'] == 'FAIL'), 'MAPPER-SET CONTROL: the FIRST of two mapper= lines is still declared when a second follows it')
     # LEDGER LEGS (the #3688 ledger, three rules):
     #  (a) a `pending:#N` entry holds a live render as INFO, and the run reports it as LIVE, not silent;
     #  (b) a funnel-arm key is held by the ledger exactly like any other sink (it could not be before);

@@ -250,7 +250,7 @@ fn resolve_namespace_standard_memory(
     // A severed / dangling pointer (`Ok(None)`) is a genuinely-unowned state
     // (parity with the pg twin's `NotFound → None`); a read FAULT is not, and
     // must refuse rather than allow.
-    db::get(conn, &standard_id).map_err(|e| e.to_string())
+    db::get(conn, &standard_id).map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))
 }
 
 /// #2721 / CB-19 — resolve the caller for a namespace-standard mutation,
@@ -463,7 +463,7 @@ fn handle_namespace_set_standard_inner(
         // Load the standard memory first so we can read its existing
         // governance blob and merge.
         let mut mem = db::get(conn, id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or_else(|| crate::errors::msg::memory_not_found(id))?;
         // Compute the merged governance JSON: existing fields preserved,
         // incoming overrides applied per-key.
@@ -498,7 +498,9 @@ fn handle_namespace_set_standard_inner(
             None,
             Some(&metadata),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err("handle_namespace_set_standard_inner", e)
+        })?;
         if !found {
             return Err(format!("memory not found during governance merge: {id}"));
         }
@@ -832,7 +834,8 @@ fn handle_namespace_clear_standard_inner(
             .is_ok();
         if meta_row_exists {
             let resolved = match db::get_namespace_standard(conn, namespace) {
-                Ok(Some(standard_id)) => db::get(conn, &standard_id).map_err(|e| e.to_string())?,
+                Ok(Some(standard_id)) => db::get(conn, &standard_id)
+                    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?,
                 Ok(None) => None,
                 Err(e) => return Err(e.to_string()),
             };
@@ -891,7 +894,8 @@ fn handle_namespace_clear_standard_inner(
         crate::governance::audit::ForensicPayload::new().ident("namespace", namespace),
     );
 
-    let cleared = db::clear_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
+    let cleared = db::clear_namespace_standard(conn, namespace)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("clear_namespace_standard", e))?;
     Ok(json!({"cleared": cleared, "namespace": namespace}))
 }
 

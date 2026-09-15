@@ -124,7 +124,7 @@ pub fn handle_skill_promote_from_reflection(
         &caller,
         read_caller.as_deref(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| crate::mcp::error_text::mcp_foreign_err("as_deref", error))
 }
 
 /// Shared SQLite promotion body. HTTP preserves its authenticated actor separately
@@ -229,8 +229,7 @@ pub(crate) fn handle_skill_promote_for_caller(
     // ReflectsOn). The substrate `reflect` writer is the only producer
     // of these edges, so the order matches the original source_ids
     // input order at the wire level.
-    let links = crate::db::get_links(conn, reflection_id)
-        .map_err(|e| anyhow::anyhow!("loading reflects_on edges: {e}"))?;
+    let links = crate::db::get_links(conn, reflection_id).context("loading reflects_on edges")?;
     let mut source_ids: Vec<String> = links
         .into_iter()
         .filter(|l| l.source_id == reflection_id && l.relation == MemoryLinkRelation::ReflectsOn)
@@ -401,6 +400,7 @@ pub(crate) fn handle_skill_promote_for_caller(
 // --- D1.5 (#986): per-tool McpTool impl for memory_skill_promote_from_reflection ---
 
 use crate::mcp::registry::McpTool;
+use anyhow::Context as _;
 use schemars::JsonSchema;
 use serde::Deserialize;
 

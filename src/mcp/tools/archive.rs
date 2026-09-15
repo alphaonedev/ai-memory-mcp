@@ -29,7 +29,7 @@ pub(super) fn handle_archive_list(
         limit.min(crate::storage::LIST_MAX_LIMIT),
         offset,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("min", e))?;
     Ok(json!({"archived": items, "count": items.len()}))
 }
 
@@ -178,9 +178,11 @@ pub(super) fn handle_archive_purge(
     }
 
     let purged = if as_admin {
-        db::purge_archive(conn, older_than_days).map_err(|e| e.to_string())?
+        db::purge_archive(conn, older_than_days)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("purge_archive", e))?
     } else {
-        db::purge_archive_for_caller(conn, &caller, older_than_days).map_err(|e| e.to_string())?
+        db::purge_archive_for_caller(conn, &caller, older_than_days)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("purge_archive", e))?
     };
     Ok(json!({
         "purged": purged,
@@ -201,7 +203,8 @@ pub(super) fn handle_archive_stats(
     conn: &rusqlite::Connection,
     caller: Option<&str>,
 ) -> Result<Value, String> {
-    db::archive_stats_scoped(conn, caller).map_err(|e| e.to_string())
+    db::archive_stats_scoped(conn, caller)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("archive_stats_scoped", e))
 }
 
 /// #3204 item 7 — the three gates a real `memory_gc` sweep must clear, in the
@@ -300,12 +303,12 @@ fn gate_gc_sweep(
             "SELECT DISTINCT namespace FROM memories WHERE {}",
             db::SQL_GC_EXPIRED_WHERE,
         ))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("gate_gc_sweep", e))?;
     let namespaces: Vec<String> = stmt
         .query_map(rusqlite::params![now, owner], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("gate_gc_sweep", e))?
         .collect::<rusqlite::Result<Vec<String>>>()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("query_map", e))?;
     for ns in &namespaces {
         if db::resolve_governance_policy(conn, ns)
             .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any))
@@ -388,7 +391,7 @@ pub(super) fn handle_gc(
                 rusqlite::params![now, owner],
                 |r| r.get(0),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| crate::mcp::error_text::mcp_foreign_err("get", error))?;
         // #3171 — surface `archived` on BOTH shapes. The tool advertises
         // "archives first", but that is conditional on the daemon's
         // `archive_on_gc` setting: with it OFF the sweep is a permanent
@@ -398,7 +401,8 @@ pub(super) fn handle_gc(
         // tool docs.)
         return Ok(json!({"collected": count, "dry_run": true, "archived": archive}));
     }
-    let count = db::gc_for_caller(conn, archive, owner).map_err(|e| e.to_string())?;
+    let count = db::gc_for_caller(conn, archive, owner)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("gc_for_caller", e))?;
     Ok(json!({"collected": count, "dry_run": false, "archived": archive}))
 }
 

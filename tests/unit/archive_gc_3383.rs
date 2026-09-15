@@ -226,10 +226,12 @@ fn gc_owner_archive_rolls_back_on_delete_failure_3383() {
         [json!({"agent_id":"ai:gc-owner-3383"}).to_string()],
     ).unwrap();
     conn.execute_batch("CREATE TRIGGER refuse_gc_3383 BEFORE DELETE ON memories BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;").unwrap();
-    assert!(
-        handle_gc(&conn, &json!({}), true)
-            .unwrap_err()
-            .contains("injected delete failure")
+    // #3713 — the trigger's RAISE text is driver text: the caller sees the
+    // storage class; the rollback (archived_total == 0 below) is the
+    // contract this cell pins.
+    assert_eq!(
+        handle_gc(&conn, &json!({}), true).unwrap_err(),
+        crate::mcp::error_text::DB_ERROR_TEXT
     );
     assert_eq!(
         db::archive_stats(&conn).unwrap()["archived_total"],

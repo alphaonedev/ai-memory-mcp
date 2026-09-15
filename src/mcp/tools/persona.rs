@@ -68,8 +68,9 @@ pub(super) fn handle_persona(
         .as_str()
         .unwrap_or(crate::DEFAULT_NAMESPACE);
 
-    let persona = get_latest_persona(conn, entity_id, namespace)
-        .map_err(|e| format!("memory_persona substrate error: {e}"))?;
+    let persona = get_latest_persona(conn, entity_id, namespace).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("memory_persona substrate error", e)
+    })?;
     // v1.0.0 #3596 — caller visibility gate on the BACKING Persona row.
     // `get_latest_persona` selects by `(entity_id, namespace)` with no
     // owner / scope predicate, so without this every tenant could read every

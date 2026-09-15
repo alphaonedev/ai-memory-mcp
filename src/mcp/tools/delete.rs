@@ -125,10 +125,13 @@ pub(super) fn handle_delete(
     );
 
     // Resolve the memory first so governance has owner context.
-    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+    let target = if let Some(m) =
+        db::get(conn, id).map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    {
         Some(m)
     } else {
-        db::get_by_prefix(conn, id).map_err(|e| e.to_string())?
+        db::get_by_prefix(conn, id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
     };
     let Some(target) = target else {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
@@ -234,7 +237,7 @@ pub(super) fn handle_delete(
             &payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
@@ -293,9 +296,11 @@ pub(super) fn handle_delete(
     // to consult documentation to know whether its data still exists.
     let archived = crate::visibility::inbox_delete_retains(&target.namespace);
     let deleted = if archived {
-        db::delete_archive_first(conn, &target.id).map_err(|e| e.to_string())?
+        db::delete_archive_first(conn, &target.id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("delete_archive_first", e))?
     } else {
-        db::delete(conn, &target.id).map_err(|e| e.to_string())?
+        db::delete(conn, &target.id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("delete_archive_first", e))?
     };
     if deleted {
         // v1.0.0 #2446 — queue the erasure for federated fan-out. The MCP

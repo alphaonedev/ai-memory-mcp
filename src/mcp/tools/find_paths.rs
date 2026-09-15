@@ -125,12 +125,11 @@ pub fn handle_find_paths(
         max_results,
         include_invalidated,
     )
-    .map_err(|e| {
-        // Match the kg_query convention: depth-budget violations
-        // surface their error message verbatim so callers can
-        // distinguish "you asked for too much" from a real fault.
-        e.to_string()
-    })?;
+    // Match the kg_query convention: a depth-budget violation is OUR typed
+    // `StorageError::TraversalBudgetExceeded`, which the #3713 funnel passes
+    // through verbatim so callers can distinguish "you asked for too much"
+    // from a real fault; a driver fault is logged and rendered as its class.
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("find_paths", e))?;
 
     let paths: Vec<_> = paths
         .into_iter()

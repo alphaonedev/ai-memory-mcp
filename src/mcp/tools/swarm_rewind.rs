@@ -107,7 +107,7 @@ fn resolve_rewind_target(
 ) -> Result<(String, &'static str), String> {
     // Memory / claim-id arm — raw existence probe (any lifecycle state).
     if db::namespace_by_id(conn, to)
-        .map_err(|e| format!("swarm_rewind target probe: {e}"))?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("swarm_rewind target probe", e))?
         .is_some()
     {
         return Ok((to.to_string(), "memory"));
@@ -116,7 +116,7 @@ fn resolve_rewind_target(
     // Checkpoint arm — resolve the checkpoint, then extract a root memory id
     // from its condition/metadata.
     if let Some(cp) = crate::checkpoints::get(conn, to)
-        .map_err(|e| format!("swarm_rewind checkpoint probe: {e}"))?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("swarm_rewind checkpoint probe", e))?
     {
         let root = checkpoint_root_memory_id(&cp).ok_or_else(|| {
             format!(
@@ -125,11 +125,21 @@ fn resolve_rewind_target(
             )
         })?;
         if db::namespace_by_id(conn, &root)
-            .map_err(|e| format!("swarm_rewind checkpoint root probe: {e}"))?
+            .map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err("swarm_rewind checkpoint root probe", e)
+            })?
             .is_none()
         {
+            // #3713 — the root id is a STORED reference the caller did not
+            // supply; it goes to the operator log, the caller gets the verdict.
+            tracing::warn!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                checkpoint = to,
+                root,
+                "swarm_rewind: checkpoint root memory not found"
+            );
             return Err(format!(
-                "swarm_rewind: checkpoint {to} root memory {root} not found"
+                "swarm_rewind: checkpoint {to} root memory not found"
             ));
         }
         return Ok((root, "checkpoint"));
@@ -205,7 +215,7 @@ pub fn handle_swarm_rewind(conn: &rusqlite::Connection, params: &Value) -> Resul
     {
         use crate::permissions::{Op, PermissionContext, Permissions};
         let link_ns = db::namespace_by_id(conn, &root_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("namespace_by_id", e))?
             .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
         let agent_id = crate::identity::resolve_governance_subject(
             params[param_names::AGENT_ID].as_str(),
@@ -249,7 +259,8 @@ pub fn handle_swarm_rewind(conn: &rusqlite::Connection, params: &Value) -> Resul
     // unchanged. A hidden (already-contaminated) root returns `None` from the
     // visibility-filtered `get`, so the idempotent re-run is not blocked here.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller()
-        && let Some(root) = db::get(conn, &root_id).map_err(|e| e.to_string())?
+        && let Some(root) = db::get(conn, &root_id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
         && !crate::visibility::caller_owns_for_mutation(
             &root,
             &caller,
@@ -281,7 +292,7 @@ pub fn handle_swarm_rewind(conn: &rusqlite::Connection, params: &Value) -> Resul
         &freeze_routines,
         dry_run,
     )
-    .map_err(|e| format!("swarm_rewind: {e}"))?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("swarm_rewind", e))?;
 
     Ok(render_report(&report))
 }

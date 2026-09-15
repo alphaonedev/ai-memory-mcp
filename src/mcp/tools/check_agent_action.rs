@@ -131,7 +131,8 @@ pub fn run_check(
     // the CLI `governance check-action` reuse of this funnel — the CLI
     // process never installs the gate).
     crate::mcp::consult_pre_governance_decision_gate("", kind, agent_id, None)?;
-    let decision = check_agent_action(conn, agent_id, action).map_err(|e| e.to_string())?;
+    let decision = check_agent_action(conn, agent_id, action)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("check_agent_action", e))?;
     Ok(json!({
         "decision": decision,
         "kind": kind,

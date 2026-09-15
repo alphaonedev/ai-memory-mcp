@@ -71,6 +71,9 @@ mod param_shapes_3365_tests;
 // error codes, method names, MCP protocol revision.
 pub mod jsonrpc;
 
+/// #3713 — the ONE renderer of tool errors into caller-visible text.
+pub mod error_text;
+
 // #3374 — table-driven regression suite for the NUMERIC / BOOLEAN parameter
 // shapes that silently took a server default (`action_create.priority`,
 // `lease_*.ttl_secs`, `signal_send.ttl_secs`, `signal_inbox`/`inbox.limit`,
@@ -2840,9 +2843,11 @@ fn dispatch_memory_capture_turn(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
     // #3393 — the RESOLVED authority principal, never the raw handshake
     // `clientInfo.name` (which the row could then never be read back by).
     // The handler is `anyhow`-typed (QUAL-6); the legacy envelope's String
-    // error is rendered here, at the dispatch boundary, via `Display`.
+    // error is rendered here, at the dispatch boundary, through the ONE
+    // #3713 funnel: a typed refusal riding the chain keeps its message, a
+    // driver chain is logged for the operator and rendered as its class.
     capture_turn::handle_capture_turn_mcp(ctx.conn, ctx.arguments, ctx.authority)
-        .map_err(|e| e.to_string())
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("capture_turn", e))
 }
 
 fn dispatch_memory_check_agent_action(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

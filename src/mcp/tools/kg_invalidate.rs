@@ -157,7 +157,8 @@ pub fn handle_kg_invalidate(
     // (`resolve_read_visibility_caller`) so it fires ONLY when AI_MEMORY_AGENT_ID
     // is set (multi-tenant opt-in); single-operator trust-all default unchanged.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller()
-        && let Some(src) = db::get(conn, source_id).map_err(|e| e.to_string())?
+        && let Some(src) = db::get(conn, source_id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
         && !crate::visibility::caller_owns_for_mutation(
             &src,
             &caller,
@@ -186,7 +187,7 @@ pub fn handle_kg_invalidate(
         valid_until,
         actor.as_deref(),
     )
-    .map_err(|e| e.to_string())?
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
     {
         Some(res) => {
             // v0.7 J4 / G14 — emit `memory_link_invalidated` webhook

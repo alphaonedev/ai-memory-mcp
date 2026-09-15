@@ -253,7 +253,7 @@ Every patch/release must be reviewed against these 10 areas:
 | 3 | Command injection | No `std::process::Command` in production code |
 | 4 | Path traversal | File paths use `PathBuf::join()` safely |
 | 5 | `unwrap()` calls | Zero new production `unwrap()` — use `?` or `.map_err()` |
-| 6 | Error message leakage | Only expose tier names and IDs, not internal state or stack traces |
+| 6 | Error message leakage | Only expose tier names and IDs, not internal state or stack traces. On the MCP surface every tool error string is rendered by the ONE funnel `crate::mcp::error_text::mcp_error_text` (#3713): a driver / `std::io` / codec `Display` never reaches the caller (it is logged for the operator under the `mcp.tool.error` target and rendered as its class constant); an own-vocabulary refusal riding an `anyhow` chain gets a typed root via `crate::errors::refusal` / `invalid_input` so it passes through verbatim. Gate 7 (`scripts/check-foreign-text-to-caller.py`) enforces this mechanically |
 | 7 | Race conditions | Check embedding regen, HNSW updates, consolidate paths |
 | 8 | Auth/authz | HTTP API requires `--auth-token` for non-localhost access |
 | 9 | Data in logs | Only UUIDs, error messages, GC counts; no user content |

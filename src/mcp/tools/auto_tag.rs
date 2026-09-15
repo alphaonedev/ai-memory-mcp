@@ -36,7 +36,7 @@ pub(super) fn handle_auto_tag(
     // #3348 read visibility precedes #1786 ownership: mutation permission
     // alone does not grant permission to send a row to the model.
     let mem = db::get(conn, id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
         .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
     if !crate::visibility::is_readable_on_query(&mem, caller, None) {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
@@ -58,9 +58,9 @@ pub(super) fn handle_auto_tag(
     // tested at ≥95% via wiremock-driven success / error / shape
     // cases below; real-LLM tag quality is validated end-to-end via
     // the LongMemEval benchmark (see `benchmarks/longmemeval/`).
-    let tags = llm
-        .auto_tag(&mem.title, &mem.content, None)
-        .map_err(|e| e.to_string())?;
+    let tags = llm.auto_tag(&mem.title, &mem.content, None).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("auto_tag", crate::mcp::error_text::llm(e))
+    })?;
     // Apply tags to the memory
     let mut all_tags = mem.tags.clone();
     for t in &tags {

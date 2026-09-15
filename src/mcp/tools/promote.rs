@@ -100,9 +100,13 @@ pub(super) fn handle_promote(
     validate::validate_id(id).map_err(|e| e.to_string())?;
     // Resolve prefix if exact ID not found; capture the memory so governance
     // has owner context (Task 1.9).
-    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+    let target = if let Some(m) =
+        db::get(conn, id).map_err(|e| crate::mcp::error_text::mcp_foreign_err("validate_id", e))?
+    {
         m
-    } else if let Some(m) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
+    } else if let Some(m) = db::get_by_prefix(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    {
         m
     } else {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
@@ -176,7 +180,7 @@ pub(super) fn handle_promote(
                 &dest_payload,
                 dest_capability.as_ref(),
             )
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
             {
                 GovernanceDecision::Allow => {}
                 GovernanceDecision::Deny(refusal) => {
@@ -263,7 +267,7 @@ pub(super) fn handle_promote(
             &payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
@@ -297,7 +301,7 @@ pub(super) fn handle_promote(
         })?;
         let clone_id =
             db::promote_to_namespace(conn, &resolved_id, to_ns, Some(dest_agent_id.as_str()))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_str", e))?;
         // P5 (G9): fire `memory_promote` webhook for vertical mode AFTER
         // the clone commits. memory_id = source id (subscribers can
         // distinguish via `mode` and `clone_id` in the details block).
@@ -387,7 +391,7 @@ pub(super) fn handle_promote(
         expires_at_arg,
         None,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_promote", e))?;
     if !found {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }

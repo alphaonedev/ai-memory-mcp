@@ -51,8 +51,9 @@ pub fn handle_export_reflection(
 ) -> Result<Value, String> {
     let caller =
         crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
-    handle_export_reflection_for_caller(conn, params, caller.as_deref())
-        .map_err(|error| error.to_string())
+    handle_export_reflection_for_caller(conn, params, caller.as_deref()).map_err(|error| {
+        crate::mcp::error_text::mcp_foreign_err("resolve_mcp_read_visibility_caller", error)
+    })
 }
 
 /// HTTP passes its already resolved caller; `None` retains the local read posture.
@@ -84,8 +85,8 @@ pub(crate) fn handle_export_reflection_for_caller(
         return Err(anyhow::anyhow!("memory is not a reflection: {memory_id}"));
     }
 
-    let edges = collect_outbound_reflects_on(conn, memory_id)
-        .map_err(|e| anyhow::anyhow!("reading reflects_on links: {e}"))?;
+    let edges =
+        collect_outbound_reflects_on(conn, memory_id).context("reading reflects_on links")?;
     for edge in &edges {
         read_reflection_member(conn, &edge.target_id, memory_id, caller)?;
     }
@@ -106,7 +107,7 @@ pub(super) fn read_reflection_member(
     caller: Option<&str>,
 ) -> anyhow::Result<crate::models::Memory> {
     db::get(conn, member_id)
-        .map_err(|error| anyhow::anyhow!("reading reflection substrate: {error}"))?
+        .context("reading reflection substrate")?
         .filter(|memory| crate::visibility::is_readable_on_query(memory, caller, None))
         .ok_or_else(|| anyhow::anyhow!("reflection not found: {reflection_id}"))
 }
@@ -161,6 +162,7 @@ fn suggested_filename(namespace: &str, id: &str, format: ExportFormat) -> String
 // --- D1.5 (#986): per-tool McpTool impl for memory_export_reflection ---
 
 use crate::mcp::registry::McpTool;
+use anyhow::Context as _;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
