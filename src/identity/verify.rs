@@ -169,7 +169,7 @@ pub enum AttestLevel {
 impl AttestLevel {
     /// Stable wire string for the `metadata.attest_level` field.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claimed => "claimed",
             Self::AgentAttested => "agent_attested",
@@ -193,6 +193,62 @@ impl AttestLevel {
             Self::AgentAttested => 1,
         }
     }
+}
+
+/// #3548 — the CLOSED set of values a memory row's top-level
+/// `metadata.attest_level` may carry. THIS MODULE OWNS IT.
+///
+/// Measured writers (2026-09-14, the whole tree):
+/// - the identity / store paths stamp [`AttestLevel`] (`claimed`,
+///   `agent_attested`): `identity::attest::stamp_attestation` for every
+///   MCP / HTTP / CLI store, `handlers::federation_receive` and
+///   `handlers::consolidate_federation` for federation-applied rows,
+///   `storage::mod` / `store::postgres` re-stamps, `cli::io` import, and
+///   `models::crdt_merge`;
+/// - the L4 capture channel (`mcp::tools::capture_turn`) stamps the two
+///   L4 members of the LINK vocabulary, `self_signed` (the channel attests
+///   itself, no host key) and `signed_by_peer` (a HOST key verified) —
+///   different keys and different assurance from `agent_attested` (the
+///   AGENT's bound key), and the same values its `signed_events` row and
+///   response envelope carry under the #1414 contract, so they are kept
+///   verbatim rather than collapsed.
+///
+/// NOT this field, measured: `operator_signed` is the governance RULES
+/// table's own column; `loader_observed` lives on
+/// `metadata.model_family_attest`; persona snapshots stamp the NESTED
+/// `metadata.persona.attest_level`.
+///
+/// `memory_recall`'s `content_attestation` is a verbatim pass-through of
+/// this field. A fifth value is a contract change: it must be added here,
+/// with its writer, and the exact-set pin in `tests/` and the docs list
+/// bound to this constant both fail until it is. Folding the L4 pair into
+/// one owned enum is #3736 (v1.0.1).
+pub const ATTEST_LEVEL_MEMORY_STAMP_VALUES: [&str; 4] = [
+    AttestLevel::Claimed.as_str(),
+    AttestLevel::AgentAttested.as_str(),
+    crate::models::link::AttestLevel::SelfSigned.as_str(),
+    crate::models::link::AttestLevel::SignedByPeer.as_str(),
+];
+
+/// #3548 — the ONE gate every writer of a memory's top-level
+/// `metadata.attest_level` passes its value through: returns the canonical
+/// `&'static str` for a member of [`ATTEST_LEVEL_MEMORY_STAMP_VALUES`], or
+/// an error naming the value and the owner. A writer cannot stamp a fifth
+/// value by accident; it has to widen the set here, on purpose.
+///
+/// # Errors
+/// The value is not a member of the closed set.
+pub fn memory_stamp_value(candidate: &str) -> Result<&'static str, String> {
+    ATTEST_LEVEL_MEMORY_STAMP_VALUES
+        .iter()
+        .copied()
+        .find(|v| *v == candidate)
+        .ok_or_else(|| {
+            format!(
+                "attest_level {candidate:?} is not in the closed memory stamp set \
+                 {ATTEST_LEVEL_MEMORY_STAMP_VALUES:?} owned by identity::verify (#3548)"
+            )
+        })
 }
 
 /// Reason a store-path write was refused (or could not be attested) by
@@ -572,6 +628,38 @@ pub fn lookup_peer_public_key_in(observed_by: &str, dir: &Path) -> Option<Verify
 mod tests {
     use super::*;
     use crate::identity::keypair as kp_mod;
+
+    /// #3548 — the memory stamp set is EXACTLY the two identity variants
+    /// plus the two L4 capture values; a fifth writer must add itself here.
+    #[test]
+    fn attest_level_memory_stamp_set_is_exactly_four_3548() {
+        assert_eq!(ATTEST_LEVEL_MEMORY_STAMP_VALUES.len(), 4);
+        let set: std::collections::BTreeSet<&str> =
+            ATTEST_LEVEL_MEMORY_STAMP_VALUES.iter().copied().collect();
+        assert_eq!(set.len(), 4, "no duplicate spellings");
+        for v in [AttestLevel::Claimed, AttestLevel::AgentAttested] {
+            assert!(set.contains(v.as_str()), "{v:?} is an identity stamp");
+            assert_eq!(memory_stamp_value(v.as_str()), Ok(v.as_str()));
+        }
+        for v in [
+            crate::models::link::AttestLevel::SelfSigned,
+            crate::models::link::AttestLevel::SignedByPeer,
+        ] {
+            assert!(set.contains(v.as_str()), "{v:?} is an L4 capture stamp");
+            assert_eq!(memory_stamp_value(v.as_str()), Ok(v.as_str()));
+        }
+        // The rest of the LINK vocabulary is NOT a memory stamp.
+        for v in [
+            "unsigned",
+            "peer_attested",
+            "daemon_signed",
+            "operator_signed",
+            "loader_observed",
+            "",
+        ] {
+            assert!(memory_stamp_value(v).is_err(), "{v:?} must be refused");
+        }
+    }
     use crate::identity::sign;
     use tempfile::TempDir;
 
