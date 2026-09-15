@@ -19,6 +19,11 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::doc_markdown)]
 
+// #3733 — key dirs created 0700 (not the ambient umask; the #3198 guard
+// refuses a group-writable key dir at umask 0002).
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Output;
@@ -34,7 +39,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
     let home = dir.join("home");
     std::fs::create_dir_all(home.join(".config")).expect("scratch home");
     let keys = dir.join("keys");
-    std::fs::create_dir_all(&keys).expect("scratch keys");
+    key_dir_sandbox::mkdir_0700(&keys);
     std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .current_dir(dir)
         .args(args)
