@@ -83,6 +83,12 @@ pub struct VerifyAuditTrailArgs {
     /// legacy — rotated / restored / federated nodes do not regress). The value
     /// is resolved to a key in the binary's SYNCHRONOUS pre-runtime phase and
     /// threaded as a parameter — never re-published to the environment.
+    ///
+    /// Limitation (#3354 / #3479): a chain that ran unsigned before its key
+    /// was provisioned keeps that unsigned prefix; enrolling the pin then
+    /// convicts those rows, and provisioning the key does not clear the past.
+    /// v1.0.0 has no supported in-product remedy — the pin is for chains
+    /// signed from their first row (which #3354 makes every fresh store).
     #[arg(long, value_name = "BASE64")]
     pub audit_pubkey: Option<String>,
 }
@@ -186,6 +192,15 @@ pub fn render(
                 "  audit-signature coverage FAIL (AI_MEMORY_AUDIT_PUBKEY pin enrolled): \
                  {unverified} of {checked} walked row(s) did not verify against the pin \
                  (stripped / downgraded / forged / skip-class row)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+            // #3354 / #3479 — the limitation an operator enabling the pin reads
+            // HERE, not only in a changelog: rows written before a key existed
+            // are unsigned and stay unsigned.
+            writeln!(
+                out.stdout,
+                "  note: {}",
+                crate::governance::audit::UNSIGNED_PREFIX_LIMITATION
             )
             .context(CTX_WRITE_AUDIT_REPORT)?;
         }
@@ -388,6 +403,51 @@ mod tests {
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("OK"), "got: {s}");
         assert!(s.contains("3 event(s) checked"), "got: {s}");
+    }
+
+    /// #3354 / #3479 — an unsigned prefix under an enrolled pin is the
+    /// require-mode limitation, and the operator reads it HERE: the coverage
+    /// FAIL is followed by the one sentence naming that provisioning a key
+    /// does not clear the past and that v1.0.0 has no in-product remedy.
+    /// The rows are unsigned (`attest_level = unsigned`, no signature), so
+    /// with a pin enrolled `verify_audit_trail` reports `Unverified` and the
+    /// verb exits 1 — which is the RED half of the same pin: without the
+    /// note the operator would see only "stripped / downgraded / forged".
+    #[test]
+    fn unsigned_prefix_under_pin_prints_the_limitation_note_3354() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = crate::db::open(&path).expect("open");
+            for i in 0..2 {
+                append_signed_event(&conn, &fixture_event(format!("pre-key-{i}").as_bytes()))
+                    .expect("append");
+            }
+        }
+        let pin = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng).verifying_key();
+        let args = VerifyAuditTrailArgs {
+            since: None,
+            json: false,
+            store_url: None,
+            audit_pubkey: None,
+        };
+        let mut buf_out = Vec::<u8>::new();
+        let mut buf_err = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+        let code = run(&path, &args, Some(&pin), &mut out).expect("run");
+        assert_eq!(code, 1, "an unsigned prefix under a pin is dirty");
+        let s = String::from_utf8(buf_out).expect("utf-8");
+        assert!(
+            s.contains("audit-signature coverage FAIL"),
+            "the coverage FAIL line renders: {s}"
+        );
+        assert!(
+            s.contains(crate::governance::audit::UNSIGNED_PREFIX_LIMITATION),
+            "the #3479 limitation is printed beside the FAIL, where the operator reads it: {s}"
+        );
+        assert!(
+            s.contains("#3479"),
+            "the note names the issue that carries the remedy: {s}"
+        );
     }
 
     // Note: tamper / gap exit-code-1 paths require an `UPDATE` /
