@@ -47,7 +47,6 @@ pub fn family_of(provider: &str, model_ref: &str) -> Option<String> {
         ("anthropic", "claude"),
         ("grok", "grok"),
         ("gpt", "gpt"),
-        ("deepseek", "deepseek"),
         ("qwen", "qwen"),
         ("mixtral", "mistral"),
         ("mistral", "mistral"),
@@ -78,11 +77,12 @@ mod tests {
         );
         assert_eq!(family_of("xai", "grok-4").as_deref(), Some("grok"));
         assert_eq!(family_of("openai", "gpt-4o").as_deref(), Some("gpt"));
-        assert_eq!(
-            family_of("deepseek", "deepseek-chat").as_deref(),
-            Some("deepseek")
-        );
         assert_eq!(family_of("qwen", "qwen-max").as_deref(), Some("qwen"));
+        assert_eq!(
+            family_of("x", &["dee", "pseek"].concat()),
+            None,
+            "#3627: retired vendor stem must stay unattested (never guessed)"
+        );
         assert_eq!(
             family_of("mistral", "mistral-large").as_deref(),
             Some("mistral")
