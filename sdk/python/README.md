@@ -137,7 +137,7 @@ AiMemoryClient(base_url="http://localhost:9077", agent_id="ai:claude-opus-4.7@ho
 | `stats()` | `GET /api/v1/stats` | |
 | `namespaces()` | `GET /api/v1/namespaces` | |
 | `gc()` | `POST /api/v1/gc` | |
-| `export()` / `import_()` | `GET` / `POST /api/v1/export|import` | |
+| `export()` / `export_pages(limit=None)` / `import_()` | `GET` / `POST /api/v1/export|import` | `export()` is the one-shot body and is refused (413 `EXPORT_PAGING_REQUIRED`) past the daemon's page ceiling; `export_pages()` walks `?limit=&cursor=` for a corpus of any size (#3288). |
 | `subscribe(req)` / `unsubscribe(id)` / `subscriptions()` | `POST` / `DELETE ?id=<id>` / `GET /api/v1/subscriptions` | Webhook mgmt. The delete takes the id in the QUERY STRING — the daemon registers `delete` on the collection path only. |
 | `notify(req)` / `inbox(...)` | `/api/v1/notify`, `/api/v1/inbox` | Agent-to-agent messaging. |
 | `agents()` / `register_agent(...)` | `/api/v1/agents` | NHI registry. |
