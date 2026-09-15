@@ -358,7 +358,11 @@ impl McpTool for SubscriptionReplayTool {
         "Replay subscription_events since an RFC3339 timestamp."
     }
     fn docs() -> &'static str {
-        "K7: replay events ordered by delivered_at asc."
+        "K7: replay events ordered by delivered_at asc. Each event carries delivery_status: \
+         ack | failed are terminal; pending means NO terminal status was recorded, which \
+         includes a delivery that settled but whose terminal status write FAILED (#3659) — \
+         so pending alone cannot distinguish in-flight from lost; a row still pending past \
+         the 60 s settle window is the lost case (doctor warns; reliable write is #3735)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SubscriptionReplayRequest>()

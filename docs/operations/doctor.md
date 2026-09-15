@@ -150,6 +150,15 @@ sections.
 - `success_rate_pct` — `(dispatched - failed) / dispatched * 100`.
   **Warning** when < 95% over the lifetime totals (P5 will refine this
   to a rolling-1h window).
+- `audit_rows_pending` / `audit_rows_pending_stale` (#3659) — rows in
+  `subscription_events` still `pending`, and the subset older than the
+  60 s settle window. A delivery settles inside one minute, so a stale
+  `pending` row is one whose `ack`/`failed` status update never landed:
+  **Warning** when > 0, because the totals above are then known to
+  understate reality. The live per-stage bookkeeping failure counters
+  are on the daemon's `/health` `webhook_audit_delivery` and `/metrics`
+  `ai_memory_webhook_audit_update_failed_total{stage}`; `doctor` reports
+  `unavailable` for this pair only when the table itself cannot be read.
 
 ### Capabilities
 

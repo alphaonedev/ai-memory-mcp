@@ -3576,6 +3576,37 @@ fn section_webhook(conn: &rusqlite::Connection) -> ReportSection {
         facts.push(("success_rate_pct".into(), "no_deliveries_yet".into()));
     }
 
+    // #3659 — the persisted delivery history is only as good as the status
+    // transitions that reached it. A row still `pending` past the settle
+    // window is a delivery whose ack/failed UPDATE was lost (or never
+    // attempted), so the totals above are known to be incomplete. Measured
+    // from the table; the live per-stage failure counters are on the
+    // daemon's /health `webhook_audit_delivery` and /metrics.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(db::WEBHOOK_AUDIT_SETTLE_SECS))
+        .to_rfc3339();
+    match db::doctor_webhook_audit_pending(conn, &cutoff) {
+        Ok((pending, stale)) => {
+            facts.push(("audit_rows_pending".into(), pending.to_string()));
+            facts.push(("audit_rows_pending_stale".into(), stale.to_string()));
+            if stale > 0 {
+                severity = Severity::Warning;
+                let msg = format!(
+                    "{stale} delivery audit row(s) still `pending` after {} s: their \
+                     ack/failed status update never landed, so dispatched/failed totals \
+                     understate reality (#3659)",
+                    db::WEBHOOK_AUDIT_SETTLE_SECS
+                );
+                note = Some(match note.take() {
+                    Some(prev) => format!("{prev}; {msg}"),
+                    None => msg,
+                });
+            }
+        }
+        Err(e) => {
+            facts.push(("audit_rows_pending".into(), format!("unavailable ({e})")));
+        }
+    }
+
     ReportSection {
         name: "Webhook".into(),
         severity,
@@ -5361,6 +5392,41 @@ mod tests {
         assert_eq!(fact(wh, "dispatched_total"), "0");
         assert_eq!(fact(wh, "failed_total"), "0");
         assert_eq!(fact(wh, "success_rate_pct"), "no_deliveries_yet");
+        // #3659 — an empty audit table is measured as zero pending, not
+        // "unavailable".
+        assert_eq!(fact(wh, "audit_rows_pending"), "0");
+        assert_eq!(fact(wh, "audit_rows_pending_stale"), "0");
+    }
+
+    #[test]
+    fn local_run_webhook_section_warns_on_stale_pending_audit_rows_3659() {
+        let env = TestEnv::fresh();
+        {
+            // `db::open` runs the migrations so `subscription_events` exists.
+            let conn = crate::db::open(&env.db_path).expect("open + migrate");
+            // A fresh pending row (inside the settle window) and a stale one.
+            let now = chrono::Utc::now().to_rfc3339();
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(3_600)).to_rfc3339();
+            for (cid, at) in [("cid-fresh", now.as_str()), ("cid-stale", old.as_str())] {
+                conn.execute(
+                    "INSERT INTO subscription_events \
+                     (subscription_id, correlation_id, event_type, payload, delivered_at, \
+                      delivery_status) VALUES ('sub-3659', ?1, 'memory_store', '{}', ?2, 'pending')",
+                    rusqlite::params![cid, at],
+                )
+                .expect("seed");
+            }
+        }
+        let report = run_local_collect(&env.db_path);
+        let wh = find(&report, "Webhook");
+        assert_eq!(fact(wh, "audit_rows_pending"), "2");
+        assert_eq!(fact(wh, "audit_rows_pending_stale"), "1");
+        assert_eq!(wh.severity, Severity::Warning);
+        assert!(
+            wh.note.as_deref().is_some_and(|n| n.contains("#3659")),
+            "note must name the lost status update: {:?}",
+            wh.note
+        );
     }
 
     // -------------------------------------------------------------------

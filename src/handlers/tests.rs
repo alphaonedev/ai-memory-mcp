@@ -12324,6 +12324,13 @@ async fn http_health_route_returns_200_with_status_ok() {
     // straight from the AppState wiring — both false in this test.
     assert_eq!(v["embedder_ready"], false);
     assert_eq!(v["federation_enabled"], false);
+    // #3659 — webhook delivery-audit persistence rides /health as a signal
+    // object, never a bare number.
+    let wa = &v[super::transport::HEALTH_KEY_WEBHOOK_AUDIT_DELIVERY];
+    assert_eq!(wa["state"], "available", "signal object expected: {v}");
+    assert!(wa["value"]["failed_total"].is_u64());
+    assert!(wa["value"]["failed_by_stage"]["status_no_row"].is_u64());
+    assert!(wa["value"]["actionable"].is_boolean());
 }
 
 // ---- prometheus_metrics happy path ----

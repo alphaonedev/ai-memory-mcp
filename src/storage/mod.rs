@@ -916,11 +916,12 @@ pub mod sync_state_rekey;
 // widening or loss is visible in review).
 pub use doctor::{
     CapabilityExpansionRow, ReflectionDepthRow, SyncPeerWatermark, SyncWatermarks,
-    count_active_governance_rules, count_pending_actions_by_status, count_subscriptions,
-    doctor_dim_violations, doctor_governance_coverage, doctor_governance_depth_distribution,
-    doctor_oldest_pending_age_secs, doctor_reflection_depth_distribution,
-    doctor_reflection_depth_exceeded_count, doctor_reflection_totals_by_namespace,
-    doctor_sync_peer_watermarks, doctor_webhook_delivery_totals, is_namespace_standard,
+    WEBHOOK_AUDIT_SETTLE_SECS, count_active_governance_rules, count_pending_actions_by_status,
+    count_subscriptions, doctor_dim_violations, doctor_governance_coverage,
+    doctor_governance_depth_distribution, doctor_oldest_pending_age_secs,
+    doctor_reflection_depth_distribution, doctor_reflection_depth_exceeded_count,
+    doctor_reflection_totals_by_namespace, doctor_sync_peer_watermarks,
+    doctor_webhook_audit_pending, doctor_webhook_delivery_totals, is_namespace_standard,
     list_active_governance_policies, list_capability_expansions, record_capability_expansion,
     sweep_pending_action_timeouts,
 };
