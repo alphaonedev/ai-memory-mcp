@@ -1997,6 +1997,10 @@ fn emit_federation_newer_wins_supersede_leaf_if_enabled(
 /// admission probe). `prepare_cached` keys on this text, so the format runs
 /// once per process and the statement is re-parsed once per connection.
 static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948 / #3690) — this static IS the
+    // COW-supersede statement `insert_inner` executes; the fn carries the
+    // sanction and the revision emission, the text lives here so
+    // `prepare_cached` keys on one string. The guard reads both.
     format!(
         "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
@@ -17992,6 +17996,9 @@ pub(crate) fn export_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<
 /// the lane does with a HIDDEN holder, and with an inbound row whose ID is
 /// already local under a tombstone, is #3699's by-id newer-wins ruling.
 static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    // APPEND-ONLY-SANCTIONED (#1823 G6 / #2954 / #3690) — this static IS the
+    // federation newer-wins statement `insert_if_newer` executes; that fn
+    // carries the sanction and the revision emission, the text lives here.
     format!(
         "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
