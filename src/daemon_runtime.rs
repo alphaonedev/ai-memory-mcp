@@ -6030,11 +6030,16 @@ fn boot_security_posture_warnings(
 /// Pulled out of `bootstrap_serve` (the [`api_key_bind_guard`] precedent) so
 /// the outcome is unit-testable without standing up a daemon. The refusal
 /// names the plaintext path being refused.
-fn tls_bind_guard(tls_present: bool, host: &str, port: u16) -> std::result::Result<(), String> {
+///
+/// # Errors
+///
+/// No in-process TLS material for the bind (the QUAL-7 shape: a typed
+/// `anyhow` refusal the caller propagates, not a stringly-typed unit result).
+fn tls_bind_guard(tls_present: bool, host: &str, port: u16) -> anyhow::Result<()> {
     if tls_present {
         return Ok(());
     }
-    Err(crate::transit_encryption::plaintext_listener_refusal(
+    anyhow::bail!(crate::transit_encryption::plaintext_listener_refusal(
         host, port,
     ))
 }
@@ -6351,9 +6356,7 @@ pub async fn bootstrap_serve(
         args.port,
         shape_assessment.declared,
     )?;
-    if let Err(reason) = tls_bind_guard(true, args.host.as_str(), args.port) {
-        anyhow::bail!("{reason}");
-    }
+    tls_bind_guard(true, args.host.as_str(), args.port)?;
 
     // v1.0.0 #3474 — record whether THIS listener may carry a freshly minted
     // bearer credential. The #2032 M2 guard above only WARNs on a plaintext
@@ -9924,7 +9927,7 @@ mod tests {
     #[test]
     fn tls_bind_guard_tls_present_binds_3705() {
         for host in ["0.0.0.0", "127.0.0.1", "::1", "localhost"] {
-            assert_eq!(tls_bind_guard(true, host, 9077), Ok(()), "{host}");
+            assert!(tls_bind_guard(true, host, 9077).is_ok(), "{host}");
         }
     }
 
@@ -9941,7 +9944,8 @@ mod tests {
             "10.0.0.7",
         ] {
             let err = tls_bind_guard(false, host, 9077)
-                .expect_err("a plaintext bind must be refused on every host (#3705)");
+                .expect_err("a plaintext bind must be refused on every host (#3705)")
+                .to_string();
             assert!(
                 err.contains(crate::transit_encryption::ISSUE_TAG)
                     && err.contains(&format!("http://{host}:9077"))
