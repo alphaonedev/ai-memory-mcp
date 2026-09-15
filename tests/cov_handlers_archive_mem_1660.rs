@@ -155,6 +155,28 @@ async fn seed(router: &axum::Router, ns: &str, title: &str, caller: &str) -> Str
     v["id"].as_str().expect("id").to_string()
 }
 
+/// [`seed`] with an explicit `metadata.scope` (`"collective"` makes the row
+/// readable by every caller while `metadata.agent_id` stays the owner's).
+async fn seed_scoped(
+    router: &axum::Router,
+    ns: &str,
+    title: &str,
+    caller: &str,
+    scope: &str,
+) -> String {
+    let body = json!({
+        "tier": "mid", "namespace": ns, "title": title,
+        "content": format!("seed body for {title}"), "tags": [], "priority": 5,
+        "confidence": 1.0, "source": "user", "metadata": {"scope": scope},
+    });
+    let (status, v) = send(router, "POST", "/api/v1/memories", Some(caller), Some(body)).await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "seed_scoped: {status} {v}",
+    );
+    v["id"].as_str().expect("id").to_string()
+}
+
 // ===========================================================================
 // archive.rs — sqlite SUCCESS arms (archive_by_ids, restore, purge, list)
 // ===========================================================================
@@ -326,11 +348,29 @@ async fn update_memory_owner_sqlite_returns_200() {
     assert_eq!(status, StatusCode::OK, "{v}");
 }
 
+/// #3426 (folding #3339) — HIDDEN case. The seed writes no `scope`, so the
+/// row is alice's PRIVATE row and mallory cannot READ it (`GET` is 404); a
+/// write to it answers the read path's own `404 {"error":"not found"}`,
+/// byte-identical, so the write path is no longer an existence oracle for
+/// a row the caller may not see. Pre-#3426 this was `403` naming alice.
 #[tokio::test]
-async fn update_memory_non_owner_returns_403() {
+async fn update_memory_hidden_row_non_owner_returns_404() {
     let (router, _f) = build_router();
     let id = seed(&router, "cov-upd2", "Owned by alice", "alice").await;
-    let (status, _v) = send(
+    let (g, _) = send(
+        &router,
+        "GET",
+        &format!("/api/v1/memories/{id}"),
+        Some("mallory"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        g,
+        StatusCode::NOT_FOUND,
+        "the row is not readable by mallory"
+    );
+    let (status, v) = send(
         &router,
         "PUT",
         &format!("/api/v1/memories/{id}"),
@@ -338,7 +378,57 @@ async fn update_memory_non_owner_returns_403() {
         Some(json!({"content": "hijack attempt"})),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(
+        v,
+        json!({"error": "not found"}),
+        "byte-identical to the read path"
+    );
+}
+
+/// #3426 — READABLE case. A `collective` row is readable by every caller
+/// but owned by alice, so a non-owner write is a refusal the caller is
+/// entitled to see: `403` with `code: NOT_OWNER`, naming the refused caller
+/// and never the owner. Masking a readable row as missing would be a lie.
+#[tokio::test]
+async fn update_memory_readable_row_non_owner_returns_403_not_owner() {
+    let (router, _f) = build_router();
+    let id = seed_scoped(
+        &router,
+        "cov-upd3",
+        "Shared by alice",
+        "alice",
+        "collective",
+    )
+    .await;
+    let (g, _) = send(
+        &router,
+        "GET",
+        &format!("/api/v1/memories/{id}"),
+        Some("mallory"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        g,
+        StatusCode::OK,
+        "the collective row IS readable by mallory"
+    );
+    let (status, v) = send(
+        &router,
+        "PUT",
+        &format!("/api/v1/memories/{id}"),
+        Some("mallory"),
+        Some(json!({"content": "hijack attempt"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], "NOT_OWNER", "{v}");
+    assert_eq!(v["caller"], "mallory", "{v}");
+    assert!(
+        !v.to_string().contains("alice"),
+        "#3426: the refusal never names the owner: {v}"
+    );
 }
 
 #[tokio::test]
@@ -396,14 +486,26 @@ async fn delete_memory_owner_sqlite_returns_200() {
     assert_eq!(s2, StatusCode::NOT_FOUND);
 }
 
+/// #3426 (folding #3339) — HIDDEN case: bob's private row is not readable
+/// by eve, so the delete answers the read path's `404`, never a `403` that
+/// confirms the id exists. (The pre-#3426 comment here claimed "the row is
+/// visible (default sqlite reads are trust-all)" — that is the `caller ==
+/// None` posture; the write gate consults the row's visibility for THIS
+/// caller.)
 #[tokio::test]
-async fn delete_memory_non_owner_returns_403() {
+async fn delete_memory_hidden_row_non_owner_returns_404() {
     let (router, _f) = build_router();
     let id = seed(&router, "cov-del2", "Owned by bob", "bob").await;
-    // The row is visible (default sqlite reads are trust-all), so the
-    // `require_caller_owns_memory` ownership gate fires its 403 arm for
-    // a non-owner caller before any delete is attempted.
-    let (status, _v) = send(
+    let (g, _) = send(
+        &router,
+        "GET",
+        &format!("/api/v1/memories/{id}"),
+        Some("eve"),
+        None,
+    )
+    .await;
+    assert_eq!(g, StatusCode::NOT_FOUND, "the row is not readable by eve");
+    let (status, v) = send(
         &router,
         "DELETE",
         &format!("/api/v1/memories/{id}"),
@@ -411,7 +513,54 @@ async fn delete_memory_non_owner_returns_403() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(
+        v,
+        json!({"error": "not found"}),
+        "byte-identical to the read path"
+    );
+    // Still there for its owner: a masked refusal is still a refusal.
+    let (s2, _) = send(
+        &router,
+        "GET",
+        &format!("/api/v1/memories/{id}"),
+        Some("bob"),
+        None,
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+}
+
+/// #3426 — READABLE case: a `collective` row owned by bob is readable by
+/// eve, so her delete is refused `403 NOT_OWNER`, naming her and never bob.
+#[tokio::test]
+async fn delete_memory_readable_row_non_owner_returns_403_not_owner() {
+    let (router, _f) = build_router();
+    let id = seed_scoped(&router, "cov-del3", "Shared by bob", "bob", "collective").await;
+    let (status, v) = send(
+        &router,
+        "DELETE",
+        &format!("/api/v1/memories/{id}"),
+        Some("eve"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], "NOT_OWNER", "{v}");
+    assert_eq!(v["caller"], "eve", "{v}");
+    assert!(
+        !v.to_string().contains("bob"),
+        "#3426: the refusal never names the owner: {v}"
+    );
+    let (s2, _) = send(
+        &router,
+        "GET",
+        &format!("/api/v1/memories/{id}"),
+        Some("bob"),
+        None,
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "the refused delete left the row");
 }
 
 // ===========================================================================
