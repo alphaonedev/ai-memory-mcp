@@ -264,7 +264,21 @@ async fn postgres_delete_owner_mismatch_returns_permission_denied() {
         } => {
             assert_eq!(action, "delete");
             assert_eq!(target, inserted_id);
-            assert!(reason.contains(bob) && reason.contains(alice), "{reason}");
+            // #3426 — SAL-level refusal (this is the store funnel, not the
+            // HTTP surface, so there is no 403-vs-404 masking here: the
+            // hide-on-write lives in the handlers' visibility-scoped read).
+            // The reason is the bare SSOT message: it names NEITHER the
+            // owner (never disclosed) NOR the caller (the HTTP body carries
+            // `caller`; the AUTHZ trace carries both).
+            assert_eq!(
+                reason,
+                ai_memory::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+                "{reason}"
+            );
+            assert!(
+                !reason.contains(alice),
+                "#3426: the refusal never names the owner: {reason}"
+            );
         }
         other => panic!("expected PermissionDenied, got: {other:?}"),
     }
