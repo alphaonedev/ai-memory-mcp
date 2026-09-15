@@ -127,7 +127,13 @@ pub fn tool_sizes_under_ci_gate() -> usize {
 /// -> 28_100 (+71 headroom, lockstep on this base, never lower); the merger
 /// re-takes the number on the resolved tree, where other branches' docs
 /// stack (the #3730 inbox docs alone are +81).
-pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_100;
+/// MERGER BUMP 2026-09-15 — re-taken on the TRUE full 33-entry resolved tree
+/// (#3730-r5 + #3733), as the lockstep note above instructs. MEASURED 28_184
+/// cl100k tokens against the 28_100 a branch could see: the 29-entry tree was
+/// 28_103 and #3730's inbox docs are the +81 that comment predicted BY NAME.
+/// NO SINGLE BRANCH CAN MEASURE THIS — every branch adding a `docs` field
+/// stacks here. 28_100 -> 28_300 (+116 headroom, never lower).
+pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_300;
 
 /// Sum of every tool's `total_tokens` (verbose schema) — the
 /// worst-case prefix cost on a `verbose=true` opt-in harness with
