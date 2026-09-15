@@ -21,6 +21,7 @@
 //!   the origin (#3667's "provider" case, previously a report-wide masker).
 //! * `doctor --db <postgres url>`: the URL-shaped `--db` refusal renders the
 //!   store URL from the allowlist (#3667's "url-shaped db" case).
+//!
 //! The federation peer refusals, the sync-daemon boot line and the config
 //! display are pinned as unit tests beside their sites (`federation::peer`,
 //! `config_redact`, `store_url`).
