@@ -14500,6 +14500,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_family_reports_measured_confidence_source_not_default_3373() {
+        // #3373 — a MEASURED confidence_source (!= caller_provided) must read back the
+        // SAME through load_family as through get. A projection that omits the column
+        // defaults it to caller_provided — a DEFAULT that reads like a MEASUREMENT.
+        let (ns, fam) = ("cs-fam-3373", "core");
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let id = chunkc_seed_family_memory(&conn, ns, fam);
+        conn.execute(
+            "UPDATE memories SET confidence_source = 'auto_derived' WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+        let via_get = db::get(&conn, &id).unwrap().unwrap().confidence_source;
+        let resp = crate::mcp::handle_load_family(
+            &conn,
+            &json!({"family": fam, "namespace": ns, "k": 10}),
+            None,
+        )
+        .unwrap();
+        let via_lf = resp["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == json!(id))
+            .expect("#3373: seeded row present in load_family result")["confidence_source"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            via_lf,
+            via_get.as_str(),
+            "#3373: load_family must report the MEASURED confidence_source, not the default"
+        );
+        assert_ne!(
+            via_lf, "caller_provided",
+            "#3373: seeded source was auto_derived; caller_provided means the projection defaulted it"
+        );
+    }
+
     fn chunkc_seed_family_memory(
         conn: &rusqlite::Connection,
         namespace: &str,
