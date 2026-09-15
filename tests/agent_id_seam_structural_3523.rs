@@ -161,28 +161,106 @@ fn line_is_cfg_gated(source: &str, needle: &str) -> Option<bool> {
 /// Call sites of the TEST-ONLY probe-free constructor, in the shape
 /// [`arming_call_sites`] uses, so the walk is unit-testable over a synthetic
 /// buffer rather than only over the tree it happens to find.
-fn probe_free_call_sites(rel: &str, source: &str) -> Vec<String> {
+/// The attribute that makes the item it decorates a UNIT-TEST region:
+/// `#[cfg(test)]`, exactly. `#[cfg(any(test, feature = "test-support"))]`
+/// is deliberately NOT one — that is the seam's own gate, compiled into
+/// every `cargo test` binary including the `ai-memory` BIN (the #3516
+/// lesson), which is precisely the build these scans exist to police.
+const CFG_TEST_ATTR: &str = "#[cfg(test)]";
+
+/// Per line of `source`: is the line inside a `#[cfg(test)]` region?
+///
+/// A region is the brace-balanced body of the item that FOLLOWS a
+/// `#[cfg(test)]` attribute (skipping blank lines, comments and further
+/// attributes) — `mod handler_tests { … }` is the common shape, a single
+/// `#[cfg(test)] fn` the other. Such an item is NOT compiled into any
+/// shipped binary, not even the `test-support`-unified `ai-memory` BIN,
+/// so a call inside it is a unit test arming the seam on its own thread,
+/// not production code arming it. Without this the walk was a name search
+/// wearing a structural-check costume: it could not tell an in-module unit
+/// test from production code in the same file, and its only two outcomes
+/// were blocking legitimate tests or being switched off.
+///
+/// Brace counting is textual (a `{` or `}` inside a string literal or
+/// comment would miscount). That errs toward a SHORTER region — an early
+/// `}` ends the region and re-exposes what follows to the scan — never a
+/// longer one, so the failure mode is a false positive on a unit test, not
+/// a silently exempted production site. Comment lines are skipped when
+/// counting, so a brace in a `//` line never opens or closes a region.
+fn cfg_test_region_lines(source: &str) -> Vec<bool> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut in_region = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() != CFG_TEST_ATTR {
+            i += 1;
+            continue;
+        }
+        // Walk to the item the attribute decorates.
+        let mut j = i + 1;
+        while j < lines.len() {
+            let t = lines[j].trim();
+            if t.is_empty() || is_comment_line(t) || t.starts_with("#[") {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        // The region is the brace-balanced body starting at that item.
+        let mut depth: i64 = 0;
+        let mut opened = false;
+        let mut k = j;
+        while k < lines.len() {
+            let t = lines[k].trim();
+            in_region[k] = true;
+            if !is_comment_line(t) {
+                for ch in t.chars() {
+                    match ch {
+                        '{' => {
+                            depth += 1;
+                            opened = true;
+                        }
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            if opened && depth <= 0 {
+                break;
+            }
+            // A `;`-terminated item with no body (`#[cfg(test)] use …;`,
+            // `mod tests;`) is the one line.
+            if !opened && t.ends_with(';') {
+                break;
+            }
+            k += 1;
+        }
+        i = k + 1;
+    }
+    in_region
+}
+
+/// The NON-COMMENT, NON-`#[cfg(test)]`-region lines of `source` carrying
+/// any of `tokens`, as `"<rel>:<line-number>: <trimmed line>"`.
+fn production_lines_with(rel: &str, source: &str, tokens: &[&str]) -> Vec<String> {
+    let test_region = cfg_test_region_lines(source);
     source
         .lines()
         .enumerate()
-        .filter(|(_, line)| {
+        .filter(|(i, line)| {
             let trimmed = line.trim_start();
-            !is_comment_line(trimmed) && line.contains(PROBE_FREE_CTOR_TOKEN)
+            !test_region[*i] && !is_comment_line(trimmed) && tokens.iter().any(|t| line.contains(t))
         })
         .map(|(i, line)| format!("{rel}:{}: {}", i + 1, line.trim()))
         .collect()
 }
 
+fn probe_free_call_sites(rel: &str, source: &str) -> Vec<String> {
+    production_lines_with(rel, source, &[PROBE_FREE_CTOR_TOKEN])
+}
+
 fn arming_call_sites(rel: &str, source: &str) -> Vec<String> {
-    source
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            let trimmed = line.trim_start();
-            !is_comment_line(trimmed) && SEAM_ARMING_TOKENS.iter().any(|t| line.contains(t))
-        })
-        .map(|(i, line)| format!("{rel}:{}: {}", i + 1, line.trim()))
-        .collect()
+    production_lines_with(rel, source, &SEAM_ARMING_TOKENS)
 }
 
 /// STRUCTURE 1. Both halves of the seam are `cfg`-gated to test builds, so
@@ -485,6 +563,108 @@ pub fn handle_something() {
         arming_call_sites("src/contrived.rs", src).len(),
         1,
         "a production call site arming the seam must be caught"
+    );
+}
+
+/// The #3393 shape: an IN-MODULE unit test (`#[cfg(test)] mod handler_tests
+/// { … }`) arming the seam on its own thread is a test, not production code
+/// — it is compiled into no shipped binary, not even the
+/// `test-support`-unified BIN — and must not be flagged.
+#[test]
+fn detector_spares_an_in_module_unit_test_3523() {
+    let src = r#"
+pub fn handle_something() {}
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+
+    #[test]
+    fn env_owner_wins() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::set("ai:env-owner");
+        let _un = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let c = OllamaClient::new_for_tests_without_probe("http://127.0.0.1:1", "m");
+    }
+}
+"#;
+    assert!(
+        arming_call_sites("src/contrived.rs", src).is_empty(),
+        "a `#[cfg(test)]` unit test arming the seam is not a production site"
+    );
+    assert!(
+        probe_free_call_sites("src/contrived.rs", src).is_empty(),
+        "nor is its call to the probe-free constructor"
+    );
+}
+
+/// The region ENDS where the test module's brace closes: a production site
+/// AFTER it is still caught — the exemption is the module, not the file.
+#[test]
+fn detector_catches_a_production_site_after_a_cfg_test_module_3523() {
+    let src = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        let _g = crate::identity::test_agent_id::AgentIdOverride::set("ai:in-test");
+    }
+}
+
+pub fn handle_something() {
+    let _g = crate::identity::test_agent_id::AgentIdOverride::set("ai:oops");
+}
+"#;
+    let hits = arming_call_sites("src/contrived.rs", src);
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the production site after the module: {hits:?}"
+    );
+    assert!(hits[0].contains("ai:oops"), "{hits:?}");
+}
+
+/// Only `#[cfg(test)]` opens a region. The seam's own
+/// `#[cfg(any(test, feature = "test-support"))]` does NOT: that code IS
+/// compiled into the `test-support`-unified `ai-memory` BIN (#3516), which
+/// is exactly what this scan polices. Nor does any feature cfg.
+#[test]
+fn detector_does_not_treat_the_test_support_cfg_as_a_test_region_3523() {
+    let src = r#"
+#[cfg(any(test, feature = "test-support"))]
+mod seam_consumers {
+    pub fn arm() {
+        let _g = crate::identity::test_agent_id::AgentIdOverride::set("ai:bin");
+    }
+}
+#[cfg(feature = "sal")]
+pub fn other() {
+    let _g = crate::identity::test_agent_id::AgentIdOverride::set("ai:feature");
+}
+"#;
+    assert_eq!(
+        arming_call_sites("src/contrived.rs", src).len(),
+        2,
+        "a feature-gated or test-support-gated site is compiled into a shipped test binary"
+    );
+}
+
+/// A brace inside a comment neither opens nor closes a region, and an early
+/// `}` only ever SHORTENS a region (a false positive on a test, never a
+/// silently exempted production site).
+#[test]
+fn detector_region_ignores_braces_in_comments_3523() {
+    let src = r#"
+#[cfg(test)]
+mod tests {
+    // a stray } in a comment
+    fn t() {
+        let _g = crate::identity::test_agent_id::AgentIdOverride::set("ai:in-test");
+    }
+}
+"#;
+    assert!(
+        arming_call_sites("src/contrived.rs", src).is_empty(),
+        "the comment brace must not end the region early"
     );
 }
 
