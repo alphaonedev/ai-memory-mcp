@@ -1869,6 +1869,28 @@ pub fn validate_url_dns(url: &str) -> Result<()> {
 ///   is not set (post-#1053 fail-CLOSED).
 /// - Any resolved address is private / link-local (or loopback when
 ///   `allow_loopback` is false).
+/// #3744 — the AUTHORITY of a URL with any userinfo removed: everything
+/// after the LAST `@` of the segment between `scheme://` and the first
+/// `/`, `?` or `#`. Both SSRF guards extract their host from this, never
+/// from the raw authority. Before this helper the host was taken as the
+/// text before the last `:` of the raw authority, so for
+/// `https://a:b@169.254.169.254/` the "host" was the USERNAME `a`, the
+/// loopback / private-range checks ran against that literal and PASSED,
+/// and a private, loopback or cloud-metadata target rode into the table at
+/// registration; only the DNS guard's failure to RESOLVE the username text
+/// refused it later — by accident and under the wrong reason. A tenant who
+/// can register a webhook must not be able to hide an internal target in
+/// the userinfo. Userinfo is a credential in the row as well (#3697), and
+/// is stripped here rather than refused so the caller's error names the
+/// real host it targeted.
+fn authority_without_userinfo(rest: &str) -> &str {
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..host_end];
+    authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..])
+}
+
 pub(crate) fn validate_url_dns_resolved(
     url: &str,
     allow_loopback: bool,
@@ -1929,8 +1951,10 @@ fn validate_url_dns_with(
     let (_scheme, rest) = lower
         .split_once("://")
         .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host_port = &rest[..host_end];
+    // #3744 — userinfo is stripped BEFORE any host extraction, the same
+    // way `validate_url_with` does it; this guard is the SECOND line of
+    // defence for the same class and must read the same host.
+    let host_port = authority_without_userinfo(rest);
     // v0.7.0 #1082 — extract the host (sans port + brackets) for the
     // reqwest `Client::builder().resolve(host, addr)` override the
     // caller installs. The override matches by host string the
@@ -2125,8 +2149,9 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     // Extract host (portion before '/' or ':' or '?'). IPv6 URLs use
     // `[ipv6]:port` syntax — the brackets must be stripped and the
     // colon-split must skip the colons inside the v6 literal.
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host_port = &rest[..host_end];
+    // #3744 — userinfo is stripped BEFORE any host extraction; see
+    // `authority_without_userinfo`.
+    let host_port = authority_without_userinfo(rest);
     let host: String = if let Some(stripped) = host_port.strip_prefix('[') {
         // IPv6: host is everything before the closing bracket.
         match stripped.find(']') {
@@ -2773,6 +2798,101 @@ mod tests {
         assert!(validate_url("https://169.254.1.1/hook").is_err());
         assert!(validate_url("https://[fc00::1]/hook").is_err());
         assert!(validate_url("https://[fe80::1]/hook").is_err());
+    }
+
+    /// #3744 — userinfo must not hide the target from the SYNTACTIC guard.
+    /// Before the fix the host was taken as the text before the last `:`
+    /// of the raw authority, so each of these read its "host" as the
+    /// username and PASSED. Each is refused at registration (this is the
+    /// guard `insert` runs) and the refusal names the REAL host.
+    #[test]
+    fn userinfo_does_not_hide_a_private_loopback_or_metadata_host_3744() {
+        for (url, host) in [
+            ("https://a:b@10.0.0.1/x", "10.0.0.1"),
+            (
+                "https://a:b@169.254.169.254/latest/meta-data",
+                "169.254.169.254",
+            ),
+            ("https://a:b@[fd00::1]/hook", "fd00::1"),
+            ("https://a@10.0.0.1/x", "10.0.0.1"),
+            ("https://a:b@10.0.0.1:443/x", "10.0.0.1"),
+            ("https://user:p%40ss@[fe80::1]:8443/hook", "fe80::1"),
+        ] {
+            let err = validate_url_with(url, false)
+                .expect_err(&format!("#3744: {url} must be refused at registration"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(host),
+                "#3744: the refusal names the real host {host} for {url}: {msg}"
+            );
+            assert!(
+                !msg.contains("a:b") && !msg.contains("p%40ss"),
+                "#3744: the refusal never echoes the userinfo for {url}: {msg}"
+            );
+        }
+        // Loopback behind userinfo is the same shape, gated by the same opt-in.
+        assert!(validate_url_with("https://a:b@127.0.0.1/x", false).is_err());
+        assert!(validate_url_with("https://a:b@[::1]/x", false).is_err());
+        assert!(validate_url_with("https://a:b@127.0.0.1/x", true).is_ok());
+    }
+
+    /// #3744 — the second line of defence, made explicit: the DNS-resolved
+    /// guard reads the SAME userinfo-stripped host, so a userinfo URL to a
+    /// private / loopback / metadata address is refused there BECAUSE THE
+    /// ADDRESS IS PRIVATE, not because the username fails to resolve. Until
+    /// 2026-09-15 this guard was the only thing refusing these at dispatch,
+    /// and it did so by accident (`user:pw@host` is not a resolvable name);
+    /// this cell records that it is load-bearing and what it must see.
+    #[test]
+    fn dns_guard_reads_the_userinfo_stripped_host_3744() {
+        for (url, host) in [
+            ("https://a:b@10.0.0.1/x", "10.0.0.1"),
+            ("https://a:b@169.254.169.254/latest", "169.254.169.254"),
+            ("https://a:b@[fd00::1]/hook", "fd00::1"),
+            ("https://a:b@127.0.0.1/x", "127.0.0.1"),
+        ] {
+            let err = validate_url_dns_with(url, false)
+                .expect_err(&format!("#3744: the DNS guard refuses {url}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(host),
+                "#3744: the DNS guard's refusal names the real host {host} for {url}: {msg}"
+            );
+            assert!(
+                !msg.contains("invalid port value") && !msg.contains("resolution failed"),
+                "#3744: refused as an address-class violation, not a resolver hiccup: {msg}"
+            );
+        }
+        // And it still opens for the opted-in loopback shape, userinfo or not.
+        assert!(validate_url_dns_with("https://a:b@127.0.0.1/x", true).is_ok());
+    }
+
+    #[test]
+    fn authority_without_userinfo_strips_at_the_last_at_sign_3744() {
+        assert_eq!(
+            authority_without_userinfo("example.com/hook"),
+            "example.com"
+        );
+        assert_eq!(
+            authority_without_userinfo("a:b@example.com:8443/hook?x=1"),
+            "example.com:8443"
+        );
+        assert_eq!(
+            authority_without_userinfo("a@b@example.com/"),
+            "example.com"
+        );
+        assert_eq!(
+            authority_without_userinfo("a:b@[fd00::1]:443"),
+            "[fd00::1]:443"
+        );
+        assert_eq!(
+            authority_without_userinfo("example.com?x=@y"),
+            "example.com"
+        );
+        assert_eq!(
+            authority_without_userinfo("example.com/p@th"),
+            "example.com"
+        );
     }
 
     #[test]
