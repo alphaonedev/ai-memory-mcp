@@ -318,6 +318,84 @@ pub fn sanitize_shipped_vector(vector: &[f32]) -> Option<Vec<f32>> {
     Some(vector.iter().map(|x| x * inv).collect())
 }
 
+/// v1.0.0 #3699 (5-agent vote 4d3ea1c5, option (a)) — the order a receiver
+/// APPLIES one push body's `memories[]`: CAUSAL, `updated_at` ascending with
+/// the `id` tiebreak — the very order `/sync/since` emits and the newer-wins
+/// SQL compares, applied on the RECEIVE side so it holds for every sender,
+/// including the push-DLQ replay that re-POSTs a captured body and the
+/// retry paths that could reorder it.
+///
+/// Why: the `(title, namespace)` newer-wins merge folds an inbound row whose
+/// title is held locally by a DIFFERENT live id into that row (the intended
+/// dedup for two nodes that independently stored the same title). Delivered
+/// out of causal order — a new memory W arriving BEFORE the consolidation
+/// tombstone that freed its title (#3690 / v100) — W is folded into the
+/// still-live source A, and when A's tombstone arrives it loses by-id to the
+/// merged row: the peer keeps A live carrying W's text and never creates W,
+/// permanently. In causal order the tombstone lands first (by id, A hidden),
+/// so W lands beside it as its own row and both replicas agree on ids.
+///
+/// Scope, stated honestly: this closes reordering WITHIN one push body. A
+/// tombstone and a W split across two pushes (the DLQ replays one captured
+/// body per row) is not ordered by this and stays a documented residual; the
+/// cross-id merge itself is counted (`ai_memory_fed_cross_id_title_merge_total`)
+/// and WARNed at the merge site so it is never silent inside a 200.
+///
+/// Stable: rows with equal `(updated_at, id)` keep their wire order. Every
+/// row is returned exactly once, paired with its WIRE position, so counters
+/// and the quota short-circuit see the same multiset the sender shipped and
+/// the per-item response arrays (`attestation_rejections`) are rendered back
+/// in wire order — the sender's contract is positional; only the APPLY order
+/// changes, and the applied prefix before a 429 is then causally closed
+/// rather than arbitrary.
+#[must_use]
+pub fn causal_apply_order(
+    memories: &[crate::models::Memory],
+) -> Vec<(usize, &crate::models::Memory)> {
+    let mut ordered: Vec<(usize, &crate::models::Memory)> = memories.iter().enumerate().collect();
+    ordered.sort_by(|(_, a), (_, b)| {
+        (a.updated_at.as_str(), a.id.as_str()).cmp(&(b.updated_at.as_str(), b.id.as_str()))
+    });
+    ordered
+}
+
+/// #3699 — `tracing` target of the per-merge WARN paired with
+/// `ai_memory_fed_cross_id_title_merge_total`.
+pub const CROSS_ID_TITLE_MERGE_TARGET: &str = "federation.cross_id_merge";
+
+#[cfg(test)]
+mod causal_apply_order_tests {
+    use super::causal_apply_order;
+    use crate::models::Memory;
+
+    fn row(id: &str, updated_at: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            updated_at: updated_at.to_string(),
+            ..Memory::default()
+        }
+    }
+
+    /// #3699 — a body carrying W (newer) before the tombstone A (older)
+    /// applies A first; equal stamps fall back to the id; nothing is lost.
+    #[test]
+    fn orders_by_updated_at_then_id_and_keeps_every_row_3699() {
+        let body = vec![
+            row("w-new", "2026-09-15T10:00:02Z"),
+            row("a-tombstone", "2026-09-15T10:00:01Z"),
+            row("b", "2026-09-15T10:00:02Z"),
+            row("a-tombstone-dup", "2026-09-15T10:00:01Z"),
+        ];
+        let ordered = causal_apply_order(&body);
+        let ids: Vec<&str> = ordered.iter().map(|(_, m)| m.id.as_str()).collect();
+        assert_eq!(ids, ["a-tombstone", "a-tombstone-dup", "b", "w-new"]);
+        let wire: Vec<usize> = ordered.iter().map(|(i, _)| *i).collect();
+        assert_eq!(wire, [1, 3, 2, 0], "each row keeps its wire position");
+        assert_eq!(ids.len(), body.len());
+        assert!(causal_apply_order(&[]).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod sanitize_shipped_vector_tests {
     use super::sanitize_shipped_vector;

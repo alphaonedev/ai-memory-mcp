@@ -308,6 +308,18 @@ pub struct Metrics {
     /// quarantine used to emit nothing while `/sync/push` returned 200).
     pub federation_quarantined_unattributed: IntCounter,
 
+    /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
+    /// federated memories folded into a LOCAL row of a DIFFERENT id by the
+    /// newer-wins `(title, namespace)` merge (the inbound id was never
+    /// created here). Legitimate for two nodes that independently stored
+    /// the same title; a non-zero rate on a fleet that consolidates is the
+    /// signature of out-of-CAUSAL-order delivery (a new memory arriving
+    /// before the tombstone that freed its title), which the receive loop's
+    /// causal ordering closes within one push body and NOT across pushes.
+    /// Paired with a per-merge WARN naming both ids at the merge site, so
+    /// the divergence is never silent inside an HTTP 200.
+    pub federation_cross_id_title_merge: IntCounter,
+
     /// v1.0.0 #2402 — the route-OUT twin of
     /// [`Self::federation_quarantined_unattributed`]: monotonic count of
     /// quarantined rows an OPERATOR released through
@@ -973,6 +985,19 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_quarantined_unattributed.clone()))?;
 
+        // #3699 (5-agent vote 4d3ea1c5) — cross-id title-merge observability.
+        let federation_cross_id_title_merge = IntCounter::new(
+            "ai_memory_fed_cross_id_title_merge_total",
+            "Monotonic count of inbound federated memories folded into a local \
+             row of a DIFFERENT id by the newer-wins (title, namespace) merge \
+             (the inbound id was never created on this node). Legitimate for \
+             two nodes that independently stored the same title; on a fleet \
+             that consolidates, a non-zero rate is the signature of a memory \
+             delivered before the tombstone that freed its title (#3699). Each \
+             increment pairs with a WARN naming both ids.",
+        )?;
+        registry.register(Box::new(federation_cross_id_title_merge.clone()))?;
+
         // v1.0.0 #2402 — the route-OUT counter. #1948 advertised "operator
         // dequarantine" as the way out of quarantine and shipped no caller, so
         // there was nothing to count; now that the verb exists, releasing a
@@ -1287,6 +1312,7 @@ impl Metrics {
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
+            federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
@@ -1468,6 +1494,19 @@ pub fn unstamped_mutation_allowed_count(backend: &str, funnel: &str) -> u64 {
 #[must_use]
 pub fn fed_quarantined_unattributed_count() -> u64 {
     registry().federation_quarantined_unattributed.get()
+}
+
+/// v1.0.0 #3699 — record ONE inbound federated memory folded into a local
+/// row of a different id by the `(title, namespace)` newer-wins merge. The
+/// caller emits the paired WARN naming both ids (`federation.cross_id_merge`).
+pub fn inc_fed_cross_id_title_merge() {
+    registry().federation_cross_id_title_merge.inc();
+}
+
+/// #3699 — read the cross-id title-merge counter (test accessor).
+#[must_use]
+pub fn fed_cross_id_title_merge_count() -> u64 {
+    registry().federation_cross_id_title_merge.get()
 }
 
 /// v1.0.0 #2402 — record one quarantined memory released by an OPERATOR

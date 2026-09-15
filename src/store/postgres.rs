@@ -25409,6 +25409,20 @@ impl MemoryStore for PostgresStore {
         let applied_id = row
             .try_get::<String, _>("id")
             .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
+        // #3699 (5-agent vote 4d3ea1c5) — cross-id title merge: counted and
+        // WARNed (sqlite twin in `storage::insert_if_newer`), never silent.
+        if applied_id != memory.id {
+            crate::metrics::inc_fed_cross_id_title_merge();
+            tracing::warn!(
+                target: crate::federation::CROSS_ID_TITLE_MERGE_TARGET,
+                inbound_id = %memory.id,
+                local_id = %applied_id,
+                namespace = %memory.namespace,
+                "federation newer-wins merge folded an inbound memory into a local row of a \
+                 different id under the same (title, namespace); the inbound id is not \
+                 created on this node (#3699)"
+            );
+        }
         // #2383 (N1) — invariant backstop, same tx: a non-NULL
         // `encrypted_envelope` MUST open under the row's persisted
         // `metadata.agent_id`.
