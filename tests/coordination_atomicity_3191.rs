@@ -34,6 +34,8 @@ use ai_memory::subscriptions::{self, MAX_SUBSCRIPTION_DLQ_ROWS};
 use rusqlite::Connection;
 use std::path::Path;
 
+mod common;
+
 const NS: &str = "_cp_3191";
 
 fn pending(id: &str) -> Checkpoint {
@@ -265,22 +267,18 @@ fn dlq_cap_never_overshot_under_concurrency_3191() {
 /// called.
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_refuses_and_dlqs_when_audit_write_fails_3191() {
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    // Wiremock binds to 127.0.0.1; opt into loopback so the SSRF guard does not
-    // reject the subscription at insert time (testing only). This is the sole
-    // webhook test in this binary, so the process-global setting is safe here.
+    // The receiver binds to 127.0.0.1; opt into loopback so the SSRF guard
+    // does not reject the subscription at insert time (testing only). This is
+    // the sole webhook test in this binary, so the process-global setting is
+    // safe here. #3705 — the receiver serves TLS (every `http://` target is
+    // refused, loopback included); the dispatcher trusts the fixture leaf.
     ai_memory::config::set_allow_loopback_webhooks(true);
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
 
-    let server = MockServer::start().await;
     // The webhook MUST NOT be called: a delivery that cannot be audited is not
-    // sent. `.expect(0)` is verified on server drop.
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server)
-        .await;
+    // sent. Asserted explicitly at the end (the old mock's `.expect(0)`).
+    let server =
+        common::tls_receiver::TlsReceiver::start(tls, common::tls_receiver::Respond::ok()).await;
     let url = format!("{}/hook", server.uri());
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -326,6 +324,11 @@ async fn dispatch_refuses_and_dlqs_when_audit_write_fails_3191() {
         dlq_depth, 1,
         "an un-auditable delivery must be routed to the DLQ, not dispatched"
     );
-    // Server drop asserts the webhook endpoint received ZERO calls.
+    // The webhook endpoint received ZERO calls.
+    assert_eq!(
+        server.received_count().await,
+        0,
+        "an un-auditable delivery must never reach the receiver"
+    );
     drop(server);
 }
