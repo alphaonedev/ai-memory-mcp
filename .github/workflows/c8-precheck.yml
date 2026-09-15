@@ -941,6 +941,51 @@ jobs:
         # THIS checkout vs origin/release/v1.0.0 is GREEN.
         run: bash scripts/check-cert-expiry.sh --self-test
 
+  foreign-text-to-caller-gate:
+    # #3688 gate 7 (Conductor ruling on the reviewer-f2r secret-to-sink sweep,
+    # 2026-09-13). Keyed on SOURCE x SINK, never on a binding's name: a
+    # FOREIGN value (a backend driver's error Display, a peer's / provider's
+    # response body, a subprocess's stdout, an operator path / DSN label) must
+    # never be RENDERED into a CALLER-FACING sink (an HTTP JSON error body, an
+    # MCP tool error string, a hook Deny.reason, a MemoryError payload, a
+    # stored record a caller reads back). The passing state is rendered from
+    # an allowlist (a typed mapper such as store_err_to_response /
+    # handler_error_500, a msg:: constant, a closed vocabulary) or DROPPED,
+    # never masked: redact_*/mask_*/scrub_* are TRANSPARENT to the taint and a
+    # ledger entry that names one is itself a FAIL. A validator echoing the
+    # CALLER'S OWN input is cleared by provenance, not by name.
+    #
+    # scripts/check-foreign-text-to-caller.py walks every rendered identifier
+    # to its producer (the gate-8 python-core shape). The live findings on the
+    # chain-12 tree (311 instances / 170 keys) are held in
+    # scripts/qc-allowlists/foreign-text-to-caller.txt as `pending:#issue`
+    # under #3713 / #3707 / #3724 / #3708 / #3674 / #3698; the summary reports
+    # LIVE renders separately from what the ledger holds (a green run says
+    # "tracked", never "none"). A fix lands by deleting the ledger line; a
+    # stale line is a NOTICE (the correction lane may land first).
+    #
+    # No `needs:`, no job-level `if:`, no `paths:` -- always runs. Declared in
+    # required-contexts-not-required.txt at introduction (rule (f) of gate 7
+    # of the lint set); REQUIRE it mirror-first when the required set is next
+    # revised (#3554 ORDER rule).
+    name: "Foreign-text-to-caller gate (#3688 gate 7)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run foreign-text-to-caller gate
+        run: bash scripts/check-foreign-text-to-caller.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants the finding classes (a funnel arm carrying an operator path,
+        # a redact_*-masked render, a bare destructured field, a prefix
+        # wrapper, a DLQ record, a Deny.reason) that must stay RED and the
+        # controls (the typed funnels, echo validators, a typed refusal, a
+        # declared mapper, CLI --json) that must pass, plus the ledger legs
+        # (pending holds a sink AND a funnel arm as INFO and is counted LIVE;
+        # a stale entry is a NOTICE; keys are deterministic) in a throwaway
+        # tree under .local-runs/ -- never /tmp.
+        run: bash scripts/check-foreign-text-to-caller.sh --self-test
+
   external-pr-operator-approval-gate:
     # 2026-08-26 operator directive — "we want collaboration with rigid security
     # controls: PRs require Justin's approval and SSH key code signing". The

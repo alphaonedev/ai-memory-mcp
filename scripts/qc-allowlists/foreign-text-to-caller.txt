@@ -1,0 +1,216 @@
+# scripts/qc-allowlists/foreign-text-to-caller.txt — #3688 gate 7 PENDING-FIX ledger.
+#
+# Grammar (enforced by scripts/check-foreign-text-to-caller.py):
+#   <file>:<fn>:<sink-kind>:<source-kind>=pending:#NNNN   a LIVE foreign render, tracked under an open issue
+#   <file>:<fn>:<sink-kind>:<source-kind>=echo:<why>       the rendered value is the CALLER'S OWN input
+#   mapper=<fn_name>                                       an additional TYPED mapper whose output is caller-safe
+#
+# THREE RULES (Conductor, 2026-09-13; the gate enforces them, this file respects them):
+#   1. DIRECTION, not convenience. A value crossing to a CALLER is never allowlisted as passing —
+#      it is `pending` under an issue until the render is routed through a typed mapper or dropped.
+#      An operator LOG is a different audience (TIER 2) and is never a finding. Only an ECHO of the
+#      caller's own input is a genuine acknowledgement; the gate already clears the validator echoes
+#      by provenance, so an `echo:` line here needs a reason the walk could not see. There are NONE
+#      today: every entry below is a live foreign render, tracked.
+#   2. No entry may name a masker (redact_* / mask_* / scrub_*). The gate FAILS such an entry.
+#   3. The gate reports LIVE instances separately from ledgered ones (its summary's "LIVE foreign
+#      renders reaching a caller" line); a ledger that turns findings into silence is the same defect
+#      as a gate that certifies nothing. A `pending` entry keeps the finding visible as INFO with its
+#      issue; a stale entry (site fixed or moved) is a NOTICE.
+#
+# A key is re-derived on every run from PROVENANCE, not from a binding name. Moving a render from a
+# helper (`signal_insert_error`) into its caller re-keys the finding and UN-LEDGERS it — that is a
+# new finding, not a fixed one: the gate goes RED and the issue owner adds the new key. A site that
+# renders several foreign values keys on the first identifier by name (deterministic tie-break), so
+# one key can stand for two taints (forward_to_http: the peer body `e` and the URL `url`).
+#
+# Census at chain-12 tip 8b4f65a22, gate 8ce30edf0 + this branch: 170 keys, 311 instances,
+# 0 echo, 0 mappers.
+#   #3713  MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp)                       119 keys
+#   #3707  HTTP handler JSON bodies (http-body) + errors.rs From<...> (memory-error)                   44 keys
+#   #3724  webhook receiver text persisted into subscription_dlq.last_error (dlq-record)                1 keys
+#   #3708  hook / governance Deny.reason (deny-reason)                                                  2 keys
+#   #3674  store_err_to_response schema arms carrying a path / DSN label (funnel-arm)                   3 keys
+#   #3698  forward_to_http: peer body AND federation URL in MCP error text (one key covers both taints)   1 keys
+
+# ---- #3713 — MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp) (119 keys) ----
+src/mcp/tools/action.rs:handle_action_add_edge:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_action_create:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_action_edges:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_action_frontier:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_action_get:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_action_list:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_action_next:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_action_transition:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_lease_acquire:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_lease_get:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_lease_release:mcp-error:db=pending:#3713
+src/mcp/tools/action.rs:handle_lease_renew:mcp-error:db=pending:#3713
+src/mcp/tools/agent.rs:handle_agent_list:mcp-error:db=pending:#3713
+src/mcp/tools/agent.rs:handle_agent_register:mcp-error:db=pending:#3713
+src/mcp/tools/archive.rs:gate_gc_sweep:mcp-error:db=pending:#3713
+src/mcp/tools/archive.rs:handle_archive_list:mcp-error:db=pending:#3713
+src/mcp/tools/archive.rs:handle_archive_purge:mcp-error:db=pending:#3713
+src/mcp/tools/archive.rs:handle_archive_stats:mcp-error:db=pending:#3713
+src/mcp/tools/archive.rs:handle_gc:mcp-error:db=pending:#3713
+src/mcp/tools/auto_tag.rs:handle_auto_tag:mcp-error:db=pending:#3713
+src/mcp/tools/calibrate_confidence.rs:handle_calibrate_confidence:mcp-error:db=pending:#3713
+src/mcp/tools/capture_turn.rs:handle_capture_turn:mcp-error:db=pending:#3713
+src/mcp/tools/check_agent_action.rs:run_check:mcp-error:db=pending:#3713
+src/mcp/tools/check_duplicate.rs:handle_check_duplicate:mcp-error:db=pending:#3713
+src/mcp/tools/checkpoint.rs:handle_checkpoint_create:mcp-error:db=pending:#3713
+src/mcp/tools/checkpoint.rs:handle_checkpoint_query:mcp-error:db=pending:#3713
+src/mcp/tools/checkpoint.rs:handle_checkpoint_resolve:mcp-error:db=pending:#3713
+src/mcp/tools/checkpoint.rs:handle_checkpoint_verify:mcp-error:db=pending:#3713
+src/mcp/tools/consolidate.rs:handle_consolidate:mcp-error:db=pending:#3713
+src/mcp/tools/consolidate.rs:resolve_consolidate_sources:mcp-error:db=pending:#3713
+src/mcp/tools/delete.rs:handle_delete:mcp-error:db=pending:#3713
+src/mcp/tools/dependents_of_invalidated.rs:handle_dependents_of_invalidated:mcp-error:db=pending:#3713
+src/mcp/tools/detect_contradiction.rs:handle_detect_contradiction:mcp-error:db=pending:#3713
+src/mcp/tools/entity_get_by_alias.rs:handle_entity_get_by_alias:mcp-error:db=pending:#3713
+src/mcp/tools/entity_register.rs:handle_entity_register:mcp-error:db=pending:#3713
+src/mcp/tools/export_reflection.rs:handle_export_reflection:mcp-error:db=pending:#3713
+src/mcp/tools/export_reflection.rs:handle_export_reflection_for_caller:mcp-error:db=pending:#3713
+src/mcp/tools/export_reflection.rs:read_reflection_member:mcp-error:db=pending:#3713
+src/mcp/tools/find_paths.rs:handle_find_paths:mcp-error:db=pending:#3713
+src/mcp/tools/forget.rs:handle_forget:mcp-error:db=pending:#3713
+src/mcp/tools/forget.rs:handle_stats:mcp-error:db=pending:#3713
+src/mcp/tools/get.rs:handle_get:mcp-error:db=pending:#3713
+src/mcp/tools/get_taxonomy.rs:handle_get_taxonomy:mcp-error:db=pending:#3713
+src/mcp/tools/kg_invalidate.rs:handle_kg_invalidate:mcp-error:db=pending:#3713
+src/mcp/tools/kg_query.rs:kg_query_by_source_uri:mcp-error:db=pending:#3713
+src/mcp/tools/kg_query.rs:kg_query_from_source:mcp-error:db=pending:#3713
+src/mcp/tools/kg_timeline.rs:handle_kg_timeline:mcp-error:db=pending:#3713
+src/mcp/tools/link.rs:handle_get_links:mcp-error:db=pending:#3713
+src/mcp/tools/link.rs:handle_link:mcp-error:db=pending:#3713
+src/mcp/tools/list.rs:handle_list_capped:mcp-error:db=pending:#3713
+src/mcp/tools/load_family.rs:handle_load_family:mcp-error:db=pending:#3713
+src/mcp/tools/namespace.rs:handle_namespace_clear_standard_inner:mcp-error:db=pending:#3713
+src/mcp/tools/namespace.rs:handle_namespace_set_standard_inner:mcp-error:db=pending:#3713
+src/mcp/tools/namespace.rs:resolve_namespace_standard_memory:mcp-error:db=pending:#3713
+src/mcp/tools/notify.rs:handle_inbox_with_policy:mcp-error:db=pending:#3713
+src/mcp/tools/notify.rs:handle_notify:mcp-error:db=pending:#3713
+src/mcp/tools/notify.rs:persist_notify:mcp-error:db=pending:#3713
+src/mcp/tools/notify.rs:persist_notify:memory-error:db=pending:#3713
+src/mcp/tools/offload.rs:handle_deref:mcp-error:db=pending:#3713
+src/mcp/tools/offload.rs:handle_offload:mcp-error:db=pending:#3713
+src/mcp/tools/pending.rs:handle_pending_approve:mcp-error:db=pending:#3713
+src/mcp/tools/pending.rs:handle_pending_list:mcp-error:db=pending:#3713
+src/mcp/tools/pending.rs:handle_pending_reject:mcp-error:db=pending:#3713
+src/mcp/tools/pending.rs:handle_subscription_dlq_list:mcp-error:db=pending:#3713
+src/mcp/tools/persona.rs:handle_persona:mcp-error:db=pending:#3713
+src/mcp/tools/promote.rs:handle_promote:mcp-error:db=pending:#3713
+src/mcp/tools/quota_status.rs:handle_quota_status:mcp-error:db=pending:#3713
+src/mcp/tools/recall.rs:handle_recall_dto:mcp-error:db=pending:#3713
+src/mcp/tools/recall_observations.rs:handle_recall_observations:mcp-error:db=pending:#3713
+src/mcp/tools/reflect.rs:handle_reflect_caller:mcp-error:db=pending:#3713
+src/mcp/tools/reflection_origin.rs:handle_reflection_origin:mcp-error:db=pending:#3713
+src/mcp/tools/replay.rs:handle_replay:mcp-error:db=pending:#3713
+src/mcp/tools/routine.rs:handle_routine_create:mcp-error:db=pending:#3713
+src/mcp/tools/routine.rs:handle_routine_freeze:mcp-error:db=pending:#3713
+src/mcp/tools/routine.rs:handle_routine_list:mcp-error:db=pending:#3713
+src/mcp/tools/routine.rs:handle_routine_run:mcp-error:db=pending:#3713
+src/mcp/tools/routine.rs:handle_routine_status:mcp-error:db=pending:#3713
+src/mcp/tools/rule_list.rs:handle_rule_list:mcp-error:db=pending:#3713
+src/mcp/tools/search.rs:handle_search:mcp-error:db=pending:#3713
+src/mcp/tools/session_start.rs:handle_session_start:mcp-error:db=pending:#3713
+src/mcp/tools/share.rs:handle_share:mcp-error:db=pending:#3713
+src/mcp/tools/signal.rs:handle_signal_ack_with_hooks:mcp-error:db=pending:#3713
+src/mcp/tools/signal.rs:handle_signal_inbox:mcp-error:db=pending:#3713
+src/mcp/tools/signal.rs:handle_signal_read:mcp-error:db=pending:#3713
+src/mcp/tools/signal.rs:handle_signal_send_with_hooks:mcp-error:db=pending:#3713
+src/mcp/tools/signal.rs:handle_signal_thread:mcp-error:db=pending:#3713
+src/mcp/tools/skill_compositional_context.rs:handle_skill_compositional_context:mcp-error:db=pending:#3713
+src/mcp/tools/skill_export.rs:handle_skill_export_in_root:mcp-error:db=pending:#3713
+src/mcp/tools/skill_export.rs:resolve_export_root:mcp-error:path=pending:#3713
+src/mcp/tools/skill_get.rs:handle_skill_get:mcp-error:db=pending:#3713
+src/mcp/tools/skill_list.rs:handle_skill_list:mcp-error:db=pending:#3713
+src/mcp/tools/skill_promote.rs:handle_skill_promote_for_caller:mcp-error:db=pending:#3713
+src/mcp/tools/skill_promote.rs:handle_skill_promote_from_reflection:mcp-error:db=pending:#3713
+src/mcp/tools/skill_register.rs:collect_resources:mcp-error:path=pending:#3713
+src/mcp/tools/skill_register.rs:register_core:mcp-error:db=pending:#3713
+src/mcp/tools/skill_register.rs:reject_symlink_escape:mcp-error:path=pending:#3713
+src/mcp/tools/skill_register.rs:resolve_import_root:mcp-error:path=pending:#3713
+src/mcp/tools/skill_retire.rs:handle_skill_delete:mcp-error:db=pending:#3713
+src/mcp/tools/skill_retire.rs:handle_skill_retire:mcp-error:db=pending:#3713
+src/mcp/tools/store/mod.rs:handle_store:mcp-error:db=pending:#3713
+src/mcp/tools/store/mod.rs:handle_store_inner:mcp-error:db=pending:#3713
+src/mcp/tools/store/synthesis.rs:apply_pending_synthesis_deletes_with_links:mcp-error:db=pending:#3713
+src/mcp/tools/store/synthesis.rs:apply_synthesis_updates_and_deletes:mcp-error:db=pending:#3713
+src/mcp/tools/store/validation.rs:parse_and_build_memory:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_list_subscriptions:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_list_subscriptions_as_caller:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_list_subscriptions_as_caller:memory-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_subscribe:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_subscribe_as_created_by:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_subscribe_as_created_by:memory-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_subscription_replay:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_unsubscribe:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_unsubscribe_as_caller:mcp-error:db=pending:#3713
+src/mcp/tools/subscribe.rs:handle_unsubscribe_as_caller:memory-error:db=pending:#3713
+src/mcp/tools/swarm_rewind.rs:handle_swarm_rewind:mcp-error:db=pending:#3713
+src/mcp/tools/swarm_rewind.rs:resolve_rewind_target:mcp-error:db=pending:#3713
+src/mcp/tools/update.rs:handle_update:mcp-error:db=pending:#3713
+src/mcp/tools/update.rs:handle_update_inner:mcp-error:db=pending:#3713
+src/mcp/tools/verify.rs:handle_verify:mcp-error:db=pending:#3713
+
+# ---- #3707 — HTTP handler JSON bodies (http-body) + errors.rs From<...> (memory-error) (44 keys) ----
+src/errors.rs:from:memory-error:db=pending:#3707
+src/handlers/capture_turn.rs:capture_turn_write:http-body:db=pending:#3707
+src/handlers/coordination.rs:checkpoint_resolve_error:http-body:db=pending:#3707
+src/handlers/coordination.rs:local_transition_via_db:http-body:db=pending:#3707
+src/handlers/coordination.rs:local_transition_via_store:http-body:db=pending:#3707
+src/handlers/coordination.rs:signal_insert_error:http-body:db=pending:#3707
+src/handlers/create.rs:create_memory_postgres:http-body:db=pending:#3707
+src/handlers/create.rs:create_memory_write:http-body:db=pending:#3707
+src/handlers/errors.rs:attested_write_admission_response:http-body:db=pending:#3707
+src/handlers/hook_subscribers.rs:clear_namespace_standard_inner:http-body:db=pending:#3707
+src/handlers/hook_subscribers.rs:get_inbox:http-body:db=pending:#3707
+src/handlers/hook_subscribers.rs:get_namespace_standard_qs:http-body:db=pending:#3707
+src/handlers/hook_subscribers.rs:session_start:http-body:db=pending:#3707
+src/handlers/hook_subscribers.rs:set_namespace_standard_inner:http-body:db=pending:#3707
+src/handlers/kg.rs:entity_register:http-body:db=pending:#3707
+src/handlers/kg.rs:kg_find_paths:http-body:db=pending:#3707
+src/handlers/kg.rs:kg_query:http-body:db=pending:#3707
+src/handlers/memories.rs:delete_memory:http-body:db=pending:#3707
+src/handlers/memories.rs:promote_memory:http-body:db=pending:#3707
+src/handlers/memories.rs:update_memory_write:http-body:db=pending:#3707
+src/handlers/memories_query.rs:forget_memories:http-body:db=pending:#3707
+src/handlers/power_consolidation.rs:load_family_handler:http-body:db=pending:#3707
+src/handlers/route_1111.rs:calibrate_confidence_http_via_store:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_calibrate_confidence_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_check_agent_action_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_dependents_of_invalidated_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_export_reflection_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_recall_observations_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_reflect_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_reflection_origin_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_replay_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_rule_list_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_smart_load_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_subscription_dlq_list_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_subscription_replay_http:http-body:db=pending:#3707
+src/handlers/route_1111.rs:handle_verify_http:http-body:db=pending:#3707
+src/handlers/share.rs:share_memory:http-body:db=pending:#3707
+src/handlers/skills.rs:skill_compose_route:http-body:db=pending:#3707
+src/handlers/skills.rs:skill_delete_route:http-body:db=pending:#3707
+src/handlers/skills.rs:skill_export_route:http-body:path=pending:#3707
+src/handlers/skills.rs:skill_get_route:http-body:db=pending:#3707
+src/handlers/skills.rs:skill_promote_route:http-body:db=pending:#3707
+src/handlers/skills.rs:skill_register_route:http-body:db=pending:#3707
+src/handlers/skills.rs:skill_retire_route:http-body:db=pending:#3707
+
+# ---- #3724 — webhook receiver text persisted into subscription_dlq.last_error (dlq-record) (1 keys) ----
+src/subscriptions.rs:send:dlq-record:http=pending:#3724
+
+# ---- #3708 — hook / governance Deny.reason (deny-reason) (2 keys) ----
+src/cli/governance_check_action.rs:run_from_pretool_stdin:deny-reason:db=pending:#3708
+src/hooks/chain.rs:fire_scoped:deny-reason:proc=pending:#3708
+
+# ---- #3674 — store_err_to_response schema arms carrying a path / DSN label (funnel-arm) (3 keys) ----
+src/handlers/postgres_gate.rs:store_err_to_response:funnel-arm:StoreError::SchemaAheadOfBinary.detail=pending:#3674
+src/handlers/postgres_gate.rs:store_err_to_response:funnel-arm:StoreError::SchemaStampInvalid.detail=pending:#3674
+src/handlers/postgres_gate.rs:store_err_to_response:funnel-arm:StoreError::SchemaVersionPoisoned.detail=pending:#3674
+
+# ---- #3698 — forward_to_http: peer body AND federation URL in MCP error text (one key covers both taints) (1 keys) ----
+src/mcp/tools/store/transport.rs:forward_to_http:mcp-error:http=pending:#3698
