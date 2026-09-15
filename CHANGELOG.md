@@ -48,6 +48,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer drives severity. `storage::doctor_max_sync_skew_secs` (which
   turned a failed `prepare` into "not observed") is replaced by
   `doctor_sync_peer_watermarks`, which propagates the failure.
+### Added (#3714 / #3715 — the deployment shape is the primary configuration input; unknown config keys refuse)
+
+- `[deployment] shape = "singleton" | "team" | "production" | "federated" | "hive"`
+  — the ONE new top-level setting of the configuration programme. One
+  definition (`config::shape::DeploymentShape::derive`) yields a
+  `ShapeDerived` table where every row is a **FLOOR** (an override below it
+  refuses boot) or a **default** (an explicit value wins). `#3700` (posture)
+  and `#3709` (transit) consume that table, never the environment. A config
+  with no `[deployment]` block is a `singleton`; nothing ever promotes a
+  running node to a stricter shape — promotion is an operator act.
+- v1.0.0 enforces two rows at boot: `production` / `federated` / `hive` pin
+  `AI_MEMORY_SECURITY_PROFILE=asi-hard` when it is unset and refuse a
+  `standard` override; the same shapes REQUIRE at-rest encryption — and
+  because no recovery escrow for the at-rest key exists yet (#3717), the
+  requirement is DECLARED (boot WARN, `doctor` "Deployment shape" section,
+  #3557) rather than silently enabled: a lost key must never mean lost
+  memory. An explicit `[encryption].at_rest = false` under those shapes
+  refuses boot. Every other derived row is declared here and enforced by
+  its named consumer.
+- `ai-memory config show [--file]` renders the derivation table with the
+  marker on every row (no secrets, no effective values — what the SHAPE
+  says).
+- **Unknown config keys now REFUSE the boot loader at every nesting level**
+  (exit 78, the #3166 class). The accepted key tree is derived from
+  `AppConfig`'s schema (`schemars`), not a hand list — 174 leaf keys at this
+  release — so a new field is accepted the moment it exists. The refusal
+  names the full key path, the nearest accepted sibling by edit distance,
+  any section where a key of that name IS accepted, and the exact repair
+  command. Pre-v1.0.0 only top-level unknown keys WARNed; nested ones were
+  silent. **Run `ai-memory config check` BEFORE upgrading**: it is the
+  detector — valid TOML that the daemon would refuse exits **5** with the
+  same per-key report and never refuses anything itself. `config migrate`,
+  `config check`, `config show` and `governance migrate-to-permissions`
+  all parse through `toml::Value` and stay reachable from a refused
+  config (a fail-closed loader whose repair path is behind the same gate
+  is a lockout, not a control).
+
+### Fixed (#3555 — write receipts declare their durability)
+
+- HTTP create, update, bulk, capture/replay and sync-push receipts, local MCP
+  store/update/capture receipts, and CLI store/update/capture receipts declare
+  `durability_class` and `fsync`. Forwarded MCP stores retain the daemon receipt.
+- Local writes declare `local-only`; SQLite reads the live `synchronous` setting.
+  Successful quorum creates report the actual acknowledgement count and replica
+  count on SQLite and PostgreSQL. Explicit backup-posture attestation can raise
+  an acknowledged replicated write to `replicated+backup`.
+- SDK and shim wire types expose receipt evidence. The generated all-funnel
+  structural contract is deferred to #3558; no competing manifest is introduced.
 
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 

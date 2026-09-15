@@ -97,7 +97,14 @@ pub fn handle_share(
     };
 
     if let Some(c) = caller
-        && !crate::visibility::caller_owns_for_mutation(&source, c, true)
+        && !crate::visibility::caller_owns_for_mutation(
+            &source,
+            c,
+            true,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::SHARE,
+            ),
+        )
     {
         crate::governance::audit::record_decision(
             c,

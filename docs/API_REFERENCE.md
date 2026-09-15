@@ -1615,12 +1615,12 @@ This is the write-side twin of the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail
 (#1923). The process working directory is deliberately NOT the fallback root: a
 daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 
-> **Total HTTP surface at v1.0.0: 86 unique URL paths across 100
+> **Total HTTP surface at v1.0.0: 88 unique URL paths across 102
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 86` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 100`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 88` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 102`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).
@@ -1631,7 +1631,7 @@ daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 > grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l
 > ```
 >
-> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (86): the
+> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (88): the
 > `/api/v1/*` paths plus the bare `/metrics`. Do not count `.route(`
 > occurrences in `src/lib.rs` to get the registration total — the
 > router also registers test-only routes under `#[cfg(test)]`, so a
@@ -1717,3 +1717,63 @@ The v0.8.0 net-new tools were the coordination families `memory_action_*`, `memo
 - `docs/CLI_REFERENCE.md` — corresponding CLI surface.
 - `docs/SECURITY.md` — API key + mTLS + governance.
 - `docs/TROUBLESHOOTING.md` — common error scenarios.
+
+
+### Authenticated health monitoring (v1)
+
+`GET /api/v1/monitoring/status` returns versioned, metadata-only JSON;
+`GET /api/v1/monitoring/metrics` returns standard Prometheus exposition. Both
+require the daemon's native TLS and existing enrolled-key or bound mTLS
+authentication (the operator key also works). `[monitoring]` assigns ordinary
+principals a health-only scope enforced before all route dispatch. See the
+[health monitoring contract](HEALTH-MONITORING.md) for enrollment, fields,
+privacy, unavailable audit signals and the storage-boundary follow-up #3672.
+
+## Write receipt durability (#3555)
+
+Write receipts for HTTP create, update, bulk, capture/replay and sync push,
+MCP store/update/capture, and CLI store/update/capture include these top-level fields:
+
+| Field | Meaning |
+| --- | --- |
+| `durability_class` | `local-only`, `quorum W-of-N`, or `replicated+backup` |
+| `fsync` | Observed local commit flush cadence; independent of replica count |
+| `quorum_acks` | Actual distinct acknowledgements including the local commit, when a quorum was established |
+| `quorum_n` | Total configured replicas including the local node |
+| `quorum_required` | Configured acknowledgement threshold for that operation |
+
+For `quorum W-of-N`, W is the actual acknowledgement count at the successful
+quorum verdict, not merely the configured threshold; for example,
+`"durability_class": "quorum 2-of-3"`, `"quorum_acks": 2`, `"quorum_n": 3`.
+The evidence belongs to this operation. A configured mesh, asynchronous fanout,
+or a queued approval does not establish quorum durability for a memory.
+Bulk commits keep the conservative `local-only` aggregate class because their
+fanout can fail independently for individual rows. Capture and sync receivers
+acknowledge local writes; they do not wait for additional replication.
+A replay reports the current local posture, not reconstructed historical evidence.
+
+SQLite `NORMAL` writes report `local-only` with `fsync: per-checkpoint`;
+`FULL` and `EXTRA` report `local-only` with `fsync: per-commit`.
+PostgreSQL reads `fsync` and `synchronous_commit` from the active store pool;
+local fsync with synchronous commits reports `per-commit`. With
+`synchronous_commit=off`, it reports `asynchronous WAL flush`; with `fsync=off`,
+it reports `never (OS write-back only)`. Native PostgreSQL standby configuration
+alone does not establish an application-level W/N count.
+Commit settings must remain stable across pooled writer connections during an
+operation; a receipt is an observation of the active posture, not a settings lock.
+A durability-observation or serialization error fails receipt production with
+500; the response warns that the write may have completed, so callers must use their
+usual idempotency key when reconciling the result.
+
+An operator may explicitly set
+`AI_MEMORY_BACKUP_POSTURE_ATTESTATION=attested` to attest that the replicated
+installation has the required backup posture. Only a write with at least one
+remote acknowledgement can then report `replicated+backup`. Unset or other
+values never enable that class. The setting is a trusted operator posture
+attestation, not a claim that a particular asynchronous backup already contains
+this commit. The receipt retains the actual W/N counts alongside this class.
+Local fsync settings alone never enable either replicated class.
+
+The RPO and loss metric must be interpreted within the receipt's declared
+class and local flush cadence. The generated mutating-surface structural test
+is deferred to #3558, which owns the canonical inventory schema and generator.

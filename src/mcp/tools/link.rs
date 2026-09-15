@@ -276,7 +276,14 @@ pub(super) fn handle_link(
         // memory owned by a DIFFERENT agent (the MCP link path bypasses the
         // HTTP source-owner gate, leaving a graph-forge primitive).
         if let Some(src) = link_owner.as_ref()
-            && !crate::visibility::caller_owns_for_mutation(src, &caller, false)
+            && !crate::visibility::caller_owns_for_mutation(
+                src,
+                &caller,
+                false,
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::LINK,
+                ),
+            )
         {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
@@ -293,7 +300,14 @@ pub(super) fn handle_link(
         // left to `db::create_link_signed`'s FK error (more actionable).
         if let Some(tgt) = db::get(conn, target_id).ok().flatten() {
             if relation == SUPERSEDES {
-                if !crate::visibility::caller_owns_for_mutation(&tgt, &caller, false) {
+                if !crate::visibility::caller_owns_for_mutation(
+                    &tgt,
+                    &caller,
+                    false,
+                    crate::identity::owner_stamp::MutationSite::sqlite(
+                        crate::identity::owner_stamp::funnel::LINK,
+                    ),
+                ) {
                     return Err(TARGET_NOT_OWNED_FOR_MUTATION.into());
                 }
             } else if !crate::visibility::is_readable_on_query(

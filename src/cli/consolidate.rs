@@ -78,10 +78,16 @@ pub fn run(
         ) {
             anyhow::bail!(crate::errors::msg::memory_not_found(id));
         }
-        if caller
-            .as_deref()
-            .is_some_and(|c| !crate::visibility::caller_owns_for_mutation(&mem, c, false))
-        {
+        if caller.as_deref().is_some_and(|c| {
+            !crate::visibility::caller_owns_for_mutation(
+                &mem,
+                c,
+                false,
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::CONSOLIDATE,
+                ),
+            )
+        }) {
             anyhow::bail!(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY);
         }
     }
@@ -194,9 +200,16 @@ pub fn run_auto(
                     mem,
                     caller.as_deref(),
                     args.namespace.as_deref(),
-                ) && caller
-                    .as_deref()
-                    .is_none_or(|c| crate::visibility::caller_owns_for_mutation(mem, c, false))
+                ) && caller.as_deref().is_none_or(|c| {
+                    crate::visibility::caller_owns_for_mutation(
+                        mem,
+                        c,
+                        false,
+                        crate::identity::owner_stamp::MutationSite::sqlite(
+                            crate::identity::owner_stamp::funnel::CONSOLIDATE,
+                        ),
+                    )
+                })
             })
             .collect();
         if memories.len() < args.min_count {

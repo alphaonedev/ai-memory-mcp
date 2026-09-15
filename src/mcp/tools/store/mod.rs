@@ -337,6 +337,54 @@ pub(crate) fn handle_store(
     // Batman Form-2 atomisation structurally inert product-wide.
     atomise: crate::hooks::pre_store::AtomiseWiring<'_>,
 ) -> Result<Value, String> {
+    let mut receipt = handle_store_inner(
+        conn,
+        db_path,
+        params,
+        embedder,
+        llm,
+        vector_index,
+        resolved_ttl,
+        autonomous_hooks,
+        mcp_client,
+        federation_forward_url,
+        active_keypair,
+        atomise,
+    )?;
+    if federation_forward_url.is_none() {
+        crate::write_receipt::WriteDurability::sqlite(conn)
+            .and_then(|durability| durability.attach(&mut receipt))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_store_inner(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    llm: Option<&OllamaClient>,
+    vector_index: Option<&dyn VectorSearchIndex>,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    autonomous_hooks: bool,
+    mcp_client: Option<&str>,
+    federation_forward_url: Option<&str>,
+    // Issue #1239 — synthesis Update / Delete verdicts now emit a
+    // `supersedes` link new → target via `db::create_link_signed`. The
+    // active daemon keypair (when configured) signs the link so the
+    // edge lands with `attest_level='self_signed'` — matching the
+    // legacy supersede path through `update_with_archive_on_supersede`.
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    // #2983/#2984/#2986 — the LIVE atomisation wiring, threaded from
+    // `ToolDispatchCtx::atomise_handler` (rebuilt on every `[llm]`
+    // hot-reload, #2172) plus the bounded background worker queue.
+    // Replaces the ABOLISHED process-global `AUTO_ATOMISE_DISPATCH`
+    // OnceLock, which had zero production callers and therefore made
+    // Batman Form-2 atomisation structurally inert product-wide.
+    atomise: crate::hooks::pre_store::AtomiseWiring<'_>,
+) -> Result<Value, String> {
     // #1885 (critical) — mandatory-hook-presence enforcement gate, consulted
     // BEFORE the store commits (and before any federation forward). Under
     // `[hooks].enforce_mode = enforce` with `pre_store` in `required_events` and

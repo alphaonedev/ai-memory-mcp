@@ -146,6 +146,8 @@ const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
 /// entirely (so a fresh-DB doctor report is unchanged).
 #[cfg(feature = "sal-postgres")]
 const SECTION_POSTGRES_EXTENSIONS: &str = "Postgres extensions (#3264)";
+/// v1.0.0 #3124 — the unstamped-owner census row (both backends).
+const SECTION_UNSTAMPED_OWNERS: &str = "Unstamped owners (#3124)";
 
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
@@ -1117,6 +1119,9 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // `ai-memory.db` in `$PWD`, so the very next step ("could not open
     // database") is a SYMPTOM whose cause would otherwise never be printed.
     sections.push(section_config_health_3166());
+    if let Some(section) = section_deployment_shape_3714() {
+        sections.push(section);
+    }
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -1130,6 +1135,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // URL outright).
     #[cfg(feature = "sal-postgres")]
     if let Some(pg) = section_postgres_extensions_3264() {
+        sections.push(pg);
+    }
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = section_postgres_unstamped_owners_3124() {
         sections.push(pg);
     }
 
@@ -1259,6 +1268,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     sections.push(section_embedding_space_census_2167(&conn));
     sections.push(section_recall_index_coverage_1964(&conn));
     sections.push(section_corpus_lifecycle_1965(&conn));
+    sections.push(section_unstamped_owners_3124(
+        crate::identity::owner_stamp::sqlite_census(&conn).map_err(anyhow::Error::from),
+        crate::identity::owner_stamp::BACKEND_LABEL_SQLITE,
+    ));
     sections.push(section_recall_local());
     sections.push(section_governance(&conn));
     sections.push(section_sync(&conn));
@@ -1345,6 +1358,127 @@ where
                 }
             })?
     })
+}
+
+/// v1.0.0 #3124 — render the unstamped-owner census for one backend.
+///
+/// Severity contract (vote constraint 2): `Info` when both live counts are 0;
+/// `Warning` when unstamped / malformed rows exist under the default
+/// `AI_MEMORY_UNSTAMPED_MUTATION=warn`; `Critical` when they exist under
+/// `refuse` (every caller-scoped mutation of those rows is now refused). A
+/// census that could not be read is `Critical` — never reported as 0.
+fn section_unstamped_owners_3124(
+    census: Result<crate::identity::owner_stamp::UnstampedCensus>,
+    backend: &str,
+) -> ReportSection {
+    use crate::identity::owner_stamp::{CENSUS_REMEDY, ENV_UNSTAMPED_MUTATION, mode};
+    let posture = mode();
+    let raw_env = std::env::var(ENV_UNSTAMPED_MUTATION).ok();
+    let mut facts = vec![
+        ("backend".into(), backend.to_string()),
+        (
+            "unstamped_mutation_mode".into(),
+            posture.as_str().to_string(),
+        ),
+    ];
+    if let Some(raw) = raw_env.as_deref()
+        && !crate::identity::owner_stamp::is_recognised_token(raw)
+    {
+        facts.push((
+            "unrecognised_value".into(),
+            format!("{raw:?} (boot refuses this value; accepted: warn | refuse)"),
+        ));
+    }
+    let c = match census {
+        Ok(c) => c,
+        Err(e) => {
+            facts.push((
+                "error".into(),
+                crate::logging::redact_urls_in_message(&format!("{e:#}")),
+            ));
+            return ReportSection {
+                name: SECTION_UNSTAMPED_OWNERS.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some("the unstamped-owner census could not be read".into()),
+            };
+        }
+    };
+    facts.push(("unstamped_rows".into(), c.unstamped.to_string()));
+    facts.push(("malformed_owner_rows".into(), c.malformed.to_string()));
+    facts.push((
+        "archived_unstamped_rows".into(),
+        c.archived_unstamped.to_string(),
+    ));
+    let affected = c.unstamped.saturating_add(c.malformed);
+    let (severity, note) = if affected == 0 {
+        (Severity::Info, None)
+    } else if posture.refuses() {
+        (
+            Severity::Critical,
+            Some(format!(
+                "{affected} live row(s) carry no provable owner and every caller-scoped \
+                 mutation of them is REFUSED under {ENV_UNSTAMPED_MUTATION}=refuse — {CENSUS_REMEDY}"
+            )),
+        )
+    } else {
+        (
+            Severity::Warning,
+            Some(format!(
+                "{affected} live row(s) carry no provable owner; under the default \
+                 {ENV_UNSTAMPED_MUTATION}=warn any caller may mutate the unstamped ones \
+                 (each admission WARNs) — {CENSUS_REMEDY}"
+            )),
+        )
+    };
+    ReportSection {
+        name: SECTION_UNSTAMPED_OWNERS.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// v1.0.0 #3124 — the postgres twin of the unstamped-owner census. `None`
+/// on a SQLite deployment (no `postgres://` store URL), like
+/// [`section_postgres_extensions_3264`].
+#[cfg(feature = "sal-postgres")]
+fn section_postgres_unstamped_owners_3124() -> Option<ReportSection> {
+    let url = match crate::store_url::resolve_store_url(None) {
+        Ok(Some(url)) if crate::store_url::is_postgres_url(&url) => url,
+        // No postgres store (or an unresolvable one — the extensions
+        // section already reports that as Critical).
+        _ => return None,
+    };
+    let census: Result<crate::identity::owner_stamp::UnstampedCensus> =
+        run_pg_probe(|| async move {
+            let probe = async {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(PG_PROBE_TIMEOUT)
+                    .connect(&url)
+                    .await?;
+                let (unstamped, malformed, archived): (i64, i64, i64) =
+                    sqlx::query_as(crate::identity::owner_stamp::PG_CENSUS_SQL)
+                        .fetch_one(&pool)
+                        .await?;
+                pool.close().await;
+                Ok::<_, sqlx::Error>(crate::identity::owner_stamp::UnstampedCensus {
+                    unstamped: u64::try_from(unstamped).unwrap_or(0),
+                    malformed: u64::try_from(malformed).unwrap_or(0),
+                    archived_unstamped: u64::try_from(archived).unwrap_or(0),
+                })
+            };
+            tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
+                .await
+                .map_err(|_elapsed| anyhow::anyhow!(MSG_PG_PROBE_TIMEOUT))?
+                .map_err(anyhow::Error::from)
+        })
+        .and_then(|inner| inner);
+    Some(section_unstamped_owners_3124(
+        census,
+        crate::identity::owner_stamp::BACKEND_LABEL_POSTGRES,
+    ))
 }
 
 /// v1.0.0 (#3264) — "Postgres extensions" report row(s).
@@ -1635,6 +1769,76 @@ fn section_config_health_3166() -> ReportSection {
                     .into(),
             ),
         },
+    }
+}
+
+/// #3714 — the deployment shape and the two floors v1.0.0 enforces from
+/// it (posture, at-rest), rendered with their markers so an operator sees
+/// what the shape requires versus suggests. `None` when the config could
+/// not be loaded (the Configuration section above already reports that)
+/// or when config loading is skipped.
+fn section_deployment_shape_3714() -> Option<ReportSection> {
+    const NAME: &str = "Deployment shape (#3714)";
+    if crate::config::skip_config() {
+        return None;
+    }
+    let config = crate::config::AppConfig::load_for_boot().ok()?;
+    let shape = config.effective_shape();
+    let derived = shape.derive();
+    let mut facts: Vec<(String, String)> = vec![(
+        crate::models::field_names::SHAPE.into(),
+        shape.as_str().into(),
+    )];
+    for row in derived.rows() {
+        let [setting, marker, value, _enforced_by] = row;
+        facts.push((setting, format!("{value} ({marker})")));
+    }
+    let env = std::env::var(crate::security_profile::ENV_SECURITY_PROFILE).ok();
+    match crate::config::shape::evaluate_boot(&config, env.as_deref()) {
+        Ok((report, pin)) => {
+            let mut severity = Severity::Info;
+            let mut notes = Vec::new();
+            if let Some(value) = pin {
+                facts.push((
+                    "security_posture_at_boot".into(),
+                    format!("pinned to {value} by the shape (env unset)"),
+                ));
+            }
+            if report.at_rest_pending_escrow {
+                severity = severity_max(severity, Severity::Warning);
+                facts.push((
+                    "at_rest_status".into(),
+                    "required, NOT enabled (no recovery escrow)".into(),
+                ));
+                notes.push(crate::config::shape::at_rest_pending_escrow_warning(shape));
+            }
+            if report.at_rest_on_without_escrow {
+                severity = severity_max(severity, Severity::Warning);
+                facts.push((
+                    "at_rest_status".into(),
+                    "enabled WITHOUT a recovery escrow".into(),
+                ));
+                notes.push(
+                    "a lost `<key-dir>/<agent>.x25519.priv` loses `content`; the escrow is #3717"
+                        .into(),
+                );
+            }
+            Some(ReportSection {
+                name: NAME.into(),
+                severity,
+                facts,
+                note: (!notes.is_empty()).then(|| notes.join(" ")),
+            })
+        }
+        Err(e) => {
+            facts.push(("boot".into(), "REFUSED".into()));
+            Some(ReportSection {
+                name: NAME.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some(format!("{e:#}")),
+            })
+        }
     }
 }
 
@@ -4080,7 +4284,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_eighteen_sections_3582() {
+    fn local_run_on_empty_db_produces_nineteen_sections_3582_3124() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
@@ -4094,7 +4298,9 @@ mod tests {
         // #3147/#3155 inserted "Identity" after Configuration — total is
         // now 16; #3471 appended "Wake hub (#3471)"; #3582 added
         // "Federation peer authorization" before the database open and
-        // Identity — total is now 18.
+        // Identity — total is now 18; #3124 added the unconditional
+        // "Unstamped owners (#3124)" census after "Corpus Lifecycle (#1965)"
+        // — total is now 19.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -4104,13 +4310,13 @@ mod tests {
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
-        // DSN under that same lock. The count stays 18 on a SQLite
+        // DSN under that same lock. The count stays 19 on a SQLite
         // deployment, which is the invariant this test pins.
         //
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 18);
+        assert_eq!(report.sections.len(), 19);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -4123,6 +4329,7 @@ mod tests {
                 "Embedding Space Census (#2167)",
                 "Recall Index Coverage (#1964)",
                 "Corpus Lifecycle (#1965)",
+                SECTION_UNSTAMPED_OWNERS,
                 "Recall",
                 "Governance",
                 "Sync",

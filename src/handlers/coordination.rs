@@ -38,7 +38,7 @@ use crate::handlers::AppState;
 
 /// Response field carrying the W-of-N acknowledgement count on a successful
 /// fanout (one spelling, pm-v3.1 literal gate).
-const QUORUM_ACKS_FIELD: &str = "quorum_acks";
+use crate::write_receipt::QUORUM_ACKS_FIELD;
 
 /// Rejection detail for a non-terminal `state` on the checkpoint-resolve route
 /// (one spelling, pm-v3.1 literal gate). Mirrors the MCP handler's wording.

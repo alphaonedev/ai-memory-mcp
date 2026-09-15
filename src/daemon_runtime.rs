@@ -2871,13 +2871,9 @@ pub async fn run(
             }
         }
         Command::Reown(a) => {
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            // v0.8.0 #1709/#1720 WS-B B2 — namespace ownership re-stamp.
-            match cli::reown::run(&db_path, &a, &mut out)? {
+            // v0.8.0 #1709/#1720 WS-B B2 + v1.0.0 #3124 R4 — backend routing
+            // lives in `cli::reown::dispatch` (qual_10 budget).
+            match cli::reown::dispatch(&a, &db_path, app_config, cli_agent_id.as_deref()).await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -6140,6 +6136,12 @@ fn cert_peer_binding_boot_warnings(
 /// reads while keeping the deprecation warning live for external
 /// consumers.
 #[allow(deprecated)]
+// #3582 — `peer_posture::enforce_at_boot` MUST be the FIRST statement in this
+// function body; `tests/federation_peer_posture_3582.rs` asserts that structurally,
+// and the assertion reads the raw body text, so nothing (not even a comment) may
+// precede it. #3646's monitoring-scope validation was inserted ahead of the gate
+// during the chain-12 merge, which let a node with an uncertified federation
+// posture do work before the refusal fired. Refuse first, validate scopes after.
 pub async fn bootstrap_serve(
     db_path: &Path,
     args: &ServeArgs,
@@ -6149,6 +6151,21 @@ pub async fn bootstrap_serve(
         !args.quorum_peers.is_empty(),
         args.mtls_allowlist.as_deref(),
     )?;
+    if let Some(scopes) = &app_config.monitoring
+        && !scopes.peer_ids.is_empty()
+    {
+        let bindings = tls::cert_peer_binding_map_from_env()?;
+        anyhow::ensure!(
+            args.tls_cert.is_some()
+                && args.tls_key.is_some()
+                && args.mtls_allowlist.is_some()
+                && bindings.as_ref().is_some_and(|map| scopes
+                    .peer_ids
+                    .iter()
+                    .all(|id| map.values().any(|v| v == id))),
+            "monitoring peer scopes require TLS, the mTLS allowlist, and an existing certificate binding for every scoped peer"
+        );
+    }
     // S5-C1 (v0.7.0 fix campaign 2026-05-13): refuse default-off auth
     // on non-loopback binds. When `api_key` is unset, the `api_key_auth`
     // middleware is a pass-through — every privileged endpoint (write,
@@ -7181,6 +7198,16 @@ pub async fn bootstrap_serve(
             }
         }
     };
+
+    let enrolled_agent_keys = Arc::new(
+        crate::handlers::identity_binding::EnrolledAgentKeys::from_map(
+            enrolled_agent_keys.snapshot().as_ref().clone(),
+        )
+        .with_monitoring(
+            app_config.monitoring.clone().unwrap_or_default(),
+            args.tls_cert.is_some() && args.tls_key.is_some(),
+        ),
+    );
 
     // #3065 (Wave-2 Cluster B, cert-core) — the ADMIN_HEADER_TRUST identity
     // boot-gate. Header-asserted identity (AI_MEMORY_ADMIN_HEADER_TRUST=1 +

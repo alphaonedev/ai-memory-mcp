@@ -103,7 +103,7 @@ use crate::models::{Memory, MemoryLink, Tier};
 /// `track_g_hook_pipeline`. Mapping narrative in
 /// `docs/compliance/nsa-csi-mcp.html` §3.3 (concern c), §4.4
 /// (recommendation d), and §4.6 (recommendation f).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
     /// Fires before a memory is persisted. Payload: [`MemoryDelta`] (writable).
