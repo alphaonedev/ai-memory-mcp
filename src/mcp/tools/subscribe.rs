@@ -100,7 +100,8 @@ pub fn handle_subscribe(
 ) -> Result<Value, String> {
     let created_by =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    handle_subscribe_as_created_by(conn, params, &created_by).map_err(|e| e.message())
+    handle_subscribe_as_created_by(conn, params, &created_by)
+        .map_err(|e| crate::mcp::error_text::mcp_error_text(&e))
 }
 
 /// #3433: CLI has already resolved the caller via the global `--agent-id`
@@ -155,7 +156,7 @@ pub(crate) fn handle_subscribe_as_created_by(
     // subscribers closes the "any MCP client owns the webhook fleet"
     // hole flagged by the v0.6.0 security review.
     let registered = crate::db::list_agents(conn)
-        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?
+        .map_err(|e| crate::mcp::error_text::log_foreign("list_agents", e))?
         .into_iter()
         .any(|a| a.agent_id == created_by);
     if !registered {
@@ -179,7 +180,7 @@ pub(crate) fn handle_subscribe_as_created_by(
             event_types: event_types.as_deref(),
         },
     )
-    .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
+    .map_err(|e| crate::mcp::error_text::log_foreign("as_deref", e))?;
 
     let mut response = json!({
         "id": id,
@@ -206,7 +207,8 @@ pub fn handle_unsubscribe(
     // another tenant's list output) and remove the other tenant's
     // webhook fleet. The resolution chain matches `handle_subscribe`.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    handle_unsubscribe_as_caller(conn, params, &caller).map_err(|e| e.message())
+    handle_unsubscribe_as_caller(conn, params, &caller)
+        .map_err(|e| crate::mcp::error_text::mcp_error_text(&e))
 }
 
 /// #3433: CLI has already resolved the caller. See
@@ -220,7 +222,7 @@ pub(crate) fn handle_unsubscribe_as_caller(
         .as_str()
         .ok_or_else(|| MemoryError::ValidationFailed(crate::errors::msg::ID_REQUIRED.into()))?;
     let removed = crate::subscriptions::delete(conn, id, Some(caller))
-        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
+        .map_err(|e| crate::mcp::error_text::log_foreign("delete", e))?;
     Ok(json!({"id": id, "removed": removed}))
 }
 
@@ -232,7 +234,8 @@ pub fn handle_list_subscriptions(
     // only return subscriptions owned by the caller. Pre-fix this
     // returned every tenant's rows.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    handle_list_subscriptions_as_caller(conn, &caller).map_err(|e| e.message())
+    handle_list_subscriptions_as_caller(conn, &caller)
+        .map_err(|e| crate::mcp::error_text::mcp_error_text(&e))
 }
 
 /// #3433: CLI has already resolved the caller. See
@@ -242,7 +245,7 @@ pub(crate) fn handle_list_subscriptions_as_caller(
     caller: &str,
 ) -> Result<Value, MemoryError> {
     let subs = crate::subscriptions::list(conn, Some(caller))
-        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
+        .map_err(|e| crate::mcp::error_text::log_foreign("list", e))?;
     Ok(json!({"count": subs.len(), (field_names::SUBSCRIPTIONS): subs}))
 }
 
@@ -276,8 +279,8 @@ pub fn handle_subscription_replay(
     // wire shape as a non-existent subscription so the existence of
     // the id is not leaked.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    let owner =
-        crate::subscriptions::get_owner(conn, subscription_id).map_err(|e| e.to_string())?;
+    let owner = crate::subscriptions::get_owner(conn, subscription_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_agent_id", e))?;
     let owner_matches = owner.as_deref() == Some(caller.as_str());
     if !owner_matches {
         // Identical envelope shape to "subscription found but no
@@ -292,7 +295,7 @@ pub fn handle_subscription_replay(
         }));
     }
     crate::subscriptions::memory_subscription_replay(conn, subscription_id, &since)
-        .map_err(|e| e.to_string())
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("memory_subscription_replay", e))
 }
 
 // --- D1.5 (#986): per-tool McpTool impls for the in-scope subscribe tools ---

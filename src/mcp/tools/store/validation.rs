@@ -269,15 +269,14 @@ pub(super) fn parse_and_build_memory(
             let viewer = crate::identity::resolve_read_visibility_caller();
             if let Some(existing_id) =
                 db::find_by_title_namespace(conn, title, &namespace, viewer.as_deref())
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
             {
                 return Err(conflict_error_message(title, &namespace, &existing_id));
             }
             title.to_string()
         }
-        OnConflict::Version => {
-            db::next_versioned_title(conn, title, &namespace).map_err(|e| e.to_string())?
-        }
+        OnConflict::Version => db::next_versioned_title(conn, title, &namespace)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("next_versioned_title", e))?,
         OnConflict::Merge => title.to_string(),
     };
 

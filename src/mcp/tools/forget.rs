@@ -207,7 +207,7 @@ pub(super) fn handle_forget(
             if pattern.is_some() || tier.is_some() {
                 let namespaces =
                     db::forget_distinct_namespaces_for_caller(conn, pattern, tier.as_ref(), caller)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?;
                 for ns in &namespaces {
                     forget_governance_gate_one_ns(
                         conn,
@@ -300,7 +300,8 @@ pub(super) fn handle_forget(
 }
 
 pub(super) fn handle_stats(conn: &rusqlite::Connection, db_path: &Path) -> Result<Value, String> {
-    let stats = db::stats(conn, db_path).map_err(|e| e.to_string())?;
+    let stats = db::stats(conn, db_path)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("stats", e))?;
     serde_json::to_value(stats).map_err(|e| e.to_string())
 }
 

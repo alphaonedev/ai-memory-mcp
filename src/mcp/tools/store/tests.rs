@@ -3036,10 +3036,10 @@ fn store_insert_and_refund_failures_remain_observable_without_persisting_3496() 
         None,
     )
     .expect_err("the forced insert fault must remain observable");
-    assert!(
-        err.contains("forced memory insert failure 3496"),
-        "got: {err}"
-    );
+    // #3713 — "observable" means the WRITE FAILS and the quota is refunded
+    // (asserted below); the trigger's text is driver text and stays on the
+    // operator log, the caller sees the storage class.
+    assert_eq!(err, crate::mcp::error_text::DB_ERROR_TEXT, "got: {err}");
     let charged: (i64, i64) = conn
         .query_row(
             "SELECT current_memories_today, current_storage_bytes

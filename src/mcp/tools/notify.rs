@@ -33,7 +33,8 @@ pub fn handle_notify(
 ) -> Result<Value, String> {
     let input = parse_notify(params).map_err(|e| e.message())?;
     let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    persist_notify(conn, db_path, input, resolved_ttl, &sender).map_err(|e| e.message())
+    persist_notify(conn, db_path, input, resolved_ttl, &sender)
+        .map_err(|e| crate::mcp::error_text::mcp_error_text(&e))
 }
 
 /// #3579: HTTP has already resolved and validated this sender. Never feed it
@@ -190,7 +191,7 @@ fn persist_notify(
         bytes: payload_bytes,
     };
     crate::quotas::check_and_record(conn, sender, &mem.namespace, quota_op)
-        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
+        .map_err(|e| crate::mcp::error_text::log_foreign("check_and_record", e))?;
 
     // #3639 — refuse-on-conflict: an inbox delivery must NEVER merge into an
     // existing row (the minted title makes a collision practically
@@ -206,7 +207,7 @@ fn persist_notify(
             {
                 crate::quotas::log_refund_op_failed(sender, &refund_err);
             }
-            return Err(MemoryError::DatabaseError(e.to_string()));
+            return Err(crate::mcp::error_text::log_foreign("persist_notify", e));
         }
     };
 
@@ -441,7 +442,7 @@ pub(crate) fn handle_inbox_with_policy(
         None, // #1834 valid_at (no as-of)
         None, // #2580 metadata_eq (no narrowing)
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("metadata_eq", e))?;
     let messages = items.iter().map(inbox_message).collect();
     Ok(inbox_envelope(&owner, &namespace, unread_only, messages))
 }
@@ -730,7 +731,9 @@ mod d1_5_986_tests {
             &sender,
         )
         .expect_err("pre-resolved sender must hit the same quota refusal");
-        assert!(matches!(typed, MemoryError::DatabaseError(_)));
+        // #3713 — the quota refusal now has its own typed variant (it used
+        // to ride `DatabaseError` as text) and still passes through verbatim.
+        assert!(matches!(typed, MemoryError::QuotaExceeded(_)));
         assert_eq!(typed.message(), err);
         let inbox_rows: i64 = conn
             .query_row(

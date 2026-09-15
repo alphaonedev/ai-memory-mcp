@@ -153,7 +153,7 @@ pub(super) fn handle_search(
                 as_agent,
                 caller,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_search", e))?;
             let results = filter_visible(results, caller, namespace, as_agent);
             return Ok(json!({"results": results, "count": results.len()}));
         }
@@ -176,7 +176,7 @@ pub(super) fn handle_search(
         source_uri,
         caller,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_search", e))?;
     let results = filter_visible(results, caller, namespace, as_agent);
     Ok(json!({"results": results, "count": results.len()}))
 }

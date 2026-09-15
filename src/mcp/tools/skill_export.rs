@@ -126,16 +126,27 @@ fn create_dir_all_secure(dir: &Path) -> std::io::Result<()> {
 /// cannot be created or canonicalized.
 fn resolve_export_root(configured_root: Option<&str>, db_path: &Path) -> Result<PathBuf, String> {
     if let Some(root) = configured_root.map(str::trim).filter(|s| !s.is_empty()) {
-        let canonical = std::fs::canonicalize(Path::new(root)).map_err(|_| {
+        // #3713 — the configured root is OPERATOR config: its path goes to the
+        // operator log, the caller gets the verdict.
+        let canonical = std::fs::canonicalize(Path::new(root)).map_err(|e| {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                root,
+                error = %e,
+                "{SKILLS_EXPORT_ROOT_ENV} is not a directory or does not exist"
+            );
             format!(
-                "{SKILLS_EXPORT_ROOT_ENV} '{root}' is not a directory or does not exist \
+                "{SKILLS_EXPORT_ROOT_ENV} is not a directory or does not exist \
                  (it is never created for you)"
             )
         })?;
         if !canonical.is_dir() {
-            return Err(format!(
-                "{SKILLS_EXPORT_ROOT_ENV} '{root}' is not a directory"
-            ));
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                root,
+                "{SKILLS_EXPORT_ROOT_ENV} is not a directory"
+            );
+            return Err(format!("{SKILLS_EXPORT_ROOT_ENV} is not a directory"));
         }
         return Ok(canonical);
     }
@@ -155,27 +166,42 @@ fn resolve_export_root(configured_root: Option<&str>, db_path: &Path) -> Result<
         _ => Path::new("."),
     };
     let default_root = store_dir.join(DEFAULT_EXPORT_DIR_NAME);
+    // #3713 — the default root sits beside the store: an operator path. Each
+    // failure names it on the operator log and tells the caller only which
+    // step failed and the remedy.
     if !default_root.exists() {
         create_dir_all_secure(&default_root).map_err(|e| {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                root = %default_root.display(),
+                error = %e,
+                "cannot create the default skills-export root"
+            );
             format!(
-                "cannot create the default skills-export root '{}': {e}; \
-                 set {SKILLS_EXPORT_ROOT_ENV} to an existing directory",
-                default_root.display()
+                "cannot create the default skills-export root; \
+                 set {SKILLS_EXPORT_ROOT_ENV} to an existing directory"
             )
         })?;
     }
     let canonical = std::fs::canonicalize(&default_root).map_err(|e| {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            root = %default_root.display(),
+            error = %e,
+            "cannot resolve the default skills-export root"
+        );
         format!(
-            "cannot resolve the default skills-export root '{}': {e}; \
-             set {SKILLS_EXPORT_ROOT_ENV} to an existing directory",
-            default_root.display()
+            "cannot resolve the default skills-export root; \
+             set {SKILLS_EXPORT_ROOT_ENV} to an existing directory"
         )
     })?;
     if !canonical.is_dir() {
-        return Err(format!(
-            "the default skills-export root '{}' is not a directory",
-            default_root.display()
-        ));
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            root = %default_root.display(),
+            "the default skills-export root is not a directory"
+        );
+        return Err("the default skills-export root is not a directory".to_owned());
     }
     Ok(canonical)
 }
@@ -511,7 +537,7 @@ pub fn handle_skill_export_in_root(
             "SELECT resource_path, resource_kind, content_blob \
              FROM skill_resources WHERE skill_id = ?1",
         )
-        .map_err(|e| format!("resources prepare: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources prepare", e))?;
 
     let mut exported_resources: Vec<String> = Vec::new();
     let resources_root = target.join("resources");
@@ -523,10 +549,11 @@ pub fn handle_skill_export_in_root(
                 row.get::<_, Option<Vec<u8>>>(2)?,
             ))
         })
-        .map_err(|e| format!("resources query: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources query", e))?;
 
     for row in rows {
-        let (res_path, _kind, content_blob_opt) = row.map_err(|e| format!("row: {e}"))?;
+        let (res_path, _kind, content_blob_opt) =
+            row.map_err(|e| crate::mcp::error_text::mcp_foreign_err("row", e))?;
         if let Some(blob) = content_blob_opt {
             // #1453 (SEC, MED) — `res_path` is attacker-influenceable: it
             // is persisted verbatim in `skill_resources.resource_path` at

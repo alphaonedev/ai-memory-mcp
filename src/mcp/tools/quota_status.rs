@@ -54,7 +54,8 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
             // `peek_*` twins return the identical wire shape from a
             // synthesised default; the real write paths still materialise the
             // row on the first actual write, so no accounting is lost.
-            let row = crate::quotas::peek_status(conn, aid, ns).map_err(|e| e.to_string())?;
+            let row = crate::quotas::peek_status(conn, aid, ns)
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("peek_status", e))?;
             Ok(json!({
                 "agent_id": aid,
                 "namespace": ns,
@@ -63,7 +64,8 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
         }
         // Per-agent aggregate (rolled-up across every namespace).
         (Some(aid), None) => {
-            let row = crate::quotas::peek_aggregate_status(conn, aid).map_err(|e| e.to_string())?;
+            let row = crate::quotas::peek_aggregate_status(conn, aid)
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("peek_aggregate_status", e))?;
             Ok(json!({
                 "agent_id": aid,
                 "namespace": crate::quotas::GLOBAL_NAMESPACE,
@@ -72,7 +74,8 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
         }
         // Per-namespace listing (every agent that has written in this ns).
         (None, Some(ns)) => {
-            let rows = crate::quotas::list_status(conn, Some(ns)).map_err(|e| e.to_string())?;
+            let rows = crate::quotas::list_status(conn, Some(ns))
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_status", e))?;
             Ok(json!({
                 "count": rows.len(),
                 "namespace": ns,
@@ -81,7 +84,8 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
         }
         // Full substrate listing.
         (None, None) => {
-            let rows = crate::quotas::list_status(conn, None).map_err(|e| e.to_string())?;
+            let rows = crate::quotas::list_status(conn, None)
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_status", e))?;
             Ok(json!({
                 "count": rows.len(),
                 "quotas": rows,

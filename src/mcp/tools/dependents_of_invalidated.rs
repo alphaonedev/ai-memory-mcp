@@ -48,7 +48,12 @@ pub fn handle_dependents_of_invalidated(
     }
     let dependents =
         crate::notification::invalidation::list_dependents_of_invalidated(conn, memory_id)
-            .map_err(|e| format!("dependents_of_invalidated substrate error: {e}"))?;
+            .map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err(
+                    "dependents_of_invalidated substrate error",
+                    e,
+                )
+            })?;
     // v1.0.0 #3599 — the dependent list (and the transitive suspect set
     // below) is an existence + namespace oracle over rows the caller may not
     // read. Filter every rendered row through the per-row scope predicate,
@@ -97,9 +102,14 @@ pub fn handle_dependents_of_invalidated(
     // computed (cycle-safe, depth-bounded) — the direct default stays
     // byte-identical.
     if params["transitive"].as_bool().unwrap_or(false) {
-        let suspects =
-            crate::db::transitive_suspects(conn, memory_id, crate::db::LINEAGE_MAX_DEPTH)
-                .map_err(|e| format!("transitive_suspects substrate error: {e}"))?;
+        let suspects = crate::db::transitive_suspects(
+            conn,
+            memory_id,
+            crate::db::LINEAGE_MAX_DEPTH,
+        )
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err("transitive_suspects substrate error", e)
+        })?;
         let rendered_suspects: Vec<Value> = suspects
             .iter()
             .filter(|n| row_readable(&n.id))

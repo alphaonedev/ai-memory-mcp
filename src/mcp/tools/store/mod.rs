@@ -354,7 +354,7 @@ pub(crate) fn handle_store(
     if federation_forward_url.is_none() {
         crate::write_receipt::WriteDurability::sqlite(conn)
             .and_then(|durability| durability.attach(&mut receipt))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| crate::mcp::error_text::mcp_foreign_err("attach", error))?;
     }
     Ok(receipt)
 }
@@ -479,7 +479,7 @@ fn handle_store_inner(
         crate::identity::attest_v2::parse_presented(params).map_err(|e| e.to_string())?;
     if let Some(v2) = presented_v2 {
         crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("parse_presented", e))?;
     } else {
         let presented_sig = params["signature"]
             .as_str()
@@ -509,7 +509,7 @@ fn handle_store_inner(
                 Some(&sig_bytes),
                 crate::identity::attest::WriteSurface::Mcp,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_store_inner", e))?;
             // #3419 (security-high) — admit-once replay guard. The signature has
             // now VERIFIED, so consult the durable ledger before the row is
             // stored: an Ed25519 signature is re-verifiable forever, so without
@@ -548,7 +548,7 @@ fn handle_store_inner(
                 None,
                 crate::identity::attest::WriteSurface::Mcp,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_store_inner", e))?;
         }
     }
 
@@ -618,7 +618,7 @@ fn handle_store_inner(
             &mem_payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
@@ -917,7 +917,7 @@ fn handle_store_inner(
             None,                       // expires_at
             Some(&preserved_metadata),  // metadata (agent_id preserved)
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("metadata", e))?;
         // Regenerate embedding if content changed during dedup update
         if content_changed && let Some(emb) = embedder {
             let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
@@ -1047,7 +1047,10 @@ fn handle_store_inner(
             bytes: payload_bytes,
         },
     ) {
-        return Err(e.to_string());
+        return Err(crate::mcp::error_text::mcp_foreign_err(
+            "handle_store_inner",
+            e,
+        ));
     }
 
     // #2878 — under `on_conflict=error` the write must be ATOMICALLY
@@ -1115,7 +1118,10 @@ fn handle_store_inner(
                 );
                 return Err(format!("GOVERNANCE_REFUSED: {}", refusal.reason));
             }
-            return Err(e.to_string());
+            return Err(crate::mcp::error_text::mcp_foreign_err(
+                "handle_store_inner",
+                e,
+            ));
         }
     };
 

@@ -36,7 +36,7 @@ fn resolve_consolidate_sources(
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         let row = db::get(conn, id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or_else(|| crate::errors::msg::memory_not_found(id))?;
         if !crate::visibility::is_readable_on_query(&row, caller, requested_namespace) {
             return Err(crate::errors::msg::memory_not_found(id));
@@ -107,9 +107,15 @@ pub(super) fn handle_consolidate(
             .iter()
             .map(|mem| (mem.title.clone(), mem.content.clone()))
             .collect();
-        llm_client
-            .summarize_memories(&memory_pairs)
-            .map_err(|e| format!("LLM summarization failed: {e}"))?
+        llm_client.summarize_memories(&memory_pairs).map_err(|e| {
+            format!(
+                "LLM summarization failed: {}",
+                crate::mcp::error_text::mcp_foreign_err(
+                    "LLM summarization failed",
+                    crate::mcp::error_text::llm(e),
+                )
+            )
+        })?
     } else {
         return Err(
             "summary is required (or use smart/autonomous tier for auto-summarization)".into(),
@@ -199,7 +205,10 @@ pub(super) fn handle_consolidate(
             namespace,
             consolidate_quota_op,
         ) {
-            return Err(e.to_string());
+            return Err(crate::mcp::error_text::mcp_foreign_err(
+                "handle_consolidate",
+                e,
+            ));
         }
     }
     // #2121 — `memory_consolidate` is a TENANT-facing authoring write (the
@@ -231,7 +240,10 @@ pub(super) fn handle_consolidate(
                     crate::quotas::log_refund_op_failed(&consolidator_agent_id, &re);
                 }
             }
-            return Err(e.to_string());
+            return Err(crate::mcp::error_text::mcp_foreign_err(
+                "handle_consolidate",
+                e,
+            ));
         }
     };
 

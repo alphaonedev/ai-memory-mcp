@@ -166,7 +166,7 @@ pub fn handle_verify(
     }
 
     let record = db::get_link_for_verify(conn, &source_id, &target_id, &relation)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get_link_for_verify", e))?
         .ok_or_else(link_not_found)?;
 
     // Decision matrix mirrors `decide_attest_level` from the H3 tests:
