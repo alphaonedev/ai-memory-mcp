@@ -1608,7 +1608,11 @@ pub fn build_router_with_timeout(
             app_state.clone(),
             postgres_route_gate_layer,
         ))
-        .layer(TraceLayer::new_for_http())
+        // #3649 — the span is built by `http_diagnostic_span`, never by
+        // tower-http's `DefaultMakeSpan`, which records the full request URI
+        // (query string included) and so copies recall text or a
+        // query-string credential into any sink that enables DEBUG.
+        .layer(TraceLayer::new_for_http().make_span_with(http_diagnostic_span))
         .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
         // #1579 B4 — gzip response compression (4.6× measured
         // response-size win on recall payloads in the perf audit).
@@ -1636,6 +1640,48 @@ pub fn build_router_with_timeout(
     // Reads the process-wide cap seeded at boot; `0` = disabled (no layer
     // composed, byte-identical to a build without admission control).
     compose_admission_control(router, max_inflight_requests())
+}
+
+/// Route label recorded on the HTTP diagnostic span when the request matched
+/// no registered route (it reached the router fallback).
+pub const HTTP_SPAN_UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// Tracing target of the HTTP diagnostic span. It is the module path
+/// tower-http's `DefaultMakeSpan` emitted from, so every filter directive an
+/// operator already uses to enable the span (`tower_http=debug`,
+/// `tower_http::trace=debug`, `tower_http::trace::make_span=debug`) still
+/// enables it.
+pub const HTTP_SPAN_TARGET: &str = "tower_http::trace::make_span";
+
+/// Build the per-request diagnostic span for the HTTP router (#3649).
+///
+/// Records the method, the HTTP version, and the matched route TEMPLATE
+/// (`/api/v1/memories/{id}`) — never the request URI. A query string can carry
+/// recall text or a credential, and a captured path segment can carry an
+/// identifier, so neither may reach a log sink. The template comes from
+/// axum's [`axum::extract::MatchedPath`], which is the router's own
+/// registration string, not caller input. A request that matched no route is
+/// labelled [`HTTP_SPAN_UNMATCHED_ROUTE`]; there is deliberately no fallback to
+/// the raw path. Headers are not recorded (same as tower-http's default).
+///
+/// The span is built here, at construction time, rather than redacted from
+/// rendered output: a filter over rendered logs would have to recognise every
+/// secret shape, and a span field that is never recorded cannot leak.
+fn http_diagnostic_span(request: &axum::extract::Request) -> tracing::Span {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or(
+            HTTP_SPAN_UNMATCHED_ROUTE,
+            axum::extract::MatchedPath::as_str,
+        );
+    tracing::debug_span!(
+        target: HTTP_SPAN_TARGET,
+        "request",
+        method = %request.method(),
+        route,
+        version = ?request.version(),
+    )
 }
 
 /// #1733 (Pillar-4 4.A) — wrap `router` with the HTTP admission-control
