@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// JSON contract major version; incompatible changes require a new version/path.
+/// (The field NAME lives in `models::field_names::SCHEMA_VERSION`; this is its VALUE.)
 pub const SCHEMA_VERSION: u32 = 1;
 const FEDERATION_FIELD: &str = "federation";
 pub use super::routes::{MONITORING_METRICS as METRICS_PATH, MONITORING_STATUS as STATUS_PATH};
@@ -26,7 +27,7 @@ pub use super::routes::{MONITORING_METRICS as METRICS_PATH, MONITORING_STATUS as
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Operator-assigned health-only scope on existing identities. No secrets.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MonitoringConfig {
     /// Ordinary enrolled agent principals restricted to health routes.
@@ -314,7 +315,7 @@ pub(crate) async fn status(State(app): State<AppState>) -> Response {
         reasons.push("keyword_only_by_design");
     }
     let body = json!({
-        "schema_version": SCHEMA_VERSION,
+        (crate::models::field_names::SCHEMA_VERSION): SCHEMA_VERSION,
         "software_version": crate::PKG_VERSION,
         "observed_at_seconds": now,
         "status": state,

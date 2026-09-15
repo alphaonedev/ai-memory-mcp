@@ -6,6 +6,12 @@
 
 src/cli/agents.rs:DAEMON_PRINCIPAL
 src/cli/commands/undo_edit.rs:AI_OPERATOR
+# #3124 R4 (Conductor ruling condition 4) — `ai-memory reown` on a postgres
+# store: an OPERATOR-only admin lane (CLI-only verb, no MCP / HTTP surface;
+# reaching it requires the store credentials, the `quarantine release`
+# posture). `actor` is the RESOLVED operator principal (`reown::resolve_operator`,
+# anonymous refused) and is the attribution of the `memory.reowned` chain row.
+src/cli/reown.rs:actor
 src/cli/curator.rs:AI_CURATOR
 src/cli/stop.rs:AI_OPERATOR
 src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID
@@ -87,3 +93,15 @@ src/recover/line_file.rs:cfg_agent_id
 # Candidate exceptions for Fable's code/security review on #3498.
 src/handlers/kg.rs:caller
 src/handlers/links.rs:caller
+
+# #955 SECURITY-medium (Track A QC sweep, 2026-05-20), surfaced 2026-09-12 by
+# #3623's precheck rewrite — NOT a new bypass. `resolve_namespace_standard` on
+# postgres performs a SUBSTRATE-INTERNAL policy read: it is called by other
+# trait methods that have already resolved their own caller context, and the
+# standard memory it reads is governance policy the substrate must see
+# regardless of `metadata.scope`. `for_agent("governance")` would mismatch the
+# standard's owner and silently drop the policy row when scope=private,
+# breaking governance resolution for private namespaces. The older precheck
+# did not detect this call site; #3623 restored that coverage, which is what
+# this entry records.
+src/store/postgres.rs:GOVERNANCE_INTERNAL

@@ -158,7 +158,14 @@ pub fn handle_kg_invalidate(
     // is set (multi-tenant opt-in); single-operator trust-all default unchanged.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller()
         && let Some(src) = db::get(conn, source_id).map_err(|e| e.to_string())?
-        && !crate::visibility::caller_owns_for_mutation(&src, &caller, false)
+        && !crate::visibility::caller_owns_for_mutation(
+            &src,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::KG_INVALIDATE,
+            ),
+        )
     {
         return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
     }

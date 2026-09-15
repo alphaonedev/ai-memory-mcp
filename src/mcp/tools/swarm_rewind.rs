@@ -250,7 +250,14 @@ pub fn handle_swarm_rewind(conn: &rusqlite::Connection, params: &Value) -> Resul
     // visibility-filtered `get`, so the idempotent re-run is not blocked here.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller()
         && let Some(root) = db::get(conn, &root_id).map_err(|e| e.to_string())?
-        && !crate::visibility::caller_owns_for_mutation(&root, &caller, false)
+        && !crate::visibility::caller_owns_for_mutation(
+            &root,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::SWARM_REWIND,
+            ),
+        )
     {
         return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
     }

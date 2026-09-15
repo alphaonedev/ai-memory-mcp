@@ -53,11 +53,11 @@ fn api_reference_cites_ssot_route_and_tool_counts_3416() {
     let tools = ai_memory::profile::Profile::full().expected_tool_count();
 
     assert_eq!(
-        routes, 100,
+        routes, 102,
         "SSOT moved; update this pin and the doc together"
     );
     assert_eq!(
-        paths, 86,
+        paths, 88,
         "SSOT moved; update this pin and the doc together"
     );
     assert_eq!(

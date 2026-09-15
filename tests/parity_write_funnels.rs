@@ -341,19 +341,18 @@ async fn sqlite_sal_update_and_delete_enforce_the_caller_owns_gate() {
 
 #[tokio::test]
 async fn unstamped_row_is_allowed_through_sqlite_sal_gate() {
-    // Option B (gatekeeper decision, 2026-08-22) — the sqlite SAL gate mirrors
-    // SQLITE'S OWN contract, not postgres's #1628 refusal. An UNSTAMPED row
-    // (no `metadata.agent_id`: legacy / pre-v0.6.3 / migrated) stays MUTABLE,
-    // exactly as the canonical `visibility::caller_owns_for_mutation`
-    // predicate specifies and as the HTTP `require_caller_owns_memory`
-    // carve-out and every MCP mutate tool already behave.
+    // Option B (gatekeeper decision, 2026-08-22), kept as the DEFAULT posture
+    // of the #3124 single cross-backend policy: under
+    // `AI_MEMORY_UNSTAMPED_MUTATION=warn` (the default; this binary never sets
+    // the knob) an UNSTAMPED row (no `metadata.agent_id`: legacy / pre-v0.6.3 /
+    // migrated) stays MUTABLE through the sqlite SAL gate — the admission is
+    // now reported (WARN + counter) rather than silent.
     //
-    // Why this matters (the reason the tighter posture was rejected): refusing
-    // unstamped rows would turn today-writable legacy rows into permanently
-    // inaccessible ones for every non-admin caller — a data-loss mode — and it
-    // would break the single-operator default, where rows may carry no stamp
-    // at all. Cross-backend unification (stamp legacy rows via migration, then
-    // refuse everywhere) is tracked as #3124.
+    // Why the default does not refuse: refusing unstamped rows would turn
+    // today-writable legacy rows into inaccessible ones for every non-admin
+    // caller — a data-loss mode — and break the single-operator default. The
+    // `refuse` twin of this pin (and the other surfaces, both backends) lives
+    // in `tests/unstamped_policy_3124.rs` / `tests/unstamped_policy_3124_pg.rs`.
     let (_guard, db_path) = fresh_db_path();
     let conn = db::open(&db_path).expect("db::open");
     let now = chrono::Utc::now().to_rfc3339();
