@@ -35,6 +35,21 @@ src/storage/mod.rs	stamp_embedding_space_attested
 src/storage/mod.rs	adopt_legacy_embedding_space
 src/storage/mod.rs	sync_state_observe
 src/storage/mod.rs	sync_state_record_push
+# #3655 — per-peer CONTACT stamp (`sync_peer_contact.last_contact_at` +
+# the pulling loop's cadence): the record that a peer ANSWERED a pull just
+# now, written on every 2xx pull — empty window included — apart from the
+# data watermark. It is federation bookkeeping about an exchange that
+# already happened, never record-plane content: no memory, link, event or
+# text crosses it, only a timestamp and a cadence integer, monotonic. The
+# memories the same pull carried are applied through the gated funnels
+# (`insert_if_newer` and siblings) AFTER this stamp, so a record stop still
+# refuses the content while keeping the evidence of WHICH PEERS WERE
+# REACHABLE — the reachability window `doctor` renders (#3654) must not go
+# blind the moment a stop is declared, and a stop that erased its own
+# reachability evidence would hide exactly the peers an operator needs to
+# know about during it. Same class and same argument as the two sync_state
+# rows above and the #3659 delivery-audit rows below. Reviewed (f2r).
+src/storage/mod.rs	sync_peer_record_contact
 src/storage/mod.rs	memories_updated_since_counted
 src/storage/mod.rs	dim_violations
 src/storage/mod.rs	revoke_agent_api_key
