@@ -174,6 +174,10 @@ fn migrate_json_and_stderr_render_the_dsn_from_the_allowlist_3711() {
 
 /// The allowlist rendering of `credentialed_dsn()`: scheme, host, port,
 /// database — the ONE thing a DSN sink may print (`store_url_display`).
+/// Exists only for the two `sal-postgres` cells below, so it carries their
+/// cfg: on a plain `--features sal` build the cells vanish and an ungated
+/// const is dead code under `-D warnings` (the cfg-stripped Lint step).
+#[cfg(feature = "sal-postgres")]
 const DSN_RENDERED: &str = "postgres://127.0.0.1:9/ai_memory";
 
 // These two cells are `sal-postgres`-gated and PRESENCE-asserting since
