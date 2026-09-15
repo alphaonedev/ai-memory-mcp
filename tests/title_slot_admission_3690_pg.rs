@@ -699,3 +699,59 @@ async fn pg_store_onto_another_agents_private_row_is_a_typed_unnamed_conflict_36
     assert_eq!(id, a);
     assert_eq!(raw(&store, &a).await.0, "alice v2");
 }
+
+/// The Conductor's #3696 pin requirement, pg twin: `Refused` is still the
+/// typed `StoreError::Conflict` (the shape a caller acts on) with an EMPTY
+/// id, and a VISIBLE occupant returns its REAL id through the SAME funnel
+/// and arm — paired on one sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_refused_conflict_keeps_its_typed_shape_and_a_visible_occupant_keeps_its_id_3696() {
+    let Some(store) = connect().await else {
+        return;
+    };
+    let alice = CallerContext::for_agent("ai:alice-3696");
+    let bob = CallerContext::for_agent("ai:bob-3696");
+    let admin = CallerContext::for_admin("ai:substrate-3696");
+    let ns = uid("ns");
+    let a = uid("a");
+    let mut seed = mem(&a, &ns, "slot", "alice's text");
+    seed.metadata = serde_json::json!({ "agent_id": "ai:alice-3696", "scope": "private" });
+    store.store(&alice, &seed).await.expect("seed");
+    let mut bobs = mem(&uid("b"), &ns, "slot", "bob's text");
+    bobs.metadata = serde_json::json!({ "agent_id": "ai:bob-3696", "scope": "private" });
+    // hidden to bob: typed Conflict, id EMPTY
+    let err = store
+        .store_with_embedding_no_overwrite(&bob, &bobs, None, None)
+        .await
+        .expect_err("slot taken");
+    assert!(
+        matches!(&err, StoreError::Conflict { id } if id.is_empty()),
+        "typed, unnamed: {err:?}"
+    );
+    // visible (owner, and the trust-all admin): the SAME arm names the real id
+    for ctx in [&alice, &admin] {
+        let err = store
+            .store_with_embedding_no_overwrite(ctx, &bobs, None, None)
+            .await
+            .expect_err("slot taken");
+        assert!(
+            matches!(&err, StoreError::Conflict { id } if *id == a),
+            "named through the same path: {err:?}"
+        );
+    }
+    // lifecycle axis through the same arm
+    set_state(&store, &a, "quarantined").await;
+    let err = store
+        .store_with_embedding_no_overwrite(&alice, &bobs, None, None)
+        .await
+        .expect_err("slot taken");
+    assert!(
+        matches!(&err, StoreError::Conflict { id } if id.is_empty()),
+        "typed, unnamed: {err:?}"
+    );
+    assert_eq!(
+        raw(&store, &a).await.0,
+        "alice's text",
+        "never written into"
+    );
+}
