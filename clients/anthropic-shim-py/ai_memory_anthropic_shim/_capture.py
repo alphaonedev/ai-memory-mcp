@@ -67,6 +67,35 @@ def _pick_call_response(stdout_text: str) -> dict[str, Any] | None:
     return None
 
 
+def _captured_payload(resp: dict[str, Any]) -> dict[str, Any] | None:
+    """The capture_turn tool payload dict, if the result carries one.
+
+    ``mcp/mod.rs`` serialises the handler ``Value`` into
+    ``result.content[0].text`` as a JSON string, so a governance
+    Ask / Pending object rides one level of JSON nesting. Returns ``None``
+    on every shape mismatch (absent / not a dict / not a list / empty /
+    not a string / not JSON) — the normal captured-success shape, which
+    carries no such object.
+    """
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    first = content[0]
+    if not isinstance(first, dict):
+        return None
+    text = first.get("text")
+    if not isinstance(text, str):
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def build_capture_request(
     *,
     host_session_id: str,
@@ -162,6 +191,32 @@ def capture_turn(
     if isinstance(resp.get("result"), dict) and resp["result"].get("isError") is True:
         print("WARN ai-memory-anthropic-shim: substrate returned isError:true", file=sys.stderr)
         return False
+    # #3544 — a governance decision returns an Ok result (no `error`, no
+    # `isError`) whose tool payload carries a `status`. Neither is a captured
+    # turn, but they are NOT the same and a caller must tell them apart: an Ask
+    # (capture_turn.rs) persists NOTHING, while a Pending is DURABLY QUEUED and
+    # recoverable via memory_pending_approve — so its `pending_id`, the only
+    # recovery handle, must survive to the caller rather than be discarded.
+    payload = _captured_payload(resp)
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        if status == "ask":
+            print(
+                "WARN ai-memory-anthropic-shim: capture_turn returned status=ask "
+                "(governance approval requested; nothing persisted, no recovery id); "
+                "not counting as a captured turn",
+                file=sys.stderr,
+            )
+            return False
+        if status == "pending":
+            pending_id = payload.get("pending_id")
+            print(
+                "WARN ai-memory-anthropic-shim: capture_turn returned status=pending, "
+                f"pending_id={pending_id} (durably QUEUED for approval; recover via "
+                "memory_pending_approve); not counting as a captured turn",
+                file=sys.stderr,
+            )
+            return False
     return True
 
 
