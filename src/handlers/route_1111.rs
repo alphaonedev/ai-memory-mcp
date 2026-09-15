@@ -537,7 +537,12 @@ pub async fn handle_recall_observations_http(
                 )
                     .into_response()
             }
-            Err(e) => err_response(e.to_string()),
+            // #3707 — a `StoreError` Display carries sqlx server text. Route it
+            // through the typed funnel; the detail goes to the operator log.
+            Err(e) => {
+                tracing::error!(error = %e, "recall-observations substrate error");
+                crate::handlers::postgres_gate::store_err_to_response(e)
+            }
         };
     }
     let lock = app.db.lock().await;
@@ -650,7 +655,11 @@ pub async fn handle_reflection_origin_http(
             )
                 .into_response(),
             Ok(None) => err_response(crate::errors::msg::memory_not_found(memory_id)),
-            Err(e) => err_response(e.to_string()),
+            // #3707 — typed funnel, detail to the log.
+            Err(e) => {
+                tracing::error!(error = %e, "reflection-origin substrate error");
+                crate::handlers::postgres_gate::store_err_to_response(e)
+            }
         };
     }
     let lock = app.db.lock().await;
@@ -810,7 +819,12 @@ pub async fn handle_export_reflection_http(
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => err_response(e.to_string()),
+        // #3707 — rusqlite / anyhow text names tables and columns; log it and
+        // return the shared log-then-opaque 500 instead of echoing it.
+        Err(e) => {
+            tracing::error!(error = %e, "export_reflection substrate error");
+            crate::handlers::errors::handler_error_500(&e)
+        }
     }
 }
 
@@ -1131,7 +1145,11 @@ async fn calibrate_confidence_http_via_store(
         .await
     {
         Ok(report) => (StatusCode::OK, Json(json!({ "report": report }))).into_response(),
-        Err(e) => err_response(format!("memory_calibrate_confidence substrate error: {e}")),
+        // #3707 — the route prefix belongs on the log line, not in the body.
+        Err(e) => {
+            tracing::error!(error = %e, "memory_calibrate_confidence substrate error");
+            crate::handlers::postgres_gate::store_err_to_response(e)
+        }
     }
 }
 

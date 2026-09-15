@@ -675,11 +675,9 @@ pub async fn forget_memories(
         {
             Ok(ns) => ns,
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response();
+                // #3707 — a `StoreError` Display carries sqlx server text.
+                tracing::error!(error = %e, "forget_distinct_namespaces failed");
+                return crate::handlers::postgres_gate::store_err_to_response(e);
             }
         };
         for ns in &matched {
@@ -788,11 +786,12 @@ pub async fn forget_memories(
             }
             Json(json!({"deleted": n})).into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        // #3707 — `db::forget` surfaces rusqlite/anyhow text naming tables and
+        // columns. Log it; return the shared log-then-opaque response.
+        Err(e) => {
+            tracing::error!(error = %e, "forget failed");
+            crate::handlers::errors::handler_error_500(&e)
+        }
     }
 }
 
