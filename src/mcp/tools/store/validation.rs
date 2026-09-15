@@ -85,11 +85,23 @@ pub(super) fn default_on_conflict_for_client(mcp_client: Option<&str>) -> OnConf
 /// `super::handle_store`). Single-sources the wire shape — the message literal
 /// lives at exactly one site — so a race-detected conflict is byte-identical to
 /// a probe-detected one.
+///
+/// #3695 / #3696 — an EMPTY `existing_id` is the Refused rendering: the slot
+/// is held by a row this caller cannot read (hidden lifecycle, or another
+/// agent's private row). The merge hint would be a lie there — no
+/// `on_conflict` mode writes into a row the caller cannot read — so the
+/// remedy offered is the only one that exists: another title (or `version`,
+/// which suffixes to a free slot).
 pub(super) fn conflict_error_message(title: &str, namespace: &str, existing_id: &str) -> String {
+    let remedy = if existing_id.is_empty() {
+        "The slot is held by a row not readable by this caller; choose another title \
+         or pass on_conflict='version' to suffix it."
+    } else {
+        "Pass on_conflict='merge' to update in place or 'version' to suffix the title."
+    };
     format!(
         "CONFLICT: memory with title '{title}' already exists in namespace \
-         '{namespace}' (existing id: {existing_id}). Pass \
-         on_conflict='merge' to update in place or 'version' to suffix the title."
+         '{namespace}' (existing id: {existing_id}). {remedy}"
     )
 }
 
