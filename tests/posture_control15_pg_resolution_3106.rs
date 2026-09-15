@@ -249,6 +249,14 @@ fn certified_pg_config_reaches_all_pass() {
     let sb = sandbox("certified-pg");
     let key_dir = sb.path().join("keys");
     std::fs::create_dir_all(&key_dir).expect("key dir");
+    // #3705 review — a key dir never inherits the ambient umask (0002 on
+    // the reference host yields 0775, which the #3198 check refuses).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 key dir");
+    }
 
     // check #19 — the daemon audit signing key, resolved under AGENT_ID.
     let gen_node = run_bin(

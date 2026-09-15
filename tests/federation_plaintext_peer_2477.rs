@@ -3,47 +3,37 @@
 
 #![allow(clippy::doc_markdown)]
 
-//! #2477 (SECURITY) — a federation peer URL must not carry PLAINTEXT
-//! memory content off-host.
+//! #2477 → #3705 (SECURITY) — a federation peer URL must never carry
+//! PLAINTEXT memory content. Anywhere.
 //!
-//! ## The defect
+//! ## History
 //!
-//! `FederationConfig::build` (`src/federation/peer.rs`) formatted the raw
-//! operator-supplied `--quorum-peers` string straight into
-//! `PeerEndpoint::sync_push_url` with **no scheme validation whatsoever**,
-//! and `cli::sync::build_sync_client` (`ai-memory sync-daemon --peers`) —
-//! a second, fully independent peer-URL door — did the same. Federation
-//! replicates memory content that is NOT end-to-end encrypted
-//! (`src/encryption/mod.rs`; #1968 open), so `http://peer.example:9077`
-//! shipped tenant memory in the clear to anyone on the path.
+//! #2477 closed the door `FederationConfig::build` and
+//! `cli::sync::build_sync_client` left open (no scheme validation at all:
+//! `http://peer.example:9077` shipped tenant memory in the clear), but it
+//! EXEMPTED literal loopback peers and shipped an acknowledgement hatch
+//! (`AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`). The operator mandate behind
+//! #3705 — *"only encrypted data in transit … anywhere"* — removes both:
+//! loopback is shared by every local process on a multi-agent host (*peer
+//! is loopback* is not *peer is trusted*, the #2502 ruling), and a reachable
+//! downgrade path is a defect even when never taken.
 //!
-//! That trivially bypassed the four-condition opt-in ceremony #2448 built
-//! for the strictly WEAKER "accept ANY server cert" case
-//! (`--insecure-skip-server-verify` + `--client-cert` + `--client-key` +
-//! an explicit falsy `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`): plain
-//! `http://` needed none of them. `docs/encryption.html` meanwhile asserted
-//! unqualified that peer traffic "travels over mutual TLS ... TLS 1.3 only
-//! (no fallback)".
+//! ## What this file pins now
 //!
-//! ## R-203
+//! * every `http://` peer is REFUSED — non-loopback, literal loopback,
+//!   decimal/hex loopback, spoofed-loopback shapes — on BOTH doors;
+//! * the refusal names the #3705 mandate and steers to `https://`, and
+//!   never offers a hatch;
+//! * the hatch itself is closed for good: no token opens it, and a truthy
+//!   value is a boot refusal in its own right (pinned in
+//!   `tests/transit_encryption_3705.rs`);
+//! * `https://` builds; a scheme-less / foreign-scheme peer still refuses;
+//!   one plaintext peer refuses the WHOLE build (never a silent quorum
+//!   shrink); `asi-hard` keeps the hatch pinned unset.
 //!
-//! Parent commit `03bbd556`. The refusal tests below FAIL there — `build`
-//! and `build_sync_client` both return `Ok` for an `http://` non-loopback
-//! peer. Observed failure at the parent:
-//!
-//! ```text
-//! thread 'quorum_build_refuses_plaintext_non_loopback_peer_2477' panicked:
-//!   #2477: a plaintext non-loopback peer must be REFUSED at boot; build()
-//!   accepted it and would replicate memory content in the clear
-//! ```
-//!
-//! The loopback-exemption and hatch tests are posture guards: they pass at
-//! the parent for the wrong reason (nothing was ever refused), and exist to
-//! block an over-broad fix that would brick every dev mesh and CI fixture
-//! in this repo (dozens of `http://127.0.0.1:PORT` peers).
-//!
-//! Design: 3x3 adversarial vote (9 lenses, option D 6/9), citing the
-//! 5-agent vote `4d3ea1c5`.
+//! Every `_3705` refusal test FAILS on the #3700 parent commit `4b7ddb963`,
+//! where `validate_peer_url_scheme` accepts `http://127.0.0.1:9077` (the
+//! loopback exemption) and honours the hatch for non-loopback peers.
 
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -56,10 +46,12 @@ static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 const HATCH: &str = "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS";
 
 fn clear_hatch() {
+    // SAFETY: serialised by ENV_LOCK; no other thread reads the hatch here.
     unsafe { std::env::remove_var(HATCH) };
 }
 
 fn set_hatch(v: &str) {
+    // SAFETY: serialised by ENV_LOCK; no other thread reads the hatch here.
     unsafe { std::env::set_var(HATCH, v) };
 }
 
@@ -77,70 +69,180 @@ fn build_one(peer: &str) -> anyhow::Result<Option<FederationConfig>> {
     )
 }
 
+fn refusal_of(peer: &str) -> String {
+    match build_one(peer) {
+        Err(e) => format!("{e}"),
+        Ok(_) => panic!(
+            "#3705: a plaintext peer must be REFUSED at boot; build() accepted {peer:?} \
+             and would replicate memory content in the clear"
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// R-203 — the refusal
+// The refusal — door #1 (`serve --quorum-peers`)
 // ---------------------------------------------------------------------------
 
-/// R-203. THE defect on door #1 (`serve --quorum-peers`).
+/// A plaintext NON-loopback peer is refused (unchanged from #2477); the
+/// refusal now names the mandate and offers no hatch.
+///
+/// FAILS ON THE PARENT: the message names `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`
+/// as the escape path (`assert!(!msg.contains(HATCH))`).
 #[tokio::test]
-async fn quorum_build_refuses_plaintext_non_loopback_peer_2477() {
+async fn quorum_build_refuses_plaintext_non_loopback_peer_3705() {
     let _g = ENV_LOCK.lock().await;
     clear_hatch();
-    let got = build_one("http://peer.example:9077");
-    assert!(
-        got.is_err(),
-        "#2477: a plaintext non-loopback peer must be REFUSED at boot; \
-         build() accepted it and would replicate memory content in the clear"
-    );
-    let msg = match got {
-        Err(e) => format!("{e}"),
-        Ok(_) => unreachable!("asserted Err above"),
-    };
+    let msg = refusal_of("http://peer.example:9077");
     assert!(
         msg.contains("peer.example"),
         "refusal must name the offending peer: {msg}"
     );
-    // The refusal must steer the operator to FIX the posture, naming the
-    // secure remedies BEFORE the escape hatch (the #2448 ordering rule —
-    // a control whose message leads with "here's how to turn me off" is
-    // a control that gets turned off).
-    let https_at = msg.find("https://").expect("names https:// remedy");
-    let hatch_at = msg.find(HATCH).expect("names the escape hatch");
     assert!(
-        https_at < hatch_at,
-        "secure remedies must be named BEFORE the escape hatch: {msg}"
+        msg.contains("#3705"),
+        "refusal must name the mandate: {msg}"
+    );
+    assert!(
+        msg.contains("https://"),
+        "refusal must steer to https: {msg}"
+    );
+    assert!(
+        !msg.contains(HATCH),
+        "no downgrade path may be offered any more: {msg}"
     );
 }
 
-/// R-203. The SECOND door — `ai-memory sync-daemon --peers`. A fix scoped
-/// only to `federation/peer.rs` would leave this one wide open, so the
-/// refusal is theatre without it.
+/// LITERAL loopback plaintext peers are REFUSED — the #2477 exemption is
+/// gone. Loopback is shared by every local process.
+///
+/// FAILS ON THE PARENT: `build_one("http://127.0.0.1:9077")` is `Ok`.
 #[tokio::test]
-async fn sync_daemon_refuses_plaintext_non_loopback_peer_2477() {
+async fn loopback_plaintext_peers_are_refused_3705() {
     let _g = ENV_LOCK.lock().await;
     clear_hatch();
-    let args = ai_memory::cli::sync::SyncDaemonArgs {
-        peers: vec!["http://peer.example:9077".to_string()],
-        interval: 2,
-        api_key: None,
-        batch_size: 500,
-        client_cert: None,
-        client_key: None,
-        insecure_skip_server_verify: false,
-        ca_cert: None,
-    };
-    let got = ai_memory::cli::sync::build_sync_client(&args).await;
+    for peer in [
+        "http://127.0.0.1:9077",
+        "http://localhost:9077",
+        "http://[::1]:9077",
+        // url/reqwest normalise decimal/hex IPv4 forms to 127.0.0.1 — still
+        // plaintext, still refused.
+        "http://2130706433:9077",
+        "http://0x7f000001:9077",
+    ] {
+        let msg = refusal_of(peer);
+        assert!(
+            msg.contains("#3705") && msg.contains("loopback included"),
+            "#3705: loopback plaintext peer {peer} must be refused with the mandate text: {msg}"
+        );
+    }
+}
+
+/// #2677 spoof shapes stay refused (they never were loopback).
+#[tokio::test]
+async fn loopback_spoof_shapes_are_refused_2677() {
+    let _g = ENV_LOCK.lock().await;
+    clear_hatch();
+    for peer in [
+        "http://127.0.0.1.evil.com:9077",
+        "http://localhost.evil.com:9077",
+        "http://evil.com/?x=127.0.0.1",
+        "http://127.0.0.2:9077",
+    ] {
+        assert!(
+            build_one(peer).is_err(),
+            "#2677: spoof loopback peer must be REFUSED: {peer}"
+        );
+    }
+}
+
+/// A container-bridge hostname was never loopback; still refused.
+#[tokio::test]
+async fn container_hostname_is_refused_2477() {
+    let _g = ENV_LOCK.lock().await;
+    clear_hatch();
     assert!(
-        got.is_err(),
-        "#2477: the sync-daemon peer door must refuse plaintext non-loopback \
-         peers too — it is an independent path from FederationConfig::build"
+        build_one("http://ic-bob:19077").is_err(),
+        "#2477: a container-bridge hostname must be refused"
     );
 }
 
-/// R-203. A scheme-less peer (`peer.example:9077`) was silently accepted
-/// and produced a `sync_push_url` that could only fail opaquely at request
-/// time. Refusing at boot is strictly clearer — and closes the door on a
-/// non-`http`/`https` transport slipping in.
+// ---------------------------------------------------------------------------
+// The refusal — door #2 (`ai-memory sync-daemon --peers`)
+// ---------------------------------------------------------------------------
+
+/// The sync-daemon door refuses plaintext peers too — loopback included.
+///
+/// FAILS ON THE PARENT: `http://127.0.0.1:9077` builds a sync client.
+#[tokio::test]
+async fn sync_daemon_refuses_every_plaintext_peer_3705() {
+    let _g = ENV_LOCK.lock().await;
+    clear_hatch();
+    for peer in ["http://peer.example:9077", "http://127.0.0.1:9077"] {
+        let args = ai_memory::cli::sync::SyncDaemonArgs {
+            peers: vec![peer.to_string()],
+            interval: 2,
+            api_key: None,
+            batch_size: 500,
+            client_cert: None,
+            client_key: None,
+            insecure_skip_server_verify: false,
+            ca_cert: None,
+        };
+        let got = ai_memory::cli::sync::build_sync_client(&args).await;
+        let msg = match got {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("#3705: the sync-daemon door must refuse plaintext peer {peer}"),
+        };
+        assert!(msg.contains("#3705"), "{peer}: {msg}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The hatch is closed for good
+// ---------------------------------------------------------------------------
+
+/// No token opens the plaintext-peer hatch any more — truthy, falsy,
+/// empty or garbage, the refusal stands. (A TRUTHY value is additionally a
+/// boot refusal in its own right — `tests/transit_encryption_3705.rs`.)
+///
+/// FAILS ON THE PARENT: `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS=1` opens the
+/// refusal for `http://peer.example:9077`.
+#[tokio::test]
+async fn hatch_never_opens_the_refusal_3705() {
+    let _g = ENV_LOCK.lock().await;
+    for tok in ["1", "true", "yes", "on", "ON", "0", "false", "", "maybe"] {
+        set_hatch(tok);
+        assert!(
+            build_one("http://peer.example:9077").is_err(),
+            "#3705: hatch token {tok:?} must NOT open plaintext federation"
+        );
+        assert!(
+            build_one("http://127.0.0.1:9077").is_err(),
+            "#3705: hatch token {tok:?} must NOT open plaintext loopback federation"
+        );
+    }
+    clear_hatch();
+    assert!(
+        !ai_memory::tls::plaintext_peers_allowed(),
+        "the resolver is pinned closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Posture guards (unchanged contracts)
+// ---------------------------------------------------------------------------
+
+/// `https://` is always fine.
+#[tokio::test]
+async fn https_peer_is_always_accepted_2477() {
+    let _g = ENV_LOCK.lock().await;
+    clear_hatch();
+    let cfg = build_one("https://peer.example:9077").expect("https must build");
+    assert_eq!(cfg.expect("Some for quorum_writes=1").peer_count(), 1);
+    let cfg = build_one("https://127.0.0.1:9077").expect("https loopback must build");
+    assert_eq!(cfg.expect("Some for quorum_writes=1").peer_count(), 1);
+}
+
+/// A scheme-less peer and a foreign scheme are refused at boot.
 #[tokio::test]
 async fn quorum_build_refuses_schemeless_and_foreign_scheme_peers_2477() {
     let _g = ENV_LOCK.lock().await;
@@ -155,113 +257,7 @@ async fn quorum_build_refuses_schemeless_and_foreign_scheme_peers_2477() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Posture guards — an over-broad fix must NOT brick these
-// ---------------------------------------------------------------------------
-
-/// GUARD. `https://` is always fine, hatch or no hatch.
-#[tokio::test]
-async fn https_peer_is_always_accepted_2477() {
-    let _g = ENV_LOCK.lock().await;
-    clear_hatch();
-    let cfg = build_one("https://peer.example:9077").expect("https must build");
-    assert_eq!(cfg.expect("Some for quorum_writes=1").peer_count(), 1);
-}
-
-/// GUARD. LITERAL loopback plaintext is exempt UNCONDITIONALLY — no hatch,
-/// no warning-driven config churn. Dozens of this repo's own fixtures and
-/// every single-host dev mesh use `http://127.0.0.1:PORT`; the bytes never
-/// leave the kernel, so none of the disclosure risk applies. Mirrors the
-/// inbound `tls_bind_guard`'s silent loopback exemption.
-#[tokio::test]
-async fn loopback_plaintext_peers_are_exempt_2477() {
-    let _g = ENV_LOCK.lock().await;
-    clear_hatch();
-    for peer in [
-        "http://127.0.0.1:9077",
-        "http://localhost:9077",
-        "http://[::1]:9077",
-    ] {
-        assert!(
-            build_one(peer).is_ok(),
-            "#2477: loopback plaintext peer {peer} must stay exempt"
-        );
-    }
-}
-
-/// GUARD. A container-bridge hostname is NOT loopback. `http://ic-bob:9077`
-/// crosses an interceptable virtual NIC, so treating "feels local" as "is
-/// local" would be the exact category error this control exists to prevent
-/// — this repo's own `infra/plan-c` fleet uses that shape and therefore
-/// carries the explicit hatch.
-#[tokio::test]
-async fn container_hostname_is_not_treated_as_loopback_2477() {
-    let _g = ENV_LOCK.lock().await;
-    clear_hatch();
-    assert!(
-        build_one("http://ic-bob:19077").is_err(),
-        "#2477: a container-bridge hostname must NOT be exempted as loopback"
-    );
-}
-
-/// #2677 — pin EXACTNESS of the loopback exemption. Happy-path loopback tests
-/// would still pass if `host_is_loopback` were weakened to `starts_with("127.")`
-/// or `contains("localhost")`, which would accept plaintext peers on attacker
-/// hosts. Spoof shapes must stay refused without the hatch.
-#[tokio::test]
-async fn loopback_spoof_shapes_are_refused_not_exempt_2677() {
-    let _g = ENV_LOCK.lock().await;
-    clear_hatch();
-    for peer in [
-        "http://127.0.0.1.evil.com:9077",
-        "http://localhost.evil.com:9077",
-        "http://evil.com/?x=127.0.0.1",
-        "http://127.0.0.2:9077",
-    ] {
-        assert!(
-            build_one(peer).is_err(),
-            "#2677: spoof loopback peer must be REFUSED (exact host match only): {peer}"
-        );
-    }
-    // url crate normalises decimal/hex IPv4 to 127.0.0.1 — true loopback;
-    // pin acceptance so a behaviour flip is deliberate.
-    for peer in ["http://2130706433:9077", "http://0x7f000001:9077"] {
-        assert!(
-            build_one(peer).is_ok(),
-            "#2677: decimal/hex IPv4 loopback forms must stay exempt after URL \
-             normalisation: {peer}"
-        );
-    }
-}
-
-/// GUARD. The staged-rollout hatch works, and only on an explicit truthy
-/// token: an unrecognised value must never silently widen the control
-/// (the FBL-14 rule).
-#[tokio::test]
-async fn hatch_opens_only_on_an_explicit_truthy_token_2477() {
-    let _g = ENV_LOCK.lock().await;
-    for tok in ["1", "true", "yes", "on", "ON"] {
-        set_hatch(tok);
-        assert!(
-            build_one("http://peer.example:9077").is_ok(),
-            "#2477: hatch token {tok:?} must open the refusal"
-        );
-    }
-    for tok in ["0", "false", "no", "off", "", "maybe", "sure"] {
-        set_hatch(tok);
-        assert!(
-            build_one("http://peer.example:9077").is_err(),
-            "#2477: non-truthy hatch token {tok:?} must KEEP the refusal \
-             (an unrecognised token must never widen a security control)"
-        );
-    }
-    clear_hatch();
-}
-
-/// GUARD. Refusal is WHOLE-BOOT, never per-peer skip-and-continue: one bad
-/// peer in a list must not silently shrink `n = 1 + peer_urls.len()` (which
-/// feeds `QuorumPolicy::new`) and thereby change the quorum guarantee
-/// without saying so.
+/// Refusal is WHOLE-BOOT, never per-peer skip-and-continue.
 #[tokio::test]
 async fn one_plaintext_peer_refuses_the_whole_build_2477() {
     let _g = ENV_LOCK.lock().await;
@@ -286,9 +282,7 @@ async fn one_plaintext_peer_refuses_the_whole_build_2477() {
     );
 }
 
-/// GUARD. The `asi-hard` posture pins the hatch OFF, so a hardened
-/// procurement deployment cannot re-open plaintext federation — the
-/// no-disable contract that #2448 established one door over.
+/// `asi-hard` keeps the (now inert) hatch pinned unset.
 #[test]
 fn asi_hard_pins_the_plaintext_hatch_off_2477() {
     let pins = ai_memory::security_profile::pinned_knobs();

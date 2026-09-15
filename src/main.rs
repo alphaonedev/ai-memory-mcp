@@ -228,6 +228,16 @@ fn main() -> Result<()> {
         ai_memory::identity::owner_stamp::validate_boot_token()?;
     }
 
+    // v1.0.0 #3705 — "only encrypted data in transit": the selector token
+    // (one grammar; falsy or unrecognised REFUSES, never proceeds in
+    // cleartext), the removed downgrade paths (a set hatch refuses) and the
+    // config-carried outbound URLs. Read-only. `doctor` never refuses — it
+    // reports the transit posture of every surface instead.
+    if !is_doctor {
+        ai_memory::transit_encryption::enforce_process_floor()?;
+        ai_memory::transit_encryption::enforce_config_urls(&app_config)?;
+    }
+
     // #3582: evaluate the argv peer lists even with quorum_writes=0, before
     // workers or stores start. Doctor must remain able to diagnose refusal.
     match &cli.command {
@@ -236,9 +246,19 @@ fn main() -> Result<()> {
                 !args.quorum_peers.is_empty(),
                 args.mtls_allowlist.as_deref(),
             )?;
+            // v1.0.0 #3705 — a plaintext peer URL is refused pre-runtime, even
+            // with quorum_writes=0 (where FederationConfig::build never runs).
+            for peer in &args.quorum_peers {
+                ai_memory::tls::validate_peer_url_scheme(peer)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
         }
         daemon_runtime::Command::SyncDaemon(args) => {
             ai_memory::federation::peer_posture::enforce_at_boot(!args.peers.is_empty(), None)?;
+            for peer in &args.peers {
+                ai_memory::tls::validate_peer_url_scheme(peer)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
         }
         _ => {}
     }
@@ -302,6 +322,22 @@ fn main() -> Result<()> {
     // operators who need to point a webhook at a local listener (CI,
     // dev) set `[subscriptions] allow_loopback_webhooks = true`.
     config::set_allow_loopback_webhooks(app_config.effective_allow_loopback_webhooks());
+    // v1.0.0 #3705 — the webhook dispatcher's extra root certificate
+    // (`[subscriptions] ca_cert`): a configured file that cannot be read or
+    // parsed refuses boot — an unreachable receiver is loud, never silent.
+    if let Some(path) = app_config
+        .subscriptions
+        .as_ref()
+        .and_then(|s| s.ca_cert.as_deref())
+    {
+        let pem = std::fs::read(path).map_err(|e| {
+            anyhow::anyhow!(
+                "[subscriptions] ca_cert {}: cannot read: {e} (#3705)",
+                path.display()
+            )
+        })?;
+        ai_memory::subscriptions::install_dispatch_root_certificate(&pem)?;
+    }
 
     // v0.7.0 K9 — load `[[permissions.rules]]` into the process-wide
     // registry consulted by `Permissions::evaluate`. Empty by default

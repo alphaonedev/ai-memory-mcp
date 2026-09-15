@@ -18,9 +18,18 @@ name: ai-memory-plan-c
 # Operator quick-start (assumes you have a Postgres reachable at
 # AI_MEMORY_STORE_URL and Ollama at OLLAMA_BASE_URL — both required):
 #
-#   export AI_MEMORY_STORE_URL=postgres://...
+#   # #3705 — the DSN MUST pin sslmode=verify-full&sslrootcert=<ca> (a
+#   # plaintext DSN is refused at the connect funnel; the CA path is as
+#   # seen INSIDE the container — mount it or bake it into the image)
+#   export AI_MEMORY_STORE_URL='postgres://...?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 #   export OLLAMA_BASE_URL=http://host.docker.internal:11434
 #   docker compose -f infra/plan-c/docker-compose.yml up -d --build
+#
+# #3705 — every hop is TLS: the one-shot `ic-tls-provisioner` service mints
+# a fleet CA + per-daemon listener/client pairs into the `ic-tls` volume
+# (infra/lan-parity-test/provision-tls.sh, shared with the LAN-parity
+# stack); peers are https://; the former AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS
+# acknowledgement is a REMOVED downgrade path (a truthy value refuses boot).
 #
 # Operator recreate (after binary rebuild or schema migration):
 #
@@ -42,6 +51,9 @@ services:
     container_name: ic-alice
     hostname: ic-alice
     restart: on-failure
+    depends_on:
+      ic-tls-provisioner:
+        condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -49,6 +61,7 @@ services:
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
       AI_MEMORY_LISTEN_PORT: "19077"
+      AI_MEMORY_TLS_DIR: "/tls/ic-alice"
       AI_MEMORY_STORE_URL: "${AI_MEMORY_STORE_URL}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       AI_MEMORY_LLM_MODEL: "gemma4:e4b"
@@ -56,24 +69,23 @@ services:
       # Container-DNS peer URLs — resolved on the ic-mesh bridge
       # without touching the host network. This is the load-bearing
       # change for #878.
-      AI_MEMORY_PEER_URLS: "http://ic-bob:19077,http://ic-carol:19077"
-      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
-      # peers (a container bridge is NOT loopback), which the peer-scheme guard
-      # refuses by default. Acknowledged here because the bridge is a private,
-      # single-host Docker network used for parity/chaos testing only. Do NOT
-      # copy this line into a deployment whose peers cross a real network.
-      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
+      AI_MEMORY_PEER_URLS: "https://ic-bob:19077,https://ic-carol:19077"
+      # #3705 — https:// peers; the listener pair + quorum client pair +
+      # fleet CA under AI_MEMORY_TLS_DIR are turned into --tls-cert/--tls-key
+      # and --quorum-client-cert/-key/--quorum-ca-cert by entrypoint.plan-c.sh.
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info}"
     volumes:
       - ic-alice-keys:/root/.config/ai-memory/keys
       - ic-alice-audit:/var/log/ai-memory/audit
+      - ic-tls:/tls:ro
     ports:
       - "19077:19077"
     networks:
       - ic-mesh
     healthcheck:
-      test: ["CMD", "curl", "-f", "-sS", "--max-time", "3", "http://127.0.0.1:19077/api/v1/capabilities"]
+      # #3705 — TLS-only listener; probe by certificate hostname against the CA.
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 --cacert /tls/ca.pem https://$$(hostname):19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -85,7 +97,10 @@ services:
     hostname: ic-bob
     restart: on-failure
     depends_on:
-      - ic-alice
+      ic-tls-provisioner:
+        condition: service_completed_successfully
+      ic-alice:
+        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -93,28 +108,28 @@ services:
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
       AI_MEMORY_LISTEN_PORT: "19077"
+      AI_MEMORY_TLS_DIR: "/tls/ic-bob"
       AI_MEMORY_STORE_URL: "${AI_MEMORY_STORE_URL}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
-      AI_MEMORY_PEER_URLS: "http://ic-alice:19077,http://ic-carol:19077"
-      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
-      # peers (a container bridge is NOT loopback), which the peer-scheme guard
-      # refuses by default. Acknowledged here because the bridge is a private,
-      # single-host Docker network used for parity/chaos testing only. Do NOT
-      # copy this line into a deployment whose peers cross a real network.
-      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
+      AI_MEMORY_PEER_URLS: "https://ic-alice:19077,https://ic-carol:19077"
+      # #3705 — https:// peers; the listener pair + quorum client pair +
+      # fleet CA under AI_MEMORY_TLS_DIR are turned into --tls-cert/--tls-key
+      # and --quorum-client-cert/-key/--quorum-ca-cert by entrypoint.plan-c.sh.
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info}"
     volumes:
       - ic-bob-keys:/root/.config/ai-memory/keys
       - ic-bob-audit:/var/log/ai-memory/audit
+      - ic-tls:/tls:ro
     ports:
       - "19078:19077"
     networks:
       - ic-mesh
     healthcheck:
-      test: ["CMD", "curl", "-f", "-sS", "--max-time", "3", "http://127.0.0.1:19077/api/v1/capabilities"]
+      # #3705 — TLS-only listener; probe by certificate hostname against the CA.
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 --cacert /tls/ca.pem https://$$(hostname):19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -126,8 +141,12 @@ services:
     hostname: ic-carol
     restart: on-failure
     depends_on:
-      - ic-alice
-      - ic-bob
+      ic-tls-provisioner:
+        condition: service_completed_successfully
+      ic-alice:
+        condition: service_started
+      ic-bob:
+        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -135,32 +154,55 @@ services:
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
       AI_MEMORY_LISTEN_PORT: "19077"
+      AI_MEMORY_TLS_DIR: "/tls/ic-carol"
       AI_MEMORY_STORE_URL: "${AI_MEMORY_STORE_URL}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
-      AI_MEMORY_PEER_URLS: "http://ic-alice:19077,http://ic-bob:19077"
-      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
-      # peers (a container bridge is NOT loopback), which the peer-scheme guard
-      # refuses by default. Acknowledged here because the bridge is a private,
-      # single-host Docker network used for parity/chaos testing only. Do NOT
-      # copy this line into a deployment whose peers cross a real network.
-      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
+      AI_MEMORY_PEER_URLS: "https://ic-alice:19077,https://ic-bob:19077"
+      # #3705 — https:// peers; the listener pair + quorum client pair +
+      # fleet CA under AI_MEMORY_TLS_DIR are turned into --tls-cert/--tls-key
+      # and --quorum-client-cert/-key/--quorum-ca-cert by entrypoint.plan-c.sh.
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info}"
     volumes:
       - ic-carol-keys:/root/.config/ai-memory/keys
       - ic-carol-audit:/var/log/ai-memory/audit
+      - ic-tls:/tls:ro
     ports:
       - "19079:19077"
     networks:
       - ic-mesh
     healthcheck:
-      test: ["CMD", "curl", "-f", "-sS", "--max-time", "3", "http://127.0.0.1:19077/api/v1/capabilities"]
+      # #3705 — TLS-only listener; probe by certificate hostname against the CA.
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 --cacert /tls/ca.pem https://$$(hostname):19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
       start_period: 30s
+
+  ic-tls-provisioner:
+    # #3705 — one-shot fleet-CA + certificate provisioner shared with the
+    # LAN-parity stack (see infra/lan-parity-test/provision-tls.sh for the
+    # layout). Runs in the pg-age image (carries `openssl`) before any
+    # daemon boots; each daemon mounts the `ic-tls` volume read-only at
+    # /tls and points AI_MEMORY_TLS_DIR at its own subdirectory.
+    build:
+      context: ../lan-parity-test
+      dockerfile: Dockerfile.pg-age-vector
+    image: ai-memory-pg-age-vector:latest
+    container_name: ai-memory-plan-c-tls-provisioner
+    entrypoint: ["/bin/sh", "/usr/local/lib/ai-memory/provision-tls.sh"]
+    user: "0:0"
+    environment:
+      TLS_OUT_DIR: "/tls"
+      TLS_DAEMONS: "ic-alice ic-bob ic-carol"
+    volumes:
+      - ../lan-parity-test/provision-tls.sh:/usr/local/lib/ai-memory/provision-tls.sh:ro
+      - ic-tls:/tls
+    networks:
+      - ic-mesh
+    restart: "no"
 
 networks:
   # Issue #878 — user-defined bridge with explicit subnet so docker's
@@ -178,6 +220,8 @@ networks:
         - subnet: 172.31.78.0/24
 
 volumes:
+  # #3705 — fleet CA + per-daemon certificates (provision-tls.sh).
+  ic-tls:
   ic-alice-keys:
   ic-alice-audit:
   ic-bob-keys:

@@ -2217,7 +2217,7 @@ mod replay_arm_tests {
     #[tokio::test]
     async fn empty_queue_only_refreshes_gauge() {
         let sink = MockSink::default();
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         assert_eq!(sink.take_calls.load(Ordering::SeqCst), 1);
         assert!(sink.marked_replayed.lock().unwrap().is_empty());
@@ -2231,7 +2231,7 @@ mod replay_arm_tests {
             .lock()
             .unwrap()
             .push(row(1, "peer-0", MAX_REPLAY_ATTEMPTS));
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         // Quarantined → neither replayed nor bumped; no POST attempted.
         assert!(sink.marked_replayed.lock().unwrap().is_empty());
@@ -2243,7 +2243,7 @@ mod replay_arm_tests {
         let sink = MockSink::default();
         sink.rows.lock().unwrap().push(row(7, "peer-gone", 1));
         // Config has a DIFFERENT peer, so the row's peer is unresolvable.
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         let bumped = sink.bumped.lock().unwrap();
         assert_eq!(bumped.len(), 1);
@@ -2256,7 +2256,7 @@ mod replay_arm_tests {
         let sink = MockSink::default();
         sink.rows.lock().unwrap().push(row(3, "peer-0", 1));
         // TCP refused (port 1) → post_once returns Fail → bump.
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         assert!(
             !sink.bumped.lock().unwrap().is_empty(),
@@ -2270,7 +2270,7 @@ mod replay_arm_tests {
         let mut sink = MockSink::default();
         sink.count_should_err = true;
         sink.rows.lock().unwrap().push(row(1, "peer-gone", 1));
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         // Count error → fixed batch; take still runs; peer-gone arm bumps.
         replay_once(&cfg, &sink).await;
         assert_eq!(sink.take_calls.load(Ordering::SeqCst), 1);
@@ -2280,7 +2280,7 @@ mod replay_arm_tests {
     async fn take_error_returns_early() {
         let mut sink = MockSink::default();
         sink.take_should_err = true;
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         // Take errored → early return, no replay/bump.
         assert!(sink.marked_replayed.lock().unwrap().is_empty());
@@ -2492,7 +2492,7 @@ mod replay_arm_tests {
             .lock()
             .unwrap()
             .push(("mem-x".to_string(), TS_OLD.to_string()));
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         assert_eq!(
             sink.expanded.lock().unwrap().len(),
@@ -2516,7 +2516,7 @@ mod replay_arm_tests {
             .lock()
             .unwrap()
             .push(("mem-x".to_string(), TS_NEW.to_string()));
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         assert!(
             sink.expanded.lock().unwrap().is_empty(),
@@ -2547,7 +2547,7 @@ mod replay_arm_tests {
         // Dead peer URL: if the guard failed to fire, post_once would run
         // and the row would be BUMPED (a delivery failure) — the asserts
         // catch that regression directly.
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         assert_eq!(
             sink.marked_replayed.lock().unwrap().as_slice(),
@@ -2571,7 +2571,7 @@ mod replay_arm_tests {
             .unwrap()
             .push(delete_row(7, "mem-gone", "peer-0", TS_MID));
         // live_rows empty → the id is not live → not superseded.
-        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
         replay_once(&cfg, &sink).await;
         assert!(
             sink.marked_replayed.lock().unwrap().is_empty(),

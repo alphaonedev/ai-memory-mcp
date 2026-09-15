@@ -1474,7 +1474,7 @@ mod cov_catchup_helpers_3521 {
     #[test]
     fn sync_since_url_carries_the_cursor_and_the_local_peer_id() {
         let with_cursor =
-            sync_since_url("http://peer.test", "local-1", Some("2026-01-01T00:00:00Z"));
+            sync_since_url("https://peer.test", "local-1", Some("2026-01-01T00:00:00Z"));
         assert!(
             with_cursor.contains("since=2026-01-01T00%3A00%3A00Z"),
             "the cursor must be percent-encoded; got {with_cursor}"
@@ -1484,7 +1484,7 @@ mod cov_catchup_helpers_3521 {
             "the local peer id must be present; got {with_cursor}"
         );
 
-        let without_cursor = sync_since_url("http://peer.test", "local-1", None);
+        let without_cursor = sync_since_url("https://peer.test", "local-1", None);
         assert!(
             !without_cursor.contains("since="),
             "no cursor must mean no since= parameter; got {without_cursor}"

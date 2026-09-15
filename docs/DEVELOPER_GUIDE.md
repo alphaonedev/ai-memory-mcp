@@ -551,7 +551,7 @@ To parse TOON:
 
 ## API Reference
 
-Base URL: `http://127.0.0.1:9077/api/v1`
+Base URL: `https://127.0.0.1:9077/api/v1`
 
 All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
 

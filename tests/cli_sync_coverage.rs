@@ -701,7 +701,7 @@ async fn run_daemon_clamps_interval_and_batch_size() {
     // pre-flight (which contains the clamp arithmetic) executes
     // without panicking.
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 0,
         api_key: Some("k".to_string()),
         batch_size: 0,
@@ -727,7 +727,7 @@ async fn run_daemon_mtls_client_path_runs_through_tls_builder() {
     let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tls/valid_key_pkcs8.pem");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -758,7 +758,7 @@ async fn run_daemon_mtls_with_insecure_skip_is_refused_by_default_2448() {
     let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tls/valid_key_pkcs8.pem");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -787,7 +787,7 @@ async fn run_daemon_mtls_with_insecure_skip_is_refused_by_default_2448() {
         std::env::set_var(ai_memory::tls::FED_REQUIRE_SERVER_VERIFY_ENV, "0");
     }
     let permissive = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -810,7 +810,7 @@ async fn run_daemon_mtls_with_missing_cert_file_errors() {
     let env = Env::fresh();
     let db = env.db_path.clone();
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -833,7 +833,7 @@ async fn run_daemon_ca_cert_valid_runs_1794() {
     let ca = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tls/valid_cert.pem");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -856,7 +856,7 @@ async fn run_daemon_ca_cert_malformed_errors_1794() {
     let db = env.db_path.clone();
     let not_pem = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -884,7 +884,7 @@ async fn run_daemon_no_mtls_uses_default_client() {
     let env = Env::fresh();
     let db = env.db_path.clone();
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 1,

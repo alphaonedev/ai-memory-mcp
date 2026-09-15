@@ -178,8 +178,9 @@ the store before it opens) is `unobservable`, never `absent`.
   is REFUSED, naming every such knob and both ways out (raise or unset each
   knob, or declare a shape whose posture is a default).
 - **Singleton with no signals**: byte-identical boot. Zero-config local-CA
-  minting (#3709) is singleton-only — a node whose signals show a fleet
-  must declare its shape and enrol real peer identities.
+  minting (#3709) follows the DECLARED shape and is singleton-only — a
+  node whose signals show a fleet is warned, never re-postured: the
+  operator declares the shape and enrols real peer identities.
 
 **Migration honesty.** The detector shipped with the refusal, so run
 `ai-memory doctor` BEFORE upgrading: its default report carries
@@ -187,6 +188,143 @@ the store before it opens) is `unobservable`, never `absent`.
 states the declared shape, the observed floor and its signals, the
 promotion line, the posture and its origin, the protections that are off,
 and the boot verdict the next boot will reach. Doctor never refuses.
+
+### Only encrypted data in transit (#3705)
+
+Operator mandate (2026-09-13, ranks with the North Star): *"only encrypted
+data in transit. there is to never be any unencrypted data in transit
+anywhere in the ai-memory architecture."* "Anywhere" is literal — no
+exemption for loopback, localhost, a dev profile, a single-node install or a
+lab. Loopback is shared by every local process on a multi-agent host, so
+*peer is loopback* is not *peer is trusted* (the #2502 ruling). The floor
+lives in one module, [`src/transit_encryption.rs`](../src/transit_encryption.rs);
+every transit surface consults it.
+
+| surface | funnel | behaviour since #3705 |
+|---|---|---|
+| the daemon listener — every API route, MCP-over-HTTP, `/metrics` | `tls_bind_guard` in `bootstrap_serve` | a bind without `--tls-cert` + `--tls-key` is REFUSED on every host, loopback included; the refusal names the plaintext path |
+| outbound federation peers (`--quorum-peers`, `sync-daemon --peers`) | `tls::validate_peer_url_scheme` | every `http://` peer is REFUSED, loopback included |
+| webhook targets | `subscriptions::validate_url` (create AND dispatch) | every `http://` target is REFUSED, loopback included; https only — a receiver behind a private PKI is trusted via `[subscriptions] ca_cert` (a PEM the dispatcher adds to the public roots; unreadable/unparseable refuses boot) |
+| PostgreSQL store DSN | `PostgresStore` connect funnel | a DSN that does not pin `sslmode=verify-full` (last `sslmode` wins) is REFUSED before a socket opens |
+| MCP → daemon forward URL (`mcp_federation_forward_url`) | boot (`transit_encryption::enforce_config_urls`) | an `http://` URL REFUSES boot |
+
+**One grammar.** `AI_MEMORY_REQUIRE_TLS` is now a floor: unset and every
+canonical truthy token (`1`/`true`/`yes`/`on`, `security_profile::is_truthy`)
+affirm it; a falsy token is a downgrade request and refuses boot; an
+unrecognised token refuses boot rather than proceeding in cleartext. The
+pre-#3705 reader accepted only `1`/`true`, so `=yes` silently left TLS
+optional — the sibling control documented the rule it violated.
+
+**No downgrade paths.** `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` and
+`AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` can never open plaintext again; a
+truthy value refuses boot in every posture. A reachable downgrade path is a
+defect even when never taken, because an attacker chooses when it is taken.
+
+**Fail closed.** Absent, malformed or unrecognised configuration refuses,
+never proceeds in cleartext — deliberately the opposite of #3701, where
+entitlement fails OPEN: an entitlement failure must never cost a customer
+their data; a transit-encryption failure must never expose it.
+
+**Migration.** Run `ai-memory doctor` with the new binary BEFORE upgrading:
+its third section, "Transit encryption (#3705)", states the selector token,
+the armed downgrade paths, the forward-URL scheme, the store DSN `sslmode`,
+the local certificate's state, the plaintext webhook targets already in the
+store, and the boot verdict. Then point every client, peer and webhook at
+`https://`, and append `?sslmode=verify-full&sslrootcert=<ca.crt>` to the
+PostgreSQL DSN. The listener needs no preparation: see the next subsection.
+
+#### Zero-config first boot (#3709 item 1) — SINGLETON shape only
+
+TLS is required; on a **singleton** (no fleet signal per
+[`src/config/shape/detector.rs`](../src/config/shape/detector.rs)) the flags are
+optional. A singleton `serve` with no `--tls-cert`/`--tls-key` generates an
+installation-local CA and a server certificate
+([`src/tls_bootstrap.rs`](../src/tls_bootstrap.rs)) under
+`<key_dir>/tls/` — `local-ca.pem`, `local-ca.key` (0600), `server.pem`,
+`server.key` (0600), directory 0700. The CA lives 3650 days; the leaf 90
+days, covering the bind host, and is re-issued inside a 30-day window at
+boot and by a daily in-daemon task that hot-reloads the listener. Two
+constraints hold this in the mandate:
+
+- **Generation is not trust.** Nothing trusts the local CA implicitly: a
+  client trusts it explicitly (`curl --cacert <key_dir>/tls/local-ca.pem
+  https://127.0.0.1:9077/api/v1/health`); the bundled clients
+  (`doctor --remote`, the MCP forwarder) add it as a root for THIS
+  installation only. It is never used to trust a federation peer — peer
+  trust stays explicit (`--quorum-ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`,
+  `--mtls-allowlist`; the #2448 posture is unchanged).
+- **No silent downgrade.** A generation or renewal failure is loud and the
+  listener does not fall back to plaintext; an expired leaf refuses the
+  next boot (doctor's `local_tls_material` fact says so first).
+
+Operators with their own PKI pass `--tls-cert`/`--tls-key`; the local CA
+is then not consulted for the listener. Every refusal names its fix, and
+names only what exists in this release: the `--tls-cert`/`--tls-key` flags,
+the `sslmode=verify-full&sslrootcert=<ca.crt>` DSN parameters, and the files
+under `<key_dir>/tls/`. The `ai-memory tls init|import|renew` and
+`ai-memory db check-tls` verbs are #3709 items 2–4 (v1.0.1, a separate
+branch); a refusal never points at a verb that does not ship with it. Until
+they land, first-boot generation (singleton) and `--tls-cert`/`--tls-key`
+are the two paths.
+
+#### Bring your own certificate (enterprise PKI) — the fleet path
+
+3x7 audit ruling: *a product that mints an unmanaged CA into an enterprise
+estate on first boot is an audit finding, not a feature.* Every
+deployment whose **declared** shape is not `singleton` — `team`,
+`production`, `federated`, `hive` (`[deployment] shape`, #3714) — takes
+enterprise PKI as the first-class path. The declaration decides, never an
+observed signal: the #3700 detector may WARN that a node configured like a
+fleet is still declared `singleton`, but promotion is an operator act and
+nothing re-postures a running node (the local CA it minted is trusted only
+by the bundled clients on that host — never by a peer).
+
+- **What the certificate must cover.** A server certificate issued by your
+  PKI whose subject alternative names include every bind host the daemon
+  answers on (`--host`, the hostnames peers and clients dial, `127.0.0.1` /
+  `localhost` if anything dials loopback). Wildcards are acceptable where
+  your PKI policy allows them.
+- **How it is supplied.** `--tls-cert <fullchain.pem>` (leaf first, then
+  intermediates, PEM) and `--tls-key <key.pem>` (PKCS#8 PEM; SEC1/RSA
+  are accepted). The key file must be owner-only (`chmod 0600`), the
+  directory `0700`; the daemon refuses lax modes the same way it refuses a
+  lax key directory (#3198).
+- **Rotation.** Replace the files in place and restart, or use
+  `--tls-cert <fullchain.pem> --tls-key <key.pem>` (an `ai-memory tls import` verb is #3709 item 2, v1.0.1, separate
+  owner) which validates the pair and hands it to the daily reload task so
+  the listener picks the new material up without a restart. Expiry shows in
+  `ai-memory doctor` (`local_tls_material`) before it bites.
+- **What refuses.** A `serve` under a declared non-singleton shape without
+  operator material is refused at boot
+  (`transit_encryption::fleet_needs_enterprise_pki_refusal`, naming the
+  `[deployment] shape` line and the remedy). Nothing learned at runtime
+  (peers, the agent registry) promotes a node into this refusal — it is
+  reported by the #3700 detector and by `doctor`, and the operator declares
+  the shape. The installation-local CA is **never** consulted under a
+  declared fleet shape, and never used to trust a federation peer
+  — peer trust stays explicit (`--quorum-ca-cert`,
+  `AI_MEMORY_FED_PEER_FINGERPRINTS`, `--mtls-allowlist`; #2448 unchanged).
+- **Doctor remediation line.** "Transit encryption (#3705)" reports
+  `local_tls_material` as `absent — enterprise PKI required …` or
+  `present but LOCALLY MINTED — … audit finding; REFUSES at next boot` on a
+  fleet, Critical, with the remedy text verbatim.
+
+**Open items, stated rather than silently exempted.**
+
+- *Model-server egress.* Prompts and memory content leave the process
+  towards the LLM / embedding endpoints (`[llm].base_url`,
+  `[embeddings].url`, the legacy `ollama_url`, whose compiled default is
+  `http://localhost:11434`). #3705 DETECTS a plaintext endpoint in doctor
+  (`llm_egress_plaintext`) but does not yet refuse it; the operator's
+  ruling on local model servers is pending.
+- *Federation content is not end-to-end encrypted* (#1968;
+  `src/tls.rs` records it). Transport TLS satisfies "encrypted in transit"
+  on the wire; a TLS-terminating intermediary — a load balancer, a reverse
+  proxy, a compromised peer — sees plaintext memory content. Whether the
+  mandate reaches that far is put to the operator, not assumed.
+- *In-kernel IPC.* The wake-hub UNIX domain socket (content-free wakes) and
+  MCP over stdio are kernel-local pipes, not network transit. They are
+  named here so the exemption is explicit, never implied.
 
 ## Trust boundaries
 
@@ -376,7 +514,10 @@ Two related hardening knobs:
 
 The webhook dispatch path validates URLs before POSTing:
 
-- `https://` required unless the host is a loopback address.
+- `https://` required for every target, loopback included (#3705); a
+  receiver behind a private PKI is trusted through `[subscriptions]
+  ca_cert = "<PEM>"`, added to the public roots at boot (a file that does
+  not read or parse refuses boot).
 - Private-range IPv4 (10/8, 172.16/12, 192.168/16), IPv6
   unique-local, and link-local are rejected.
 - DNS is resolved once per send; we do NOT follow redirects.

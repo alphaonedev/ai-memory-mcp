@@ -397,8 +397,12 @@ async fn issue_3646_store_failure_is_failing_without_error_content() {
 async fn issue_3646_postgres_routes_and_seeded_non_disclosure() {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .expect("dedicated #3646 postgres database required");
+    // #3705 pins `sslmode=verify-full` on every postgres DSN, so the lane
+    // URL carries a query string; the lane-database guard reads the path.
     assert!(
-        url.ends_with("/ai_memory_codex_3646"),
+        url.split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/ai_memory_codex_3646")),
         "never use an operator database"
     );
     let app = postgres_app_state(&url).await;

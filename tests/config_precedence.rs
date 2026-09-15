@@ -1405,11 +1405,18 @@ fn test_secret_screen_mode_precedence() {
 }
 
 // ---------------------------------------------------------------------------
-// #2032 M2 (class-a, DEFINE-ONLY, 5-agent vote `4d3ea1c5`) — the two TLS
-// escape-hatch env resolvers. Tranche 2 lands the resolvers + this census
-// case; the `tls_bind_guard` that consumes them lands in tranche 3, so
-// binding behaviour is unchanged. Each defaults `false` and mirrors the
-// truthy grammar of `require_api_key_strict` (`1` / `true`, case-insensitive).
+// #2032 M2 → #3705 — the two TLS escape-hatch envs. The M2 (tranche 2/3)
+// contract this cell used to pin — `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK`
+// parses to a bool that silences the plaintext non-loopback WARN, and
+// `AI_MEMORY_REQUIRE_TLS` parses to a bool that defaults to `false` — is
+// gone under "only encrypted data in transit": in-process TLS is a FLOOR on
+// every bind (loopback included), so `require_tls_enabled()` is always
+// `true`, `allow_plaintext_nonloopback_enabled()` is always `false`, a
+// truthy `ALLOW_PLAINTEXT_NONLOOPBACK` is a REMOVED downgrade path that
+// refuses boot, and a falsy or unrecognised `REQUIRE_TLS` token refuses
+// boot rather than proceeding in cleartext. This cell pins THAT contract:
+// the resolvers are constants, and the only thing either env can still do
+// is refuse.
 // ---------------------------------------------------------------------------
 #[test]
 fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
@@ -1417,32 +1424,61 @@ fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
         ENV_ALLOW_PLAINTEXT_NONLOOPBACK, ENV_REQUIRE_TLS, allow_plaintext_nonloopback_enabled,
         require_tls_enabled,
     };
+    use ai_memory::transit_encryption::{
+        REMOVED_DOWNGRADE_ENVS, armed_downgrade_paths, enforce_no_downgrade_paths,
+        enforce_require_tls_token,
+    };
 
-    // Table of (env-value, expected-bool). `None` = unset (default false).
-    let cases: &[(Option<&str>, bool)] = &[
-        (None, false),
-        (Some("1"), true),
-        (Some("true"), true),
-        (Some("TRUE"), true),
-        (Some("0"), false),
-        (Some("false"), false),
-        (Some("garbage"), false),
+    assert!(
+        REMOVED_DOWNGRADE_ENVS.contains(&ENV_ALLOW_PLAINTEXT_NONLOOPBACK),
+        "the M2 plaintext acknowledgement is a removed downgrade path (#3705)"
+    );
+
+    // (env-value, arms the removed downgrade path?, REQUIRE_TLS token refuses boot?)
+    let cases: &[(Option<&str>, bool, bool)] = &[
+        (None, false, false),
+        (Some(""), false, false),
+        (Some("1"), true, false),
+        (Some("true"), true, false),
+        (Some("TRUE"), true, false),
+        (Some("yes"), true, false),
+        (Some("on"), true, false),
+        (Some("0"), false, true),
+        (Some("false"), false, true),
+        (Some("garbage"), false, true),
     ];
 
-    for &(val, want) in cases {
+    for &(val, arms_downgrade, require_tls_refuses) in cases {
         let _g = MultiEnvVarGuard::apply(&[
             (ENV_ALLOW_PLAINTEXT_NONLOOPBACK, val),
             (ENV_REQUIRE_TLS, val),
         ]);
+        // The resolvers no longer read the environment at all.
+        assert!(
+            !allow_plaintext_nonloopback_enabled(),
+            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK={val:?}: the plaintext acknowledgement can never \
+             open a plaintext bind again (#3705)"
+        );
+        assert!(
+            require_tls_enabled(),
+            "AI_MEMORY_REQUIRE_TLS={val:?}: in-process TLS is a floor, not an opt-in (#3705)"
+        );
+        // What the envs CAN still do: refuse boot.
         assert_eq!(
-            allow_plaintext_nonloopback_enabled(),
-            want,
-            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK={val:?} must resolve to {want}"
+            armed_downgrade_paths().contains(&ENV_ALLOW_PLAINTEXT_NONLOOPBACK),
+            arms_downgrade,
+            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK={val:?} armed={arms_downgrade}"
         );
         assert_eq!(
-            require_tls_enabled(),
-            want,
-            "AI_MEMORY_REQUIRE_TLS={val:?} must resolve to {want}"
+            enforce_no_downgrade_paths().is_err(),
+            arms_downgrade,
+            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK={val:?}: a truthy token refuses boot"
+        );
+        assert_eq!(
+            enforce_require_tls_token().is_err(),
+            require_tls_refuses,
+            "AI_MEMORY_REQUIRE_TLS={val:?}: unset/truthy affirm the floor; falsy or \
+             unrecognised refuse boot"
         );
     }
 }
