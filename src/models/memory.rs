@@ -1516,6 +1516,16 @@ impl Memory {
     /// v0.7.0 Gap 4 (#887) — derived [`ConfidenceTier`] for this
     /// memory's `confidence` value. Stable mapping; see
     /// [`ConfidenceTier::from_confidence`] for the thresholds.
+    ///
+    /// **v1.0.0 (#3548): this tier is NUMERIC-ONLY.** It thresholds the
+    /// stored `confidence` value and does NOT consult `confidence_source`,
+    /// so a caller-asserted `1.0` and an engine-measured `1.0` both map to
+    /// `Confirmed`. Recall surfaces the raw claim beside the tier
+    /// (`confidence_value` + `confidence_source`) so a consumer can tell an
+    /// asserted value from a measured one. Redefining `Confirmed` to require
+    /// engine/curator/calibrated/peer-signed provenance OR corroboration ≥ N
+    /// is DEFERRED to v1.0.1 with the crossroads vote (#3548 Part B) — a
+    /// threshold picked in the abstract would itself be an unbacked claim.
     #[must_use]
     pub fn confidence_tier(&self) -> ConfidenceTier {
         ConfidenceTier::from_confidence(self.confidence)

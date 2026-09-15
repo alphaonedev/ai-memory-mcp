@@ -646,6 +646,23 @@ pub(crate) fn prepare_capture_turn(
         if let Some(obj) = m.as_object_mut() {
             obj.entry("agent_id".to_string())
                 .or_insert_with(|| Value::String(caller.to_string()));
+            // #3548 — persist the L4 write attestation this path COMPUTES
+            // (`self_signed` for an unsigned capture, `signed_by_peer` for a
+            // host-signed one) onto the memory's OWN `metadata.attest_level`,
+            // matching this fn's documented contract and the `signed_events`
+            // row / response envelope that already carry it. Before this the
+            // captured memory carried NO attest_level, so recall's
+            // `content_attestation` (a verbatim pass-through of this field)
+            // under-reported every captured turn as `claimed` — the stamp was
+            // missing at the WRITER, not misread at the reader.
+            // The value passes the OWNER's gate (`identity::verify`): a member
+            // of the closed memory stamp set or a refused write — never an
+            // unlisted fifth value stamped by accident (#3548).
+            let stamped = crate::identity::verify::memory_stamp_value(&attest_level)?;
+            obj.insert(
+                field_names::ATTEST_LEVEL.to_string(),
+                Value::String(stamped.to_string()),
+            );
         }
         // v1.0.0 (#1945, spec §4) — a captured turn's `Observation` kind is
         // assigned by the L4 capture channel, not caller-declared:
