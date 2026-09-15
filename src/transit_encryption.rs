@@ -196,20 +196,13 @@ pub fn plaintext_listener_refusal(host: &str, port: u16) -> String {
 /// the raw bytes.
 #[must_use]
 pub fn url_origin_for_refusal(url: &str) -> String {
-    let trimmed = url.trim();
-    match reqwest::Url::parse(trimmed) {
-        Ok(parsed) => {
-            let host = parsed.host_str().unwrap_or("<no host>");
-            match parsed.port() {
-                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
-                None => format!("{}://{host}", parsed.scheme()),
-            }
-        }
-        Err(_) => match trimmed.split_once("://") {
-            Some((scheme, _)) => format!("{scheme}://<unparseable>"),
-            None => "<unparseable URL, no scheme>".to_string(),
-        },
-    }
+    // #3711 — ONE allowlist renderer for every URL that reaches a sink:
+    // `crate::url_display::url_origin` (scheme://host[:port]; an unparseable
+    // URL renders its scheme token and `<unparseable>`, never its bytes). This
+    // fn is kept as the transit-refusal name so #3705's call sites read as
+    // what they are, but it must not be a second implementation the gate-2
+    // provenance recogniser (keyed on `url_display::`) cannot see.
+    crate::url_display::url_origin(url)
 }
 
 /// The refusal for a plaintext URL on an outbound surface (`what` names the
@@ -407,9 +400,11 @@ mod tests {
             hostless.starts_with("nonsense://") && !hostless.contains("token"),
             "{hostless}"
         );
+        // #3711 — one renderer: a scheme-less string renders url_display's
+        // `<no scheme>://<unparseable>` markers, never its bytes.
         assert_eq!(
             url_origin_for_refusal("not a url at all"),
-            "<unparseable URL, no scheme>"
+            "<no scheme>://<unparseable>"
         );
         assert!(!url_origin_for_refusal("user:pw@host?token=t").contains("pw"));
     }

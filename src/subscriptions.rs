@@ -556,6 +556,33 @@ pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Durati
 /// the LLM client already uses (`src/llm.rs`).
 pub const WEBHOOK_ACK_MAX_BYTES: usize = 64 * 1024;
 
+/// #3724 — the CLOSED vocabulary a delivery attempt fails with. This string
+/// is persisted into `subscription_dlq.last_error` and read back by the
+/// subscriber through `memory_subscription_dlq_list`, so it carries NOTHING
+/// the receiver chose: not the reqwest error (its Display names the full
+/// URL, #3710), not the ack body's `status`, not its `correlation_id`. The
+/// receiver's raw text goes to the operator log only (TIER 2).
+pub mod dlq_reason {
+    /// The HTTP client could not be built.
+    pub const CLIENT_BUILD: &str = "client_build";
+    /// The receiver's ack body could not be read.
+    pub const ACK_READ: &str = "ack_read";
+    /// The receiver's ack body was not JSON.
+    pub const ACK_DECODE: &str = "ack_decode";
+    /// The receiver's ack `status` was not `"ack"`.
+    pub const ACK_STATUS_NOT_ACK: &str = "ack_status_not_ack";
+    /// The receiver's ack `correlation_id` did not match the delivery's.
+    pub const ACK_CORR_MISMATCH: &str = "ack_corr_mismatch";
+    /// The receiver's ack body exceeded [`super::WEBHOOK_ACK_MAX_BYTES`].
+    pub const ACK_TOO_LARGE: &str = "ack_too_large";
+    /// Prefix of the `http-<status>` reason (a non-2xx receiver answer).
+    pub const HTTP_PREFIX: &str = "http-";
+    /// The subscription URL failed the SSRF guard.
+    pub const SSRF_REJECTED: &str = "ssrf_rejected";
+    /// The subscription URL failed the DNS-resolved SSRF guard.
+    pub const DNS_SSRF_REJECTED: &str = "dns_ssrf_rejected";
+}
+
 /// PERF-3 (fix campaign 2026-05-26, FX-10) — default upper bound on the
 /// number of webhook deliveries that may be in flight concurrently.
 ///
@@ -1517,9 +1544,13 @@ fn send(
     signature: Option<&str>,
     correlation_id: &str,
 ) -> Result<(), String> {
+    // #3684 — a webhook URL is tenant-supplied and commonly carries its
+    // credential in the PATH (Slack / Discord) or the query string; every
+    // log line renders it as `scheme://host[:port]` only.
+    let target = crate::url_display::url_origin(url);
     if let Err(e) = validate_url(url) {
-        tracing::warn!("SSRF guard rejected webhook URL {url}: {e}");
-        return Err(format!("ssrf-rejected: {e}"));
+        tracing::warn!("SSRF guard rejected webhook URL {target}: {e}");
+        return Err(dlq_reason::SSRF_REJECTED.to_string());
     }
     // v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Resolve
     // the host once via the SSRF guard AND capture the validated
@@ -1537,8 +1568,8 @@ fn send(
         match validate_url_dns_resolved(url, crate::config::allow_loopback_webhooks()) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("DNS SSRF guard rejected webhook URL {url}: {e}");
-                return Err(format!("dns-ssrf-rejected: {e}"));
+                tracing::warn!("DNS SSRF guard rejected webhook URL {target}: {e}");
+                return Err(dlq_reason::DNS_SSRF_REJECTED.to_string());
             }
         };
     // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
@@ -1585,8 +1616,9 @@ fn send(
     let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("webhook client build failed: {e}");
-            return Err(format!("client-build: {e}"));
+            // #3724 — the reqwest builder error is operator-log only.
+            tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook client build failed for {target}: {}", crate::url_display::TransportFailure::classify(&e));
+            return Err(dlq_reason::CLIENT_BUILD.to_string());
         }
     };
     let mut req = client
@@ -1604,13 +1636,17 @@ fn send(
     let resp = match req.body(body.to_string()).send() {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("webhook POST to {url} failed: {e}");
-            return Err(crate::errors::msg::network(e));
+            // #3684 / #3710 — origin-only target, class-only error: the
+            // reqwest Display would name the full URL twice per failure,
+            // once in the log and once in the stored DLQ row.
+            let reason = crate::url_display::network_failure(&e);
+            tracing::warn!("webhook POST to {target} failed: {reason}");
+            return Err(reason);
         }
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        return Err(format!("http-{status}"));
+        return Err(format!("{}{status}", dlq_reason::HTTP_PREFIX));
     }
     // K6 ACK contract: receivers MUST return
     // {"status":"ack","correlation_id":"..."}. A 2xx with a missing /
@@ -1621,9 +1657,11 @@ fn send(
     // `Take` limiter so an over-cap stream cannot exhaust memory.
     if let Some(len) = resp.content_length() {
         if len > WEBHOOK_ACK_MAX_BYTES as u64 {
-            return Err(format!(
-                "ack-too-large: content-length {len} exceeds {WEBHOOK_ACK_MAX_BYTES}"
-            ));
+            tracing::warn!(
+                target: SUBSCRIPTIONS_TRACE_TARGET,
+                "webhook ack from {target}: content-length {len} exceeds {WEBHOOK_ACK_MAX_BYTES}"
+            );
+            return Err(dlq_reason::ACK_TOO_LARGE.to_string());
         }
     }
     let ack_body = {
@@ -1631,33 +1669,53 @@ fn send(
         let mut body = String::new();
         // Read one byte past the cap so an exactly-at-cap body still
         // reads fully while an over-cap body is detected and rejected.
-        if let Err(e) = resp
+        match resp
             .take(WEBHOOK_ACK_MAX_BYTES as u64 + 1)
             .read_to_string(&mut body)
         {
-            return Err(format!("ack-read: {e}"));
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook ack from {target}: read failed: {e}");
+                return Err(dlq_reason::ACK_READ.to_string());
+            }
         }
         if body.len() > WEBHOOK_ACK_MAX_BYTES {
-            return Err(format!(
-                "ack-too-large: streamed body exceeds {WEBHOOK_ACK_MAX_BYTES}"
-            ));
+            tracing::warn!(
+                target: SUBSCRIPTIONS_TRACE_TARGET,
+                "webhook ack from {target}: streamed body exceeds {WEBHOOK_ACK_MAX_BYTES}"
+            );
+            return Err(dlq_reason::ACK_TOO_LARGE.to_string());
         }
         body
     };
+    // #3724 — from here on every failure names the receiver's CHOSEN text
+    // (its JSON, its `status`, its `correlation_id`) in the operator log
+    // ONLY; the stored, caller-readable reason is the closed vocabulary.
     let ack: serde_json::Value = match serde_json::from_str(&ack_body) {
         Ok(v) => v,
-        Err(e) => return Err(format!("ack-decode: {e}")),
+        Err(e) => {
+            tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook ack from {target}: not JSON: {e}");
+            return Err(dlq_reason::ACK_DECODE.to_string());
+        }
     };
     let status_field = ack.get("status").and_then(|v| v.as_str()).unwrap_or("");
     if status_field != "ack" {
-        return Err(format!("ack-status: {status_field}"));
+        tracing::warn!(
+            target: SUBSCRIPTIONS_TRACE_TARGET,
+            "webhook ack from {target}: status {status_field:?} is not \"ack\""
+        );
+        return Err(dlq_reason::ACK_STATUS_NOT_ACK.to_string());
     }
     let ack_corr = ack
         .get("correlation_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if ack_corr != correlation_id {
-        return Err(format!("ack-corr-mismatch: {ack_corr}"));
+        tracing::warn!(
+            target: SUBSCRIPTIONS_TRACE_TARGET,
+            "webhook ack from {target}: correlation_id {ack_corr:?} != {correlation_id:?}"
+        );
+        return Err(dlq_reason::ACK_CORR_MISMATCH.to_string());
     }
     Ok(())
 }
@@ -1847,10 +1905,14 @@ fn validate_url_dns_with(
     url: &str,
     allow_loopback: bool,
 ) -> Result<(String, Vec<std::net::SocketAddr>)> {
+    // #3684 — every message below renders the target as its origin only;
+    // a chat-webhook URL carries its credential in the path.
+    let shown = crate::url_display::url_origin(url);
+    let url_display = shown.as_str();
     let lower = url.to_ascii_lowercase();
     let (_scheme, rest) = lower
         .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url}"))?;
+        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
     let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host_port = &rest[..host_end];
     // v0.7.0 #1082 — extract the host (sans port + brackets) for the
@@ -1926,13 +1988,13 @@ fn validate_url_dns_with(
             tracing::warn!(
                 target: SUBSCRIPTIONS_TRACE_TARGET,
                 "SSRF guard: hostname {resolved_host} violates RFC 1035 label/length \
-                 limits for {url}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
+                 limits for {url_display}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
                  ALLOW (UNSAFE, legacy posture)"
             );
             return Ok((resolved_host, Vec::new()));
         }
         return Err(anyhow!(
-            "SSRF guard: DNS resolution failed for {url}: hostname violates RFC 1035 \
+            "SSRF guard: DNS resolution failed for {url_display}: hostname violates RFC 1035 \
              label/length limits; failing CLOSED (post-#1053 secure default — set \
              AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
         ));
@@ -1944,7 +2006,7 @@ fn validate_url_dns_with(
             if fail_open {
                 tracing::warn!(
                     target: SUBSCRIPTIONS_TRACE_TARGET,
-                    "SSRF guard: DNS resolution failed for {url}: {e}; \
+                    "SSRF guard: DNS resolution failed for {url_display}: {e}; \
                      AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to ALLOW \
                      (UNSAFE, legacy posture) — reqwest's resolver may bind to \
                      private/loopback IPs the daemon could not pre-check"
@@ -1955,7 +2017,7 @@ fn validate_url_dns_with(
                 return Ok((resolved_host, Vec::new()));
             }
             return Err(anyhow!(
-                "SSRF guard: DNS resolution failed for {url}: {e}; failing CLOSED \
+                "SSRF guard: DNS resolution failed for {url_display}: {e}; failing CLOSED \
                  (post-#1053 secure default — set AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
             ));
         }
@@ -1964,7 +2026,7 @@ fn validate_url_dns_with(
         let ip = addr.ip();
         if is_private(ip) && !is_loopback_normalized(ip) {
             return Err(anyhow!(
-                "host resolves to private/link-local IP {ip}: {url}"
+                "host resolves to private/link-local IP {ip}: {url_display}"
             ));
         }
         // H11 (#628 blocker) — DNS-rebind protection for loopback.
@@ -1973,7 +2035,7 @@ fn validate_url_dns_with(
         // hostnames.
         if is_loopback_normalized(ip) && !allow_loopback {
             return Err(anyhow!(
-                "host resolves to loopback IP {ip}: {url} — rejected by default \
+                "host resolves to loopback IP {ip}: {url_display} — rejected by default \
                  (SSRF guard); set `[subscriptions] allow_loopback_webhooks = true` \
                  to opt in"
             ));
@@ -2020,21 +2082,20 @@ pub fn validate_url(url: &str) -> Result<()> {
 /// (which would race with parallel tests). Production callers go
 /// through `validate_url`.
 fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
+    // #3684 — refusals name the target as its origin only (see
+    // `validate_url_dns_with`); the subscriber who supplied the URL knows
+    // the rest, and the operator log must not.
+    let shown = crate::url_display::url_origin(url);
+    let url_display = shown.as_str();
     // Cheap scheme check without pulling the `url` crate.
     let lower = url.to_ascii_lowercase();
-    let (scheme, rest) = lower.split_once("://").ok_or_else(|| {
-        anyhow!(
-            "webhook URL missing scheme: {}",
-            crate::transit_encryption::url_origin_for_refusal(url)
-        )
-    })?;
+    let (scheme, rest) = lower
+        .split_once("://")
+        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
     if scheme != "https" && scheme != "http" {
         // #3705 review — origin only, never the query/userinfo (a webhook
         // target routinely carries a token).
-        return Err(anyhow!(
-            "webhook URL scheme must be https: {}",
-            crate::transit_encryption::url_origin_for_refusal(url)
-        ));
+        return Err(anyhow!("webhook URL scheme must be https: {url_display}"));
     }
     // v1.0.0 #3705 — "only encrypted data in transit": plaintext http:// is
     // refused to EVERY host, loopback included (the pre-#3705 loopback
@@ -2055,10 +2116,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         match stripped.find(']') {
             Some(i) => stripped[..i].to_string(),
             None => {
-                return Err(anyhow!(
-                    "malformed IPv6 URL host: {}",
-                    crate::transit_encryption::url_origin_for_refusal(url)
-                ));
+                return Err(anyhow!("malformed IPv6 URL host: {url_display}"));
             }
         }
     } else {
@@ -2080,7 +2138,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     let is_loopback = is_loopback_hostname || is_loopback_ip;
     if is_loopback && !allow_loopback {
         return Err(anyhow!(
-            "webhook URL targets loopback address {url} — rejected by default \
+            "webhook URL targets loopback address {url_display} — rejected by default \
              (SSRF guard); set `[subscriptions] allow_loopback_webhooks = true` \
              to opt in (testing / dev only)"
         ));
@@ -2095,7 +2153,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         && !is_loopback_normalized(ip)
     {
         return Err(anyhow!(
-            "webhook URL targets private / link-local address: {url}"
+            "webhook URL targets private / link-local address: {url_display}"
         ));
     }
     Ok(())

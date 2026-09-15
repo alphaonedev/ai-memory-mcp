@@ -165,7 +165,7 @@ fn reject_url_shaped_db_path(db: &Path) -> Result<()> {
                  Postgres, pass it via --store-url (or AI_MEMORY_STORE_URL / \
                  AI_MEMORY_STORE_URL_FILE); --db / AI_MEMORY_DB is a SQLite file \
                  path only.",
-                crate::logging::redact_url_password(raw)
+                crate::url_display::store_url_display(raw)
             );
         }
     }
@@ -227,7 +227,7 @@ fn resolve_store_binding(
                 "--db and --store-url are mutually exclusive. \
                  Pass exactly one. Got --db={} and --store-url={}",
                 db_path.display(),
-                crate::logging::redact_url_password(url),
+                crate::url_display::store_url_display(url),
             );
         }
     }
@@ -1270,11 +1270,10 @@ async fn dispatch_recover_previous_session(
             #[cfg(not(feature = "sal"))]
             let c = {
                 tracing::warn!(
-                    // #1926 (CWE-532) — redact the userinfo password before it
-                    // reaches the durable log sink. This was the ONE store_url
-                    // tracing site the #1579 A3 pass missed; every sibling site
-                    // routes through `redact_url_password`.
-                    store_url = %crate::logging::redact_url_password(url),
+                    // #1926 (CWE-532) / #3711 — the store URL reaches the durable
+                    // log sink only through the allowlist renderer (scheme /
+                    // host / port / database), as at every sibling site.
+                    store_url = %crate::url_display::store_url_display(url),
                     "recover-previous-session --store-url requires the 'sal' build feature; using local sqlite db path"
                 );
                 let stdout = std::io::stdout();
@@ -2220,7 +2219,7 @@ pub async fn run(
                         anyhow::bail!(
                             "quarantine --store-url {} requires the 'sal' build feature; \
                              this binary was built without it",
-                            crate::logging::redact_url_password(url)
+                            crate::url_display::store_url_display(url)
                         )
                     }
                 }
@@ -5063,7 +5062,7 @@ async fn build_store_handle(
                     // URL. Pre-fix this line shipped the full
                     // `--store-url` (credential included) to journald
                     // at INFO.
-                    let display_url = crate::logging::redact_url_password(url);
+                    let display_url = crate::url_display::store_url_display(url);
                     let store = if let Some(dim) = configured_embedding_dim {
                         tracing::info!(
                             "Wave-3 (issue #877): opening Postgres SAL store at {display_url} \
@@ -5126,7 +5125,7 @@ async fn build_store_handle(
                 // carry credentials; redact before echoing.
                 anyhow::bail!(
                     "unrecognised --store-url: {} (expected sqlite:///path or postgres://...)",
-                    crate::logging::redact_url_password(url)
+                    crate::url_display::store_url_display(url)
                 )
             }
         }
@@ -5184,7 +5183,7 @@ async fn run_verify_audit_trail(
             let path = sqlite_store_url_to_path(url).ok_or_else(|| {
                 anyhow::anyhow!(
                     "unrecognised --store-url: {} (expected postgres://... or sqlite:///path)",
-                    crate::logging::redact_url_password(url)
+                    crate::url_display::store_url_display(url)
                 )
             })?;
             crate::cli::verify_audit_trail::run(Path::new(path), a, audit_pubkey, &mut out)
@@ -5224,7 +5223,7 @@ async fn verify_audit_trail_postgres(
         .postgres_statement_timeout_secs
         .unwrap_or(crate::store::postgres::DEFAULT_STATEMENT_TIMEOUT_SECS);
     // #1579 A3 (SECURITY) — never echo the credential.
-    let display_url = crate::logging::redact_url_password(url);
+    let display_url = crate::url_display::store_url_display(url);
     tracing::info!("verify-audit-trail: opening Postgres SAL store at {display_url}");
     let store = crate::store::postgres::PostgresStore::connect_with_dim_and_timeout(
         url,
@@ -5257,7 +5256,7 @@ async fn verify_audit_trail_postgres(
     anyhow::bail!(
         "--store-url postgres:// requires the binary to be built with \
          --features sal-postgres; this binary was built without it (verifying {})",
-        crate::logging::redact_url_password(url)
+        crate::url_display::store_url_display(url)
     )
 }
 
@@ -8650,8 +8649,8 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
     // #1579 A3 (SECURITY) — the migrate report echoes both store URLs;
     // mask the userinfo password so credentials never land in stdout /
     // captured CI logs.
-    let from_display = crate::logging::redact_url_password(&args.from);
-    let to_display = crate::logging::redact_url_password(&args.to);
+    let from_display = crate::url_display::store_url_display(&args.from);
+    let to_display = crate::url_display::store_url_display(&args.to);
     if args.json {
         let value = serde_json::json!({
             "from_url": from_display,
@@ -8849,13 +8848,33 @@ pub async fn sync_cycle_once(
     batch_size: usize,
 ) -> Result<()> {
     let peer_url = peer_url.trim_end_matches('/');
+    // #3675 / #3687 / #3711 — the peer's DURABLE identity (the `sync_state`
+    // key) and its LOG label are the allowlist rendering `scheme://host
+    // [:port]/path`: never the userinfo or the query string a `--peers` URL
+    // may carry (reqwest turns `user:pass@` into a Basic auth header, so an
+    // operator has a working reason to write one). The raw URL is used ONLY
+    // to build the request. Keying the cursor by the rendering means a
+    // credential rotation keeps the cursor and a credential never lands in
+    // `sync_state.peer_id`, every backup or every `VACUUM INTO` snapshot.
+    let peer_key = crate::url_display::url_origin_and_path(peer_url);
+    let peer_key = peer_key.as_str();
 
     // --- PULL --------------------------------------------------------
     let since = {
         let conn = db::open(db_path)?;
+        // #3675 — a row a pre-#3675 daemon keyed by the raw URL is moved
+        // onto the rendered key (cursors folded, raw row deleted) so the
+        // credential leaves the at-rest copy on the first cycle after the
+        // upgrade and the peer keeps its watermarks.
+        if db::sync_state_rekey::rekey_peer(&conn, local_agent_id, peer_url, peer_key)? {
+            tracing::info!(
+                "sync-daemon: moved the sync_state cursor for peer {peer_key} off its raw \
+                 URL key (#3675)"
+            );
+        }
         db::sync_state_load(&conn, local_agent_id)?
             .entries
-            .get(peer_url)
+            .get(peer_key)
             .cloned()
     };
 
@@ -8897,11 +8916,23 @@ pub async fn sync_cycle_once(
             .header(crate::federation::signing::SIGNATURE_HEADER, sig)
             .header(crate::federation::signing::NONCE_HEADER, nonce);
     }
-    let resp = req.send().await?;
+    // #3710 — a `reqwest::Error` names the full request URL in its
+    // Display; it is classified at the origin and never rendered.
+    let resp = req.send().await.map_err(|e| {
+        anyhow::anyhow!(
+            "sync-daemon: pull {}",
+            crate::url_display::network_failure(&e)
+        )
+    })?;
     if !resp.status().is_success() {
         anyhow::bail!("sync-daemon: pull status {}", resp.status());
     }
-    let pulled: SyncSinceResponse = resp.json().await?;
+    let pulled: SyncSinceResponse = resp.json().await.map_err(|e| {
+        anyhow::anyhow!(
+            "sync-daemon: pull body {}",
+            crate::url_display::network_failure(&e)
+        )
+    })?;
     // #3655 — CONTACT is recorded the moment the peer answered, before and
     // apart from the data watermark below: an empty window is a successful
     // exchange with a reachable peer, and `sync_state_observe` (which moves
@@ -8940,7 +8971,7 @@ pub async fn sync_cycle_once(
             Err(reason) => {
                 tracing::warn!(
                     target: crate::federation::SCOPE_TRACE_TARGET,
-                    peer = %peer_url,
+                    peer = %peer_key,
                     candidate = %candidate,
                     reason,
                     "sync-daemon: refusing peer-advertised next_since cursor; leaving \
@@ -8958,7 +8989,7 @@ pub async fn sync_cycle_once(
                 Err(reason) => {
                     tracing::warn!(
                         target: crate::federation::SCOPE_TRACE_TARGET,
-                        peer = %peer_url,
+                        peer = %peer_key,
                         candidate = %fallback,
                         reason,
                         "sync-daemon: refusing peer memories.last() watermark; leaving \
@@ -9031,7 +9062,7 @@ pub async fn sync_cycle_once(
                     apply_halted = true;
                     tracing::warn!(
                         target: crate::federation::SCOPE_TRACE_TARGET,
-                        peer = %peer_url,
+                        peer = %peer_key,
                         memory_id = %to_insert.id,
                         error = %e,
                         "sync-daemon: non-durable apply — halting cursor advance so \
@@ -9050,14 +9081,14 @@ pub async fn sync_cycle_once(
             advance_to.as_deref()
         };
         if let Some(at) = observe_to {
-            db::sync_state_observe(&conn, local_agent_id, peer_url, at)?;
+            db::sync_state_observe(&conn, local_agent_id, peer_key, at)?;
         }
     }
 
     // --- PUSH --------------------------------------------------------
     let last_pushed = {
         let conn = db::open(db_path)?;
-        db::sync_state_last_pushed(&conn, local_agent_id, peer_url)
+        db::sync_state_last_pushed(&conn, local_agent_id, peer_key)
     };
     let outgoing = {
         let conn = db::open(db_path)?;
@@ -9115,17 +9146,22 @@ pub async fn sync_cycle_once(
                 .header(crate::federation::signing::SIGNATURE_HEADER, sig_header)
                 .header(crate::federation::signing::NONCE_HEADER, nonce);
         }
-        let resp = req.send().await?;
+        let resp = req.send().await.map_err(|e| {
+            anyhow::anyhow!(
+                "sync-daemon: push {}",
+                crate::url_display::network_failure(&e)
+            )
+        })?;
         if !resp.status().is_success() {
             anyhow::bail!("sync-daemon: push status {}", resp.status());
         }
         if let Some(at) = latest_pushed {
             let conn = db::open(db_path)?;
-            db::sync_state_record_push(&conn, local_agent_id, peer_url, &at)?;
+            db::sync_state_record_push(&conn, local_agent_id, peer_key, &at)?;
         }
     }
 
-    tracing::info!("sync-daemon: peer={peer_url} pulled={pull_count} pushed={push_count}");
+    tracing::info!("sync-daemon: peer={peer_key} pulled={pull_count} pushed={push_count}");
     Ok(())
 }
 
@@ -9217,7 +9253,13 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
                 )
                 .await
                 {
-                    tracing::warn!("sync-daemon: peer {peer_url} cycle failed: {e}");
+                    // #3687 — the label is the allowlist rendering; `e` is
+                    // already URL-free (every transport error in
+                    // `sync_cycle_once` is classified at its origin, #3710).
+                    tracing::warn!(
+                        "sync-daemon: peer {} cycle failed: {e}",
+                        crate::url_display::url_origin_and_path(&peer_url)
+                    );
                 }
             });
         }

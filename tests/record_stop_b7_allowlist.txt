@@ -35,6 +35,10 @@ src/storage/mod.rs	stamp_embedding_space_attested
 src/storage/mod.rs	adopt_legacy_embedding_space
 src/storage/mod.rs	sync_state_observe
 src/storage/mod.rs	sync_state_record_push
+# #3711/#3675 — folds a sync_state row from its raw (credential-bearing) peer
+# key onto the allowlist-rendered key; sync bookkeeping, same class as the
+# two rows above (keeps resume live, never record-plane content).
+src/storage/sync_state_rekey.rs	rekey_peer
 src/storage/mod.rs	memories_updated_since_counted
 src/storage/mod.rs	dim_violations
 src/storage/mod.rs	revoke_agent_api_key
