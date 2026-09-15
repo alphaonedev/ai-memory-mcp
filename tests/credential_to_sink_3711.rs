@@ -172,6 +172,24 @@ fn migrate_json_and_stderr_render_the_dsn_from_the_allowlist_3711() {
     );
 }
 
+/// The allowlist rendering of `credentialed_dsn()`: scheme, host, port,
+/// database — the ONE thing a DSN sink may print (`store_url_display`).
+const DSN_RENDERED: &str = "postgres://127.0.0.1:9/ai_memory";
+
+// These two cells are `sal-postgres`-gated and PRESENCE-asserting since
+// 2026-09-15. Measured on `1ec64196b` with the family's renderers made
+// VERBATIM (the RED leg of the six-issue discharge): both stayed GREEN.
+// On a `--features sal` build `schema-init` refuses a `postgres://` URL
+// before it ever holds a DSN ("postgres support not compiled in") and
+// `doctor` prints only derived facts (`store_url_sslmode … pinned`), so
+// there was nothing for the absence assertion to catch — the cells were
+// vacuous on that build and could not fail. Under `sal-postgres` both
+// surfaces DO reach a DSN sink (`open store at postgres://127.0.0.1:9/
+// ai_memory …`; doctor's `store` fact), so the cells live there, and each
+// now asserts the rendering is PRESENT as well as the secrets absent: a
+// renderer change or an unreached sink fails them.
+
+#[cfg(feature = "sal-postgres")]
 #[test]
 fn schema_init_json_renders_the_dsn_from_the_allowlist_3711() {
     let dir = scratch("schema-init");
@@ -183,8 +201,13 @@ fn schema_init_json_renders_the_dsn_from_the_allowlist_3711() {
     );
     assert_clean(&out, "schema-init --json stdout");
     assert_clean(&err, "schema-init stderr");
+    assert!(
+        out.contains(DSN_RENDERED) || err.contains(DSN_RENDERED),
+        "#3711: schema-init reached the DSN sink and rendered it from the allowlist:\n{out}\n{err}"
+    );
 }
 
+#[cfg(feature = "sal-postgres")]
 #[test]
 fn doctor_report_renders_the_dsn_from_the_allowlist_3711() {
     let dir = scratch("doctor");
@@ -198,6 +221,10 @@ fn doctor_report_renders_the_dsn_from_the_allowlist_3711() {
     );
     assert_clean(&out, "doctor stdout");
     assert_clean(&err, "doctor stderr");
+    assert!(
+        out.contains(DSN_RENDERED) || err.contains(DSN_RENDERED),
+        "#3711: doctor reached the DSN sink and rendered it from the allowlist:\n{out}\n{err}"
+    );
 }
 
 #[test]
