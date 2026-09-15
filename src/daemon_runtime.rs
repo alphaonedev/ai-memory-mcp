@@ -9796,13 +9796,24 @@ mod tests {
         assert!(res.is_err(), "port 1 must refuse the connection");
 
         let logs = String::from_utf8_lossy(&buf.0.lock().expect("buf lock")).to_string();
+        // #3711 — the boot line renders the store URL through `url_display`
+        // (origin + path, userinfo DROPPED), not the old `ai_memory:****@`
+        // masker. PRESENT-plus-ABSENT on the same sink: the line must still
+        // be emitted with the allowlisted rendering, AND neither the password
+        // nor the username may appear anywhere in the log — an absence-only
+        // assertion would pass just as well if the boot line stopped being
+        // emitted at all.
         assert!(
-            logs.contains("opening Postgres SAL store at postgres://ai_memory:****@127.0.0.1:1"),
-            "boot line must log the redacted URL; got:\n{logs}"
+            logs.contains("opening Postgres SAL store at postgres://127.0.0.1:1/ai_memory"),
+            "boot line must log the allowlist-rendered URL; got:\n{logs}"
         );
         assert!(
             !logs.contains(secret),
             "store-URL password leaked into the boot log:\n{logs}"
+        );
+        assert!(
+            !logs.contains("://ai_memory") && !logs.contains("@127.0.0.1"),
+            "store-URL userinfo (username or masker) leaked into the boot log:\n{logs}"
         );
     }
 
