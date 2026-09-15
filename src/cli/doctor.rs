@@ -144,6 +144,11 @@ const SECTION_IDENTITY: &str = "Identity";
 /// like a fleet but declared `singleton` is reported unprompted, at the top.
 /// This is the pre-upgrade detector; it never re-postures.
 pub const SECTION_DEPLOYMENT_SHAPE_DETECTOR: &str = "Deployment shape detector (#3700)";
+/// v1.0.0 #3705 — the transit-encryption section, THIRD in the default
+/// report (after the deployment shape), so every surface that would refuse
+/// under the "only encrypted data in transit" mandate is reported unprompted
+/// before the upgrade that enforces it. Doctor never refuses.
+pub const SECTION_TRANSIT_ENCRYPTION: &str = "Transit encryption (#3705)";
 /// v1.0.0 #2972 — doctor fact naming the model this binary will ACTUALLY
 /// load, emitted only when it differs from the configured `model` fact.
 const EFFECTIVE_MODEL_FACT: &str = "effective_model";
@@ -1156,10 +1161,14 @@ fn section_deployment_shape_detector_3700(registered_agents: Option<usize>) -> R
         ),
         (
             "registered_agents".into(),
-            assessment
-                .observed
-                .registered_agents
-                .map_or_else(|| "unobservable".to_string(), |n| n.to_string()),
+            assessment.observed.registered_agents.map_or_else(
+                || {
+                    crate::config::shape::detector::SignalState::Unobservable
+                        .as_str()
+                        .to_string()
+                },
+                |n| n.to_string(),
+            ),
         ),
         (
             "undeclared_promotion".into(),
@@ -1206,6 +1215,262 @@ fn section_deployment_shape_detector_3700(registered_agents: Option<usize>) -> R
     };
     ReportSection {
         name: SECTION_DEPLOYMENT_SHAPE_DETECTOR.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// v1.0.0 #3705 — every transit surface versus the mandate.
+///
+/// Read-only. The daemon's own listener is argv-only (`--tls-cert` /
+/// `--tls-key`) and therefore unobservable from doctor; what IS observable
+/// is everything that decides a boot before a socket exists: the
+/// `AI_MEMORY_REQUIRE_TLS` token (one grammar; falsy or unrecognised
+/// refuses), the removed downgrade paths (a truthy value refuses), the MCP
+/// forward URL scheme, the PostgreSQL DSN `sslmode` floor, and — once the
+/// store is open — the webhook subscriptions whose target is plaintext
+/// (refused at dispatch and at create). LLM / embedding egress URLs are
+/// DETECTED only: they carry prompt and memory content, but their
+/// refusal is the open item the operator has not ruled on yet.
+#[allow(deprecated)] // the legacy flat `ollama_url` is still a live egress URL
+fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> ReportSection {
+    use crate::transit_encryption::{
+        self, ENV_REQUIRE_TLS, ISSUE_TAG, MANDATE, PG_SSLMODE_FLOOR, REMEDY_ENTERPRISE_PKI,
+        REMEDY_TLS_RENEW, RequireTls,
+    };
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    // Everything that will REFUSE the next boot / connect, by name.
+    let mut refuses: Vec<String> = Vec::new();
+    let token = match transit_encryption::require_tls_token() {
+        RequireTls::Floor => "unset (floor)".to_string(),
+        RequireTls::Affirmed => "affirmed".to_string(),
+        RequireTls::DowngradeRequested(t) => {
+            refuses.push(format!("{ENV_REQUIRE_TLS}={t:?}"));
+            format!("downgrade requested: {t:?} — REFUSES boot")
+        }
+        RequireTls::Unrecognised(t) => {
+            refuses.push(format!("{ENV_REQUIRE_TLS}={t:?}"));
+            format!("unrecognised: {t:?} — REFUSES boot")
+        }
+    };
+    let armed = transit_encryption::armed_downgrade_paths();
+    let downgrade_paths = if armed.is_empty() {
+        "none".to_string()
+    } else {
+        refuses.extend(armed.iter().map(|s| (*s).to_string()));
+        format!("{} — REFUSES boot", armed.join(", "))
+    };
+    let forward_url = match app_config.mcp_federation_forward_url.as_deref() {
+        None => "unset".to_string(),
+        Some(u) if transit_encryption::url_is_plaintext_http(u) => {
+            refuses.push(crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.to_string());
+            "PLAINTEXT http — REFUSES boot".to_string()
+        }
+        // Origin only — a forward URL can carry a token; never echo it.
+        Some(u) => format!("https ({})", transit_encryption::url_origin_for_refusal(u)),
+    };
+    let store_url_sslmode = match crate::store_url::resolve_store_url(None) {
+        Ok(None) => "sqlite (no store URL)".to_string(),
+        Ok(Some(dsn))
+            if !dsn
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("postgres") =>
+        {
+            "sqlite (store URL is not postgres)".to_string()
+        }
+        Ok(Some(dsn)) if transit_encryption::dsn_pins_sslmode_verify_full(&dsn) => {
+            format!("postgres: sslmode={PG_SSLMODE_FLOOR} pinned")
+        }
+        Ok(Some(_)) => {
+            refuses.push("store URL sslmode".to_string());
+            format!("postgres: sslmode={PG_SSLMODE_FLOOR} NOT pinned — REFUSES at connect")
+        }
+        Err(e) => format!("unresolvable: {e:#}"),
+    };
+    let (webhook_targets, webhook_plaintext) = match conn {
+        None => (
+            crate::config::shape::detector::SignalState::Unobservable
+                .as_str()
+                .to_string(),
+            0_i64,
+        ),
+        Some(c) => match c.query_row(
+            "SELECT COUNT(*) FROM subscriptions WHERE lower(substr(url, 1, 7)) = 'http://'",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(n) => (format!("{n} (refused at dispatch and at create)"), n),
+            Err(e) => (format!("unreadable: {e}"), 0_i64),
+        },
+    };
+    // DETECT ONLY — the operator's ruling on model-server egress is open.
+    let mut egress: Vec<&str> = Vec::new();
+    if app_config
+        .llm
+        .as_ref()
+        .and_then(|l| l.base_url.as_deref())
+        .is_some_and(transit_encryption::url_is_plaintext_http)
+    {
+        egress.push("[llm].base_url");
+    }
+    if app_config
+        .embeddings
+        .as_ref()
+        .and_then(|e| e.url.as_deref().or(e.base_url.as_deref()))
+        .is_some_and(transit_encryption::url_is_plaintext_http)
+    {
+        egress.push("[embeddings].url");
+    }
+    if app_config.ollama_url.is_some()
+        && transit_encryption::url_is_plaintext_http(app_config.effective_ollama_url())
+    {
+        egress.push("ollama_url (legacy)");
+    }
+    let llm_egress = if egress.is_empty() {
+        "none configured (the compiled Ollama default is plaintext http://localhost:11434 \
+         when a local model server is used — detected, not enforced)"
+            .to_string()
+    } else {
+        format!(
+            "{} — PLAINTEXT model-server egress carries prompt and memory content \
+             (detected only; refusal awaits the operator's ruling)",
+            egress.join(", ")
+        )
+    };
+    // v1.0.0 #3709 item 1 — the zero-config local certificate under
+    // `<key_dir>/tls/`: absent (first boot generates it), present with its
+    // expiry and SANs, inside the renewal window (renews at next boot or by
+    // the daily in-daemon task), expired (refuses), or unreadable (a corrupt
+    // artefact is reported, never treated as absent).
+    // 3x7 audit ruling (#3709): zero-config local-CA minting is for the
+    // SINGLETON shape only — an unmanaged CA on a fleet-shaped estate is an
+    // audit finding, so a fleet must bring enterprise PKI. The shape is the
+    // operator's DECLARATION (`[deployment] shape`, absent = singleton) —
+    // never the observed signals: the #3700 detector may warn about an
+    // undeclared promotion, it may not re-posture (promotion is an operator
+    // act), and this section follows the same rule.
+    let declared = app_config.effective_shape();
+    let fleet = declared != crate::config::shape::DeploymentShape::Singleton;
+    let key_dir = crate::identity::keypair::resolved_default_key_dir_path();
+    let locally_minted = key_dir.as_ref().is_ok_and(|dir| {
+        dir.join(crate::tls_bootstrap::TLS_SUBDIR)
+            .join(crate::tls_bootstrap::LOCAL_CA_CERT_FILE)
+            .exists()
+    });
+    let mut leaf_warning = false;
+    let mut leaf_expired = false;
+    let mut fleet_pki_missing = false;
+    let local_tls_material = match key_dir
+        .as_ref()
+        .map_err(|e| format!("{e:#}"))
+        .and_then(|dir| crate::tls_bootstrap::leaf_status(dir).map_err(|e| format!("{e:#}")))
+    {
+        Ok(status) if !status.present && fleet => {
+            fleet_pki_missing = true;
+            format!(
+                "absent — enterprise PKI required under `{}`: \
+                 {REMEDY_ENTERPRISE_PKI} — REFUSES boot without --tls-cert/--tls-key",
+                declared.config_line()
+            )
+        }
+        Ok(status) if !status.present => {
+            "absent (first boot will generate a local certificate under <key_dir>/tls/, or \
+             supply --tls-cert/--tls-key)"
+                .to_string()
+        }
+        Ok(_) if fleet && locally_minted => {
+            fleet_pki_missing = true;
+            format!(
+                "present but LOCALLY MINTED — an unmanaged CA under `{}` is an audit \
+                 finding; REFUSES at next boot; import enterprise PKI: {REMEDY_ENTERPRISE_PKI}",
+                declared.config_line()
+            )
+        }
+        Ok(status) => {
+            let days = status.days_remaining.unwrap_or(0);
+            if days < 0 {
+                leaf_expired = true;
+                format!(
+                    "present, EXPIRED {} day(s) ago — REFUSES at next boot; {REMEDY_TLS_RENEW}",
+                    -days
+                )
+            } else if status.within_renewal_window || days == 0 {
+                leaf_warning = true;
+                format!(
+                    "present, INSIDE the renewal window ({days} day(s) to expiry) — a locally \
+                     minted leaf renews at the next boot or by the daily task; operator material: \
+                     {REMEDY_TLS_RENEW}"
+                )
+            } else {
+                format!(
+                    "present, {days} day(s) to expiry, SANs: {}",
+                    if status.subject_alt_names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        status.subject_alt_names.join(", ")
+                    }
+                )
+            }
+        }
+        Err(e) => format!("unreadable: {e}"),
+    };
+    if leaf_expired {
+        refuses.push("local TLS certificate expired".to_string());
+    }
+    if fleet_pki_missing {
+        refuses.push("declared non-singleton shape without enterprise PKI".to_string());
+    }
+    let listener_tls = format!(
+        "operator --tls-cert/--tls-key (unobservable from this process) or the local \
+         certificate in {}/{}; a bind without either is refused, loopback included",
+        key_dir
+            .as_ref()
+            .map_or_else(|_| "<key_dir>".to_string(), |d| d.display().to_string()),
+        crate::tls_bootstrap::TLS_SUBDIR
+    );
+    let verdict = if refuses.is_empty() {
+        "boots with in-process TLS only (a plaintext listener is refused)".to_string()
+    } else {
+        format!("REFUSES at next boot: {}", refuses.join(", "))
+    };
+    let severity = if !refuses.is_empty() || webhook_plaintext > 0 {
+        Severity::Critical
+    } else if !egress.is_empty() || leaf_warning {
+        Severity::Warning
+    } else {
+        Severity::Info
+    };
+    let facts = vec![
+        ("mandate".into(), MANDATE.to_string()),
+        ("listener_tls".into(), listener_tls),
+        ("local_tls_material".into(), local_tls_material),
+        ("require_tls_token".into(), token),
+        ("downgrade_paths_armed".into(), downgrade_paths),
+        (
+            crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.into(),
+            forward_url,
+        ),
+        ("store_url_sslmode".into(), store_url_sslmode),
+        ("webhook_plaintext_targets".into(), webhook_targets),
+        ("llm_egress_plaintext".into(), llm_egress),
+        ("boot_verdict".into(), verdict),
+    ];
+    let note = (severity != Severity::Info).then(|| {
+        format!(
+            "{ISSUE_TAG}: {MANDATE} — a plaintext listener, peer, webhook target, MCP forward \
+             URL or PostgreSQL socket is refused, loopback included; provide --tls-cert / \
+             --tls-key, https:// targets and sslmode={PG_SSLMODE_FLOOR}. `ai-memory doctor` \
+             is the pre-upgrade detector: run it BEFORE upgrading to learn what will refuse."
+        )
+    });
+    ReportSection {
+        name: SECTION_TRANSIT_ENCRYPTION.into(),
         severity,
         facts,
         note,
@@ -1302,6 +1567,11 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // re-postures. The registry signal is folded in once the connection is
     // open (below); until then it is reported as unobservable, never absent.
     sections.push(section_deployment_shape_detector_3700(None));
+    // v1.0.0 #3705 — THIRD, before the database open: every transit surface
+    // versus the "only encrypted data in transit" mandate. The webhook
+    // census is folded in once the connection is open (below); until then
+    // it is reported as unobservable, never as zero.
+    sections.push(section_transit_encryption_3705(None));
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -1452,6 +1722,14 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     {
         *slot =
             section_deployment_shape_detector_3700(db::list_agents(&conn).ok().map(|a| a.len()));
+    }
+    // v1.0.0 #3705 — fold the subscriptions census into the transit section
+    // at index 2 (plaintext webhook targets are invisible pre-open).
+    if let Some(slot) = sections
+        .iter_mut()
+        .find(|s| s.name == SECTION_TRANSIT_ENCRYPTION)
+    {
+        *slot = section_transit_encryption_3705(Some(&conn));
     }
     sections.push(section_identity_3147(Some(&conn), db_path, caller_agent_id));
     sections.push(section_storage(&conn, db_path));
@@ -4174,6 +4452,13 @@ fn http_get_json(url: &str, auth: &RemoteAuth) -> Result<Value> {
             .with_context(|| format!("read --ca-cert {}", ca_path.display()))?;
         builder =
             builder.add_root_certificate(crate::cli::sync::parse_ca_certificate(&ca_pem, ca_path)?);
+    } else if let Some(local_ca) = crate::tls_bootstrap::local_ca_certificate()? {
+        // v1.0.0 #3709 item 5 — same-installation trust only: the bundled
+        // remote doctor trusts THIS installation's zero-config local CA so
+        // `doctor --remote https://127.0.0.1:9077` works with no flag. Never a
+        // peer's certificate (peer trust stays explicit, #2448); a CA file
+        // that exists but does not parse is an error, never ignored.
+        builder = builder.add_root_certificate(local_ca);
     }
     if let Some(identity) = crate::cli::sync::sync_client_identity(
         auth.client_cert.as_deref(),
@@ -4614,7 +4899,10 @@ mod tests {
         // — total is now 19; #3700 inserted "Deployment shape detector
         // (#3700)" after Configuration (the #3714 declared-shape section
         // that precedes it is CONDITIONAL and absent under skip_config, which
-        // `run_local_collect` sets) — total is now 20.
+        // `run_local_collect` sets) — total is now 20; #3705
+        // inserted "Transit encryption (#3705)" after the detector (every
+        // transit surface versus the mandate, the pre-upgrade detector) —
+        // total is now 21.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -4624,19 +4912,20 @@ mod tests {
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
-        // DSN under that same lock. The count stays 20 on a SQLite
+        // DSN under that same lock. The count stays 21 on a SQLite
         // deployment, which is the invariant this test pins.
         //
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 20);
+        assert_eq!(report.sections.len(), 21);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Configuration",
                 SECTION_DEPLOYMENT_SHAPE_DETECTOR,
+                SECTION_TRANSIT_ENCRYPTION,
                 "Federation peer authorization",
                 "Identity",
                 "Storage",
@@ -4722,6 +5011,67 @@ mod tests {
         }
         // The resolved key value itself must NEVER appear as a fact key.
         assert!(emb.facts.iter().all(|(k, _)| k != "api_key"));
+    }
+
+    /// v1.0.0 #3705 — the transit-encryption section renders THIRD, carries
+    /// the ordered fact keys, reports the selector as the floor when unset,
+    /// folds the webhook census in once the store is open, and never
+    /// refuses (doctor is the detector).
+    #[test]
+    fn local_run_transit_encryption_section_is_third_3705() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        assert_eq!(report.sections[2].name, SECTION_TRANSIT_ENCRYPTION);
+        let transit = find(&report, SECTION_TRANSIT_ENCRYPTION);
+        let keys: Vec<&str> = transit.facts.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "mandate",
+                "listener_tls",
+                "local_tls_material",
+                "require_tls_token",
+                "downgrade_paths_armed",
+                "mcp_federation_forward_url",
+                "store_url_sslmode",
+                "webhook_plaintext_targets",
+                "llm_egress_plaintext",
+                "boot_verdict",
+            ]
+        );
+        assert_eq!(
+            fact(transit, "mandate"),
+            crate::transit_encryption::MANDATE,
+            "the mandate is stated verbatim"
+        );
+        assert_eq!(fact(transit, "require_tls_token"), "unset (floor)");
+        assert_eq!(fact(transit, "downgrade_paths_armed"), "none");
+        assert_eq!(fact(transit, "store_url_sslmode"), "sqlite (no store URL)");
+        assert_eq!(
+            fact(transit, "webhook_plaintext_targets"),
+            "0 (refused at dispatch and at create)",
+            "an open store with no subscriptions reports an observed zero"
+        );
+        assert!(
+            fact(transit, "boot_verdict").starts_with("boots with in-process TLS only"),
+            "{:?}",
+            fact(transit, "boot_verdict")
+        );
+        assert!(
+            fact(transit, "listener_tls").contains("unobservable"),
+            "the daemon's argv is unobservable from doctor"
+        );
+        assert!(
+            fact(transit, "local_tls_material").starts_with("absent")
+                || fact(transit, "local_tls_material").starts_with("present"),
+            "#3709: the local certificate is reported absent or present, never invented: {:?}",
+            fact(transit, "local_tls_material")
+        );
+        assert!(
+            !fact(transit, "local_tls_material").contains("enterprise PKI required"),
+            "a singleton (fresh store, no fleet signal) may mint its local certificate: {:?}",
+            fact(transit, "local_tls_material")
+        );
     }
 
     /// v1.0.0 #3700 — the detector section renders right after Configuration
@@ -5728,7 +6078,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO subscriptions \
                  (id, url, events, created_at, dispatch_count, failure_count) \
-                 VALUES ('s1', 'http://x', '*', ?1, 10, 5)",
+                 VALUES ('s1', 'https://x', '*', ?1, 10, 5)",
                 params![now],
             )
             .unwrap();
@@ -5759,7 +6109,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO subscriptions \
                  (id, url, events, created_at, dispatch_count, failure_count) \
-                 VALUES ('s1', 'http://x', '*', ?1, 10, 5)",
+                 VALUES ('s1', 'https://x', '*', ?1, 10, 5)",
                 params![now],
             )
             .unwrap();
@@ -5827,9 +6177,11 @@ mod tests {
         // peer authorization renders before the database open and Identity;
         // #3700 the deployment-shape detector renders second (the #3714
         // declared-shape section is absent under skip_config), with the
-        // registry signal left `unobservable` because the store never opened.
-        // Storage is the Critical failure.
-        assert_eq!(report.sections.len(), 5);
+        // registry signal left `unobservable` because the store never opened;
+        // #3705 the transit section renders third, with the webhook census
+        // left `unobservable` for the same reason. Storage is the Critical
+        // failure.
+        assert_eq!(report.sections.len(), 6);
         assert_eq!(report.sections[0].name, "Configuration");
         assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
         assert_eq!(
@@ -5837,9 +6189,15 @@ mod tests {
             "unobservable",
             "#3700: an unopened store is unobservable, never an empty registry"
         );
-        assert_eq!(report.sections[2].name, "Federation peer authorization");
-        assert_eq!(report.sections[3].name, SECTION_IDENTITY);
-        let storage = &report.sections[4];
+        assert_eq!(report.sections[2].name, SECTION_TRANSIT_ENCRYPTION);
+        assert_eq!(
+            fact(&report.sections[2], "webhook_plaintext_targets"),
+            "unobservable",
+            "#3705: an unopened store is unobservable, never zero plaintext targets"
+        );
+        assert_eq!(report.sections[3].name, "Federation peer authorization");
+        assert_eq!(report.sections[4].name, SECTION_IDENTITY);
+        let storage = &report.sections[5];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.

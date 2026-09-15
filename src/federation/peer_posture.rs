@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn recursive_public_enrollment_never_reads_private_material_3582() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::identity::test_key_dir::private_tempdir();
         assert!(!has_enrolled_public_key(temp.path()).unwrap());
         let key = crate::identity::keypair::generate("region/node").unwrap();
         crate::identity::keypair::save_public_only(&key, temp.path()).unwrap();
@@ -429,7 +429,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn enrollment_directory_cycles_are_unobservable_3582() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::identity::test_key_dir::private_tempdir();
         std::os::unix::fs::symlink(temp.path(), temp.path().join("cycle")).unwrap();
         assert!(has_enrolled_public_key(temp.path()).is_err());
     }

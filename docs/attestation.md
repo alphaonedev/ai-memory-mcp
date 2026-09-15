@@ -270,7 +270,7 @@ ai-memory store --agent-id my-agent --sign \
 adopts that timestamp so the verifier rebuilds the identical bytes):
 
 ```bash
-curl -X POST http://localhost:9077/api/v1/memories \
+curl -X POST https://localhost:9077/api/v1/memories \
   -H 'Content-Type: application/json' \
   -d '{
         "agent_id":   "my-agent",

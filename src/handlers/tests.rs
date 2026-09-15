@@ -1340,7 +1340,6 @@ async fn http_bulk_create_fans_out_with_federation() {
     // mock peer that records sync_push POSTs and bulk-create N rows;
     // the mock must see N POSTs (background-detached + foreground).
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::net::TcpListener;
 
     let state = test_state();
 
@@ -1366,21 +1365,16 @@ async fn http_bulk_create_fans_out_with_federation() {
         .with_state(MockState {
             count: count_for_peer,
         });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, peer_app).await.ok();
-    });
-
-    // Build a FederationConfig that targets the mock.
-    let peer_url = format!("http://{addr}");
+    // #3705 — the mock speaks TLS (test PKI); a plaintext peer is refused by
+    // `FederationConfig::build`, so the config trusts the test CA instead.
+    let peer_url = crate::test_support::spawn_tls_mock(peer_app).await;
     let fed = crate::federation::FederationConfig::build(
         2, // W=2 — local + 1 peer
         &[peer_url],
         std::time::Duration::from_secs(2),
         None,
         None,
-        None,
+        Some(crate::test_support::tls_test_pki().ca_pem.as_path()),
         "ai:bulk-test".to_string(),
         None,
     )
@@ -3417,7 +3411,7 @@ async fn subscribe_accepts_localhost_loopback() {
         .with_state(test_app_state(state));
 
     let body = serde_json::json!({
-        "url": "http://localhost/webhook",
+        "url": "https://localhost/webhook",
         "events": "*",
         "secret": "test-sub-secret",
     });
@@ -7951,7 +7945,7 @@ async fn h8b_subscribe_namespace_shape_synthesizes_url() {
         v["url"]
             .as_str()
             .unwrap()
-            .starts_with("http://localhost/_ns/"),
+            .starts_with("https://localhost/_ns/"),
         "expected synthetic URL, got {}",
         v["url"],
     );
@@ -8131,7 +8125,7 @@ async fn h8b_unsubscribe_by_agent_and_namespace() {
         crate::subscriptions::insert(
             &lock.0,
             &crate::subscriptions::NewSubscription {
-                url: "http://localhost/_ns/alice/demo",
+                url: "https://localhost/_ns/alice/demo",
                 events: "*",
                 secret: None,
                 namespace_filter: Some("demo"),
@@ -11028,7 +11022,6 @@ async fn h8d_spawn_mock_peer(
     behaviour: H8dPeerBehaviour,
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::net::TcpListener;
 
     let count = Arc::new(AtomicUsize::new(0));
     let count_for_peer = count.clone();
@@ -11080,12 +11073,9 @@ async fn h8d_spawn_mock_peer(
             count: count_for_peer,
             behaviour,
         });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), count)
+    // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+    let base = crate::test_support::spawn_tls_mock(app).await;
+    (base, count)
 }
 
 #[derive(Clone, Copy)]
@@ -11117,7 +11107,8 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         std::time::Duration::from_millis(timeout_ms),
         None,
         None,
-        None,
+        // #3705 — the H8d mocks speak TLS; the client trusts the test CA.
+        Some(crate::test_support::tls_test_pki().ca_pem.as_path()),
         "ai:h8d-test".to_string(),
         None,
     )
@@ -15409,7 +15400,7 @@ async fn http_subscribe_with_explicit_url_succeeds() {
     // #901: matching X-Agent-Id required for body.agent_id.
     let body = serde_json::json!({
         "agent_id": "ai:webhook-user",
-        "url": "http://localhost:9999/webhook",
+        "url": "https://localhost:9999/webhook",
         "events": "store",
         "secret": "shhh",
         "namespace_filter": "team",
@@ -15431,7 +15422,7 @@ async fn http_subscribe_with_explicit_url_succeeds() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["url"], "http://localhost:9999/webhook");
+    assert_eq!(v["url"], "https://localhost:9999/webhook");
     assert_eq!(v["events"], "store");
 }
 

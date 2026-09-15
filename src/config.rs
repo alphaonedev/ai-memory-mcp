@@ -5904,6 +5904,13 @@ pub struct SubscriptionsConfig {
     /// listener (CI, dev) set this to `true` explicitly.
     #[serde(default)]
     pub allow_loopback_webhooks: bool,
+    /// v1.0.0 #3705 — a PEM certificate (or CA) the webhook dispatcher
+    /// trusts IN ADDITION to the public roots, so a receiver behind a
+    /// private PKI can be reached over https:// (plaintext webhooks are
+    /// refused everywhere). A configured file that cannot be read or parsed
+    /// refuses boot — never silently ignored.
+    #[serde(default)]
+    pub ca_cert: Option<std::path::PathBuf>,
 }
 
 /// v1.0.0 #3467 (EPIC #3466) — `[wake_hub]` config block.

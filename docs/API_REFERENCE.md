@@ -8,7 +8,12 @@ exposes. All endpoints are prefixed with `/api/v1/` unless noted.
 
 ## Base URL
 
-Default: `http://127.0.0.1:9077`.
+Default: `https://127.0.0.1:9077`. The daemon serves TLS only (#3705,
+"only encrypted data in transit"): with no `--tls-cert`/`--tls-key` it
+issues itself a certificate from an installation-local CA under
+`<key_dir>/tls/` (#3709), so point clients at that CA
+(`curl --cacert <key_dir>/tls/local-ca.pem …`) or at the CA behind your
+own `--tls-cert`.
 
 Configure via `ai-memory serve --host <host> --port <port>`. Production
 deployments should always bind TLS: `--tls-cert` + `--tls-key`.
@@ -46,9 +51,9 @@ Failure → **401** `{"error": "missing or invalid API key"}`.
 >
 > ```bash
 > # before (v0.7.0 – v0.10.0) — now 401
-> curl "http://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
+> curl "https://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
 > # after (v1.0.0)
-> curl -H "x-api-key: $KEY" http://127.0.0.1:9077/api/v1/memories
+> curl -H "x-api-key: $KEY" https://127.0.0.1:9077/api/v1/memories
 > ```
 >
 > **Diagnosing it.** The daemon emits a once-per-process WARN under the
@@ -441,8 +446,8 @@ operators:
   — one line: a format tag, `failed`, and a UNIX timestamp.
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9077/api/v1/health
-curl -sS http://127.0.0.1:9077/api/v1/health | jq .fts_integrity
+curl -sS -o /dev/null -w '%{http_code}\n' https://127.0.0.1:9077/api/v1/health
+curl -sS https://127.0.0.1:9077/api/v1/health | jq .fts_integrity
 ```
 
 ### `GET /metrics` and `GET /api/v1/metrics`
@@ -451,7 +456,7 @@ Prometheus text exposition format. Scrape from Prometheus, alertmanager,
 or Grafana Agent.
 
 ```bash
-curl http://127.0.0.1:9077/metrics
+curl https://127.0.0.1:9077/metrics
 ```
 
 Both paths are **exempt from admission control** (#1733 / #2032 M3) so
@@ -642,7 +647,7 @@ with `_`: that prefix is reserved for substrate-owned funnels such as
 - **400 / 403 / 500** per validation / governance / server error.
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "X-API-Key: KEY" -H "X-Agent-Id: alice" \
   -H "Content-Type: application/json" \
   -d '{"title":"Meeting notes","content":"Q2 roadmap","tier":"mid"}'
@@ -820,7 +825,7 @@ JSON envelope; an unrecognised value is a 400).
 ```
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"context":"quarterly planning","limit":10}'
 ```
@@ -1427,7 +1432,9 @@ Preserves original `metadata.agent_id` into
 
 Three endpoints under `/api/v1/subscriptions` — create them via MCP
 tools or the REST surface. Dispatch is SSRF-hardened (rejects
-private-range IPs; requires `https://` unless loopback).
+private-range IPs) and `https://`-only, loopback included (#3705); a
+receiver behind a private PKI is trusted through the config key
+`[subscriptions] ca_cert = "<PEM>"` (added to the public roots at boot).
 
 Every write surface emits the same events (v1.0.0 #3403): the MCP tools,
 the HTTP handlers, and the `ai-memory` CLI write verbs (`store`,
@@ -1443,6 +1450,9 @@ persisted audit row for replay-from-cursor.
 ### `POST /api/v1/subscriptions` — register webhook
 
 Body: `{ "url": "https://…", "events": "memory_store,memory_delete", "secret": "<shared-secret>", "namespace_filter": "…", "agent_filter": "…" }`.
+`url` must be `https://` (an `http://` target is refused at create and at
+dispatch, loopback included — #3705); a private-PKI receiver needs
+`[subscriptions] ca_cert` in `config.toml`.
 `events` is a **comma-separated string** (default `"*"`). Canonical
 event types (`WEBHOOK_EVENT_TYPES` in `src/subscriptions.rs`):
 `memory_store`, `memory_promote`, `memory_delete`,
@@ -1486,23 +1496,23 @@ returns the appropriate error status.
 
 ```bash
 # Health
-curl http://127.0.0.1:9077/api/v1/health
+curl https://127.0.0.1:9077/api/v1/health
 
 # Store a memory
 curl -X POST -H "Content-Type: application/json" \
-  http://127.0.0.1:9077/api/v1/memories \
+  https://127.0.0.1:9077/api/v1/memories \
   -d '{"title":"hi","content":"there","tier":"mid"}'
 
 # Recall
 curl -X POST -H "Content-Type: application/json" \
-  http://127.0.0.1:9077/api/v1/recall \
+  https://127.0.0.1:9077/api/v1/recall \
   -d '{"context":"what did I store","limit":5}'
 
 # Incremental sync pull since a timestamp
-curl 'http://127.0.0.1:9077/api/v1/sync/since?since=2026-04-01T00:00:00Z&limit=1000'
+curl 'https://127.0.0.1:9077/api/v1/sync/since?since=2026-04-01T00:00:00Z&limit=1000'
 
 # Prometheus scrape
-curl http://127.0.0.1:9077/metrics
+curl https://127.0.0.1:9077/metrics
 ```
 
 ## HTTP ↔ MCP parameter coverage

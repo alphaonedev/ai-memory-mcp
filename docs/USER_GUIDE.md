@@ -45,7 +45,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 > **Grok note:** Grok connects via remote MCP over HTTPS only (no stdio). Run `ai-memory serve` and expose it behind an HTTPS reverse proxy. `server_label` is required. See the [Installation Guide](INSTALL.html) for details.
 
-> **Llama note:** Llama Stack connects over HTTP rather than stdio MCP. Run `ai-memory serve` to start the HTTP daemon, then point your client at `http://localhost:9077`. See the [Installation Guide](INSTALL.html) for details.
+> **Llama note:** Llama Stack connects over HTTP rather than stdio MCP. Run `ai-memory serve` to start the HTTP daemon, then point your client at `https://localhost:9077`. See the [Installation Guide](INSTALL.html) for details.
 
 ### How It Works
 
@@ -2507,7 +2507,7 @@ A: Content is limited to 65,536 bytes (64 KB).
 A: A factor of `1/(1 + days_old * 0.1)` applied during recall ranking. A memory updated today gets a boost of 1.0, a memory from 10 days ago gets 0.5, and a memory from 100 days ago gets 0.09. This ensures recent memories are preferred when relevance is similar.
 
 **Q: Can I use this with AI tools other than Claude Code?**
-A: Absolutely. `ai-memory` is AI-agnostic. The MCP server speaks standard JSON-RPC over stdio and works with any MCP-compatible client -- Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API at `http://127.0.0.1:9077/api/v1/` is completely platform-independent -- any tool, framework, or script that can make HTTP requests can store and recall memories.
+A: Absolutely. `ai-memory` is AI-agnostic. The MCP server speaks standard JSON-RPC over stdio and works with any MCP-compatible client -- Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API at `https://127.0.0.1:9077/api/v1/` is completely platform-independent -- any tool, framework, or script that can make HTTP requests can store and recall memories.
 
 **Q: Are there limits on bulk operations?**
 A: Yes. Bulk create (`POST /memories/bulk`) and import (`POST /import`) are limited to 1,000 items per request to prevent abuse and memory exhaustion.

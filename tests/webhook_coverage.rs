@@ -6,8 +6,9 @@
 //! v0.6.0.0 only fired webhooks on `memory_store`. P5 wires
 //! `dispatch_event_with_details` into the four other lifecycle paths —
 //! promote, delete, link, consolidate — and gates each subscriber on
-//! an optional structured `event_types` opt-in list. These tests use
-//! wiremock to stand up an in-process HTTP listener, register a
+//! an optional structured `event_types` opt-in list. These tests stand up
+//! an in-process TLS listener (`common::tls_receiver`, #3705 — every
+//! `http://` webhook target is refused, loopback included), register a
 //! subscription pointing at it, drive the dispatcher with the same
 //! payload shape the production handlers use, and assert the right
 //! events land at the right URLs.
@@ -35,15 +36,17 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::NamedTempFile;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+mod common;
+use common::tls_receiver::{Recorded, Respond, TlsReceiver};
 
 /// Stand up a fresh on-disk `SQLite` at a tempfile path with the
 /// production schema applied (incl. P5 migration v17).
 fn fresh_db() -> (NamedTempFile, PathBuf) {
     // H11 (#628 blocker): loopback webhook URLs are rejected by
-    // default. These tests use wiremock on 127.0.0.1, so opt in
-    // explicitly for the duration of the test process.
+    // default. These tests use a loopback receiver, so opt in explicitly
+    // for the duration of the test process (an SSRF control — #3705's
+    // plaintext refusal is separate and is met by serving TLS).
     ai_memory::config::set_allow_loopback_webhooks(true);
     // Pay the one-time reqwest::blocking TLS-connector cold init here,
     // synchronously in setup, so it lands BEFORE the timed delivery
@@ -89,7 +92,7 @@ fn subscribe_event_types(
             url: mock_url,
             events: "*",
             // R3-S1.HMAC (2026-05-13): dispatch refuses unsigned
-            // bodies. Supply a per-sub secret so the wiremock POST
+            // bodies. Supply a per-sub secret so the receiver POST
             // arrives signed.
             secret: Some("p5-test-secret"),
             namespace_filter: None,
@@ -101,68 +104,30 @@ fn subscribe_event_types(
     .expect("insert subscription")
 }
 
-/// Build a fresh `MockServer` bound to a dedicated, unique-path-anchored
-/// listener. Returns the server, the unique path component, and the
-/// full mock URL the test should hand to `subscribe_*`.
-///
-/// #1201 — under full-suite parallel-binary load, wiremock pools
-/// `BareMockServer` instances and the OS may reassign the same port
-/// across pool churn. `subscriptions::dispatch_event_with_details`
-/// spawns the HTTP POST on a detached `std::thread::spawn` (see
-/// `src/subscriptions.rs:738`), so a straggler POST from a prior test
-/// in the same binary can land on a recycled mock after port-reuse
-/// aligns. Two layers of isolation here:
-///   1. Bind a fresh `127.0.0.1:0` `TcpListener` per test and hand it
-///      to `MockServer::builder().listener(...)`. This bypasses the
-///      `MOCK_SERVER_POOL` (`wiremock-0.6.5/src/mock_server/pool.rs`)
-///      and pins the listener for the test's lifetime — the
-///      ephemeral port the kernel hands us cannot be reassigned until
-///      the listener is dropped.
-///   2. Anchor every dispatch URL on a per-test UUID path
-///      (`/hook/<uuid>`). The `wait_for_event` / `collect_event_bodies`
-///      filters check the request URL against that UUID so even if
-///      port reuse did somehow align, a foreign POST cannot be
-///      mis-counted as a "real" event for this test.
-fn fresh_mock_listener() -> std::net::TcpListener {
-    // bind retries on EADDRINUSE (5 attempts, 50 ms backoff) — under
-    // parallel binary load the ephemeral pool can briefly exhaust;
-    // the loop converts a rare transient into a deterministic bind.
-    let mut last_err = None;
-    for _ in 0..5 {
-        match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(l) => return l,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
-}
-
-async fn fresh_mock_with_unique_path() -> (MockServer, String, String) {
-    let listener = fresh_mock_listener();
-    let server = MockServer::builder().listener(listener).start().await;
+/// Build a fresh TLS receiver on an ephemeral loopback port (#3705) and
+/// anchor the dispatch URL on a per-test UUID path (`/hook/<uuid>`). The
+/// `wait_for_event` / `collect_event_bodies` filters check the request URL
+/// against that UUID so a foreign POST cannot be mis-counted as a "real"
+/// event for this test (#1201). Returns the receiver, the unique path
+/// component, and the full URL to subscribe.
+async fn fresh_mock_with_unique_path() -> (TlsReceiver, String, String) {
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = TlsReceiver::start(tls, Respond::ok()).await;
     let unique = uuid::Uuid::new_v4().simple().to_string();
     let path_str = format!("/hook/{unique}");
-    Mock::given(method("POST"))
-        .and(path(path_str.clone()))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
     let url = format!("{}{}", server.uri(), path_str);
     (server, path_str, url)
 }
 
-/// Wait up to ~5 s for the wiremock server to receive at least one
+/// Wait up to ~5 s for the receiver to receive at least one
 /// request matching `event_name` in its JSON body AND `expected_path`
 /// as its URL path. The path filter rejects straggler POSTs from
 /// concurrent tests that may have landed on a recycled port (#1201).
 async fn wait_for_event(
-    server: &MockServer,
+    server: &TlsReceiver,
     event_name: &str,
     expected_path: &str,
-) -> Option<Request> {
+) -> Option<Recorded> {
     for _ in 0..50 {
         let received = server.received_requests().await.unwrap_or_default();
         for req in received {
@@ -184,7 +149,7 @@ async fn wait_for_event(
 /// Wait until at least `n` requests matching `expected_path` have
 /// landed at the mock, then return the parsed JSON bodies.
 async fn collect_event_bodies(
-    server: &MockServer,
+    server: &TlsReceiver,
     expected_path: &str,
     n: usize,
 ) -> Vec<serde_json::Value> {

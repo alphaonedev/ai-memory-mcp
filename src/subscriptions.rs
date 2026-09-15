@@ -1555,6 +1555,12 @@ fn send(
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());
+    // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
+    // root (`[subscriptions] ca_cert`) is trusted in addition to the public
+    // roots. Never a peer's certificate by inference; always an explicit act.
+    if let Some(ca) = dispatch_root_certificate() {
+        builder = builder.add_root_certificate(ca);
+    }
     for addr in &validated_addrs {
         // Pin reqwest's per-host override. The override SHADOWS
         // reqwest's own DNS query for this host on this client,
@@ -1981,6 +1987,30 @@ fn validate_url_dns_with(
 /// SSRF guard. Rejects URLs that would cause the daemon to connect
 /// to private-range addresses, link-local, loopback (except
 /// explicitly), or non-HTTPS remote hosts.
+/// v1.0.0 #3705 — the operator-installed root certificate the webhook
+/// dispatcher trusts in addition to the public roots (`[subscriptions]
+/// ca_cert`). Installed once per process at boot; first writer wins.
+static DISPATCH_ROOT_CA: std::sync::OnceLock<reqwest::Certificate> = std::sync::OnceLock::new();
+
+/// Install the dispatcher's extra root certificate from PEM bytes. Explicit
+/// trust only: this is how a receiver behind a private PKI is reached over
+/// https:// (plaintext webhook targets are refused everywhere, #3705).
+///
+/// # Errors
+/// The bytes are not a parseable PEM certificate.
+pub fn install_dispatch_root_certificate(pem: &[u8]) -> Result<()> {
+    let cert = reqwest::Certificate::from_pem(pem)
+        .map_err(|e| anyhow!("[subscriptions] ca_cert is not a PEM certificate: {e} (#3705)"))?;
+    let _ = DISPATCH_ROOT_CA.set(cert);
+    Ok(())
+}
+
+/// The installed extra root, if any (cloned per client build).
+#[must_use]
+pub fn dispatch_root_certificate() -> Option<reqwest::Certificate> {
+    DISPATCH_ROOT_CA.get().cloned()
+}
+
 pub fn validate_url(url: &str) -> Result<()> {
     validate_url_with(url, crate::config::allow_loopback_webhooks())
 }
@@ -1992,11 +2022,28 @@ pub fn validate_url(url: &str) -> Result<()> {
 fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     // Cheap scheme check without pulling the `url` crate.
     let lower = url.to_ascii_lowercase();
-    let (scheme, rest) = lower
-        .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url}"))?;
+    let (scheme, rest) = lower.split_once("://").ok_or_else(|| {
+        anyhow!(
+            "webhook URL missing scheme: {}",
+            crate::transit_encryption::url_origin_for_refusal(url)
+        )
+    })?;
     if scheme != "https" && scheme != "http" {
-        return Err(anyhow!("webhook URL scheme must be http(s): {url}"));
+        // #3705 review — origin only, never the query/userinfo (a webhook
+        // target routinely carries a token).
+        return Err(anyhow!(
+            "webhook URL scheme must be https: {}",
+            crate::transit_encryption::url_origin_for_refusal(url)
+        ));
+    }
+    // v1.0.0 #3705 — "only encrypted data in transit": plaintext http:// is
+    // refused to EVERY host, loopback included (the pre-#3705 loopback
+    // exemption is gone — loopback is shared by every local process).
+    if scheme == "http" {
+        return Err(anyhow!(
+            "{}",
+            crate::transit_encryption::plaintext_url_refusal("webhook target", url)
+        ));
     }
     // Extract host (portion before '/' or ':' or '?'). IPv6 URLs use
     // `[ipv6]:port` syntax — the brackets must be stripped and the
@@ -2007,7 +2054,12 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         // IPv6: host is everything before the closing bracket.
         match stripped.find(']') {
             Some(i) => stripped[..i].to_string(),
-            None => return Err(anyhow!("malformed IPv6 URL host: {url}")),
+            None => {
+                return Err(anyhow!(
+                    "malformed IPv6 URL host: {}",
+                    crate::transit_encryption::url_origin_for_refusal(url)
+                ));
+            }
         }
     } else {
         // IPv4 / hostname.
@@ -2032,21 +2084,6 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
              (SSRF guard); set `[subscriptions] allow_loopback_webhooks = true` \
              to opt in (testing / dev only)"
         ));
-    }
-    if scheme == "http" && !is_loopback {
-        // Accept http only to parsed-loopback IPs; everything else
-        // requires https.
-        if let Some(ip) = parsed_ip {
-            if !is_loopback_normalized(ip) {
-                return Err(anyhow!(
-                    "webhook URL must be https for non-loopback host: {url}"
-                ));
-            }
-        } else {
-            return Err(anyhow!(
-                "webhook URL must be https for non-loopback host: {url}"
-            ));
-        }
     }
     // Reject private-range IPs regardless of scheme (RFC1918 / RFC4193 /
     // link-local). Hostnames that resolve to private ranges are not
@@ -2585,17 +2622,28 @@ mod tests {
         assert!(ua.len() > "ai-memory/".len());
     }
 
+    /// #3705 — plaintext http:// is refused to EVERY host, loopback included,
+    /// even with the loopback SSRF opt-in; the refusal names the mandate.
     #[test]
-    fn http_only_to_loopback() {
-        // H11 inner helper — assert with allow_loopback=true so the
-        // test does not depend on the test-build default and does not
-        // race with parallel tests poking the global atomic.
-        assert!(validate_url_with("http://localhost/hook", true).is_ok());
-        assert!(validate_url_with("http://127.0.0.1:8080/hook", true).is_ok());
-        // IPv6 in URLs must be bracketed per RFC 3986 §3.2.2.
-        assert!(validate_url_with("http://[::1]/hook", true).is_ok());
-        assert!(validate_url_with("http://example.com/hook", true).is_err());
-        assert!(validate_url_with("http://8.8.8.8/hook", true).is_err());
+    fn http_refused_everywhere_loopback_included_3705() {
+        for url in [
+            "http://localhost/hook",
+            "http://127.0.0.1:8080/hook",
+            "http://[::1]/hook",
+            "http://example.com/hook",
+            "http://8.8.8.8/hook",
+        ] {
+            let err = validate_url_with(url, true)
+                .expect_err("#3705: every http:// webhook target must be refused")
+                .to_string();
+            assert!(
+                err.contains(crate::transit_encryption::ISSUE_TAG) && err.contains("https://"),
+                "{url}: {err}"
+            );
+        }
+        assert!(validate_url_with("https://localhost/hook", true).is_ok());
+        assert!(validate_url_with("https://127.0.0.1:8080/hook", true).is_ok());
+        assert!(validate_url_with("https://[::1]/hook", true).is_ok());
     }
 
     #[test]
@@ -2631,9 +2679,9 @@ mod tests {
         // H11 — operators who need loopback for CI/testing opt in via
         // `[subscriptions] allow_loopback_webhooks = true`. Inner
         // helper isolates this test from the global atomic.
-        assert!(validate_url_with("http://127.0.0.1:9999/hook", true).is_ok());
-        assert!(validate_url_with("http://localhost/hook", true).is_ok());
-        assert!(validate_url_with("http://[::1]/hook", true).is_ok());
+        assert!(validate_url_with("https://127.0.0.1:9999/hook", true).is_ok());
+        assert!(validate_url_with("https://localhost/hook", true).is_ok());
+        assert!(validate_url_with("https://[::1]/hook", true).is_ok());
     }
 
     #[test]
@@ -2714,7 +2762,12 @@ mod tests {
         // Symmetric with the existing loopback opt-in: when allow_loopback
         // is true, `::ffff:127.0.0.1` should be accepted (same as plain
         // `127.0.0.1`).
-        assert!(validate_url_with("http://[::ffff:127.0.0.1]/hook", true).is_ok());
+        assert!(validate_url_with("https://[::ffff:127.0.0.1]/hook", true).is_ok());
+        // #3705 — the plaintext form is refused regardless of the opt-in.
+        let err = validate_url_with("http://[::ffff:127.0.0.1]/hook", true)
+            .expect_err("plaintext to a v4-mapped loopback must be refused (#3705)")
+            .to_string();
+        assert!(err.contains(crate::transit_encryption::ISSUE_TAG), "{err}");
     }
 
     #[test]
@@ -2886,15 +2939,15 @@ mod tests {
         // atomic. Dev/CI workflows opt in via config to get this
         // behaviour at runtime.
         assert!(
-            validate_url_dns_with("http://127.0.0.1/foo", true).is_ok(),
+            validate_url_dns_with("https://127.0.0.1/foo", true).is_ok(),
             "127.0.0.1 should be accepted by validate_url_dns when opted in"
         );
         assert!(
-            validate_url_dns_with("http://127.0.0.1:8080/", true).is_ok(),
+            validate_url_dns_with("https://127.0.0.1:8080/", true).is_ok(),
             "127.0.0.1:8080 should be accepted by validate_url_dns when opted in"
         );
         assert!(
-            validate_url_dns_with("http://localhost/", true).is_ok(),
+            validate_url_dns_with("https://localhost/", true).is_ok(),
             "localhost should be accepted by validate_url_dns when opted in"
         );
     }
@@ -2903,11 +2956,11 @@ mod tests {
     fn test_validate_url_dns_accepts_loopback_v6() {
         // Same as v4 — loopback opt-in via inner helper.
         assert!(
-            validate_url_dns_with("http://[::1]/", true).is_ok(),
+            validate_url_dns_with("https://[::1]/", true).is_ok(),
             "[::1] should be accepted by validate_url_dns when opted in"
         );
         assert!(
-            validate_url_dns_with("http://[0:0:0:0:0:0:0:1]/", true).is_ok(),
+            validate_url_dns_with("https://[0:0:0:0:0:0:0:1]/", true).is_ok(),
             "[::1] expanded form should be accepted when opted in"
         );
     }
@@ -2918,11 +2971,11 @@ mod tests {
         // close DNS-rebind SSRF against local services. Inner helper
         // pins allow_loopback=false without touching the global.
         assert!(
-            validate_url_dns_with("http://127.0.0.1/foo", false).is_err(),
+            validate_url_dns_with("https://127.0.0.1/foo", false).is_err(),
             "127.0.0.1 must be rejected by validate_url_dns when allow_loopback=false (H11)"
         );
         assert!(
-            validate_url_dns_with("http://[::1]/", false).is_err(),
+            validate_url_dns_with("https://[::1]/", false).is_err(),
             "[::1] must be rejected by validate_url_dns when allow_loopback=false (H11)"
         );
     }
@@ -3115,12 +3168,13 @@ mod tests {
     // `record_dispatch`, `load_secret_hash`) and the HTTP send path
     // (`send`) at 0 % coverage.  These tests use a `tempfile::NamedTempFile`
     // to back a real on-disk SQLite (so dispatch threads can re-open the
-    // connection via `Connection::open(db_path)`) and `wiremock` for HTTP
-    // (already a dev-dep from W3 / W10).
+    // connection via `Connection::open(db_path)`) and an in-process TLS
+    // receiver for HTTP (#3705 — plaintext targets are refused, so the
+    // plaintext-only `wiremock` cannot stand in; see `spawn_tls_receiver`).
     //
     // Style:
     //   - DB-only tests are `#[test]` (sync) and use a tempfile path.
-    //   - Tests that drive `wiremock` are `#[tokio::test(flavor =
+    //   - Tests that drive the TLS receiver are `#[tokio::test(flavor =
     //     "multi_thread")]` and run the blocking `send` via
     //     `tokio::task::spawn_blocking`, mirroring the pattern already in
     //     `llm.rs::wiremock_tests`.
@@ -3139,26 +3193,125 @@ mod tests {
         (f, p)
     }
 
-    /// v0.7.0 K6 test helper — wiremock responder that builds a 2xx
-    /// JSON ACK body whose `correlation_id` field echoes the
-    /// dispatched id from the `x-ai-memory-correlation-id` request
-    /// header. Lets the legacy dispatch tests (which previously only
-    /// asserted "2xx → success") satisfy K6's strict ACK contract
-    /// without coupling each test to the exact UUID value.
-    struct AckEcho;
-    impl wiremock::Respond for AckEcho {
-        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
-            let corr = request
-                .headers
-                .get("x-ai-memory-correlation-id")
-                .map(|v| v.to_str().unwrap_or("").to_string())
-                .unwrap_or_default();
-            let body = serde_json::json!({
-                "status": "ack",
-                "correlation_id": corr,
-            });
-            wiremock::ResponseTemplate::new(200).set_body_json(body)
+    /// #3705 — how the in-process TLS receiver answers a delivery.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// v0.7.0 K6 — a 2xx JSON ACK body whose `correlation_id` echoes
+        /// the dispatched id from the `x-ai-memory-correlation-id` request
+        /// header, so the legacy "2xx → success" tests satisfy K6's strict
+        /// ACK contract without coupling to the exact UUID value.
+        AckEcho,
+        /// A bare status (4xx / 5xx ladders).
+        Status(u16),
+        /// `302` to `location` — the SSRF-pin-bypass shape.
+        Redirect(&'static str),
+    }
+
+    /// One request the TLS receiver recorded.
+    #[derive(Clone, Debug)]
+    struct Received {
+        path: String,
+        headers: axum::http::HeaderMap,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct ReceiverState {
+        reply: Reply,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+    }
+
+    /// #3705 — "only encrypted data in transit": an in-process TLS webhook
+    /// receiver. Serves the per-process test PKI leaf
+    /// (`crate::test_support::tls_test_pki`, SANs `127.0.0.1`/`localhost`)
+    /// through the SAME `crate::tls::serve_rustls_acceptor` the daemon
+    /// uses, and records every request so each assertion keeps its
+    /// subject (2xx → ok, 5xx → failure ladder, signature header present /
+    /// absent, correlation id, redirect NOT followed). `wiremock` is
+    /// plaintext-only and can no longer stand in: `validate_url` refuses
+    /// an `http://` target.
+    struct TlsReceiver {
+        base: String,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+    }
+
+    impl TlsReceiver {
+        fn hook_url(&self) -> String {
+            format!("{}/hook", self.base)
         }
+
+        fn received(&self) -> Vec<Received> {
+            self.received
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    async fn receiver_handler(
+        axum::extract::State(state): axum::extract::State<ReceiverState>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, 1 << 20)
+            .await
+            .unwrap_or_default();
+        state
+            .received
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Received {
+                path: parts.uri.path().to_string(),
+                headers: parts.headers.clone(),
+                body: bytes.to_vec(),
+            });
+        match state.reply {
+            Reply::AckEcho => {
+                let corr = parts
+                    .headers
+                    .get("x-ai-memory-correlation-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "status": "ack",
+                        "correlation_id": corr,
+                    })),
+                )
+                    .into_response()
+            }
+            Reply::Status(code) => axum::http::StatusCode::from_u16(code)
+                .expect("a valid status code")
+                .into_response(),
+            Reply::Redirect(location) => (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, location)],
+            )
+                .into_response(),
+        }
+    }
+
+    /// Stand up a TLS receiver answering `reply`, and install the test CA
+    /// as the dispatcher's extra root (`install_dispatch_root_certificate`:
+    /// first install wins, process-wide — every receiver in this binary
+    /// serves the ONE test PKI, so the first install is the right one).
+    async fn spawn_tls_receiver(reply: Reply) -> TlsReceiver {
+        let pki = crate::test_support::tls_test_pki();
+        let ca_pem = std::fs::read(&pki.ca_pem).expect("read the test CA");
+        install_dispatch_root_certificate(&ca_pem)
+            .expect("install the test CA as the dispatcher root (#3705)");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .fallback(receiver_handler)
+            .with_state(ReceiverState {
+                reply,
+                received: received.clone(),
+            });
+        let base = crate::test_support::spawn_tls_mock(app).await;
+        TlsReceiver { base, received }
     }
 
     // ---------------- insert / delete / list ----------------
@@ -3723,23 +3876,15 @@ mod tests {
         assert_eq!(fc, 0);
     }
 
-    // ---------------- send() — wiremock-driven HTTP tests ----------------
+    // ---------------- send() — TLS-receiver-driven HTTP tests (#3705) ----------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_returns_true_on_2xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        // K6: receivers MUST return a JSON ack body — the AckEcho
-        // helper echoes the request's correlation_id header so the
-        // ack-correlation-id check in `send` passes.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .expect(1)
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        // K6: receivers MUST return a JSON ack body — the AckEcho reply
+        // echoes the request's correlation_id header so the
+        // ack-correlation-id check in `send` passes. #3705: TLS receiver.
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
             send(
@@ -3753,19 +3898,17 @@ mod tests {
         .await
         .unwrap();
         assert!(res.is_ok(), "2xx + matching ack must succeed: {res:?}");
+        assert_eq!(
+            receiver.received().len(),
+            1,
+            "exactly one POST reached the hook"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_returns_false_on_5xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        let receiver = spawn_tls_receiver(Reply::Status(500)).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
             send(&url, "{\"event\":\"x\"}", "1700000000", None, &corr)
@@ -3773,24 +3916,27 @@ mod tests {
         .await
         .unwrap();
         assert!(res.is_err(), "5xx must return Err (no retry inside send)");
+        assert_eq!(
+            receiver.received().len(),
+            1,
+            "the 5xx must come from the receiver, not from a refused URL (#3705)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_returns_false_on_4xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        let receiver = spawn_tls_receiver(Reply::Status(404)).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
             .await
             .unwrap();
         assert!(res.is_err(), "4xx must return Err");
+        assert_eq!(
+            receiver.received().len(),
+            1,
+            "the 4xx must come from the receiver, not from a refused URL (#3705)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3804,27 +3950,12 @@ mod tests {
         // 3xx is surfaced as a non-success status and the dispatch fails
         // safely. We assert BOTH that send returns Err AND that the
         // redirect target was never requested.
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
         // The hook returns a redirect to a path that, if followed, the
-        // mock would happily answer 200 — proving the failure is the
-        // un-followed redirect, not a missing target.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(
-                ResponseTemplate::new(302).insert_header("location", "/internal-rebind-target"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let redirect_followed = Mock::given(path("/internal-rebind-target"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .named("redirect target must NOT be requested");
-        server.register(redirect_followed).await;
-
-        let url = format!("{}/hook", server.uri());
+        // receiver would happily answer (it records and answers EVERY
+        // path) — proving the failure is the un-followed redirect, not a
+        // missing target.
+        let receiver = spawn_tls_receiver(Reply::Redirect("/internal-rebind-target")).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
             .await
@@ -3833,37 +3964,26 @@ mod tests {
             res.is_err(),
             "redirect must not be followed; 3xx surfaces as a failed dispatch: {res:?}"
         );
-        // The `.expect(0)` on the redirect-target mock is verified on
-        // server drop; assert it explicitly here for a clear failure
-        // message if reqwest ever regains redirect-following behavior.
-        let hits = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.url.path() == "/internal-rebind-target")
+        // Exactly one request — the hook itself — and never the redirect
+        // target; a clear failure message if reqwest ever regains
+        // redirect-following behavior.
+        let received = receiver.received();
+        assert_eq!(received.len(), 1, "one request: the hook, nothing else");
+        assert_eq!(received[0].path, "/hook");
+        let hits = received
+            .iter()
+            .filter(|r| r.path == "/internal-rebind-target")
             .count();
         assert_eq!(hits, 0, "redirect target was requested — SSRF pin bypassed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_signature_header_set_when_provided() {
-        use wiremock::matchers::{header, header_exists, method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
         // Assert the `x-ai-memory-signature` header is `sha256=<sig>`
-        // and the timestamp + correlation-id headers are set.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .and(header("x-ai-memory-signature", "sha256=abc123"))
-            .and(header_exists("x-ai-memory-timestamp"))
-            .and(header_exists("x-ai-memory-correlation-id"))
-            .and(header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON))
-            .respond_with(AckEcho)
-            .expect(1)
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        // and the timestamp + correlation-id headers are set (on the
+        // recorded request, below).
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
             send(&url, "{}", "1700000000", Some("abc123"), &corr)
@@ -3874,19 +3994,29 @@ mod tests {
             res.is_ok(),
             "2xx with matched signature header + ack must succeed: {res:?}"
         );
+        let received = receiver.received();
+        assert_eq!(received.len(), 1, "exactly one POST reached the hook");
+        let req = &received[0];
+        assert_eq!(
+            req.headers
+                .get("x-ai-memory-signature")
+                .and_then(|v| v.to_str().ok()),
+            Some("sha256=abc123")
+        );
+        assert!(req.headers.get("x-ai-memory-timestamp").is_some());
+        assert!(req.headers.get("x-ai-memory-correlation-id").is_some());
+        assert_eq!(
+            req.headers
+                .get(crate::HEADER_CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::MIME_JSON)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_no_signature_header_when_secret_absent() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking({
             let url = url.clone();
@@ -3896,11 +4026,10 @@ mod tests {
         .await
         .unwrap();
         assert!(res.is_ok(), "ack-echo must succeed: {res:?}");
-        // Inspect the captured request to confirm no signature header.
-        let received: Vec<Request> = server.received_requests().await.unwrap_or_default();
+        // Inspect the recorded request to confirm no signature header.
+        let received = receiver.received();
         assert_eq!(received.len(), 1);
         let req = &received[0];
-        // wiremock lower-cases header names.
         assert!(
             req.headers.get("x-ai-memory-signature").is_none(),
             "no signature should be sent when secret absent"
@@ -3940,20 +4069,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_event_e2e_increments_dispatch_count_on_2xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
         // Insert a wildcard subscription pointing at the mock.
         let id = {
             let conn = Connection::open(&db_path).unwrap();
-            let url = format!("{}/hook", server.uri());
+            let url = receiver.hook_url();
             insert(
                 &conn,
                 &NewSubscription {
@@ -4003,19 +4125,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_event_e2e_increments_failure_count_on_5xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::Status(500)).await;
 
         let (_keep, db_path) = fresh_db();
         let id = {
             let conn = Connection::open(&db_path).unwrap();
-            let url = format!("{}/hook", server.uri());
+            let url = receiver.hook_url();
             insert(
                 &conn,
                 &NewSubscription {
@@ -4066,22 +4181,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_event_e2e_signature_present_when_secret_set() {
-        use wiremock::matchers::{header_exists, method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .and(header_exists("x-ai-memory-signature"))
-            .and(header_exists("x-ai-memory-timestamp"))
-            .respond_with(AckEcho)
-            .expect(1)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
         let _id = {
             let conn = Connection::open(&db_path).unwrap();
-            let url = format!("{}/hook", server.uri());
+            let url = receiver.hook_url();
             insert(
                 &conn,
                 &NewSubscription {
@@ -4102,23 +4207,26 @@ mod tests {
             dispatch_event(&conn, "memory_store", "m3", "ns", None, &db_path);
         }
 
-        // Wait for the dispatch thread to fire & wiremock to record.
-        // We poll the mock's hit count instead of the DB so the
-        // assertion stays specific to "signature header present".
-        let server_ref = &server;
+        // Wait for the dispatch thread to fire & the receiver to record.
+        // We poll the receiver instead of the DB so the assertion stays
+        // specific to "signature header present".
         for _ in 0..50 {
-            let received = server_ref.received_requests().await.unwrap_or_default();
+            let received = receiver.received();
             if !received.is_empty() {
                 let req = &received[0];
                 assert!(
                     req.headers.get("x-ai-memory-signature").is_some(),
                     "signature header must be present when secret set"
                 );
+                assert!(
+                    req.headers.get("x-ai-memory-timestamp").is_some(),
+                    "timestamp header must be present"
+                );
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        panic!("dispatch thread never reached the mock server");
+        panic!("dispatch thread never reached the TLS receiver");
     }
 
     // ----------------------------------------------------------------
@@ -4213,19 +4321,12 @@ mod tests {
     async fn approval_requested_dispatches_to_opt_in_subscriber() {
         // K4: end-to-end. Insert a subscription opt-ed in to
         // `approval_requested` only; queue a pending action via the
-        // db layer; call the dispatch helper; assert the wiremock
+        // db layer; call the dispatch helper; assert the TLS receiver
         // saw the POST and the body shape carries the K4 details.
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
-        let url = format!("{}/hook", server.uri());
+        let url = receiver.hook_url();
         let opt_in: Vec<String> = vec!["approval_requested".to_string()];
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
@@ -4267,12 +4368,12 @@ mod tests {
             dispatch_approval_requested(&conn, &pending_id, &db_path);
         }
 
-        // Poll the mock for the dispatch — std::thread::spawn is
+        // Poll the receiver for the dispatch — std::thread::spawn is
         // detached so we cannot join. ~5s budget mirrors the existing
         // dispatch_event_e2e_* tests.
         let mut received = Vec::new();
         for _ in 0..50 {
-            received = server.received_requests().await.unwrap_or_default();
+            received = receiver.received();
             if !received.is_empty() {
                 break;
             }
@@ -4300,7 +4401,7 @@ mod tests {
         // Sanity: the dispatch_count was bumped on the subscription
         // row (proves we went through record_dispatch on success).
         // Poll up to 2s — dispatch_count is written back AFTER the HTTP
-        // POST is acked, so seeing the wiremock request above does not
+        // POST is acked, so seeing the receiver request above does not
         // imply the row update has landed yet (race observed on Linux
         // and Windows runners under load).
         let conn = Connection::open(&db_path).unwrap();
@@ -4431,17 +4532,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn k6_dispatch_persists_uuidv7_correlation_id() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
-        let url = format!("{}/hook", server.uri());
+        let url = receiver.hook_url();
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
             insert(
@@ -4506,19 +4600,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn k6_500_after_retries_lands_in_dlq() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        // Mock returns 500 for every attempt — exhausts the retry
+        // The receiver returns 500 for every attempt — exhausts the retry
         // ladder and forces the DLQ branch.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::Status(500)).await;
 
         let (_keep, db_path) = fresh_db();
-        let url = format!("{}/hook", server.uri());
+        let url = receiver.hook_url();
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
             insert(

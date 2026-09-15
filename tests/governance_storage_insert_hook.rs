@@ -407,8 +407,16 @@ fn spawn_healthy_serve(
     bin: &str,
     db_path: &std::path::Path,
     pub_b64: &str,
-) -> (std::process::Child, u16) {
+) -> (std::process::Child, u16, common::tls::TestTls) {
     use std::io::{BufRead, BufReader};
+    // #3705 — the daemon refuses every plaintext bind: mint a leaf beside
+    // the db and probe it with curl `--cacert` (full verification).
+    let tls = common::tls::TestTls::generate(
+        &db_path
+            .parent()
+            .expect("db in a scratch dir")
+            .join("tls-3705"),
+    );
     for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
         let port = free_port();
         let mut child = std::process::Command::new(bin)
@@ -422,6 +430,7 @@ fn spawn_healthy_serve(
                 "--port",
                 &port.to_string(),
             ])
+            .args(tls.serve_arg_strs())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -438,10 +447,10 @@ fn spawn_healthy_serve(
             })
         });
 
-        if wait_for_health(port) {
+        if wait_for_health(port, &tls) {
             // Healthy: detach the stderr drainer (it ends when the child
             // is later killed and the pipe EOFs) and hand back the child.
-            return (child, port);
+            return (child, port, tls.clone());
         }
 
         // Never came healthy — reap, then classify via captured stderr.
@@ -480,7 +489,7 @@ const CURL_PROBE_MAX_SECS: &str = "2";
 /// test. The point is a bound that exists, not a tight one.
 const CURL_REQUEST_MAX_SECS: &str = "30";
 
-fn wait_for_health(port: u16) -> bool {
+fn wait_for_health(port: u16, tls: &common::tls::TestTls) -> bool {
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Ok(out) = std::process::Command::new("curl")
@@ -492,7 +501,9 @@ fn wait_for_health(port: u16) -> bool {
                 "/dev/null",
                 "-w",
                 "%{http_code}",
-                &format!("http://127.0.0.1:{port}/api/v1/health"),
+                "--cacert",
+                tls.cert_path.to_str().unwrap(),
+                &format!("https://127.0.0.1:{port}/api/v1/health"),
             ])
             .output()
             && String::from_utf8_lossy(&out.stdout) == "200"
@@ -547,7 +558,7 @@ fn refusal_maps_to_http_403() {
         ai_memory::governance::rules_store::insert(&conn, &rule).expect("seed rule");
     }
 
-    let (mut child, port) = spawn_healthy_serve(bin, &db_path, &pub_b64);
+    let (mut child, port, tls) = spawn_healthy_serve(bin, &db_path, &pub_b64);
 
     // POST a memory — must come back 403.
     let body = serde_json::json!({
@@ -579,7 +590,9 @@ fn refusal_maps_to_http_403() {
             "content-type: application/json",
             "-d",
             &body,
-            &format!("http://127.0.0.1:{port}/api/v1/memories"),
+            "--cacert",
+            tls.cert_path.to_str().unwrap(),
+            &format!("https://127.0.0.1:{port}/api/v1/memories"),
         ])
         .output()
         .expect("curl");
