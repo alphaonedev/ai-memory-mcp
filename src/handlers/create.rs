@@ -1808,6 +1808,7 @@ async fn create_memory_write(
                 Some(&sig_bytes),
                 crate::identity::attest::WriteSurface::HttpDirect,
             ) {
+                tracing::warn!(error = %e, "attestation failed (sync signed path)");
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
@@ -1847,6 +1848,7 @@ async fn create_memory_write(
             None,
             crate::identity::attest::WriteSurface::HttpDirect,
         ) {
+            tracing::warn!(error = %e, "attestation failed (sync unsigned path)");
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
