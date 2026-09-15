@@ -1242,11 +1242,17 @@ async fn create_memory_postgres(
             )
             .await
             {
+                tracing::warn!(error = %e, "attestation failed (signed path)");
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
                         "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                        "error": e.to_string(),
+                        // #3707 — `stamp_attestation_async` returns
+                        // `anyhow::Result` and takes the store, so its chain can
+                        // wrap a `StoreError` and carry driver text out here.
+                        // The machine-readable `code` IS the contract and is
+                        // unchanged; the detail goes to the operator log.
+                        "error": "attestation failed",
                     })),
                 )
                     .into_response();
@@ -1282,11 +1288,13 @@ async fn create_memory_postgres(
         )
         .await
         {
+            tracing::warn!(error = %e, "attestation failed (unsigned path)");
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
                     "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                    "error": e.to_string(),
+                    // #3707 — see above: anyhow chain can carry store text.
+                    "error": "attestation failed",
                 })),
             )
                 .into_response();
@@ -1804,7 +1812,12 @@ async fn create_memory_write(
                     StatusCode::FORBIDDEN,
                     Json(json!({
                         "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                        "error": e.to_string(),
+                        // #3707 — `stamp_attestation_async` returns
+                        // `anyhow::Result` and takes the store, so its chain can
+                        // wrap a `StoreError` and carry driver text out here.
+                        // The machine-readable `code` IS the contract and is
+                        // unchanged; the detail goes to the operator log.
+                        "error": "attestation failed",
                     })),
                 )
                     .into_response();
@@ -1838,7 +1851,8 @@ async fn create_memory_write(
                 StatusCode::FORBIDDEN,
                 Json(json!({
                     "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                    "error": e.to_string(),
+                    // #3707 — see above: anyhow chain can carry store text.
+                    "error": "attestation failed",
                 })),
             )
                 .into_response();
