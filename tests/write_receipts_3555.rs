@@ -7,7 +7,9 @@ use serde_json::json;
 
 #[test]
 fn capture_receipt_declares_live_sqlite_durability_3555() -> anyhow::Result<()> {
-    let root = std::env::var("CARGO_TARGET_DIR")?;
+    // `CARGO_TARGET_DIR` is an input to cargo, not exported to tests: default
+    // to the standard target directory (the `capture_turn_cli_3587` shape).
+    let root = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let scratch = tempfile::Builder::new()
         .prefix("write-receipts-3555-")
         .tempdir_in(root)?;

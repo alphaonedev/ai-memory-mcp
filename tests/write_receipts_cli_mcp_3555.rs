@@ -8,6 +8,15 @@ use std::{
     process::{Command, Stdio},
 };
 
+/// `CARGO_TARGET_DIR` is an INPUT to cargo, not something it exports to a
+/// test process, so it is unset by default on every machine; fall back to
+/// the default target directory the way `capture_turn_cli_3587` and
+/// `reembed_cli_1598` do (the four #3555 targets used to `expect`/`?` it and
+/// failed by default — hidden for a whole release chain by cancelled PR checks).
+fn scratch_root() -> String {
+    std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string())
+}
+
 fn run(db: &Path, sync: &str, args: &[&str], input: &str) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     command
@@ -67,8 +76,7 @@ fn assert_local(receipt: &Value, cadence: &str) {
 
 #[test]
 fn cli_store_update_capture_receipts_3555() {
-    let scratch =
-        tempfile::tempdir_in(std::env::var("CARGO_TARGET_DIR").expect("target")).expect("scratch");
+    let scratch = tempfile::tempdir_in(scratch_root()).expect("scratch");
     for (sync, cadence) in [("NORMAL", "per-checkpoint"), ("FULL", "per-commit")] {
         let db = scratch.path().join(format!("{sync}.db"));
         let stored: Value = serde_json::from_str(&run(
@@ -115,8 +123,7 @@ fn cli_store_update_capture_receipts_3555() {
 
 #[test]
 fn mcp_store_update_capture_receipts_3555() {
-    let scratch =
-        tempfile::tempdir_in(std::env::var("CARGO_TARGET_DIR").expect("target")).expect("scratch");
+    let scratch = tempfile::tempdir_in(scratch_root()).expect("scratch");
     for (sync, cadence) in [("NORMAL", "per-checkpoint"), ("FULL", "per-commit")] {
         let db = scratch.path().join(format!("{sync}.db"));
         let stored = tool(
@@ -148,7 +155,7 @@ fn cli_pending_receipt_3555() -> anyhow::Result<()> {
     ai_memory::config::override_active_permissions_mode_for_test(
         ai_memory::config::PermissionsMode::Enforce,
     );
-    let scratch = tempfile::tempdir_in(std::env::var("CARGO_TARGET_DIR")?)?;
+    let scratch = tempfile::tempdir_in(scratch_root())?;
     let conn = ai_memory::db::open(&scratch.path().join("pending.db"))?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     let policy = GovernancePolicy {
