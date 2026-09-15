@@ -303,13 +303,31 @@ async fn sync_cycle_never_persists_or_logs_the_peer_credential_3675_3687_3710() 
 }
 
 // ---------------------------------------------------------------------
-// #3684 / #3724 — webhook dispatch: the log names the target's origin
-// only; the DLQ `last_error` is the closed vocabulary and never the
-// receiver's text.
+// #3684 / #3697 / #3724 — webhook dispatch: the log names the target's
+// origin only; the DLQ `last_error` is the closed vocabulary and never
+// the receiver's text.
+//
+// #3697 is the WARN surface specifically: `subscriptions.rs::send` binds
+// `target = url_origin(url)` once and every `warn!` interpolates that
+// binding. Four of those warn sites are DRIVEN here, each by its own
+// subscription, and the operator log is asserted CLEAN of every planted
+// secret (userinfo, path token, query token) while still naming each
+// target's origin:
+//   * the SSRF-guard refusal   — a row whose URL points at a private
+//     range (registered through a raw UPDATE, the way a row that
+//     pre-dates a guard tightening or a tampered table would look;
+//     `insert` refuses it at registration, so dispatch is the only
+//     place this line can fire);
+//   * the DNS-guard refusal    — an unresolvable host;
+//   * the POST failure         — a closed loopback port;
+//   * the ack-status refusal   — a hostile 2xx receiver.
+// The client-build and ack-read/too-large sites share the same binding
+// and are covered by `no_production_site_renders_a_url_through_the_
+// userinfo_maskers_3711` structurally, not by a driven line.
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724() {
+async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3697_3724() {
     // #3705 — every http:// webhook target is refused, loopback included, so
     // the hostile receiver speaks TLS through the shared fixture and the
     // dispatcher trusts that leaf as its operator-installed root
@@ -339,7 +357,18 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724(
         common::tls::TestTls::base_url(port)
     );
     let unreachable_url = format!("https://127.0.0.1:9/hooks/{PATH_TOKEN}?t={QUERY_TOKEN}");
-    let (sub_hostile, sub_unreachable) = {
+    // #3697 — the two guard refusals. The DNS one carries EVERY credential
+    // shape at once (userinfo + path token + query token, the issue's
+    // acceptance shape). The SSRF one carries the path and query tokens
+    // only: the syntactic guard mis-reads a userinfo URL's host (it takes
+    // the text before the last `:`), so a userinfo URL to a private address
+    // is not refused there but downstream — measured 2026-09-15, filed as
+    // #3744; this cell drives the line the fix is for, not that gap.
+    let ssrf_url = format!("https://10.0.0.1/services/{PATH_TOKEN}?t={QUERY_TOKEN}");
+    let dns_url = format!(
+        "https://{USER}:{USERINFO_PW}@no-such-host-3697.invalid/hooks/{PATH_TOKEN}?t={QUERY_TOKEN}"
+    );
+    let (sub_hostile, sub_unreachable, sub_ssrf, sub_dns) = {
         let conn = Connection::open(&db).expect("open");
         let mk = |url: &str| {
             insert(
@@ -356,7 +385,22 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724(
             )
             .expect("insert subscription")
         };
-        (mk(&hostile_url), mk(&unreachable_url))
+        // `insert` runs the SSRF guard at registration, so a private-range
+        // URL can only reach the table around it: register a valid loopback
+        // target, then rewrite the stored URL — the dispatch-time guard is
+        // what #3697's first warn line belongs to.
+        let ssrf_id = mk(&unreachable_url);
+        conn.execute(
+            "UPDATE subscriptions SET url = ?1 WHERE id = ?2",
+            rusqlite::params![ssrf_url, ssrf_id],
+        )
+        .expect("rewrite the stored URL to a private-range target");
+        (
+            mk(&hostile_url),
+            mk(&unreachable_url),
+            ssrf_id,
+            mk(&dns_url),
+        )
     };
     let sink = Capture::default();
     // The dispatcher delivers on its own worker threads, which a
@@ -369,15 +413,16 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724(
         dispatch_event(&conn, "memory_store", "evt-3711", "ns-3711", None, &db);
         // A failed delivery may consume four ACK windows plus the retry
         // backoffs (~26.2 s, `subscriptions.rs`), and under the #3705 TLS
-        // floor each attempt also pays a handshake; both deliveries run
-        // concurrently. Poll for both DLQ rows past that worst case (40 s):
-        // on a loaded host the 20 s bound this used to carry landed 1 row.
+        // floor each attempt also pays a handshake; the four deliveries run
+        // concurrently and the DNS refusal additionally waits on the
+        // resolver. Poll for all four DLQ rows past that worst case (120 s):
+        // on a loaded host the 40 s bound this used to carry landed 0 of 4.
         let db_poll = db.clone();
         let rows = tokio::task::spawn_blocking(move || {
-            for _ in 0..400 {
+            for _ in 0..300 {
                 let conn = Connection::open(&db_poll).expect("open");
                 let all = list_dlq(&conn, None).expect("dlq");
-                if all.len() >= 2 {
+                if all.len() >= 4 {
                     return all;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -386,7 +431,10 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724(
         })
         .await
         .expect("join");
-        assert_eq!(rows.len(), 2, "one DLQ row per failed delivery: {rows:?}");
+        if rows.len() != 4 {
+            eprintln!("DEBUG-LOGS:\n{}", sink.text());
+        }
+        assert_eq!(rows.len(), 4, "one DLQ row per failed delivery: {rows:?}");
         for row in &rows {
             assert_clean(&row.last_error, "subscription_dlq.last_error");
             assert!(
@@ -396,6 +444,10 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724(
             );
             if row.subscription_id == sub_hostile {
                 assert_eq!(row.last_error, dlq_reason::ACK_STATUS_NOT_ACK);
+            } else if row.subscription_id == sub_ssrf {
+                assert_eq!(row.last_error, dlq_reason::SSRF_REJECTED, "#3697");
+            } else if row.subscription_id == sub_dns {
+                assert_eq!(row.last_error, dlq_reason::DNS_SSRF_REJECTED, "#3697");
             } else {
                 assert_eq!(row.subscription_id, sub_unreachable);
                 assert!(
@@ -422,6 +474,50 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3724(
     assert!(
         logs.contains(&ai_memory::url_display::url_origin(&hostile_url)),
         "operator log names the target origin:\n{logs}"
+    );
+    // #3697 — each driven warn line fired, and named its target's ORIGIN
+    // and nothing more. `assert_clean(&logs)` above already proved the
+    // userinfo, path and query secrets are absent from the whole log; this
+    // proves the lines exist, so absence cannot be vacuous.
+    for (what, needle) in [
+        (
+            "SSRF-guard refusal",
+            format!(
+                "SSRF guard rejected webhook URL {}",
+                ai_memory::url_display::url_origin(&ssrf_url)
+            ),
+        ),
+        (
+            "DNS-guard refusal",
+            format!(
+                "DNS SSRF guard rejected webhook URL {}",
+                ai_memory::url_display::url_origin(&dns_url)
+            ),
+        ),
+        (
+            "POST failure",
+            format!(
+                "webhook POST to {} failed",
+                ai_memory::url_display::url_origin(&unreachable_url)
+            ),
+        ),
+        (
+            "ack-status refusal",
+            format!(
+                "webhook ack from {}",
+                ai_memory::url_display::url_origin(&hostile_url)
+            ),
+        ),
+    ] {
+        assert!(
+            logs.contains(&needle),
+            "#3697: the {what} warn line fired and rendered the origin only ({needle:?}):\n{logs}"
+        );
+    }
+    assert_eq!(
+        ai_memory::url_display::url_origin(&dns_url),
+        "https://no-such-host-3697.invalid",
+        "the origin rendering of a userinfo+path+query URL is scheme://host only"
     );
 }
 
