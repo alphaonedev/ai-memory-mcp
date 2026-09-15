@@ -493,6 +493,12 @@ pub fn sqlite_malformed_predicate(col: &str) -> String {
     format!("(COALESCE(json_type({col},'$.agent_id'),'null') NOT IN ('text','null'))")
 }
 
+/// #3626 — the qualified `metadata` column of the SURVIVING row inside a
+/// `(title, namespace)` upsert arm (`ON CONFLICT … DO UPDATE SET`, where the
+/// existing row is addressed as `memories` on both adapters). Named once so
+/// the ten arms reference it by name rather than repeating the literal.
+pub const UPSERT_SURVIVING_METADATA_COL: &str = "memories.metadata";
+
 /// #3626 — postgres: a `jsonb - text[]` key-drop SUFFIX appended to the
 /// merged metadata expression of every `(title, namespace)` upsert arm.
 /// Drops `agent_id` when the EXISTING row (`col`) is UNSTAMPED per
