@@ -504,7 +504,7 @@ mod pg {
         // resolving the id by key is also the "exactly one row" proof.
         let ctx = CallerContext::for_admin("ai:reader-2874");
         let winner_id = store
-            .find_by_title_namespace(title, &ns)
+            .find_by_title_namespace(title, &ns, None)
             .await
             .expect("probe survivor")
             .expect("exactly one durable row for the raced key");
@@ -564,7 +564,7 @@ mod pg {
 
         let ctx = CallerContext::for_admin("ai:reader-2874");
         let row_id = store
-            .find_by_title_namespace(title, &ns)
+            .find_by_title_namespace(title, &ns, None)
             .await
             .expect("probe row")
             .expect("still one row (id preserved on upsert)");

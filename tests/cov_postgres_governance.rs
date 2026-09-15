@@ -494,13 +494,13 @@ async fn title_helpers_and_contradictions() {
         .unwrap();
 
     let found = store
-        .find_by_title_namespace(title, &ns)
+        .find_by_title_namespace(title, &ns, None)
         .await
         .expect("find_by_title_namespace");
     assert_eq!(found.as_deref(), Some(id.as_str()));
 
     let missing = store
-        .find_by_title_namespace("no such title", &ns)
+        .find_by_title_namespace("no such title", &ns, None)
         .await
         .expect("find missing");
     assert!(missing.is_none());

@@ -2473,7 +2473,7 @@ fn mcp_store_signed_ledger_fault_refuses_before_persist_3496() {
         "the refusal should identify the failed security ledger: {err}"
     );
     assert!(
-        db::find_by_title_namespace(&conn, title, "test-ns")
+        db::find_by_title_namespace(&conn, title, "test-ns", None)
             .expect("lookup after ledger fault")
             .is_none(),
         "ledger failure must happen before memory persistence"
@@ -2525,7 +2525,7 @@ fn mcp_store_forged_signature_is_rejected() {
     );
     // Hard-reject: nothing persisted.
     assert!(
-        db::find_by_title_namespace(&conn, title, "test-ns")
+        db::find_by_title_namespace(&conn, title, "test-ns", None)
             .expect("lookup")
             .is_none(),
         "a forged write must not persist"

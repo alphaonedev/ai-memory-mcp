@@ -502,7 +502,7 @@ mod tests {
 
         // The clone must not exist: a refused promote writes nothing.
         assert!(
-            crate::db::find_by_title_namespace(&conn, "row", "acme")
+            crate::db::find_by_title_namespace(&conn, "row", "acme", None)
                 .expect("probe")
                 .is_none(),
             "a refused promote must not land the clone in the destination"
@@ -571,7 +571,7 @@ mod tests {
             "DESTINATION owner gate must refuse; got: {err}"
         );
         assert!(
-            crate::db::find_by_title_namespace(&conn, "row-bypass", "acme3")
+            crate::db::find_by_title_namespace(&conn, "row-bypass", "acme3", None)
                 .expect("probe")
                 .is_none(),
             "must not clone"
@@ -653,7 +653,7 @@ mod tests {
             None,
         )
         .expect("open destination allows");
-        let clone_id = crate::db::find_by_title_namespace(&conn, "row3", "acme2")
+        let clone_id = crate::db::find_by_title_namespace(&conn, "row3", "acme2", None)
             .expect("probe")
             .expect("clone landed");
         let clone = crate::db::get(&conn, &clone_id)

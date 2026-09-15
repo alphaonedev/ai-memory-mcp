@@ -91,6 +91,28 @@ async fn raw(store: &PostgresStore, id: &str) -> (String, String, i64) {
     .expect("row resident")
 }
 
+/// `(id, lifecycle_state, cid, version)` — the identity columns the in-place
+/// CAS must leave byte-identical (plus the version it bumps).
+async fn identity_of(store: &PostgresStore, id: &str) -> (String, String, Option<String>, i64) {
+    sqlx::query_as::<_, (String, String, Option<String>, i64)>(
+        "SELECT id, lifecycle_state, cid, version FROM memories WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(store.pool())
+    .await
+    .expect("row")
+}
+
+async fn count_key(store: &PostgresStore, ns: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM memories WHERE title = 'slot' AND namespace = $1",
+    )
+    .bind(ns)
+    .fetch_one(store.pool())
+    .await
+    .expect("count")
+}
+
 fn conflict_id(err: &StoreError) -> &str {
     match err {
         StoreError::Conflict { id } => id.as_str(),
@@ -231,7 +253,7 @@ async fn pg_store_onto_a_hidden_holder_is_a_typed_unnamed_conflict_3695() {
         );
         assert_eq!(
             store
-                .find_by_title_namespace("slot", &ns)
+                .find_by_title_namespace("slot", &ns, None)
                 .await
                 .expect("probe"),
             None,
@@ -253,7 +275,7 @@ async fn pg_find_by_title_namespace_reports_only_the_visible_occupant_3690() {
         .expect("seed");
     assert_eq!(
         store
-            .find_by_title_namespace("slot", &ns)
+            .find_by_title_namespace("slot", &ns, None)
             .await
             .expect("probe"),
         Some(a.clone())
@@ -262,7 +284,7 @@ async fn pg_find_by_title_namespace_reports_only_the_visible_occupant_3690() {
         set_state(&store, &a, state).await;
         assert_eq!(
             store
-                .find_by_title_namespace("slot", &ns)
+                .find_by_title_namespace("slot", &ns, None)
                 .await
                 .expect("probe"),
             None,
@@ -272,7 +294,7 @@ async fn pg_find_by_title_namespace_reports_only_the_visible_occupant_3690() {
     set_state(&store, &a, "done").await;
     assert_eq!(
         store
-            .find_by_title_namespace("slot", &ns)
+            .find_by_title_namespace("slot", &ns, None)
             .await
             .expect("probe"),
         Some(a)
@@ -287,7 +309,11 @@ async fn pg_find_by_title_namespace_reports_only_the_visible_occupant_3690() {
 async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_admin("ai:curator");
-    // tombstone, no live holder → in-place merge, stays tombstoned
+    // tombstone, no live holder → in-place merge, stays tombstoned.
+    // CHARACTERISATION (#2887 / #2894 / #3690): identical to the pre-v100
+    // in-place CAS — same row, identity columns byte-identical, ONE row under
+    // the key, the arm's rewrites moved; and #2894 is NOT fixed here (the row
+    // is still hidden afterwards, as before).
     let ns = uid("ns");
     let a = uid("a");
     store
@@ -295,15 +321,34 @@ async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
         .await
         .expect("seed");
     set_state(&store, &a, "tombstoned").await;
+    let before = identity_of(&store, &a).await;
+    assert_eq!(count_key(&store, &ns).await, 1);
     let id = store
         .restore_or_conflict(&ctx, &mem(&a, &ns, "slot", "restored"))
         .await
-        .expect("same-id restore of a tombstone succeeds");
-    assert_eq!(id, a);
-    let (content, state, version) = raw(&store, &a).await;
+        .expect("same-id restore of a tombstone succeeds (it did before v100)");
+    assert_eq!(id, a, "the restore lands on the SAME row (CAS semantics)");
+    let after = identity_of(&store, &a).await;
     assert_eq!(
-        (content.as_str(), state.as_str(), version),
-        ("restored", "tombstoned", 2)
+        (&after.0, &after.1, &after.2),
+        (&before.0, &before.1, &before.2),
+        "identity columns byte-identical"
+    );
+    assert_eq!(after.1, "tombstoned", "restore never un-tombstones");
+    assert_eq!(
+        after.3,
+        before.3 + 1,
+        "the same DO UPDATE arm ran (version bumped once)"
+    );
+    assert_eq!(raw(&store, &a).await.0, "restored");
+    assert_eq!(
+        count_key(&store, &ns).await,
+        1,
+        "never a second row beside the tombstone"
+    );
+    assert!(
+        matches!(store.get(&ctx, &a).await, Err(StoreError::NotFound { .. })),
+        "#2894 is not fixed here: the restored row is still hidden (pre- and post-Unit-1 alike)"
     );
 
     // a different live row took the key → refused, naming it
@@ -495,10 +540,21 @@ async fn owner(store: &PostgresStore, id: &str) -> Option<String> {
 /// #3626 — a `(title, namespace)` merge onto an UNSTAMPED row (missing /
 /// JSON null / "") leaves it unowned on every pg create funnel that merges;
 /// a stamped row keeps its owner.
+///
+/// Viewer note (the arity ruling): an unstamped `scope=private` row is
+/// readable by NO named caller on the read lanes (`is_visible_by_fields`
+/// has no owner to match), so a NAMED caller's store onto it is refused
+/// unnamed like any occupant it cannot read — pinned first. The merge that
+/// #3626 governs is therefore exercised by the trust-all viewer
+/// (`bypass_visibility` here; raw `db::insert` / an MCP without
+/// `AI_MEMORY_AGENT_ID` on sqlite), and it must leave the row unowned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
-    let Some(store) = connect().await else { return };
-    let ctx = CallerContext::for_agent("ai:tester-3690");
+    let Some(store) = connect().await else {
+        return;
+    };
+    let named = CallerContext::for_agent("ai:tester-3690");
+    let ctx = CallerContext::for_admin("ai:substrate-3626");
     for unstamped in [
         serde_json::json!({}),
         serde_json::json!({"agent_id": null}),
@@ -510,10 +566,16 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
         let mut seed = mem(&legacy, &ns, "slot", "legacy text");
         seed.metadata = unstamped.clone();
         store.store(&ctx, &seed).await.expect("seed unstamped");
+        let err = store
+            .store(&named, &mem(&uid("claimer"), &ns, "slot", "claimed"))
+            .await
+            .expect_err("a named caller cannot read an owner-less private row: refused");
+        assert_eq!(conflict_id(&err), "", "seed {unstamped}: refused unnamed");
+        assert_eq!(raw(&store, &legacy).await.0, "legacy text");
         let id = store
             .store(&ctx, &mem(&uid("claimer"), &ns, "slot", "claimed"))
             .await
-            .expect("merge");
+            .expect("merge (trust-all viewer)");
         assert_eq!(id, legacy);
         assert_eq!(
             owner(&store, &legacy).await,
@@ -563,7 +625,7 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
     let ns = uid("ns");
     let owned = uid("owned");
     store
-        .store(&ctx, &mem(&owned, &ns, "slot", "owned text"))
+        .store(&named, &mem(&owned, &ns, "slot", "owned text"))
         .await
         .expect("seed");
     let mut other = mem(&uid("other"), &ns, "slot", "x");
@@ -574,4 +636,66 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
         Some("ai:tester-3690"),
         "existing owner wins"
     );
+}
+
+/// #3696 — pg twin of the scope axis: another agent's `scope=private` live
+/// occupant refuses a non-owner viewer typed and unnamed on `store`,
+/// `store_with_embedding`, `store_with_embedding_no_overwrite` and
+/// `store_batch`; the owner merges; the pre-check never names it to a
+/// non-owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_store_onto_another_agents_private_row_is_a_typed_unnamed_conflict_3696() {
+    let Some(store) = connect().await else { return };
+    let alice = CallerContext::for_agent("ai:alice-3696");
+    let bob = CallerContext::for_agent("ai:bob-3696");
+    let ns = uid("ns");
+    let a = uid("a");
+    let mut seed = mem(&a, &ns, "slot", "alice's text");
+    seed.metadata = serde_json::json!({ "agent_id": "ai:alice-3696", "scope": "private" });
+    store.store(&alice, &seed).await.expect("seed");
+    let mut bobs = mem(&uid("b"), &ns, "slot", "bob's text");
+    bobs.metadata = serde_json::json!({ "agent_id": "ai:bob-3696", "scope": "private" });
+
+    let err = store.store(&bob, &bobs).await.expect_err("store: refused");
+    assert_eq!(conflict_id(&err), "", "the private row is never named");
+    let err = store
+        .store_with_embedding(&bob, &bobs, None, None)
+        .await
+        .expect_err("embed: refused");
+    assert_eq!(conflict_id(&err), "");
+    let err = store
+        .store_with_embedding_no_overwrite(&bob, &bobs, None, None)
+        .await
+        .expect_err("no_overwrite: refused");
+    assert_eq!(conflict_id(&err), "");
+    let err = store
+        .store_batch(&bob, std::slice::from_ref(&bobs))
+        .await
+        .expect_err("batch: refused");
+    assert_eq!(conflict_id(&err), "");
+    assert_eq!(
+        raw(&store, &a).await,
+        ("alice's text".to_string(), "open".to_string(), 1)
+    );
+    assert_eq!(
+        store
+            .find_by_title_namespace("slot", &ns, Some("ai:bob-3696"))
+            .await
+            .expect("probe"),
+        None,
+        "bob learns nothing from the pre-check"
+    );
+    assert_eq!(
+        store
+            .find_by_title_namespace("slot", &ns, Some("ai:alice-3696"))
+            .await
+            .expect("probe"),
+        Some(a.clone())
+    );
+    // the owner's re-store still merges
+    let mut again = mem(&uid("c"), &ns, "slot", "alice v2");
+    again.metadata = serde_json::json!({ "agent_id": "ai:alice-3696", "scope": "private" });
+    let id = store.store(&alice, &again).await.expect("owner merges");
+    assert_eq!(id, a);
+    assert_eq!(raw(&store, &a).await.0, "alice v2");
 }

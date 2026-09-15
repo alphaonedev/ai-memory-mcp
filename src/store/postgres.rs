@@ -14821,6 +14821,7 @@ impl PostgresStore {
             &mut tx,
             &candidate,
             crate::storage::InsertConflictArm::Merge,
+            pg_admission_viewer(ctx),
         )
         .await
         .map_err(|e| ReflectError::Database(e.to_string()))?;
@@ -16991,29 +16992,56 @@ struct PgTitleSlotHolder {
     admission: crate::models::TitleSlotAdmission,
 }
 
-async fn pg_title_slot_holder(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// The admission is decided by THE ONE two-axis predicate
+/// [`crate::visibility::title_slot_admission`] (lifecycle + the `viewer`'s
+/// scope visibility). `executor` is the funnel's open transaction or, for the
+/// pool-level `find_by_title_namespace` probe, the pool.
+async fn pg_title_slot_holder<'e, E>(
+    executor: E,
     title: &str,
     namespace: &str,
-) -> Result<Option<PgTitleSlotHolder>, sqlx::Error> {
+    viewer: Option<&str>,
+) -> Result<Option<PgTitleSlotHolder>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let row = sqlx::query(&format!(
-        "SELECT id, version, lifecycle_state FROM memories \
+        "SELECT id, version, lifecycle_state, namespace, metadata FROM memories \
          WHERE title = $1 AND namespace = $2 AND {} LIMIT 1",
         crate::models::TITLE_SLOT_INDEX_PREDICATE
     ))
     .bind(title)
     .bind(namespace)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(executor)
     .await?;
     row.map(|r| {
+        let id: String = r.try_get("id")?;
         let state: String = r.try_get("lifecycle_state")?;
+        let ns: String = r.try_get("namespace")?;
+        let metadata: serde_json::Value = r.try_get("metadata")?;
+        let admission = crate::visibility::title_slot_admission(
+            &crate::visibility::TitleSlotOccupant {
+                id: &id,
+                namespace: &ns,
+                metadata: &metadata,
+                lifecycle_state: &state,
+            },
+            viewer,
+        );
         Ok(PgTitleSlotHolder {
-            id: r.try_get("id")?,
+            id,
             version: r.try_get("version")?,
-            admission: crate::models::LifecycleState::title_slot_admission_for(&state),
+            admission,
         })
     })
     .transpose()
+}
+
+/// #3696 — the READ-visibility identity a SAL write funnel decides admission
+/// as: the caller's own agent id, or `None` (trust-all, lifecycle axis only)
+/// for a `bypass_visibility` system principal.
+fn pg_admission_viewer(ctx: &CallerContext) -> Option<&str> {
+    (!ctx.bypass_visibility).then_some(ctx.agent_id.as_str())
 }
 
 /// #3690 — postgres twin of `crate::storage::same_id_hidden_row_under_key`:
@@ -17080,27 +17108,16 @@ async fn pg_title_slot_admission(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     memory: &Memory,
     conflict_arm: crate::storage::InsertConflictArm,
+    viewer: Option<&str>,
 ) -> StoreResult<PgTitleSlotVerdict> {
-    use crate::models::TitleSlotAdmission;
-    use crate::storage::InsertConflictArm;
-    let refused = || StoreError::Conflict { id: String::new() };
     let prior_version = pg_probe_upsert_prior_version(tx, &memory.title, &memory.namespace)
         .await
         .map_err(|e| to_store_err("probe upsert prior version", e))?;
-    let holder = pg_title_slot_holder(tx, &memory.title, &memory.namespace)
+    let holder = pg_title_slot_holder(&mut **tx, &memory.title, &memory.namespace, viewer)
         .await
         .map_err(|e| to_store_err("title-slot admission probe", e))?;
-    if holder
-        .as_ref()
-        .is_some_and(|h| h.admission == TitleSlotAdmission::Refused)
-    {
-        return Err(refused());
-    }
-    if let (InsertConflictArm::RestoreSameId, Some(h)) = (conflict_arm, &holder)
-        && h.id != memory.id
-    {
-        return Err(StoreError::Conflict { id: h.id.clone() });
-    }
+    // The same-id row under this key that is NOT the holder (hidden), read
+    // only when no live holder exists.
     let same_id_hidden = if holder.is_none() {
         pg_same_id_hidden_row_under_key(tx, memory)
             .await
@@ -17108,15 +17125,22 @@ async fn pg_title_slot_admission(
     } else {
         None
     };
-    let restore_tombstone_by_id = match (&same_id_hidden, conflict_arm) {
-        (None, _) => false,
-        (Some(row), InsertConflictArm::RestoreSameId)
-            if row.admission == TitleSlotAdmission::Free =>
-        {
-            true
-        }
-        (Some(_), _) => return Err(refused()),
+    // ONE arm × occupant matrix for all three arms on both adapters
+    // (`visibility::title_slot_disposition`); this funnel only routes.
+    let facts = crate::visibility::TitleSlotFacts {
+        holder: holder.as_ref().map(|h| (h.id.clone(), h.admission)),
+        same_id_hidden: same_id_hidden.as_ref().map(|r| r.admission),
     };
+    let restore_tombstone_by_id =
+        match crate::visibility::title_slot_disposition(conflict_arm, &memory.id, &facts) {
+            crate::visibility::TitleSlotDisposition::Proceed => false,
+            crate::visibility::TitleSlotDisposition::ProceedByPrimaryKey => true,
+            crate::visibility::TitleSlotDisposition::Refuse { named } => {
+                return Err(StoreError::Conflict {
+                    id: named.unwrap_or_default(),
+                });
+            }
+        };
     let prior_version = prior_version.or_else(|| {
         crate::config::append_only_enabled()
             .then(|| same_id_hidden.as_ref().map(|r| r.version))
@@ -21328,9 +21352,13 @@ impl MemoryStore for PostgresStore {
         // when the spine is OFF or on a fresh INSERT (no prior row). Same tx.
         // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
         // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
-        let store_verdict =
-            pg_title_slot_admission(&mut tx, memory, crate::storage::InsertConflictArm::Merge)
-                .await?;
+        let store_verdict = pg_title_slot_admission(
+            &mut tx,
+            memory,
+            crate::storage::InsertConflictArm::Merge,
+            pg_admission_viewer(ctx),
+        )
+        .await?;
         let prior_version = store_verdict.prior_version;
 
         // Upsert contract matches SQLite: `ON CONFLICT (title, namespace)`.
@@ -21854,6 +21882,7 @@ impl MemoryStore for PostgresStore {
                     &mut tx,
                     &memories[idx],
                     crate::storage::InsertConflictArm::Merge,
+                    pg_admission_viewer(ctx),
                 )
                 .await?;
             }
@@ -22446,9 +22475,13 @@ impl MemoryStore for PostgresStore {
         // a fresh INSERT. Same tx as the upsert.
         // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
         // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
-        let capture_verdict =
-            pg_title_slot_admission(&mut tx, memory, crate::storage::InsertConflictArm::Merge)
-                .await?;
+        let capture_verdict = pg_title_slot_admission(
+            &mut tx,
+            memory,
+            crate::storage::InsertConflictArm::Merge,
+            pg_admission_viewer(ctx),
+        )
+        .await?;
         let prior_version = capture_verdict.prior_version;
 
         // v0.9.0 G8 (#1825) — the L4 capture mints a genesis row, so it stamps
@@ -22838,9 +22871,13 @@ impl MemoryStore for PostgresStore {
         // a fresh INSERT. Same tx as the upsert.
         // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
         // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
-        let recover_verdict =
-            pg_title_slot_admission(&mut tx, memory, crate::storage::InsertConflictArm::Merge)
-                .await?;
+        let recover_verdict = pg_title_slot_admission(
+            &mut tx,
+            memory,
+            crate::storage::InsertConflictArm::Merge,
+            pg_admission_viewer(ctx),
+        )
+        .await?;
         let prior_version = recover_verdict.prior_version;
 
         // v0.9.0 G8 (#1825) — the L2 recovery mints a genesis row, so it
@@ -28627,6 +28664,7 @@ impl MemoryStore for PostgresStore {
             &mut tx,
             &candidate,
             crate::storage::InsertConflictArm::Merge,
+            pg_admission_viewer(ctx),
         )
         .await?;
         let consolidate_seal = seal_content_for_upsert(&mut *tx, &candidate).await?;
@@ -34114,26 +34152,16 @@ impl MemoryStore for PostgresStore {
         &self,
         title: &str,
         namespace: &str,
+        viewer: Option<&str>,
     ) -> StoreResult<Option<String>> {
-        // Mirror SQLite's `db::find_by_title_namespace`: project the id
-        // for the first live row matching `(title, namespace)`. The
-        // SAL contract is "no live row matches" → `Ok(None)`, not an
-        // error — `fetch_optional` is the right primitive.
-        let id: Option<String> = sqlx::query_scalar(
-            // #3690 / #3695 — the caller-VISIBLE occupant only (sqlite twin
-            // `storage::find_by_title_namespace`): a tombstone holds no slot
-            // and a hidden occupant is never named to the caller.
-            &format!(
-                "SELECT id FROM memories WHERE title = $1 AND namespace = $2 {} LIMIT 1",
-                crate::models::lifecycle_visible_clause("")
-            ),
-        )
-        .bind(title)
-        .bind(namespace)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| to_store_err("find_by_title_namespace", e))?;
-        Ok(id)
+        // Mirror SQLite's `db::find_by_title_namespace`: the occupant the
+        // `viewer` may READ on both axes (#3690 / #3695 / #3696), through THE
+        // ONE admission predicate; "no such row" → `Ok(None)`, not an error.
+        Ok(pg_title_slot_holder(&self.pool, title, namespace, viewer)
+            .await
+            .map_err(|e| to_store_err("find_by_title_namespace", e))?
+            .filter(|h| h.admission == crate::models::TitleSlotAdmission::Occupied)
+            .map(|h| h.id))
     }
 
     async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
@@ -34178,7 +34206,7 @@ impl MemoryStore for PostgresStore {
         // shape stays identical across backends.
         const MAX_VERSION_SUFFIX: u32 = 1024;
         if self
-            .find_by_title_namespace(base_title, namespace)
+            .find_by_title_namespace(base_title, namespace, None)
             .await?
             .is_none()
         {
@@ -34187,7 +34215,7 @@ impl MemoryStore for PostgresStore {
         for n in 2..=MAX_VERSION_SUFFIX {
             let candidate = format!("{base_title} ({n})");
             if self
-                .find_by_title_namespace(&candidate, namespace)
+                .find_by_title_namespace(&candidate, namespace, None)
                 .await?
                 .is_none()
             {
@@ -34559,7 +34587,7 @@ impl MemoryStore for PostgresStore {
         // non-entity collision lives in `find_by_title_namespace`.
         if prior.is_none() {
             if let Some(existing_id) = self
-                .find_by_title_namespace(canonical_name, namespace)
+                .find_by_title_namespace(canonical_name, namespace, None)
                 .await?
             {
                 return Err(StoreError::Conflict { id: existing_id });
@@ -35076,7 +35104,9 @@ impl PostgresStore {
         // fresh INSERT. Same tx.
         // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
         // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
-        let slot_verdict = pg_title_slot_admission(&mut tx, memory, conflict_arm).await?;
+        let slot_verdict =
+            pg_title_slot_admission(&mut tx, memory, conflict_arm, pg_admission_viewer(ctx))
+                .await?;
         let prior_version = slot_verdict.prior_version;
 
         // #1383 — same denormalisation rationale as the regular
@@ -35385,15 +35415,16 @@ impl PostgresStore {
             None => {
                 // #3695 — name only a VISIBLE occupant (a hidden one, which the
                 // merge backstop or `DO NOTHING` just refused, stays unnamed).
-                let existing = sqlx::query_scalar::<_, String>(&format!(
-                    "SELECT id FROM memories WHERE title = $1 AND namespace = $2 {}",
-                    crate::models::lifecycle_visible_clause("")
-                ))
-                .bind(&memory.title)
-                .bind(&memory.namespace)
-                .fetch_optional(&mut *tx)
+                let existing = pg_title_slot_holder(
+                    &mut *tx,
+                    &memory.title,
+                    &memory.namespace,
+                    pg_admission_viewer(ctx),
+                )
                 .await
                 .map_err(|e| to_store_err("conflict existing-id probe", e))?
+                .filter(|h| h.admission == crate::models::TitleSlotAdmission::Occupied)
+                .map(|h| h.id)
                 .unwrap_or_default();
                 return Err(StoreError::Conflict { id: existing });
             }
@@ -39254,12 +39285,12 @@ mod tests {
         );
         let id = store.store(&ctx, &mem).await.expect("store");
         let found = store
-            .find_by_title_namespace("find-target-title", &ns)
+            .find_by_title_namespace("find-target-title", &ns, None)
             .await
             .expect("find_by_title_namespace");
         assert_eq!(found.as_deref(), Some(id.as_str()));
         let missing = store
-            .find_by_title_namespace("nonexistent-title", &ns)
+            .find_by_title_namespace("nonexistent-title", &ns, None)
             .await
             .expect("find_by_title_namespace miss");
         assert!(missing.is_none());

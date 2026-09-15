@@ -4943,6 +4943,12 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// Returns `Ok(None)` when no live row matches the tuple.
     ///
+    /// #3696 — `viewer` is the caller's READ-visibility identity (the value
+    /// the read lanes resolve; `None` = single-tenant trust-all): the probe
+    /// answers only with an occupant the viewer may read on BOTH axes
+    /// (`crate::visibility::title_slot_admission`), so the `409` it feeds
+    /// never names another agent's `scope=private` row or a hidden one.
+    ///
     /// # Errors
     ///
     /// Returns `Backend` when the underlying store reports an error.
@@ -4950,6 +4956,7 @@ pub trait MemoryStore: Send + Sync {
         &self,
         _title: &str,
         _namespace: &str,
+        _viewer: Option<&str>,
     ) -> StoreResult<Option<String>> {
         Err(StoreError::UnsupportedCapability {
             capability: "FIND_BY_TITLE_NAMESPACE".to_string(),
@@ -6672,7 +6679,9 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.find_by_title_namespace("t", "ns").await.unwrap_err(),
+            s.find_by_title_namespace("t", "ns", None)
+                .await
+                .unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(

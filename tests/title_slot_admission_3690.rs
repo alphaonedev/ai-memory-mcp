@@ -76,6 +76,15 @@ fn set_state(conn: &rusqlite::Connection, id: &str, state: &str) {
     .expect("set lifecycle_state");
 }
 
+fn count_key(conn: &rusqlite::Connection, title: &str, ns: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE title = ?1 AND namespace = ?2",
+        rusqlite::params![title, ns],
+        |r| r.get(0),
+    )
+    .expect("count")
+}
+
 fn raw(conn: &rusqlite::Connection, id: &str) -> (String, String, i64) {
     conn.query_row(
         "SELECT content, lifecycle_state, version FROM memories WHERE id = ?1",
@@ -219,7 +228,7 @@ fn find_by_title_namespace_reports_only_the_visible_occupant_3690_3695() {
     let (_dir, conn) = open();
     ai_memory::db::insert(&conn, &mem("id-a", "team/ops", "slot", "x")).expect("seed");
     let probe =
-        || ai_memory::db::find_by_title_namespace(&conn, "slot", "team/ops").expect("probe");
+        || ai_memory::db::find_by_title_namespace(&conn, "slot", "team/ops", None).expect("probe");
     assert_eq!(probe().as_deref(), Some("id-a"));
     for state in ["tombstoned", "quarantined", "contaminated"] {
         set_state(&conn, "id-a", state);
@@ -260,23 +269,82 @@ fn conflict_modes_treat_a_tombstone_slot_as_free_3690() {
     );
 }
 
-/// #2887 / #3690 (vote Q3) — the idempotent same-id restore of a TOMBSTONE
-/// still merges in place: the key no longer conflicts (the tombstone is not in
-/// the partial index), so the funnel re-targets the merge at the PRIMARY KEY.
-/// The row stays tombstoned — lifecycle advances go through the typed gate.
+/// #2887 / #3690 (vote Q3) / #2894 — CHARACTERISATION: the same-id restore of
+/// a TOMBSTONE behaves EXACTLY as it did before Unit 1.
+///
+/// Before v100 the full unique index covered tombstoned rows, so the restore
+/// hit the `(title, namespace)` conflict and the CAS `DO UPDATE … WHERE
+/// memories.id = excluded.id` merged IN PLACE, leaving the row tombstoned.
+/// After v100 the tombstone is not in the partial index, no title conflict
+/// fires, and the funnel re-targets the SAME `DO UPDATE` arm at the PRIMARY
+/// KEY (`visibility::TitleSlotDisposition::ProceedByPrimaryKey`) to the SAME
+/// outcome — behaviour preservation across an index change, which is what
+/// an index change must be. So this cell asserts the old contract, field by
+/// field, rather than only the outcome: ONE row under the key before and
+/// after (never a second live row beside the tombstone); the columns the
+/// arm rewrites (content, version) moved; every identity column (id,
+/// `created_at`, `cid`, `lifecycle_state`) is byte-identical.
+///
+/// #2894 is NOT fixed by Unit 1 and must not be closed by association: the
+/// restored original is still HIDDEN afterwards (the row stays tombstoned
+/// and `get` returns nothing) — exactly as broken as before, no better and
+/// no worse. The last assertion pins that as the CURRENT, still-open state.
 #[test]
-fn restore_same_id_onto_a_tombstone_still_merges_in_place_2887_3690() {
+fn restore_same_id_onto_a_tombstone_preserves_the_pre_v100_in_place_merge_2887_2894_3690() {
     let (_dir, conn) = open();
     ai_memory::db::insert(&conn, &mem("id-a", "team/ops", "slot", "pre-tombstone")).expect("seed");
     set_state(&conn, "id-a", "tombstoned");
+    let before: (String, String, String, Option<String>, i64, String) = conn
+        .query_row(
+            "SELECT id, created_at, lifecycle_state, cid, version, content FROM memories WHERE id = 'id-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .expect("row");
+    assert_eq!(count_key(&conn, "slot", "team/ops"), 1);
+
     let id =
         ai_memory::db::insert_restore_same_id(&conn, &mem("id-a", "team/ops", "slot", "restored"))
-            .expect("same-id restore against a tombstone must succeed");
-    assert_eq!(id, "id-a");
-    let (content, state, version) = raw(&conn, "id-a");
-    assert_eq!(content, "restored");
-    assert_eq!(state, "tombstoned", "restore never un-tombstones");
-    assert_eq!(version, 2, "the same DO UPDATE arm ran (version bumped)");
+            .expect("same-id restore against a tombstone must succeed (it did before v100)");
+    assert_eq!(
+        id, "id-a",
+        "the restore lands on the SAME row (CAS semantics)"
+    );
+
+    let after: (String, String, String, Option<String>, i64, String) = conn
+        .query_row(
+            "SELECT id, created_at, lifecycle_state, cid, version, content FROM memories WHERE id = 'id-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .expect("row");
+    // identity columns byte-identical (the pre-v100 in-place CAS contract)
+    assert_eq!(
+        (&after.0, &after.1, &after.2, &after.3),
+        (&before.0, &before.1, &before.2, &before.3)
+    );
+    assert_eq!(
+        after.2, "tombstoned",
+        "restore never un-tombstones (pre-v100 kept memories.lifecycle_state)"
+    );
+    // the arm's rewrites moved
+    assert_eq!(after.5, "restored");
+    assert_eq!(
+        after.4,
+        before.4 + 1,
+        "the same DO UPDATE arm ran (version bumped exactly once)"
+    );
+    // ONE row under the key — the second-live-row hazard of the partial index does not occur
+    assert_eq!(
+        count_key(&conn, "slot", "team/ops"),
+        1,
+        "never a second row beside the tombstone"
+    );
+    // #2894 — STILL OPEN: the restored original remains hidden from get.
+    assert!(
+        ai_memory::db::get(&conn, "id-a").expect("get").is_none(),
+        "#2894 is not fixed here: the restored row is still hidden (pre- and post-Unit-1 alike)"
+    );
 }
 
 /// #3690 (vote Q3) — a restore whose key is now held by a DIFFERENT live row
@@ -330,4 +398,128 @@ fn merge_store_reusing_a_tombstones_id_is_refused_not_absorbed_3690() {
         .expect_err("a merge into a tombstone is refused");
     assert_eq!(conflict(&err).existing_id, "");
     assert_eq!(raw(&conn, "id-a").0, "old");
+}
+
+// ───────────────────────────────────────────────────────────────────
+// #3696 / #3712 — the SECOND axis: an occupant the viewer cannot READ
+// ───────────────────────────────────────────────────────────────────
+
+fn private_row_of(owner: &str, id: &str, title: &str, content: &str) -> Memory {
+    let mut m = mem(id, "team/ops", title, content);
+    m.metadata = serde_json::json!({ "agent_id": owner, "scope": "private" });
+    m
+}
+
+/// #3696 — a LIVE occupant that is another agent's `scope=private` row:
+/// the merge arm refuses typed and UNNAMED for a viewer who cannot read it;
+/// the owner and the trust-all posture still merge as before.
+#[test]
+fn store_onto_another_agents_private_row_is_a_typed_unnamed_conflict_3696() {
+    let (_dir, conn) = open();
+    ai_memory::db::insert(
+        &conn,
+        &private_row_of("ai:alice", "id-a", "slot", "alice's text"),
+    )
+    .expect("seed");
+    // bob (Some viewer, not the owner): refused, unnamed, row untouched
+    let err = ai_memory::db::insert_as(
+        &conn,
+        &private_row_of("ai:bob", "id-b", "slot", "bob's text"),
+        Some("ai:bob"),
+    )
+    .expect_err("bob cannot read alice's private row, so the merge is refused");
+    assert_eq!(
+        conflict(&err).existing_id,
+        "",
+        "the private row is never named"
+    );
+    assert_eq!(
+        raw(&conn, "id-a"),
+        ("alice's text".to_string(), "open".to_string(), 1)
+    );
+    let err = ai_memory::db::insert_no_overwrite_as(
+        &conn,
+        &private_row_of("ai:bob", "id-c", "slot", "x"),
+        Some("ai:bob"),
+    )
+    .expect_err("the no-overwrite arm is refused too");
+    assert_eq!(conflict(&err).existing_id, "");
+    // the OWNER merges (legacy dedup), and so does the trust-all posture
+    let id = ai_memory::db::insert_as(
+        &conn,
+        &private_row_of("ai:alice", "id-d", "slot", "alice v2"),
+        Some("ai:alice"),
+    )
+    .expect("the owner's re-store merges");
+    assert_eq!(id, "id-a");
+    assert_eq!(raw(&conn, "id-a").0, "alice v2");
+    let id = ai_memory::db::insert(
+        &conn,
+        &private_row_of("ai:bob", "id-e", "slot", "trust-all"),
+    )
+    .expect("viewer None is the single-tenant trust-all posture");
+    assert_eq!(id, "id-a");
+}
+
+/// #3696 — the `on_conflict` pre-check never hands another agent's private
+/// row's id to the viewer; the owner and trust-all still see it.
+#[test]
+fn find_by_title_namespace_never_names_another_agents_private_row_3696() {
+    let (_dir, conn) = open();
+    ai_memory::db::insert(&conn, &private_row_of("ai:alice", "id-a", "slot", "x")).expect("seed");
+    let probe = |viewer: Option<&str>| {
+        ai_memory::db::find_by_title_namespace(&conn, "slot", "team/ops", viewer).expect("probe")
+    };
+    assert_eq!(probe(Some("ai:bob")), None, "bob learns nothing");
+    assert_eq!(
+        probe(Some("ai:alice")).as_deref(),
+        Some("id-a"),
+        "the owner sees it"
+    );
+    assert_eq!(probe(None).as_deref(), Some("id-a"), "trust-all sees it");
+}
+
+/// #3712 — the near-duplicate refusal on store is neither triggered by nor
+/// names another agent's private memory; the same row still refuses its
+/// owner (and trust-all).
+#[test]
+fn proactive_conflict_never_refuses_on_another_agents_private_row_3712() {
+    let (_dir, conn) = open();
+    let claim = "the deploy uses canary health checks before traffic shifts to the new replica set";
+    let mut alice = private_row_of("ai:alice", "id-a", "alice-private", claim);
+    alice.metadata["scope"] = serde_json::Value::String("private".into());
+    ai_memory::db::insert(&conn, &alice).expect("seed");
+    let emb: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+    ai_memory::db::set_embedding(&conn, "id-a", &emb, "test#none").expect("embed");
+    let probe = mem(
+        "probe",
+        "team/ops",
+        "bob-store",
+        &format!("{claim} and rolls back on failure"),
+    );
+    let ids = ["id-a".to_string()];
+    assert!(
+        ai_memory::db::proactive_conflict_check(&conn, &probe, &emb, Some("ai:bob"))
+            .expect("scan")
+            .is_none(),
+        "bob's store is never refused on alice's private row"
+    );
+    assert!(
+        ai_memory::db::proactive_conflict_check_candidates(
+            &conn,
+            &probe,
+            &emb,
+            &ids,
+            Some("ai:bob")
+        )
+        .expect("ann")
+        .is_none(),
+        "the ANN-routed lane never names alice's private row to bob"
+    );
+    for viewer in [Some("ai:alice"), None] {
+        let hit = ai_memory::db::proactive_conflict_check(&conn, &probe, &emb, viewer)
+            .expect("scan")
+            .expect("the owner / trust-all still get the advisory");
+        assert_eq!(hit.existing_id, "id-a");
+    }
 }

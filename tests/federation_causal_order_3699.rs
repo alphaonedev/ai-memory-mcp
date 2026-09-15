@@ -4,7 +4,7 @@
 //! v1.0.0 Consolidation Unit 1 — #3699 (federation out-of-order delivery),
 //! 5-agent vote 4d3ea1c5 option (a): the `/sync/push` receive loop applies
 //! one body's `memories[]` in CAUSAL order (`updated_at`, `id`) on BOTH
-//! backends, and a cross-id `(title, namespace)` merge is counted + WARNed.
+//! backends, and a cross-id `(title, namespace)` merge is counted + warned.
 //!
 //! The shape: the peer still holds source A LIVE (title T). Origin has
 //! consolidated A (A is a TOMBSTONE, same id, same title) and then stored a
@@ -105,6 +105,7 @@ enum Backend {
 
 /// A production router over the chosen backend plus the SAL handle the
 /// assertions read through.
+#[allow(clippy::unused_async)] // the pg arm awaits; the sqlite arm does not
 async fn router(backend: &Backend) -> (axum::Router, Arc<dyn MemoryStore>, Db) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(Mutex::new((
@@ -237,6 +238,7 @@ async fn push(router: &axum::Router, peer: &str, memories: Vec<Value>) -> (Statu
 
 /// `(content, lifecycle_state)` of a row by id on the backend the router
 /// wrote to, or `None` when no row carries the id.
+#[allow(unused_variables)] // `store` is read by the pg arm only
 async fn raw(
     backend: &Backend,
     db: &Db,
@@ -274,6 +276,7 @@ async fn raw(
 
 /// Seed the peer-side LIVE source A directly on the backend (the state
 /// before the consolidation push reaches this node).
+#[allow(unused_variables)] // `store` is read by the pg arm only
 async fn seed_live_a(
     backend: &Backend,
     db: &Db,

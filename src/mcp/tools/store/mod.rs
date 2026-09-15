@@ -981,9 +981,16 @@ fn handle_store_inner(
             // #1579 A5 — HNSW-routed candidate pool (O(log N)) with a
             // bounded-scan fallback; see
             // `db::proactive_conflict_check_with_index`.
-            if let Ok(Some(conflict)) =
-                db::proactive_conflict_check_with_index(conn, &mem, &query_embedding, vector_index)
-            {
+            if let Ok(Some(conflict)) = db::proactive_conflict_check_with_index(
+                conn,
+                &mem,
+                &query_embedding,
+                vector_index,
+                // #3712 — as the ENFORCED-read caller (the MCP read lanes'
+                // own viewer): an invisible near-duplicate never refuses
+                // the write nor is named in the refusal.
+                crate::identity::resolve_read_visibility_caller().as_deref(),
+            ) {
                 tracing::info!(
                     target: "memory_store",
                     namespace = %mem.namespace,
@@ -1047,10 +1054,14 @@ fn handle_store_inner(
     // stdio is sqlite-only per #1675, so `db::insert_no_overwrite` is the
     // path). `merge`/`version` keep the legacy `db::insert` upsert (merge =
     // opt-in upsert; version already suffixed the title to a free slot above).
+    // #3696 — the write's admission runs as the ENFORCED-read caller (the
+    // same viewer every MCP read lane resolves), so a `(title, namespace)`
+    // holder this caller cannot read is refused typed and unnamed.
+    let store_viewer = crate::identity::resolve_read_visibility_caller();
     let insert_result = if matches!(on_conflict, OnConflict::Error) {
-        db::insert_no_overwrite(conn, &mem)
+        db::insert_no_overwrite_as(conn, &mem, store_viewer.as_deref())
     } else {
-        db::insert(conn, &mem)
+        db::insert_as(conn, &mem, store_viewer.as_deref())
     };
     let actual_id = match insert_result {
         Ok(id) => id,
