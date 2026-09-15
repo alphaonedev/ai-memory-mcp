@@ -12,7 +12,7 @@ use std::path::Path;
 
 /// Sites whose error is OUR OWN closed vocabulary, not foreign text.
 ///
-/// Bound to the EXACT line, not a file:line pair: a line number rots on the
+/// Bound to the EXACT line, not a `file:line` pair: a line number rots on the
 /// next edit above it, and a whole-file exemption would hide a real leak added
 /// later in the same file. If the text changes at all the pin re-fires and the
 /// reason has to be re-argued — which is the point.
