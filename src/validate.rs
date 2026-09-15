@@ -8,7 +8,7 @@ use crate::models::{
     UpdateMemory, VALID_AGENT_TYPES, VALID_SCOPES,
 };
 
-const MAX_TITLE_LEN: usize = 512;
+pub(crate) const MAX_TITLE_LEN: usize = 512;
 /// Max characters in a namespace string (post-Task 1.4).
 /// Flat namespaces still fit in the historical 128 budget; 512 is the ceiling
 /// for hierarchical paths like `a/b/c/…` up to 8 levels deep.
