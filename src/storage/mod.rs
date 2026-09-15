@@ -18343,6 +18343,23 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // against the write-lock-held pre-image so it cannot diverge from the
         // live `CASE`). Mirrors the create-funnel #2948 wiring; the superseded
         // pre-merge content lives only in the row it replaced, never in the leaf.
+        // #3699 (5-agent vote 4d3ea1c5) — a CROSS-ID title merge (the inbound
+        // id was folded into a local row of a different id, and will never
+        // exist here) is counted and WARNed, never silent inside a 200: on a
+        // consolidating fleet it is the signature of a memory delivered before
+        // the tombstone that freed its title (see `federation::causal_apply_order`).
+        if actual_id != mem.id {
+            crate::metrics::inc_fed_cross_id_title_merge();
+            tracing::warn!(
+                target: crate::federation::CROSS_ID_TITLE_MERGE_TARGET,
+                inbound_id = %mem.id,
+                local_id = %actual_id,
+                namespace = %mem.namespace,
+                "federation newer-wins merge folded an inbound memory into a local row of a \
+                 different id under the same (title, namespace); the inbound id is not \
+                 created on this node (#3699)"
+            );
+        }
         emit_federation_newer_wins_supersede_leaf_if_enabled(
             conn,
             merge_preimage.as_ref(),

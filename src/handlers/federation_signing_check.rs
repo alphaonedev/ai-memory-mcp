@@ -302,7 +302,11 @@ pub(super) async fn sync_push_via_store(
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
-    let mut attestation_rejections = Vec::new();
+    // #3699 — wire index carried per item; rendered back in wire order.
+    let mut attestation_rejections: Vec<(
+        usize,
+        crate::handlers::federation_receive::InboundAttestationRejection,
+    )> = Vec::new();
     let mut deleted = 0usize;
     let mut links_applied = 0usize;
     let mut latest_seen: Option<String> = None;
@@ -377,7 +381,10 @@ pub(super) async fn sync_push_via_store(
             peer_header_owned.as_deref(),
             &attest_cfg,
         );
-    for mem in &body.memories {
+    // #3699 (5-agent vote 4d3ea1c5) — apply in CAUSAL order (updated_at, id)
+    // so a consolidation tombstone in this body lands BEFORE a new memory
+    // that reuses its freed title; see `federation::causal_apply_order`.
+    for (wire_idx, mem) in crate::federation::causal_apply_order(&body.memories) {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
             skipped += 1;
@@ -549,7 +556,8 @@ pub(super) async fn sync_push_via_store(
             // (`federation_receive::report_inbound_attestation_rejection`), so
             // the cause taxonomy, the WARN fields and the response entry cannot
             // drift between backends.
-            attestation_rejections.push(
+            attestation_rejections.push((
+                wire_idx,
                 crate::handlers::federation_receive::report_inbound_attestation_rejection(
                     &to_insert,
                     &attribute_agent,
@@ -558,7 +566,7 @@ pub(super) async fn sync_push_via_store(
                     crate::handlers::StorageBackend::Postgres,
                     &e,
                 ),
-            );
+            ));
             skipped += 1;
             continue;
         }
@@ -838,7 +846,7 @@ pub(super) async fn sync_push_via_store(
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
-                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
+                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): crate::handlers::federation_receive::rejections_in_wire_order(&attestation_rejections),
                 "reset_at": reset_at,
                 (field_names::STORAGE_BACKEND): "postgres",
             })),
@@ -2086,7 +2094,7 @@ pub(super) async fn sync_push_via_store(
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
-            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
+            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): crate::handlers::federation_receive::rejections_in_wire_order(&attestation_rejections),
             (crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD): unsupported_on_postgres,
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
