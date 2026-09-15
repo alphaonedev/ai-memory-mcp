@@ -8503,8 +8503,8 @@ impl PostgresStore {
         let upd_agent_id = retained_seal_agent_id
             .as_deref()
             .unwrap_or_else(|| metadata_agent_id_slot(&governed.metadata).unwrap_or_default());
-        let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
-            .map_err(at_rest_seal_err)?;
+        let upd_sealed =
+            seal_content_guarded(&mut *tx, upd_effective_content, upd_agent_id).await?;
         // When sealing, write the placeholder verbatim into `content`
         // (Some); when not sealing, bind None so the SQL COALESCE keeps the
         // patch-or-stored plaintext exactly as before.
@@ -9147,7 +9147,8 @@ impl PostgresStore {
         // new_content`, its metadata preserves the row's `agent_id`). This is
         // a fresh-id INSERT with NO ON CONFLICT arm, so only the column + bind
         // are needed.
-        let (supersede_content, supersede_envelope) = seal_content_for_insert(&candidate)?;
+        let (supersede_content, supersede_envelope) =
+            seal_content_for_insert(&mut *tx, &candidate).await?;
         sqlx::query(
             "INSERT INTO memories
                 (id, tier, namespace, title, content, tags, priority, confidence,
@@ -14410,8 +14411,14 @@ impl PostgresStore {
                         crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
                         return Ok(None);
                     }
+                    // #3718 — an ABSENT key renders as its class, never as a
+                    // wrong-recipient "decrypt failed", and never with a path.
                     return Err(StoreError::IntegrityFailed {
-                        detail: format!("decrypt failed for memory {}: {e}", memory.id),
+                        detail: format!(
+                            "{} for memory {}",
+                            crate::encryption::read_failure_detail(&e),
+                            memory.id
+                        ),
                     });
                 }
             }
@@ -17115,6 +17122,52 @@ fn at_rest_seal_err(e: impl std::fmt::Display) -> StoreError {
     }
 }
 
+/// #3718 (review) — how many rows owned by `$1` are sealed at rest. The owner
+/// of an envelope is the row's `metadata.agent_id` (the id the content was
+/// keyed to — see [`retained_agent_id_for_upsert`]).
+const SQL_COUNT_SEALED_ROWS_FOR_AGENT: &str = "SELECT COUNT(*) FROM memories \
+     WHERE encrypted_envelope IS NOT NULL AND metadata->>'agent_id' = $1";
+
+/// #3718 (review) — the postgres twin of `storage::seal_content_guarded`:
+/// seal `content` for `agent_id` WITHOUT forking the key generation. When
+/// at-rest encryption is on and no live key is loadable for `agent_id`, the
+/// seal path is the one place a key may be minted — but only for a genuinely
+/// fresh agent. An agent that already has sealed rows and no key has LOST its
+/// key (or the key directory was wiped); minting would strand every existing
+/// row behind a key nobody holds. This probes the sealed-row count for exactly
+/// that case and refuses with the typed
+/// [`crate::encryption::SealRefusedSealedRowsExist`] naming the count; the
+/// expected key path goes to the operator log. Every postgres seal path goes
+/// through here — `crate::encryption::seal_content` is never called directly
+/// from this module.
+///
+/// # Errors
+/// [`StoreError::IntegrityFailed`] carrying the sealed-rows refusal, the key
+/// directory being unreadable, or the seal itself failing; a backend error
+/// from the count.
+async fn seal_content_guarded(
+    conn: &mut sqlx::PgConnection,
+    content: &str,
+    agent_id: &str,
+) -> StoreResult<Option<(Vec<u8>, String)>> {
+    if crate::encryption::seal_would_mint(content, agent_id).map_err(at_rest_seal_err)? {
+        let sealed_rows: i64 = sqlx::query_scalar(SQL_COUNT_SEALED_ROWS_FOR_AGENT)
+            .bind(agent_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| to_store_err("count sealed rows before minting an at-rest key", e))?;
+        if sealed_rows > 0 {
+            return Err(at_rest_seal_err(
+                crate::encryption::seal_refusal_for_sealed_rows(
+                    agent_id,
+                    u64::try_from(sealed_rows).unwrap_or(0),
+                ),
+            ));
+        }
+    }
+    crate::encryption::seal_content(content, agent_id).map_err(at_rest_seal_err)
+}
+
 /// #2292 — shared at-rest content-seal computation for the postgres content-
 /// write funnels that mint or rewrite a `memories` row via a bespoke
 /// INSERT/UPDATE rather than routing through [`PostgresStore::store`]. Extracts
@@ -17142,14 +17195,16 @@ fn at_rest_seal_err(e: impl std::fmt::Display) -> StoreError {
 /// # Errors
 /// [`StoreError::IntegrityFailed`] when [`crate::encryption::seal_content`]
 /// fails (enabled gate with no `agent_id`, or an AEAD seal failure).
-fn seal_content_for_insert(memory: &Memory) -> StoreResult<(String, Option<Vec<u8>>)> {
+async fn seal_content_for_insert(
+    conn: &mut sqlx::PgConnection,
+    memory: &Memory,
+) -> StoreResult<(String, Option<Vec<u8>>)> {
     let agent_id = memory
         .metadata
         .get("agent_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let sealed =
-        crate::encryption::seal_content(&memory.content, agent_id).map_err(at_rest_seal_err)?;
+    let sealed = seal_content_guarded(conn, &memory.content, agent_id).await?;
     Ok(match sealed {
         // `placeholder` is the empty string `seal_content` returns alongside
         // the envelope; the ciphertext lives in `encrypted_envelope`.
@@ -17179,9 +17234,12 @@ impl UpsertSeal {
     /// [`StoreError::IntegrityFailed`] when the seal fails — in particular an
     /// enabled gate over a row that retains NO agent id has no recipient key,
     /// and refusing is strictly better than a silent plaintext store.
-    fn seal(memory: &Memory, sealed_under: String) -> StoreResult<Self> {
-        let sealed = crate::encryption::seal_content(&memory.content, &sealed_under)
-            .map_err(at_rest_seal_err)?;
+    async fn seal(
+        conn: &mut sqlx::PgConnection,
+        memory: &Memory,
+        sealed_under: String,
+    ) -> StoreResult<Self> {
+        let sealed = seal_content_guarded(conn, &memory.content, &sealed_under).await?;
         Ok(match sealed {
             Some((envelope, placeholder)) => Self {
                 content_to_store: placeholder,
@@ -17277,7 +17335,7 @@ async fn seal_content_for_upsert(
     memory: &Memory,
 ) -> StoreResult<UpsertSeal> {
     let sealed_under = retained_agent_id_for_upsert(conn, memory).await?;
-    UpsertSeal::seal(memory, sealed_under)
+    UpsertSeal::seal(conn, memory, sealed_under).await
 }
 
 /// v1.0.0 #2383 (N1) — BATCHED twin of [`seal_content_for_upsert`] for the
@@ -17297,17 +17355,20 @@ async fn seal_content_for_upsert_batch(
 ) -> StoreResult<Vec<UpsertSeal>> {
     if !crate::encryption::encryption_enabled(None) {
         // Encryption off: no lookup, no envelope — byte-identical to pre-#2383.
-        return memories
-            .iter()
-            .map(|memory| {
+        let mut seals = Vec::with_capacity(memories.len());
+        for memory in memories {
+            seals.push(
                 UpsertSeal::seal(
+                    &mut *conn,
                     memory,
                     metadata_agent_id_slot(&memory.metadata)
                         .unwrap_or_default()
                         .to_string(),
                 )
-            })
-            .collect();
+                .await?,
+            );
+        }
+        return Ok(seals);
     }
     let titles: Vec<String> = memories.iter().map(|m| m.title.clone()).collect();
     let namespaces: Vec<String> = memories.iter().map(|m| m.namespace.clone()).collect();
@@ -17330,18 +17391,17 @@ async fn seal_content_for_upsert_batch(
         .filter(|(_, _, has_key, _)| *has_key)
         .map(|(title, namespace, _, agent)| ((title, namespace), agent.unwrap_or_default()))
         .collect();
-    memories
-        .iter()
-        .map(|memory| {
-            let key = (memory.title.clone(), memory.namespace.clone());
-            let sealed_under = retained_by_key.get(&key).cloned().unwrap_or_else(|| {
-                metadata_agent_id_slot(&memory.metadata)
-                    .unwrap_or_default()
-                    .to_string()
-            });
-            UpsertSeal::seal(memory, sealed_under)
-        })
-        .collect()
+    let mut seals = Vec::with_capacity(memories.len());
+    for memory in memories {
+        let key = (memory.title.clone(), memory.namespace.clone());
+        let sealed_under = retained_by_key.get(&key).cloned().unwrap_or_else(|| {
+            metadata_agent_id_slot(&memory.metadata)
+                .unwrap_or_default()
+                .to_string()
+        });
+        seals.push(UpsertSeal::seal(&mut *conn, memory, sealed_under).await?);
+    }
+    Ok(seals)
 }
 
 /// v1.0.0 #2383 (N1) — post-write backstop enforcing the invariant "a non-NULL
@@ -17408,8 +17468,7 @@ async fn reconcile_envelope_owner_known(
     // Re-seal the SAME plaintext under the retained identity. `seal_content`
     // fails closed on an empty retained id, rolling the enclosing transaction
     // back rather than leaving an unreadable row on disk.
-    let repaired =
-        crate::encryption::seal_content(plaintext, retained).map_err(at_rest_seal_err)?;
+    let repaired = seal_content_guarded(&mut *conn, plaintext, retained).await?;
     let Some((repaired_envelope, placeholder)) = repaired else {
         return Err(StoreError::IntegrityFailed {
             detail: format!(
@@ -23552,8 +23611,8 @@ impl MemoryStore for PostgresStore {
         let upd_agent_id = retained_seal_agent_id
             .as_deref()
             .unwrap_or_else(|| metadata_agent_id_slot(&governed.metadata).unwrap_or_default());
-        let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
-            .map_err(at_rest_seal_err)?;
+        let upd_sealed =
+            seal_content_guarded(&mut *tx, upd_effective_content, upd_agent_id).await?;
         // When sealing, write the placeholder into `content` (Some); when not
         // sealing, bind None so the SQL COALESCE keeps the patch-or-stored
         // plaintext. `or_else(patch.content)` preserves an off-gate content
@@ -25281,8 +25340,6 @@ impl MemoryStore for PostgresStore {
         // `merge_memory` already resolved every field, so the sealed content +
         // envelope are written verbatim (no CASE); mirrors the in-place
         // `update()` seal at ~4947.
-        let (merge_content, merge_envelope) = seal_content_for_insert(&merged)?;
-
         // Full-row UPDATE by id — every column is written verbatim from
         // the already-resolved merged row (NO CASE / GREATEST / COALESCE
         // re-application; `merge_memory` resolved every field). Wrapped in
@@ -25292,6 +25349,7 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        let (merge_content, merge_envelope) = seal_content_for_insert(&mut *tx, &merged).await?;
         sqlx::query(
             "UPDATE memories SET
                 tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
