@@ -423,12 +423,16 @@ fn handle_namespace_set_standard_inner(
         },
         "namespace_set_standard",
         "",
-        serde_json::json!({
-            "namespace": namespace,
-            (field_names::STANDARD_ID): id,
-            "parent": parent,
-            "has_governance": params.get(param_names::GOVERNANCE).is_some_and(|v| !v.is_null()),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("namespace", namespace)
+            .ident(field_names::STANDARD_ID, id)
+            .opt_ident("parent", parent)
+            .flag(
+                "has_governance",
+                params
+                    .get(param_names::GOVERNANCE)
+                    .is_some_and(|v| !v.is_null()),
+            ),
     );
     if let Some(msg) = bind_refusal {
         return Err(msg);
@@ -733,7 +737,7 @@ fn record_clear_refusal(caller: &str, namespace: &str) {
         "refuse",
         AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        serde_json::json!({ "namespace": namespace }),
+        crate::governance::audit::ForensicPayload::new().ident("namespace", namespace),
     );
 }
 
@@ -884,7 +888,7 @@ fn handle_namespace_clear_standard_inner(
         "allow",
         AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        serde_json::json!({ "namespace": namespace }),
+        crate::governance::audit::ForensicPayload::new().ident("namespace", namespace),
     );
 
     let cleared = db::clear_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;

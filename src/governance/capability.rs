@@ -1047,13 +1047,12 @@ pub fn audit_grant_outcome(req: &CapRequest, base_kind: &'static str, outcome: &
                 "allow",
                 AUDIT_KIND_GRANT,
                 root_id,
-                serde_json::json!({
-                    "issuer": issuer,
-                    "op_level": op_level.as_str(),
-                    "namespace": req.namespace,
-                    "action": req.action,
-                    "flipped_from": base_kind,
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("issuer", issuer)
+                    .label("op_level", op_level.as_str())
+                    .ident("namespace", &req.namespace)
+                    .ident("action", &req.action)
+                    .label("flipped_from", base_kind),
             );
         }
         GrantOutcome::Rejected(rej) => {
@@ -1062,11 +1061,10 @@ pub fn audit_grant_outcome(req: &CapRequest, base_kind: &'static str, outcome: &
                 base_kind,
                 AUDIT_KIND_REJECT,
                 rej.code(),
-                serde_json::json!({
-                    "namespace": req.namespace,
-                    "action": req.action,
-                    "reason": rej.to_string(),
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("namespace", &req.namespace)
+                    .ident("action", &req.action)
+                    .commit("reason", &rej.to_string()),
             );
         }
     }
@@ -1203,7 +1201,7 @@ pub fn parse_presented_token(
                 "deny",
                 AUDIT_KIND_REJECT,
                 rej.code(),
-                serde_json::json!({ "stage": "edge-parse" }),
+                crate::governance::audit::ForensicPayload::new().label("stage", "edge-parse"),
             );
             Err(rej)
         }

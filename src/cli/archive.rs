@@ -212,10 +212,9 @@ pub fn run(
                 "allow",
                 crate::governance::action_labels::ARCHIVE_PURGE,
                 "",
-                serde_json::json!({
-                    (field_names::OLDER_THAN_DAYS): older_than_days,
-                    "namespace": namespace,
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .opt_number(field_names::OLDER_THAN_DAYS, older_than_days)
+                    .opt_ident("namespace", namespace.as_deref()),
             );
 
             let purged = db::purge_archive_scoped(&conn, namespace.as_deref(), older_than_days)?;

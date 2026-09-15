@@ -155,10 +155,9 @@ pub async fn register_agent(
                 "deny",
                 crate::governance::action_labels::REGISTER_AGENT,
                 "",
-                json!({
-                    "target_agent_id": body.agent_id,
-                    "outcome": "cross_register_requires_admin",
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("target_agent_id", &body.agent_id)
+                    .label("outcome", "cross_register_requires_admin"),
             );
             return resp;
         }
@@ -176,7 +175,8 @@ pub async fn register_agent(
             "deny",
             crate::governance::action_labels::REGISTER_AGENT,
             "",
-            json!({"outcome": "self_register_requires_attested_identity"}),
+            crate::governance::audit::ForensicPayload::new()
+                .label("outcome", "self_register_requires_attested_identity"),
         );
         return resp;
     }
@@ -188,12 +188,11 @@ pub async fn register_agent(
         "allow",
         crate::governance::action_labels::REGISTER_AGENT,
         "",
-        json!({
-            "new_agent_id": body.agent_id,
-            (field_names::AGENT_TYPE): body.agent_type,
-            (field_names::CAPABILITIES): capabilities,
-            "self_register": body.agent_id == caller,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("new_agent_id", &body.agent_id)
+            .ident(field_names::AGENT_TYPE, &body.agent_type)
+            .idents(field_names::CAPABILITIES, &capabilities)
+            .flag("self_register", body.agent_id == caller),
     );
 
     // v0.7.0 Wave-3 Continuation 3 — postgres-backed daemons route the
@@ -320,18 +319,17 @@ fn record_pubkey_bind_decision(
     decision: &str,
     agent_id: &str,
     pubkey_b64: &str,
-    reason: &str,
+    reason: &'static str,
 ) {
     crate::governance::audit::record_decision(
         caller,
         decision,
         BIND_AGENT_PUBKEY_ACTION,
         "#3464",
-        json!({
-            "agent_id": agent_id,
-            "pubkey_b64": pubkey_b64,
-            "reason": reason,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("agent_id", agent_id)
+            .ident("pubkey_b64", pubkey_b64)
+            .label("reason", reason),
     );
 }
 
@@ -949,7 +947,13 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     // forensic-chain entry MUST land before the storage write so the
     // audit trail captures the operator who triggered the sweep even
     // when the downstream collector errors.
-    crate::governance::audit::record_decision(&caller, "allow", "run_gc", "", json!({}));
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "run_gc",
+        "",
+        crate::governance::audit::ForensicPayload::new(),
+    );
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 17) — postgres-backed daemons
     // route through the SAL trait. Returns the same `{expired_deleted}`
@@ -1197,10 +1201,9 @@ pub async fn import_memories(
         "allow",
         "import_memories",
         "",
-        json!({
-            "memory_count": body.memories.len(),
-            "link_count": body.links.as_ref().map(Vec::len).unwrap_or(0),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .number("memory_count", body.memories.len())
+            .number("link_count", body.links.as_ref().map_or(0, Vec::len)),
     );
 
     // v0.9.0 G10.1 (#1827) — edge-parse the optional

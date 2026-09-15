@@ -924,7 +924,7 @@ pub async fn delete_memory(
         "allow",
         crate::mcp::registry::tool_names::MEMORY_DELETE,
         "",
-        json!({ "id": &id }),
+        crate::governance::audit::ForensicPayload::new().ident("id", &id),
     );
 
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the

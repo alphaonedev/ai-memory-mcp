@@ -57,11 +57,10 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
         "allow",
         crate::governance::action_labels::REGISTER_AGENT,
         "",
-        json!({
-            "new_agent_id": agent_id,
-            (field_names::AGENT_TYPE): agent_type,
-            (field_names::CAPABILITIES): &capabilities,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("new_agent_id", agent_id)
+            .ident(field_names::AGENT_TYPE, agent_type)
+            .idents(field_names::CAPABILITIES, &capabilities),
     );
 
     let id =

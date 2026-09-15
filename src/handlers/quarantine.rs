@@ -166,7 +166,7 @@ pub async fn release_quarantined(
         "allow",
         RELEASE_ENDPOINT,
         "",
-        json!({ "id": id }),
+        crate::governance::audit::ForensicPayload::new().ident("id", &id),
     );
 
     #[cfg(feature = "sal")]
