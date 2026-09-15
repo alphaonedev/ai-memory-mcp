@@ -78,6 +78,15 @@ pub mod error_codes {
     pub const ARCHIVE_RESTORE_COLLISION: &str = "ARCHIVE_RESTORE_COLLISION";
     pub const ARCHIVE_SUPERSEDE_FAILED: &str = "ARCHIVE_SUPERSEDE_FAILED";
     pub const SQLCIPHER_MISSING_PASSPHRASE: &str = "SQLCIPHER_MISSING_PASSPHRASE";
+    /// v1.0.0 #3426 — the ONE closed-vocabulary slug every cross-owner
+    /// authorization refusal on the HTTP surface carries (memory update /
+    /// delete / promote, link create / delete, kg timeline / invalidate),
+    /// rendered by `handlers::parity::owner_gate_refusal`. A refusal body is
+    /// `{error, code, caller, <id>}` and NEVER names the owning agent: the
+    /// owner is a server-side `AUTHZ_TRACE_TARGET` concern (TIER 2 audience),
+    /// not a wire concern — pre-#3426 the `"owner"` field was a cross-tenant
+    /// identity oracle for any caller holding a row id it was not entitled to.
+    pub const NOT_OWNER: &str = "NOT_OWNER";
 
     /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
     /// exceed the materialised-prefix budget
@@ -252,6 +261,12 @@ pub mod msg {
     /// four MCP mutation handlers (the HTTP twin lives in
     /// `handlers::parity::require_caller_owns_memory`).
     pub const CALLER_DOES_NOT_OWN_MEMORY: &str = "caller does not own this memory";
+    /// #939 / #3426 — the symmetric link-DELETE owner-gate refusal (either
+    /// endpoint's owner may sever an edge; a caller owning neither is
+    /// refused). Hoisted from the two `DELETE /api/v1/links` branches so the
+    /// wire string is one named const, byte-identical on both backends.
+    pub const CALLER_NOT_LINK_ENDPOINT_OWNER: &str =
+        "caller does not own either endpoint of this link";
 
     // ---- validation -------------------------------------------------------------
     pub const FORGET_FILTER_REQUIRED: &str =
@@ -441,6 +456,7 @@ mod arch_9_slug_tests {
         assert_eq!(AMBIGUOUS_ID_PREFIX, "AMBIGUOUS_ID_PREFIX");
         assert_eq!(INVALID_ARGUMENT, "INVALID_ARGUMENT");
         assert_eq!(LINK_PERMISSION_DENIED, "LINK_PERMISSION_DENIED");
+        assert_eq!(NOT_OWNER, "NOT_OWNER");
         assert_eq!(LINK_REFLECTION_CYCLE, "LINK_REFLECTION_CYCLE");
         assert_eq!(UNIQUE_CONFLICT, "UNIQUE_CONFLICT");
         // STORE_-prefixed constants — wire values intentionally

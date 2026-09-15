@@ -303,8 +303,20 @@ fn assert_caller_owns_for_mutation(
         // reason the postgres twin carries for an unstamped row.
         crate::identity::owner_stamp::REASON_UNSTAMPED_REFUSED.to_string()
     } else {
+        // #3426 — the refusal reason is the bare SSOT message. Pre-fix it
+        // interpolated the ROW OWNER's agent id, which
+        // `store_err_to_response` renders straight into the 403 body (the
+        // sanitizer only redacts URLs and filesystem paths, not
+        // principals), so a refused cross-tenant caller learned WHO holds
+        // the row. The owner is emitted only to the structured AUTHZ trace
+        // below. Matches the postgres link gate, which already refused
+        // with the bare const.
         let owner = stamp.owner_for_display();
-        format!("caller {caller:?} does not own memory (owner: {owner:?})")
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            "sal owner-gate refusal on {action}: caller {caller} != owner {owner} (id={id})"
+        );
+        crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string()
     };
     Err(StoreError::PermissionDenied {
         action: action.to_string(),
