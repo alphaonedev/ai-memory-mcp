@@ -20,20 +20,80 @@ use super::FederationConfig;
 // to the prior inline macros (`tracing` level per helper unchanged).
 // ---------------------------------------------------------------------------
 
-fn log_catchup_http_skip(peer_id: &str, status: impl std::fmt::Display) {
+// #3654 — each outcome helper ALSO records the outcome against the peer's
+// pull freshness (`super::freshness`). A single failure stays at DEBUG here;
+// the freshness registry escalates a sustained streak to a rate-limited WARN
+// and logs the recovery, so the three variants cannot disagree about when a
+// peer is "down".
+
+fn log_catchup_http_skip(peer_id: &str, status: reqwest::StatusCode) {
     tracing::debug!("catchup: peer {peer_id} returned HTTP {status} — skipping this tick");
+    super::freshness::record(
+        peer_id,
+        super::freshness::Direction::Pull,
+        super::freshness::Observation::Failure(super::freshness::FailureClass::from_http_status(
+            status.as_u16(),
+        )),
+    );
 }
 
 fn log_catchup_unreachable(peer_id: &str, e: impl std::fmt::Display) {
     tracing::debug!("catchup: peer {peer_id} unreachable: {e}");
+    super::freshness::record(
+        peer_id,
+        super::freshness::Direction::Pull,
+        super::freshness::Observation::Failure(super::freshness::FailureClass::Unreachable),
+    );
 }
 
 fn log_catchup_unparseable_body(peer_id: &str, e: impl std::fmt::Display) {
     tracing::warn!("catchup: peer {peer_id} returned unparseable body: {e}");
+    super::freshness::record(
+        peer_id,
+        super::freshness::Direction::Pull,
+        super::freshness::Observation::Failure(super::freshness::FailureClass::BadResponse),
+    );
+}
+
+/// #3654 — a 2xx whose envelope has no `memories` array. Pre-#3654 this was
+/// a silent `continue`; it is a malformed response and now counts as one.
+fn log_catchup_missing_memories(peer_id: &str) {
+    tracing::debug!("catchup: peer {peer_id} returned a sync envelope with no memories array");
+    super::freshness::record(
+        peer_id,
+        super::freshness::Direction::Pull,
+        super::freshness::Observation::Failure(super::freshness::FailureClass::BadResponse),
+    );
 }
 
 fn log_catchup_pull_ok(peer_id: &str, rows: usize) {
-    tracing::info!("catchup: pull: {peer_id} ok ({rows} row(s) returned)");
+    // #3654 — structured fields so the success line is queryable without
+    // parsing prose; the message bytes are unchanged (pinned by
+    // `tests/federation_catchup_api_key.rs`).
+    tracing::info!(
+        peer_id = %peer_id,
+        rows,
+        "catchup: pull: {peer_id} ok ({rows} row(s) returned)"
+    );
+    super::freshness::record(
+        peer_id,
+        super::freshness::Direction::Pull,
+        super::freshness::Observation::Success,
+    );
+}
+
+/// #3654 — take a catch-up response: record the peer's clock offset from its
+/// `Date` header (any response, success or not, carries the peer's clock),
+/// then keep it only when it is a 2xx. The single spelling for the three
+/// catch-up variants.
+fn accept_catchup_response(peer_id: &str, resp: reqwest::Response) -> Option<reqwest::Response> {
+    super::freshness::record_response_clock(peer_id, resp.headers());
+    if resp.status().is_success() {
+        Some(resp)
+    } else {
+        log_catchup_http_skip(peer_id, resp.status());
+        None
+    }
 }
 
 fn log_catchup_unparseable_memory(peer_id: &str, e: impl std::fmt::Display) {
@@ -308,7 +368,11 @@ pub fn spawn_catchup_loop(
     }
     #[cfg(not(feature = "sal"))]
     {
+        // #3654 — publish the cadence so a stalled worker is alertable; the
+        // guard lives in the task, so the series dies with the loop.
+        let cadence = super::freshness::publish_catchup_interval(interval);
         tokio::spawn(async move {
+            let _cadence = cadence;
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
                 catchup_once(&config, &db).await;
@@ -335,7 +399,11 @@ pub fn spawn_catchup_loop_with_store(
     store: Option<Arc<dyn crate::store::MemoryStore>>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    // #3654 — publish the cadence so a stalled worker is alertable; the
+    // guard lives in the task, so the series dies with the loop.
+    let cadence = super::freshness::publish_catchup_interval(interval);
     tokio::spawn(async move {
+        let _cadence = cadence;
         // Small upfront delay so the first catchup doesn't fire before the
         // HTTP server has bound — avoids spurious "connection refused" on
         // node-1 during rolling start of a fresh cluster.
@@ -426,11 +494,10 @@ pub(super) async fn catchup_once_with_store(
         // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
         req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
         let resp = match req.send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                log_catchup_http_skip(&peer.id, r.status());
-                continue;
-            }
+            Ok(r) => match accept_catchup_response(&peer.id, r) {
+                Some(r) => r,
+                None => continue,
+            },
             Err(e) => {
                 log_catchup_unreachable(&peer.id, e);
                 continue;
@@ -447,7 +514,10 @@ pub(super) async fn catchup_once_with_store(
 
         let memories = match body.get("memories").and_then(|v| v.as_array()) {
             Some(arr) => arr.clone(),
-            None => continue,
+            None => {
+                log_catchup_missing_memories(&peer.id);
+                continue;
+            }
         };
         // #2441 (CB-11) — the peer applies its per-peer namespace allowlist +
         // `scope=private` visibility filter IN MEMORY, AFTER the SQL `LIMIT`, so a
@@ -756,11 +826,10 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
         req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
         let resp = match req.send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                log_catchup_http_skip(&peer.id, r.status());
-                continue;
-            }
+            Ok(r) => match accept_catchup_response(&peer.id, r) {
+                Some(r) => r,
+                None => continue,
+            },
             Err(e) => {
                 log_catchup_unreachable(&peer.id, e);
                 continue;
@@ -777,7 +846,10 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
 
         let memories = match body.get("memories").and_then(|v| v.as_array()) {
             Some(arr) => arr.clone(),
-            None => continue,
+            None => {
+                log_catchup_missing_memories(&peer.id);
+                continue;
+            }
         };
 
         // #2441 (CB-11) — consume the peer's examined-watermark so an
@@ -942,11 +1014,10 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
         // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
         req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
         let resp = match req.send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                log_catchup_http_skip(&peer.id, r.status());
-                continue;
-            }
+            Ok(r) => match accept_catchup_response(&peer.id, r) {
+                Some(r) => r,
+                None => continue,
+            },
             Err(e) => {
                 log_catchup_unreachable(&peer.id, e);
                 continue;

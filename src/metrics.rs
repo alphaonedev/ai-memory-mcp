@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Registry, TextEncoder,
 };
 
 // =====================================================================
@@ -149,6 +149,40 @@ pub struct Metrics {
     /// non-zero rate to detect mesh-divergence drift early — before a
     /// follow-up catchup sync surfaces the gap.
     pub federation_partial_quorum_total: IntCounter,
+    /// #3654 — configured federation membership (the census): `1` per
+    /// configured peer. `peer` is the minted `peer-h1…` id (or a hashed
+    /// label for an id of unknown shape — see `federation::freshness`).
+    pub federation_peer_configured: IntGaugeVec,
+    /// #3654 — unix seconds (local clock) of the last attempted exchange
+    /// with a peer, per `direction` (`pull` catch-up / `push` fan-out).
+    /// Absent until the first attempt.
+    pub federation_peer_last_attempt_timestamp_seconds: IntGaugeVec,
+    /// #3654 — unix seconds (local clock) of the last SUCCESSFUL exchange
+    /// with a peer, per `direction`. A push only counts when the peer's own
+    /// report says it applied the items (#2341). Absent until the first
+    /// success.
+    pub federation_peer_last_success_timestamp_seconds: IntGaugeVec,
+    /// #3654 — failed attempts since the last success, per peer and
+    /// `direction`.
+    pub federation_peer_consecutive_failures: IntGaugeVec,
+    /// #3654 — failed attempts per peer, `direction` and closed-set `class`.
+    pub federation_peer_failures_total: IntCounterVec,
+    /// #3654 — peer clock minus local clock, whole seconds, from the peer's
+    /// HTTP `Date` header on the last catch-up response.
+    pub federation_peer_clock_skew_seconds: IntGaugeVec,
+    /// #3654 — pending push-DLQ rows per peer, refreshed each replay tick.
+    pub federation_peer_push_dlq_depth: IntGaugeVec,
+    /// #3654 — unix seconds of the oldest pending push-DLQ failure per peer.
+    /// Absent when the peer's backlog is empty.
+    pub federation_peer_push_dlq_oldest_failed_timestamp_seconds: IntGaugeVec,
+    /// #3654 — the configured catch-up interval in seconds. A label-less
+    /// vector, not a scalar gauge: a vector exports nothing until a child
+    /// exists, so the series is ABSENT on a node that runs no catch-up loop
+    /// (a registered scalar would export `0`, which reads as "the interval is
+    /// zero seconds" and silently disarms the stall alert built on it). The
+    /// child exists exactly while a loop holds a
+    /// [`crate::federation::freshness::CatchupIntervalGuard`].
+    pub federation_catchup_interval_seconds: IntGaugeVec,
     /// Cluster-A COR-3 (v0.7.0): count of memory rows whose Form 4
     /// fact-provenance JSON columns (`citations`, `source_span`,
     /// `confidence_signals`, or pre-Form-4 `metadata`) failed to parse
@@ -666,6 +700,95 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_partial_quorum_total.clone()))?;
 
+        // #3654 — per-peer federation freshness. The `peer` label is bounded
+        // by configured membership and never carries a URL.
+        let federation_peer_configured = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_configured",
+                "1 for every peer in this node's configured federation membership (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_configured.clone()))?;
+        let federation_peer_last_attempt_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_last_attempt_timestamp_seconds",
+                "Unix seconds (local clock) of the last attempted exchange with a peer. \
+                 direction=pull|push. Absent until the first attempt (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_last_attempt_timestamp_seconds.clone(),
+        ))?;
+        let federation_peer_last_success_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_last_success_timestamp_seconds",
+                "Unix seconds (local clock) of the last successful exchange with a peer; \
+                 a push counts only when the peer applied it. direction=pull|push. \
+                 Absent until the first success (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_last_success_timestamp_seconds.clone(),
+        ))?;
+        let federation_peer_consecutive_failures = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_consecutive_failures",
+                "Failed attempts since the last success with a peer. direction=pull|push (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(federation_peer_consecutive_failures.clone()))?;
+        let federation_peer_failures_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_failures_total",
+                "Failed exchanges with a peer. direction=pull|push; class=unauthorized|\
+                 throttled|rejected|server_error|unreachable|bad_response|not_applied|\
+                 task_failed|other (#3654).",
+            ),
+            &["peer", "direction", "class"],
+        )?;
+        registry.register(Box::new(federation_peer_failures_total.clone()))?;
+        let federation_peer_clock_skew_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_clock_skew_seconds",
+                "Peer clock minus local clock in whole seconds, from the peer's HTTP Date \
+                 header on the last catch-up response (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_clock_skew_seconds.clone()))?;
+        let federation_peer_push_dlq_depth = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_push_dlq_depth",
+                "Pending federation_push_dlq rows per peer, refreshed each replay tick (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_push_dlq_depth.clone()))?;
+        let federation_peer_push_dlq_oldest_failed_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_push_dlq_oldest_failed_timestamp_seconds",
+                "Unix seconds of the oldest pending federation_push_dlq failure per peer; \
+                 absent when the peer's backlog is empty (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_push_dlq_oldest_failed_timestamp_seconds.clone(),
+        ))?;
+        let federation_catchup_interval_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_catchup_interval_seconds",
+                "Configured federation catch-up interval in seconds; absent when the \
+                 catch-up loop is not running (#3654).",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(federation_catchup_interval_seconds.clone()))?;
+
         // Cluster-A COR-3 (v0.7.0) — corrupt-provenance observability.
         let corrupt_provenance_rows_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -1089,6 +1212,15 @@ impl Metrics {
             federation_fanout_dropped_total,
             federation_fanout_retry_total,
             federation_partial_quorum_total,
+            federation_peer_configured,
+            federation_peer_last_attempt_timestamp_seconds,
+            federation_peer_last_success_timestamp_seconds,
+            federation_peer_consecutive_failures,
+            federation_peer_failures_total,
+            federation_peer_clock_skew_seconds,
+            federation_peer_push_dlq_depth,
+            federation_peer_push_dlq_oldest_failed_timestamp_seconds,
+            federation_catchup_interval_seconds,
             corrupt_provenance_rows_total,
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,
@@ -1732,6 +1864,38 @@ mod tests {
         enc.encode(&b.registry.gather(), &mut buf_b).unwrap();
         assert!(String::from_utf8_lossy(&buf_a).contains("ai_memory_store_total"));
         assert!(String::from_utf8_lossy(&buf_b).contains("ai_memory_store_total"));
+    }
+
+    /// #3654 D1 — the catch-up cadence series must not exist on a node that
+    /// runs no catch-up loop. A fresh registry (a process that never spawned
+    /// one) renders no sample at all; the series appears only while a child
+    /// exists and disappears again when the child is removed.
+    #[test]
+    fn catchup_interval_series_is_absent_until_a_loop_owns_it_3654() {
+        const NAME: &str = "ai_memory_federation_catchup_interval_seconds";
+        fn rendered(m: &super::Metrics) -> String {
+            let mut buf = Vec::new();
+            TextEncoder::new()
+                .encode(&m.registry.gather(), &mut buf)
+                .expect("encode");
+            String::from_utf8(buf).expect("utf8")
+        }
+        let m = super::Metrics::try_new().expect("fresh registry");
+        assert!(
+            !rendered(&m).contains(NAME),
+            "a node with no catch-up loop must not export the cadence (not even 0)"
+        );
+        m.federation_catchup_interval_seconds
+            .with_label_values(&[])
+            .set(47);
+        let sample = rendered(&m)
+            .lines()
+            .find_map(|l| l.strip_prefix(NAME).map(str::trim).map(str::to_owned));
+        assert_eq!(sample.as_deref(), Some("47"));
+        m.federation_catchup_interval_seconds
+            .remove_label_values(&[])
+            .expect("the child exists");
+        assert!(!rendered(&m).contains(NAME));
     }
 
     #[test]

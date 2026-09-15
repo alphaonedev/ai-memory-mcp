@@ -163,6 +163,18 @@ pub trait FederationDlqSink: Send + Sync {
     /// Prometheus gauge.
     async fn pending_dlq_count(&self) -> Result<i64, String>;
 
+    /// #3654 — the pending backlog per peer: row count and the oldest
+    /// pending `failed_at` (unix seconds), over the same
+    /// `replayed_at IS NULL` predicate as [`Self::pending_dlq_count`].
+    ///
+    /// The default is an honest `Err`: a sink that cannot measure this leaves
+    /// the per-peer series absent rather than publishing a guessed `0`.
+    async fn pending_dlq_backlog_by_peer(
+        &self,
+    ) -> Result<Vec<super::freshness::PeerDlqBacklog>, String> {
+        Err("per-peer backlog is not measured by this DLQ sink".to_string())
+    }
+
     /// #1544 — refresh `last_error` on a pending row WITHOUT bumping
     /// `attempt_count`. Called when a replay attempt is THROTTLED (peer
     /// 429): the row is left pending so it converges once the quota
@@ -918,7 +930,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
 
         let outcome = post_once(
             &config.client,
-            &peer.sync_push_url,
+            peer,
             &row.payload_json,
             &row.memory_id,
             Some(&row.memory_id),
@@ -1201,6 +1213,16 @@ async fn refresh_depth_gauge(sink: &dyn FederationDlqSink) {
             );
         }
     }
+    // #3654 — the same tick refreshes the per-peer backlog. On error the
+    // per-peer series are left as they were (last measurement) rather than
+    // zeroed, and the aggregate gauge above still carries the total.
+    match sink.pending_dlq_backlog_by_peer().await {
+        Ok(backlog) => super::freshness::record_push_dlq_backlog(&backlog),
+        Err(e) => tracing::debug!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            "replay: per-peer federation_push_dlq backlog not refreshed: {e}"
+        ),
+    }
 }
 
 /// Sqlite implementation of [`FederationDlqSink`] backed by a
@@ -1363,6 +1385,37 @@ impl FederationDlqSink for SqliteDlqSink {
             |r| r.get::<_, i64>(0),
         )
         .map_err(|e| format!("sqlite pending_dlq_count: {e}"))
+    }
+
+    async fn pending_dlq_backlog_by_peer(
+        &self,
+    ) -> Result<Vec<super::freshness::PeerDlqBacklog>, String> {
+        // `failed_at` is RFC3339 TEXT whose offset spelling has varied across
+        // releases (see `restore_supersedes`), so the minimum is taken over
+        // the PARSED instant, never over the raw string. `strftime('%s')` is
+        // exact integer seconds; the float `julianday` arithmetic it replaces
+        // truncated to one second early on most instants. A row whose
+        // `failed_at` does not parse yields NULL, so it still counts toward
+        // the depth and simply cannot be the oldest.
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT peer_id, COUNT(*), \
+                 MIN(CAST(strftime('%s', failed_at) AS INTEGER)) \
+                 FROM federation_push_dlq WHERE replayed_at IS NULL GROUP BY peer_id",
+            )
+            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer prepare: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(super::freshness::PeerDlqBacklog {
+                    peer_id: r.get(0)?,
+                    pending: r.get(1)?,
+                    oldest_failed_unix: r.get(2)?,
+                })
+            })
+            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer query: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("sqlite pending_dlq_backlog_by_peer collect: {e}"))
     }
 
     async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
@@ -1689,6 +1742,29 @@ impl FederationDlqSink for PostgresDlqSink {
                 .await
                 .map_err(|e| format!("postgres pending_dlq_count: {e}"))?;
         Ok(row.0)
+    }
+
+    async fn pending_dlq_backlog_by_peer(
+        &self,
+    ) -> Result<Vec<super::freshness::PeerDlqBacklog>, String> {
+        let pool = self.store.pool();
+        let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT peer_id, COUNT(*), EXTRACT(EPOCH FROM MIN(failed_at))::BIGINT \
+             FROM federation_push_dlq WHERE replayed_at IS NULL GROUP BY peer_id",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("postgres pending_dlq_backlog_by_peer: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(peer_id, pending, oldest_failed_unix)| super::freshness::PeerDlqBacklog {
+                    peer_id,
+                    pending,
+                    oldest_failed_unix,
+                },
+            )
+            .collect())
     }
 
     async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {

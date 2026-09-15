@@ -480,6 +480,12 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_operator_dequarantined_total` | counter | The route-OUT twin (#2402): quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release`. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change; a no-op release does not increment. Pairs with the `quarantine.operator_release` WARN. |
 | `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_size` | counter, gauge | Vector-index pressure; see `AI_MEMORY_VECTOR_INDEX_CAPACITY`. |
 | `ai_memory_federation_push_dlq_depth`, `..._quarantined_by_cause_total{cause}` | gauge, counter | Federation push-DLQ backlog and its cause breakdown. |
+| `ai_memory_federation_peer_configured{peer}` | gauge | `1` per peer in this node's configured membership (#3654). The census: a peer that never answers is still listed. |
+| `ai_memory_federation_peer_last_attempt_timestamp_seconds{peer,direction}`, `..._last_success_timestamp_seconds{peer,direction}` | gauge | UNIX seconds, on THIS node's clock, of the last attempted and the last successful exchange with the peer. `direction` is `pull` (our catch-up of the peer) or `push` (our writes to it); a push only counts as a success when the peer applied it. Absent until first observed, never a fake `0` (#3654). |
+| `ai_memory_federation_peer_consecutive_failures{peer,direction}`, `ai_memory_federation_peer_failures_total{peer,direction,class}` | gauge, counter | Failure streak since the last success, and failures by closed-set `class` (`unauthorized`, `throttled`, `rejected`, `server_error`, `unreachable`, `bad_response`, `not_applied`, `task_failed`, `other`) (#3654). |
+| `ai_memory_federation_peer_clock_skew_seconds{peer}` | gauge | Peer clock minus local clock from the `Date` header of the peer's last catch-up (pull) response, whole seconds; absent on a node that runs no catch-up loop. Measured, never used as a freshness timestamp (#3654). |
+| `ai_memory_federation_peer_push_dlq_depth{peer}`, `..._push_dlq_oldest_failed_timestamp_seconds{peer}` | gauge | Per-peer push-DLQ backlog and its oldest pending failure, refreshed each replay tick; the oldest-failure series is absent when the backlog is empty (#3654). |
+| `ai_memory_federation_catchup_interval_seconds` | gauge | The configured catch-up cadence, so a stalled catch-up worker is alertable as `time() - last_attempt{direction="pull"}` exceeding a few intervals. Present only while a catch-up loop runs: a node with no catch-up loop exports no sample at all, never a `0` (#3654). |
 | `ai_memory_deferred_audit_drainer_terminal_state` | gauge | Terminal state of the deferred-audit drainer supervisor: `0` = running/graceful, `1` = sink unresolved past `max_restarts`, `2` = sink panicked past `max_restarts` (#3164). **Page on any non-zero value** — the daemon keeps serving requests, but governance refusals are no longer reaching `signed_events` on that node, so it is audit-degraded until restarted. |
 
 This table is the operationally load-bearing subset, not the full
@@ -1609,12 +1615,12 @@ This is the write-side twin of the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail
 (#1923). The process working directory is deliberately NOT the fallback root: a
 daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 
-> **Total HTTP surface at v1.0.0: 86 unique URL paths across 100
+> **Total HTTP surface at v1.0.0: 88 unique URL paths across 102
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 86` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 100`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 88` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 102`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).
@@ -1625,7 +1631,7 @@ daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 > grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l
 > ```
 >
-> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (86): the
+> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (88): the
 > `/api/v1/*` paths plus the bare `/metrics`. Do not count `.route(`
 > occurrences in `src/lib.rs` to get the registration total — the
 > router also registers test-only routes under `#[cfg(test)]`, so a
@@ -1711,3 +1717,13 @@ The v0.8.0 net-new tools were the coordination families `memory_action_*`, `memo
 - `docs/CLI_REFERENCE.md` — corresponding CLI surface.
 - `docs/SECURITY.md` — API key + mTLS + governance.
 - `docs/TROUBLESHOOTING.md` — common error scenarios.
+
+### Authenticated health monitoring (v1)
+
+`GET /api/v1/monitoring/status` returns versioned, metadata-only JSON;
+`GET /api/v1/monitoring/metrics` returns standard Prometheus exposition. Both
+require the daemon's native TLS and existing enrolled-key or bound mTLS
+authentication (the operator key also works). `[monitoring]` assigns ordinary
+principals a health-only scope enforced before all route dispatch. See the
+[health monitoring contract](HEALTH-MONITORING.md) for enrollment, fields,
+privacy, unavailable audit signals and the storage-boundary follow-up #3672.

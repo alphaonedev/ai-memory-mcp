@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (#3654 — per-peer federation freshness)
+
+- **#3654 (observability) — a peer that stops converging is now visible
+  per peer, and sustained failure is no longer DEBUG-only.** New registry
+  `src/federation/freshness.rs` records, per configured peer and per
+  direction (`pull` catch-up / `push` writes), the last attempt, the last
+  success (a push counts only when the peer applied it, #2341), the
+  failure streak and its closed-set class, the peer's clock offset from
+  its HTTP `Date` header, and the per-peer push-DLQ backlog. Nine new
+  Prometheus series (`ai_memory_federation_peer_*` and
+  `ai_memory_federation_catchup_interval_seconds`) expose them; a series
+  appears only after its first observation, never as a fake `0`, and
+  every timestamp is taken from the local clock so a skewed peer cannot
+  look fresh. Catch-up failures stay at DEBUG for a transient and
+  escalate to a WARN (`federation.peer_freshness`) at 3 consecutive
+  failures, then only when the streak doubles; recovery logs one INFO.
+  A fan-out task that panics is now attributed to its peer
+  (`PeerTasks`), where every lane previously logged an anonymous join
+  error and `bulk_catchup_push` reported the peer as `"unknown"`. A 2xx
+  catch-up envelope with no `memories` array is now recorded as a
+  malformed response instead of being skipped silently. The `peer`
+  label is the minted `peer-h1…` id; an id of any other shape is hashed
+  first, since a legacy id can be a credential-bearing URL. The catch-up
+  cadence series exists only while a catch-up loop runs (a node without
+  one exports no sample, never a `0`). The per-peer block of
+  `/api/v1/monitoring/status` (#3646) is now populated from the registry:
+  `reachability` is derived from pulls only and is `unknown` (with a
+  reason) when there is no fresh pull, never healthy from silence, and
+  `last_successful_push_age_seconds` is the age of the last push the
+  peer applied. Every observed per-peer value is an
+  `{"state":"available","value":…}` signal object and every unobserved
+  one an explicit not-observed object, never a bare number. Not measured
+  by this change: per-peer replication lag and catch-up progress
+  (#3681), the `ai-memory sync-daemon` lane (#3682), and inbound-only
+  peers, which are not enumerated on the status surface (#3686).
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`
