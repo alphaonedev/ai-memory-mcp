@@ -1788,7 +1788,10 @@ mod d1_6_987_tests {
         // client could discover it. Declaring them makes the advertised
         // contract match the enforced one; none of them is newly honoured.
         // ------------------------------------------------------------------
-        ("memory_agent_register", &["caller_agent_id"]),
+        // #3372 (2026-09-15) — `update` was honoured by the handler since the
+        // identity-overwrite refusal landed and undeclared until the sweep's
+        // #3171 gate named it; same disposition as the row above.
+        ("memory_agent_register", &["caller_agent_id", "update"]),
         ("memory_archive_purge", &["agent_id", "as_admin"]),
         ("memory_atomise", &["agent_id"]),
         ("memory_check_agent_action", &["kind_inner"]),

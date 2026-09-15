@@ -160,6 +160,11 @@ pub struct AgentRegisterRequest {
     /// is refused rather than signed into the forensic chain.
     #[serde(default)]
     pub caller_agent_id: Option<String>,
+
+    /// #3372 — allow a re-registration that changes `agent_type` or
+    /// `capabilities` (refused otherwise; the prior values are audited).
+    #[serde(default)]
+    pub update: bool,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_agent_register`.
