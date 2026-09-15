@@ -870,24 +870,35 @@ impl MemoryStore for SqliteStore {
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #3730 — retention policy by namespace: an inbox message is archived
+        // (`archive_reason = "delete"`), every other row is erased. Looked up
+        // FIRST, through the scalar probe (never the full-row `get`, whose
+        // mapper is pinned fail-closed on an unopenable at-rest envelope — the
+        // #2488 lesson), because the gate below is DERIVED from it.
+        let retains = db::namespace_by_id(&conn, id)
+            .map_err(box_err)?
+            .as_deref()
+            .is_some_and(crate::visibility::inbox_delete_retains);
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity;
         // pg enforces the same gate in its trait `delete`).
-        // Inbox carve-out ENABLED for delete: the addressed recipient may
-        // delete a message sent to it, mirroring HTTP `delete_memory` /
-        // MCP `memory_delete`.
+        // Inbox carve-out for delete: the addressed recipient may delete a
+        // message sent to it, mirroring HTTP `delete_memory` / MCP
+        // `memory_delete` — but ONLY on the path that archives. Passing a
+        // bare `true` here admitted the recipient for every delete while the
+        // routing below retained only inbox rows, so a non-owner who merely
+        // had a row addressed to it could erase that row — sever, tombstone,
+        // crypto-erase — in any other namespace (pre-dates #3730 on this
+        // adapter; measured 2026-09-15, pinned by
+        // recipient_gate_derived_from_namespace_3730). One predicate governs
+        // both the admission and the disposition.
         assert_caller_owns_for_mutation(
             &conn,
             ctx,
             id,
             "delete",
-            true,
+            retains,
             crate::identity::owner_stamp::funnel::DELETE,
         )?;
-        // #3730 — retention policy by namespace: an inbox message is archived
-        // (`archive_reason = "delete"`), every other row is erased.
-        let retains = db::get(&conn, id)
-            .map_err(box_err)?
-            .is_some_and(|m| crate::visibility::inbox_delete_retains(&m.namespace));
         let removed = if retains {
             db::delete_archive_first(&conn, id).map_err(box_err)?
         } else {
