@@ -17,6 +17,17 @@
 mod common;
 use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http_ready};
 
+// #3354/#3198 FIXTURE ISOLATION — this suite previously set NO `HOME` and NO
+// `AI_MEMORY_KEY_DIR` and used no sandbox, so every spawned child ran against
+// the DEVELOPER'S real `~/.config/ai-memory` and its result depended on that
+// dir's ambient permissions: a group-writable ancestor there makes #3198
+// correctly refuse the key store, which surfaces as the #3354 "no signing key
+// … could not be generated" boot refusal on the ledger-writing tests. #3733
+// moved eleven key-dir-CREATING fixtures onto this sandbox; THIS file was
+// missed because it CREATES nothing, it merely INHERITED. See `cmd`.
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 /// #998 (2026-05-21) — concrete admin id seeded into
 /// `AI_MEMORY_ADMIN_AGENT_IDS` for every spawned integration daemon.
 /// Replaces the pre-#980 `"*"` wildcard which now fails
@@ -24,9 +35,59 @@ use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http
 /// [`curl_get_as_admin`] / [`curl_post_as_admin`].
 const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 
+/// Process-wide isolated `HOME` + key directory for every spawned child, so
+/// the suite's result depends on state it OWNS, never the developer's real
+/// `~/.config/ai-memory`. The key dir is forced to `0o700` (`mkdir_0700`) so it
+/// clears the #3198 gate under ANY umask — `create_dir_all` under umask `0002`
+/// would otherwise leave `0o775`, which #3198 correctly refuses. An explicit
+/// `AI_MEMORY_KEY_DIR` override is gated on the dir ITSELF (`enforce_key_dir_secure`
+/// at resolution + the save-time file->keydir chain), so a `0o700` leaf passes
+/// regardless of parent perms — the same reason the #3733 fixtures pass under
+/// umask `0002`. Built once and shared so a daemon/CLI signing key persists
+/// across the multiple invocations a single test makes.
+fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Path) {
+    use std::sync::OnceLock;
+    static ISOLATED: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
+    let (home, keys) = ISOLATED.get_or_init(|| {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("integration-isolated");
+        let home = root.join("home");
+        let keys = root.join("keys");
+        key_dir_sandbox::mkdir_0700(&home);
+        key_dir_sandbox::mkdir_0700(&keys);
+        // RACE-FREE first boot — mint the daemon signing key ONCE, in-process,
+        // before any parallel test spawns concurrent `serve` daemons. On a cold
+        // shared key dir, multiple daemons would otherwise race to generate the
+        // same `host:<hostname>` id; whichever writes the on-disk pair LAST then
+        // disagrees with the in-memory key an earlier daemon already booted
+        // with, and cross-peer/fanout signature verification fails
+        // (`http_*_fans_out`, `http_pending_governance_approve_rejects_cross_peer`,
+        // …). Generating it here means every daemon LOADS the same key. The id
+        // matches the daemon's own `resolve_agent_id(None, None)` fallback (no
+        // `AI_MEMORY_AGENT_ID` is set on the spawned children); tests that pin a
+        // distinct id mint their own key with no contention.
+        if let Ok(id) = ai_memory::identity::resolve_agent_id(None, None)
+            && let Ok(kp) = ai_memory::identity::keypair::generate(&id)
+        {
+            let _ = ai_memory::identity::keypair::save(&kp, keys.as_path());
+        }
+        (home, keys)
+    });
+    (home.as_path(), keys.as_path())
+}
+
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
+    // #3354/#3198 FIXTURE ISOLATION — an isolated HOME + a `0o700` key dir this
+    // suite owns, so a spawned ledger-writing child mints/loads its signing key
+    // without ever touching (or depending on the permissions of) the
+    // developer's real `~/.config/ai-memory`. Per-test `.env` overrides still
+    // win (env vars are shadowed at `.env()` call time), and no test in this
+    // file sets either var, so this is the sole, uniform source.
+    let (isolated_home, isolated_keys) = isolated_home_and_keys();
+    c.env("HOME", isolated_home)
+        .env("AI_MEMORY_KEY_DIR", isolated_keys);
     // Spawned CLI `--json` reports must be a single JSON document on
     // stdout. GitHub-hosted Check runners (and some local shells) inherit
     // `RUST_LOG=info`; curator then prefixes stdout with a tracing INFO
