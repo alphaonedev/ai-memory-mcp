@@ -147,13 +147,18 @@ async fn postgres_archive_by_ids_owner_mismatch_returns_permission_denied_3193()
         } => {
             assert_eq!(action, "archive", "action carries op name; got: {action:?}");
             assert_eq!(target, id, "target is the row id");
-            assert!(
-                reason.contains(bob),
-                "reason names the rejected caller, got: {reason:?}"
+            // #3426 — SAL-level refusal: the reason is the bare SSOT message
+            // and names neither the owner (never disclosed to a refused
+            // caller) nor the caller (the HTTP 403 body carries `caller`, the
+            // AUTHZ trace carries both). No 403-vs-404 question at this layer.
+            assert_eq!(
+                reason,
+                ai_memory::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+                "got: {reason:?}"
             );
             assert!(
-                reason.contains(alice),
-                "reason names the rightful owner, got: {reason:?}"
+                !reason.contains(alice),
+                "#3426: the refusal never names the rightful owner: {reason:?}"
             );
         }
         other => panic!("expected PermissionDenied, got: {other:?}"),
