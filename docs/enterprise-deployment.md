@@ -1718,6 +1718,7 @@ From `src/metrics.rs`:
 | `ai_memory_federation_fanout_retry_total` (counter) | Cross-peer retry events. Trend high under cross-DC partition. |
 | `ai_memory_federation_fanout_dropped_total` (counter) | Post-quorum drops (peer rewrote id or refused to ack). Page on sustained increment. |
 | `ai_memory_federation_partial_quorum_total` (counter) | Quorum met but some peer(s) didn't ack. Investigate trend lines. |
+| `ai_memory_federation_peer_last_success_timestamp_seconds{peer,direction}` (gauge) | Per-peer freshness (#3654). Page when `last_attempt` is newer than `last_success` for a peer for longer than your tolerance: that peer has stopped accepting pushes (`direction="push"`) or answering catch-up (`direction="pull"`). See `docs/federation.md` §Per-peer freshness. |
 | `recall_total` / `recall_latency_seconds` (histogram) | Recall throughput + latency profile. |
 | `memory_store_total` / `memory_store_latency_seconds` (histogram) | Write throughput + latency. |
 
