@@ -671,8 +671,15 @@ async fn http_create_memory_on_conflict_version_rewrites_title() {
 
 #[tokio::test]
 async fn http_create_memory_on_conflict_merge_upserts() {
+    // #3690 / #3696 — the merge is by the SAME caller that owns the row.
+    // `create_basic` stamps the occupant `ai:test`; the merge presents the
+    // same identity, so the occupant is VISIBLE to it and the Merge arm
+    // proceeds (the matrix's "live visible holder → Proceed" cell). Before
+    // Unit 1 this cell merged WITHOUT an identity, i.e. as a fresh
+    // `anonymous:req-*` principal that could not read the row it was
+    // overwriting — the #3695/#3696 defect encoded as a requirement.
     let (router, _f) = build_router_fixture();
-    let (s1, _) = create_basic(&router, "chunk-d/merge", "merge-mem").await;
+    let (s1, id) = create_basic(&router, "chunk-d/merge", "merge-mem").await;
     assert_eq!(s1, StatusCode::CREATED);
     let body = json!({
         "tier": "long",
@@ -685,9 +692,73 @@ async fn http_create_memory_on_conflict_merge_upserts() {
         "source": "api",
         "metadata": {},
         "on_conflict": "merge",
+        "agent_id": "ai:test",
     });
-    let (status, _payload) = post_json(&router, "/api/v1/memories", body).await;
-    assert_eq!(status, StatusCode::CREATED);
+    let (status, payload) = post_json(&router, "/api/v1/memories", body).await;
+    assert_eq!(status, StatusCode::CREATED, "{payload}");
+    // It merged INTO the occupant: same id, not a second row.
+    assert_eq!(
+        payload.get("id").and_then(|v| v.as_str()),
+        Some(id.as_str())
+    );
+}
+
+/// #3690 / #3696 — the invariant is *cannot read ⇒ cannot merge*, pinned as
+/// a PAIR on one caller: an identity-less second writer (a fresh
+/// `anonymous:req-*` principal) cannot `GET` the `ai:test`-owned private row
+/// (404), and its `on_conflict=merge` into that row is refused UNNAMED
+/// (409 with an EMPTY `existing_id`, so the refusal does not disclose the
+/// id of a row the caller cannot see). Asserting either half alone would
+/// pass for an unrelated reason — a 409 from an ordinary named conflict, or
+/// a 404 from a row that never existed — so both halves sit in one cell.
+#[tokio::test]
+async fn http_create_memory_on_conflict_merge_refuses_unnamed_when_the_caller_cannot_read_the_occupant_3696()
+ {
+    let (router, _f) = build_router_fixture();
+    let (s1, id) = create_basic(&router, "chunk-d/merge-hidden", "merge-mem").await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    // The same identity-less caller shape for BOTH halves: no body agent_id,
+    // no x-agent-id header.
+    let read = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/memories/{id}"))
+        .body(Body::empty())
+        .unwrap();
+    let read_status = router.clone().oneshot(read).await.unwrap().status();
+    assert_eq!(
+        read_status,
+        StatusCode::NOT_FOUND,
+        "an identity-less caller must not be able to read the ai:test-owned row"
+    );
+
+    let body = json!({
+        "tier": "long",
+        "namespace": "chunk-d/merge-hidden",
+        "title": "merge-mem",
+        "content": "merged content",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {},
+        "on_conflict": "merge",
+    });
+    let (status, payload) = post_json(&router, "/api/v1/memories", body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "cannot read ⇒ cannot merge: {payload}"
+    );
+    assert_eq!(
+        payload.get("existing_id").and_then(|v| v.as_str()),
+        Some(""),
+        "the refusal must be UNNAMED — it must not disclose the hidden occupant's id: {payload}"
+    );
+    assert!(
+        !payload.to_string().contains(&id),
+        "the hidden occupant's id leaked into the refusal body: {payload}"
+    );
 }
 
 #[tokio::test]
