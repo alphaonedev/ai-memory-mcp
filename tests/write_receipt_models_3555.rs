@@ -6,7 +6,9 @@ use serde_json::json;
 
 #[test]
 fn sqlite_replication_models_3555() -> anyhow::Result<()> {
-    let root = std::env::var("CARGO_TARGET_DIR")?;
+    // `CARGO_TARGET_DIR` is an input to cargo, not exported to tests: default
+    // to the standard target directory (the `capture_turn_cli_3587` shape).
+    let root = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let scratch = tempfile::tempdir_in(root)?;
     let conn = ai_memory::db::open(&scratch.path().join("models.db"))?;
     for (sync, fsync) in [("NORMAL", "per-checkpoint"), ("FULL", "per-commit")] {
