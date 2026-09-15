@@ -357,6 +357,132 @@ pub fn audit_key_is_installed() -> bool {
     DAEMON_AUDIT_KEY.get().is_some()
 }
 
+/// v1.0.0 #3354 — the issue tag every "ledger is unsigned" line carries, so
+/// an operator can grep one token for "why are my events unsigned".
+pub const UNSIGNED_LEDGER_ISSUE: &str = "#3354";
+
+/// #3354 — the ONE spelling of the command that provisions a signing key for
+/// `agent_id`. It is the real verb (`identity generate`); there is no
+/// top-level `keygen`, and a remedy that names a verb that does not exist is
+/// a support ticket.
+#[must_use]
+pub fn signing_key_provisioning_command(agent_id: &str) -> String {
+    format!("ai-memory identity generate --agent-id {agent_id}")
+}
+
+/// #3354 — the ONE spelling of the operator-visible warning a process emits
+/// when it will write UNSIGNED `signed_events` rows: no `<agent_id>.priv`
+/// under the key directory matches the resolved agent id, so
+/// [`try_sign_audit_payload`] has nothing to sign with and every row lands
+/// `attest_level=unsigned`. Shared by the boot line, the MCP
+/// `memory_session_start` response and the tests so the spelling cannot
+/// drift.
+#[must_use]
+pub fn unsigned_ledger_warning(agent_id: &str, key_dir: &Path) -> String {
+    format!(
+        "WARN {UNSIGNED_LEDGER_ISSUE}: signed-events ledger is UNSIGNED — no signing key for \
+         {agent_id} in {}; every signed_events row this process writes carries \
+         attest_level=unsigned. Fix: run `{}` (then restart)",
+        key_dir.display(),
+        signing_key_provisioning_command(agent_id)
+    )
+}
+
+/// #3354 — the WRITE-PATH fix: make sure the resolved agent id has a
+/// signing key BEFORE the process writes its first ledger row. Loads the
+/// key when it exists; when it does not, GENERATES it (the same helper the
+/// `daemon` label has always used at boot — automatic generation is not
+/// automatic trust, #3709: the new key signs this node's own ledger and
+/// binds nothing anywhere else) and loads it. Returns the key (`None` only
+/// when generation was disabled or the key could not be loaded afterwards)
+/// and the generation outcome (`None` when the key already existed).
+///
+/// Before #3354 a fresh store whose resolved id had no key wrote every
+/// `signed_events` row `unsigned` behind a debug-level log: a ledger that
+/// claimed a guarantee it did not provide.
+///
+/// # Errors
+/// The key directory cannot be resolved, or generation / persistence fails.
+pub fn ensure_daemon_signing_key(
+    agent_id: &str,
+) -> Result<(
+    Option<SigningKey>,
+    Option<crate::identity::keypair::EnsureOutcome>,
+)> {
+    if let Some(key) = load_daemon_signing_key(agent_id)? {
+        return Ok((Some(key), None));
+    }
+    let dir = crate::identity::keypair::default_key_dir()?;
+    let outcome = crate::identity::keypair::ensure_keypair(agent_id, &dir, false)?;
+    let key = load_daemon_signing_key(agent_id)?;
+    Ok((key, Some(outcome)))
+}
+
+/// #3354 — the refusal for a ledger-writing process whose resolved agent
+/// id has no signing key and could not be given one: the process must not
+/// append an unsigned row, so it does not start. Names the id, the cause
+/// and the real provisioning verb.
+#[must_use]
+pub fn unsigned_ledger_refusal(agent_id: &str, cause: &str) -> String {
+    format!(
+        "{UNSIGNED_LEDGER_ISSUE}: refusing to start a ledger-writing command as `{agent_id}`: \
+         no signing key for that id is loadable and one could not be generated ({cause}). \
+         An unsigned signed_events row is a guarantee the ledger did not provide, so none is \
+         written. Fix: run `{}` (or make the key directory writable so the key can be \
+         generated), then retry. Read-only verbs (`doctor`, `stats`, `recall`, the \
+         `verify-*` family) stay reachable.",
+        signing_key_provisioning_command(agent_id)
+    )
+}
+
+/// #3354 — the one-line notice when a key was generated for the resolved
+/// id at boot (loud on the daemons, tracing-only on one-shot verbs).
+#[must_use]
+pub fn signing_key_generated_notice(agent_id: &str, pub_path: &Path) -> String {
+    format!(
+        "{UNSIGNED_LEDGER_ISSUE}: generated an audit signing key for `{agent_id}` at {} — the \
+         ledger this process writes is signed from its first row. Automatic generation is not \
+         automatic trust: enrol the public key wherever this identity must verify.",
+        pub_path.display()
+    )
+}
+
+/// #3354 — content-free signing status of THIS process's ledger writer:
+/// whether a daemon audit key is installed, the agent id the process signs
+/// as, and the warning text when it does not. Carries no key material and
+/// no path other than the key directory named in the warning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LedgerSigningStatus {
+    /// `true` when [`audit_key_is_installed`]: new `signed_events` rows are
+    /// `daemon_signed`. `false`: they are `unsigned`.
+    pub daemon_signed_events: bool,
+    /// The agent id this process resolved for signing (the same resolution
+    /// the boot path uses to look up `<agent_id>.priv`).
+    pub agent_id: String,
+    /// The operator-facing warning when unsigned; `None` when signed.
+    pub warning: Option<String>,
+}
+
+/// #3354 — read-only: resolve the ledger signing status of this process.
+#[must_use]
+pub fn ledger_signing_status() -> LedgerSigningStatus {
+    let agent_id =
+        crate::identity::resolve_agent_id(None, None).unwrap_or_else(|_| "ai-memory".to_string());
+    let daemon_signed_events = audit_key_is_installed();
+    let warning = if daemon_signed_events {
+        None
+    } else {
+        let key_dir = crate::identity::keypair::resolved_default_key_dir_path()
+            .unwrap_or_else(|_| PathBuf::from("<unresolved key directory>"));
+        Some(unsigned_ledger_warning(&agent_id, &key_dir))
+    };
+    LedgerSigningStatus {
+        daemon_signed_events,
+        agent_id,
+        warning,
+    }
+}
+
 struct ForensicSink {
     dir: PathBuf,
     last_hash: String,
@@ -1358,11 +1484,9 @@ pub fn load_daemon_signing_key(agent_id: &str) -> Result<Option<SigningKey>> {
         Ok(k) => k,
         Err(e) => {
             if signing_key_load_is_absent(&e) {
-                tracing::debug!(
-                    agent_id,
-                    "no daemon signing key enrolled; operating unsigned \
-                     (expected when no key is provisioned)"
-                );
+                // #3354 — LOUD, never debug: a process that will write
+                // unsigned ledger rows says so once, with the fix.
+                tracing::warn!(agent_id, "{}", unsigned_ledger_warning(agent_id, &dir));
             } else {
                 tracing::warn!(
                     agent_id,
@@ -2136,6 +2260,20 @@ pub fn load_enrolled_witness_pubkey() -> Result<Option<VerifyingKey>> {
 /// not a trust anchor (the witness custody-mistake this control refuses to
 /// repeat). Resolve via [`resolve_audit_pubkey`].
 pub const AUDIT_PUBKEY_ENV: &str = "AI_MEMORY_AUDIT_PUBKEY";
+
+/// #3354 / #3479 — the ONE spelling of the require-mode limitation, rendered
+/// by `verify-audit-trail` beside a signature-coverage FAIL and cited by the
+/// `--audit-pubkey` / [`AUDIT_PUBKEY_ENV`] documentation. A customer who ran
+/// unsigned and later provisioned a key cannot bring the historical prefix
+/// under the pin: provisioning the key does not clear the past, and in
+/// v1.0.0 there is no supported in-product remedy (the epoch-seal /
+/// re-anchor of an unsigned prefix is #3479, v1.0.1). Require-mode is for
+/// chains signed from the beginning — which, since #3354, every fresh store
+/// is.
+pub const UNSIGNED_PREFIX_LIMITATION: &str = "rows written before this node's signing key \
+     existed are unsigned and stay unsigned: provisioning the key does not clear the past, \
+     and v1.0.0 has no in-product remedy (epoch-seal / re-anchor is #3479, v1.0.1). The \
+     AI_MEMORY_AUDIT_PUBKEY pin is for chains signed from their first row.";
 
 /// v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin from the `--audit-pubkey`
 /// CLI flag (highest precedence — the universal CLI-flag-wins ladder; the value
@@ -4772,6 +4910,14 @@ mod tests {
         // function converts to Ok(None) (lines 464-467, 481-484).
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
+        // #3354 — a key dir never inherits the ambient umask (0002 on the
+        // reference host yields 0775, which the #3198 check correctly
+        // refuses — that refusal is the product being right).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let _g = crate::identity::keypair::key_dir_env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -5369,5 +5515,53 @@ mod tests {
             parse_witness_dual_head(&verdict).is_none(),
             "parse declines a non-AuditHeadWitness checkpoint"
         );
+    }
+}
+
+#[cfg(test)]
+mod unsigned_ledger_3354_tests {
+    use super::*;
+
+    /// #3354 — the ONE warning spelling names the issue, the agent id, the
+    /// key directory, the `unsigned` level and the REAL provisioning verb.
+    #[test]
+    fn unsigned_ledger_warning_names_key_and_command_3354() {
+        let dir = Path::new("/keys/sandbox");
+        let w = unsigned_ledger_warning("ai:ledger-3354", dir);
+        assert!(w.starts_with("WARN #3354"), "{w}");
+        assert!(
+            w.contains("ai:ledger-3354") && w.contains("/keys/sandbox"),
+            "{w}"
+        );
+        assert!(w.contains("attest_level=unsigned"), "{w}");
+        assert!(
+            w.contains("`ai-memory identity generate --agent-id ai:ledger-3354`"),
+            "the remedy must be the real verb: {w}"
+        );
+        assert!(
+            !w.contains("keygen"),
+            "there is no top-level keygen verb: {w}"
+        );
+    }
+
+    /// #3354 — the status carries the warning exactly when no key is
+    /// installed, and its JSON shape is the caller-visible contract.
+    #[test]
+    fn ledger_signing_status_is_consistent_with_the_installed_key_3354() {
+        let _ = crate::identity::test_key_dir::install();
+        let status = ledger_signing_status();
+        assert_eq!(status.daemon_signed_events, audit_key_is_installed());
+        assert_eq!(status.warning.is_none(), status.daemon_signed_events);
+        let json = serde_json::to_value(&status).expect("serialise");
+        assert!(json["daemon_signed_events"].is_boolean());
+        assert!(json["agent_id"].is_string());
+        if !status.daemon_signed_events {
+            assert!(
+                json["warning"]
+                    .as_str()
+                    .is_some_and(|w| w.contains(UNSIGNED_LEDGER_ISSUE)),
+                "{json}"
+            );
+        }
     }
 }

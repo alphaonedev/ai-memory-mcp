@@ -2124,7 +2124,7 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::keys::run(&db_path, a, j, &mut out)
+            cli::keys::run(&db_path, a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Identity(a) => {
             // v0.7 H1 — keypair lifecycle is DB-free. The handler
