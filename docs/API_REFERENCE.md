@@ -1418,8 +1418,61 @@ Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
 
 ### `GET /api/v1/export`
 
-**Admin-gated.** Returns
-`{"memories":[…],"links":[…],"count":N,"exported_at":"…"}`.
+**Admin-gated, bounded (v1.0.0 #3288).** Two modes:
+
+- **Unpaged** (no query parameters): returns
+  `{"memories":[…],"links":[…],"count":N,"exported_at":"…"}` for the whole
+  corpus, but only while the corpus fits the page ceiling
+  (`AI_MEMORY_MAX_PAGE_SIZE`, default 1000). A larger corpus is **refused**
+  with `413 {"code":"EXPORT_PAGING_REQUIRED","max_rows":N}`. It is never
+  truncated, because a client written before paging would keep a partial
+  body as a complete backup.
+- **Paged** (`?limit=N`, then `?limit=N&cursor=<next_cursor>`): each response
+  carries at most `N` memories (`1 <= N <= AI_MEMORY_MAX_PAGE_SIZE`) and the
+  graph edges that page owns, plus `next_cursor` (`null` on the last page).
+  The cursor is opaque. An edge appears exactly once, on the page carrying
+  the later of its two endpoints, so importing the pages in order through
+  `POST /api/v1/import` (1000 memories per call) never references a memory
+  that is not yet imported.
+
+Every body also carries `withheld` (the counts of live rows it does not
+carry: `withheld` forbidden-class drops with `withheld_by_class`,
+`quarantined`, `undecryptable`, plus the reported `tombstoned`, `expired`,
+`redacted` and `dangling_links_withheld` — that last key is the "withheld
+edges" count the acceptance names; the SDK sums it under that name) and
+`partial` (`true` when a forbidden-class, quarantined or undecryptable row was
+withheld). In paged mode the counts are per page: sum them, and OR `partial`,
+across the walk. Refusals: `400 EXPORT_LIMIT_OUT_OF_RANGE` (with `max`) and
+`400 EXPORT_CURSOR_INVALID`. The Python SDK's `export_pages()` performs the
+walk.
+
+**Namespace scope (`?namespace=<ns>`, #3427).** Restricts the export — the
+unpaged body and every page — to one namespace, as a `WHERE` predicate on the
+same ordered query (never a post-filter, so the page bound holds and the
+`withheld` counts are scoped too). The scope is pinned in the cursor: a
+cursor minted under one scope presented with another is refused
+(`400 EXPORT_CURSOR_INVALID`). Every body echoes the scope that was applied
+as `namespace` (`null` = whole corpus), so the operator holding the file can
+see it without trusting the request. An edge whose other endpoint lies
+outside the scope is not carried and is counted in
+`dangling_links_withheld`. Any query parameter the export does not know is
+refused with `400` naming it — a parameter that claims to bound an egress and
+does not is worse than no parameter, so nothing is silently ignored. A
+malformed namespace is `400 VALIDATION_FAILED`.
+
+**Consistency (`"snapshot": false`, #3288 amended acceptance).** A paged walk
+is a **live keyset scan**, not a snapshot, and every body says so. Rows that
+sort *after* the cursor are visited exactly once even when inserted during
+the walk. A row inserted during the walk whose `(created_at, id)` sorts
+*before* the cursor is **not** visited — a federated receive keeps the peer's
+`created_at`, so a backdated insert is not hypothetical on a federating node;
+take the export when the node is quiet, or re-walk. The cursor pins the expiry
+cutoff `as_of` of the walk's first page; a walk continued with an old cursor
+therefore still exports rows that expired after that cutoff and have not yet
+been collected (consistent-walk behaviour, admin-only). Keyset order assumes
+the storage-stable `created_at` rendering every local writer uses
+(`+00:00`, UTC); a row carrying a different offset rendering would sort by
+its text, not its instant.
 
 ### `POST /api/v1/import`
 
