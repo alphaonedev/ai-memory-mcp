@@ -1663,7 +1663,7 @@ const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that r
 /// and the `SELECT` would return the wrong row id. `SQLite` 3.35+
 /// supports `RETURNING`; it executes atomically within the `INSERT`.
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, InsertConflictArm::Merge)
+    insert_inner(conn, mem, true, InsertConflictArm::Merge, None)
 }
 
 /// v1.0.0 #2771/#2887 — the `(title, namespace)` conflict-resolution arm the
@@ -1707,7 +1707,38 @@ pub enum InsertConflictArm {
 ///   already exists — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert`].
 pub fn insert_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, InsertConflictArm::Refuse)
+    insert_inner(conn, mem, true, InsertConflictArm::Refuse, None)
+}
+
+/// #3696 — [`insert`] with the caller's READ-visibility identity: a
+/// `(title, namespace)` holder the `viewer` cannot read (another agent's
+/// `scope=private` row) is refused with a typed conflict that names NO row,
+/// exactly like a lifecycle-hidden one (`visibility::title_slot_admission`).
+/// `viewer` is the value the surface's read lanes resolve (MCP
+/// `identity::resolve_read_visibility_caller()`, HTTP the resolved request
+/// agent); `None` is the single-tenant trust-all posture [`insert`] keeps.
+///
+/// # Errors
+///
+/// As [`insert`], plus the typed [`ConflictError`] (empty `existing_id`) for
+/// a holder hidden from `viewer` on either axis.
+pub fn insert_as(conn: &Connection, mem: &Memory, viewer: Option<&str>) -> Result<String> {
+    insert_inner(conn, mem, true, InsertConflictArm::Merge, viewer)
+}
+
+/// #3696 — [`insert_no_overwrite`] with the caller's READ-visibility
+/// identity (see [`insert_as`]).
+///
+/// # Errors
+///
+/// As [`insert_no_overwrite`]; a holder hidden from `viewer` on either axis
+/// is the same typed, unnamed conflict.
+pub fn insert_no_overwrite_as(
+    conn: &Connection,
+    mem: &Memory,
+    viewer: Option<&str>,
+) -> Result<String> {
+    insert_inner(conn, mem, true, InsertConflictArm::Refuse, viewer)
 }
 
 /// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
@@ -1730,7 +1761,7 @@ pub fn insert_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
 ///   `(mem.title, mem.namespace)` — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert`].
 pub fn insert_restore_same_id(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, InsertConflictArm::RestoreSameId)
+    insert_inner(conn, mem, true, InsertConflictArm::RestoreSameId, None)
 }
 
 /// v1.0.0 #2211 — REMOTE-ADMISSION insert for the Portability-v2 importer.
@@ -1749,7 +1780,7 @@ pub fn insert_restore_same_id(conn: &Connection, mem: &Memory) -> Result<String>
 ///
 /// Identical to [`insert`].
 pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, false, InsertConflictArm::Merge)
+    insert_inner(conn, mem, false, InsertConflictArm::Merge, None)
 }
 
 /// v1.0.0 #2878 — FAIL-CLOSED remote-admission insert: the no-overwrite twin
@@ -1770,7 +1801,7 @@ pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
 ///   already exists — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert_imported`].
 pub fn insert_imported_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, false, InsertConflictArm::Refuse)
+    insert_inner(conn, mem, false, InsertConflictArm::Refuse, None)
 }
 
 /// Shared body of [`insert`] / [`insert_imported`] / [`insert_no_overwrite`] /
@@ -2190,6 +2221,7 @@ fn insert_inner(
     mem: &Memory,
     stamp_local_clock: bool,
     conflict_arm: InsertConflictArm,
+    viewer: Option<&str>,
 ) -> Result<String> {
     use rusqlite::OptionalExtension;
     // #1955 R45 — record-stop fence: outermost of the write funnel, so a
@@ -2371,61 +2403,33 @@ fn insert_inner(
         // statement re-asserts this atomically (`title_slot_merge_backstop`),
         // so a quarantine that lands between this read and the write still
         // updates nothing.
-        let slot_holder = title_slot_holder(conn, &mem.title, &mem.namespace)?;
-        if slot_holder
-            .as_ref()
-            .is_some_and(|h| h.admission == crate::models::TitleSlotAdmission::Refused)
-        {
-            return Err(ConflictError {
-                existing_id: String::new(),
-                title: mem.title.clone(),
-                namespace: mem.namespace.clone(),
-            }
-            .into());
-        }
-        // #2887 / #3690 (vote Q3) — a restore whose key is held by a DIFFERENT
-        // live row is refused up front, NAMING the visible holder (the CAS
-        // `AND memories.id = excluded.id` below is the atomic backstop for a
-        // holder that lands between this read and the write).
-        if let (InsertConflictArm::RestoreSameId, Some(holder)) = (conflict_arm, &slot_holder)
-            && holder.id != mem.id
-        {
-            return Err(ConflictError {
-                existing_id: holder.id.clone(),
-                title: mem.title.clone(),
-                namespace: mem.namespace.clone(),
-            }
-            .into());
-        }
-        // A row ALREADY stored under the incoming id, under this same key,
-        // that is not the holder — hidden. Only a RESTORE may write into a
-        // TOMBSTONE in place (the #2887 idempotent same-id restore, which
-        // keeps the row tombstoned: lifecycle advances go through the typed
-        // gate, never a re-store); a Merge / Refuse write into it is the
-        // #3690 defect shape (a store that lands in a hidden row and is never
-        // seen again) and is refused typed, and a hidden-for-security row is
-        // refused on every arm.
+        let slot_holder = title_slot_holder(conn, &mem.title, &mem.namespace, viewer)?;
+        // The same-id row under this key that is NOT the holder (hidden), read
+        // only when no live holder exists.
         let same_id_hidden = if slot_holder.is_none() {
             same_id_hidden_row_under_key(conn, mem)?
         } else {
             None
         };
-        let restore_tombstone_by_id = match (&same_id_hidden, conflict_arm) {
-            (None, _) => false,
-            (Some(row), InsertConflictArm::RestoreSameId)
-                if row.admission == crate::models::TitleSlotAdmission::Free =>
-            {
-                true
-            }
-            (Some(_), _) => {
-                return Err(ConflictError {
-                    existing_id: String::new(),
-                    title: mem.title.clone(),
-                    namespace: mem.namespace.clone(),
-                }
-                .into());
-            }
+        // ONE arm × occupant matrix for all three arms on both adapters
+        // (`visibility::title_slot_disposition`); this funnel only routes.
+        let facts = crate::visibility::TitleSlotFacts {
+            holder: slot_holder.as_ref().map(|h| (h.id.clone(), h.admission)),
+            same_id_hidden: same_id_hidden.as_ref().map(|r| r.admission),
         };
+        let restore_tombstone_by_id =
+            match crate::visibility::title_slot_disposition(conflict_arm, &mem.id, &facts) {
+                crate::visibility::TitleSlotDisposition::Proceed => false,
+                crate::visibility::TitleSlotDisposition::ProceedByPrimaryKey => true,
+                crate::visibility::TitleSlotDisposition::Refuse { named } => {
+                    return Err(ConflictError {
+                        existing_id: named.unwrap_or_default(),
+                        title: mem.title.clone(),
+                        namespace: mem.namespace.clone(),
+                    }
+                    .into());
+                }
+            };
         let prior_version_on_conflict: Option<i64> = if crate::config::append_only_enabled() {
             slot_holder
                 .as_ref()
@@ -2585,7 +2589,8 @@ fn insert_inner(
                 // row), and `find_by_title_namespace` answers only with a
                 // VISIBLE occupant, so the hidden row is never named (#3695).
                 let existing_id =
-                    find_by_title_namespace(conn, &mem.title, &mem.namespace)?.unwrap_or_default();
+                    find_by_title_namespace(conn, &mem.title, &mem.namespace, viewer)?
+                        .unwrap_or_default();
                 return Err(ConflictError {
                     existing_id,
                     title: mem.title.clone(),
@@ -3213,7 +3218,9 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // still fires loud, and the caller's retry sees the new
             // state. Reading the id is best-effort context for the
             // diagnostic.
-            if let Some(existing_id) = find_by_title_namespace(conn, &mem.title, &mem.namespace)? {
+            if let Some(existing_id) =
+                find_by_title_namespace(conn, &mem.title, &mem.namespace, None)?
+            {
                 return Err(ConflictError {
                     existing_id,
                     title: mem.title.clone(),
@@ -9054,25 +9061,20 @@ pub fn find_by_title_namespace(
     conn: &Connection,
     title: &str,
     namespace: &str,
+    viewer: Option<&str>,
 ) -> Result<Option<String>> {
-    use rusqlite::OptionalExtension;
-    // #3690 / #3695 — answer with the caller-VISIBLE occupant only. A
-    // tombstone holds no slot at v100 (a store lands beside it), and a
-    // hidden `quarantined` / `contaminated` occupant is never NAMED to the
+    // #3690 / #3695 / #3696 — answer with an occupant the `viewer` may READ on
+    // BOTH axes, through THE ONE admission predicate
+    // (`visibility::title_slot_admission`). A tombstone holds no slot at v100
+    // (a store lands beside it); a hidden `quarantined` / `contaminated`
+    // occupant, or another agent's `scope=private` row, is never NAMED to the
     // caller: the write funnels refuse it with an empty `existing_id`, and
-    // this is the probe those funnels (and the `on_conflict` pre-checks)
-    // read it from, so it must not hand the hidden id back either.
-    let id: Option<String> = conn
-        .query_row(
-            &format!(
-                "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 {} LIMIT 1",
-                crate::models::lifecycle_visible_clause("")
-            ),
-            params![title, namespace],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(id)
+    // this is the probe those funnels (and the `on_conflict` pre-checks) read
+    // it from, so it must not hand the hidden id back either. `None` is the
+    // single-tenant trust-all posture (lifecycle axis only).
+    Ok(title_slot_holder(conn, title, namespace, viewer)?
+        .filter(|h| h.admission == crate::models::TitleSlotAdmission::Occupied)
+        .map(|h| h.id))
 }
 
 /// #3690 — the row that HOLDS the `(title, namespace)` slot (the occupant the
@@ -9085,25 +9087,44 @@ struct TitleSlotHolder {
     admission: crate::models::TitleSlotAdmission,
 }
 
+/// The admission is decided by THE ONE two-axis predicate
+/// [`crate::visibility::title_slot_admission`] (lifecycle + the `viewer`'s
+/// scope visibility); a holder whose stored metadata is unparseable is read
+/// as `{}` (the `row_to_memory` fallback), i.e. owner-less private.
 fn title_slot_holder(
     conn: &Connection,
     title: &str,
     namespace: &str,
+    viewer: Option<&str>,
 ) -> Result<Option<TitleSlotHolder>> {
     use rusqlite::OptionalExtension;
     conn.query_row(
         &format!(
-            "SELECT id, version, lifecycle_state FROM memories \
+            "SELECT id, version, lifecycle_state, namespace, metadata FROM memories \
              WHERE title = ?1 AND namespace = ?2 AND {} LIMIT 1",
             crate::models::TITLE_SLOT_INDEX_PREDICATE
         ),
         params![title, namespace],
         |r| {
+            let id: String = r.get(0)?;
             let state: String = r.get(2)?;
+            let ns: String = r.get(3)?;
+            let raw_meta: String = r.get(4)?;
+            let metadata: serde_json::Value = serde_json::from_str(&raw_meta)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            let admission = crate::visibility::title_slot_admission(
+                &crate::visibility::TitleSlotOccupant {
+                    id: &id,
+                    namespace: &ns,
+                    metadata: &metadata,
+                    lifecycle_state: &state,
+                },
+                viewer,
+            );
             Ok(TitleSlotHolder {
-                id: r.get(0)?,
+                id,
                 version: r.get(1)?,
-                admission: crate::models::LifecycleState::title_slot_admission_for(&state),
+                admission,
             })
         },
     )
@@ -9163,12 +9184,12 @@ pub fn next_versioned_title(
     base_title: &str,
     namespace: &str,
 ) -> Result<String> {
-    if find_by_title_namespace(conn, base_title, namespace)?.is_none() {
+    if find_by_title_namespace(conn, base_title, namespace, None)?.is_none() {
         return Ok(base_title.to_string());
     }
     for n in 2..=MAX_VERSION_SUFFIX {
         let candidate = format!("{base_title} ({n})");
-        if find_by_title_namespace(conn, &candidate, namespace)?.is_none() {
+        if find_by_title_namespace(conn, &candidate, namespace, None)?.is_none() {
             return Ok(candidate);
         }
     }
@@ -11757,6 +11778,12 @@ pub fn proactive_conflict_check(
     conn: &Connection,
     mem: &Memory,
     query_embedding: &[f32],
+    // #3712 — the caller's READ-visibility identity (the value the read lanes
+    // resolve; `None` = single-tenant trust-all): a near-duplicate the caller
+    // cannot read (another agent's `scope=private` row) is dropped BEFORE
+    // scoring, so it neither refuses the write nor is named or described in
+    // the refusal — the #3696 non-disclosure rule on the near-duplicate lane.
+    viewer: Option<&str>,
 ) -> Result<Option<ProactiveConflict>> {
     if query_embedding.is_empty() {
         return Ok(None);
@@ -11799,7 +11826,7 @@ pub fn proactive_conflict_check(
     // #3693 — a hidden (quarantined / contaminated / tombstoned) row is never
     // a conflict advisory's subject: its id would be named to the caller.
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, title, content, embedding FROM memories
+        "SELECT id, title, content, embedding, namespace, metadata FROM memories
          WHERE embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?1)
            AND namespace = ?2
@@ -11809,7 +11836,7 @@ pub fn proactive_conflict_check(
          LIMIT ?3",
         lifecycle_vis = crate::models::lifecycle_visible_clause(""),
     ))?;
-    let rows: Vec<(String, String, String, Vec<u8>)> = stmt
+    let rows: Vec<ProactiveCandidateRow> = stmt
         .query_map(
             params![
                 now,
@@ -11817,18 +11844,15 @@ pub fn proactive_conflict_check(
                 i64::try_from(PROACTIVE_CONFLICT_SCAN_LIMIT).unwrap_or(i64::MAX),
                 active_space
             ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            },
+            read_proactive_candidate_row,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    Ok(proactive_conflict_verdict(mem, query_embedding, rows))
+    Ok(proactive_conflict_verdict(
+        mem,
+        query_embedding,
+        visible_proactive_candidates(rows, viewer),
+    ))
 }
 
 /// #1579 A5 — HNSW-routed entry point for the proactive conflict
@@ -11874,6 +11898,9 @@ pub fn proactive_conflict_check_with_index(
     mem: &Memory,
     query_embedding: &[f32],
     vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
+    // #3712 — the caller's READ-visibility identity: an invisible near-
+    // duplicate neither refuses the write nor is named (`None` = trust-all).
+    viewer: Option<&str>,
 ) -> Result<Option<ProactiveConflict>> {
     if query_embedding.is_empty() {
         return Ok(None);
@@ -11888,14 +11915,14 @@ pub fn proactive_conflict_check_with_index(
     {
         let hits = idx.search(query_embedding, PROACTIVE_CONFLICT_INDEX_K, None);
         let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
-        return proactive_conflict_check_candidates(conn, mem, query_embedding, &ids);
+        return proactive_conflict_check_candidates(conn, mem, query_embedding, &ids, viewer);
     }
     tracing::trace!(
         target: "proactive_conflict",
         namespace = %mem.namespace,
         "no fully-searchable (or empty) vector index — bounded recency-scan fallback (#1579 A5)"
     );
-    proactive_conflict_check(conn, mem, query_embedding)
+    proactive_conflict_check(conn, mem, query_embedding, viewer)
 }
 
 /// #1579 A5 — verify an ANN-derived candidate id list against the DB
@@ -11916,6 +11943,8 @@ pub fn proactive_conflict_check_candidates(
     mem: &Memory,
     query_embedding: &[f32],
     candidate_ids: &[String],
+    // #3712 — see `proactive_conflict_check`.
+    viewer: Option<&str>,
 ) -> Result<Option<ProactiveConflict>> {
     if query_embedding.is_empty() || candidate_ids.is_empty() {
         return Ok(None);
@@ -11943,7 +11972,7 @@ pub fn proactive_conflict_check_candidates(
     // when no active space is seeded.
     let active_space = crate::embeddings::active_embedding_space();
     let sql = format!(
-        "SELECT id, title, content, embedding FROM memories
+        "SELECT id, title, content, embedding, namespace, metadata FROM memories
          WHERE id IN ({placeholders})
            AND embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?{p_now})
@@ -11969,18 +11998,64 @@ pub fn proactive_conflict_check_candidates(
     binds.push(rusqlite::types::Value::Text(now));
     binds.push(rusqlite::types::Value::Text(mem.namespace.clone()));
     binds.push(active_space.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text));
-    let rows: Vec<(String, String, String, Vec<u8>)> = stmt
-        .query_map(rusqlite::params_from_iter(binds), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
-        })?
+    let rows: Vec<ProactiveCandidateRow> = stmt
+        .query_map(
+            rusqlite::params_from_iter(binds),
+            read_proactive_candidate_row,
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    Ok(proactive_conflict_verdict(mem, query_embedding, rows))
+    Ok(proactive_conflict_verdict(
+        mem,
+        query_embedding,
+        visible_proactive_candidates(rows, viewer),
+    ))
+}
+
+/// #3712 — one near-duplicate candidate as both proactive SELECTs project
+/// it: the scoring tuple plus the `(namespace, metadata)` the scope
+/// predicate needs.
+struct ProactiveCandidateRow {
+    id: String,
+    title: String,
+    content: String,
+    embedding: Vec<u8>,
+    namespace: String,
+    metadata: String,
+}
+
+fn read_proactive_candidate_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProactiveCandidateRow> {
+    Ok(ProactiveCandidateRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        content: row.get(2)?,
+        embedding: row.get(3)?,
+        namespace: row.get(4)?,
+        metadata: row.get(5)?,
+    })
+}
+
+/// #3712 — drop every candidate the `viewer` cannot READ before scoring, via
+/// the public [`crate::visibility::is_visible_by_fields`] (the predicate
+/// every read lane applies; not a copy of it). `None` keeps every row (the
+/// single-tenant trust-all posture). Unparseable stored metadata reads as
+/// `{}` (owner-less private), the `row_to_memory` fallback.
+fn visible_proactive_candidates(
+    rows: Vec<ProactiveCandidateRow>,
+    viewer: Option<&str>,
+) -> Vec<(String, String, String, Vec<u8>)> {
+    rows.into_iter()
+        .filter(|r| {
+            viewer.is_none_or(|caller| {
+                let metadata: serde_json::Value = serde_json::from_str(&r.metadata)
+                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                crate::visibility::is_visible_by_fields(&r.id, &r.namespace, &metadata, caller)
+            })
+        })
+        .map(|r| (r.id, r.title, r.content, r.embedding))
+        .collect()
 }
 
 /// #1579 A5 — shared scoring + verdict tail of the proactive conflict
@@ -32669,7 +32744,7 @@ mod tests {
             "expected typed ConflictError, got: {err}"
         );
         // First writer's content is preserved (no silent overwrite).
-        let row = find_by_title_namespace(&conn, "dup-title", "ns-conflict")
+        let row = find_by_title_namespace(&conn, "dup-title", "ns-conflict", None)
             .unwrap()
             .expect("first row still present");
         let fetched = get(&conn, &row).unwrap().unwrap();
@@ -32706,10 +32781,10 @@ mod tests {
         let id_b = insert_with_conflict(&conn, &m2, ConflictMode::Version).unwrap();
         assert_ne!(id_a, id_b, "version mode produces a distinct row");
         // Both titles are reachable: original + `(2)` suffix.
-        let original_id = find_by_title_namespace(&conn, "versioned", "ns-v")
+        let original_id = find_by_title_namespace(&conn, "versioned", "ns-v", None)
             .unwrap()
             .expect("original row");
-        let versioned_id = find_by_title_namespace(&conn, "versioned (2)", "ns-v")
+        let versioned_id = find_by_title_namespace(&conn, "versioned (2)", "ns-v", None)
             .unwrap()
             .expect("versioned row");
         assert_eq!(original_id, id_a);

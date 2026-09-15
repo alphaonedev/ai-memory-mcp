@@ -169,7 +169,8 @@ pub(crate) fn probe_sqlite(conn: &rusqlite::Connection, inbound: &Memory) -> Opt
     let prior = match by_id {
         Some(row) => Some(row),
         None => {
-            match crate::db::find_by_title_namespace(conn, &inbound.title, &inbound.namespace) {
+            match crate::db::find_by_title_namespace(conn, &inbound.title, &inbound.namespace, None)
+            {
                 Ok(Some(id)) => match crate::db::get(conn, &id) {
                     Ok(row) => row,
                     Err(e) => {
@@ -248,7 +249,7 @@ pub(crate) async fn probe_store(
     let prior = match by_id {
         Some(row) => Some(row),
         None => match store
-            .find_by_title_namespace(&inbound.title, &inbound.namespace)
+            .find_by_title_namespace(&inbound.title, &inbound.namespace, None)
             .await
         {
             Ok(Some(id)) => match store_get(store, ctx, &id).await {

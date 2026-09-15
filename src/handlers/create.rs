@@ -502,11 +502,14 @@ fn resolve_create_conflict_title(
     conn: &rusqlite::Connection,
     body: &CreateMemory,
     on_conflict_mode: crate::mcp::tools::OnConflictMode,
+    // #3696 — the resolved request agent: the probe names only an occupant
+    // this caller may read on both axes (`visibility::title_slot_admission`).
+    viewer: Option<&str>,
 ) -> Result<String, axum::response::Response> {
     use crate::mcp::tools::OnConflictMode;
     match on_conflict_mode {
         OnConflictMode::Error => {
-            match db::find_by_title_namespace(conn, &body.title, &body.namespace) {
+            match db::find_by_title_namespace(conn, &body.title, &body.namespace, viewer) {
                 Ok(Some(existing_id)) => Err(conflict_409_response(
                     &body.title,
                     &body.namespace,
@@ -728,6 +731,8 @@ fn insert_create_with_quota(
     // REFUSED atomically (409 CONFLICT) instead of upsert-merged. `false`
     // (`merge`/`version`) keeps the legacy `db::insert` upsert.
     fail_on_conflict: bool,
+    // #3696 — the resolved request agent (see `resolve_create_conflict_title`).
+    viewer: Option<&str>,
 ) -> Result<String, axum::response::Response> {
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
@@ -818,9 +823,9 @@ fn insert_create_with_quota(
     }
 
     let insert_result = if fail_on_conflict {
-        db::insert_no_overwrite(&lock.0, mem)
+        db::insert_no_overwrite_as(&lock.0, mem, viewer)
     } else {
-        db::insert(&lock.0, mem)
+        db::insert_as(&lock.0, mem, viewer)
     };
     match insert_result {
         Ok(actual_id) => {
@@ -1164,7 +1169,7 @@ async fn create_memory_postgres(
         OnConflictMode::Error => {
             match app
                 .store
-                .find_by_title_namespace(&body.title, &body.namespace)
+                .find_by_title_namespace(&body.title, &body.namespace, Some(agent_id))
                 .await
             {
                 Ok(Some(existing_id)) => {
@@ -1733,10 +1738,11 @@ async fn create_memory_write(
     );
 
     // Stage 2 — on_conflict resolution against the live connection.
-    let resolved_title = match resolve_create_conflict_title(&lock.0, &body, on_conflict_mode) {
-        Ok(t) => t,
-        Err(resp) => return resp,
-    };
+    let resolved_title =
+        match resolve_create_conflict_title(&lock.0, &body, on_conflict_mode, Some(&agent_id)) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
 
     // #2587 — `body.tags.clone()` verbatim; auto-tags are no longer
     // merged in before the durable insert (see the comment near the top
@@ -1873,9 +1879,13 @@ async fn create_memory_write(
         // #1579 A5 — verify the pre-lock ANN candidates (point lookups
         // + exact cosine recompute) when an index was available;
         // bounded recency scan otherwise.
+        // #3712 — as the resolved request agent: a near-duplicate this caller
+        // cannot read neither refuses the write nor is named in the 409.
         let check_result = match &conflict_candidate_ids {
-            Some(ids) => db::proactive_conflict_check_candidates(&lock.0, &mem, qe, ids),
-            None => db::proactive_conflict_check(&lock.0, &mem, qe),
+            Some(ids) => {
+                db::proactive_conflict_check_candidates(&lock.0, &mem, qe, ids, Some(&agent_id))
+            }
+            None => db::proactive_conflict_check(&lock.0, &mem, qe, Some(&agent_id)),
         };
         match check_result {
             Ok(Some(conflict)) => {
@@ -1935,6 +1945,7 @@ async fn create_memory_write(
         &embedding,
         create_space.as_deref(),
         fail_on_conflict,
+        Some(&agent_id),
     ) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2123,7 +2134,7 @@ mod tests {
         let mut body = make_body("dup-title");
         body.namespace = "ns-x".to_string();
         use crate::mcp::tools::OnConflictMode;
-        let err = resolve_create_conflict_title(&conn, &body, OnConflictMode::Error)
+        let err = resolve_create_conflict_title(&conn, &body, OnConflictMode::Error, None)
             .expect_err("must return CONFLICT");
         assert_eq!(err.status(), StatusCode::CONFLICT);
     }
@@ -2143,7 +2154,7 @@ mod tests {
         let mut body = make_body("vers-title");
         body.namespace = "ns-v".to_string();
         use crate::mcp::tools::OnConflictMode;
-        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Version)
+        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Version, None)
             .expect("version path returns Ok");
         // `next_versioned_title` appends a free numeric suffix when the
         // base name is taken (`vers-title (2)`-style). The exact suffix
@@ -2165,7 +2176,7 @@ mod tests {
         // path is documented as a no-op (UPSERT happens inside
         // `db::insert`).
         use crate::mcp::tools::OnConflictMode;
-        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Merge)
+        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Merge, None)
             .expect("merge path returns Ok");
         assert_eq!(resolved, "merge-title");
     }

@@ -1103,7 +1103,8 @@ fn redaction_would_clobber(
     };
     let existing = match by_id {
         Some(row) => Some(row),
-        None => match db::find_by_title_namespace(conn, &incoming.title, &incoming.namespace) {
+        None => match db::find_by_title_namespace(conn, &incoming.title, &incoming.namespace, None)
+        {
             Ok(Some(id)) => match db::get(conn, &id) {
                 Ok(row) => row,
                 Err(e) => {
@@ -2461,7 +2462,7 @@ mod tests {
         assert_eq!(original.title, "clash-title");
         assert_eq!(original.content, "ORIGINAL-content");
         // Incoming landed under the `(2)` suffix with its own content.
-        let suffixed_id = db::find_by_title_namespace(&conn, "clash-title (2)", "clash-ns")
+        let suffixed_id = db::find_by_title_namespace(&conn, "clash-title (2)", "clash-ns", None)
             .unwrap()
             .expect("a `clash-title (2)` suffixed sibling row must exist");
         let suffixed = db::get(&conn, &suffixed_id).unwrap().unwrap();

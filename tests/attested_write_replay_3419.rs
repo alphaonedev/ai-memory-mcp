@@ -257,7 +257,7 @@ fn enroll(db_path: &std::path::Path) -> ai_memory::identity::keypair::AgentKeypa
 /// The live row's id for `title` in the test namespace, if any.
 fn stored_id(db_path: &std::path::Path, title: &str) -> Option<String> {
     let conn = ai_memory::db::open(db_path).expect("reopen for id lookup");
-    ai_memory::db::find_by_title_namespace(&conn, title, NS).expect("find_by_title_namespace")
+    ai_memory::db::find_by_title_namespace(&conn, title, NS, None).expect("find_by_title_namespace")
 }
 
 fn live_row_count(db_path: &std::path::Path) -> i64 {

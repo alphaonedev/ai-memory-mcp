@@ -250,8 +250,14 @@ pub(super) fn parse_and_build_memory(
     // exists; `Merge` defers to the legacy code path below.
     let resolved_title = match on_conflict {
         OnConflict::Error => {
+            // #3696 — probe as the ENFORCED-read caller: an occupant this
+            // caller cannot read (another agent's private row, or a hidden
+            // one) is never named here; the write's own admission refuses it
+            // typed and unnamed.
+            let viewer = crate::identity::resolve_read_visibility_caller();
             if let Some(existing_id) =
-                db::find_by_title_namespace(conn, title, &namespace).map_err(|e| e.to_string())?
+                db::find_by_title_namespace(conn, title, &namespace, viewer.as_deref())
+                    .map_err(|e| e.to_string())?
             {
                 return Err(conflict_error_message(title, &namespace, &existing_id));
             }
