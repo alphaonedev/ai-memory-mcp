@@ -110,7 +110,7 @@ CLI subcommands):
 | HTTP routes | **102 production `.route(...)` registrations** / 88 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v99** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v98" |
+| Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
 
 ## Before upgrading — run `ai-memory config check` (#3715)
 
@@ -643,12 +643,12 @@ those two review lanes raised, and no tag has been cut.
 > summarized here for completeness and to record that both review lanes
 > closed with zero GA-blockers among the findings they raised.
 
-## Schema ladder v78 → v98
+## Schema ladder v78 → v100
 
-`CURRENT_SCHEMA_VERSION = 99` on both adapters
+`CURRENT_SCHEMA_VERSION = 100` on both adapters
 (`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
-`src/store/postgres.rs::{migrate_v79 … migrate_v98}`.
+`src/store/postgres.rs::{migrate_v79 … migrate_v100}`.
 
 **The ladder is not uniformly additive, and this document previously
 said it was.** v79–v85 are pure additive `ADD COLUMN` / `CREATE TABLE`
