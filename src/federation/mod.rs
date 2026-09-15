@@ -172,7 +172,10 @@ pub struct FederationConfig {
 }
 
 /// A single peer in the quorum mesh. The `id` is what we record in
-/// the ack tracker (typically the URL or the peer's mTLS fingerprint).
+/// the ack tracker: the credential-free `stable_peer_id` digest of the
+/// normalized URL (#2442), never the URL itself. `sync_push_url` may carry
+/// credentials, so render it only through `url_display::url_origin_and_path`
+/// (#3667/#3711: an allowlist renderer, never a masker).
 #[derive(Clone, Debug)]
 pub struct PeerEndpoint {
     pub id: String,

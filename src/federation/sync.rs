@@ -843,7 +843,9 @@ pub async fn broadcast_store_quorum_with_embedding(
             .peers
             .iter()
             .filter(|p| !acked.contains(&p.id))
-            .map(|p| p.sync_push_url.clone())
+            // #3667/#3711 — a log line is a sink: the peer renders as its
+            // origin + path (#3675 identity), never its userinfo or query.
+            .map(|p| crate::url_display::url_origin_and_path(&p.sync_push_url))
             .collect();
         if !missing.is_empty() {
             missing.sort();

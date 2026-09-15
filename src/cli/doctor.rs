@@ -3771,7 +3771,13 @@ fn section_llm_reachability_1146() -> ReportSection {
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
         ("model".into(), resolved.model.clone()),
-        ("base_url".into(), resolved.base_url.clone()),
+        // #3667/#3711 — a doctor fact is a sink (text, --json, pasted reports):
+        // the endpoint an operator needs is the origin; the userinfo/query a
+        // base URL routinely carries is the credential.
+        (
+            "base_url".into(),
+            crate::url_display::url_origin(&resolved.base_url),
+        ),
         ("config_source".into(), resolved.source.as_str().to_string()),
         (
             field_names::KEY_SOURCE.into(),
@@ -3817,7 +3823,10 @@ fn section_llm_reachability_1146() -> ReportSection {
             resolved.api_key().map(str::to_string),
         )
     };
-    facts.push(("probe_url".into(), probe_url.clone()));
+    facts.push((
+        "probe_url".into(),
+        crate::url_display::url_origin_and_path(&probe_url),
+    ));
 
     let started = std::time::Instant::now();
     let client = match reqwest::blocking::Client::builder()
@@ -3883,7 +3892,7 @@ fn section_llm_reachability_1146() -> ReportSection {
                     Some(format!(
                         "unexpected status {} from {} — verify base_url + endpoint shape",
                         status.as_u16(),
-                        probe_url
+                        crate::url_display::url_origin_and_path(&probe_url)
                     )),
                 )
             }
@@ -3891,19 +3900,19 @@ fn section_llm_reachability_1146() -> ReportSection {
         Err(e) => {
             let elapsed_ms = started.elapsed().as_millis();
             facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
-            facts.push(("error".into(), e.to_string()));
-            let kind = if e.is_timeout() {
-                "timeout"
-            } else if e.is_connect() {
-                "connect"
-            } else {
-                "transport"
-            };
+            // #3667/#3711 — a doctor fact and note are sinks (text, `--json`,
+            // every pasted report). `reqwest::Error`'s Display appends the
+            // request URL — userinfo stripped, query VERBATIM — so the fact
+            // carries the failure CLASS, and the note names the probe from
+            // the allowlist (origin + path), never the raw URL.
+            let failure = crate::url_display::TransportFailure::classify(&e);
+            facts.push(("error".into(), crate::url_display::network_failure(&e)));
             (
                 Severity::Critical,
                 Some(format!(
-                    "network/{kind} error contacting {probe_url} — verify \
-                     base_url and connectivity"
+                    "network/{failure} error contacting {} — verify \
+                     base_url and connectivity",
+                    crate::url_display::url_origin_and_path(&probe_url)
                 )),
             )
         }
@@ -3970,7 +3979,10 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
         ("model".into(), resolved.model.clone()),
-        ("base_url".into(), resolved.url.clone()),
+        (
+            "base_url".into(),
+            crate::url_display::url_origin(&resolved.url),
+        ),
         ("config_source".into(), resolved.source.as_str().to_string()),
         (
             field_names::KEY_SOURCE.into(),
@@ -4049,7 +4061,10 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         let req = client.get(&url);
         (url, req)
     };
-    facts.push(("probe_url".into(), probe_url.clone()));
+    facts.push((
+        "probe_url".into(),
+        crate::url_display::url_origin_and_path(&probe_url),
+    ));
 
     let (mut severity, mut note) = match req.send() {
         Ok(resp) => {
@@ -4089,7 +4104,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
                     Some(format!(
                         "unexpected status {} from {} — verify base_url + endpoint shape",
                         status.as_u16(),
-                        probe_url
+                        crate::url_display::url_origin_and_path(&probe_url)
                     )),
                 )
             }
@@ -4097,19 +4112,19 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         Err(e) => {
             let elapsed_ms = started.elapsed().as_millis();
             facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
-            facts.push(("error".into(), e.to_string()));
-            let kind = if e.is_timeout() {
-                "timeout"
-            } else if e.is_connect() {
-                "connect"
-            } else {
-                "transport"
-            };
+            // #3667/#3711 — a doctor fact and note are sinks (text, `--json`,
+            // every pasted report). `reqwest::Error`'s Display appends the
+            // request URL — userinfo stripped, query VERBATIM — so the fact
+            // carries the failure CLASS, and the note names the probe from
+            // the allowlist (origin + path), never the raw URL.
+            let failure = crate::url_display::TransportFailure::classify(&e);
+            facts.push(("error".into(), crate::url_display::network_failure(&e)));
             (
                 Severity::Critical,
                 Some(format!(
-                    "network/{kind} error contacting {probe_url} — verify \
-                     base_url and connectivity"
+                    "network/{failure} error contacting {} — verify \
+                     base_url and connectivity",
+                    crate::url_display::url_origin_and_path(&probe_url)
                 )),
             )
         }
