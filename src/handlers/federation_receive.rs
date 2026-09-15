@@ -1021,6 +1021,16 @@ pub(crate) struct InboundAttestationRejection {
     cause: &'static str,
 }
 
+/// #3699 — render the per-item rejections in the sender's WIRE order (the
+/// receive loop applies in causal order; the response array stays positional).
+pub(crate) fn rejections_in_wire_order(
+    collected: &[(usize, InboundAttestationRejection)],
+) -> Vec<&InboundAttestationRejection> {
+    let mut ordered: Vec<&(usize, InboundAttestationRejection)> = collected.iter().collect();
+    ordered.sort_by_key(|(wire_idx, _)| *wire_idx);
+    ordered.into_iter().map(|(_, r)| r).collect()
+}
+
 /// Classify a per-write attestation refusal into its closed-set cause token.
 ///
 /// Split out of the reporter so the classification is a pure, total function of
@@ -2554,7 +2564,10 @@ async fn sync_push_write(
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
-    let mut attestation_rejections = Vec::new();
+    // #3699 — collected with each item's WIRE index: the loop applies in causal
+    // order, but the sender's contract for this array is positional, so it is
+    // rendered back in wire order (`rejections_in_wire_order`).
+    let mut attestation_rejections: Vec<(usize, InboundAttestationRejection)> = Vec::new();
     let mut deleted = 0usize;
     let mut archived = 0usize;
     let mut restored = 0usize;
@@ -2636,7 +2649,10 @@ async fn sync_push_write(
         &attest_cfg,
         require_push_ns_scope,
     );
-    for mem in &body.memories {
+    // #3699 (5-agent vote 4d3ea1c5) — apply in CAUSAL order (updated_at, id)
+    // so a consolidation tombstone in this body lands BEFORE a new memory
+    // that reuses its freed title; see `federation::causal_apply_order`.
+    for (wire_idx, mem) in crate::federation::causal_apply_order(&body.memories) {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
             skipped += 1;
@@ -2810,13 +2826,16 @@ async fn sync_push_write(
             author_bound_key.as_ref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
-            attestation_rejections.push(report_inbound_attestation_rejection(
-                &to_insert,
-                &attribute_agent,
-                &body.sender_agent_id,
-                author_bound_key.as_ref(),
-                crate::handlers::StorageBackend::Sqlite,
-                &e,
+            attestation_rejections.push((
+                wire_idx,
+                report_inbound_attestation_rejection(
+                    &to_insert,
+                    &attribute_agent,
+                    &body.sender_agent_id,
+                    author_bound_key.as_ref(),
+                    crate::handlers::StorageBackend::Sqlite,
+                    &e,
+                ),
             ));
             skipped += 1;
             continue;
@@ -3087,7 +3106,7 @@ async fn sync_push_write(
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
-                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
+                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),
                 "reset_at": reset_at,
             })),
         )
@@ -4522,7 +4541,7 @@ async fn sync_push_write(
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
-            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
+            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),
             "dry_run": body.dry_run,
             "receiver_agent_id": local_agent_id,
             "receiver_clock": receiver_clock,
