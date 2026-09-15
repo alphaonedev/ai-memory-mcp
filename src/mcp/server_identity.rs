@@ -494,11 +494,37 @@ mod tests {
 
     #[test]
     fn tampered_schema_version_fails_verification() {
+        const TAMPER: &str = "vTEST_TAMPERED";
         let kp = make_test_keypair("ai:nhi@host");
         let mut block = build_signed_identity(Some(&kp), fixed_timestamp())
             .unwrap()
             .expect("signing keypair must yield Some");
-        block["schema_version"] = json!("v99");
+
+        // ALLOWED-PATH CONTROL: the UNTAMPERED block must verify. Without it,
+        // the `.is_err()` assertion below could pass because verification
+        // started failing for an unrelated reason, not because the tamper was
+        // detected.
+        verify_signed_identity(&block).expect("the untampered block must verify");
+
+        // A TEST SENTINEL THAT CAN BECOME A REAL VALUE IS NOT A SENTINEL. The
+        // old literal `"v99"` silently BECAME the real signed value once
+        // CURRENT_SCHEMA_VERSION reached 99 (#3655-v2), so the "tamper" wrote
+        // the value that was already there — a no-op, verification correctly
+        // succeeded, and this assertion went vacuous (#3748). Use a `vTEST_`
+        // sentinel per the module convention above (production versions are
+        // numeric, so a `vTEST_` value can never collide) AND machine-check
+        // that it actually differs from the signed value, so the NEXT collision
+        // fails LOUDLY here instead of silently disarming the test.
+        let signed = block["schema_version"]
+            .as_str()
+            .expect("schema_version present")
+            .to_owned();
+        assert_ne!(
+            signed, TAMPER,
+            "the tamper value must differ from the signed value, or the tamper              is a no-op and this test proves nothing"
+        );
+
+        block["schema_version"] = json!(TAMPER);
         assert!(
             verify_signed_identity(&block).is_err(),
             "tampered schema_version must fail verification"
