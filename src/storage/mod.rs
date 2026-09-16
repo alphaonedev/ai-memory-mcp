@@ -24279,8 +24279,8 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
             // and the queued row was a dead letter. Dispatch vertical
             // payloads onto `promote_to_namespace`; leave a real store
             // payload on the Memory-insert path.
-            let is_vertical_promote =
-                pa.payload.get("mode").and_then(|v| v.as_str()) == Some("vertical");
+            let is_vertical_promote = pa.payload.get(field_names::MODE).and_then(|v| v.as_str())
+                == Some(field_names::MODE_VERTICAL);
             if is_vertical_promote {
                 let mid = pa.memory_id.clone().or_else(|| {
                     pa.payload

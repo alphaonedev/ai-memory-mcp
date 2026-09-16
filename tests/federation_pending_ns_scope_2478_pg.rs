@@ -949,3 +949,184 @@ async fn federated_approve_rebinds_forged_decider_on_postgres_3628() {
     assert_eq!(own["status"], "approved", "{report}");
     assert_eq!(own["decided_by"], PEER_ID);
 }
+
+// ---------------------------------------------------------------------
+// #3629 (CWE-284, write-confinement) — the `store` arm's #3202 vertical-promote
+// overload `{id, to_namespace, mode: "vertical"}`, at a postgres receiver.
+// The gate (`pending_action_effect`) is ONE shared function, so these cells
+// prove the pg funnel refuses at the LANE gate — the row is never filed —
+// exactly as the sqlite twin does. What they deliberately do NOT assert is the
+// clone itself: the pg executor's `store` arm deserialises the payload as a
+// `Memory` and refuses a vertical payload with `invalid store payload`, so on
+// pg the breach stops at execute anyway; the lane gate must still refuse it
+// BEFORE a governance row carrying an out-of-scope subject is persisted.
+// ---------------------------------------------------------------------
+
+/// The enrolment for the peer as a whole `{root}/**` TREE (bare `{root}` and
+/// everything below it), so a vertical clone from `{root}/leaf` up into
+/// `{root}` is in scope at both ends — the present half needs it because a
+/// `{root}/*` scope can never contain both a namespace and its ancestor.
+fn set_tree_posture_deciding_as(root: &str, also_as: &[&str]) {
+    set_scoped_posture_deciding_as(root, also_as);
+    let senders: Vec<String> = std::iter::once(PEER_ID.to_string())
+        .chain(also_as.iter().map(|s| (*s).to_string()))
+        .collect();
+    let senders = serde_json::to_string(&senders).expect("sender list");
+    // SAFETY: all callers hold FED_ENV_LOCK; this binary serializes env users.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+            format!(
+                r#"{{"{PEER_ID}":{{"allowed_namespaces":["{root}/**"],"allowed_sender_agent_ids":{senders}}}}}"#
+            ),
+        );
+    }
+}
+
+/// The #3202 vertical payload as `src/mcp/tools/promote.rs` queues it.
+fn vertical_store_entry_3629(
+    pid: &str,
+    declared_namespace: &str,
+    memory_id: Option<&str>,
+    source_id: &str,
+    to_namespace: &str,
+) -> Value {
+    json!({
+        "id": pid,
+        "action_type": "store",
+        "memory_id": memory_id,
+        "namespace": declared_namespace,
+        "payload": {
+            "id": source_id,
+            (ai_memory::models::field_names::TO_NAMESPACE): to_namespace,
+            (ai_memory::models::field_names::MODE): ai_memory::models::field_names::MODE_VERTICAL,
+        },
+        "requested_by": PEER_ID,
+        "requested_at": chrono::Utc::now().to_rfc3339(),
+        "status": "pending",
+        "decided_by": null,
+        "decided_at": null,
+        "approvals": []
+    })
+}
+
+/// ABSENT — the destination `to_namespace` (the bare root, an ancestor of the
+/// in-scope `{root}/leaf` source) is outside a `{root}/*` scope: refused at the
+/// lane gate, nothing filed.
+#[tokio::test]
+async fn federated_vertical_store_destination_out_of_scope_refused_on_postgres_3629() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+    let root = uniq("public-3629a");
+    let leaf_ns = format!("{root}/leaf");
+    set_scoped_posture(&root);
+
+    let source_id = uuid::Uuid::new_v4().to_string();
+    seed_row(&store, &source_id, &leaf_ns, &uniq("pg-vertical-source")).await;
+
+    let pid = uuid::Uuid::new_v4().to_string();
+    let entry = vertical_store_entry_3629(&pid, &leaf_ns, Some(&source_id), &source_id, &root);
+    let (status, report) = push_governance(&router, vec![entry], vec![]).await;
+    assert!(status.is_success(), "{report}");
+
+    assert_eq!(
+        counter(&report, "pendings_applied"),
+        0,
+        "#3629 pg: a `store` pending with `mode: vertical` CLONES into \
+         `payload.to_namespace`; that destination is outside the peer's scope, \
+         so the lane gate must refuse it before anything is filed: {report}"
+    );
+    assert!(
+        pending_snapshot_3582(&pool, &pid).await.is_none(),
+        "#3629 pg: the out-of-scope governance row must not be persisted"
+    );
+    assert_eq!(count_ns(&pool, &root).await, 0, "{report}");
+}
+
+/// ABSENT — the SOURCE row, reached only through `payload.id` (no `memory_id`,
+/// the executor's fallback), lives in `{root}/mid/leaf`, outside a `{root}/*`
+/// scope, while the destination `{root}/mid` is in scope: only the by-id half
+/// can refuse this one.
+#[tokio::test]
+async fn federated_vertical_store_source_by_payload_id_out_of_scope_refused_on_postgres_3629() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+    let root = uniq("public-3629b");
+    let dest_ns = format!("{root}/mid");
+    let source_ns = format!("{root}/mid/leaf");
+    set_scoped_posture(&root);
+
+    let source_id = uuid::Uuid::new_v4().to_string();
+    seed_row(
+        &store,
+        &source_id,
+        &source_ns,
+        &uniq("pg-vertical-deep-source"),
+    )
+    .await;
+
+    let pid = uuid::Uuid::new_v4().to_string();
+    let entry = vertical_store_entry_3629(&pid, &dest_ns, None, &source_id, &dest_ns);
+    let (status, report) = push_governance(&router, vec![entry], vec![]).await;
+    assert!(status.is_success(), "{report}");
+
+    assert_eq!(
+        counter(&report, "pendings_applied"),
+        0,
+        "#3629 pg: the source row's STORED namespace `{source_ns}` is outside the \
+         peer's scope; the by-id probe on `payload.id` must refuse it: {report}"
+    );
+    assert!(
+        pending_snapshot_3582(&pool, &pid).await.is_none(),
+        "#3629 pg: the out-of-scope governance row must not be persisted"
+    );
+}
+
+/// PRESENT — both ends inside a `{root}/**` tree scope: the row is filed and
+/// its approval applies, so the gate confines the overload rather than
+/// refusing every vertical payload.
+#[tokio::test]
+async fn federated_vertical_store_in_scope_is_filed_and_approved_on_postgres_3629() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let (router, store) = pg_router(&url).await;
+    let pool = raw_pool(&url).await;
+    let root = uniq("public-3629c");
+    let leaf_ns = format!("{root}/leaf");
+    let approver = uniq("ai:approver-3629");
+    register_approver(&store, &approver).await;
+    set_tree_posture_deciding_as(&root, &[approver.as_str()]);
+
+    let source_id = uuid::Uuid::new_v4().to_string();
+    seed_row(&store, &source_id, &leaf_ns, &uniq("pg-vertical-source-ok")).await;
+
+    let pid = uuid::Uuid::new_v4().to_string();
+    let entry = vertical_store_entry_3629(&pid, &leaf_ns, Some(&source_id), &source_id, &root);
+    let decision = json!({ "id": pid, "approved": true, "decider": approver });
+    let (status, report) = push_governance(&router, vec![entry], vec![decision]).await;
+    assert!(status.is_success(), "{report}");
+
+    assert_eq!(counter(&report, "pendings_applied"), 1, "{report}");
+    assert_eq!(counter(&report, "pending_decisions_applied"), 1, "{report}");
+    let row = pending_snapshot_3582(&pool, &pid).await.expect("filed row");
+    assert_eq!(row["status"], "approved", "{report}");
+    // The clone itself is NOT asserted here: the pg executor's `store` arm has
+    // no vertical dispatch (it refuses the payload as `invalid store payload`),
+    // so on pg the decision applies and the execute is counted `skipped`.
+}

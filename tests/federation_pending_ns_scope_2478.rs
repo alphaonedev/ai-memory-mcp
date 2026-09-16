@@ -90,6 +90,13 @@ const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":[
 /// Deep-scope posture for the `promote` cell: the peer may act on the leaf but
 /// NOT on its ancestor, which is where `promote_to_namespace` clones into.
 const SCOPED_ALLOWLIST_DEEP: &str = r#"{"ai:evil":{"allowed_namespaces":["public/deep/x"],"allowed_sender_agent_ids":["ai:evil","ai:approver"]}}"#;
+/// #3629 — the whole `public/**` tree, so a vertical clone from `public/deep/x`
+/// up into `public/deep` is IN scope at both ends (the present half).
+const SCOPED_ALLOWLIST_PUBLIC_TREE: &str = r#"{"ai:evil":{"allowed_namespaces":["public/**"],"allowed_sender_agent_ids":["ai:evil","ai:approver"]}}"#;
+/// #3629 — ONLY the `secure` root (a bare pattern matches itself and nothing
+/// below it), so a vertical clone whose DESTINATION is `secure` is in scope
+/// while its SOURCE `secure/ops` row is not — isolating the by-id half.
+const SCOPED_ALLOWLIST_SECURE_ROOT: &str = r#"{"ai:evil":{"allowed_namespaces":["secure"],"allowed_sender_agent_ids":["ai:evil","ai:approver"]}}"#;
 
 /// RAII posture guard — `Drop` runs on unwind, so a failing assertion cannot
 /// leak an enrolled allowlist into the next test in this binary (#2482 shape).
@@ -546,6 +553,173 @@ async fn exploit_promote_arm_clones_into_out_of_scope_ancestor_2478() {
          DESTINATION is a write and must be in the peer's scope. The issue text \
          named only 'the target row's stored namespace' for this arm — that is \
          under-specified and this cell is why"
+    );
+}
+
+/// #3629 — the #3202 vertical-promote payload, byte-shaped as
+/// `src/mcp/tools/promote.rs` queues it: `action_type = "store"` with
+/// `{id, to_namespace, mode: "vertical"}`, which `execute_pending_action`
+/// routes onto `promote_to_namespace` (a CLONE into an ancestor).
+fn vertical_store_payload(source_id: &str, to_namespace: &str) -> Value {
+    json!({
+        "id": source_id,
+        (ai_memory::models::field_names::TO_NAMESPACE): to_namespace,
+        (ai_memory::models::field_names::MODE): ai_memory::models::field_names::MODE_VERTICAL,
+    })
+}
+
+// ---------------------------------------------------------------------
+// #3629 (CWE-284, write-confinement) — the `store` arm's vertical-promote
+// overload. The #2478 gate modelled `store` as "insert into
+// `payload.namespace`", so a `{id, to_namespace, mode: "vertical"}` payload
+// showed the gate nothing but the decoy `pa.namespace`, and the executor then
+// cloned the source row into `to_namespace`. `validate_promotion_target`
+// confines the destination to an ANCESTOR of the source, so the achievable
+// breach (rehearsed live on #3629) is a clone into an out-of-scope ancestor —
+// the same shape `exploit_promote_arm_clones_into_out_of_scope_ancestor_2478`
+// pins for the non-overloaded arm.
+//
+// Three cells isolate the three inputs the fix adds to the gate's subject:
+// the destination (`payload.to_namespace`), the source by `memory_id`, and the
+// source by `payload.id` (the executor's fallback when `memory_id` is absent);
+// a fourth is the PRESENT half — the in-scope twin still clones.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn exploit_vertical_store_arm_clones_into_out_of_scope_ancestor_3629() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_posture(Some(SCOPED_ALLOWLIST_DEEP), None);
+    let (router, db) = build_router_with_db();
+    register_approver(&db).await;
+
+    let leaf_id = seed_row(&router, "public/deep/x", "vertical-source").await;
+    let pid = uuid::Uuid::new_v4().to_string();
+    let entry = pending_entry(
+        &pid,
+        "store",         // the overloaded arm
+        "public/deep/x", // in scope — the decoy
+        Some(&leaf_id),
+        &vertical_store_payload(&leaf_id, "public/deep"), // destination NOT in scope
+    );
+
+    let (status, report) = push_governance(&router, vec![entry], vec![approve(&pid)]).await;
+    assert!(status.is_success(), "got {status} {report}");
+
+    assert_eq!(
+        count_ns(&db, "public/deep").await,
+        0,
+        "#3629: a `store`-typed pending with `mode: vertical` is a CLONE into \
+         `payload.to_namespace`, so the destination is a write and must be in \
+         the peer's scope — the gate saw only the decoy `pa.namespace` before"
+    );
+    assert_eq!(
+        counter(&report, "pendings_applied"),
+        0,
+        "the refusal must happen at the lane gate, before the row is filed: {report}"
+    );
+}
+
+#[tokio::test]
+async fn exploit_vertical_store_arm_source_by_memory_id_out_of_scope_3629() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_posture(Some(SCOPED_ALLOWLIST_SECURE_ROOT), None);
+    let (router, db) = build_router_with_db();
+    register_approver(&db).await;
+
+    // The SOURCE lives in `secure/ops` (out of scope); the DESTINATION `secure`
+    // is its ancestor AND in scope, so only the by-id half can refuse this.
+    let source_id = seed_row(&router, VICTIM_NS, "secret-in-ops").await;
+    let pid = uuid::Uuid::new_v4().to_string();
+    let entry = pending_entry(
+        &pid,
+        "store",
+        "secure", // in scope — the decoy
+        Some(&source_id),
+        &vertical_store_payload(&source_id, "secure"),
+    );
+
+    let (status, report) = push_governance(&router, vec![entry], vec![approve(&pid)]).await;
+    assert!(status.is_success(), "got {status} {report}");
+
+    assert_eq!(
+        count_ns(&db, "secure").await,
+        0,
+        "#3629: the source row is reached BY ID (`memory_id`) and its stored \
+         namespace `{VICTIM_NS}` is not in the peer's scope — the clone into the \
+         in-scope ancestor must be refused on the source, not waved through"
+    );
+    assert_eq!(counter(&report, "pendings_applied"), 0, "{report}");
+}
+
+#[tokio::test]
+async fn exploit_vertical_store_arm_source_by_payload_id_out_of_scope_3629() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_posture(Some(SCOPED_ALLOWLIST_SECURE_ROOT), None);
+    let (router, db) = build_router_with_db();
+    register_approver(&db).await;
+
+    let source_id = seed_row(&router, VICTIM_NS, "secret-in-ops-by-payload").await;
+    let pid = uuid::Uuid::new_v4().to_string();
+    // `memory_id` ABSENT: the executor falls back to `payload.id`, so a gate
+    // that lists only `memory_id` would be blind to exactly this row.
+    let entry = pending_entry(
+        &pid,
+        "store",
+        "secure",
+        None,
+        &vertical_store_payload(&source_id, "secure"),
+    );
+
+    let (status, report) = push_governance(&router, vec![entry], vec![approve(&pid)]).await;
+    assert!(status.is_success(), "got {status} {report}");
+
+    assert_eq!(
+        count_ns(&db, "secure").await,
+        0,
+        "#3629: the executor's `memory_id.or(payload.id)` fallback reaches the \
+         `{VICTIM_NS}` row through `payload.id`; the gate must list that id too"
+    );
+    assert_eq!(counter(&report, "pendings_applied"), 0, "{report}");
+}
+
+/// PRESENT half — the same wire shape with BOTH ends in scope still files,
+/// approves and CLONES, so the fix confines rather than disables the #3202
+/// vertical promote.
+#[tokio::test]
+async fn control_vertical_store_arm_in_scope_clone_still_lands_3629() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    set_posture(Some(SCOPED_ALLOWLIST_PUBLIC_TREE), None);
+    let (router, db) = build_router_with_db();
+    register_approver(&db).await;
+
+    let leaf_id = seed_row(&router, "public/deep/x", "vertical-source-ok").await;
+    let pid = uuid::Uuid::new_v4().to_string();
+    let entry = pending_entry(
+        &pid,
+        "store",
+        "public/deep/x",
+        Some(&leaf_id),
+        &vertical_store_payload(&leaf_id, "public/deep"),
+    );
+
+    let (status, report) = push_governance(&router, vec![entry], vec![approve(&pid)]).await;
+    assert!(status.is_success(), "got {status} {report}");
+
+    assert_eq!(counter(&report, "pendings_applied"), 1, "{report}");
+    assert_eq!(counter(&report, "pending_decisions_applied"), 1, "{report}");
+    assert_eq!(
+        count_ns(&db, "public/deep").await,
+        1,
+        "#3629 present half: source and destination both in scope — the clone \
+         must still land, or the gate is refusing the feature, not the breach"
+    );
+    assert!(
+        row_exists(&db, &leaf_id).await,
+        "a vertical promote CLONES; the source row must survive"
     );
 }
 

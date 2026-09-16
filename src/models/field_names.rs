@@ -543,6 +543,14 @@ pub const TOTAL_LINES: &str = "total_lines";
 pub const TOTAL_MEMORIES: &str = "total_memories";
 /// `to_namespace` — wire/row field name.
 pub const TO_NAMESPACE: &str = "to_namespace";
+/// `mode` — the #3202 vertical-promote marker key on a `store`-typed pending
+/// payload (`{id, to_namespace, mode: "vertical"}`), read by
+/// `crate::storage::execute_pending_action` and by the #2478 federation
+/// effect gate (`pending_action_effect`), which MUST stay in lockstep (#3629).
+pub const MODE: &str = "mode";
+/// `vertical` — the [`MODE`] value that routes a `store`-typed pending onto
+/// `promote_to_namespace` instead of the `Memory`-insert path.
+pub const MODE_VERTICAL: &str = "vertical";
 /// `transcript_id` — I2 link / I4 replay envelope.
 pub const TRANSCRIPT_ID: &str = "transcript_id";
 /// `transcripts` — wire/row field name.

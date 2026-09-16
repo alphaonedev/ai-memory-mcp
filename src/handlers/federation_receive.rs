@@ -1423,6 +1423,13 @@ pub(super) fn pending_author_authorized(
 /// as it names the same key the executor obeys.
 const PENDING_PAYLOAD_NAMESPACE_KEY: &str = "namespace";
 
+/// #3629 — payload key naming the SOURCE row of a #3202 vertical-promote
+/// `store` pending when the row's own `memory_id` is absent. Mirrors the
+/// `pa.memory_id.or(payload.id)` fallback in
+/// [`crate::storage::execute_pending_action`]'s `store` arm; same lockstep
+/// contract as [`PENDING_PAYLOAD_NAMESPACE_KEY`].
+const PENDING_PAYLOAD_ID_KEY: &str = "id";
+
 /// The namespaces an approved `pending_actions` row would actually TOUCH when
 /// [`crate::storage::execute_pending_action`] replays it (#2478).
 ///
@@ -1458,7 +1465,9 @@ fn governed_action_of(action_type: &str) -> Option<crate::models::GovernedAction
 ///
 /// [`crate::storage::execute_pending_action`] **never reads `pa.namespace`**.
 /// Its `store` arm deserialises `pa.payload` into a `Memory` and inserts
-/// `mem.namespace`; its `promote` arm clones the target into
+/// `mem.namespace` — or, when `payload.mode == "vertical"` (#3202), clones the
+/// row named by `memory_id` / `payload.id` into `payload.to_namespace` exactly
+/// like the promote arm (#3629); its `promote` arm clones the target into
 /// `payload.to_namespace`; its `reflect` arm writes into `payload.namespace`
 /// (falling back to `pa.namespace`) and mints a signed `reflects_on` edge onto
 /// every `payload.source_ids[i]`; only its `delete` arm touches
@@ -1494,7 +1503,28 @@ pub(super) fn pending_action_effect(
     let mut destructive = false;
 
     match action {
-        G::Store => claimed.extend(pending_payload_str(pa, PENDING_PAYLOAD_NAMESPACE_KEY)),
+        G::Store => {
+            claimed.extend(pending_payload_str(pa, PENDING_PAYLOAD_NAMESPACE_KEY));
+            // #3629 (CWE-284) — #3202 overloaded `store` with the vertical-promote
+            // payload `{id, to_namespace, mode: "vertical"}`, which the executor
+            // routes onto `promote_to_namespace(<memory_id | payload.id>,
+            // to_namespace)` — a CLONE of an existing row into an ancestor
+            // namespace, exactly the `promote` arm below. Model it the same
+            // way: the source row is reached BY ID (its stored namespace is
+            // never on the wire) and the destination is a WRITE. Both ids the
+            // executor may fall back through are listed, so the gate can only
+            // refuse more than the executor touches, never less.
+            if pending_payload_str(pa, crate::models::field_names::MODE)
+                == Some(crate::models::field_names::MODE_VERTICAL)
+            {
+                by_id.extend(pa.memory_id.as_deref());
+                by_id.extend(pending_payload_str(pa, PENDING_PAYLOAD_ID_KEY));
+                claimed.extend(pending_payload_str(
+                    pa,
+                    crate::models::field_names::TO_NAMESPACE,
+                ));
+            }
+        }
         G::Delete => {
             destructive = true;
             by_id.extend(pa.memory_id.as_deref());
