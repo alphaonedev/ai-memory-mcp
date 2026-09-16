@@ -179,27 +179,65 @@ fn migrate_v97_stamps_the_literal_97_3464() {
     );
 }
 
-/// v99 occupies the moving-tip dispatch slot; v97 and v98 remain settled
-/// literals. Both backends must retain this handoff so neither settled rung
-/// can be skipped on upgrade.
+/// #3464/#3655 — the tip is DERIVED from `CURRENT_SCHEMA_VERSION` in each
+/// source, never named here: the previous version of this test pinned "v99
+/// owns the tip" by name and went red the day v100 landed (#3690) — a test
+/// sentinel that pinned a moment (the #3748 shape). Both backends must
+/// dispatch the tip from the single `< CURRENT_SCHEMA_VERSION` arm, and every
+/// settled version from 97 up to the tip from a literal arm.
 #[test]
-fn v99_owns_tip_and_v98_is_settled_3655() {
+fn the_tip_owns_the_current_schema_version_arm_and_settled_versions_are_literal_3655() {
     let pg = postgres_source();
-    assert!(
-        pg.contains(
-            "if current_version < CURRENT_SCHEMA_VERSION {\n            self.migrate_v99().await?;"
-        ),
-        "#3464: PostgreSQL must dispatch v99 from the single current-tip arm"
-    );
-    assert!(pg.contains("if current_version < 98 {\n            self.migrate_v98().await?;"));
-    assert!(pg.contains("if current_version < 97 {\n            self.migrate_v97().await?;"));
     let sqlite = sqlite_migrations_source();
-    assert!(sqlite.contains("if version < 97 {\n            // v97"));
-    assert!(sqlite.contains("if version < 98 {\n            // v98 (#3401)"));
-    assert!(
-        sqlite.contains("if version < CURRENT_SCHEMA_VERSION {\n            // v99 (#3655)"),
-        "#3464: SQLite must dispatch v99 from the single current-tip arm"
+    let pg_tip = declared_schema_version(&pg, "i32");
+    let sqlite_tip = declared_schema_version(&sqlite, "i64");
+    assert_eq!(
+        pg_tip, sqlite_tip,
+        "#3464: both backends must declare the same CURRENT_SCHEMA_VERSION"
     );
+    assert!(
+        pg_tip >= 99,
+        "#3464: parsed tip {pg_tip} is below the v99 this test was born on — parser drift, fix the parser"
+    );
+    assert!(
+        pg.contains(&format!(
+            "if current_version < CURRENT_SCHEMA_VERSION {{\n            self.migrate_v{pg_tip}().await?;"
+        )),
+        "#3464: PostgreSQL must dispatch v{pg_tip} from the single current-tip arm"
+    );
+    assert!(
+        sqlite.contains(&format!(
+            "if version < CURRENT_SCHEMA_VERSION {{\n            // v{sqlite_tip} "
+        )),
+        "#3464: SQLite must dispatch v{sqlite_tip} from the single current-tip arm"
+    );
+    for v in 97..pg_tip {
+        assert!(
+            pg.contains(&format!(
+                "if current_version < {v} {{\n            self.migrate_v{v}().await?;"
+            )),
+            "#3464: PostgreSQL v{v} is settled and must dispatch from a literal `< {v}` arm"
+        );
+        assert!(
+            sqlite.contains(&format!("if version < {v} {{\n            // v{v} ")),
+            "#3464: SQLite v{v} is settled and must dispatch from a literal `< {v}` arm"
+        );
+    }
+}
+
+/// The declared tip, read from the source under test so the assertion above
+/// follows the ladder instead of naming a rung.
+fn declared_schema_version(src: &str, ty: &str) -> u32 {
+    let needle = format!("const CURRENT_SCHEMA_VERSION: {ty} = ");
+    let idx = src
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no `{needle}` in the source under test"));
+    src[idx + needle.len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("CURRENT_SCHEMA_VERSION is a literal integer")
 }
 
 #[test]
