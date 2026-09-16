@@ -9341,13 +9341,27 @@ fn find_similar_title_candidates(
 /// `"kubernetes rolling deploy strategy"`, Jaccard 1/6 ≈ 0.167)
 /// without depending on whether 0.30 happens to be the right
 /// stopword-noise floor for the wire surface.
-pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> Result<Vec<Memory>> {
+///
+/// **Visibility** (#3712): this is a DISCRETIONARY probe whose output is
+/// echoed to the caller as `potential_contradictions`, so it is filtered
+/// through the caller's READ visibility (`viewer`: the value the read lanes
+/// resolve; `None` = single-tenant trust-all) BEFORE the wire cap — a row
+/// the caller cannot read is never named in a store response, and never
+/// consumes one of the five wire slots either. The same rule the
+/// near-duplicate funnel applies (`proactive_conflict_check`).
+pub fn find_contradictions(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+    viewer: Option<&str>,
+) -> Result<Vec<Memory>> {
     // Stage 1 — FTS5 recall. Pull a wider candidate pool (20) so the
     // stage-2 Jaccard filter has headroom; the final cap of 5 is
     // applied after the filter so the wire shape is preserved.
     let candidates = find_similar_title_candidates(conn, title, namespace, 20)?;
 
-    // Stage 2 — Jaccard floor on stopword-stripped title tokens.
+    // Stage 2 — Jaccard floor on stopword-stripped title tokens, then the
+    // #3712 visibility filter, then the wire cap.
     let seed_tokens = contradiction_title_tokens(title);
     let mut filtered: Vec<Memory> = candidates
         .into_iter()
@@ -9356,6 +9370,7 @@ pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> R
             contradiction_title_jaccard(&seed_tokens, &cand_tokens)
                 >= CONTRADICTION_TITLE_JACCARD_FLOOR
         })
+        .filter(|cand| crate::visibility::is_readable_on_query(cand, viewer, Some(namespace)))
         .collect();
     filtered.truncate(5);
     Ok(filtered)
@@ -26080,7 +26095,8 @@ mod tests {
         )
         .unwrap();
 
-        let contradictions = find_contradictions(&conn, "Database is PostgreSQL", "infra").unwrap();
+        let contradictions =
+            find_contradictions(&conn, "Database is PostgreSQL", "infra", None).unwrap();
         assert!(!contradictions.is_empty());
     }
 
@@ -26123,7 +26139,8 @@ mod tests {
         .unwrap();
 
         // Tomato seed must not flag moon-landing or retrieval rows.
-        let hits = find_contradictions(&conn, "Tomatoes are red fruit", "v1-p5-disjoint").unwrap();
+        let hits =
+            find_contradictions(&conn, "Tomatoes are red fruit", "v1-p5-disjoint", None).unwrap();
         assert!(
             hits.iter().all(|m| m.title == "Tomatoes are red fruit"),
             "tomato seed leaked false positives: {:?}",
@@ -26131,8 +26148,13 @@ mod tests {
         );
 
         // Moon-landing seed must not flag tomato or retrieval rows.
-        let hits =
-            find_contradictions(&conn, "Moon landing happened in 1969", "v1-p5-disjoint").unwrap();
+        let hits = find_contradictions(
+            &conn,
+            "Moon landing happened in 1969",
+            "v1-p5-disjoint",
+            None,
+        )
+        .unwrap();
         assert!(
             hits.iter()
                 .all(|m| m.title == "Moon landing happened in 1969"),
@@ -26145,6 +26167,7 @@ mod tests {
             &conn,
             "Retrieval-augmented generation works by combining recall with synthesis",
             "v1-p5-disjoint",
+            None,
         )
         .unwrap();
         assert!(
@@ -26172,7 +26195,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let hits = find_contradictions(&conn, "the is a", "v1-p5-stopword").unwrap();
+        let hits = find_contradictions(&conn, "the is a", "v1-p5-stopword", None).unwrap();
         assert!(
             hits.is_empty(),
             "pure-stopword seed pulled candidates: {:?}",
@@ -26199,7 +26222,8 @@ mod tests {
             &make_memory("Database is MySQL", "v1-p5-positive", Tier::Long, 5),
         )
         .unwrap();
-        let hits = find_contradictions(&conn, "Database is PostgreSQL", "v1-p5-positive").unwrap();
+        let hits =
+            find_contradictions(&conn, "Database is PostgreSQL", "v1-p5-positive", None).unwrap();
         let titles: Vec<&str> = hits.iter().map(|m| m.title.as_str()).collect();
         assert!(
             titles.contains(&"Database is MySQL"),
