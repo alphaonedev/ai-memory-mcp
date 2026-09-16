@@ -762,3 +762,46 @@ async fn entity_get_by_alias_invalid_namespace_is_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// #3707 R1 (reviewer-f2r) — both populations through ONE sink. An own
+/// refusal reaches the caller verbatim as a 400 (present). A storage fault
+/// wrapped in a `.context("literal")` is an opaque 500 (absent: neither the
+/// context label nor the driver's text crosses). The previous arm classified
+/// by carrier type (`&'static str` / `String`) and anyhow's `downcast_ref`
+/// matched the context label, so a driver fault came back as an unlogged 400.
+#[tokio::test]
+async fn route_1111_export_reflection_context_wrapped_fault_is_opaque_500_3707() {
+    let (r, db_tmp) = sqlite_router();
+
+    // PRESENT — the own refusal, verbatim.
+    let (status, body) = post_json(&r, "/api/v1/memory_export_reflection", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], ai_memory::errors::msg::MEMORY_ID_REQUIRED);
+
+    // Induce a fault under the `.context("reading reflection substrate")`
+    // wrapper: the substrate's first query can no longer find `memories`.
+    {
+        let conn = rusqlite::Connection::open(db_tmp.path()).expect("open the router's db file");
+        conn.execute_batch("ALTER TABLE memories RENAME TO memories_gone;")
+            .expect("rename memories");
+    }
+
+    // ABSENT — the fault is a 500 with the opaque body; no label, no driver text.
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_export_reflection",
+        json!({"memory_id": "mem-any"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"], ai_memory::errors::msg::INTERNAL_SERVER_ERROR);
+    let text = body.to_string();
+    assert!(
+        !text.contains("reading reflection substrate"),
+        "the context label crossed to the caller: {text}"
+    );
+    assert!(
+        !text.contains("no such table") && !text.contains("memories_gone"),
+        "driver text crossed to the caller: {text}"
+    );
+}

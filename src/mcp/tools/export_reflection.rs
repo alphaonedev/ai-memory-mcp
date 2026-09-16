@@ -64,9 +64,11 @@ pub(crate) fn handle_export_reflection_for_caller(
 ) -> anyhow::Result<Value> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!(crate::errors::msg::MEMORY_ID_REQUIRED))?;
+        .ok_or_else(|| crate::errors::invalid_input(crate::errors::msg::MEMORY_ID_REQUIRED))?;
     if memory_id.is_empty() {
-        return Err(anyhow::anyhow!(crate::errors::msg::MEMORY_ID_EMPTY));
+        return Err(crate::errors::invalid_input(
+            crate::errors::msg::MEMORY_ID_EMPTY,
+        ));
     }
     // #3171 — an unknown STRING already fails closed (`parse_format_for_mcp`),
     // but a present-but-non-string `format` (`5`, `true`, `{}`) silently
@@ -75,14 +77,16 @@ pub(crate) fn handle_export_reflection_for_caller(
     let format_str = match params.get(param_names::FORMAT) {
         None | Some(Value::Null) => "md",
         Some(v) => v.as_str().ok_or_else(|| {
-            anyhow::anyhow!("format must be a string ('md', 'markdown' or 'json')")
+            crate::errors::invalid_input("format must be a string ('md', 'markdown' or 'json')")
         })?,
     };
-    let format = parse_format_for_mcp(format_str).map_err(anyhow::Error::msg)?;
+    let format = parse_format_for_mcp(format_str).map_err(crate::errors::invalid_input)?;
 
     let mem = read_reflection_member(conn, memory_id, memory_id, caller)?;
     if !matches!(mem.memory_kind, MemoryKind::Reflection) {
-        return Err(anyhow::anyhow!("memory is not a reflection: {memory_id}"));
+        return Err(crate::errors::refusal(format!(
+            "memory is not a reflection: {memory_id}"
+        )));
     }
 
     let edges =
@@ -109,7 +113,7 @@ pub(super) fn read_reflection_member(
     db::get(conn, member_id)
         .context("reading reflection substrate")?
         .filter(|memory| crate::visibility::is_readable_on_query(memory, caller, None))
-        .ok_or_else(|| anyhow::anyhow!("reflection not found: {reflection_id}"))
+        .ok_or_else(|| crate::errors::refusal(format!("reflection not found: {reflection_id}")))
 }
 
 /// Local copy of the format parser — kept here so the MCP error

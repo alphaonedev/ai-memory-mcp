@@ -828,11 +828,13 @@ pub async fn handle_export_reflection_http(
         Err(e) => {
             // `anyhow!(msg::CONST)` stores the `&'static str` itself, so that is
             // the type to downcast to; a `String`-built refusal is the other spelling.
-            if let Some(refusal) = e.downcast_ref::<&'static str>() {
-                return err_response((*refusal).to_string());
-            }
-            if let Some(refusal) = e.downcast_ref::<String>() {
-                return err_response(refusal.clone());
+            // #3707 R1 (reviewer-f2r): classify by the TYPED root, never by the
+            // carrier — anyhow's downcast_ref also matches a `.context("literal")`
+            // wrapper on a storage fault, so a `&'static str` arm turned a driver
+            // fault into an unlogged 400. Own refusals are planted with
+            // `crate::errors::{refusal, invalid_input}` in the substrate.
+            if let Some(own) = e.downcast_ref::<crate::errors::OwnText>() {
+                return err_response(own.to_string());
             }
             if let Some(crate::storage::StorageError::InvalidArgument { reason }) =
                 e.downcast_ref::<crate::storage::StorageError>()
