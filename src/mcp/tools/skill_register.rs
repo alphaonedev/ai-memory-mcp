@@ -93,39 +93,47 @@ pub(super) fn resource_digest(content: &[u8]) -> Vec<u8> {
 pub(super) fn validate_parameters_schema(schema: &Value) -> anyhow::Result<()> {
     let obj = schema
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("parameters_schema must be a JSON object"))?;
+        .ok_or_else(|| crate::errors::invalid_input("parameters_schema must be a JSON object"))?;
 
     if let Some(ty) = obj.get("type") {
         if ty.as_str() != Some("object") {
-            anyhow::bail!("parameters_schema.type must be \"object\" when present: got {ty}");
+            return Err(crate::errors::invalid_input(format!(
+                "parameters_schema.type must be \"object\" when present: got {ty}"
+            )));
         }
     }
 
     let properties = match obj.get(field_names::PROPERTIES) {
         Some(props) => Some(props.as_object().ok_or_else(|| {
-            anyhow::anyhow!("parameters_schema.properties must be a JSON object")
+            crate::errors::invalid_input("parameters_schema.properties must be a JSON object")
         })?),
         None => None,
     };
     if let Some(props_obj) = properties {
         for (key, val) in props_obj {
             if !val.is_object() {
-                anyhow::bail!("parameters_schema.properties.{key} must be a JSON object schema");
+                return Err(crate::errors::invalid_input(format!(
+                    "parameters_schema.properties.{key} must be a JSON object schema"
+                )));
             }
         }
     }
 
     if let Some(required) = obj.get("required") {
         let req_arr = required.as_array().ok_or_else(|| {
-            anyhow::anyhow!("parameters_schema.required must be a JSON array of strings")
+            crate::errors::invalid_input(
+                "parameters_schema.required must be a JSON array of strings",
+            )
         })?;
         for r in req_arr {
             let name = r.as_str().ok_or_else(|| {
-                anyhow::anyhow!("parameters_schema.required entries must be strings")
+                crate::errors::invalid_input("parameters_schema.required entries must be strings")
             })?;
             let known = properties.is_some_and(|p| p.contains_key(name));
             if !known {
-                anyhow::bail!("parameters_schema.required references unknown property '{name}'");
+                return Err(crate::errors::invalid_input(format!(
+                    "parameters_schema.required references unknown property '{name}'"
+                )));
             }
         }
     }
