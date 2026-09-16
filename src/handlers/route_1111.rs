@@ -819,9 +819,26 @@ pub async fn handle_export_reflection_http(
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        // #3707 — rusqlite / anyhow text names tables and columns; log it and
-        // return the shared log-then-opaque 500 instead of echoing it.
+        // #3707 — TWO error populations ride this one anyhow arm, and my first
+        // cut flattened both to 500 (cov3_handlers_sqlite caught it: a missing
+        // `id` is OUR OWN 400 refusal, not a driver fault). A String error is
+        // the handler's own closed-vocabulary refusal and keeps its 400; a
+        // typed StorageError::InvalidArgument likewise; anything else is
+        // rusqlite/anyhow text naming tables and columns -> log, opaque 500.
         Err(e) => {
+            // `anyhow!(msg::CONST)` stores the `&'static str` itself, so that is
+            // the type to downcast to; a `String`-built refusal is the other spelling.
+            if let Some(refusal) = e.downcast_ref::<&'static str>() {
+                return err_response((*refusal).to_string());
+            }
+            if let Some(refusal) = e.downcast_ref::<String>() {
+                return err_response(refusal.clone());
+            }
+            if let Some(crate::storage::StorageError::InvalidArgument { reason }) =
+                e.downcast_ref::<crate::storage::StorageError>()
+            {
+                return err_response(reason.clone());
+            }
             tracing::error!(error = %e, "export_reflection substrate error");
             crate::handlers::errors::handler_error_500(&e)
         }
