@@ -1105,6 +1105,11 @@ impl PgvectorPreflightFacts {
 /// probe, the version probe and the `ai-memory doctor` report row.
 pub(crate) const PGVECTOR_EXTENSION_NAME: &str = "vector";
 
+/// v1.0.0 #3755 — the pending-payload key naming the vertical-promote
+/// SOURCE when `pending_actions.memory_id` is unset (the sqlite #3202 arm
+/// reads the same key; the federated effect gate names it the same way).
+const PENDING_PAYLOAD_ID_KEY: &str = "id";
+
 /// #3264 — Apache AGE extension name, for the `doctor` report row that
 /// pairs "AGE installed" with "`ag_catalog` reachable by this role".
 pub(crate) const AGE_EXTENSION_NAME: &str = "age";
@@ -32361,21 +32366,72 @@ impl MemoryStore for PostgresStore {
         }
         let memory_id: Option<String> = match pa.action_type.as_str() {
             "store" => {
-                let mut mem: Memory = match serde_json::from_value(pa.payload.clone()) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return Err(StoreError::IntegrityFailed {
-                            detail: format!("invalid store payload: {e}"),
-                        });
+                // v1.0.0 #3755 — the #3202 VERTICAL-promote payload. When the
+                // DESTINATION namespace of a cross-namespace promote requires
+                // approval, the destination STORE gate queues `action_type =
+                // "store"` carrying `{mode: "vertical", id, to_namespace}` —
+                // a clone REQUEST, not a `Memory`. The sqlite executor
+                // dispatches that shape onto `promote_to_namespace`
+                // (`db::execute_pending_action`, the #3202 arm); pre-#3755 this
+                // arm ran `from_value::<Memory>` over it, which cannot parse,
+                // so an APPROVED vertical store surfaced as
+                // `IntegrityFailed("invalid store payload …")` — on the
+                // federated lane counted `skipped` behind an HTTP 200 (the
+                // receiver approved and landed nothing). ONE predicate, the
+                // sqlite arm's: source = `memory_id` or the payload `id`,
+                // destination = `to_namespace`. No destination re-gate here —
+                // this pending row IS the destination-store approval; the
+                // re-gate belongs to the `promote` arm below (#3259).
+                let is_vertical_promote = pa
+                    .payload
+                    .get(crate::models::field_names::MODE)
+                    .and_then(|v| v.as_str())
+                    == Some(crate::models::field_names::MODE_VERTICAL);
+                if is_vertical_promote {
+                    let mid = pa.memory_id.clone().or_else(|| {
+                        pa.payload
+                            .get(PENDING_PAYLOAD_ID_KEY)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                    let to_ns = pa
+                        .payload
+                        .get(crate::models::field_names::TO_NAMESPACE)
+                        .and_then(|v| v.as_str());
+                    match (mid, to_ns) {
+                        (Some(mid), Some(to_ns)) => Some(
+                            self.pg_promote_to_namespace(
+                                ctx,
+                                &mid,
+                                to_ns,
+                                Some(pa.requested_by.as_str()),
+                            )
+                            .await?,
+                        ),
+                        _ => {
+                            return Err(StoreError::InvalidInput {
+                                detail: crate::storage::MSG_VERTICAL_STORE_PAYLOAD_INCOMPLETE
+                                    .to_string(),
+                            });
+                        }
                     }
-                };
-                // Stamp fresh id + timestamps for idempotent replay.
-                mem.id = uuid::Uuid::new_v4().to_string();
-                let now = Utc::now().to_rfc3339();
-                mem.created_at.clone_from(&now);
-                mem.updated_at = now;
-                mem.access_count = 0;
-                Some(self.store(ctx, &mem).await?)
+                } else {
+                    let mut mem: Memory = match serde_json::from_value(pa.payload.clone()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Err(StoreError::IntegrityFailed {
+                                detail: format!("invalid store payload: {e}"),
+                            });
+                        }
+                    };
+                    // Stamp fresh id + timestamps for idempotent replay.
+                    mem.id = uuid::Uuid::new_v4().to_string();
+                    let now = Utc::now().to_rfc3339();
+                    mem.created_at.clone_from(&now);
+                    mem.updated_at = now;
+                    mem.access_count = 0;
+                    Some(self.store(ctx, &mem).await?)
+                }
             }
             "delete" => {
                 if let Some(mid) = pa.memory_id.clone() {

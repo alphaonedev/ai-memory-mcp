@@ -25,6 +25,13 @@ use std::path::Path;
 /// each such site is precisely the hardcoded-literal class the operator
 /// directive forbids. Single-sourced here, in the module that owns the sqlite
 /// schema, so `erasure::archive_sync` and `storage::migrations` cannot drift.
+/// #3202 / #3755 — the ONE refusal reason for a `mode: "vertical"` pending-store
+/// payload that names no source id or no `to_namespace`; both executors
+/// (`execute_pending_action` here, `PostgresStore::execute_pending_action`)
+/// refuse with it so the two backends stay byte-identical.
+pub const MSG_VERTICAL_STORE_PAYLOAD_INCOMPLETE: &str =
+    "vertical promote pending-store payload missing id or to_namespace";
+
 pub(crate) const TABLE_MEMORIES: &str = "memories";
 /// Cold mirror of [`TABLE_MEMORIES`]; see its docs.
 pub(crate) const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
@@ -24304,9 +24311,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                     }
                     _ => {
                         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-                            reason:
-                                "vertical promote pending-store payload missing id or to_namespace"
-                                    .into(),
+                            reason: MSG_VERTICAL_STORE_PAYLOAD_INCOMPLETE.into(),
                         }));
                     }
                 }

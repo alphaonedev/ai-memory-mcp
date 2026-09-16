@@ -1126,7 +1126,19 @@ async fn federated_vertical_store_in_scope_is_filed_and_approved_on_postgres_362
     assert_eq!(counter(&report, "pending_decisions_applied"), 1, "{report}");
     let row = pending_snapshot_3582(&pool, &pid).await.expect("filed row");
     assert_eq!(row["status"], "approved", "{report}");
-    // The clone itself is NOT asserted here: the pg executor's `store` arm has
-    // no vertical dispatch (it refuses the payload as `invalid store payload`),
-    // so on pg the decision applies and the execute is counted `skipped`.
+    // #3755 — the approved vertical store must LAND: the pg executor's `store`
+    // arm dispatches the vertical payload onto the clone path (the sqlite
+    // #3202 arm's shape). Pre-#3755 it refused the payload as `invalid store
+    // payload`, the decision counted APPLIED and the execute `skipped` — an
+    // approval that landed nothing behind an HTTP 200.
+    assert_eq!(
+        counter(&report, "skipped"),
+        0,
+        "#3755: the approved vertical store must execute, not be skipped: {report}"
+    );
+    assert_eq!(
+        count_ns(&pool, &root).await,
+        1,
+        "#3755: the approved vertical store lands the clone in to_namespace on pg: {report}"
+    );
 }
