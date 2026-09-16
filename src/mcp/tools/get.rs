@@ -118,8 +118,9 @@ pub(super) fn handle_get(
     // existence is not disclosed. #3387 lifted the gate into `mask_invisible`
     // so every by-id content read shares one implementation.
     match mask_invisible(
-        db::resolve_id(conn, id)
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_id", e))?,
+        db::resolve_id(conn, id).map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err(crate::mcp::error_text::site::RESOLVE_ID, e)
+        })?,
         caller,
     ) {
         Some(mem) => {

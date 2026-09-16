@@ -523,8 +523,9 @@ pub(super) fn handle_get_links(
     // shape an unknown id yields when the caller cannot see the anchor — so it
     // cannot confirm a private row's existence or enumerate its neighbors.
     // #3498: the anchor is explicit; other endpoints are ambient reads.
-    let resolved = db::resolve_id(conn, id)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_id", e))?;
+    let resolved = db::resolve_id(conn, id).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err(crate::mcp::error_text::site::RESOLVE_ID, e)
+    })?;
     if let Some(mem) = resolved.as_ref() {
         if !crate::visibility::is_readable_on_query(mem, caller, Some(&mem.namespace)) {
             return Ok(json!({"links": [], "count": 0}));

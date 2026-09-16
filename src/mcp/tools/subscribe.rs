@@ -156,7 +156,9 @@ pub(crate) fn handle_subscribe_as_created_by(
     // subscribers closes the "any MCP client owns the webhook fleet"
     // hole flagged by the v0.6.0 security review.
     let registered = crate::db::list_agents(conn)
-        .map_err(|e| crate::mcp::error_text::log_foreign("list_agents", e))?
+        .map_err(|e| {
+            crate::mcp::error_text::log_foreign(crate::mcp::error_text::site::LIST_AGENTS, e)
+        })?
         .into_iter()
         .any(|a| a.agent_id == created_by);
     if !registered {

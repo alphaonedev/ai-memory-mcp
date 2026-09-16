@@ -2078,6 +2078,10 @@ const MIGRATION_LOCK_SITE_MIGRATE: &str = "migrate advisory lock";
 // ceiling, and the sequence needed to be pinnable as data by a unit test).
 use crate::store::pg_migration_lock::migration_lock_probe_delay_ms;
 
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
+const SITE_ENTITY_GET_BY_ALIAS: &str = "entity_get_by_alias";
+const SITE_LIST_PENDING_ACTIONS: &str = "list_pending_actions";
+
 /// v1.0.0 #3519 — how often (ms) a waiter re-states, at WARN, that it is
 /// still queued behind the migration lock. A boot that legitimately waits out
 /// a long ladder must be OBSERVABLE (an operator has to be able to tell
@@ -33476,7 +33480,7 @@ impl MemoryStore for PostgresStore {
         .bind(now_dt)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| to_store_err("list_agents", e))?;
+        .map_err(|e| to_store_err(crate::mcp::error_text::site::LIST_AGENTS, e))?;
 
         let mut agents = Vec::with_capacity(rows.len());
         for r in &rows {
@@ -33541,7 +33545,7 @@ impl MemoryStore for PostgresStore {
         .bind(limit_i64)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| to_store_err("list_pending_actions", e))?;
+        .map_err(|e| to_store_err(SITE_LIST_PENDING_ACTIONS, e))?;
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
@@ -33629,7 +33633,7 @@ impl MemoryStore for PostgresStore {
             .bind(ENTITY_KIND)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| to_store_err("entity_get_by_alias", e))?
+            .map_err(|e| to_store_err(SITE_ENTITY_GET_BY_ALIAS, e))?
         };
 
         let Some(r) = row else {
@@ -35885,7 +35889,7 @@ impl PostgresStore {
         .bind(limit_i)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| to_store_err("list_pending_actions", e))?;
+        .map_err(|e| to_store_err(SITE_LIST_PENDING_ACTIONS, e))?;
         let mut out: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
         for r in &rows {
             let id: String = r.try_get("id").unwrap_or_default();
@@ -39165,7 +39169,10 @@ mod tests {
             .register_agent(&ctx, &agent)
             .await
             .expect("register_agent");
-        let listed = store.list_agents().await.expect("list_agents");
+        let listed = store
+            .list_agents()
+            .await
+            .expect(crate::mcp::error_text::site::LIST_AGENTS);
         assert!(
             listed.iter().any(|r| r.agent_id == agent_id),
             "registered agent must surface in list_agents"
@@ -39215,7 +39222,7 @@ mod tests {
             .bind(&pid)
             .execute(&store.pool)
             .await;
-        let rows = list_result.expect("list_pending_actions");
+        let rows = list_result.expect(SITE_LIST_PENDING_ACTIONS);
         let row = rows
             .iter()
             .find(|r| r.id == pid)
@@ -39260,7 +39267,7 @@ mod tests {
         let rec = store
             .entity_get_by_alias(&alias, Some(&ns))
             .await
-            .expect("entity_get_by_alias");
+            .expect(SITE_ENTITY_GET_BY_ALIAS);
         let rec = rec.expect("entity must resolve");
         assert_eq!(rec.entity_id, entity_id);
         assert_eq!(rec.namespace, ns);

@@ -663,7 +663,11 @@ pub async fn list_agents(
     // The handler uses `CallerContext::for_admin` below to bypass
     // the SAL visibility filter; that's correct for operators but
     // was unauthenticated. Mirror the #957 admin pattern.
-    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "list_agents") {
+    if let Err(resp) = crate::handlers::admin_role::require_admin(
+        &app,
+        &headers,
+        crate::mcp::error_text::site::LIST_AGENTS,
+    ) {
         return resp;
     }
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons

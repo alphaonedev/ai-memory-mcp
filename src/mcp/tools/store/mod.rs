@@ -39,6 +39,9 @@ use std::path::Path;
 
 use self::validation::OnConflict;
 
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
+const SITE_HANDLE_STORE_INNER: &str = "handle_store_inner";
+
 /// Re-export of the canonical `OnConflict` enum (formerly `pub(super)`)
 /// so external consumers — most notably the HTTP handler at
 /// `src/handlers/create.rs` — can route through the single
@@ -509,7 +512,7 @@ fn handle_store_inner(
                 Some(&sig_bytes),
                 crate::identity::attest::WriteSurface::Mcp,
             )
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_store_inner", e))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_STORE_INNER, e))?;
             // #3419 (security-high) — admit-once replay guard. The signature has
             // now VERIFIED, so consult the durable ledger before the row is
             // stored: an Ed25519 signature is re-verifiable forever, so without
@@ -548,7 +551,7 @@ fn handle_store_inner(
                 None,
                 crate::identity::attest::WriteSurface::Mcp,
             )
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_store_inner", e))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_STORE_INNER, e))?;
         }
     }
 
@@ -1048,7 +1051,7 @@ fn handle_store_inner(
         },
     ) {
         return Err(crate::mcp::error_text::mcp_foreign_err(
-            "handle_store_inner",
+            SITE_HANDLE_STORE_INNER,
             e,
         ));
     }
@@ -1119,7 +1122,7 @@ fn handle_store_inner(
                 return Err(format!("GOVERNANCE_REFUSED: {}", refusal.reason));
             }
             return Err(crate::mcp::error_text::mcp_foreign_err(
-                "handle_store_inner",
+                SITE_HANDLE_STORE_INNER,
                 e,
             ));
         }

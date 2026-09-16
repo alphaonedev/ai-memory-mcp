@@ -73,8 +73,9 @@ pub fn handle_share(
     // #3379 — sharing discloses content: first apply the query read funnel,
     // then the canonical mutation ownership rule. Hidden and absent sources
     // retain the same refusal; readable foreign rows fail ownership separately.
-    let resolved = db::resolve_id(conn, source_memory_id)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_id", e))?;
+    let resolved = db::resolve_id(conn, source_memory_id).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err(crate::mcp::error_text::site::RESOLVE_ID, e)
+    })?;
     let existed = resolved.is_some();
     let Some(source) = resolved.filter(|source| {
         // Share has no namespace parameter: substrate rows are never shareable.

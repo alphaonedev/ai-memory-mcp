@@ -196,3 +196,11 @@ mod tests {
         assert_eq!(mcp_foreign_err("insert", e), DB_ERROR_TEXT);
     }
 }
+
+/// pm-v3.1 hardcoded-literal ratchet — site names that are spelled in MORE
+/// THAN ONE FILE live here, once. A per-file const cannot see repo-wide
+/// duplication, and the ratchet counts repo-wide.
+pub mod site {
+    pub const LIST_AGENTS: &str = "list_agents";
+    pub const RESOLVE_ID: &str = "resolve_id";
+}

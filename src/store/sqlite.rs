@@ -25,6 +25,8 @@ use super::{
 };
 use crate::quotas::{self, QuotaStatus};
 
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
+
 /// SAL adapter over the existing bundled-SQLite storage. Holds an
 /// `Arc<Mutex<Connection>>` matching the HTTP daemon's shared state so
 /// the adapter can be used alongside the existing free-function code
@@ -6231,7 +6233,10 @@ mod tests {
             .register_agent(&ctx, &agent)
             .await
             .expect("register_agent");
-        let listed = store.list_agents().await.expect("list_agents");
+        let listed = store
+            .list_agents()
+            .await
+            .expect(crate::mcp::error_text::site::LIST_AGENTS);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].agent_id, "ai:tester@host");
         assert_eq!(listed[0].agent_type, "test");
@@ -6242,7 +6247,10 @@ mod tests {
     #[tokio::test]
     async fn list_agents_empty_store_returns_empty_vec() {
         let store = fresh_store();
-        let listed = store.list_agents().await.expect("list_agents");
+        let listed = store
+            .list_agents()
+            .await
+            .expect(crate::mcp::error_text::site::LIST_AGENTS);
         assert!(listed.is_empty());
     }
 

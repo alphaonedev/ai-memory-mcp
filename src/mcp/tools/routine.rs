@@ -250,9 +250,9 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
                 None,
                 Some(&err),
             )
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?;
             Ok(json!({
-                (RESP_RUN): serde_json::to_value(&failed).map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?,
+                (RESP_RUN): serde_json::to_value(&failed).map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?,
                 "error": err,
             }))
         }
@@ -266,9 +266,9 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
                 Some(&ids_json),
                 None,
             )
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?;
             Ok(json!({
-                (RESP_RUN): serde_json::to_value(&completed).map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_routine_run", e))?,
+                (RESP_RUN): serde_json::to_value(&completed).map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?,
                 "created_action_ids": ids_json,
             }))
         }
@@ -332,6 +332,9 @@ pub fn handle_routine_list(conn: &rusqlite::Connection, params: &Value) -> Resul
 use crate::mcp::registry::McpTool;
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
+const SITE_HANDLE_ROUTINE_RUN: &str = "handle_routine_run";
 
 /// v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_create`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]

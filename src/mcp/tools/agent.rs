@@ -126,8 +126,9 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
 }
 
 pub(super) fn handle_agent_list(conn: &rusqlite::Connection) -> Result<Value, String> {
-    let agents = db::list_agents(conn)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_agents", e))?;
+    let agents = db::list_agents(conn).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err(crate::mcp::error_text::site::LIST_AGENTS, e)
+    })?;
     Ok(json!({
         "count": agents.len(),
         "agents": agents,

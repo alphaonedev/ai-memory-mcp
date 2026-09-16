@@ -179,10 +179,10 @@ pub(super) fn handle_archive_purge(
 
     let purged = if as_admin {
         db::purge_archive(conn, older_than_days)
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("purge_archive", e))?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_PURGE_ARCHIVE, e))?
     } else {
         db::purge_archive_for_caller(conn, &caller, older_than_days)
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("purge_archive", e))?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_PURGE_ARCHIVE, e))?
     };
     Ok(json!({
         "purged": purged,
@@ -411,6 +411,9 @@ pub(super) fn handle_gc(
 use crate::mcp::registry::McpTool;
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
+const SITE_PURGE_ARCHIVE: &str = "purge_archive";
 
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_list`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
