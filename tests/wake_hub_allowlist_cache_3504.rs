@@ -407,6 +407,9 @@ fn the_posture_reports_the_snapshot_age_in_both_renderings_3504() {
         // #3471's ops surface added this field; the posture path under test is
         // the non-probe one, so it stays false.
         health: false,
+        // #3643's admit-readiness gate; this posture test exercises the report,
+        // not the exit gate, so it stays false.
+        require_admits: false,
         json: false,
     };
     let cfg = resolve_config(&args, &ai_memory::config::AppConfig::default()).expect("resolve");

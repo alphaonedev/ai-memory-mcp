@@ -40,7 +40,7 @@ use crate::cli::CliOutput;
 use crate::config::AppConfig;
 use std::sync::Arc;
 
-use crate::wake_hub::allowlist_reload::SnapshotFreshness;
+use crate::wake_hub::allowlist_reload::{AdmitReadiness, SnapshotFreshness};
 use crate::wake_hub::delegation_verifier::{
     AllowlistCache, ReloadingAllowlist, ScopedDelegationVerifier,
 };
@@ -80,6 +80,14 @@ pub struct WakeHubArgs {
     /// `ExecStartPost` / watchdog or a launchd health check.
     #[arg(long)]
     pub health: bool,
+    /// With `--posture`: EXIT NON-ZERO when the resolved allowlist snapshot
+    /// admits nobody (empty, aged-out, unreadable, or absent). The credential-
+    /// free admit-readiness gate the pre-auth `--health` probe cannot be — usable
+    /// as a systemd `ExecStartPost` so a hub that admits nobody goes RED honestly
+    /// (#3643). Reports the same `admits` / `admits_nobody` the JSON posture
+    /// carries; it only decides the exit code, never the output.
+    #[arg(long)]
+    pub require_admits: bool,
     /// Emit machine-readable JSON instead of a human-readable report.
     #[arg(long)]
     pub json: bool,
@@ -166,6 +174,15 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
             // refresher fall behind before the agents do.
             "allowlist_snapshot": SnapshotFreshness::observe(cfg.allowlist_path.as_deref())
                 .to_json(),
+            // #3643 — the credential-free ADMIT dimension the pre-auth `--health`
+            // probe is structurally blind to: how many principals this snapshot
+            // will admit RIGHT NOW, and whether that is nobody. Read from the same
+            // parsed snapshot the runtime verifier admits against, gated by the
+            // same freshness ceiling — a fresh-but-empty (REPLACE_AGENT_ID) or
+            // aged-out snapshot reports `admits_nobody: true` here while `--health`
+            // still reports the socket reachable.
+            "admit_readiness": AdmitReadiness::observe(cfg.allowlist_path.as_deref())
+                .to_json(),
             // #3471 ops surface.
             "drain_deadline_ms": DRAIN_DEADLINE_MS,
             "slow_consumer_percent": SLOW_CONSUMER_PERCENT,
@@ -244,6 +261,18 @@ pub fn print_posture(cfg: &HubConfig, args: &WakeHubArgs, out: &mut CliOutput<'_
         out.stdout,
         "  allowlist snapshot:    {}",
         SnapshotFreshness::observe(cfg.allowlist_path.as_deref()).summary()
+    )?;
+    // #3643 admit dimension — the state `--health` cannot see.
+    let admit = AdmitReadiness::observe(cfg.allowlist_path.as_deref());
+    writeln!(
+        out.stdout,
+        "  admits:                {}{}",
+        admit.admits,
+        if admit.admits_nobody {
+            " — ADMITS NOBODY (empty / aged-out / absent allowlist; `--health` cannot see this)"
+        } else {
+            " principal(s)"
+        }
     )?;
     // #3471 ops block.
     let fd = fd_budget_facts(cfg);
@@ -443,6 +472,14 @@ impl IdentityPosture {
     }
 }
 
+/// Process exit when `--posture --require-admits` finds the hub admits nobody.
+///
+/// Distinct from [`health::EXIT_UNREACHABLE`] (`2`) so a systemd journal can
+/// tell "the socket did not answer" apart from "the socket answered but the
+/// allowlist admits nobody" — the #3643 failure the pre-auth `--health` probe
+/// is structurally blind to.
+pub const EXIT_ADMITS_NOBODY: i32 = 3;
+
 /// Bind and serve until SIGINT / SIGTERM, or run one of the non-binding
 /// reporting modes.
 ///
@@ -466,6 +503,16 @@ pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32>
         // probing anything is the order an operator debugs in.
         if args.posture {
             print_posture(&cfg, args, &mut out)?;
+            // #3643 admit-readiness gate. `--posture` alone is a non-interacting
+            // INSPECTION and always exits 0; `--require-admits` turns the same
+            // admit dimension the JSON already reported into an EXIT so a systemd
+            // ExecStartPost can go RED on a hub that admits nobody. It reads the
+            // same `admits_nobody` value print_posture just surfaced.
+            if args.require_admits
+                && AdmitReadiness::observe(cfg.allowlist_path.as_deref()).admits_nobody
+            {
+                return Ok(EXIT_ADMITS_NOBODY);
+            }
             return Ok(0);
         }
         return run_health(&cfg, args.json, &mut out).await;
@@ -551,6 +598,7 @@ mod tests {
             allowlist: None,
             posture: false,
             health: false,
+            require_admits: false,
             json: false,
         }
     }
@@ -778,5 +826,127 @@ mod tests {
         let err = String::from_utf8(se).expect("utf8");
         assert!(text.contains("UNREACHABLE"), "{text}");
         assert!(err.contains("fix:"), "{err}");
+    }
+    /// #3643 write a 0600 snapshot naming exactly `n` agents, stamped fresh —
+    /// the shape the hub loader demands. `n == 0` is the shipped
+    /// REPLACE_AGENT_ID shape (`identity hub-cache` omits the placeholder,
+    /// publishing a valid, fresh, ZERO-entry snapshot).
+    fn write_snapshot(path: &std::path::Path, n: usize) {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let agents: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let key = ed25519_dalek::SigningKey::from_bytes(&[0xC0u8 + i as u8; 32]);
+                serde_json::json!({
+                    "agent_id": format!("agent-3643-cli-{i}"),
+                    "pubkey_b64": crate::identity::keypair::encode_public_base64(
+                        &key.verifying_key()
+                    ),
+                    "bind_authority": "possession_proof",
+                    "bound_at": "2026-09-01T00:00:00Z",
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "version": crate::wake_hub::delegation_verifier::ALLOWLIST_FILE_VERSION,
+            "refreshed_at": chrono::Utc::now().to_rfc3339(),
+            "agents": agents,
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create snapshot");
+        f.write_all(&serde_json::to_vec(&body).expect("encode"))
+            .expect("write snapshot");
+        drop(f);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+
+    /// #3643 THE PIN — the admit dimension `--health` is structurally blind to
+    /// must be VISIBLE on `--posture --json` AND must drive a non-zero EXIT
+    /// under `--require-admits`, so a systemd ExecStartPost can go RED honestly.
+    ///
+    /// RED LEG: the shipped REPLACE_AGENT_ID shape — a fresh, valid, ZERO-entry
+    /// snapshot — reports `admits_nobody: true` / `admits: 0` and exits non-zero.
+    /// The "pin that cannot fail" is now ABLE to fail on exactly the state it
+    /// exists to catch. ALLOWED-PATH CONTROL: a fresh snapshot naming N > 0
+    /// principals reports `admits: N` / `admits_nobody: false` and exits ZERO on
+    /// the SAME sink and the SAME gate. Both admit fields are read off
+    /// `--posture --json`; both exits off `--posture --require-admits`.
+    #[tokio::test]
+    async fn require_admits_reds_on_empty_and_greens_on_populated_3643() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        let empty = dir.path().join("empty-allow.json");
+        write_snapshot(&empty, 0);
+        let full = dir.path().join("full-allow.json");
+        write_snapshot(&full, 3);
+
+        // Both legs read `admits` / `admits_nobody` off the SAME `--posture --json`
+        // sink the operator would read.
+        let admit_doc = |path: &std::path::Path| -> serde_json::Value {
+            let mut a = args();
+            a.socket = Some(dir.path().join("never-bound-3643.sock"));
+            a.allowlist = Some(path.to_path_buf());
+            a.posture = true;
+            a.json = true;
+            let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
+            let mut so = Vec::new();
+            let mut se = Vec::new();
+            let mut out = CliOutput::from_std(&mut so, &mut se);
+            print_posture(&cfg, &a, &mut out).expect("posture");
+            serde_json::from_slice(&so).expect("valid JSON")
+        };
+
+        let red = admit_doc(&empty);
+        assert_eq!(red["admit_readiness"]["admits"], 0, "empty admits nobody");
+        assert_eq!(red["admit_readiness"]["admits_nobody"], true);
+
+        let green = admit_doc(&full);
+        assert_eq!(green["admit_readiness"]["admits"], 3, "populated admits N");
+        assert_eq!(green["admit_readiness"]["admits_nobody"], false);
+
+        // The EXIT the ExecStartPost consumes — same admit dimension, same gate.
+        let mut a_red = args();
+        a_red.socket = Some(dir.path().join("never-bound-red.sock"));
+        a_red.allowlist = Some(empty.clone());
+        a_red.posture = true;
+        a_red.require_admits = true;
+        let red_exit = dispatch(&a_red, &AppConfig::default())
+            .await
+            .expect("dispatch");
+        assert_eq!(
+            red_exit, EXIT_ADMITS_NOBODY,
+            "the empty snapshot must go RED under --require-admits"
+        );
+        assert_ne!(red_exit, 0, "RED means a non-zero exit for ExecStartPost");
+
+        let mut a_green = a_red.clone();
+        a_green.allowlist = Some(full.clone());
+        let green_exit = dispatch(&a_green, &AppConfig::default())
+            .await
+            .expect("dispatch");
+        assert_eq!(
+            green_exit, 0,
+            "a snapshot with N > 0 entries must exit ZERO on the same assertion"
+        );
+
+        // Plain `--posture` stays an INSPECTION: exit 0 even when it admits
+        // nobody, so the gate is opt-in and does not surprise an operator
+        // debugging by hand.
+        let mut a_plain = a_red.clone();
+        a_plain.require_admits = false;
+        let plain_exit = dispatch(&a_plain, &AppConfig::default())
+            .await
+            .expect("dispatch");
+        assert_eq!(
+            plain_exit, 0,
+            "plain --posture is inspection-only and never gates the exit"
+        );
     }
 }

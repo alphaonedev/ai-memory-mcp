@@ -320,6 +320,68 @@ impl SnapshotFreshness {
     }
 }
 
+/// The credential-free ADMIT dimension of the wake hub: how many principals
+/// the published snapshot will admit RIGHT NOW.
+///
+/// #3643 — the pre-auth `--health` probe connects, waits for the challenge and
+/// closes, presenting no hello, so it reports a hub REACHABLE even when that
+/// hub admits nobody (an empty or aged-out allowlist). That is a health check
+/// structurally blind to the one failure the wake plane exists to avoid. The
+/// admit truth is LOCAL and needs no hub connection and no identity: it is read
+/// from the SAME parsed snapshot the runtime [`super::delegation_verifier`]
+/// admits hellos against, gated by the SAME [`SnapshotFreshness`] ceiling the
+/// hub enforces on every hello — so what this reports and what the hub does
+/// cannot drift. Surfaced on `--posture` and given a non-zero exit so a systemd
+/// `ExecStartPost` can go RED honestly when the hub admits nobody.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmitReadiness {
+    /// Principals the hub will admit right now: the snapshot's entry count when
+    /// it is readable AND within the freshness ceiling, otherwise `0`. A stale,
+    /// unreadable, empty, or absent snapshot admits nobody, so all four collapse
+    /// to `0` — the number is LIVE admission, never a raw count that would read
+    /// as "5 admitted" for a snapshot the hub refuses for age.
+    pub admits: usize,
+    /// `true` exactly when `admits == 0`: the admit-nobody state `--health`
+    /// cannot see. The one field the systemd admit-readiness gate keys its exit
+    /// code on.
+    pub admits_nobody: bool,
+}
+
+impl AdmitReadiness {
+    /// Observe the live admit count of the snapshot at `path`, if configured.
+    #[must_use]
+    pub fn observe(path: Option<&Path>) -> Self {
+        let admits = Self::live_admit_count(path);
+        Self {
+            admits,
+            admits_nobody: admits == 0,
+        }
+    }
+
+    /// Read the live admit count: the parsed entry count, but only while the
+    /// snapshot is one the hub would actually serve hellos from. The freshness
+    /// verdict is [`SnapshotFreshness`] (the single source of truth for the
+    /// ceiling), so a stale snapshot admits `0` here exactly as the hub refuses
+    /// every hello there — and an absent or unreadable snapshot is `within_max_age
+    /// == false`, so it collapses to `0` too without a second error branch.
+    fn live_admit_count(path: Option<&Path>) -> usize {
+        let Some(path) = path else { return 0 };
+        if !SnapshotFreshness::observe(Some(path)).within_max_age {
+            return 0;
+        }
+        AllowlistCache::read_file(path).map_or(0, |file| file.agents.len())
+    }
+
+    /// The two machine-readable fields the posture JSON carries.
+    #[must_use]
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "admits": self.admits,
+            "admits_nobody": self.admits_nobody,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +589,78 @@ mod tests {
         let unreadable = SnapshotFreshness::observe(Some(&dir.path().join("nope.json")));
         assert_eq!(unreadable.age_secs, None);
         assert!(!unreadable.within_max_age);
+    }
+    /// Write a 0600 snapshot naming exactly `n` agents, stamped `age_secs` in
+    /// the past. `n == 0` is the shipped REPLACE_AGENT_ID shape (`identity
+    /// hub-cache` omits the placeholder, publishing a valid snapshot with zero
+    /// entries).
+    fn write_snapshot_n(path: &Path, n: usize, age_secs: i64) {
+        let agents: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let key = ed25519_dalek::SigningKey::from_bytes(&[0xB0u8 + i as u8; 32]);
+                serde_json::json!({
+                    "agent_id": format!("agent-3643-{i}"),
+                    "pubkey_b64": crate::identity::keypair::encode_public_base64(
+                        &key.verifying_key()
+                    ),
+                    "bind_authority": "possession_proof",
+                    "bound_at": "2026-09-01T00:00:00Z",
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "version": ALLOWLIST_FILE_VERSION,
+            "refreshed_at": (Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339(),
+            "agents": agents,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create snapshot");
+        file.write_all(serde_json::to_vec(&body).expect("encode").as_slice())
+            .expect("write snapshot");
+        drop(file);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+
+    /// The #3643 admit dimension: a fresh-but-EMPTY snapshot (the shipped
+    /// REPLACE_AGENT_ID shape) admits nobody, a populated fresh snapshot admits
+    /// exactly its entry count, and a STALE snapshot admits nobody however many
+    /// principals it names (the hub refuses every hello past the ceiling).
+    #[test]
+    fn admit_readiness_counts_live_admissions_3643() {
+        let dir = owner_only_dir();
+        let path = dir.path().join("allow.json");
+
+        // Shipped empty shape: valid, fresh, zero entries.
+        write_snapshot_n(&path, 0, 1);
+        let empty = AdmitReadiness::observe(Some(&path));
+        assert_eq!(empty.admits, 0, "an empty snapshot admits nobody");
+        assert!(empty.admits_nobody, "admits_nobody must be true on empty");
+        assert_eq!(empty.to_json()["admits"], 0);
+        assert_eq!(empty.to_json()["admits_nobody"], true);
+
+        // Populated + fresh: the allowed-path control.
+        write_snapshot_n(&path, 3, 1);
+        let full = AdmitReadiness::observe(Some(&path));
+        assert_eq!(full.admits, 3, "a populated fresh snapshot admits its N");
+        assert!(
+            !full.admits_nobody,
+            "admits_nobody must be false when N > 0"
+        );
+
+        // Populated but STALE: named entries, but the hub refuses every hello,
+        // so it admits nobody — admits collapses to 0, admits_nobody is true.
+        write_snapshot_n(&path, 3, MAX_CACHE_AGE_SECS + 5);
+        let stale = AdmitReadiness::observe(Some(&path));
+        assert_eq!(stale.admits, 0, "a stale snapshot admits nobody");
+        assert!(stale.admits_nobody);
+
+        // Absent / unreadable: admits nobody, no error branch.
+        assert!(AdmitReadiness::observe(None).admits_nobody);
+        assert!(AdmitReadiness::observe(Some(&dir.path().join("nope.json"))).admits_nobody);
     }
 }
