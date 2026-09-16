@@ -217,6 +217,9 @@ const PG_EXT_NOT_INSTALLED: &str = "not installed";
 /// #3264 — fact key for the AGE-absent explanatory line.
 #[cfg(feature = "sal-postgres")]
 const KG_BACKEND_NOTE_KEY: &str = "kg_backend_note";
+/// #3756 — fact key carrying the AGE-version comparator's verdict.
+#[cfg(feature = "sal-postgres")]
+const FACT_AGE_VERSION_VERDICT: &str = "age_version_verdict";
 
 /// #3264 — AGE is opt-in; its absence is a legitimate deployment, so the
 /// row stays INFO and simply says what the KG will do instead.
@@ -2073,6 +2076,21 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
             facts.age_catalog_usage.to_string(),
         ),
         ("pgvector_verdict".into(), verdict.label().to_string()),
+        // #3756 — the comparator's verdict on the installed version
+        // (`canonical` / `tested_alternate` / `below_floor` / `unparseable`;
+        // `not installed` when AGE is absent), so the operator sees the
+        // judgement next to the number it judged.
+        (
+            FACT_AGE_VERSION_VERDICT.into(),
+            age_version.as_deref().map_or_else(
+                || PG_EXT_NOT_INSTALLED.to_string(),
+                |v| {
+                    crate::store::postgres::age_version::age_version_verdict(v)
+                        .label()
+                        .to_string()
+                },
+            ),
+        ),
     ];
 
     // The CRITICAL arm carries the EXACT remedy text the bootstrap abort
@@ -2080,7 +2098,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
     let (severity, note) = pg_extensions_verdict_3264(
         verdict,
         &facts.database,
-        age_version.is_some(),
+        age_version.as_deref(),
         facts.age_catalog_usage,
     );
 
@@ -2121,13 +2139,29 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
 fn pg_extensions_verdict_3264(
     verdict: crate::store::postgres::PgvectorPreflight,
     database: &str,
-    age_installed: bool,
+    age_version: Option<&str>,
     age_catalog_usage: bool,
 ) -> (Severity, Option<String>) {
+    use crate::store::postgres::age_version::{
+        AgeVersionVerdict, age_version_remedy, age_version_verdict,
+    };
     use crate::store::postgres::{MSG_PGVECTOR_MAY_NEED_ADMIN_CREATE, PgvectorPreflight};
+    let age_installed = age_version.is_some();
 
     if let Some(detail) = verdict.preemptive_refusal_detail(database) {
         return (Severity::Critical, Some(detail));
+    }
+    // v1.0.0 #3756 — JUDGE the installed AGE version instead of displaying
+    // it. Below the tested floor (or unparseable) is CRITICAL with the named
+    // remedy: on such a substrate the graph projection drops edge validity
+    // and kg_timeline omits edges kg_query returns — two answers from one
+    // store behind a green doctor. It ranks below the pgvector CRITICAL
+    // (the daemon cannot boot at all) and above every WARN.
+    let age = age_version.map(|v| (v, age_version_verdict(v)));
+    if let Some((v, verdict_age)) = age
+        && verdict_age.is_red()
+    {
+        return (Severity::Critical, age_version_remedy(v, verdict_age));
     }
     if verdict == PgvectorPreflight::AvailableNeedsSuperuserCreate {
         return (
@@ -2139,6 +2173,14 @@ fn pg_extensions_verdict_3264(
         return (
             Severity::Warning,
             Some(MSG_AGE_CATALOG_USAGE_MISSING.to_string()),
+        );
+    }
+    // #3756 — the tested alternate (or any above-floor non-canonical
+    // version) is YELLOW: bootable and tested, not the certified pin.
+    if let Some((v, AgeVersionVerdict::TestedAlternate)) = age {
+        return (
+            Severity::Warning,
+            age_version_remedy(v, AgeVersionVerdict::TestedAlternate),
         );
     }
     (Severity::Info, None)
@@ -8201,8 +8243,126 @@ enabled = true
 mod pg_extensions_verdict_tests_3264 {
     use super::{MSG_AGE_CATALOG_USAGE_MISSING, Severity, pg_extensions_verdict_3264};
     use crate::store::postgres::PgvectorPreflight;
+    use crate::store::postgres::age_version::{AGE_VERSION_CANONICAL, AGE_VERSION_FLOOR};
 
     const DB: &str = "aimemory";
+
+    /// #3756 — the doctor JUDGES the AGE version through the probe seam
+    /// (no live cluster): below the floor is CRITICAL (RED, doctor exit 2)
+    /// and the note is the named remedy — the version, the floor and the
+    /// canonical pin all appear, so the operator knows what to install.
+    #[test]
+    fn age_below_floor_is_critical_with_the_named_remedy_3756() {
+        for age_usage in [false, true] {
+            let (sev, note) = pg_extensions_verdict_3264(
+                PgvectorPreflight::Installed,
+                DB,
+                Some("1.5.0"),
+                age_usage,
+            );
+            assert_eq!(
+                sev,
+                Severity::Critical,
+                "AGE 1.5.0 is an unsupported substrate"
+            );
+            let note = note.expect("RED carries the remedy");
+            for needle in ["1.5.0", AGE_VERSION_FLOOR, AGE_VERSION_CANONICAL, "#3756"] {
+                assert!(
+                    note.contains(needle),
+                    "the remedy must name {needle:?}: {note}"
+                );
+            }
+        }
+    }
+
+    /// #3756 — an `extversion` the comparator cannot parse is RED too: a
+    /// version nobody can read is a version nobody can vouch for.
+    #[test]
+    fn age_unparseable_version_is_critical_3756() {
+        let (sev, note) =
+            pg_extensions_verdict_3264(PgvectorPreflight::Installed, DB, Some("garbage"), true);
+        assert_eq!(sev, Severity::Critical, "garbage extversion is RED");
+        let note = note.expect("RED carries a note");
+        assert!(
+            note.contains("\"garbage\""),
+            "the note quotes the raw value: {note}"
+        );
+        assert!(
+            note.contains(AGE_VERSION_CANONICAL),
+            "the note names the canonical pin: {note}"
+        );
+    }
+
+    /// #3756 — the tested alternate (the floor itself) is YELLOW: bootable,
+    /// tested, not the certified pin.
+    #[test]
+    fn age_tested_alternate_is_warning_3756() {
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::Installed,
+            DB,
+            Some(AGE_VERSION_FLOOR),
+            true,
+        );
+        assert_eq!(
+            sev,
+            Severity::Warning,
+            "AGE {AGE_VERSION_FLOOR} is the tested alternate"
+        );
+        let note = note.expect("YELLOW carries a note");
+        assert!(
+            note.contains(AGE_VERSION_CANONICAL),
+            "names the canonical pin: {note}"
+        );
+    }
+
+    /// #3756 present half — the canonical pin stays GREEN (INFO, no note).
+    #[test]
+    fn age_canonical_stays_info_3756() {
+        assert_eq!(
+            pg_extensions_verdict_3264(
+                PgvectorPreflight::Installed,
+                DB,
+                Some(AGE_VERSION_CANONICAL),
+                true
+            ),
+            (Severity::Info, None)
+        );
+    }
+
+    /// #3756 — the pgvector CRITICAL still outranks an AGE RED (the daemon
+    /// cannot boot at all), and an AGE RED outranks the pgvector
+    /// needs-admin WARN and the `ag_catalog` WARN.
+    #[test]
+    fn age_red_ranks_below_pgvector_critical_and_above_the_warns_3756() {
+        let remedy = PgvectorPreflight::NotAvailableOnServer
+            .preemptive_refusal_detail(DB)
+            .expect("the 0A000 class refuses bootstrap");
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::NotAvailableOnServer,
+            DB,
+            Some("1.5.0"),
+            true,
+        );
+        assert_eq!(
+            (sev, note.as_deref()),
+            (Severity::Critical, Some(remedy.as_str()))
+        );
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::AvailableNeedsSuperuserCreate,
+            DB,
+            Some("1.5.0"),
+            false,
+        );
+        assert_eq!(
+            sev,
+            Severity::Critical,
+            "AGE RED outranks the pgvector needs-admin WARN"
+        );
+        assert!(
+            note.is_some_and(|n| n.contains("#3756")),
+            "and carries the AGE remedy"
+        );
+    }
 
     /// The one bootstrap-blocking pgvector verdict (`0A000` — the server
     /// image ships no `vector.so`) is CRITICAL (doctor exit 2) and carries
@@ -8219,7 +8379,7 @@ mod pg_extensions_verdict_tests_3264 {
             let (sev, note) = pg_extensions_verdict_3264(
                 PgvectorPreflight::NotAvailableOnServer,
                 DB,
-                true,
+                Some(AGE_VERSION_CANONICAL),
                 age_usage,
             );
             assert_eq!(sev, Severity::Critical);
@@ -8237,7 +8397,7 @@ mod pg_extensions_verdict_tests_3264 {
         let (sev, note) = pg_extensions_verdict_3264(
             PgvectorPreflight::AvailableNeedsSuperuserCreate,
             DB,
-            false,
+            None,
             false,
         );
         assert_eq!(
@@ -8261,7 +8421,12 @@ mod pg_extensions_verdict_tests_3264 {
     /// `age`) — WARN, with the `GRANT` in the note.
     #[test]
     fn age_installed_without_ag_catalog_usage_warns() {
-        let (sev, note) = pg_extensions_verdict_3264(PgvectorPreflight::Installed, DB, true, false);
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::Installed,
+            DB,
+            Some(AGE_VERSION_CANONICAL),
+            false,
+        );
         assert_eq!(sev, Severity::Warning);
         let note = note.expect("WARN must carry a note");
         assert_eq!(note, MSG_AGE_CATALOG_USAGE_MISSING);
@@ -8280,11 +8445,15 @@ mod pg_extensions_verdict_tests_3264 {
             PgvectorPreflight::Installed,
             PgvectorPreflight::AvailableCreatableProceed,
         ] {
-            for (age_installed, age_usage) in [(false, false), (false, true), (true, true)] {
+            for (age_version, age_usage) in [
+                (None, false),
+                (None, true),
+                (Some(AGE_VERSION_CANONICAL), true),
+            ] {
                 assert_eq!(
-                    pg_extensions_verdict_3264(verdict, DB, age_installed, age_usage),
+                    pg_extensions_verdict_3264(verdict, DB, age_version, age_usage),
                     (Severity::Info, None),
-                    "{verdict:?} / age={age_installed} usage={age_usage}"
+                    "{verdict:?} / age={age_version:?} usage={age_usage}"
                 );
             }
         }

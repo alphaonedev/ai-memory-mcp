@@ -183,6 +183,31 @@ CANONICAL_PGVECTOR_PATCH="$(
     | head -1 || true
 )"
 
+# #3756 — the Apache AGE pins. SSOT for the CANONICAL pin is the same
+# provisioning library as the pgvector patch above (`EXPECTED_AGE_VERSION`
+# default, the value the cert-postgres-age lane refuses to certify away
+# from); SSOT for the tested FLOOR is the alternate matrix's base image
+# (`infra/lan-parity-test/Dockerfile.pg-age-vector`, `FROM
+# apache/age:release_PG16_<floor>`). The Rust comparator
+# `src/store/postgres/age_version.rs` MIRRORS both as named consts so the
+# doctor's RED/YELLOW/GREEN verdict cannot drift from the certified
+# matrix; `check_age_version_consts_rule` binds the mirror to the SSOTs.
+CANONICAL_AGE_VERSION="$(
+    grep -oE '\$\{DOCKER_1461_EXPECTED_AGE_VERSION:-[0-9]+\.[0-9]+\.[0-9]+\}' \
+        deploy/docker-1461/provision/lib.sh 2>/dev/null \
+    | head -1 \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+    | head -1 || true
+)"
+CANONICAL_AGE_FLOOR="$(
+    grep -oE '^FROM[[:space:]]+apache/age:release_PG[0-9]+_[0-9]+\.[0-9]+\.[0-9]+' \
+        infra/lan-parity-test/Dockerfile.pg-age-vector 2>/dev/null \
+    | head -1 \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+$' \
+    | head -1 || true
+)"
+AGE_VERSION_RS="src/store/postgres/age_version.rs"
+
 # Profile::full().expected_tool_count() — count of RegisteredTool::of::<>() entries
 CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || echo 0)
 # asi-hard pinned-knob count (#3113). SSOT = the `KnobSpec` entries in the
@@ -819,6 +844,40 @@ for ln, line in enumerate(open('$f', encoding='utf-8').read().splitlines(), 1):
 # Frozen pages never reach this rule: they are filtered out of
 # HTML_DOC_FILES by HTML_FROZEN_EXEMPT at the top of this script, which is
 # exactly why a `whats-new-v0.8.0` page may keep stamping v0.8.0.
+# #3756 — bind the Rust AGE-version pins to their SSOTs. Fails CLOSED when
+# the mirror exists but a SSOT is unreadable; skips cleanly when the mirror
+# is absent (a fixture tree). A mismatch names both values.
+check_age_version_consts_rule() {
+    local rule_name="AGE_VERSION_* (comparator pins mirror the SSOT)"
+    [[ -f "$AGE_VERSION_RS" ]] || return 0
+    local rs_canonical rs_floor
+    rs_canonical="$(grep -oE 'pub const AGE_VERSION_CANONICAL: &str = "[0-9]+\.[0-9]+\.[0-9]+"' "$AGE_VERSION_RS" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    rs_floor="$(grep -oE 'pub const AGE_VERSION_FLOOR: &str = "[0-9]+\.[0-9]+\.[0-9]+"' "$AGE_VERSION_RS" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    if [[ -z "$rs_canonical" || -z "$rs_floor" ]]; then
+        printf 'FAIL: %s: could not read AGE_VERSION_CANONICAL / AGE_VERSION_FLOOR from %s (#2713 fail-closed)\n' "$rule_name" "$AGE_VERSION_RS" >&2
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    if [[ -z "$CANONICAL_AGE_VERSION" ]]; then
+        printf 'FAIL: %s: could not resolve EXPECTED_AGE_VERSION from deploy/docker-1461/provision/lib.sh — refusing to validate %s (#2713 fail-closed)\n' "$rule_name" "$AGE_VERSION_RS" >&2
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    if [[ -z "$CANONICAL_AGE_FLOOR" ]]; then
+        printf 'FAIL: %s: could not resolve the alternate-matrix AGE from infra/lan-parity-test/Dockerfile.pg-age-vector — refusing to validate %s (#2713 fail-closed)\n' "$rule_name" "$AGE_VERSION_RS" >&2
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    if [[ "$rs_canonical" != "$CANONICAL_AGE_VERSION" ]]; then
+        printf 'FAIL: %s: %s: AGE_VERSION_CANONICAL = %s but deploy/docker-1461/provision/lib.sh EXPECTED_AGE_VERSION = %s\n' "$rule_name" "$AGE_VERSION_RS" "$rs_canonical" "$CANONICAL_AGE_VERSION" >&2
+        fail_count=$((fail_count + 1))
+    fi
+    if [[ "$rs_floor" != "$CANONICAL_AGE_FLOOR" ]]; then
+        printf 'FAIL: %s: %s: AGE_VERSION_FLOOR = %s but infra/lan-parity-test/Dockerfile.pg-age-vector pins AGE %s\n' "$rule_name" "$AGE_VERSION_RS" "$rs_floor" "$CANONICAL_AGE_FLOOR" >&2
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 check_html_version_stamp_rule() {
     local rule_name="HTML_CHROME_VERSION_STAMP"
     local canonical="$CANONICAL_RELEASE_VERSION"
@@ -1389,6 +1448,7 @@ run_all_rules() {
         scripts/check-bootstrap-cert-gate.sh
     check_generalised_numeric_claims
     check_pgvector_version_rule
+    check_age_version_consts_rule
     check_html_version_stamp_rule
     # MCP tool count at --profile full
     check_narrative_count_rule \

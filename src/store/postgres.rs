@@ -87,6 +87,10 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
+// v1.0.0 #3756 — the pure Apache AGE `extversion` comparator (floor /
+// canonical pins mirroring the SSOT) shared by `ai-memory doctor` and the
+// `serve` boot WARN. Own module: pure, no sqlx, unit-tested without a cluster.
+pub mod age_version;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
@@ -3125,6 +3129,30 @@ impl PostgresStore {
                  recursive-CTE, not an AGE Cypher traversal (#2582/#2613); \
                  kg_query/kg_timeline/lineage still use AGE Cypher"
             );
+            // v1.0.0 #3756 — ONE boot WARN when the installed AGE is below the
+            // tested floor (or reports a version the comparator cannot read):
+            // the graph projection does not persist edge validity there, so
+            // kg_timeline omits edges kg_query returns. No boot refusal under
+            // the freeze — `ai-memory doctor` is the operator's instrument
+            // (it goes RED on the same verdict); a failed probe is a debug
+            // line, never a boot blocker.
+            match probe_extension_version(&pool, AGE_EXTENSION_NAME).await {
+                Ok(Some(extversion)) => {
+                    if let Some(msg) = age_version::age_version_boot_warning(&extversion) {
+                        tracing::warn!(
+                            target: age_version::AGE_VERSION_TRACE_TARGET,
+                            age_version = %extversion,
+                            "{msg}"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!(
+                    target: age_version::AGE_VERSION_TRACE_TARGET,
+                    error = %e,
+                    "AGE version probe failed at connect; the doctor reports the version"
+                ),
+            }
         }
 
         // v0.7.0.1 G4 — when AGE is the resolved KG backend, ensure
