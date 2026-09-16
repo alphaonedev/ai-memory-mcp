@@ -634,23 +634,61 @@ impl ForensicPayload {
     /// An identifier (id, namespace, agent id, public key, fingerprint). Kept
     /// verbatim when it is identifier-shaped and carries no credential,
     /// otherwise written as a commitment.
+    ///
+    /// #3739 — `ident` is a DECLARATION: the call site says this value IS an
+    /// identifier. The runtime fallback to a commitment stays (a value that
+    /// trips the secret screen is never written verbatim), but under
+    /// `debug_assertions` a downgrade is loud — it panics naming the key and
+    /// the failing property — so the test suite is the detector for a call
+    /// site whose value is not what it declared. A call site that genuinely
+    /// cannot know declares that with [`Self::ident_or_commit`] instead.
     pub fn ident(self, key: &'static str, id: &str) -> Self {
-        self.push(key, ident_field(id))
+        self.push(key, ident_field_declared(key, id))
     }
 
-    /// An optional identifier; `None` renders `null`.
+    /// An optional identifier; `None` renders `null`. Declared like
+    /// [`Self::ident`] (#3739).
     pub fn opt_ident(self, key: &'static str, id: Option<&str>) -> Self {
-        let field = id.map_or(ForensicField::Value(serde_json::Value::Null), ident_field);
+        let field = id.map_or(ForensicField::Value(serde_json::Value::Null), |id| {
+            ident_field_declared(key, id)
+        });
         self.push(key, field)
     }
 
-    /// A list of identifiers, each sanitised as [`Self::ident`].
+    /// A list of identifiers, each declared as [`Self::ident`] (#3739).
     pub fn idents<I, S>(self, key: &'static str, ids: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let items = ids.into_iter().map(|s| ident_field(s.as_ref())).collect();
+        let items = ids
+            .into_iter()
+            .map(|s| ident_field_declared(key, s.as_ref()))
+            .collect();
+        self.push(key, ForensicField::Array(items))
+    }
+
+    /// #3739 — a value that MAY be an identifier: kept verbatim when it is
+    /// identifier-shaped and carries no credential, otherwise written as a
+    /// commitment, and the call site declares that it knows either can
+    /// happen. This is the honest name for the runtime router; it never
+    /// panics. Prefer [`Self::ident`] (the value is an identifier) or
+    /// [`Self::commit`] (the value is free text) when the call site knows.
+    pub fn ident_or_commit(self, key: &'static str, value: &str) -> Self {
+        self.push(key, ident_field(value))
+    }
+
+    /// #3739 — the list twin of [`Self::ident_or_commit`]: each item routed
+    /// by shape, none declared.
+    pub fn idents_or_commit<I, S>(self, key: &'static str, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let items = values
+            .into_iter()
+            .map(|s| ident_field(s.as_ref()))
+            .collect();
         self.push(key, ForensicField::Array(items))
     }
 
@@ -741,6 +779,59 @@ fn ident_field(s: &str) -> ForensicField {
     } else {
         ForensicField::Commitment(s.as_bytes().to_vec())
     }
+}
+
+/// Marker every #3739 downgrade panic starts with (tests match on it).
+#[cfg(debug_assertions)]
+const FORENSIC_IDENT_DOWNGRADE: &str = "forensic ident downgrade";
+
+/// #3739 — [`ident_field`] for a value the call site DECLARED an identifier.
+///
+/// Release builds: byte-identical to [`ident_field`] (the fallback stays; an
+/// audit sink must never take the daemon down). Debug builds: a value that
+/// would be downgraded to a commitment panics naming the key and the failing
+/// property — never the value, which may be the credential the screen found.
+/// The existing test suite thereby detects every call site whose value is not
+/// what it declared, with no enumeration to keep in sync.
+fn ident_field_declared(key: &'static str, s: &str) -> ForensicField {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(why) = ident_downgrade_reason(s) {
+            panic!(
+                "{FORENSIC_IDENT_DOWNGRADE}: key {key:?} was declared ident() but its value \
+                 would be written as a commitment ({why}); declare commit() for free text, \
+                 ident_or_commit() when either is possible, or fix the value"
+            );
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = key;
+    ident_field(s)
+}
+
+/// #3739 — WHY `s` is not a forensic identifier, as a property (length, the
+/// first illegal byte's offset, the secret-screen kinds), or `None` when it
+/// is one. The value itself is never part of the answer.
+#[cfg(debug_assertions)]
+fn ident_downgrade_reason(s: &str) -> Option<String> {
+    if s.len() > FORENSIC_IDENT_MAX_LEN {
+        return Some(format!(
+            "too long ({} > {FORENSIC_IDENT_MAX_LEN} bytes)",
+            s.len()
+        ));
+    }
+    if let Some((offset, byte)) = s
+        .bytes()
+        .enumerate()
+        .find(|(_, b)| !(b.is_ascii_alphanumeric() || FORENSIC_IDENT_PUNCT.contains(b)))
+    {
+        return Some(format!("illegal byte 0x{byte:02x} at offset {offset}"));
+    }
+    if let crate::secret_screen::ScreenOutcome::Hit { kinds, .. } = crate::secret_screen::screen(s)
+    {
+        return Some(format!("secret-screened ({})", kinds.join(",")));
+    }
+    None
 }
 
 /// Render a commitment: `hmac-sha256:<hex>` under `mac_key`, or
@@ -4058,12 +4149,15 @@ mod tests {
             "refuse",
             "bash",
             token,
+            // #3739 — the values that are NOT identifiers go through the
+            // honest router (`ident_or_commit`); `ident()` on them is now a
+            // debug-time detector hit (see the `issue_3739_*` tests).
             ForensicPayload::new()
                 .ident("kept", "ai:alice@host/ns-1")
-                .ident("spaced", "rm -rf /srv/x")
-                .ident("credential", token)
+                .ident_or_commit("spaced", "rm -rf /srv/x")
+                .ident_or_commit("credential", token)
                 .commit("reason", "ISSUE_3647 free text")
-                .idents("list", ["ok-1", "not ok"]),
+                .idents_or_commit("list", ["ok-1", "not ok"]),
         );
         shutdown();
         let rows = rows_3647(tmp.path());
@@ -4106,7 +4200,10 @@ mod tests {
             ForensicPayload::new()
                 .opt_idents("absent", none)
                 .opt_idents("empty", Some(Vec::<&str>::new()))
-                .opt_idents("present", Some(["ai:worker", "not ok"]))
+                // #3739 — `opt_idents` items are DECLARED identifiers; the
+                // non-identifier list case is pinned through `idents_or_commit`
+                // in `issue_3647_sink_sanitises_row_fields_and_commits_free_text`.
+                .opt_idents("present", Some(["ai:worker", "ai:other"]))
                 .opt_ident("scalar_absent", None)
                 .opt_ident("scalar_present", Some("ai:admin")),
         );
@@ -4122,15 +4219,106 @@ mod tests {
         assert_eq!(payload["empty"], serde_json::json!([]));
         assert_eq!(
             payload["present"],
-            serde_json::json!(["ai:worker", forensic_commitment(&key, b"not ok")])
+            serde_json::json!(["ai:worker", "ai:other"])
         );
         assert_eq!(payload["scalar_absent"], serde_json::Value::Null);
         assert_eq!(payload["scalar_present"], "ai:admin");
+    }
+
+    /// #3739 P1 — a call site that DECLARES `ident()` for a value that would
+    /// be committed is loud in debug builds: the panic names the key and the
+    /// failing property (an illegal byte here), never the value. Fails on the
+    /// pre-#3739 tree, where the downgrade was silent (no panic).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "forensic ident downgrade: key \"cmd\" was declared ident()")]
+    fn issue_3739_declared_ident_with_a_space_panics_in_debug_naming_the_key() {
+        let _ = ForensicPayload::new().ident("cmd", "a value with spaces");
+    }
+
+    /// #3739 P1 (second property) — a value over the length bound is named
+    /// as "too long", with the length, not the value.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "too long (300 > 256 bytes)")]
+    fn issue_3739_declared_ident_too_long_panics_in_debug_naming_the_length() {
+        let long = "a".repeat(300);
+        let _ = ForensicPayload::new().opt_ident("agent", Some(long.as_str()));
+    }
+
+    /// #3739 P1 (third property) — a credential-shaped value is named by the
+    /// screen kinds; the message must not carry the token.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn issue_3739_declared_ident_of_a_credential_panics_without_the_token() {
+        let token = "ghp_Q8zR2mV7kX4pL9wN3cT6yB1fH5jD0sA2eG7u";
+        let caught = std::panic::catch_unwind(|| {
+            let _ = ForensicPayload::new().idents("keys", [token]);
+        })
+        .expect_err("a declared ident of a credential must panic in debug");
+        let message = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| caught.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("panic payload is a string");
+        assert!(message.contains("forensic ident downgrade"), "{message}");
+        assert!(message.contains("key \"keys\""), "{message}");
+        assert!(message.contains("secret-screened ("), "{message}");
+        assert!(
+            !message.contains(token),
+            "the panic must not carry the credential: {message}"
+        );
+    }
+
+    /// #3739 P2 — the controls on the same sink: a declared identifier that
+    /// IS one renders verbatim with no panic, and the honest router renders
+    /// the commitment for a non-identifier with no panic (the runtime
+    /// fallback is preserved and exercised, not removed).
+    #[test]
+    fn issue_3739_ident_of_an_identifier_and_ident_or_commit_never_panic() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key = fresh_key();
+        fresh_init(tmp.path(), Some(key.clone()));
+        record_decision(
+            "ai:t",
+            "allow",
+            "bash",
+            "",
+            ForensicPayload::new()
+                .ident("kept", "ai:alice@host/ns-1")
+                .ident_or_commit("either_id", "ai:bob")
+                .ident_or_commit("either_text", "a value with spaces")
+                .idents_or_commit("either_list", ["ok-1", "not ok"]),
+        );
+        shutdown();
+        let rows = rows_3647(tmp.path());
+        assert_eq!(rows.len(), 1);
+        let payload = &rows[0].payload;
+        let commitment = |s: &str| forensic_commitment(&key, s.as_bytes());
+        assert_eq!(payload["kept"], "ai:alice@host/ns-1");
+        assert_eq!(payload["either_id"], "ai:bob");
+        assert_eq!(payload["either_text"], commitment("a value with spaces"));
+        assert_eq!(
+            payload["either_list"],
+            serde_json::json!(["ok-1", commitment("not ok")])
+        );
         let text = serde_json::to_string(&rows[0]).unwrap();
         assert!(
-            !text.contains("not ok"),
-            "free text never reaches the row: {text}"
+            !text.contains("with spaces") && !text.contains("not ok"),
+            "{text}"
         );
+        // The property namer itself: `None` for an identifier, a property
+        // (not the value) otherwise.
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(ident_downgrade_reason("ai:alice@host/ns-1"), None);
+            assert_eq!(ident_downgrade_reason(""), None);
+            assert_eq!(
+                ident_downgrade_reason("a b").as_deref(),
+                Some("illegal byte 0x20 at offset 1")
+            );
+        }
     }
 
     #[test]

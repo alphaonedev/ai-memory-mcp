@@ -210,7 +210,15 @@ pub fn handle_share(
                 .ident(field_names::SOURCE_MEMORY_ID, source_memory_id)
                 .ident(field_names::TARGET_AGENT_ID, target_agent_id)
                 .ident(field_names::FROM_AGENT_ID, &from_agent_id)
-                .ident(field_names::TARGET_NAMESPACE, &target_namespace),
+                // #3739 — found by the declared-ident detector: this
+                // namespace is minted as `_shared/<from>\u{2192}<to>/` (an
+                // arrow outside the forensic identifier alphabet), so a
+                // declared `ident()` ALWAYS routed it to a commitment and no
+                // audit row ever carried the target namespace in the clear.
+                // `ident_or_commit` names what happens today without changing
+                // it; whether the row should DISCLOSE this namespace (widen
+                // the alphabet, or mint an ASCII token) is a separate ruling.
+                .ident_or_commit(field_names::TARGET_NAMESPACE, &target_namespace),
         );
     }
 
