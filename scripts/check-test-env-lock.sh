@@ -280,13 +280,26 @@
 # gate from firing on a worker thread, which is a worse trade than the
 # residual. Widen the READER pattern here if a new victim cohort appears.
 #
+# ARM (h) -- issue #3517 (2026-09-16). The READER census. Arms (d)/(e)
+# ratchet the WRITERS of AI_MEMORY_AGENT_ID; a lib test that READS it through
+# an identity-resolving entry point (`resolve_actor` / `resolve_agent_id` /
+# `resolve_governance_subject` / a `handle_*` of a file that calls one /
+# `handle_request`) while assuming it is ABSENT is exposed to the same race
+# and was ungated. Per-file ratchet of unguarded reader TESTS against
+# scripts/qc-allowlists/test-agent-id-reader-baseline.txt; a reader retires
+# by MOVING to its own test binary (the arm (e) remedy) when its entry point
+# is `pub`, else by holding a token plus an explicit, reviewed
+# `--update-baseline` widening. See the arm (h) header block below.
+#
 # Usage:
 #   scripts/check-test-env-lock.sh
-#     - exit 0 on clean, exit 1 on any violation (arms (a)-(f))
+#     - exit 0 on clean, exit 1 on any violation (arms (a)-(h))
+#   scripts/check-test-env-lock.sh --reader-census
+#     - list every unguarded reader test arm (h) counts (`path:line:test`)
 #   scripts/check-test-env-lock.sh --update-baseline
-#     - rewrite BOTH census baselines (arm (d) #3475, arm (e) #3523). Any
-#       number it RAISES is a deliberate widening of the control and must be
-#       justified in review; lowering one is always safe.
+#     - rewrite the THREE census baselines (arm (d) #3475, arm (e) #3523,
+#       arm (h) #3517). Any number it RAISES is a deliberate widening of the
+#       control and must be justified in review; lowering one is always safe.
 #   scripts/check-test-env-lock.sh --self-test
 #     - injects: a violating fixture ($HOME mutation, zero test_env_lock
 #       reference anywhere in the file), a compliant fixture (same
@@ -549,8 +562,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # A qualified config::set_lineage_dag( call in a new src/** file is
     # the seeder-leak shape; a method call on LineageDagIsolation is NOT.
     probe_arm_g="${ROOT}/src/check_test_env_arm_g_probe_3577.rs"
+    # Arm (h) (#3517): an UNGUARDED reader test of an entry point (REJECT),
+    # the same test holding the crate-wide lock (PASS), and a test of a
+    # handler that takes the resolved caller as a PARAMETER and never reads
+    # the env (PASS -- not reader-exposed).
+    probe_arm_h="${ROOT}/src/check_test_env_arm_h_probe_3517.rs"
+    probe_arm_h_compliant="${ROOT}/src/check_test_env_arm_h_compliant_probe_3517.rs"
+    probe_arm_h_param="${ROOT}/src/check_test_env_arm_h_param_probe_3517.rs"
 
-    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g"; do
+    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run -- remove manually)" >&2
@@ -899,12 +919,57 @@ fn contrived_lineage_dag_seed_without_funnel() {
 }
 EOF
 
+    cat > "$probe_arm_h" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-env-lock.sh --self-test.
+// A handler that resolves the caller through the env-reading entry point,
+// and a test that calls it supplying an actor with NO reader token in its
+// body — the issue #3517 routine race shape.
+pub fn handle_arm_h_probe(actor: Option<&str>) -> Result<String, String> {
+    crate::coordination_guard::resolve_actor(actor)
+}
+#[test]
+fn contrived_unguarded_reader_test() {
+    let r = handle_arm_h_probe(Some("agent-a"));
+    assert!(r.is_ok());
+}
+EOF
+
+    cat > "$probe_arm_h_compliant" <<'EOF'
+// CONTRIVED COMPLIANT FIXTURE for scripts/check-test-env-lock.sh
+// --self-test. The same reader shape, holding the crate-wide lock for the
+// whole test body — arm (h) must NOT flag it. (The lock token rather than
+// the unset guard so this fixture is not an arm (e) helper-routed write.)
+pub fn handle_arm_h_compliant_probe(actor: Option<&str>) -> Result<String, String> {
+    crate::coordination_guard::resolve_actor(actor)
+}
+#[test]
+fn contrived_lock_holding_reader_test() {
+    let _g = crate::identity::agent_id_env_test_lock();
+    let r = handle_arm_h_compliant_probe(Some("agent-a"));
+    assert!(r.is_ok());
+}
+EOF
+
+    cat > "$probe_arm_h_param" <<'EOF'
+// CONTRIVED COMPLIANT FIXTURE for scripts/check-test-env-lock.sh
+// --self-test. The handler takes the ALREADY-RESOLVED caller as a
+// parameter and never reads the env, so a test passing an actor to it is
+// not reader-exposed — arm (h) must NOT flag it.
+pub fn handle_arm_h_param_probe(caller: Option<&str>) -> bool {
+    caller.is_some()
+}
+#[test]
+fn contrived_param_caller_test() {
+    assert!(handle_arm_h_param_probe(Some("agent-a")));
+}
+EOF
+
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g"
+    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"
     printf '%s\n' "$gate_output"
 
     # PASS requires: non-zero exit, ALL EIGHT violators reported (no-lock,
@@ -925,6 +990,7 @@ EOF
     hay_has 'contrived_naked_passphrase_seed\|\.check_passphrase_window_probe_3539\.rs' "$gate_output" || ok=0
     hay_has 'contrived_naked_plain_sqlite_boot\|bootstrap_serve' "$gate_output" || ok=0
     hay_has 'check_test_env_arm_g_probe_3577\.rs' "$gate_output" || ok=0
+    hay_has 'NEW OFFENDER  src/check_test_env_arm_h_probe_3517\.rs' "$gate_output" || ok=0
     if hay_has '\.check_home_lock_compliant_probe\.rs' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: the compliant fixture was flagged)" >&2
@@ -950,6 +1016,14 @@ EOF
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (e) flagged the documented-exempt isolation fixture -- a gate that fires on test_key_dir::install() will be switched off)" >&2
         exit 1
     fi
+    if hay_has 'check_test_env_arm_h_compliant_probe_3517\.rs' "$gate_output"; then
+        echo "FAIL: self-test -- arm (h) flagged the LOCK-HOLDING reader fixture (over-widening)" >&2
+        exit 1
+    fi
+    if hay_has 'check_test_env_arm_h_param_probe_3517\.rs' "$gate_output"; then
+        echo "FAIL: self-test -- arm (h) flagged a handler that takes the caller as a PARAMETER (not reader-exposed)" >&2
+        exit 1
+    fi
     if hay_has '\.check_passphrase_window_compliant_probe_3539\.rs\|contrived_guarded_' "$gate_output"; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (f) flagged the correctly-funnelled passphrase fixture)" >&2
@@ -957,7 +1031,7 @@ EOF
     fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-env-lock gate self-test: PASS (caught all ten contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, the #3523 arm (e) helper-routed bypass, BOTH #3539 arm (f) shapes (naked passphrase seed, naked plain-sqlite boot), and the #3577 arm (g) LINEAGE_DAG setter -- and spared all four compliant fixtures; exit=${gate_exit})"
+        echo "Test-env-lock gate self-test: PASS (caught all eleven contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, the #3523 arm (e) helper-routed bypass, BOTH #3539 arm (f) shapes (naked passphrase seed, naked plain-sqlite boot), the #3577 arm (g) LINEAGE_DAG setter, and the #3517 arm (h) unguarded reader -- and spared all six compliant fixtures; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
@@ -1256,6 +1330,270 @@ helper_mutation_census () {
     done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k2,2
 }
 
+# ---------------------------------------------------------------------
+# ARM (h) -- issue #3517 (2026-09-16). The READER census.
+#
+# Arms (d)/(e) ratchet the WRITERS of AI_MEMORY_AGENT_ID. A READER that
+# assumes the variable is ABSENT is just as exposed: the lib default run on
+# 539a5b845 lost `mcp::routine::handler_tests::
+# create_freeze_run_status_list_roundtrips_over_mcp` because a sibling test
+# installed `ai:bob` under `agent_id_env_test_lock` while this one supplied
+# `created_by = "agent-a"` and held NO lock -- `resolve_actor` compared the
+# two and refused. Every such reader must hold one of the canonical tokens
+# for its whole body:
+#   * identity::agent_id_env_unset_guard   (RAII: lock + remove + restore)
+#   * identity::agent_id_env_test_lock     (the crate-wide mutex itself)
+#   * identity::test_agent_id::            (#3523 thread-local override that
+#                                            shadows the env for the thread)
+# plus any SAME-FILE helper whose signature RETURNS one of those guards (a
+# delegate wrapper such as `fn single_operator_posture() ->
+# crate::identity::AgentIdEnvUnsetGuard`), which is the only shape in which a
+# token outside the test body still spans the test.
+#
+# WHAT IS COUNTED. A `#[test]`/`#[tokio::test]` fn body under src/** that
+# calls an ENTRY POINT and cites no token. The entry set is DERIVED, never
+# a module list: the three callers of the ONE env reader
+# `identity::agent_id_env()` (`resolve_agent_id`,
+# `resolve_read_visibility_caller`, `resolve_mcp_read_visibility_caller`),
+# their transitive wrappers (`resolve_governance_subject`, `resolve_actor`,
+# `prepare_action`, `resolve_mcp_agent_id`, `Authority::resolve_mcp[_in]`),
+# every `handle_*` fn DEFINED in a file whose PRODUCTION text (above the
+# first `#[cfg(test)]`) calls one of those, and the MCP top-level dispatch
+# (`handle_request`). File-level reachability over-approximates (a
+# `handle_*` in a reaching file that itself never resolves counts) -- the
+# ratchet absorbs that: the over-count is frozen in the baseline and only
+# MOVEMENT is judged.
+#
+# RATCHET. Per-file count of unguarded reader TESTS against
+# scripts/qc-allowlists/test-agent-id-reader-baseline.txt (`<count> <path>`;
+# the arm (d)/(e) shape). Counts may fall, never rise; a file absent from
+# the baseline is a NEW OFFENDER. Burn it down to zero; the arm then IS the
+# hard rule. `--update-baseline` rewrites it alongside the other two.
+# ---------------------------------------------------------------------
+
+# The nine entry points (the callers of `identity::agent_id_env()` and
+# their wrappers). A new resolver is a one-name addition here.
+READER_ENTRY_PATTERN='\b(resolve_agent_id|resolve_read_visibility_caller|resolve_mcp_read_visibility_caller|resolve_governance_subject|resolve_actor|prepare_action|resolve_mcp_agent_id|resolve_mcp|resolve_mcp_in)\('
+# The top-level MCP dispatch resolves the caller for every tool.
+READER_DISPATCH_PATTERN='\b(handle_request|dispatch_tool|call_tool)\('
+# COMMA-joined guard tokens (the #3523 SEPARATOR note on naked_home_mutations).
+READER_GUARD_TOKENS='agent_id_env_unset_guard,agent_id_env_test_lock,test_agent_id::'
+READER_BASELINE_FILE="${ROOT}/scripts/qc-allowlists/test-agent-id-reader-baseline.txt"
+
+# reader_handle_defs <file>
+# Emits the `|`-joined names of every `handle_*` fn DEFINED in <file> whose
+# attribute stack carries no `#[test]` / `#[..::test]` — the production
+# handlers, wherever they sit relative to the file's test modules.
+reader_handle_defs () {
+    python3 - "$1" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+src = '\n'.join(re.sub(r'//.*$', '', l) for l in src.split('\n'))
+sig = re.compile(r'\b(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*fn\s+(handle_[a-z0-9_]+)\s*[<(]')
+test_attr = re.compile(r'#\[(?:[A-Za-z_][A-Za-z0-9_]*::)*test(?:\([^)]*\))?\]')
+names = set()
+for m in sig.finditer(src):
+    # the attribute stack: walk back over blank lines and `#[..]` lines
+    head = src[:m.start()]
+    lines = head.split('\n')
+    stack = []
+    for l in reversed(lines[:-1] if lines and lines[-1].strip() == '' else lines):
+        t = l.strip()
+        if t == '' or t.startswith('#['):
+            stack.append(t)
+            continue
+        break
+    if any(test_attr.search(a) for a in stack):
+        continue
+    names.add(m.group(1))
+print('|'.join(sorted(names)))
+PY
+}
+
+# reader_handle_pattern
+# Emits the alternation of every `handle_*` fn DEFINED in a src/** file whose
+# production text (above its first `#[cfg(test)]`) calls an entry point --
+# the ONE-HOP reach. Empty when no such file exists (the --self-test
+# fixture tree), in which case only the direct entry points are matched.
+reader_handle_pattern () {
+    local names=""
+    while IFS= read -r -d '' f; do
+        local prod
+        # Reach is judged over the WHOLE comment-stripped file (not only the
+        # text above `#[cfg(test)]`): `#[cfg(test)]` also gates single items
+        # early in a file (mcp/mod.rs:67, check_agent_action.rs:329), so a
+        # text cut there hid the production call below it. A test-module
+        # call making its file "reaching" is an over-approximation the
+        # ratchet absorbs (see the header).
+        prod="$(sed -E 's#//.*$##' "$f" 2>/dev/null)"
+        grep -qE "$READER_ENTRY_PATTERN" <<< "$prod" || continue
+        # The `handle_*` DEFINITIONS are the NON-test fns of the file (a test
+        # fn named `handle_gc_dry_run_…` must never become an entry point).
+        # Test modules interleave with production code in this repo
+        # (mcp/tools/pending.rs defines `handle_pending_reject` BELOW a
+        # `#[cfg(test)] mod`), so a text cut at the first test module is
+        # wrong in both directions; the attribute stack decides instead.
+        local h
+        h="$(reader_handle_defs "$f" || true)"
+        [[ -n "$h" ]] && names="${names:+${names}|}${h}"
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null)
+    printf '%s' "$names"
+}
+
+# naked_reader_tests <file> <tokens-csv> <linenos-csv>
+# Arm (c)'s fn-scoped idea with TWO changes, so it is a sibling and not a
+# reuse: it prints each flagged `#[test]` fn NAME once (the ratchet unit is
+# the test, so the baseline counts agree with the #3517 census), and it
+# walks braces in python3 rather than awk. The awk walker strips string
+# literals line-by-line, and src/mcp/mod.rs carries hundreds of MULTI-LINE
+# raw-string JSON fixtures whose braces then desynchronise the fn tracking
+# (arm (c) is safe from this only because $HOME mutations sit in short
+# fns). Braces inside string literals are BALANCED in every fixture this
+# repo ships, so counting them is the more robust walk here; a genuinely
+# unbalanced literal would only mis-scope ONE fn, never abort the gate.
+# python3 is already a gate dependency (scripts/check-docs-vs-ssot.sh).
+naked_reader_tests () {
+    python3 - "$1" "$2" "$3" <<'PY'
+import re, sys
+path, tokens, linenos = sys.argv[1], sys.argv[2], sys.argv[3]
+tokens = [t for t in tokens.split(',') if t]
+hits = {int(n) for n in linenos.split(',') if n}
+src = open(path, encoding='utf-8', errors='replace').read()
+# line-comment strip that keeps line numbers (one output line per input
+# line) and is STRING-AWARE: a `//` inside a literal (`"https://…"`) is not
+# a comment. The arm (c) awk stripper is not, and a URL literal there eats
+# the rest of its line — including the `})` that closes a `json!({…})` —
+# which desynchronises the brace walk for the rest of the file.
+def strip_comment(line):
+    out = []
+    in_str = False
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if in_str:
+            # Blank the literal's CONTENT (keep the quotes) so a `{` inside a
+            # string — `Body::from("{not json")` — never enters the brace walk.
+            if c == '\\' and i + 1 < n:
+                out.append('  ')
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+                out.append(c)
+            else:
+                out.append(' ')
+        else:
+            if c == "'" and i + 2 < n and line[i + 2] == "'":
+                out.append(line[i:i + 3])
+                i += 3
+                continue
+            if c == '"':
+                in_str = True
+            elif c == '/' and i + 1 < n and line[i + 1] == '/':
+                break
+            out.append(c)
+        i += 1
+    return ''.join(out)
+
+src = '\n'.join(strip_comment(l) for l in src.split('\n'))
+attr = re.compile(r'#\[(?:[A-Za-z_][A-Za-z0-9_]*::)*test(?:\([^)]*\))?\]')
+sig = re.compile(r'\b(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern\s+"[^"]*")\s+)*fn\s+([A-Za-z_][A-Za-z0-9_]*)')
+
+def body_at(pos):
+    """brace-balanced body starting at the first `{` at/after pos -> (i, j)."""
+    i = src.find('{', pos)
+    if i < 0:
+        return None
+    depth = 0
+    j = i
+    while j < len(src):
+        c = src[j]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    return i, j
+
+# SAME-FILE delegate wrappers: a fn whose own body cites a canonical token
+# (`fn single_operator_posture() -> AgentIdEnvUnsetGuard { agent_id_env_unset_guard() }`)
+# is itself a token — the guard it returns spans the calling test. Keyed on
+# the token in the BODY, never on a return type: `fn forensic_lock() ->
+# MutexGuard<..>` guards a different mutex and must not count.
+# ONE pass against the CANONICAL tokens (a snapshot): a wrapper is never
+# derived from another wrapper, so the reader seam `agent_id_env()` (whose
+# body cites the override) cannot transitively bless `resolve_agent_id`.
+canonical = list(tokens)
+entry = re.compile(r'^(agent_id_env|resolve_agent_id|resolve_read_visibility_caller|'
+                   r'resolve_mcp_read_visibility_caller|resolve_governance_subject|'
+                   r'resolve_actor|prepare_action|resolve_mcp_agent_id|resolve_mcp|resolve_mcp_in)$')
+for fm in sig.finditer(src):
+    if entry.match(fm.group(1)):
+        continue
+    span = body_at(fm.end())
+    if span and any(t in src[span[0]:span[1] + 1] for t in canonical):
+        tokens.append(fm.group(1) + '(')
+for m in attr.finditer(src):
+    fm = sig.search(src, m.end())
+    if not fm:
+        continue
+    # the attribute stack must reach the fn with only attributes / blank
+    # lines in between (a `#[test]` followed by a non-fn item is not a test)
+    between = src[m.end():fm.start()]
+    if re.search(r'^\s*[^\s#\]]', between, re.M):
+        continue
+    span = body_at(fm.end())
+    if not span:
+        continue
+    i, j = span
+    body = src[i:j + 1]
+    first = src.count('\n', 0, i) + 1
+    last = src.count('\n', 0, j) + 1
+    if not any(first <= h <= last for h in hits):
+        continue
+    if any(t in body for t in tokens):
+        continue
+    print(f"{src.count(chr(10), 0, fm.start()) + 1}:{fm.group(1)}")
+PY
+}
+
+# reader_census [--list]
+# Emits `<unguarded reader tests> <path>` per src/** file (sorted by path);
+# with --list, emits `<path>:<line>:<test>` per flagged test instead.
+reader_census () {
+    local mode="${1:-}"
+    local handles reader_pattern
+    handles="$(reader_handle_pattern)"
+    reader_pattern="${READER_ENTRY_PATTERN}|${READER_DISPATCH_PATTERN}"
+    [[ -n "$handles" ]] && reader_pattern="${reader_pattern}|\b(${handles})\("
+    while IFS= read -r -d '' f; do
+        local base="${f##*/}"
+        case "$base" in .*) continue ;; esac
+        local rel stripped hits csv tokens helpers flagged
+        rel="${f#"${ROOT}/"}"
+        stripped="$(strip_line_comments "$f")"
+        hits="$(grep -nE "$reader_pattern" <<< "$stripped" || true)"
+        [[ -z "${hits//[[:space:]]/}" ]] && continue
+        csv="$(printf '%s\n' "$hits" | cut -d: -f1 | paste -sd, -)"
+        tokens="$READER_GUARD_TOKENS"
+        flagged="$(naked_reader_tests "$f" "$tokens" "$csv" || true)"
+        [[ -z "${flagged//[[:space:]]/}" ]] && continue
+        if [[ "$mode" == "--list" ]]; then
+            while IFS= read -r t; do [[ -n "$t" ]] && printf '%s:%s\n' "$rel" "$t"; done <<< "$flagged"
+        else
+            printf '%s %s\n' "$(printf '%s\n' "$flagged" | grep -c . || true)" "$rel"
+        fi
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k2,2
+}
+
+if [[ "${1:-}" == "--reader-census" ]]; then
+    reader_census --list
+    exit 0
+fi
+
 if [[ "${1:-}" == "--update-baseline" ]]; then
     {
         echo "# scripts/qc-allowlists/test-env-mutation-baseline.txt -- issue #3475 ratchet baseline."
@@ -1286,6 +1624,21 @@ if [[ "${1:-}" == "--update-baseline" ]]; then
         helper_mutation_census
     } > "$HELPER_BASELINE_FILE"
     echo "Test-env-lock gate: helper baseline rewritten -> ${HELPER_BASELINE_FILE#"${ROOT}/"}"
+    {
+        echo "# scripts/qc-allowlists/test-agent-id-reader-baseline.txt -- issue #3517 ratchet baseline."
+        echo "#"
+        echo "# Format: <unguarded AI_MEMORY_AGENT_ID reader tests> <path>"
+        echo "#"
+        echo "# A lib test that reaches an identity-resolving entry point (see the"
+        echo "# arm (h) header in scripts/check-test-env-lock.sh) and cites none of"
+        echo "# agent_id_env_unset_guard / agent_id_env_test_lock / test_agent_id::"
+        echo "# in its own body. Counts may fall, never rise; burn down to zero."
+        echo "# Regenerate with: scripts/check-test-env-lock.sh --update-baseline"
+        echo "# A regenerated baseline that RAISES any number is a deliberate,"
+        echo "# reviewable widening -- justify it in review."
+        reader_census
+    } > "$READER_BASELINE_FILE"
+    echo "Test-env-lock gate: reader baseline rewritten -> ${READER_BASELINE_FILE#"${ROOT}/"}"
     # Propagate an arms-(a)-(c) failure: rewriting the census baselines must
     # never launder a $HOME-serialization violation into a green exit.
     exit "$home_fail"
@@ -1558,7 +1911,61 @@ else
     echo "Test-env-lock gate arm (g): PASS (no src/** file calls config::set_lineage_dag / set_consolidate_tombstone_sources outside the #3577 funnel)"
 fi
 
-if (( home_fail != 0 || arm_d_fail != 0 || arm_e_fail != 0 || arm_f_fail != 0 || arm_g_fail != 0 )); then
+if [[ ! -f "$READER_BASELINE_FILE" ]]; then
+    echo "Test-env-lock gate arm (h): missing baseline ${READER_BASELINE_FILE#"${ROOT}/"}" >&2
+    echo "(regenerate with: scripts/check-test-env-lock.sh --update-baseline)" >&2
+    exit 1
+fi
+
+arm_h_report="$(
+    reader_census | awk -v baseline="$READER_BASELINE_FILE" '
+    BEGIN {
+        while ((getline line < baseline) > 0) {
+            if (line ~ /^[[:space:]]*(#|$)/) continue
+            split(line, F, /[[:space:]]+/)
+            known[F[2]] = 1; base_n[F[2]] = F[1] + 0
+        }
+        close(baseline)
+    }
+    {
+        n = $1 + 0; path = $2
+        if (!(path in known)) {
+            print "  NEW OFFENDER  " path " (unguarded reader tests=" n ")"
+            next
+        }
+        if (n > base_n[path])
+            print "  unguarded reader tests INCREASED  " path "  " base_n[path] " -> " n
+    }
+    '
+)"
+
+if [[ -n "${arm_h_report//[[:space:]]/}" ]]; then
+    {
+        echo "New UNGUARDED READER of AI_MEMORY_AGENT_ID in the LIB TEST BINARY (issue #3517):"
+        printf '%s\n' "$arm_h_report"
+        echo ""
+        echo "A lib test that reaches an identity-resolving entry point"
+        echo "(resolve_agent_id / resolve_governance_subject / resolve_actor /"
+        echo "a handle_* of a file that calls one / handle_request) runs in the"
+        echo "SAME process as every writer of AI_MEMORY_AGENT_ID. Hold the"
+        echo "reader token for the whole test body, as its FIRST statement:"
+        echo ""
+        echo "  let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();"
+        echo ""
+        echo "(or agent_id_env_test_lock() / the test_agent_id:: override)."
+        echo "List the offenders: scripts/check-test-env-lock.sh --reader-census"
+        echo "A deliberate widening is the explicit baseline bump:"
+        echo "  scripts/check-test-env-lock.sh --update-baseline"
+        echo ""
+    } >&2
+    echo "Test-env-lock gate arm (h): FAIL" >&2
+    arm_h_fail=1
+else
+    arm_h_fail=0
+    echo "Test-env-lock gate arm (h): PASS (no src/** file gained an unguarded AI_MEMORY_AGENT_ID reader test over the #3517 baseline)"
+fi
+
+if (( home_fail != 0 || arm_d_fail != 0 || arm_e_fail != 0 || arm_f_fail != 0 || arm_g_fail != 0 || arm_h_fail != 0 )); then
     echo "" >&2
     echo "Test-env-lock gate: FAIL" >&2
     exit 1
