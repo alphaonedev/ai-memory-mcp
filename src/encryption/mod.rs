@@ -1029,7 +1029,7 @@ pub fn encryption_enabled(config_flag: Option<bool>) -> bool {
         std::env::var(ENV_ENCRYPT_AT_REST)
             .ok()
             .as_deref()
-            .map(str::to_ascii_lowercase)
+            .map(|s| s.trim().to_ascii_lowercase())
             .as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
@@ -1482,6 +1482,53 @@ mod tests {
         assert!(encryption_enabled(None));
         assert!(encryption_enabled(Some(true)));
         // `env` restores `AI_MEMORY_ENCRYPT_AT_REST` on Drop.
+        set_config_at_rest(false);
+    }
+
+    /// #3621 — `encryption_enabled` lowercased but did NOT `trim()`, while its
+    /// three sibling truthy parsers (`security_profile`,
+    /// `enterprise_federation_posture`, `erasure`) all
+    /// `trim().to_ascii_lowercase()`. This is the one truthy knob that fails
+    /// OPEN: a value it does not recognise leaves at-rest content encryption
+    /// OFF, so a whitespace-padded `AI_MEMORY_ENCRYPT_AT_REST` silently shipped
+    /// plaintext. Both legs read the same sink, `encryption_enabled(None)`.
+    #[test]
+    fn encryption_enabled_trims_surrounding_whitespace_3621() {
+        let _lock = env_lock();
+        let env = EnvGuard::capture(ENV_ENCRYPT_AT_REST);
+        set_config_at_rest(false);
+
+        // THE PIN — RED on the untrimmed pre-fix code: a truthy value with
+        // surrounding whitespace (and mixed case) MUST enable. Untrimmed, each
+        // keeps its padding after `to_ascii_lowercase` and misses the
+        // `"1"|"true"|"yes"|"on"` set, so at-rest encryption stays off.
+        for v in ["  1  ", "\t1\n", " true ", " TrUe ", "  YES\t", " on "] {
+            env.set(v);
+            assert!(
+                encryption_enabled(None),
+                "a whitespace-padded / mixed-case truthy value must enable \
+                 at-rest encryption (it fails OPEN otherwise): {v:?}"
+            );
+        }
+
+        // ALLOWED-PATH CONTROL — the trim must not change the recognised set:
+        // plain truthy still enables; falsy / empty / whitespace-only / unknown
+        // still disables.
+        for v in ["1", "true", "yes", "on", "TRUE"] {
+            env.set(v);
+            assert!(
+                encryption_enabled(None),
+                "plain truthy must still enable: {v:?}"
+            );
+        }
+        for v in ["0", "false", "no", "off", "", "   ", "nonsense", " maybe "] {
+            env.set(v);
+            assert!(
+                !encryption_enabled(None),
+                "falsy / empty / whitespace-only / unknown must still disable: {v:?}"
+            );
+        }
+
         set_config_at_rest(false);
     }
 
