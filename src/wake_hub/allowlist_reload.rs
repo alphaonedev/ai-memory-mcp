@@ -53,7 +53,9 @@ use chrono::{DateTime, FixedOffset, Utc};
 
 use crate::identity::hub_cache::MAX_CACHE_AGE_SECS;
 
-use super::delegation_verifier::{AllowlistCache, EnrolledRoot, RootKeyResolver};
+use super::delegation_verifier::{
+    AllowlistCache, EnrolledRoot, RootBindAuthority, RootKeyResolver,
+};
 use super::identity::DenyReason;
 use super::limits::ALLOWLIST_CACHE_TTL;
 
@@ -358,18 +360,37 @@ impl AdmitReadiness {
         }
     }
 
-    /// Read the live admit count: the parsed entry count, but only while the
-    /// snapshot is one the hub would actually serve hellos from. The freshness
-    /// verdict is [`SnapshotFreshness`] (the single source of truth for the
-    /// ceiling), so a stale snapshot admits `0` here exactly as the hub refuses
-    /// every hello there — and an absent or unreadable snapshot is `within_max_age
-    /// == false`, so it collapses to `0` too without a second error branch.
+    /// Read the live admit count: the entries the hub would ADMIT, but only
+    /// while the snapshot is one the hub would actually serve hellos from. The
+    /// freshness verdict is [`SnapshotFreshness`] (the single source of truth
+    /// for the ceiling), so a stale snapshot admits `0` here exactly as the hub
+    /// refuses every hello there — and an absent or unreadable snapshot is
+    /// `within_max_age == false`, so it collapses to `0` too without a second
+    /// error branch.
+    ///
+    /// #3643 R2 — an ENTRY is not an ADMISSION. The hello path admits an entry
+    /// only when its root's `bind_authority` may delegate for that principal
+    /// ([`RootBindAuthority::may_delegate_for`], the gate
+    /// [`super::delegation_verifier`] applies to every hello): a legacy-unproven
+    /// binding, an unrecognised authority, and `daemon_key_dir` on any name but
+    /// the reserved producer are refused there. Counting `agents.len()` reported
+    /// "admits N" for a snapshot the hub admits nobody from — the exact blind
+    /// spot this dimension exists to close — so the count applies the SAME
+    /// predicate, and the two cannot drift.
     fn live_admit_count(path: Option<&Path>) -> usize {
         let Some(path) = path else { return 0 };
         if !SnapshotFreshness::observe(Some(path)).within_max_age {
             return 0;
         }
-        AllowlistCache::read_file(path).map_or(0, |file| file.agents.len())
+        AllowlistCache::read_file(path).map_or(0, |file| {
+            file.agents
+                .iter()
+                .filter(|entry| {
+                    RootBindAuthority::from_column(&entry.bind_authority)
+                        .may_delegate_for(&entry.agent_id)
+                })
+                .count()
+        })
     }
 
     /// The two machine-readable fields the posture JSON carries.

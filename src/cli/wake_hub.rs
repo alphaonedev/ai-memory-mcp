@@ -832,17 +832,32 @@ mod tests {
     /// REPLACE_AGENT_ID shape (`identity hub-cache` omits the placeholder,
     /// publishing a valid, fresh, ZERO-entry snapshot).
     fn write_snapshot(path: &std::path::Path, n: usize) {
+        let proven = crate::identity::pubkey_bind::BindAuthority::PossessionProof.as_str();
+        let entries: Vec<(String, &str)> = (0..n)
+            .map(|i| (format!("agent-3643-cli-{i}"), proven))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = entries.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+        write_snapshot_entries(path, &borrowed);
+    }
+
+    /// #3643 (R2) — the same 0600 fresh snapshot, but with each entry's
+    /// `(agent_id, bind_authority)` chosen by the cell, so a pin can name
+    /// entries the hub REFUSES at hello (legacy-unproven, `daemon_key_dir` on a
+    /// name that is not the reserved producer) next to ones it admits.
+    fn write_snapshot_entries(path: &std::path::Path, entries: &[(&str, &str)]) {
         use std::io::Write as _;
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        let agents: Vec<serde_json::Value> = (0..n)
-            .map(|i| {
+        let agents: Vec<serde_json::Value> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (agent_id, authority))| {
                 let key = ed25519_dalek::SigningKey::from_bytes(&[0xC0u8 + i as u8; 32]);
                 serde_json::json!({
-                    "agent_id": format!("agent-3643-cli-{i}"),
+                    "agent_id": agent_id,
                     "pubkey_b64": crate::identity::keypair::encode_public_base64(
                         &key.verifying_key()
                     ),
-                    "bind_authority": "possession_proof",
+                    "bind_authority": authority,
                     "bound_at": "2026-09-01T00:00:00Z",
                 })
             })
@@ -948,5 +963,121 @@ mod tests {
             plain_exit, 0,
             "plain --posture is inspection-only and never gates the exit"
         );
+    }
+
+    /// #3643 R2 — `admits` is an ADMISSION count, not an ENTRY count. The hello
+    /// path admits an entry only if
+    /// `RootBindAuthority::from_column(bind_authority).may_delegate_for(agent_id)`
+    /// (`delegation_verifier.rs`, the `may_delegate_for` gate); a snapshot whose
+    /// entries the hub would refuse must report `admits: 0` / `admits_nobody:
+    /// true` and RED the `--require-admits` exit, on the SAME `--posture --json`
+    /// sink as the empty/populated pin above. Both halves in one cell:
+    /// (absent) N legacy-unproven entries and a `daemon_key_dir` entry on a name
+    /// that is not the reserved producer count ZERO; (present) the reserved
+    /// `wake-hub-producer` entry with `daemon_key_dir` counts ONE — the one
+    /// `daemon_key_dir` name the hub DOES admit, so the fix cannot be "ignore
+    /// `daemon_key_dir`" — and a mixed snapshot counts only its admissible entry.
+    #[tokio::test]
+    async fn require_admits_counts_admissions_not_entries_3643() {
+        use crate::identity::pubkey_bind::BindAuthority;
+        use crate::identity::sentinels::WAKE_HUB_PRODUCER;
+        use crate::wake_hub::delegation_verifier::{
+            DAEMON_KEY_DIR_AUTHORITY, LEGACY_UNPROVEN_AUTHORITY,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        let proven = BindAuthority::PossessionProof.as_str();
+
+        let legacy = dir.path().join("legacy-allow.json");
+        write_snapshot_entries(
+            &legacy,
+            &[
+                ("agent-3643-legacy-0", LEGACY_UNPROVEN_AUTHORITY),
+                ("agent-3643-legacy-1", LEGACY_UNPROVEN_AUTHORITY),
+                ("agent-3643-legacy-2", LEGACY_UNPROVEN_AUTHORITY),
+            ],
+        );
+        let impostor = dir.path().join("impostor-allow.json");
+        write_snapshot_entries(
+            &impostor,
+            &[("agent-3643-not-the-producer", DAEMON_KEY_DIR_AUTHORITY)],
+        );
+        let producer = dir.path().join("producer-allow.json");
+        write_snapshot_entries(&producer, &[(WAKE_HUB_PRODUCER, DAEMON_KEY_DIR_AUTHORITY)]);
+        let mixed = dir.path().join("mixed-allow.json");
+        write_snapshot_entries(
+            &mixed,
+            &[
+                ("agent-3643-legacy-0", LEGACY_UNPROVEN_AUTHORITY),
+                ("agent-3643-proven-0", proven),
+                ("agent-3643-legacy-1", LEGACY_UNPROVEN_AUTHORITY),
+            ],
+        );
+
+        let admit_doc = |path: &std::path::Path| -> serde_json::Value {
+            let mut a = args();
+            a.socket = Some(dir.path().join("never-bound-3643-r2.sock"));
+            a.allowlist = Some(path.to_path_buf());
+            a.posture = true;
+            a.json = true;
+            let cfg = resolve_config(&a, &AppConfig::default()).expect("resolve");
+            let mut so = Vec::new();
+            let mut se = Vec::new();
+            let mut out = CliOutput::from_std(&mut so, &mut se);
+            print_posture(&cfg, &a, &mut out).expect("posture");
+            serde_json::from_slice(&so).expect("valid JSON")
+        };
+        let gate_args = |path: &std::path::Path| -> WakeHubArgs {
+            let mut a = args();
+            a.socket = Some(dir.path().join("never-bound-3643-r2.sock"));
+            a.allowlist = Some(path.to_path_buf());
+            a.posture = true;
+            a.require_admits = true;
+            a
+        };
+
+        // ABSENT — three entries, zero admissions: the hub refuses every one.
+        let doc = admit_doc(&legacy);
+        assert_eq!(
+            doc["admit_readiness"]["admits"], 0,
+            "legacy-unproven entries are not admissions: {doc}"
+        );
+        assert_eq!(doc["admit_readiness"]["admits_nobody"], true);
+        let exit = dispatch(&gate_args(&legacy), &AppConfig::default())
+            .await
+            .expect("dispatch");
+        assert_eq!(exit, EXIT_ADMITS_NOBODY);
+
+        // ABSENT — `daemon_key_dir` on a name that is not the reserved producer.
+        let doc = admit_doc(&impostor);
+        assert_eq!(doc["admit_readiness"]["admits"], 0, "{doc}");
+        assert_eq!(doc["admit_readiness"]["admits_nobody"], true);
+        let exit = dispatch(&gate_args(&impostor), &AppConfig::default())
+            .await
+            .expect("dispatch");
+        assert_eq!(exit, EXIT_ADMITS_NOBODY);
+
+        // PRESENT — the reserved producer under `daemon_key_dir` IS admitted.
+        let doc = admit_doc(&producer);
+        assert_eq!(
+            doc["admit_readiness"]["admits"], 1,
+            "the reserved wake-hub-producer entry is the one daemon_key_dir admission: {doc}"
+        );
+        assert_eq!(doc["admit_readiness"]["admits_nobody"], false);
+        let exit = dispatch(&gate_args(&producer), &AppConfig::default())
+            .await
+            .expect("dispatch");
+        assert_eq!(exit, 0, "the producer entry must green the gate");
+
+        // MIXED — only the admissible entry counts.
+        let doc = admit_doc(&mixed);
+        assert_eq!(doc["admit_readiness"]["admits"], 1, "{doc}");
+        assert_eq!(doc["admit_readiness"]["admits_nobody"], false);
+        let exit = dispatch(&gate_args(&mixed), &AppConfig::default())
+            .await
+            .expect("dispatch");
+        assert_eq!(exit, 0);
     }
 }
