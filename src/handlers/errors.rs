@@ -234,6 +234,16 @@ pub(crate) fn internal_error_response(
 /// copies are four places a future edit can start interpolating something that
 /// is not. One helper removes the SHAPE the #3707 pin scans for, so there is
 /// nothing to exempt and nothing for the pin to learn to ignore.
+/// #3707 — ONE spelling for each caller-facing failure body. The literal gate
+/// (`check-const-name-literals`) counts repeated string literals against a
+/// baseline; four copies of `"action_get failed"` is four places the wording
+/// can drift, and the whole point of routing these through one place was that
+/// there be one place. Name it once.
+pub(crate) const ACTION_GET_FAILED: &str = "action_get failed";
+pub(crate) const ACTION_TRANSITION_FAILED: &str = "action_transition failed";
+pub(crate) const ATTESTATION_FAILED_MSG: &str = "attestation failed";
+pub(crate) const CHECKPOINT_RESOLVE_FAILED: &str = "checkpoint resolve failed";
+
 pub(crate) fn quota_exceeded_response(qe: &crate::quotas::QuotaError) -> axum::response::Response {
     (
         StatusCode::TOO_MANY_REQUESTS,

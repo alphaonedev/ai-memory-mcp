@@ -1243,7 +1243,7 @@ async fn create_memory_postgres(
                         // wrap a `StoreError` and carry driver text out here.
                         // The machine-readable `code` IS the contract and is
                         // unchanged; the detail goes to the operator log.
-                        "error": "attestation failed",
+                        "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                     })),
                 )
                     .into_response();
@@ -1285,7 +1285,7 @@ async fn create_memory_postgres(
                 Json(json!({
                     "code": crate::errors::error_codes::ATTESTATION_FAILED,
                     // #3707 — see above: anyhow chain can carry store text.
-                    "error": "attestation failed",
+                    "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                 })),
             )
                 .into_response();
@@ -1809,7 +1809,7 @@ async fn create_memory_write(
                         // wrap a `StoreError` and carry driver text out here.
                         // The machine-readable `code` IS the contract and is
                         // unchanged; the detail goes to the operator log.
-                        "error": "attestation failed",
+                        "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                     })),
                 )
                     .into_response();
@@ -1845,7 +1845,7 @@ async fn create_memory_write(
                 Json(json!({
                     "code": crate::errors::error_codes::ATTESTATION_FAILED,
                     // #3707 — see above: anyhow chain can carry store text.
-                    "error": "attestation failed",
+                    "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                 })),
             )
                 .into_response();

@@ -574,7 +574,7 @@ async fn local_transition_via_db(
             tracing::error!(error = %e, action_id, "action_get failed");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "action_get failed"})),
+                Json(json!({"error": crate::handlers::errors::ACTION_GET_FAILED})),
             )
                 .into_response());
         }
@@ -591,7 +591,7 @@ async fn local_transition_via_db(
                 tracing::error!(error = %e, action_id, "action_transition failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "action_transition failed"})),
+                    Json(json!({"error": crate::handlers::errors::ACTION_TRANSITION_FAILED})),
                 )
                     .into_response()
             })?;
@@ -634,7 +634,7 @@ async fn local_transition_via_store(
             tracing::error!(error = %e, action_id, "action_get failed");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "action_get failed"})),
+                Json(json!({"error": crate::handlers::errors::ACTION_GET_FAILED})),
             )
                 .into_response());
         }
@@ -648,7 +648,7 @@ async fn local_transition_via_store(
             tracing::error!(error = %e, action_id, "action_transition failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "action_transition failed"})),
+                Json(json!({"error": crate::handlers::errors::ACTION_TRANSITION_FAILED})),
             )
                 .into_response()
         })?;
