@@ -226,8 +226,8 @@ fn contradiction_and_synthesis_lanes_skip_hidden_rows_3693() {
         )
         .expect("seed visible");
         set_state(&conn, "hid", hidden);
-        let contradictions =
-            db::find_contradictions(&conn, "deploy strategy", "team/ops").expect("contradictions");
+        let contradictions = db::find_contradictions(&conn, "deploy strategy", "team/ops", None)
+            .expect("contradictions");
         let ids: Vec<&str> = contradictions.iter().map(|m| m.id.as_str()).collect();
         assert!(
             !ids.contains(&"hid"),

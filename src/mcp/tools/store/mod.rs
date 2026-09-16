@@ -1166,8 +1166,15 @@ fn handle_store_inner(
     // omitted rather than silently echoing the un-filtered pool — the
     // synthesis path's verdicts still applied; only the wire-side
     // contradictions hint is suppressed.
-    let filtered_contradictions =
-        db::find_contradictions(conn, &mem.title, &mem.namespace).unwrap_or_default();
+    // #3712 — as the ENFORCED-read caller: a row this caller cannot read is
+    // never named in `potential_contradictions`.
+    let filtered_contradictions = db::find_contradictions(
+        conn,
+        &mem.title,
+        &mem.namespace,
+        crate::identity::resolve_read_visibility_caller().as_deref(),
+    )
+    .unwrap_or_default();
     let contradiction_ids: Vec<String> = filtered_contradictions
         .iter()
         .filter(|c| c.id != mem.id && c.id != actual_id)

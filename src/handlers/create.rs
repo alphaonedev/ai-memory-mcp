@@ -1875,8 +1875,11 @@ async fn create_memory_write(
     // contradiction hint to "none found" rather than blocking the
     // store. The proactive #519 check (below) is the load-bearing
     // duplicate gate.
+    // #3712 — as the resolved request agent: a row this caller cannot read
+    // is never named in `potential_contradictions`.
     let contradictions =
-        db::find_contradictions(&lock.0, &mem.title, &mem.namespace).unwrap_or_default();
+        db::find_contradictions(&lock.0, &mem.title, &mem.namespace, Some(&agent_id))
+            .unwrap_or_default();
     let contradiction_ids: Vec<String> = contradictions
         .iter()
         .filter(|c| c.id != mem.id)
