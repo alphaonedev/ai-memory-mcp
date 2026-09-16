@@ -70,24 +70,34 @@ impl PostgresStore {
             "TRUE"
         };
 
-        let count_sql = format!("SELECT COUNT(*) FROM memories WHERE {ns_clause}{owner_filter}");
-        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        // #3694 — plan the SET (id + prior owner), not only the count, so the
+        // report names what moved and from whom on this backend exactly as
+        // the sqlite funnel does; ids are kept only up to the report cap.
+        let plan_sql = format!(
+            "SELECT id, metadata ->> 'agent_id' FROM memories \
+             WHERE {ns_clause}{owner_filter} ORDER BY id"
+        );
+        let mut plan_q = sqlx::query_as::<_, (String, Option<String>)>(&plan_sql);
         if let Some(ns) = namespace {
-            count_q = count_q.bind(ns);
+            plan_q = plan_q.bind(ns);
         }
-        let matched: i64 = count_q
-            .fetch_one(&self.pool)
+        let planned = plan_q
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| to_store_err("reown count", e))?;
-        let matched = usize::try_from(matched).unwrap_or(usize::MAX);
+            .map_err(|e| to_store_err("reown plan", e))?;
+        let mut report = crate::storage::ReownReport {
+            matched: 0,
+            rewritten: 0,
+            dry_run,
+            select,
+            ..crate::storage::ReownReport::default()
+        };
+        for (id, from) in planned {
+            crate::storage::reown_plan_push(&mut report, id, from);
+        }
 
         if dry_run {
-            return Ok(crate::storage::ReownReport {
-                matched,
-                rewritten: 0,
-                dry_run: true,
-                select,
-            });
+            return Ok(report);
         }
 
         let mut tx = self
@@ -160,11 +170,7 @@ impl PostgresStore {
              row was appended in the same transaction (#3124)"
         );
 
-        Ok(crate::storage::ReownReport {
-            matched,
-            rewritten,
-            dry_run: false,
-            select,
-        })
+        report.rewritten = rewritten;
+        Ok(report)
     }
 }

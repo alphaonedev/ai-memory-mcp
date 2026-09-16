@@ -1514,7 +1514,9 @@ that carry no owner.
 ai-memory reown --namespace prod --to alice --only-unowned --dry-run   # count first
 ai-memory reown --namespace prod --to alice --only-unowned             # adopt unowned rows only
 ai-memory reown --all-namespaces --to alice --only-unowned --dry-run   # every namespace
-ai-memory reown --namespace prod --to alice                            # re-own OWNED rows
+ai-memory reown --namespace prod --to alice                            # same as --only-unowned (the default, #3694)
+ai-memory reown --namespace prod --to alice --take-owned --dry-run     # plan taking rows from their owners
+ai-memory reown --namespace prod --to alice --take-owned --yes         # take them (confirmed)
 ```
 
 | Flag | Notes |
@@ -1523,11 +1525,13 @@ ai-memory reown --namespace prod --to alice                            # re-own 
 | `--all-namespaces` | Sweep every namespace (conflicts with `--namespace`). |
 | `--to <agent_id>` | The new owner stamped onto `metadata.agent_id`. Validated against the wire agent_id shape; a malformed value is rejected before any write. |
 | `--dry-run` | Count the matched rows and print the plan WITHOUT writing. Run it first. |
-| `--only-unowned` | Re-own ONLY rows with no ownership stamp (missing / null / empty `metadata.agent_id`); a row that has an owner is never touched. The remedy for the doctor census. |
-| `--claim-unowned` | Re-own **every** row in scope, **owned rows included** (claim-all) — rows are taken from their current owners. Conflicts with `--only-unowned`; to adopt only legacy rows use `--only-unowned`. |
-| (default) | Without `--only-unowned` / `--claim-unowned`, only rows that already have an owner are rewritten. |
+| `--only-unowned` | Re-own ONLY rows with no ownership stamp (missing / null / empty `metadata.agent_id`); a row that has an owner is never touched. The remedy for the doctor census, and the **default** since #3694. |
+| `--take-owned` | TAKE every row in scope that already has an owner (#3694). Moves rows off other agents; without `--dry-run` it requires `--yes`, otherwise it refuses and names the row count and the owners it would take, writing nothing. Conflicts with `--only-unowned`. |
+| `--yes` | Confirm a `--take-owned` run. |
+| `--claim-unowned` | **Removed (#3694)** — a hard error naming the replacements. It selected **every** row in scope, owned rows included, under a name that reads as the narrow action. Use `--only-unowned` (the default) or `--take-owned --yes`. |
+| (default) | Without a selection flag, only rows that have **no** owner are rewritten (#3694: the narrowest action is what you get by typing the least). |
 | `--store-url <postgres://…>` | Re-own on a Postgres store. The `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL` channels are honoured with the same precedence as `curator` / `serve`. |
-| `--json` | Emit the machine-readable `{matched, rewritten, dry_run, select}` report instead of the human summary. |
+| `--json` | Emit the machine-readable `{matched, rewritten, dry_run, select, owners, changes, changes_omitted}` report instead of the human summary. `owners` maps each prior owner to the rows taken from it; `changes` lists the first 200 rows moved with the owner each came from and `changes_omitted` counts the rest (#3694). |
 
 Only `metadata.agent_id` is touched (a single-key `json_set` /
 `jsonb_set`); every other metadata key is preserved and the

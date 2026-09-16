@@ -811,9 +811,9 @@ pub fn enforce_owner_lockout_guard(conn: &rusqlite::Connection) -> Result<()> {
          row(s) in this database are NOT owned by it ({owned_by}). With \
          read-path ownership filtering those rows are HIDDEN from `{caller}` \
          — the operator self-lockout trap (#1720). Re-own them first:\n    \
-         ai-memory reown --namespace <ns> --to {caller}\n  \
-         (add --claim-unowned to also take rows with no owner; --dry-run to \
-         preview)."
+         ai-memory reown --namespace <ns> --to {caller} --take-owned --yes\n  \
+         (the bare command adopts only rows with NO owner, #3694; --dry-run \
+         to preview what would move and from whom)."
     );
     if require_owned_rows_enabled() {
         anyhow::bail!(

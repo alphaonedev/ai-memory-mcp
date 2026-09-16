@@ -771,9 +771,9 @@ pub enum Command {
     /// in EXACTLY `--namespace` to `--to`, so an operator can establish
     /// durable ownership over a namespace BEFORE enabling `scope=private`
     /// visibility filtering (avoiding a self-lockout from legacy /
-    /// foreign-owned rows). Default rewrites every owned row;
-    /// `--claim-unowned` also covers absent/empty-`agent_id` rows;
-    /// `--dry-run` counts without writing. Only the single `agent_id`
+    /// foreign-owned rows). The default rewrites ONLY unstamped rows
+    /// (#3694: the narrowest action); `--take-owned --yes` takes rows from
+    /// their current owners; `--dry-run` plans without writing. Only the single `agent_id`
     /// metadata key is rewritten (the `agent_id_idx` generated column
     /// re-projects the new owner); `--to` is validated. Additive admin
     /// tool — no schema change, no visibility-behaviour change, no

@@ -19803,18 +19803,26 @@ pub fn set_embeddings_batch_reembed(
 /// `--claim-unowned` rewrote EVERY row in the namespace, owned rows included,
 /// so running it to claim legacy rows silently took rows from their real
 /// owners. The three selections are now named.
+///
+/// v1.0.0 #3694 — the DEFAULT is the narrowest selection, `OnlyUnowned`. The
+/// historical default (`Owned`: every row that has an owner, i.e. rows taken
+/// from OTHER agents) is reached only by the explicit `--take-owned` flag.
+/// `All` has no CLI flag any more (`--claim-unowned` is a hard error naming
+/// the two replacements); it remains a store-level selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReownSelect {
     /// Rows that already carry a (non-empty) `agent_id` — any current owner.
-    /// The historical default.
-    #[default]
+    /// The historical default; since #3694 only `--take-owned` selects it.
     Owned,
     /// ONLY unstamped rows (missing / JSON null / `""` `agent_id` — the ONE
     /// #3124 definition). Never touches a row that has an owner. The remedy
-    /// `ai-memory doctor` names for the unstamped-owner census.
+    /// `ai-memory doctor` names for the unstamped-owner census. The default
+    /// since #3694: a destructive command's default is its narrowest action.
+    #[default]
     OnlyUnowned,
-    /// Every row in scope, owned or not (`--claim-unowned`, claim-all).
+    /// Every row in scope, owned or not (claim-all). No CLI flag reaches it
+    /// since #3694.
     All,
 }
 
@@ -19830,17 +19838,39 @@ impl ReownSelect {
     }
 }
 
+/// v1.0.0 #3694 — one row a [`reown`] sweep selected: its id and the owner it
+/// is taken FROM (`None` for an unstamped row). The report carries the SET,
+/// not only the count, so an operator can see that the wrong row moved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReownChange {
+    /// The memory id.
+    pub id: String,
+    /// The prior `metadata.agent_id`; `None` when the row was unstamped.
+    pub from: Option<String>,
+}
+
+/// v1.0.0 #3694 — the most `changes` entries a [`ReownReport`] lists; the
+/// remainder is counted in `changes_omitted`, never silently dropped. The
+/// per-owner `owners` map is never capped (distinct owners are few).
+pub const REOWN_REPORT_MAX_CHANGES: usize = 200;
+
 /// v0.8.0 #1709/#1720 WS-B B2 — outcome of a [`reown`] sweep.
 ///
 /// `matched` is the number of rows the namespace + ownership filter
 /// selected; `rewritten` is the number actually written (`0` under a
 /// dry-run, otherwise `== matched` unless a concurrent writer changed a
-/// row's stamp between the `COUNT` and the `UPDATE`, which share one
+/// row's stamp between the plan `SELECT` and the `UPDATE`, which share one
 /// `WHERE`).
 /// `dry_run` echoes the requested mode so the CLI / JSON envelope can
 /// render the right verb without re-deriving it; `select` echoes which
 /// rows were in scope (#3124 R4).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// v1.0.0 #3694 — `owners` (prior owner -> rows taken from it, stamped rows
+/// only) and `changes` (the first [`REOWN_REPORT_MAX_CHANGES`] selected rows
+/// with the owner each is taken from; `changes_omitted` counts the rest) name
+/// the SET on both backends, on a dry run too, so a seizing run can be
+/// refused with the owners it would take.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReownReport {
     /// Rows selected by the namespace + ownership filter.
     pub matched: usize,
@@ -19851,6 +19881,34 @@ pub struct ReownReport {
     /// Which rows the sweep selected (#3124 R4).
     #[serde(default)]
     pub select: ReownSelect,
+    /// Prior owner -> number of selected rows taken from it (#3694). Unstamped
+    /// rows are not listed here (`matched - sum(owners)` is that count).
+    #[serde(default)]
+    pub owners: std::collections::BTreeMap<String, usize>,
+    /// The first [`REOWN_REPORT_MAX_CHANGES`] selected rows (#3694).
+    #[serde(default)]
+    pub changes: Vec<ReownChange>,
+    /// Selected rows beyond the `changes` cap (#3694).
+    #[serde(default)]
+    pub changes_omitted: usize,
+}
+
+/// v1.0.0 #3694 — fold one selected row into the report's set fields, shared
+/// by both backends so the two reports agree row for row.
+pub fn reown_plan_push(report: &mut ReownReport, id: String, from: Option<String>) {
+    report.matched = report.matched.saturating_add(1);
+    if let Some(owner) = from.as_deref().filter(|o| !o.is_empty()) {
+        let n = report.owners.entry(owner.to_string()).or_insert(0);
+        *n = n.saturating_add(1);
+    }
+    if report.changes.len() < REOWN_REPORT_MAX_CHANGES {
+        report.changes.push(ReownChange {
+            id,
+            from: from.filter(|o| !o.is_empty()),
+        });
+    } else {
+        report.changes_omitted = report.changes_omitted.saturating_add(1);
+    }
 }
 
 /// v1.0.0 #3124 (R4) — the audit payload for one non-dry-run reown: the
@@ -19935,26 +19993,41 @@ pub fn reown(
     };
     // COUNT binds the namespace as ?1; the UPDATE binds ?1 = to_id,
     // ?2 = now, ?3 = namespace.
-    let (count_ns, update_ns) = if namespace.is_some() {
+    let (plan_ns, update_ns) = if namespace.is_some() {
         ("namespace = ?1", "namespace = ?3")
     } else {
         ("1 = 1", "1 = 1")
     };
 
-    let count_sql = format!("SELECT COUNT(*) FROM memories WHERE {count_ns}{owner_filter}");
-    let matched: i64 = match namespace {
-        Some(ns) => conn.query_row(&count_sql, params![ns], |row| row.get(0))?,
-        None => conn.query_row(&count_sql, [], |row| row.get(0))?,
+    // #3694 — plan the SET (id + prior owner), not only the count, so the
+    // report names what moved and from whom; ids are kept only up to the
+    // report cap, the rest is counted.
+    let plan_sql = format!(
+        "SELECT id, json_extract(metadata, '$.agent_id') FROM memories \
+         WHERE {plan_ns}{owner_filter} ORDER BY id"
+    );
+    let mut report = ReownReport {
+        matched: 0,
+        rewritten: 0,
+        dry_run,
+        select,
+        ..ReownReport::default()
     };
-    let matched = usize::try_from(matched).unwrap_or(usize::MAX);
+    {
+        let mut stmt = conn.prepare(&plan_sql)?;
+        let mut rows = match namespace {
+            Some(ns) => stmt.query(params![ns])?,
+            None => stmt.query([])?,
+        };
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let from: Option<String> = row.get(1)?;
+            reown_plan_push(&mut report, id, from);
+        }
+    }
 
     if dry_run {
-        return Ok(ReownReport {
-            matched,
-            rewritten: 0,
-            dry_run: true,
-            select,
-        });
+        return Ok(report);
     }
 
     let write_txn = connection::WriteTxn::begin(conn)?;
@@ -20009,12 +20082,8 @@ pub fn reown(
         "reown: an operator re-stamped metadata.agent_id; a memory.reowned signed-chain row \
          was appended in the same transaction (#3124)"
     );
-    Ok(ReownReport {
-        matched,
-        rewritten,
-        dry_run: false,
-        select,
-    })
+    report.rewritten = rewritten;
+    Ok(report)
 }
 
 /// #1598 — `(total_rows, rows_with_embeddings)` for the reembed

@@ -18,15 +18,23 @@
 //!
 //! - `--namespace <ns>` is an EXACT namespace match (not the subtree);
 //!   `--all-namespaces` sweeps every namespace. Exactly one is required.
-//! - Default: rewrite every row that already carries an `agent_id` (any
-//!   current owner).
-//! - `--only-unowned`: rewrite ONLY the unstamped rows (missing / null /
-//!   `""` `agent_id` — the #3124 definition) and never an owned one. This is
-//!   the remedy `ai-memory doctor` names for the unstamped-owner census.
-//! - `--claim-unowned`: rewrite EVERY row in scope, owned rows INCLUDED
-//!   (claim-all). It takes rows from their current owners — use
-//!   `--only-unowned` to adopt only the legacy class.
-//! - `--dry-run`: count the matched rows, write NOTHING. Run it first.
+//! - Default (v1.0.0 #3694): rewrite ONLY the unstamped rows (missing /
+//!   null / `""` `agent_id` — the #3124 definition) and never an owned one.
+//!   `--only-unowned` names the same selection explicitly. This is the
+//!   remedy `ai-memory doctor` names for the unstamped-owner census, and it
+//!   is the narrowest action, so it is what the bare command does.
+//! - `--take-owned`: rewrite every row that already carries an `agent_id`,
+//!   i.e. TAKE rows from their current owners. Without `--dry-run` it
+//!   requires `--yes`; without `--yes` it plans, REFUSES, and names the row
+//!   count and the owners it would take, writing nothing.
+//! - `--claim-unowned` (pre-#3694: every row, owned included, under the
+//!   safest-sounding name) is a HARD ERROR naming the two replacements. It
+//!   is not renamed, so an old script fails loudly instead of quietly doing
+//!   what it always did.
+//! - `--dry-run`: plan the matched rows, write NOTHING. Run it first.
+//! - The report names the SET, not only the count: the prior owners with a
+//!   per-owner count and the first rows moved (`changes`, capped, with the
+//!   remainder counted), on both backends.
 //!
 //! Only `metadata.agent_id` is touched (`json_set` of the single key);
 //! every other metadata key is preserved and the `agent_id_idx`
@@ -80,22 +88,36 @@ pub struct ReownArgs {
     #[arg(long, value_name = "AGENT_ID")]
     pub to: String,
 
-    /// Count the matched rows and print the plan WITHOUT writing
-    /// anything. Run this first.
+    /// Plan the matched rows (ids and prior owners) and print the plan
+    /// WITHOUT writing anything. Run this first.
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Re-own EVERY row in scope, owned rows INCLUDED (claim-all): rows are
-    /// taken from their current owners. To adopt only the legacy rows that
-    /// carry no owner, use `--only-unowned` instead.
-    #[arg(long, conflicts_with = "only_unowned")]
+    /// REMOVED (#3694): this flag selected EVERY row in scope, owned rows
+    /// included, under a name that reads as the narrow action. It is a hard
+    /// error that names the replacements: `--only-unowned` (the default) to
+    /// adopt rows with no owner, `--take-owned --yes` to take rows from their
+    /// current owners.
+    #[arg(long, hide = true)]
     pub claim_unowned: bool,
 
     /// Re-own ONLY rows with no ownership stamp (missing / null / empty
     /// `metadata.agent_id`); a row that has an owner is never touched
-    /// (#3124). The remedy `ai-memory doctor` names for unstamped rows.
-    #[arg(long)]
+    /// (#3124). The DEFAULT since #3694; the flag names it explicitly.
+    #[arg(long, conflicts_with = "take_owned")]
     pub only_unowned: bool,
+
+    /// TAKE every row in scope that already has an owner (#3694). This moves
+    /// rows off other agents; without `--dry-run` it requires `--yes`, and
+    /// without `--yes` it refuses, naming the row count and the owners it
+    /// would take.
+    #[arg(long)]
+    pub take_owned: bool,
+
+    /// Confirm a `--take-owned` run that would take rows from their current
+    /// owners (#3694). Has no effect on the default (unowned-only) selection.
+    #[arg(long)]
+    pub yes: bool,
 
     /// Postgres store to re-own on (`postgres://…`). The
     /// `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL` channels are
@@ -104,23 +126,52 @@ pub struct ReownArgs {
     #[arg(long, value_name = "URL")]
     pub store_url: Option<String>,
 
-    /// Emit the machine-readable JSON report
-    /// (`{matched, rewritten, dry_run, select}`) instead of the human summary.
+    /// Emit the machine-readable JSON report (`{matched, rewritten, dry_run,
+    /// select, owners, changes, changes_omitted}`) instead of the human
+    /// summary.
     #[arg(long)]
     pub json: bool,
 }
 
+/// The `--claim-unowned` hard error (#3694). One literal, tested verbatim.
+const CLAIM_UNOWNED_REMOVED: &str = "reown: --claim-unowned was removed (#3694): it selected EVERY row in scope, \
+     owned rows included, under a name that reads as the narrow action. Use \
+     --only-unowned (the default) to adopt rows that have no owner, or \
+     --take-owned --yes to take rows from their current owners.";
+
 impl ReownArgs {
-    /// The row selection the flags name.
+    /// The row selection the flags name. The DEFAULT is the narrowest
+    /// selection (#3694): unstamped rows only. `--claim-unowned` maps to
+    /// nothing here; [`Self::validate`] refuses it before any store is opened.
     #[must_use]
     pub fn select(&self) -> crate::storage::ReownSelect {
-        if self.only_unowned {
-            crate::storage::ReownSelect::OnlyUnowned
-        } else if self.claim_unowned {
-            crate::storage::ReownSelect::All
-        } else {
+        if self.take_owned {
             crate::storage::ReownSelect::Owned
+        } else {
+            crate::storage::ReownSelect::OnlyUnowned
         }
+    }
+
+    /// Refuse the removed `--claim-unowned` flag with a message that names
+    /// the replacements (#3694). Called by every entry point BEFORE a store
+    /// is opened, so an old invocation fails loudly and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// `--claim-unowned` was passed.
+    pub fn validate(&self) -> Result<()> {
+        if self.claim_unowned {
+            anyhow::bail!("{CLAIM_UNOWNED_REMOVED}");
+        }
+        Ok(())
+    }
+
+    /// `true` when this invocation would WRITE rows taken from their current
+    /// owners without the operator having confirmed it (#3694): the seizing
+    /// selection, not a dry run, no `--yes`.
+    #[must_use]
+    pub fn needs_confirmation(&self) -> bool {
+        self.take_owned && !self.dry_run && !self.yes
     }
 
     /// `None` = `--all-namespaces`.
@@ -169,26 +220,86 @@ fn render(
     } else if report.dry_run {
         writeln!(
             out.stdout,
-            "would reown {} row(s) in {} to {} (select: {})",
+            "would reown {} row(s) in {} to {} (select: {}){}",
             report.matched,
             args.scope_label(),
             args.to,
             report.select.as_str(),
+            owners_suffix(report),
         )
         .context(CTX_WRITE_REOWN_REPORT)?;
+        render_changes(report, out)?;
     } else {
         writeln!(
             out.stdout,
-            "reowned {} of {} row(s) in {} to {} (select: {})",
+            "reowned {} of {} row(s) in {} to {} (select: {}){}",
             report.rewritten,
             report.matched,
             args.scope_label(),
             args.to,
             report.select.as_str(),
+            owners_suffix(report),
+        )
+        .context(CTX_WRITE_REOWN_REPORT)?;
+        render_changes(report, out)?;
+    }
+    Ok(())
+}
+
+/// `; from alice (2), bob (1)` — the prior owners a report's rows are taken
+/// from, or empty when every selected row was unstamped (#3694).
+fn owners_suffix(report: &crate::storage::ReownReport) -> String {
+    if report.owners.is_empty() {
+        return String::new();
+    }
+    let list = report
+        .owners
+        .iter()
+        .map(|(owner, n)| format!("{owner} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; from {list}")
+}
+
+/// One line per selected row (`<id> <- <prior owner | unowned>`), then the
+/// omitted count when the report cap was reached (#3694). What changed, and
+/// from whom, is part of the human report, not only the JSON one.
+fn render_changes(report: &crate::storage::ReownReport, out: &mut CliOutput<'_>) -> Result<()> {
+    for change in &report.changes {
+        writeln!(
+            out.stdout,
+            "  {} <- {}",
+            change.id,
+            change.from.as_deref().unwrap_or("(unowned)")
+        )
+        .context(CTX_WRITE_REOWN_REPORT)?;
+    }
+    if report.changes_omitted > 0 {
+        writeln!(
+            out.stdout,
+            "  ... and {} more row(s) not listed",
+            report.changes_omitted
         )
         .context(CTX_WRITE_REOWN_REPORT)?;
     }
     Ok(())
+}
+
+/// The `--take-owned` refusal (#3694): the plan names the row count and the
+/// owners the run would take; nothing was written. `Ok(())` when the plan is
+/// empty, so a no-op sweep needs no confirmation.
+fn refuse_unconfirmed_take(args: &ReownArgs, plan: &crate::storage::ReownReport) -> Result<()> {
+    if plan.matched == 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "reown: refusing to take {} row(s) in {} from {} owner(s) without --yes{}; \
+         re-run with --yes to confirm, or --dry-run to inspect the plan (#3694)",
+        plan.matched,
+        args.scope_label(),
+        plan.owners.len(),
+        owners_suffix(plan),
+    )
 }
 
 /// Run the reown migration against the LOCAL sqlite database. Returns
@@ -205,6 +316,7 @@ pub fn run(
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    args.validate()?;
     let actor = resolve_operator(cli_agent_id)?;
     // v1.0.0 #2572 — the SQLite leg still refuses a Postgres store (a build
     // without `sal` cannot route one, and a phantom write to a throwaway
@@ -214,6 +326,20 @@ pub fn run(
     let db_path = db_path.as_path();
     let conn =
         crate::db::open(db_path).with_context(|| crate::errors::msg::opening(db_path.display()))?;
+    if args.needs_confirmation() {
+        // #3694 — plan first (a dry run writes nothing), refuse naming the
+        // owners the run would take.
+        let plan = crate::storage::reown(
+            &conn,
+            args.namespace(),
+            &args.to,
+            args.select(),
+            true,
+            &actor,
+        )
+        .context("reown plan")?;
+        refuse_unconfirmed_take(args, &plan)?;
+    }
     let report = crate::storage::reown(
         &conn,
         args.namespace(),
@@ -244,6 +370,7 @@ pub async fn dispatch(
     app_config: &crate::config::AppConfig,
     cli_agent_id: Option<&str>,
 ) -> Result<i32> {
+    args.validate()?;
     let resolved = crate::store_url::resolve_store_url(args.store_url.as_deref())?;
     if let Some(url) = resolved
         .as_deref()
@@ -302,8 +429,18 @@ pub async fn run_store(
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    args.validate()?;
     let actor = resolve_operator(cli_agent_id)?;
     let ctx = crate::store::CallerContext::for_admin(actor);
+    if args.needs_confirmation() {
+        // #3694 — plan first (a dry run writes nothing), refuse naming the
+        // owners the run would take. Same rule as the SQLite leg.
+        let plan = store
+            .reown(&ctx, args.namespace(), &args.to, args.select(), true)
+            .await
+            .map_err(|e| anyhow::anyhow!("reown plan: {e}"))?;
+        refuse_unconfirmed_take(args, &plan)?;
+    }
     let report = store
         .reown(
             &ctx,
@@ -333,6 +470,16 @@ mod tests {
     }
 
     fn seed(path: &Path, title: &str, ns: &str, agent_id: &str) {
+        seed_with(path, title, ns, serde_json::json!({ "agent_id": agent_id }));
+    }
+
+    /// #3694 — an UNSTAMPED row (no `agent_id` key at all), the class the
+    /// bare default must adopt.
+    fn seed_unstamped(path: &Path, title: &str, ns: &str) {
+        seed_with(path, title, ns, serde_json::json!({}));
+    }
+
+    fn seed_with(path: &Path, title: &str, ns: &str, metadata: serde_json::Value) {
         let conn = crate::db::open(path).expect("open");
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
@@ -353,7 +500,7 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({ "agent_id": agent_id }),
+            metadata,
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -370,6 +517,45 @@ mod tests {
         crate::storage::insert(&conn, &mem).expect("insert");
     }
 
+    /// The bare invocation: a scope and a target, NO selection flag.
+    fn bare_args(ns: &str, to: &str) -> ReownArgs {
+        ReownArgs {
+            namespace: Some(ns.to_string()),
+            all_namespaces: false,
+            to: to.to_string(),
+            dry_run: false,
+            claim_unowned: false,
+            only_unowned: false,
+            take_owned: false,
+            yes: false,
+            store_url: None,
+            json: false,
+        }
+    }
+
+    fn owner_of(path: &Path, title: &str) -> Option<String> {
+        let conn = crate::db::open(path).expect("open");
+        conn.query_row(
+            "SELECT json_extract(metadata, '$.agent_id') FROM memories WHERE title = ?1",
+            [title],
+            |row| row.get(0),
+        )
+        .expect("owner")
+    }
+
+    fn run_capture(path: &Path, args: &ReownArgs) -> (Result<i32>, String) {
+        let mut buf_out = Vec::<u8>::new();
+        let mut buf_err = Vec::<u8>::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+            run(path, args, Some("ai:operator"), &mut out)
+        };
+        (code, String::from_utf8(buf_out).expect("utf-8"))
+    }
+
+    /// The explicit seizing path still rewrites and reports counts; since
+    /// #3694 it needs `--take-owned --yes` (this test used the bare default
+    /// when the default WAS the seizing selection).
     #[test]
     fn cli_reown_rewrites_and_reports_counts() {
         let (_dir, path) = temp_db();
@@ -377,25 +563,163 @@ mod tests {
         seed(&path, "b", "claim-ns", "alice");
         seed(&path, "c", "other-ns", "alice");
 
-        let args = ReownArgs {
-            namespace: Some("claim-ns".to_string()),
-            all_namespaces: false,
-            to: "bob".to_string(),
-            dry_run: false,
-            claim_unowned: false,
-            only_unowned: false,
-            store_url: None,
-            json: true,
-        };
-        let mut buf_out = Vec::<u8>::new();
-        let mut buf_err = Vec::<u8>::new();
-        let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, Some("ai:operator"), &mut out).expect("run");
-        assert_eq!(code, 0);
-        let s = String::from_utf8(buf_out).expect("utf-8");
+        let mut args = bare_args("claim-ns", "bob");
+        args.take_owned = true;
+        args.yes = true;
+        args.json = true;
+        let (code, s) = run_capture(&path, &args);
+        assert_eq!(code.expect("run"), 0);
         assert!(s.contains("\"matched\": 2"), "got: {s}");
         assert!(s.contains("\"rewritten\": 2"), "got: {s}");
         assert!(s.contains("\"dry_run\": false"), "got: {s}");
+        // #3694 — the SET, not only the count: both rows are named with the
+        // owner they were taken from.
+        let report: crate::storage::ReownReport = serde_json::from_str(&s).expect("report json");
+        assert_eq!(report.owners.get("alice"), Some(&2));
+        assert_eq!(report.changes.len(), 2);
+        assert!(
+            report
+                .changes
+                .iter()
+                .all(|c| c.from.as_deref() == Some("alice")),
+            "{report:?}"
+        );
+        assert_eq!(report.changes_omitted, 0);
+    }
+
+    /// #3694 P1 — the DEFAULT is the narrowest action. One owned row (alice)
+    /// and one unstamped row; the bare command adopts the unstamped row
+    /// (presence) and leaves the owned row exactly where it was (absence).
+    /// Fails on the pre-#3694 tree, where the bare command SEIZED the owned
+    /// row and skipped the unstamped one.
+    #[test]
+    fn cli_reown_bare_default_adopts_unowned_and_never_touches_owned_3694() {
+        let (_dir, path) = temp_db();
+        seed(&path, "owned1", "ns-3694", "alice");
+        seed_unstamped(&path, "u1", "ns-3694");
+
+        let mut args = bare_args("ns-3694", "bob");
+        args.json = true;
+        let (code, s) = run_capture(&path, &args);
+        assert_eq!(code.expect("bare default runs"), 0);
+        let report: crate::storage::ReownReport = serde_json::from_str(&s).expect("report json");
+        assert_eq!(report.select, crate::storage::ReownSelect::OnlyUnowned);
+        assert_eq!(report.matched, 1, "{report:?}");
+        assert_eq!(report.rewritten, 1, "{report:?}");
+        assert_eq!(
+            owner_of(&path, "owned1").as_deref(),
+            Some("alice"),
+            "#3694: the bare default must NEVER touch a row that has an owner"
+        );
+        assert_eq!(
+            owner_of(&path, "u1").as_deref(),
+            Some("bob"),
+            "#3694: the bare default must adopt the unstamped row"
+        );
+        assert!(
+            report.owners.is_empty(),
+            "no row was taken from an owner: {report:?}"
+        );
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(report.changes[0].from, None, "{report:?}");
+    }
+
+    /// #3694 P2 — the seizing path is explicit and confirmed. Without `--yes`
+    /// it refuses, naming the count and the owner it would take, and writes
+    /// nothing (the refusal control); with `--yes` it moves the row and the
+    /// report names it with the owner it came from (the allowed path).
+    #[test]
+    fn cli_reown_take_owned_refuses_without_yes_and_names_owners_3694() {
+        let (_dir, path) = temp_db();
+        seed(&path, "owned1", "ns-3694", "alice");
+        seed_unstamped(&path, "u1", "ns-3694");
+
+        let mut args = bare_args("ns-3694", "bob");
+        args.take_owned = true;
+        let (code, _s) = run_capture(&path, &args);
+        let err = code.expect_err("--take-owned without --yes must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to take 1 row(s)"), "{text}");
+        assert!(text.contains("from 1 owner(s)"), "{text}");
+        assert!(
+            text.contains("alice (1)"),
+            "the refusal must NAME the owner: {text}"
+        );
+        assert!(text.contains("--yes"), "{text}");
+        assert_eq!(
+            owner_of(&path, "owned1").as_deref(),
+            Some("alice"),
+            "refusal wrote nothing"
+        );
+        assert_eq!(owner_of(&path, "u1"), None, "refusal wrote nothing");
+
+        args.yes = true;
+        args.json = true;
+        let (code, s) = run_capture(&path, &args);
+        assert_eq!(code.expect("confirmed take runs"), 0);
+        let report: crate::storage::ReownReport = serde_json::from_str(&s).expect("report json");
+        assert_eq!(report.select, crate::storage::ReownSelect::Owned);
+        assert_eq!(report.rewritten, 1, "{report:?}");
+        assert_eq!(report.owners.get("alice"), Some(&1), "{report:?}");
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(report.changes[0].from.as_deref(), Some("alice"));
+        assert_eq!(owner_of(&path, "owned1").as_deref(), Some("bob"));
+        assert_eq!(
+            owner_of(&path, "u1"),
+            None,
+            "--take-owned never adopts the unstamped row"
+        );
+    }
+
+    /// #3694 P3 — `--claim-unowned` is a hard error naming the replacements,
+    /// and it writes nothing (both rows unchanged).
+    #[test]
+    fn cli_reown_claim_unowned_is_a_hard_error_naming_replacements_3694() {
+        let (_dir, path) = temp_db();
+        seed(&path, "owned1", "ns-3694", "alice");
+        seed_unstamped(&path, "u1", "ns-3694");
+        let mut args = bare_args("ns-3694", "bob");
+        args.claim_unowned = true;
+        let (code, _s) = run_capture(&path, &args);
+        let err = code.expect_err("--claim-unowned must be a hard error");
+        let text = format!("{err:#}");
+        assert!(text.contains("--claim-unowned was removed"), "{text}");
+        assert!(
+            text.contains("--only-unowned"),
+            "must name the narrow replacement: {text}"
+        );
+        assert!(
+            text.contains("--take-owned --yes"),
+            "must name the seizing replacement: {text}"
+        );
+        assert_eq!(owner_of(&path, "owned1").as_deref(), Some("alice"));
+        assert_eq!(owner_of(&path, "u1"), None);
+    }
+
+    /// #3694 — the human report prints what changed and from whom, with the
+    /// per-owner count, on the dry run and on the live run.
+    #[test]
+    fn cli_reown_human_report_names_the_set_3694() {
+        let (_dir, path) = temp_db();
+        seed(&path, "owned1", "ns-3694", "alice");
+        seed(&path, "owned2", "ns-3694", "carol");
+        let mut args = bare_args("ns-3694", "bob");
+        args.take_owned = true;
+        args.dry_run = true;
+        let (code, s) = run_capture(&path, &args);
+        assert_eq!(code.expect("dry run"), 0);
+        assert!(
+            s.contains(
+                "would reown 2 row(s) in ns-3694 to bob (select: owned); from alice (1), carol (1)"
+            ),
+            "got: {s}"
+        );
+        assert!(s.contains("<- alice"), "got: {s}");
+        assert!(s.contains("<- carol"), "got: {s}");
+        assert!(
+            !s.contains("not listed"),
+            "under the cap nothing is omitted: {s}"
+        );
     }
 
     #[test]
@@ -417,13 +741,55 @@ mod tests {
             args: ReownArgs,
         }
         let parse = |argv: &[&str]| Wrap::try_parse_from(argv).map(|w| w.args);
+        // #3694 — the bare command is the NARROW action.
         let a = parse(&["x", "--namespace", "n", "--to", "b"]).expect("default");
-        assert_eq!(a.select(), crate::storage::ReownSelect::Owned);
+        assert_eq!(a.select(), crate::storage::ReownSelect::OnlyUnowned);
+        assert!(a.validate().is_ok());
+        assert!(!a.needs_confirmation());
         let a = parse(&["x", "--all-namespaces", "--to", "b", "--only-unowned"]).expect("only");
         assert_eq!(a.select(), crate::storage::ReownSelect::OnlyUnowned);
         assert!(a.namespace().is_none());
-        let a = parse(&["x", "--namespace", "n", "--to", "b", "--claim-unowned"]).expect("all");
-        assert_eq!(a.select(), crate::storage::ReownSelect::All);
+        // #3694 — the seizing selection is explicit, and it needs --yes.
+        let a = parse(&["x", "--namespace", "n", "--to", "b", "--take-owned"]).expect("take");
+        assert_eq!(a.select(), crate::storage::ReownSelect::Owned);
+        assert!(a.needs_confirmation());
+        let a = parse(&["x", "--all-namespaces", "--to", "b", "--take-owned"]).expect("take all");
+        assert!(
+            a.needs_confirmation(),
+            "--all-namespaces --take-owned needs --yes (P4)"
+        );
+        let a = parse(&[
+            "x",
+            "--all-namespaces",
+            "--to",
+            "b",
+            "--take-owned",
+            "--yes",
+        ])
+        .expect("confirmed");
+        assert!(!a.needs_confirmation());
+        let a = parse(&[
+            "x",
+            "--namespace",
+            "n",
+            "--to",
+            "b",
+            "--take-owned",
+            "--dry-run",
+        ])
+        .expect("dry");
+        assert!(
+            !a.needs_confirmation(),
+            "a dry run writes nothing, so it needs no confirmation"
+        );
+        // #3694 — the removed flag still parses (so the error is OURS, not
+        // clap's generic one) and is refused by validate(), never mapped.
+        let a = parse(&["x", "--namespace", "n", "--to", "b", "--claim-unowned"]).expect("parses");
+        let err = a.validate().expect_err("hard error");
+        assert!(
+            format!("{err}").contains("--claim-unowned was removed"),
+            "{err}"
+        );
         assert!(parse(&["x", "--to", "b"]).is_err(), "a scope is required");
         assert!(
             parse(&["x", "--namespace", "n", "--all-namespaces", "--to", "b"]).is_err(),
@@ -436,11 +802,11 @@ mod tests {
                 "n",
                 "--to",
                 "b",
-                "--claim-unowned",
+                "--take-owned",
                 "--only-unowned"
             ])
             .is_err(),
-            "--claim-unowned conflicts with --only-unowned"
+            "--take-owned conflicts with --only-unowned"
         );
     }
 
@@ -448,23 +814,21 @@ mod tests {
     fn cli_reown_dry_run_human_text() {
         let (_dir, path) = temp_db();
         seed(&path, "a", "claim-ns", "alice");
-        let args = ReownArgs {
-            namespace: Some("claim-ns".to_string()),
-            all_namespaces: false,
-            to: "bob".to_string(),
-            dry_run: true,
-            claim_unowned: false,
-            only_unowned: false,
-            store_url: None,
-            json: false,
-        };
-        let mut buf_out = Vec::<u8>::new();
-        let mut buf_err = Vec::<u8>::new();
-        let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, Some("ai:operator"), &mut out).expect("run");
-        assert_eq!(code, 0);
-        let s = String::from_utf8(buf_out).expect("utf-8");
+        // #3694 — the owned row is in scope only for the explicit seizing
+        // selection; the bare default plans 0 rows here.
+        let mut args = bare_args("claim-ns", "bob");
+        args.dry_run = true;
+        args.take_owned = true;
+        let (code, s) = run_capture(&path, &args);
+        assert_eq!(code.expect("run"), 0);
         assert!(s.contains("would reown 1 row(s)"), "got: {s}");
         assert!(s.contains("select: owned"), "got: {s}");
+        let (code, s) = run_capture(&path, &bare_args("claim-ns", "bob"));
+        assert_eq!(code.expect("run"), 0);
+        assert!(
+            s.contains("reowned 0 of 0 row(s)"),
+            "bare default leaves the owned row: {s}"
+        );
+        assert!(s.contains("select: only_unowned"), "got: {s}");
     }
 }

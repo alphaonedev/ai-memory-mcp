@@ -327,6 +327,147 @@ fn pg_census_counts_the_three_classes() {
 }
 
 /// #3124 R4 (Conductor condition 4) — the postgres reown: `OnlyUnowned`
+/// #3694 — the postgres twin of the CLI default pin, driven through the CLI
+/// entry point the dispatcher uses for a `postgres://` store
+/// (`cli::reown::run_store`), with NO selection flag. One owned row (alice)
+/// and one unstamped row: the bare default adopts the unstamped row and
+/// leaves the owned row untouched, and the report names the set. Then the
+/// explicit seizing path: refused without `--yes` (nothing written), moved
+/// with it. Fails on the pre-#3694 tree, where the bare command seized the
+/// owned row and skipped the unstamped one on this backend too.
+#[test]
+fn pg_reown_bare_default_adopts_unowned_and_never_touches_owned_3694() {
+    let _p = posture(MODE_WARN);
+    runtime().block_on(async {
+        let Some(store) = live_pg().await else { return };
+        let ns = ns();
+        let unowned = seed(&store, &ns, "r-unowned-3694", &json!({})).await;
+        let owned = seed(
+            &store,
+            &ns,
+            "r-owned-3694",
+            &json!({"agent_id": "ai:alice"}),
+        )
+        .await;
+        let agent_of = |id: String| {
+            let pool = store.pool().clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT metadata->>'agent_id' FROM memories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("owner")
+            }
+        };
+        let bare = |json: bool| ai_memory::cli::reown::ReownArgs {
+            namespace: Some(ns.clone()),
+            all_namespaces: false,
+            to: "ai:bob".to_string(),
+            dry_run: false,
+            claim_unowned: false,
+            only_unowned: false,
+            take_owned: false,
+            yes: false,
+            store_url: None,
+            json,
+        };
+        let run = |args: ai_memory::cli::reown::ReownArgs| {
+            let store = &store;
+            async move {
+                let mut out_buf = Vec::<u8>::new();
+                let mut err_buf = Vec::<u8>::new();
+                let code = {
+                    let mut out = ai_memory::cli::CliOutput::from_std(&mut out_buf, &mut err_buf);
+                    ai_memory::cli::reown::run_store(
+                        store,
+                        &args,
+                        Some("ai:reown-operator-3694"),
+                        &mut out,
+                    )
+                    .await
+                };
+                (code, String::from_utf8(out_buf).expect("utf-8"))
+            }
+        };
+
+        // P1 — the bare default.
+        let (code, out) = run(bare(true)).await;
+        assert_eq!(code.expect("bare default runs"), 0);
+        let report: ai_memory::storage::ReownReport =
+            serde_json::from_str(&out).expect("report json");
+        assert_eq!(report.select, ai_memory::storage::ReownSelect::OnlyUnowned);
+        assert_eq!(report.matched, 1, "{report:?}");
+        assert_eq!(report.rewritten, 1, "{report:?}");
+        assert_eq!(
+            agent_of(owned.clone()).await.as_deref(),
+            Some("ai:alice"),
+            "#3694: the bare default must NEVER touch a row that has an owner"
+        );
+        assert_eq!(
+            agent_of(unowned.clone()).await.as_deref(),
+            Some("ai:bob"),
+            "#3694: the bare default must adopt the unstamped row"
+        );
+        assert!(report.owners.is_empty(), "{report:?}");
+        assert_eq!(report.changes.len(), 1, "{report:?}");
+        assert_eq!(report.changes[0].id, unowned);
+        assert_eq!(report.changes[0].from, None);
+
+        // P2 — the seizing path: refused without --yes, nothing written. After
+        // P1 the namespace holds TWO owned rows (alice's, and the adopted row
+        // now bob's), so the plan names both owners.
+        let mut take = bare(true);
+        take.take_owned = true;
+        let (code, _out) = run(take).await;
+        let err = code.expect_err("--take-owned without --yes must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to take 2 row(s)"), "{text}");
+        assert!(text.contains("from 2 owner(s)"), "{text}");
+        assert!(
+            text.contains("ai:alice (1)") && text.contains("ai:bob (1)"),
+            "the refusal must NAME the owners: {text}"
+        );
+        assert_eq!(
+            agent_of(owned.clone()).await.as_deref(),
+            Some("ai:alice"),
+            "refusal wrote nothing"
+        );
+
+        // ... and the allowed path, confirmed, names what it took and from whom.
+        let mut take = bare(true);
+        take.take_owned = true;
+        take.yes = true;
+        let (code, out) = run(take).await;
+        assert_eq!(code.expect("confirmed take runs"), 0);
+        let report: ai_memory::storage::ReownReport =
+            serde_json::from_str(&out).expect("report json");
+        assert_eq!(report.select, ai_memory::storage::ReownSelect::Owned);
+        assert_eq!(report.rewritten, 2, "{report:?}");
+        assert_eq!(report.owners.get("ai:alice"), Some(&1), "{report:?}");
+        assert_eq!(report.owners.get("ai:bob"), Some(&1), "{report:?}");
+        assert_eq!(report.changes.len(), 2, "{report:?}");
+        let taken_from_alice = report
+            .changes
+            .iter()
+            .find(|c| c.id == owned)
+            .expect("the owned row is in the change set");
+        assert_eq!(taken_from_alice.from.as_deref(), Some("ai:alice"));
+        assert_eq!(agent_of(owned.clone()).await.as_deref(), Some("ai:bob"));
+
+        // P3 — the removed flag is a hard error on this backend too.
+        let mut claim = bare(false);
+        claim.claim_unowned = true;
+        let (code, _out) = run(claim).await;
+        let err = code.expect_err("--claim-unowned must be a hard error");
+        assert!(
+            format!("{err:#}").contains("--claim-unowned was removed"),
+            "{err:#}"
+        );
+    });
+}
+
 /// rewrites ONLY unstamped rows (never an owned one), bumps `version`, and
 /// appends exactly one `memory.reowned` chain row naming the operator; a dry
 /// run writes nothing.
