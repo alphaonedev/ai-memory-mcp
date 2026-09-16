@@ -86,6 +86,43 @@ fn log_catchup_pull_ok(peer_id: &str, rows: usize) {
     );
 }
 
+/// #3654 — ONE classifier for the catch-up answer, shared by all three
+/// pullers (the SAL `serve` loop, the sqlite-only `serve` loop and the
+/// `catchup_once_for_tests` probe). A transport failure, a non-2xx, an
+/// unparseable body and a 2xx envelope with no `memories` array each record
+/// exactly one pull failure on the peer's freshness row; only a well-formed
+/// envelope returns. The probe used to carry its own copy that read a
+/// missing array as an EMPTY window and stamped a success, so the pin that
+/// drives it could not see the arm the two production loops already had —
+/// three copies of one classification is how that happens.
+async fn fetch_catchup_envelope(
+    peer_id: &str,
+    req: reqwest::RequestBuilder,
+) -> Option<(serde_json::Value, Vec<serde_json::Value>)> {
+    let resp = match req.send().await {
+        Ok(r) => accept_catchup_response(peer_id, r)?,
+        Err(e) => {
+            log_catchup_unreachable(peer_id, &e);
+            return None;
+        }
+    };
+    let body: serde_json::Value = match read_capped_sync_json(resp).await {
+        Ok(v) => v,
+        Err(e) => {
+            log_catchup_unparseable_body(peer_id, e);
+            return None;
+        }
+    };
+    let memories = match body.get("memories").and_then(|v| v.as_array()) {
+        Some(arr) => arr.clone(),
+        None => {
+            log_catchup_missing_memories(peer_id);
+            return None;
+        }
+    };
+    Some((body, memories))
+}
+
 /// #3654 — take a catch-up response: record the peer's clock offset from its
 /// `Date` header (any response, success or not, carries the peer's clock),
 /// then keep it only when it is a 2xx. The single spelling for the three
@@ -503,31 +540,10 @@ pub(super) async fn catchup_once_with_store(
         // #2290 — sign the catch-up GET so enrolled peers accept it under
         // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
         req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
-        let resp = match req.send().await {
-            Ok(r) => match accept_catchup_response(&peer.id, r) {
-                Some(r) => r,
-                None => continue,
-            },
-            Err(e) => {
-                log_catchup_unreachable(&peer.id, &e);
-                continue;
-            }
-        };
-
-        let body: serde_json::Value = match read_capped_sync_json(resp).await {
-            Ok(v) => v,
-            Err(e) => {
-                log_catchup_unparseable_body(&peer.id, e);
-                continue;
-            }
-        };
-
-        let memories = match body.get("memories").and_then(|v| v.as_array()) {
-            Some(arr) => arr.clone(),
-            None => {
-                log_catchup_missing_memories(&peer.id);
-                continue;
-            }
+        // #3654 — one classifier for all three pullers; every malformed answer
+        // records exactly one pull failure before this `continue`.
+        let Some((body, memories)) = fetch_catchup_envelope(&peer.id, req).await else {
+            continue;
         };
         // #2441 (CB-11) — the peer applies its per-peer namespace allowlist +
         // `scope=private` visibility filter IN MEMORY, AFTER the SQL `LIMIT`, so a
@@ -870,31 +886,10 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         // #2290 — sign the catch-up GET so enrolled peers accept it under
         // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
         req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
-        let resp = match req.send().await {
-            Ok(r) => match accept_catchup_response(&peer.id, r) {
-                Some(r) => r,
-                None => continue,
-            },
-            Err(e) => {
-                log_catchup_unreachable(&peer.id, &e);
-                continue;
-            }
-        };
-
-        let body: serde_json::Value = match read_capped_sync_json(resp).await {
-            Ok(v) => v,
-            Err(e) => {
-                log_catchup_unparseable_body(&peer.id, e);
-                continue;
-            }
-        };
-
-        let memories = match body.get("memories").and_then(|v| v.as_array()) {
-            Some(arr) => arr.clone(),
-            None => {
-                log_catchup_missing_memories(&peer.id);
-                continue;
-            }
+        // #3654 — one classifier for all three pullers; every malformed answer
+        // records exactly one pull failure before this `continue`.
+        let Some((body, memories)) = fetch_catchup_envelope(&peer.id, req).await else {
+            continue;
         };
 
         // #2441 (CB-11) — consume the peer's examined-watermark so an
@@ -1079,29 +1074,11 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
         // #2290 — sign the catch-up GET so enrolled peers accept it under
         // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
         req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
-        let resp = match req.send().await {
-            Ok(r) => match accept_catchup_response(&peer.id, r) {
-                Some(r) => r,
-                None => continue,
-            },
-            Err(e) => {
-                log_catchup_unreachable(&peer.id, &e);
-                continue;
-            }
+        // #3654 — one classifier for all three pullers; every malformed answer
+        // records exactly one pull failure before this `continue`.
+        let Some((_body, memories)) = fetch_catchup_envelope(&peer.id, req).await else {
+            continue;
         };
-
-        let body: serde_json::Value = match read_capped_sync_json(resp).await {
-            Ok(v) => v,
-            Err(e) => {
-                log_catchup_unparseable_body(&peer.id, e);
-                continue;
-            }
-        };
-        let memories = body
-            .get("memories")
-            .and_then(|v| v.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
         log_catchup_pull_ok(&peer.id, memories.len());
     }
 }
