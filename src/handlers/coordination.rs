@@ -41,7 +41,6 @@ use crate::handlers::AppState;
 use crate::write_receipt::QUORUM_ACKS_FIELD;
 
 // pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
-const MSG_CHECKPOINT_RESOLVE_FAILED: &str = "checkpoint resolve failed";
 
 /// Rejection detail for a non-terminal `state` on the checkpoint-resolve route
 /// (one spelling, pm-v3.1 literal gate). Mirrors the MCP handler's wording.
@@ -799,7 +798,7 @@ pub async fn resolve_checkpoint(
                     )
                     .await
                     .map_err(|e| {
-                        tracing::error!(error = %e, MSG_CHECKPOINT_RESOLVE_FAILED);
+                        tracing::error!(error = %e, "{}", super::errors::CHECKPOINT_RESOLVE_FAILED);
                         checkpoint_resolve_error()
                     })
             } else {
@@ -898,7 +897,7 @@ async fn local_resolve_via_db(
         app.active_keypair.as_ref().as_ref(),
     )
     .map_err(|e| {
-        tracing::error!(error = %e, MSG_CHECKPOINT_RESOLVE_FAILED);
+        tracing::error!(error = %e, "{}", super::errors::CHECKPOINT_RESOLVE_FAILED);
         checkpoint_resolve_error()
     })
 }
@@ -911,7 +910,7 @@ async fn local_resolve_via_db(
 fn checkpoint_resolve_error() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": MSG_CHECKPOINT_RESOLVE_FAILED})),
+        Json(json!({"error": super::errors::CHECKPOINT_RESOLVE_FAILED})),
     )
         .into_response()
 }
