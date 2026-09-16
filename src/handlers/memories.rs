@@ -714,18 +714,7 @@ async fn update_memory_write(
                     Ok(0) => None,
                     Ok(delta) => Some((owner, eff_ns, delta)),
                     Err(crate::quotas::QuotaCheckError::Quota(qe)) => {
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(json!({
-                                "code": crate::errors::error_codes::QUOTA_EXCEEDED,
-                                "error": qe.to_string(),
-                                "limit": qe.limit.as_str(),
-                                "current": qe.current,
-                                "max": qe.max,
-                                "agent_id": qe.agent_id,
-                            })),
-                        )
-                            .into_response();
+                        return crate::handlers::errors::quota_exceeded_response(&qe);
                     }
                     Err(crate::quotas::QuotaCheckError::Sql(se)) => {
                         tracing::error!("update_memory: quota substrate error: {se}");

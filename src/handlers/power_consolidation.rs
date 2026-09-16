@@ -649,18 +649,9 @@ pub async fn consolidate_memories(
             consolidate_quota_op,
         ) {
             return match e {
-                crate::quotas::QuotaCheckError::Quota(qe) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
-                        "error": qe.to_string(),
-                        "limit": qe.limit.as_str(),
-                        "current": qe.current,
-                        "max": qe.max,
-                        "agent_id": qe.agent_id,
-                    })),
-                )
-                    .into_response(),
+                crate::quotas::QuotaCheckError::Quota(qe) => {
+                    crate::handlers::errors::quota_exceeded_response(&qe)
+                }
                 crate::quotas::QuotaCheckError::Sql(se) => {
                     tracing::error!("consolidate quota substrate error: {se}");
                     (

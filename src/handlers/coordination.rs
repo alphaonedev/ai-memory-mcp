@@ -335,9 +335,15 @@ pub async fn send_signal(
     if let Some(kp) = app.active_keypair.as_ref().as_ref() {
         if kp.can_sign() {
             if let Err(e) = crate::signals::sign_into(&mut signal, kp) {
+                // #3707 — `sign_signal` returns `anyhow::Result`: today its only
+                // sources are "no private key" and a CBOR encode error, but an
+                // anyhow chain is an OPEN BAG and any future `?` reaches this
+                // body with no compiler involvement. Bounded by inspection is
+                // not bounded. Log the chain, return the constant.
+                tracing::error!(error = %e, "sign signal failed");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("sign signal failed: {e}")})),
+                    Json(json!({"error": "sign signal failed"})),
                 )
                     .into_response();
             }
@@ -538,9 +544,15 @@ async fn local_transition_via_db(
     let lease = match crate::actions::lease_get(&lock.0, action_id) {
         Ok(l) => l,
         Err(e) => {
+            // #3707 F1 (reviewer-f2r) — a rusqlite Display (SQL text, table and
+            // column names, `database is locked`) went straight into the 500
+            // body. The two calls BELOW this one in the same fn were converted
+            // by the first #3707 pass; this arm was walked past. Detail to the
+            // operator log, constant to the caller -- the same three-line shape.
+            tracing::error!(error = %e, action_id, "lease_get failed");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("lease_get failed: {e}")})),
+                Json(json!({"error": "lease_get failed"})),
             )
                 .into_response());
         }
@@ -571,14 +583,7 @@ async fn local_transition_via_db(
     // Wave-2 B5 — local action CAS is a record-plane mutation. Reads
     // (the `get` above) stay live; the write is fenced (ERRORS-09).
     if let Err(e) = crate::storage::record_stop::gate_storage_conn(&lock.0) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "code": crate::errors::error_codes::RECORD_STOPPED,
-                "error": e.to_string(),
-            })),
-        )
-            .into_response());
+        return Err(crate::handlers::errors::record_stopped_response(&e));
     }
     let outcome =
         crate::actions::transition_cas(&lock.0, action_id, from_state, to, claimed_by, now)

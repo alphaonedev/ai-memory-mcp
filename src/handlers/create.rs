@@ -798,18 +798,9 @@ fn insert_create_with_quota(
             // on the limit name. Substrate errors bubble up as 500
             // because the row was never written.
             return Err(match e {
-                crate::quotas::QuotaCheckError::Quota(qe) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
-                        "error": qe.to_string(),
-                        "limit": qe.limit.as_str(),
-                        "current": qe.current,
-                        "max": qe.max,
-                        "agent_id": qe.agent_id,
-                    })),
-                )
-                    .into_response(),
+                crate::quotas::QuotaCheckError::Quota(qe) => {
+                    crate::handlers::errors::quota_exceeded_response(&qe)
+                }
                 crate::quotas::QuotaCheckError::Sql(se) => {
                     tracing::error!("quota substrate error: {se}");
                     (

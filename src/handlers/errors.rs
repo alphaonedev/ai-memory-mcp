@@ -226,6 +226,43 @@ pub(crate) fn internal_error_response(
 /// sanitized-body 500 sites across the handler modules with one
 /// definition. Log line and response body are BYTE-IDENTICAL to the
 /// prior inline pattern; only the spelling is centralised.
+/// #3707 (reviewer-f2r F2, option b) — ONE spelling for the quota-exceeded body.
+///
+/// This JSON was copy-pasted at four handler sites, each spelling
+/// `qe.to_string()` into `"error"`. `QuotaError` is OUR OWN typed value and its
+/// Display is a closed vocabulary, so the text is safe -- but four hand-rolled
+/// copies are four places a future edit can start interpolating something that
+/// is not. One helper removes the SHAPE the #3707 pin scans for, so there is
+/// nothing to exempt and nothing for the pin to learn to ignore.
+pub(crate) fn quota_exceeded_response(qe: &crate::quotas::QuotaError) -> axum::response::Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "code": crate::errors::error_codes::QUOTA_EXCEEDED,
+            "error": qe.to_string(),
+            "limit": qe.limit.as_str(),
+            "current": qe.current,
+            "max": qe.max,
+            "agent_id": qe.agent_id,
+        })),
+    )
+        .into_response()
+}
+
+/// #3707 (f2r F2, option b) — ONE spelling for the record-stop 503. The
+/// record-stop error is our own typed refusal (closed vocabulary), rendered
+/// here once instead of at two handler sites each spelling `e.to_string()`.
+pub(crate) fn record_stopped_response(e: &dyn std::fmt::Display) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "code": crate::errors::error_codes::RECORD_STOPPED,
+            "error": e.to_string(),
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) fn handler_error_500(e: &dyn std::fmt::Display) -> axum::response::Response {
     tracing::error!("handler error: {e}");
     (
