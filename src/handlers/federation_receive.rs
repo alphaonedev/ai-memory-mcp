@@ -330,16 +330,7 @@ fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
 fn refuse_if_record_stopped(conn: &rusqlite::Connection) -> Option<Response> {
     match crate::storage::record_stop::gate_storage_conn(conn) {
         Ok(()) => None,
-        Err(e) => Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "code": crate::errors::error_codes::RECORD_STOPPED,
-                    "error": e.to_string(),
-                })),
-            )
-                .into_response(),
-        ),
+        Err(e) => Some(crate::handlers::errors::record_stopped_response(&e)),
     }
 }
 

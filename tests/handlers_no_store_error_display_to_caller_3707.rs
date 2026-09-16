@@ -51,10 +51,24 @@ fn leak_sites(src: &str) -> Vec<(usize, String)> {
         // missing one.
         let lo = i.saturating_sub(12);
         let ctx = lines[lo..=i].join("\n");
+        // WIDENED after reviewer-f2r proved the four-token version VACUOUS: the
+        // sqlite coordination lanes never spell the store as `app.store.` or
+        // `db::` -- they go through `&lock.0` + `crate::actions::` /
+        // `crate::signals::` / `crate::checkpoints::`, and the record-stop gate
+        // through `crate::storage::`. A pin that cannot fire on the spelling a
+        // whole family of handlers uses is green with a live leak in the tree,
+        // which is exactly what happened. AN ENUMERATION HIDDEN INSIDE A
+        // DERIVATION IS STILL AN ENUMERATION.
         let store_origin = ctx.contains("app.store.")
             || ctx.contains("db::")
             || ctx.contains(".store\n")
-            || ctx.contains("self.store");
+            || ctx.contains("self.store")
+            || ctx.contains("lock.0")
+            || ctx.contains("guard.0")
+            || ctx.contains("crate::actions::")
+            || ctx.contains("crate::signals::")
+            || ctx.contains("crate::checkpoints::")
+            || ctx.contains("crate::storage::");
         // A DOWNCAST to one of OUR OWN error types means the site is rendering
         // a TYPED VARIANT we authored, not a driver's `Display`. `links.rs`
         // states that contract outright -- its body shape is byte-identical to

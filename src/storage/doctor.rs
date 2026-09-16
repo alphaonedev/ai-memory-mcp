@@ -451,7 +451,7 @@ pub fn doctor_webhook_delivery_totals(conn: &Connection) -> Result<(u64, u64)> {
 /// `sync_peer_contact` (v3 review): contact is the more fundamental fact — a
 /// peer can be contacted without ever delivering data, never the reverse —
 /// so a peer that has only ever answered empty windows is visible here.
-/// `peer_id` is REDACTED at construction (`logging::redact_url_password`):
+/// A URL-shaped `peer_id` is allowlist-RENDERED at construction (`url_display::url_origin_and_path`, #3711):
 /// a legacy peer id may be a URL and a URL may embed credentials, and this
 /// struct feeds every doctor fact and note.
 #[derive(Debug, Clone, PartialEq, Eq)]
