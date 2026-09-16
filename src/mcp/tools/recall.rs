@@ -730,14 +730,55 @@ pub fn decorate_memory_many(
             if let Some(level) = attest_map.get(&mem.id) {
                 obj.insert("latest_link_attest_level".to_string(), json!(level));
             }
-            // v0.8.0 #1709 §2.5 T1 (C1a) — provenance_tier decoration
-            // composed PURELY from already-fetched data (the row's
-            // confidence_source + the batched attest level). No new DB
-            // query, no LLM. Decoration only — NOT a ranking key.
+            // v0.8.0 #1709 §2.5 T1 (C1a); #3548 Part A — the EDGE-derived
+            // attestation, composed PURELY from already-fetched data (the row's
+            // confidence_source + the batched strongest-incident-link attest
+            // level). No new DB query, no LLM. Decoration only — NOT a ranking
+            // key. This is a property of HOW the memory was reached (the
+            // incident link), not of the memory itself.
+            let link_attestation = provenance_tier(mem.confidence_source, attest_level);
+            // #3548 Part A — `link_attestation` is the first-class, honestly
+            // named field for the edge-derived value. `provenance_tier` is kept
+            // as its documented ALIAS for one release (v1.0.0 → removed v1.0.1)
+            // so existing consumers keep working.
+            obj.insert("link_attestation".to_string(), json!(link_attestation));
+            obj.insert("provenance_tier".to_string(), json!(link_attestation));
+            // #3548 Part A (rework) — `content_attestation` is the row's OWN write
+            // attestation, read VERBATIM from the `metadata.attest_level` stamp the
+            // write path sets (`identity::attest::stamp_attestation`): `claimed`
+            // for an unsigned write, `agent_attested` for a verified agent
+            // signature (`operator_signed` / `loader_observed` on the governance /
+            // model paths). This is a DIFFERENT concept and a DIFFERENT vocabulary
+            // from `link_attestation` (an edge signature, `models::link::AttestLevel`
+            // = unsigned/self_signed/peer_attested/…) and MUST NOT be parsed with
+            // the link enum: their value sets are DISJOINT, so the link
+            // `from_str` returned `None` for every real row and an agent_attested
+            // row read identically to an unsigned one (the reviewer-f2r finding).
+            // Absent stamp ⇒ `claimed`, the write path's own insert-if-absent
+            // default (`identity::attest::stamp_claimed_if_absent`).
+            let content_attestation = mem
+                .metadata
+                .get(crate::models::field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(crate::identity::verify::AttestLevel::Claimed.as_str());
             obj.insert(
-                "provenance_tier".to_string(),
-                json!(provenance_tier(mem.confidence_source, attest_level)),
+                "content_attestation".to_string(),
+                json!(content_attestation),
             );
+            // #3548 Part B (additive half, v1.0.0) — surface the confidence CLAIM
+            // beside its derived tier. `confidence_value` is the raw stored
+            // number; `confidence_source` is already serialized from the Memory
+            // struct. NB: `confidence_tier` is NUMERIC-ONLY in v1.0.0
+            // (`ConfidenceTier::from_confidence` thresholds the value; the source
+            // is NOT consulted), so a caller-asserted 1.0 and a measured 1.0 both
+            // read `confirmed`. Redefining `confirmed` to require engine/curator/
+            // calibrated/peer-signed provenance OR corroboration ≥ N is DEFERRED
+            // to v1.0.1 with the crossroads vote — a threshold chosen in the
+            // abstract would be exactly the unbacked-claim defect this family
+            // describes. The field stays honest because its contract says plainly
+            // what it measures.
+            obj.insert("confidence_value".to_string(), json!(mem.confidence));
             // v0.8.0 #1709 §2.5 T4 (D1-anchor) — deterministic
             // scheduled-fact validity recomputed from the row's ANCHOR
             // (`effective_expires_at`), emitted ONLY when confidence-decay

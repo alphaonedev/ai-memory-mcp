@@ -19,6 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SDK and shim wire types expose receipt evidence. The generated all-funnel
   structural contract is deferred to #3558; no competing manifest is introduced.
 
+### Added (#3548 — recall names content vs link attestation, and surfaces the confidence claim)
+
+- Recall verbose-provenance rows now carry `content_attestation` (the memory's
+  OWN write attestation, read verbatim from the `metadata.attest_level` stamp:
+  `claimed` / `agent_attested` / `operator_signed` / `loader_observed` — the
+  MEMORY-WRITE vocabulary, absent ⇒ `claimed`) and `link_attestation` (the
+  strongest incident-EDGE attestation, in the distinct LINK vocabulary
+  `signed_peer` > `curator_derived` > `self_signed` > `unsigned_caller`) as
+  distinct fields. The two are DIFFERENT concepts with DISJOINT value sets and
+  are deliberately not parsed with the same enum. Previously the single
+  `provenance_tier` derived from the incident edge yet read like a property of
+  the memory; the two claims are now named apart. `provenance_tier` is kept as a
+  DEPRECATED alias of `link_attestation` for one release (removed v1.0.1).
+- Rows also carry `confidence_value` (the raw stored `confidence`) beside
+  `confidence_tier`. `confidence_tier` is documented as NUMERIC-ONLY in v1.0.0 —
+  it thresholds the value and does NOT consult `confidence_source`, so a
+  caller-asserted `1.0` and an engine-measured `1.0` both read `confirmed`; the
+  raw value + source now travel with the tier so a consumer can tell an asserted
+  value from a measured one. Redefining `confirmed` to require
+  engine/curator/calibrated/peer-signed provenance OR corroboration ≥ N is
+  DEFERRED to v1.0.1 with the crossroads vote.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`
