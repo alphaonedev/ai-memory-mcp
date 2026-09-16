@@ -73,15 +73,23 @@ const IN_SCOPE_NS: &str = "public/ok";
 const APPROVER: &str = "ai:approver";
 
 /// `ai:evil` may act inside `public/*` only.
-const SCOPED_ALLOWLIST: &str =
-    r#"{"ai:evil":{"allowed_namespaces":["public/*"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+///
+/// #3628 — every scoped posture here also authorises the peer to DECIDE as
+/// `ai:approver`. The APPROVE arm now rebinds an unauthorised wire `decider`
+/// to the attested peer exactly as the REJECT arm has since #2720, and an
+/// unregistered peer then fails the registered-approver gate; before #3628
+/// these cells got their approvals through by naming `ai:approver` as a
+/// third party the peer was never authorised to speak for — the forgery
+/// #3628 closes. The cells' subject (namespace scope of the EFFECT) is
+/// unchanged; the identity authority they always assumed is now declared.
+const SCOPED_ALLOWLIST: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*"],"allowed_sender_agent_ids":["ai:evil","ai:approver"]}}"#;
 
 /// The CONTROL posture: the same peer, scoped to reach the victim namespace too.
-const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/*"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/*"],"allowed_sender_agent_ids":["ai:evil","ai:approver"]}}"#;
 
 /// Deep-scope posture for the `promote` cell: the peer may act on the leaf but
 /// NOT on its ancestor, which is where `promote_to_namespace` clones into.
-const SCOPED_ALLOWLIST_DEEP: &str = r#"{"ai:evil":{"allowed_namespaces":["public/deep/x"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+const SCOPED_ALLOWLIST_DEEP: &str = r#"{"ai:evil":{"allowed_namespaces":["public/deep/x"],"allowed_sender_agent_ids":["ai:evil","ai:approver"]}}"#;
 
 /// RAII posture guard — `Drop` runs on unwind, so a failing assertion cannot
 /// leak an enrolled allowlist into the next test in this binary (#2482 shape).

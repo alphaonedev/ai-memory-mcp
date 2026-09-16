@@ -1553,6 +1553,17 @@ pub(super) async fn sync_push_via_store(
             continue;
         }
         let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        // #3628 (CWE-346) — ONE decider binding for BOTH arms, resolved before the
+        // split (the sqlite funnel's shape): the APPROVE arm passed the wire
+        // `dec.decider` verbatim into `approve_with_approver_type` while REJECT
+        // rebound it (#2720 F-12), so an enrolled peer could record an approval
+        // as any registered local agent other than the requester.
+        let bound_decider = resolve_inbound_decider(
+            &dec.decider,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        );
         if dec.approved {
             // #2478 — the `deleted` counter must report rows DESTROYED, not
             // deletes attempted, or the 200 envelope lies in the other
@@ -1570,7 +1581,7 @@ pub(super) async fn sync_push_via_store(
                 };
             match app
                 .store
-                .approve_with_approver_type(&apply_ctx, &dec.id, &dec.decider)
+                .approve_with_approver_type(&apply_ctx, &dec.id, &bound_decider)
                 .await
             {
                 Ok(crate::store::ApproveOutcome::Approved) => {
@@ -1602,6 +1613,7 @@ pub(super) async fn sync_push_via_store(
                         target: ATTESTATION_TRACE_TARGET,
                         pending_id = %dec.id,
                         decider = %dec.decider,
+                        bound_decider = %bound_decider,
                         "sync_push(store): refusing forged / unauthorized federated approval \
                          (#1920): {reason}"
                     );
@@ -1620,15 +1632,10 @@ pub(super) async fn sync_push_via_store(
                 }
             }
         } else {
-            // #2720 F-12 (CWE-346) — bind the decider to the attested peer,
-            // never the self-asserted wire `dec.decider`, so the signed
-            // `pending_action.denied` audit row records the real actor.
-            let bound_decider = resolve_inbound_decider(
-                &dec.decider,
-                &body.sender_agent_id,
-                &attest_cfg,
-                peer_header_owned.as_deref(),
-            );
+            // #2720 F-12 (CWE-346) — the decider bound above the split (shared
+            // with the APPROVE arm since #3628), never the self-asserted wire
+            // `dec.decider`, so the signed `pending_action.denied` audit row
+            // records the real actor.
             match app
                 .store
                 .decide_pending_action(&apply_ctx, &dec.id, false, &bound_decider)

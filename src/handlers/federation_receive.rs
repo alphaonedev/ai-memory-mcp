@@ -3686,6 +3686,21 @@ async fn sync_push_write(
         // refused. A REJECT merely DENIES a pending (converges toward the
         // originator's rejected state) and grants no authority, so it keeps
         // the idempotent `decide_pending_action(false)` transition.
+        //
+        // #3628 (CWE-346) — ONE decider binding for BOTH arms, resolved before
+        // the split. #2720 F-12 rebound the REJECT arm's wire `dec.decider` to
+        // the attested peer, but the APPROVE arm kept passing it verbatim into
+        // `approve_with_approver_type`, whose self-approval gate only compares
+        // `decider == requested_by` — so an enrolled peer could record an
+        // approval (and the signed `pending_action.approved` audit row) as ANY
+        // registered local agent other than the requester. The binding is the
+        // same call, not a copy, so the two arms cannot drift on WHO again.
+        let bound_decider = resolve_inbound_decider(
+            &dec.decider,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        );
         if dec.approved {
             // #2478 (CWE-284) — the APPROVE arm is the one that EXECUTES, and
             // `db::execute_pending_action` reaches `insert()` in the payload's
@@ -3759,7 +3774,7 @@ async fn sync_push_write(
             match db::approve_with_approver_type(
                 &lock.0,
                 &dec.id,
-                &dec.decider,
+                &bound_decider,
                 db::ApproveSurface::Http,
             ) {
                 Ok(db::ApproveOutcome::Approved) => {
@@ -3802,6 +3817,7 @@ async fn sync_push_write(
                         target: ATTESTATION_TRACE_TARGET,
                         pending_id = %dec.id,
                         decider = %dec.decider,
+                        bound_decider = %bound_decider,
                         "sync_push: refusing forged / unauthorized federated approval (#1920): \
                          {reason}"
                     );
@@ -3868,17 +3884,12 @@ async fn sync_push_write(
                 skipped += 1;
                 continue;
             }
-            // #2720 F-12 (CWE-346) — bind the decider to the attested peer, never
-            // the self-asserted wire `dec.decider`. Mirrors the memory lane's
+            // #2720 F-12 (CWE-346) — the decider is the one bound above the
+            // split (shared with the APPROVE arm since #3628), never the
+            // self-asserted wire `dec.decider`. Mirrors the memory lane's
             // `resolve_inbound_attribution`: an unauthorized third-party claim is
             // rebound to the sender so the signed `pending_action.denied` audit
             // row records the real attested actor, not a forged operator id.
-            let bound_decider = resolve_inbound_decider(
-                &dec.decider,
-                &body.sender_agent_id,
-                &attest_cfg,
-                peer_header_owned.as_deref(),
-            );
             match db::decide_pending_action(&lock.0, &dec.id, false, &bound_decider) {
                 Ok(true) => pending_decisions_applied += 1,
                 Ok(false) => noop += 1, // already decided — converged state
