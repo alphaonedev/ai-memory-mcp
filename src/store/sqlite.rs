@@ -3862,7 +3862,10 @@ impl MemoryStore for SqliteStore {
 
     async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
         let conn = self.state.lock().await;
-        db::find_contradictions(&conn, title, namespace).map_err(box_err)
+        // #3712 — the trait method carries no caller identity and has no
+        // production caller (both write surfaces call `db::` directly with
+        // their viewer); trust-all here is the documented posture, not a gap.
+        db::find_contradictions(&conn, title, namespace, None).map_err(box_err)
     }
 
     async fn invalidate_link(

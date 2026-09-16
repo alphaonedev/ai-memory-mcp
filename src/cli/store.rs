@@ -556,8 +556,10 @@ pub(crate) fn run_with_curator(
             }
         }
     }
+    // #3712 — CLI is operator-as-actor: trust-all (`None`), like every CLI
+    // read lane.
     let contradictions =
-        db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
+        db::find_contradictions(&conn, &mem.title, &mem.namespace, None).unwrap_or_default();
     let actual_id = db::insert(&conn, &mem)?;
 
     // PR-5 (issue #487): security audit trail. No-op when disabled.
