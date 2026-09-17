@@ -38,7 +38,7 @@ fn forget_preview(
         ),
         None => db::forget_matches(conn, namespace, pattern, tier, DRY_RUN_PREVIEW_CAP + 1),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("forget_preview", e))?;
     let truncated = rows.len() > DRY_RUN_PREVIEW_CAP;
     rows.truncate(DRY_RUN_PREVIEW_CAP);
     Ok((rows, truncated))
@@ -229,7 +229,7 @@ pub(super) fn handle_forget(
             Some(ref c) => db::forget_count_for_caller(conn, namespace, pattern, tier.as_ref(), c),
             None => db::forget_count(conn, namespace, pattern, tier.as_ref()),
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("forget_count", e))?;
         // #1602 — sighted preview: the matched rows (id/title/
         // namespace/tier) ride along with the count so callers can see
         // WHAT a destructive pattern is about to remove. The
@@ -274,7 +274,7 @@ pub(super) fn handle_forget(
         Some(ref c) => db::forget_for_caller(conn, namespace, pattern, tier.as_ref(), archive, c),
         None => db::forget(conn, namespace, pattern, tier.as_ref(), archive),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("forget", e))?;
     // v1.0.0 #2446 — queue the erasures for federated fan-out (best-effort;
     // never fails the forget, writes nothing when undrainable).
     crate::federation::erasure_outbox::enqueue_erasures(
@@ -1101,5 +1101,53 @@ mod tests {
             "single-operator forget deleted the row"
         );
         crate::config::clear_permissions_mode_override_for_test();
+    }
+
+    // #3761 — a driver fault behind the dry-run count reaches the caller
+    // as the storage class, never as SQL text. RED on the base tree, where
+    // the `match`-arm `.map_err(|e| e.to_string())` rendered
+    // `no such table: memories` verbatim.
+    #[test]
+    fn dry_run_count_fault_renders_closed_3761() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        conn.execute_batch("DROP TABLE memories")
+            .expect("drop memories");
+        let err = handle_forget(
+            &conn,
+            &json!({"namespace": "ns3761", "dry_run": true}),
+            false,
+            None,
+        )
+        .expect_err("a dropped memories table must fail the dry-run count");
+        assert_eq!(
+            err,
+            crate::mcp::error_text::DB_ERROR_TEXT,
+            "the caller gets the class, got: {err}"
+        );
+        assert!(
+            !err.contains("no such table") && !err.contains("memories"),
+            "#3761: driver text must not cross to the caller: {err}"
+        );
+    }
+
+    // #3761 — the live-run preview arm: same closed render, same sink.
+    #[test]
+    fn live_preview_fault_renders_closed_3761() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        conn.execute_batch("DROP TABLE memories")
+            .expect("drop memories");
+        let err = handle_forget(&conn, &json!({"namespace": "ns3761"}), false, None)
+            .expect_err("a dropped memories table must fail the live preview");
+        assert_eq!(
+            err,
+            crate::mcp::error_text::DB_ERROR_TEXT,
+            "the caller gets the class, got: {err}"
+        );
+        assert!(
+            !err.contains("no such table") && !err.contains("memories"),
+            "#3761: driver text must not cross to the caller: {err}"
+        );
     }
 }

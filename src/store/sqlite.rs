@@ -192,6 +192,26 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// Map the typed coordination-guard refusal onto the SAL error: quota and
+/// validation keep their structural variants (the postgres twin maps
+/// `prepare_action` to `IntegrityFailed` the same way); a driver fault
+/// stays a backend detail, byte-identical to the pre-typed funnel.
+fn memory_guard_err(e: crate::errors::MemoryError) -> StoreError {
+    match e {
+        crate::errors::MemoryError::QuotaExceeded(quota) => StoreError::QuotaExceeded {
+            agent_id: quota.agent_id,
+            namespace: quota.namespace,
+            limit: quota.limit.as_str().to_string(),
+            current: quota.current,
+            max: quota.max,
+        },
+        crate::errors::MemoryError::ValidationFailed(detail) => {
+            StoreError::IntegrityFailed { detail }
+        }
+        other => box_err(other.message()),
+    }
+}
+
 /// v1.0.0 #3474 — SAL-layer `GovernedAction` back to its `models` twin, the
 /// inverse of the `From` impl in `store::mod`. The two enums exist so the
 /// trait surface need not import the models crate at every site; the sqlite
@@ -2394,7 +2414,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         crate::actions::create_guarded(&conn, action.clone())
             .map(|a| a.id)
-            .map_err(box_err)
+            .map_err(memory_guard_err)
     }
 
     async fn action_get(

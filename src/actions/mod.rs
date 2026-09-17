@@ -113,11 +113,17 @@ pub fn create(conn: &Connection, action: &Action) -> rusqlite::Result<String> {
 /// Create an action with the shared coordination guards and atomic quota charge.
 ///
 /// # Errors
-/// Refuses invalid input, exhausted quota, record-stop, or persistence failure.
-pub fn create_guarded(conn: &Connection, action: Action) -> Result<Action, String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+/// Refuses invalid input, exhausted quota, record-stop, or persistence
+/// failure as a typed [`crate::errors::MemoryError`]: own-vocabulary
+/// refusals (validation, quota) keep their message, while driver failures
+/// classify as the foreign `DatabaseError` the MCP funnel renders closed.
+pub fn create_guarded(
+    conn: &Connection,
+    action: Action,
+) -> Result<Action, crate::errors::MemoryError> {
+    let tx = conn.unchecked_transaction()?;
     let action = create_guarded_in_transaction(&tx, action)?;
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.commit()?;
     Ok(action)
 }
 
@@ -125,17 +131,24 @@ pub fn create_guarded(conn: &Connection, action: Action) -> Result<Action, Strin
 pub(crate) fn create_guarded_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     action: Action,
-) -> Result<Action, String> {
-    gate_record_stop_actions(tx).map_err(|e| e.to_string())?;
-    let (action, bytes) = crate::coordination_guard::prepare_action(action)?;
+) -> Result<Action, crate::errors::MemoryError> {
+    use crate::errors::MemoryError;
+    gate_record_stop_actions(tx)?;
+    let (action, bytes) =
+        crate::coordination_guard::prepare_action(action).map_err(MemoryError::ValidationFailed)?;
     crate::quotas::check_and_record_storage_only_in_transaction(
         tx,
         action.agent_id.as_deref().unwrap_or_default(),
         &action.namespace,
         bytes,
     )
-    .map_err(|e| e.to_string())?;
-    create(tx, &action).map_err(|e| e.to_string())?;
+    .map_err(|e| match e {
+        crate::quotas::QuotaCheckError::Quota(quota) => MemoryError::QuotaExceeded(quota),
+        crate::quotas::QuotaCheckError::Sql(sql) => {
+            MemoryError::DatabaseError(format!("quota check substrate error: {sql}"))
+        }
+    })?;
+    create(tx, &action)?;
     Ok(action)
 }
 

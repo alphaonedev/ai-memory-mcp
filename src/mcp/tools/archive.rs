@@ -48,7 +48,7 @@ pub(super) fn handle_archive_restore(
         Some(c) => db::restore_archived_for_caller(conn, id, c),
         None => db::restore_archived(conn, id),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("archive_restore", e))?;
     if !restored {
         return Err(crate::errors::msg::NOT_FOUND_IN_ARCHIVE.into());
     }
@@ -1001,6 +1001,32 @@ mod tests {
         )
         .expect("maximum bounded cutoff remains valid");
         assert_eq!(value["purged"].as_u64(), Some(0));
+    }
+
+    // #3761 — a driver fault behind `memory_archive_restore` reaches the
+    // caller as the storage class, never as SQL text. RED on the base tree,
+    // where the `match`-arm `.map_err(|e| e.to_string())` rendered
+    // `no such table: memories` verbatim. The fault drops the LIVE table
+    // (the archived-existence probe swallows errors into `Ok(false)` via
+    // `unwrap_or`, so only the restore INSERT still propagates loudly).
+    #[test]
+    fn archive_restore_fault_renders_closed_3761() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = open_conn();
+        let id = seed_archived(&conn, "ns3761", "t3761", "ai:test-3761");
+        conn.execute_batch("DROP TABLE memories")
+            .expect("drop memories");
+        let err = handle_archive_restore(&conn, &json!({"id": id}), None)
+            .expect_err("a dropped memories table must fail the restore");
+        assert_eq!(
+            err,
+            crate::mcp::error_text::DB_ERROR_TEXT,
+            "the caller gets the class, got: {err}"
+        );
+        assert!(
+            !err.contains("no such table") && !err.contains("memories"),
+            "#3761: driver text must not cross to the caller: {err}"
+        );
     }
 }
 

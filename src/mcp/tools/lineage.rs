@@ -120,10 +120,11 @@ pub fn handle_lineage(
             ));
         }
     }
-    // Depth-budget violations surface their message verbatim (the
-    // kg_query/find_paths convention) so callers can tell "you asked for
-    // too much" from a real fault.
-    .map_err(|e| e.to_string())?;
+    // Depth-budget violations keep their message verbatim through the
+    // funnel typed refusal root (the kg_query/find_paths convention) so
+    // callers can tell "you asked for too much" from a real fault; driver
+    // faults render as the storage class.
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lineage", e))?;
 
     let nodes: Vec<_> = nodes
         .into_iter()

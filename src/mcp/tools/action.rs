@@ -38,7 +38,9 @@ fn sweep_expired_leases_best_effort(conn: &rusqlite::Connection) {
 /// as JSON.
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on insert failure.
+/// Returns the caller-safe MCP error text on guard or insert failure: a
+/// driver fault renders as the storage class, while own-vocabulary refusals
+/// (validation, quota) pass through unchanged.
 pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let namespace = params
         .get(param_names::NAMESPACE)
@@ -92,7 +94,8 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         updated_at: now,
     };
 
-    let action = crate::actions::create_guarded(conn, action)?;
+    let action = crate::actions::create_guarded(conn, action)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("action_create", e))?;
     let id = &action.id;
 
     // #1722 — coordination observability: best-effort audit row for the

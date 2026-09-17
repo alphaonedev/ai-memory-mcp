@@ -332,7 +332,11 @@ pub(crate) fn materialize_template_for_caller(
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut ids = Vec::with_capacity(plan.actions.len());
     for action in plan.actions {
-        ids.push(crate::actions::create_guarded_in_transaction(&tx, action)?.id);
+        ids.push(
+            crate::actions::create_guarded_in_transaction(&tx, action)
+                .map_err(|e| e.message())?
+                .id,
+        );
     }
     for (from, to, edge_type) in plan.edges {
         match crate::actions::add_edge(&tx, &from, &to, edge_type, now)

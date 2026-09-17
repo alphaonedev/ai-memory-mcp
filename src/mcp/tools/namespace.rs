@@ -259,8 +259,8 @@ fn resolve_namespace_standard_memory(
     conn: &rusqlite::Connection,
     namespace: &str,
 ) -> Result<Option<crate::models::Memory>, String> {
-    let Some(standard_id) =
-        db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?
+    let Some(standard_id) = db::get_namespace_standard(conn, namespace)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("namespace_standard", e))?
     else {
         return Ok(None); // no standard bound → unowned
     };
@@ -422,10 +422,18 @@ fn handle_namespace_set_standard_inner(
     // their own. A read FAULT refuses (fail-closed): an unverifiable current
     // owner must never be treated as unowned.
     let rebind_refusal: Option<String> = match db::namespace_standard_binding(conn, namespace) {
-        Err(err) => Some(format!(
-            "cannot verify the current namespace-standard owner (error={err}); refusing \
-             the bind rather than treating the standard as unowned"
-        )),
+        Err(err) => {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                error = %err,
+                "namespace_set_standard: cannot verify the current standard owner; refusing the bind",
+            );
+            Some(
+                "cannot verify the current namespace-standard owner; refusing the bind \
+                 rather than treating the standard as unowned"
+                    .to_string(),
+            )
+        }
         Ok(binding) => crate::visibility::namespace_standard_mutation_admission(
             &caller,
             caller == sentinels::DAEMON_PRINCIPAL,
@@ -438,11 +446,19 @@ fn handle_namespace_set_standard_inner(
     };
     let bind_refusal: Option<String> = match (rebind_refusal, parent_standard) {
         (Some(refusal), _) => Some(refusal),
-        (None, Err(err)) => Some(format!(
-            "cannot verify declared parent namespace ownership (parent={}, error={err}); \
-             refusing the bind rather than treating the parent as unowned",
-            parent.unwrap_or("")
-        )),
+        (None, Err(err)) => {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                error = %err,
+                parent = parent.unwrap_or(""),
+                "namespace_set_standard: cannot verify the declared parent owner; refusing the bind",
+            );
+            Some(format!(
+                "cannot verify declared parent namespace ownership (parent={}); refusing \
+                 the bind rather than treating the parent as unowned",
+                parent.unwrap_or("")
+            ))
+        }
         (None, Ok(parent_standard)) => match db::get(conn, id) {
             Ok(Some(existing_mem)) => {
                 authorize_namespace_standard_bind(&caller, &existing_mem, parent_standard.as_ref())
