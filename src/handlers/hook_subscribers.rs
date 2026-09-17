@@ -481,14 +481,13 @@ async fn set_namespace_standard_inner(
                         target: super::AUTHZ_TRACE_TARGET,
                         "POST /namespaces/{{ns}}/standard 403 (postgres path): {msg} (ns={ns}, id={standard_id})"
                     );
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": msg,
-                            "caller": caller_principal
-                        })),
-                    )
-                        .into_response();
+                    // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`);
+                    // `msg` is the bare SSOT const, never the owner.
+                    return crate::handlers::parity::owner_gate_refusal(
+                        &msg,
+                        Some(caller_principal),
+                        crate::handlers::parity::RefusedResource::Namespace(ns),
+                    );
                 }
             }
             // Genuinely-absent id — parity with the sqlite `Ok(None)` arm (the
@@ -504,14 +503,13 @@ async fn set_namespace_standard_inner(
                         target: super::AUTHZ_TRACE_TARGET,
                         "POST /namespaces/{{ns}}/standard 403 (postgres path, parent graft): {msg} (ns={ns})"
                     );
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": msg,
-                            "caller": caller_principal
-                        })),
-                    )
-                        .into_response();
+                    // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`);
+                    // `msg` is the bare SSOT const, never the owner.
+                    return crate::handlers::parity::owner_gate_refusal(
+                        &msg,
+                        Some(caller_principal),
+                        crate::handlers::parity::RefusedResource::Namespace(ns),
+                    );
                 }
             }
             Err(e) => return store_err_to_response(e),
@@ -634,14 +632,12 @@ async fn set_namespace_standard_inner(
                     target: super::AUTHZ_TRACE_TARGET,
                     "POST /namespaces/{{ns}}/standard 403: {msg} (ns={ns})"
                 );
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "error": msg,
-                        "caller": caller
-                    })),
-                )
-                    .into_response();
+                // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`).
+                return crate::handlers::parity::owner_gate_refusal(
+                    &msg,
+                    Some(caller.as_str()),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                );
             }
             m.id
         } else {
@@ -722,14 +718,12 @@ async fn set_namespace_standard_inner(
                 target: super::AUTHZ_TRACE_TARGET,
                 "POST /namespaces/{{ns}}/standard 403 (body.id path): {msg} (ns={ns}, id={resolved_id})"
             );
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": msg,
-                    "caller": caller
-                })),
-            )
-                .into_response();
+            // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`).
+            return crate::handlers::parity::owner_gate_refusal(
+                &msg,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            );
         }
     }
 
@@ -1175,6 +1169,19 @@ async fn clear_namespace_standard_inner(
                 Json(json!({"error": "no namespace_meta row matched"})),
             )
                 .into_response(),
+            // #3407 — the owner-gate refusal is rendered HERE, where the
+            // caller principal is in scope, so the body is byte-identical to
+            // the sqlite arm below (`store_err_to_response` maps the same
+            // reason to the same shape but cannot name the caller).
+            Err(crate::store::StoreError::PermissionDenied { reason, .. })
+                if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD =>
+            {
+                crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                    Some(caller.as_str()),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                )
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -1218,6 +1225,17 @@ async fn clear_namespace_standard_inner(
                 }
             }
             (StatusCode::OK, Json(v)).into_response()
+        }
+        // #3407 — the owner-gate refusal is the ONE closed shape on both
+        // backends (403 `NOT_OWNER`, `namespace` echoed, owner never named);
+        // pre-#3407 this arm answered 400 with a text that named the owner,
+        // while the postgres arm above answered 403 with the same disclosure.
+        Err(e) if e == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD => {
+            crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            )
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }

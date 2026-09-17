@@ -290,6 +290,23 @@ pub mod msg {
     /// wire string is one named const, byte-identical on both backends.
     pub const CALLER_NOT_LINK_ENDPOINT_OWNER: &str =
         "caller does not own either endpoint of this link";
+    /// #3407 — the namespace-standard owner-gate refusal (SET and CLEAR, both
+    /// backends, MCP and HTTP). Names NEITHER the caller NOR the recorded
+    /// owner: the pre-#3407 text interpolated `(caller=…, owner=…)` /
+    /// `(owner: …)`, which handed a refused caller the owning agent id — the
+    /// identity oracle #3426 closed for memories and left open here. The
+    /// owner belongs in the `AUTHZ_TRACE_TARGET` warn line at the gate.
+    pub const CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD: &str =
+        "caller does not own this namespace standard";
+    /// #3407 / #2542 — the declared-parent graft refusal; same rule, distinct
+    /// text so the two SET-path refusals stay operator-actionable.
+    pub const CALLER_DOES_NOT_OWN_PARENT_NAMESPACE_STANDARD: &str =
+        "caller does not own this declared parent namespace standard";
+    /// #3407 — `DELETE /api/v1/subscriptions` on a row another agent
+    /// created. Both backends answer with this const inside the
+    /// `handlers::parity::owner_gate_refusal` shape (403 `NOT_OWNER`); the
+    /// sqlite arm used to answer `200 {"removed": false}` for the same act.
+    pub const CALLER_DOES_NOT_OWN_SUBSCRIPTION: &str = "caller does not own this subscription";
 
     // ---- validation -------------------------------------------------------------
     pub const FORGET_FILTER_REQUIRED: &str =

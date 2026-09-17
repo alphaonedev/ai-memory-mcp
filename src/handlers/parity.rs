@@ -833,6 +833,12 @@ pub enum RefusedResource<'a> {
         /// The edge's target memory id.
         target_id: &'a str,
     },
+    /// #3407 — the namespace whose governance standard the caller asked to
+    /// bind or clear, echoed as `namespace`.
+    Namespace(&'a str),
+    /// #3407 — the webhook subscription the caller asked to remove, echoed
+    /// as `id` (the same key the success envelope uses).
+    Subscription(&'a str),
 }
 
 impl RefusedResource<'_> {
@@ -851,6 +857,12 @@ impl RefusedResource<'_> {
             } => {
                 body.insert("source_id".to_string(), json!(source_id));
                 body.insert("target_id".to_string(), json!(target_id));
+            }
+            Self::Namespace(namespace) => {
+                body.insert("namespace".to_string(), json!(namespace));
+            }
+            Self::Subscription(id) => {
+                body.insert("id".to_string(), json!(id));
             }
         }
     }

@@ -886,8 +886,12 @@ pub(crate) const REASON_CLEAR_STANDARD_UNRESOLVABLE: &str = "cannot clear namesp
 
 /// #1777 — wire-pinned refusal text for a clear by a caller who is not the
 /// bound standard's owner. Sibling of [`REASON_CLEAR_STANDARD_UNRESOLVABLE`].
-pub(crate) fn reason_clear_standard_not_owner(owner: &str) -> String {
-    format!("caller does not own this namespace standard (owner: {owner})")
+pub(crate) fn reason_clear_standard_not_owner() -> String {
+    // #3407 — the recorded owner is NOT part of the reason: the reason is
+    // what the refused caller reads (via `StoreError::PermissionDenied` on
+    // both adapters and `postgres_gate::store_err_to_response`), and naming
+    // the owner there is the identity oracle #3426 closed for memories.
+    crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()
 }
 
 /// #3176 — the shared authorization decision for `clear_namespace_standard`.
@@ -925,10 +929,18 @@ pub(crate) fn authorize_clear_namespace_standard(
                 && owner != crate::identity::sentinels::SYSTEM_PRINCIPAL
                 && owner != ctx.effective_principal() =>
         {
+            // #3407 — the owner is server-side evidence only (the #3426
+            // discipline): it goes to the authz trace, never into the reason.
+            tracing::warn!(
+                target: crate::handlers::AUTHZ_TRACE_TARGET,
+                "sal owner-gate refusal: {} on {namespace}: caller {} != owner {owner}",
+                crate::OP_CLEAR_NAMESPACE_STANDARD,
+                ctx.effective_principal()
+            );
             Err(StoreError::PermissionDenied {
                 action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
                 target: namespace.to_string(),
-                reason: reason_clear_standard_not_owner(owner),
+                reason: reason_clear_standard_not_owner(),
             })
         }
         // Caller owns it, or it is unowned (absent / empty / `system`) → ALLOW.

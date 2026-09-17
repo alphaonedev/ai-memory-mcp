@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
@@ -311,6 +311,24 @@ pub fn delete(conn: &Connection, id: &str, caller_agent_id: Option<&str>) -> Res
         conn.execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?
     };
     Ok(n > 0)
+}
+
+/// #3407 — the recorded creator of subscription `id` (`created_by`), or
+/// `None` when no such row exists. Deliberately UNSCOPED: the HTTP
+/// `unsubscribe` handler uses it to tell "another agent's row" (a 403
+/// `NOT_OWNER` refusal that names nobody) from "no such row" (the
+/// idempotent `removed: false`). Never rendered to a caller.
+///
+/// # Errors
+/// Any SQLite error.
+pub fn owner_of(conn: &Connection, id: &str) -> Result<Option<Option<String>>> {
+    Ok(conn
+        .query_row(
+            "SELECT created_by FROM subscriptions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?)
 }
 
 /// List active subscriptions, optionally scoped to a single owner.

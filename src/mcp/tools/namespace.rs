@@ -173,7 +173,11 @@ pub(crate) fn authorize_namespace_standard_bind(
     if caller == sentinels::DAEMON_PRINCIPAL {
         return Ok(());
     }
-    authorize_namespace_standard_owner(caller, existing_mem, "namespace standard")?;
+    authorize_namespace_standard_owner(
+        caller,
+        existing_mem,
+        crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+    )?;
     // #2542 — the declared parent must be entitled too (unowned or same owner).
     authorize_namespace_standard_parent(caller, declared_parent_standard)
 }
@@ -194,24 +198,34 @@ pub(crate) fn authorize_namespace_standard_parent(
     }
     match parent_standard {
         None => Ok(()),
-        Some(mem) => {
-            authorize_namespace_standard_owner(caller, mem, "declared parent namespace standard")
-        }
+        Some(mem) => authorize_namespace_standard_owner(
+            caller,
+            mem,
+            crate::errors::msg::CALLER_DOES_NOT_OWN_PARENT_NAMESPACE_STANDARD,
+        ),
     }
 }
 
 /// #2541 / #929 / #2542 — the shared ownership predicate applied to a
 /// namespace-standard memory (the bound standard, or the declared parent's
-/// standard). `subject` names the memory in the refusal so the two call sites
+/// standard). `refusal` is the SSOT text for the memory being judged
+/// (`errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD` /
+/// `CALLER_DOES_NOT_OWN_PARENT_NAMESPACE_STANDARD`) so the two call sites
 /// produce distinct, operator-actionable errors while sharing ONE ownership
 /// rule: an UNOWNED owner passes — that is an EMPTY string, the exact literal
 /// `system`, or [`sentinels::SYSTEM_PRINCIPAL`] (also `"system"`); any other
 /// named owner that differs from the caller refuses. (Review Finding 5: there is
 /// no `system:`-PREFIX match — only these exact values pass.)
+///
+/// #3407 — the refusal names NEITHER the caller NOR the recorded owner. The
+/// pre-#3407 text `(caller=…, owner=…)` reached the refused caller on the MCP
+/// surface verbatim and on HTTP inside the 403 body: an identity oracle (the
+/// same class #3426 closed for the memory owner gates). The owner is
+/// server-side evidence and goes to the authz trace at the gate.
 fn authorize_namespace_standard_owner(
     caller: &str,
     mem: &crate::models::Memory,
-    subject: &str,
+    refusal: &'static str,
 ) -> Result<(), String> {
     let recorded_owner = mem
         .metadata
@@ -222,9 +236,12 @@ fn authorize_namespace_standard_owner(
         || recorded_owner == "system"
         || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
     if !is_unowned && recorded_owner != caller {
-        return Err(format!(
-            "caller does not own this {subject} (caller={caller}, owner={recorded_owner})"
-        ));
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            standard = %mem.id,
+            "namespace-standard owner-gate refusal: {refusal}: caller {caller} != owner {recorded_owner}"
+        );
+        return Err(refusal.to_string());
     }
     Ok(())
 }
@@ -858,9 +875,17 @@ fn handle_namespace_clear_standard_inner(
                         // opposite-ordering half of the #2634 class). Chain
                         // "refuse" here so the refusal is audited.
                         record_clear_refusal(&caller, namespace);
-                        return Err(format!(
-                            "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
-                        ));
+                        // #3407 — the owner is server-side evidence only; the
+                        // refusal the caller reads is the bare SSOT const (the
+                        // same one the SAL adapters put in `PermissionDenied`).
+                        tracing::warn!(
+                            target: crate::handlers::AUTHZ_TRACE_TARGET,
+                            "namespace-standard owner-gate refusal: {} on {namespace}: caller {caller} != owner {recorded_owner}",
+                            crate::OP_CLEAR_NAMESPACE_STANDARD
+                        );
+                        return Err(
+                            crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()
+                        );
                     }
                 }
                 None => {
@@ -1314,14 +1339,14 @@ mod tests {
             }),
         )
         .expect_err("wire agent_id=daemon must not bypass the ownership gate");
-        assert!(err.contains("does not own"), "got: {err}");
-        assert!(
-            err.contains(sentinels::ANONYMOUS_INVALID),
-            "wire daemon must downgrade to anonymous:invalid, got: {err}"
-        );
-        assert!(
-            !err.contains(&format!("caller={}", sentinels::DAEMON_PRINCIPAL)),
-            "wire daemon must never be honored as the daemon principal, got: {err}"
+        // #3407 — the refusal is the bare SSOT const: it names neither the
+        // caller nor the owner, so the proof that the wire daemon was NOT
+        // honoured is the refusal itself (a real daemon principal bypasses
+        // this gate) plus the unchanged binding asserted below.
+        assert_eq!(
+            err,
+            crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+            "wire daemon must downgrade to anonymous:invalid and be refused by the bare const"
         );
         assert!(
             db::get_namespace_standard(&conn, "ns-2721")

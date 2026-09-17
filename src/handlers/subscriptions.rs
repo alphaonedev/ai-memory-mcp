@@ -747,6 +747,19 @@ pub async fn unsubscribe(
                     Json(json!({"id": id, "removed": false, (field_names::STORAGE_BACKEND): "postgres"})),
                 )
                     .into_response(),
+                // #3407 — another agent's subscription: the ONE closed
+                // refusal shape (403 `NOT_OWNER`), byte-identical to the
+                // sqlite arm below. The SAL gate already logged the owner
+                // to the authz trace; the caller learns that they may not,
+                // never who may. (Pre-#3407 this fell through to the generic
+                // memory-owner text while sqlite answered `200 removed:false`.)
+                Err(crate::store::StoreError::PermissionDenied { .. }) => {
+                    crate::handlers::parity::owner_gate_refusal(
+                        crate::errors::msg::CALLER_DOES_NOT_OWN_SUBSCRIPTION,
+                        Some(caller.as_str()),
+                        crate::handlers::parity::RefusedResource::Subscription(&id),
+                    )
+                }
                 Err(e) => store_err_to_response(e),
             },
             None => (
@@ -786,6 +799,37 @@ pub async fn unsubscribe(
     // and delete it.
     if let Some(id) = q.id.clone() {
         let lock = app.db.lock().await;
+        // #3407 — a row ANOTHER agent created is refused with the ONE closed
+        // shape (403 `NOT_OWNER`) instead of the idempotent `200 removed:
+        // false` that a genuinely absent id still gets: the postgres arm
+        // refuses the same act through the SAL owner gate, and the two
+        // backends must answer with the same class. The creator goes to the
+        // authz trace only; the body names nobody.
+        match crate::subscriptions::owner_of(&lock.0, &id) {
+            Ok(Some(creator)) if creator.as_deref() != Some(caller.as_str()) => {
+                drop(lock);
+                tracing::warn!(
+                    target: super::AUTHZ_TRACE_TARGET,
+                    "DELETE /subscriptions 403: caller {caller} != creator {} (id={id})",
+                    creator.as_deref().unwrap_or("")
+                );
+                return crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_DOES_NOT_OWN_SUBSCRIPTION,
+                    Some(caller.as_str()),
+                    crate::handlers::parity::RefusedResource::Subscription(&id),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                drop(lock);
+                tracing::error!("{}", crate::errors::msg::unsubscribe(&e));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                )
+                    .into_response();
+            }
+        }
         let outcome = crate::subscriptions::delete(&lock.0, &id, Some(&caller));
         drop(lock);
         return match outcome {
