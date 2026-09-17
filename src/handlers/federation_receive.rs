@@ -544,6 +544,22 @@ pub(super) fn resolve_inbound_attribution(
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
     else {
+        // #3624 — an author-less inbound row was attributed to the sender for
+        // quota AND attestation, but the sender was NEVER written into the
+        // PERSISTED metadata, so the replicated row landed UNSTAMPED (#3124):
+        // the stored owner disagreed with the quota/attestation subject, and a
+        // later caller-scoped mutation of it was refused under
+        // `AI_MEMORY_UNSTAMPED_MUTATION=refuse`. Stamp the resolved attribution
+        // at this one point — the same `as_object_mut` write the re-attribution
+        // branch below uses (write paths always build object metadata) — so the
+        // three cannot diverge. `attest_level` is left to
+        // `apply_inbound_write_attestation`, which also runs for author-less rows.
+        if let Some(obj) = to_insert.metadata.as_object_mut() {
+            obj.insert(
+                crate::META_KEY_AGENT_ID.to_string(),
+                serde_json::Value::String(sender_agent_id.to_string()),
+            );
+        }
         return sender_agent_id.to_string();
     };
     // The #238-attested body author is always trusted to author as itself.
