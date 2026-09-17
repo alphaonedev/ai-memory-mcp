@@ -458,7 +458,7 @@ flowchart TB
   SPEC["CC0 wire + on-disk format<br/>+ golden vectors"]
   IMPL1["Reference impl<br/>ai-memory TRACT-2026"]
   IMPL2["Second impl<br/>weekend reimplement gate"]
-  CERT["Certification mark only<br/>pass vectors = conformant"]
+  CERT["Conformance label only<br/>pass vectors = conformant"]
 
   SPEC --> IMPL1
   SPEC --> IMPL2

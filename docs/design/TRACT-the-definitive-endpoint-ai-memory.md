@@ -235,7 +235,7 @@ The substrate may make the **record** compound (richer, distilled, provenance-cl
 | Wire format + on-disk format + conformance vectors | **CC0 + patent non-aggression covenant** (unrelicensable) |
 | Reference implementation | **MPL-2.0** (weak/file-level copyleft) — *Apache-2.0* alt for MCU/firmware; patent grant mandatory; **AGPL forbidden** |
 | Docs beyond normative spec | CC-BY |
-| Name / brand | foundation-owned **certification mark** only |
+| Name / brand | foundation-owned **conformance label** only |
 
 **License ruling (residual resolved): AGPL is rejected.** For an *endpoint* substrate whose mission is "runs on every endpoint," AGPL's network-copyleft makes the reference impl un-embeddable in the exact targets it serves (phones, IoT, firmware) — vendors clean-room a private impl from the CC0 spec instead, **fragmenting conformance** (the opposite of the goal) and undercutting the design's own "two interoperable implementations" gate. Since the **format is CC0**, the impl license cannot create a durable moat anyway (weekend-reimplement + pass vectors), so it should optimize for **maximum embedding + fix-back-flow** — MPL-2.0's file-level copyleft does exactly that.
 
