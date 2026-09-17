@@ -15,7 +15,7 @@
     "path": "src/wake_hub/conn.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "e8c34fdc7414999bd5a6b9dc6827bfea983c7cc1816fcfb888a6b6e84aefd514"
+    "sha256": "9cf3d61cb2f31337ce729e91b2dce66b79e20607c2a145b543bf0c7bb99222b8"
   },
   {
     "path": "src/wake_hub/delegation_verifier.rs",
@@ -75,7 +75,7 @@
     "path": "src/wake_hub/routing.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "680990a9359a3c01bb1b254206a699b58e04ec48dc66a8021c48b39b524ad070"
+    "sha256": "521f82ca5e4c50814e6afe763a06a66fbe73336817f01fdb4cd0192847486323"
   },
   {
     "path": "src/wake_hub/server.rs",

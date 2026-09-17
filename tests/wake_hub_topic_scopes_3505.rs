@@ -180,6 +180,25 @@ async fn join(
     client
 }
 
+/// Connect + hello for one agent with an EXPLICIT hello-topic set (the #3640
+/// replacement cells need a session whose hello re-declares a topic).
+async fn join_with_topics(
+    hub: &Harness,
+    agent: &str,
+    root_seed: u8,
+    session_seed: u8,
+    topics: &[String],
+) -> wake_hub_harness::Client {
+    let mut client = hub.connect().await;
+    client.delegation = mint(agent, &root_key(root_seed), &session_key(session_seed));
+    client
+        .hello(agent, &session_key(session_seed), topics)
+        .await;
+    let welcome = client.expect_frame().await;
+    assert_eq!(welcome.kind, Kind::Welcome, "{agent} must be admitted");
+    client
+}
+
 // ---------------------------------------------------------------------------
 // Derivation — the snapshot names exactly what the store predicate admits
 // ---------------------------------------------------------------------------
@@ -779,6 +798,181 @@ async fn a_namespace_removed_by_a_refresh_drops_the_subscription_3505() {
         delivered.to,
         format!("#_inbox/{ALICE}"),
         "the dropped topic must deliver nothing after the refresh"
+    );
+    hub.stop().await;
+}
+
+/// #3640 — a topic the DISPLACED session added at RUNTIME must not survive the
+/// replacement. The router topic index is keyed by agent id, not session, and
+/// a displaced session's `unregister` compare-and-remove returns false (the
+/// route is already the replacement's), so its `unsubscribe_all` cleanup is
+/// SKIPPED. Any topic the old session subscribed to at runtime — never
+/// re-declared in the new session's hello — would otherwise leak into the
+/// index under the agent id and, because it is in NO live session's
+/// `subscribed` set, ESCAPE the #3505 one-second revalidation forever. The
+/// invariant this pins: after a replacement the router topic set for an agent
+/// equals the new (only) live session's revalidated `subscribed`, so #3505
+/// covers exactly the index.
+#[tokio::test]
+async fn a_replaced_sessions_runtime_topic_does_not_leak_into_the_replacement_3640() {
+    let dir = owner_only_dir();
+    let path = dir.path().join("allow.json");
+    publish(
+        &path,
+        vec![
+            row(ALICE, &root_key(61), &[SHARED]),
+            row(BOB, &root_key(63), &[SHARED]),
+        ],
+    );
+    let hub = hub_over(path.clone());
+
+    // Session A joins (hello = own inbox only) and subscribes a PROVEN
+    // namespace topic at RUNTIME — the leak vector.
+    let mut alice_a = join(&hub, ALICE, 61, 62).await;
+    let topic = format!("#{SHARED}");
+    subscribe_synced(&mut alice_a, &topic).await;
+
+    let mut bob = join(&hub, BOB, 63, 64).await;
+    bob.wake(&topic, "row-3640-live").await;
+    assert_eq!(
+        alice_a.expect_frame().await.kind,
+        Kind::Wake,
+        "the runtime topic is live on session A before the replacement"
+    );
+
+    // Session B replaces A: same agent id, a fresh session, hello = own inbox
+    // ONLY. B never re-declares the runtime topic.
+    let mut alice_b = join(&hub, ALICE, 61, 66).await;
+    assert_eq!(
+        alice_a.expect_error(ErrorCode::Replaced.as_u16()).await,
+        "session replaced",
+        "the displaced session is told why and closed"
+    );
+
+    // THE FAILURE PATH: the runtime topic the displaced session added, and the
+    // replacement never re-declared, must deliver NOTHING to B — the index now
+    // equals B's revalidated `subscribed` set. The own-inbox wake that DOES
+    // land on the SAME sink is the presence assertion: it proves the topic
+    // wake was DROPPED, not merely late.
+    bob.wake(&topic, "row-3640-leaked").await;
+    bob.wake(&format!("#_inbox/{ALICE}"), "row-3640-inbox")
+        .await;
+    let delivered = alice_b.expect_frame().await;
+    assert_eq!(delivered.kind, Kind::Wake);
+    assert_eq!(
+        delivered.to,
+        format!("#_inbox/{ALICE}"),
+        "the displaced session's runtime topic must not survive into the replacement (#3640)"
+    );
+    hub.stop().await;
+}
+
+/// #3640 control — a topic the REPLACEMENT re-declares in its hello SURVIVES
+/// the reset. `reset_subscriptions` removes only the displaced session's
+/// leftovers, never a topic the new session actually holds.
+#[tokio::test]
+async fn a_replacement_that_redeclares_a_topic_keeps_routing_it_3640() {
+    let dir = owner_only_dir();
+    let path = dir.path().join("allow.json");
+    publish(
+        &path,
+        vec![
+            row(ALICE, &root_key(71), &[SHARED]),
+            row(BOB, &root_key(73), &[SHARED]),
+        ],
+    );
+    let hub = hub_over(path.clone());
+    let topic = format!("#{SHARED}");
+
+    // A joins (hello = own inbox) and runtime-subscribes the topic.
+    let mut alice_a = join(&hub, ALICE, 71, 72).await;
+    subscribe_synced(&mut alice_a, &topic).await;
+
+    // B replaces A and RE-DECLARES the topic in its hello.
+    let mut alice_b = join_with_topics(
+        &hub,
+        ALICE,
+        71,
+        76,
+        &[format!("#_inbox/{ALICE}"), topic.clone()],
+    )
+    .await;
+    assert_eq!(
+        alice_a.expect_error(ErrorCode::Replaced.as_u16()).await,
+        "session replaced",
+        "the displaced session is told why and closed"
+    );
+
+    // The re-declared topic still routes to B — the reset kept it.
+    let mut bob = join(&hub, BOB, 73, 74).await;
+    bob.wake(&topic, "row-3640-redeclared").await;
+    let delivered = alice_b.expect_frame().await;
+    assert_eq!(delivered.kind, Kind::Wake);
+    assert_eq!(
+        delivered.to, topic,
+        "a topic the replacement re-declared must keep routing after replacement (#3640)"
+    );
+    hub.stop().await;
+}
+
+/// #3640 control — a runtime subscribe by the REPLACEMENT, AFTER the reset,
+/// works AND stays covered by #3505 revalidation. The reset must not poison a
+/// later subscribe.
+#[tokio::test]
+async fn a_runtime_subscribe_after_replacement_works_and_is_revalidated_3640() {
+    let dir = owner_only_dir();
+    let path = dir.path().join("allow.json");
+    publish(
+        &path,
+        vec![
+            row(ALICE, &root_key(81), &[SHARED]),
+            row(BOB, &root_key(83), &[SHARED]),
+        ],
+    );
+    let hub = hub_over(path.clone());
+    let topic = format!("#{SHARED}");
+
+    // A joins and runtime-subscribes; B replaces A (hello = own inbox only), so
+    // the reset drops A's leftover topic.
+    let mut alice_a = join(&hub, ALICE, 81, 82).await;
+    subscribe_synced(&mut alice_a, &topic).await;
+    let mut alice_b = join(&hub, ALICE, 81, 86).await;
+    assert_eq!(
+        alice_a.expect_error(ErrorCode::Replaced.as_u16()).await,
+        "session replaced",
+        "the displaced session is told why and closed"
+    );
+
+    // B runtime-subscribes the topic AFTER the replacement — the reset did not
+    // poison it, so the subscribe takes and routes.
+    subscribe_synced(&mut alice_b, &topic).await;
+    let mut bob = join(&hub, BOB, 83, 84).await;
+    bob.wake(&topic, "row-3640-post").await;
+    assert_eq!(
+        alice_b.expect_frame().await.kind,
+        Kind::Wake,
+        "a post-replacement runtime subscribe must route"
+    );
+
+    // And it is STILL covered by #3505: a refresh removing the proof drops it
+    // within the one-second revalidation, while the own inbox still lands.
+    publish(
+        &path,
+        vec![
+            row(ALICE, &root_key(81), &[]),
+            row(BOB, &root_key(83), &[SHARED]),
+        ],
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    bob.wake(&topic, "row-3640-post-drop").await;
+    bob.wake(&format!("#_inbox/{ALICE}"), "row-3640-post-inbox")
+        .await;
+    let delivered = alice_b.expect_frame().await;
+    assert_eq!(delivered.kind, Kind::Wake);
+    assert_eq!(
+        delivered.to,
+        format!("#_inbox/{ALICE}"),
+        "the post-replacement subscription must still be revalidated by #3505 (#3640)"
     );
     hub.stop().await;
 }
