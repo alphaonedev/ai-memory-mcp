@@ -728,6 +728,13 @@ pub(crate) fn import_from_str(
                 }
             }
         }
+        // #3625 — TAIL GUARANTEE: the `!trust_source` block above restamps to
+        // the caller (import provenance hygiene); this closes the gap where a
+        // trust-source row with no agent_id landed UNSTAMPED (Applied). A present
+        // author is Kept; non-object metadata is left UNTOUCHED (NotAnObject) so
+        // the metadata-shape validation below still refuses it (#2264). ONE
+        // predicate, shared with the v2 importer and receive.
+        crate::identity::owner_stamp::ensure_stamped(&mut mem.metadata, &caller_id);
         // #3464 — this CLI import is a non-transactional per-row apply. Resolve
         // the authoritative historical key only after stripping transported
         // trust fields and immediately before verification; never freeze a key
@@ -1692,6 +1699,75 @@ mod tests {
         );
     }
 
+    fn v1_payload_3625(id: &str, metadata: serde_json::Value) -> String {
+        serde_json::json!({
+            "memories": [{
+                "id": id, "tier": Tier::Mid.as_str(), "namespace": "ns-3625",
+                "title": "t", "content": "c", "tags": [], "priority": 5,
+                "confidence": 1.0, "source": "import", "access_count": 0,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "last_accessed_at": null, "expires_at": null,
+                "metadata": metadata,
+            }],
+            "links": [], "count": 1, "exported_at": "2026-01-01T00:00:00+00:00"
+        })
+        .to_string()
+    }
+
+    fn v1_import_read_3625(id: &str, metadata: serde_json::Value) -> models::Memory {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = ImportArgs {
+            allow_dangling: false,
+            trust_source: true, // the #3625 defect surfaces UNDER trust-source
+            store_url: None,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = env.output();
+            import_from_str(
+                &v1_payload_3625(id, metadata),
+                &db,
+                &args,
+                false,
+                Some("ai:caller"),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let conn = db::open(&db).unwrap();
+        db::get(&conn, id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn v1_import_trust_source_keeps_present_author_3625() {
+        // (a) object WITH agent_id -> Kept (control; passes both sides).
+        let m = v1_import_read_3625(
+            "10000000-0000-0000-0000-000000000001",
+            serde_json::json!({"agent_id": "src-author"}),
+        );
+        assert_eq!(
+            m.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("src-author")
+        );
+    }
+
+    #[test]
+    fn v1_import_stamps_authorless_even_under_trust_source_3625() {
+        // (b) object WITHOUT agent_id -> Applied. RED pre-wire: trust-source left it unstamped.
+        let m = v1_import_read_3625(
+            "10000000-0000-0000-0000-000000000002",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            m.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("ai:caller"),
+            "metadata={}",
+            m.metadata
+        );
+    }
+
     #[test]
     fn test_import_trust_source_preserves_agent_id() {
         let src = TestEnv::fresh();
@@ -2128,6 +2204,112 @@ mod tests {
         let conn = db::open(&v2_db).unwrap();
         assert!(db::get(&conn, &bad_id).unwrap().is_none());
         assert!(db::get(&conn, &good_id).unwrap().is_some());
+    }
+
+    /// #3625/#2264 interaction pin: null (non-object) metadata stays REFUSED
+    /// under BOTH trust-source postures — `ensure_stamped` must not materialise
+    /// an object that smuggles the row past the shape refusal — and the valid
+    /// sibling still imports AND is left with a #3124 owner stamp.
+    #[test]
+    fn null_metadata_refused_under_both_trust_postures_and_sibling_stamped_3625() {
+        for trust_source in [false, true] {
+            let src = TestEnv::fresh();
+            let src_db = src.db_path.clone();
+            let bad_id = seed_memory(&src_db, "metadata-shape", "bad", "bad metadata");
+            let good_id = seed_memory(&src_db, "metadata-shape", "good", "valid sibling");
+
+            // v1
+            let mut v1: serde_json::Value =
+                serde_json::from_str(&export_payload_at(&src_db)).unwrap();
+            v1["memories"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|memory| memory["id"] == bad_id)
+                .expect("bad v1 row")["metadata"] = serde_json::Value::Null;
+            let mut v1_dst = TestEnv::fresh();
+            let v1_db = v1_dst.db_path.clone();
+            {
+                let mut out = v1_dst.output();
+                import_from_str(
+                    &v1.to_string(),
+                    &v1_db,
+                    &ImportArgs {
+                        allow_dangling: false,
+                        trust_source,
+                        store_url: None,
+                        on_conflict: OnConflict::Version,
+                    },
+                    true,
+                    Some("ai:metadata-importer"),
+                    &mut out,
+                )
+                .unwrap();
+            }
+            let v1_conn = db::open(&v1_db).unwrap();
+            assert!(
+                db::get(&v1_conn, &bad_id).unwrap().is_none(),
+                "v1 null metadata must be refused (trust_source={trust_source})"
+            );
+            let v1_good = db::get(&v1_conn, &good_id)
+                .unwrap()
+                .expect("v1 valid sibling imports");
+            assert!(
+                v1_good
+                    .metadata
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|author| !author.is_empty()),
+                "v1 valid sibling must be stamped (trust_source={trust_source}): {}",
+                v1_good.metadata
+            );
+
+            // v2
+            let mut v2: serde_json::Value =
+                serde_json::from_str(&export_full_payload_at(&src_db)).unwrap();
+            v2["memories"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|memory| memory["id"] == bad_id)
+                .expect("bad v2 row")["metadata"] = serde_json::Value::Null;
+            let mut v2_dst = TestEnv::fresh();
+            let v2_db = v2_dst.db_path.clone();
+            {
+                let mut out = v2_dst.output();
+                import_from_str(
+                    &v2.to_string(),
+                    &v2_db,
+                    &ImportArgs {
+                        allow_dangling: false,
+                        trust_source,
+                        store_url: None,
+                        on_conflict: OnConflict::Version,
+                    },
+                    true,
+                    Some("ai:metadata-importer"),
+                    &mut out,
+                )
+                .unwrap();
+            }
+            let v2_conn = db::open(&v2_db).unwrap();
+            assert!(
+                db::get(&v2_conn, &bad_id).unwrap().is_none(),
+                "v2 null metadata must be refused (trust_source={trust_source})"
+            );
+            let v2_good = db::get(&v2_conn, &good_id)
+                .unwrap()
+                .expect("v2 valid sibling imports");
+            assert!(
+                v2_good
+                    .metadata
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|author| !author.is_empty()),
+                "v2 valid sibling must be stamped (trust_source={trust_source}): {}",
+                v2_good.metadata
+            );
+        }
     }
 
     /// ★ #2210 — the v2 route validates the `spec_version` VALUE: a

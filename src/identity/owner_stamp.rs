@@ -457,6 +457,62 @@ pub fn admit_unstamped_rows(
     }
 }
 
+/// Outcome of [`ensure_stamped`] — the ONE #3124 stamping predicate, shared by
+/// the federation receive author-less path (#3624) and both import restamp
+/// funnels (#3625). A descriptive enum (API-09), not a bool, so every call site
+/// reads what the row needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stamping {
+    /// Metadata was already an object carrying a non-empty string `agent_id`
+    /// (a valid [`OwnerStamp::Stamped`]) — left verbatim. The control leg and
+    /// the import trust-source "preserve the source author" contract.
+    Kept,
+    /// Metadata was an object with NO valid `agent_id` (absent / JSON null /
+    /// `""` / a malformed non-string value) — `agent_id` inserted (overwriting
+    /// the malformed value, which owns nothing under #3124).
+    Applied,
+    /// Metadata was NOT a JSON object (JSON null / string / array / number /
+    /// bool) — left UNTOUCHED. A non-object cannot carry an `agent_id`, and
+    /// materialising one here would defeat the caller's own metadata-shape
+    /// refusal (#3625/#2264): the import path validates the shape AFTER this
+    /// predicate, so a fabricated object would smuggle a row the shape check
+    /// exists to reject. The caller reads this variant and lets its shape
+    /// refusal fire.
+    NotAnObject,
+}
+
+/// Guarantee `metadata` carries a valid #3124 owner stamp (`metadata.agent_id`
+/// a non-empty JSON string) and report what it did.
+///
+/// ONE definition, three call sites (federation receive #3624, v1 CLI import,
+/// v2 portability restamp #3625). It NEVER overwrites a row that already has a
+/// valid owner — that is a caller's provenance policy (e.g. the importer's
+/// restamp-to-caller under `!trust_source` runs BEFORE this tail guarantee), so
+/// a present author is always [`Stamping::Kept`].
+///
+/// Not `#[must_use]`: the primary purpose is the SIDE EFFECT (guarantee the
+/// stamp); the returned [`Stamping`] is informational and the receive / import
+/// call sites legitimately ignore it.
+pub fn ensure_stamped(metadata: &mut Value, agent_id: &str) -> Stamping {
+    // A valid owner is kept verbatim (trust-source / present-author control).
+    if matches!(OwnerStamp::of(metadata), OwnerStamp::Stamped(_)) {
+        return Stamping::Kept;
+    }
+    if let Some(obj) = metadata.as_object_mut() {
+        // Object with no valid agent_id (absent / null / empty / malformed).
+        obj.insert(
+            crate::META_KEY_AGENT_ID.to_string(),
+            Value::String(agent_id.to_string()),
+        );
+        return Stamping::Applied;
+    }
+    // Non-object metadata: leave it UNTOUCHED so the caller's metadata-shape
+    // validation still refuses the row (#3625/#2264). Materialising an object
+    // here would smuggle a row past the very shape check that runs after this
+    // predicate on the import path.
+    Stamping::NotAnObject
+}
+
 /// Stable refusal reason for an unstamped row under `refuse` (and on the
 /// postgres funnels that refuse it in both modes).
 pub const REASON_UNSTAMPED_REFUSED: &str = "memory carries no ownership stamp (metadata.agent_id); \
@@ -605,6 +661,65 @@ pub const CENSUS_REMEDY: &str = "re-own them to the principal you actually call 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ensure_stamped_keeps_a_present_owner_3625() {
+        // (a) object WITH a non-empty string agent_id -> Kept, verbatim.
+        let mut m = json!({"agent_id": "ai:alice", "k": 1});
+        assert_eq!(ensure_stamped(&mut m, "ai:caller"), Stamping::Kept);
+        assert_eq!(m["agent_id"], json!("ai:alice"));
+        assert_eq!(m["k"], json!(1));
+    }
+
+    #[test]
+    fn ensure_stamped_applies_when_absent_null_empty_or_malformed_3625() {
+        // (b) object WITHOUT a valid agent_id -> Applied (insert / overwrite).
+        for start in [
+            json!({}),
+            json!({"agent_id": null}),
+            json!({"agent_id": ""}),
+            json!({"agent_id": 123}),
+            json!({"agent_id": {"x": 1}}),
+        ] {
+            let mut m = start.clone();
+            assert_eq!(
+                ensure_stamped(&mut m, "ai:caller"),
+                Stamping::Applied,
+                "start={start}"
+            );
+            assert_eq!(m["agent_id"], json!("ai:caller"), "start={start}");
+            assert!(
+                matches!(OwnerStamp::of(&m), OwnerStamp::Stamped("ai:caller")),
+                "start={start}"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_stamped_leaves_non_object_untouched_3625() {
+        // (c) non-object metadata -> NotAnObject; metadata is UNCHANGED, so the
+        // caller's shape validation still refuses the row (#3625/#2264). It is
+        // NEVER materialised into an object and never becomes Stamped.
+        for original in [
+            json!("legacy-string"),
+            json!(42),
+            json!(["a", "b"]),
+            json!(true),
+            json!(null),
+        ] {
+            let mut m = original.clone();
+            assert_eq!(
+                ensure_stamped(&mut m, "ai:caller"),
+                Stamping::NotAnObject,
+                "orig={original}"
+            );
+            assert_eq!(m, original, "non-object metadata must be left untouched");
+            assert!(
+                !matches!(OwnerStamp::of(&m), OwnerStamp::Stamped(_)),
+                "a non-object must never become Stamped: orig={original}"
+            );
+        }
+    }
 
     #[test]
     fn owner_stamp_one_definition_3124() {

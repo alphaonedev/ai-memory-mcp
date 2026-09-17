@@ -554,12 +554,13 @@ pub(super) fn resolve_inbound_attribution(
         // branch below uses (write paths always build object metadata) — so the
         // three cannot diverge. `attest_level` is left to
         // `apply_inbound_write_attestation`, which also runs for author-less rows.
-        if let Some(obj) = to_insert.metadata.as_object_mut() {
-            obj.insert(
-                crate::META_KEY_AGENT_ID.to_string(),
-                serde_json::Value::String(sender_agent_id.to_string()),
-            );
-        }
+        // #3625 — routed through the ONE stamping predicate (moved, not a second
+        // copy). Only the reachable object cases fire here (Kept / Applied):
+        // the receive loop runs `validate_memory` FIRST, which refuses non-object
+        // metadata before attribution, so the `NotAnObject` arm is unreachable at
+        // receive (it is exercised only at the two import sites, which validate
+        // shape AFTER this predicate).
+        crate::identity::owner_stamp::ensure_stamped(&mut to_insert.metadata, sender_agent_id);
         return sender_agent_id.to_string();
     };
     // The #238-attested body author is always trusted to author as itself.

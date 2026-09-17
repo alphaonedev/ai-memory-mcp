@@ -1754,6 +1754,12 @@ fn restamp_inbound_identity(
             report.restamped += 1;
         }
     }
+    // #3625 — TAIL GUARANTEE (mirrors the v1 importer + receive): after the
+    // `!trust_source` restamp above, ensure EVERY posture leaves a valid #3124
+    // owner stamp — trust-source-with-no-agent_id (Applied). A present author is
+    // Kept; non-object metadata is left UNTOUCHED (NotAnObject) so the
+    // metadata-shape validation still refuses it (#2264).
+    crate::identity::owner_stamp::ensure_stamped(&mut staged.metadata, &opts.caller_agent_id);
     original_claim
 }
 
@@ -2127,6 +2133,54 @@ mod tests {
 
     /// The explicit operator-trusted-backup posture (#2211) — the legacy
     /// verbatim behaviour the byte-exact round-trip tests exercise.
+
+    fn opts_caller_3625(trust: bool) -> ImportOptions {
+        ImportOptions {
+            trust_source: trust,
+            caller_agent_id: "ai:caller".into(),
+            ..ImportOptions::default()
+        }
+    }
+
+    fn v2_import_read_3625(id: &str, metadata: serde_json::Value) -> crate::models::Memory {
+        let src = fresh_conn("src-3625-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let mut m = memory_fixture(id, "t3625", "seed-author");
+        m.metadata = metadata;
+        env.memories.push(m);
+        let dst = fresh_conn("dst-3625-");
+        import_full_envelope(&dst, &env, &opts_caller_3625(true)).expect("import");
+        crate::db::get(&dst, id).expect("get").expect("row")
+    }
+
+    #[test]
+    fn v2_import_trust_source_keeps_present_author_3625() {
+        // (a) object WITH agent_id -> Kept (control).
+        let m = v2_import_read_3625(
+            "20000000-0000-0000-0000-000000000001",
+            serde_json::json!({"agent_id": "src-author"}),
+        );
+        assert_eq!(
+            m.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("src-author")
+        );
+    }
+
+    #[test]
+    fn v2_import_stamps_authorless_even_under_trust_source_3625() {
+        // (b) object WITHOUT agent_id -> Applied. RED pre-wire.
+        let m = v2_import_read_3625(
+            "20000000-0000-0000-0000-000000000002",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            m.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("ai:caller"),
+            "metadata={}",
+            m.metadata
+        );
+    }
+
     fn opts_trusted() -> ImportOptions {
         ImportOptions {
             trust_source: true,
