@@ -573,7 +573,7 @@ async fn archive_list_returns_empty_envelope_on_postgres() {
         .json()
         .await
         .expect("archive stats body");
-    assert!(stats["total_archived"].is_number());
+    assert!(stats["archived_total"].is_number());
 
     shutdown.notify_one();
     let _ = handle.await;

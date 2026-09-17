@@ -5351,6 +5351,12 @@ pub trait MemoryStore: Send + Sync {
             capability: "LIST_ARCHIVED".to_string(),
         })
     }
+
+    async fn archive_stats(&self) -> StoreResult<serde_json::Value> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_STATS".to_string(),
+        })
+    }
 }
 
 /// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded

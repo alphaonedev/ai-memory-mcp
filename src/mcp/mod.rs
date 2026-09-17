@@ -683,6 +683,8 @@ pub(crate) use namespace::authorize_namespace_standard_bind;
 // delegates parent authorization to `handle_namespace_set_standard`).
 #[cfg(feature = "sal")]
 pub(crate) use namespace::authorize_namespace_standard_parent;
+#[cfg(feature = "sal")]
+pub(crate) use namespace::merge_governance_for_response;
 // v0.7.0 G-PHASE-E-2 (#707) — promoted to `pub` so the integration
 // regression at `tests/g_phase_e_2_namespace_set_standard_governance_passthrough.rs`
 // can exercise the merge path directly. The handler is still routed
