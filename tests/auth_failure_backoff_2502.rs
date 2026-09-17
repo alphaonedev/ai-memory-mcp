@@ -271,3 +271,71 @@ async fn requests_without_peer_address_fall_through_to_normal_auth() {
         "no peer -> right key admitted"
     );
 }
+
+/// (g) amend F1 BLOCKER pin — the headline claim: a backed-off source is
+/// refused BEFORE its key is compared, so the CORRECT shared key AND the
+/// correct per-agent key presented from that same source are still refused
+/// with 429 + Retry-After + the closed-vocabulary body (no key oracle);
+/// the same correct keys from a DIFFERENT source are admitted at the same
+/// moment (allowed-path control). Non-vacuity: forcing `pre_check` to
+/// `Admit` turns this cell red.
+#[tokio::test]
+async fn correct_keys_during_backoff_are_still_refused() {
+    let router = test_router(Some(SHARED_KEY), enrolled_agent_keys());
+    let hot = ip(51);
+    let cold = ip(52);
+    for i in 0..5 {
+        let out = attempt(&router, hot, Some(WRONG_KEY)).await;
+        assert_eq!(
+            out.status,
+            StatusCode::UNAUTHORIZED,
+            "failure {i} stays 401"
+        );
+    }
+    let sixth = attempt(&router, hot, Some(WRONG_KEY)).await;
+    assert_eq!(
+        sixth.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "6th wrong attempt refuses"
+    );
+    let shared_during = attempt(&router, hot, Some(SHARED_KEY)).await;
+    assert_eq!(
+        shared_during.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "correct shared key during backoff is still refused, not admitted"
+    );
+    assert!(
+        shared_during.retry_after.is_some(),
+        "refusal carries Retry-After"
+    );
+    assert_eq!(
+        shared_during.body, b"{\"error\":\"auth_backoff\"}",
+        "refusal body is the closed vocabulary"
+    );
+    let agent_during = attempt(&router, hot, Some(AGENT_TOKEN)).await;
+    assert_eq!(
+        agent_during.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "correct per-agent key during backoff is still refused, not admitted"
+    );
+    assert!(
+        agent_during.retry_after.is_some(),
+        "per-agent refusal carries Retry-After"
+    );
+    assert_eq!(
+        agent_during.body, b"{\"error\":\"auth_backoff\"}",
+        "per-agent refusal body is the closed vocabulary"
+    );
+    let shared_cold = attempt(&router, cold, Some(SHARED_KEY)).await;
+    assert_eq!(
+        shared_cold.status,
+        StatusCode::OK,
+        "correct shared key from a different source is admitted at the same moment"
+    );
+    let agent_cold = attempt(&router, cold, Some(AGENT_TOKEN)).await;
+    assert_eq!(
+        agent_cold.status,
+        StatusCode::OK,
+        "correct per-agent key from a different source is admitted at the same moment"
+    );
+}

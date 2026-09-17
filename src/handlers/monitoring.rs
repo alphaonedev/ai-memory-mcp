@@ -365,7 +365,7 @@ pub(crate) async fn metrics() -> Response {
         &m.federation_partial_quorum_total,
         &m.admission_shed_total,
         &m.auth_failures_total,
-        &m.auth_backoff_sources,
+        &m.auth_backoff_episodes_total,
         &m.recall_embed_degraded_total,
         &m.rerank_budget_degraded_total,
         &m.query_embed_cache_hits_total,

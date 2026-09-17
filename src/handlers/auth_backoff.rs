@@ -33,9 +33,13 @@
 //! * Fail-open (issue item 3): a broken counter admits and logs at WARN —
 //!   degrade, never deny. Pinned by the [`FailingStore`] seam.
 //! * Observability: `ai_memory_auth_failures_total` (no per-source label —
-//!   unbounded cardinality is forbidden) plus `ai_memory_auth_backoff_sources`
-//!   (sources currently refused), and one WARN edge-triggered on crossing
-//!   the threshold, never per failure.
+//!   unbounded cardinality is forbidden) plus
+//!   `ai_memory_auth_backoff_episodes_total` (backoff episodes begun since
+//!   boot, incremented exactly on the crossing edge — amend F5: a gauge of
+//!   "currently refused" would lie, because a source that crosses and never
+//!   returns keeps the gauge non-zero after its window expires while the
+//!   render path cannot recompute it), and one WARN edge-triggered on
+//!   crossing the threshold, never per failure.
 //!
 //! Constants only, no env knob (ruling 7): nothing in the row-130 class
 //! requires operator tuning here, so no `CLAUDE.md` env-table row and no
@@ -133,7 +137,7 @@ pub trait AuthFailureStore: Send {
     /// without the refusal becoming a key oracle.
     fn check(&mut self, source: IpAddr, now: Instant) -> Result<AuthDecision, StoreError>;
     /// A successful authentication resets the source. Returns whether a
-    /// backed-off source was cleared (the gauge edge).
+    /// backed-off source was cleared.
     fn record_success(&mut self, source: IpAddr) -> Result<bool, StoreError>;
     /// Sources currently refused at `now` (the gauge value).
     fn backed_off_count(&self, now: Instant) -> usize;
@@ -242,9 +246,10 @@ impl AuthFailureStore for LruAuthFailureStore {
             .entries
             .remove(&source)
             .is_some_and(|entry| entry.failures > FREE_FAILURES);
-        if was_backed_off {
-            self.recency.retain(|s| *s != source);
-        }
+        // Amend F3: recency shrinks with entries on EVERY success, not only
+        // for backed-off sources — otherwise each fail-a-few-times-then-succeed
+        // client leaks one recency element forever while entries stays capped.
+        self.recency.retain(|s| *s != source);
         Ok(was_backed_off)
     }
 
@@ -337,39 +342,48 @@ impl AuthFailurePolicy {
     /// errors.
     #[must_use]
     pub fn on_failure(&self, source: IpAddr, now: Instant) -> AuthDecision {
-        let mut inner = match self.shared.lock() {
-            Ok(inner) => inner,
-            Err(_) => return Self::fail_open(source, OP_RECORD_FAILURE),
-        };
-        if inner.broken {
-            return Self::fail_open(source, OP_RECORD_FAILURE);
-        }
-        match inner.store.record_failure(source, now) {
-            Ok((decision, crossed)) => {
-                let metrics = crate::metrics::registry();
-                metrics.auth_failures_total.inc();
-                if crossed {
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        ip = %source,
-                        failures = FREE_FAILURES + 1,
-                        "auth failures from one source crossed the backoff threshold — \
-                         refusing further attempts with 429 (edge-triggered)"
-                    );
-                }
-                if crossed || matches!(decision, AuthDecision::Refuse { .. }) {
-                    metrics
-                        .auth_backoff_sources
-                        .set(i64::try_from(inner.store.backed_off_count(now)).unwrap_or(i64::MAX));
-                }
-                decision
+        // Amend F4: the mutex is held only for the store call. The WARN edge
+        // and both metric increments happen AFTER the guard drops, so a slow
+        // log/metrics sink can never stall the auth hot path; `backed_off_count`
+        // (an O(entries) scan) is nowhere near it (F5 removed the sampling).
+        let outcome: Option<(AuthDecision, bool)> = {
+            let mut inner = match self.shared.lock() {
+                Ok(inner) => inner,
+                Err(_) => return Self::fail_open(source, OP_RECORD_FAILURE),
+            };
+            if inner.broken {
+                return Self::fail_open(source, OP_RECORD_FAILURE);
             }
-            Err(_) => Self::fail_open(source, OP_RECORD_FAILURE),
+            match inner.store.record_failure(source, now) {
+                Ok((decision, crossed)) => Some((decision, crossed)),
+                Err(_) => None,
+            }
+        };
+        let Some((decision, crossed)) = outcome else {
+            return Self::fail_open(source, OP_RECORD_FAILURE);
+        };
+        let metrics = crate::metrics::registry();
+        metrics.auth_failures_total.inc();
+        if crossed {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                ip = %source,
+                failures = FREE_FAILURES + 1,
+                "auth failures from one source crossed the backoff threshold — \
+                 refusing further attempts with 429 (edge-triggered)"
+            );
+            // Amend F5: episodes-since-boot, incremented exactly on the
+            // crossing edge — the same place the WARN fires.
+            metrics.auth_backoff_episodes_total.inc();
         }
+        decision
     }
 
     /// A successful authentication resets the source.
     pub fn on_success(&self, source: IpAddr) {
+        // Amend F4: no metric sample under the guard — F5 moved the gauge to
+        // an episodes counter incremented on the crossing edge only, so the
+        // success path needs no scan at all.
         let mut inner = match self.shared.lock() {
             Ok(inner) => inner,
             Err(_) => {
@@ -384,13 +398,12 @@ impl AuthFailurePolicy {
         if inner.broken {
             return;
         }
-        match inner.store.record_success(source) {
-            Ok(true) => {
-                crate::metrics::registry().auth_backoff_sources.set(
-                    i64::try_from(inner.store.backed_off_count(Instant::now())).unwrap_or(i64::MAX),
-                );
-            }
-            Ok(false) | Err(_) => {}
+        if inner.store.record_success(source).is_err() {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                ip = %source,
+                "auth-failure counter unavailable on success — continuing (fail-open)"
+            );
         }
     }
 }
@@ -588,5 +601,41 @@ mod tests {
             }
             AuthDecision::Admit => panic!("backed-off source must be refused"),
         }
+    }
+
+    /// Amend F3 pin: `recency` must shrink with `entries`. 2000 distinct
+    /// sources each fail once then succeed -> `recency.len() <=
+    /// entries.len() <= 1024`. Before the fix `record_success` pruned
+    /// `recency` only for backed-off sources, so every client that failed
+    /// 1-5 times then succeeded leaked one `recency` element forever.
+    #[test]
+    fn recency_shrinks_with_entries_on_success() {
+        let mut store = LruAuthFailureStore::new();
+        let now = Instant::now();
+        let mut sources = Vec::with_capacity(2000);
+        for i in 0..2000u32 {
+            let source = IpAddr::from([10, 200, (i >> 8) as u8, (i & 0xff) as u8]);
+            sources.push(source);
+            let _ = store.record_failure(source, now).expect("record");
+        }
+        assert!(
+            store.entries.len() <= MAX_TRACKED_SOURCES,
+            "entries bounded: {}",
+            store.entries.len()
+        );
+        for source in sources {
+            let _ = store.record_success(source).expect("reset");
+        }
+        assert!(
+            store.recency.len() <= store.entries.len(),
+            "recency must shrink with entries: recency {} > entries {}",
+            store.recency.len(),
+            store.entries.len()
+        );
+        assert!(
+            store.recency.len() <= MAX_TRACKED_SOURCES,
+            "recency bounded: {}",
+            store.recency.len()
+        );
     }
 }
