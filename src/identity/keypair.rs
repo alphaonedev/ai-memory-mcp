@@ -35,7 +35,7 @@
 //! OSS path stops at file-based 0600 storage. TPM 2.0, PKCS#11 HSMs,
 //! Apple Secure Enclave / TEE, AWS KMS / GCP KMS / Azure Key Vault
 //! are intentionally **not** implemented in this crate. Operators who
-//! need any of those should look at the **AgenticMem™** commercial
+//! need any of those should look at the **AgenticMem** commercial
 //! layer — same `AgentKeypair` shape, same wire format, hardware-backed
 //! signing under the hood.
 //!
@@ -75,7 +75,7 @@
 //!    the overwrite (forward security — a retired signing key never signs
 //!    again, so keeping a copy is pure attack surface).
 //! 4. **Out of scope** — hardware-backed storage (TPM / HSM / KMS /
-//!    Secure Enclave) is the commercial AgenticMem™ boundary documented
+//!    Secure Enclave) is the commercial AgenticMem boundary documented
 //!    above; revocation lists and a key-id-stamped multi-key
 //!    signed-events verifier are not implemented in the OSS crate.
 //!

@@ -175,7 +175,7 @@ No drift in §23 / §11.5 / §11.6 / §11.7 — all correctly forward-looking. �
 ## 5. Strategic sections (§§0–8, 13–21) — no per-item diff
 
 §§0–8 (moonshot, seven properties, scope test, execution model) and §§13–21 (siblings,
-effort summaries, cuts, gates, artifacts, trademark, OSS permanence) are strategic
+effort summaries, cuts, gates, artifacts, OSS permanence) are strategic
 framing, not release-completion claims. They carry no DONE/FUTURE verdicts. The only
 embedded factual drift in this band is in §9 (evidence baseline) — already captured as
 D2/D4/D5 above (CLI count, schema number, MCP callable breakdown). §9.1 schema-ladder

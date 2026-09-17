@@ -10,7 +10,7 @@
 | **Method** | **7 waves × 7 adversarial agents = 49 slots** · CodeGraph-anchored · ROADMAP.md + moonshot-synthesis + TRACT §26 + Red Queen §25 |
 | **Primary sources** | `docs/v1.0.0/perfect-endpoint-assessment/w7-a7-grand-synthesis.md` · `docs/v1.0.0/perfect-endpoint-assessment/w7-a2-v1-epic-dag.md` · `docs/v1.0.0/perfect-endpoint-assessment/waves/w7-a1-final-scorecard.md` · all `waves/w*-a*.md` |
 | **Supersedes (for planning)** | ROADMAP §11.6 *as executable epic* (prose rewrite still required); does **not** replace ROADMAP.md until operator merges R1–R18 |
-| **Trademark** | ai-memory™ · Apache 2.0 |
+| **License** | Apache 2.0 |
 
 ---
 
@@ -575,7 +575,7 @@ P0-3 fed write-sig ──────────────────► v1.
 | 6 | Endpoint-resident + LLM-agnostic | Real |
 | 7 | SAL + embeddings-as-cache | CORRECT |
 | 8 | Seven-property composition as identity | Named; partial hold |
-| 9 | Apache-2.0 + trademark | Medium; dies under category confusion |
+| 9 | Apache-2.0 | Medium; dies under category confusion |
 | 10 | Recall quality / R@k | **Low** (anti-primary) |
 | — | Tool-count supremacy | **Anti-moat** |
 | — | “Perfect” grandeur brand | **Anti-moat** |
