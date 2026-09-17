@@ -97,6 +97,7 @@ fn router(api_key: Option<&str>, admins: Vec<String>) -> axum::Router {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }

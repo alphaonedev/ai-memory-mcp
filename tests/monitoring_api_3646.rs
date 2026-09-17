@@ -144,6 +144,7 @@ fn router(mut app: AppState, tls: bool, shared: bool) -> (axum::Router, Arc<Enro
         mtls_enforced: true,
         enrolled_agent_keys: Arc::clone(&registry),
         identity_mode: ai_memory::config::HttpIdentityMode::Off,
+        ..Default::default()
     };
     (ai_memory::build_router(auth, app), registry)
 }

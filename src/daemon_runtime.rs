@@ -7836,6 +7836,8 @@ pub async fn bootstrap_serve(
         // #2044 — SAME shared `Arc` + posture as `AppState` (loaded above).
         enrolled_agent_keys: enrolled_agent_keys.clone(),
         identity_mode: http_identity_mode,
+        // #2502 — production backoff policy (bounded LRU, constants only).
+        auth_backoff: crate::handlers::auth_backoff::AuthFailurePolicy::new(),
     };
     if api_key_state.key.is_some() {
         if mtls_enforced {
@@ -8342,13 +8344,13 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                         bindings,
                     ))
                     .handle(handle)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             } else {
                 axum_server::bind(socket_addr)
                     .acceptor(tls::serve_rustls_acceptor(&tls_config))
                     .handle(handle)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             }
         }

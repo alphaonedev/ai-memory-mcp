@@ -103,6 +103,7 @@ fn build_router() -> (axum::Router, NamedTempFile) {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         },
         app_state,
     );

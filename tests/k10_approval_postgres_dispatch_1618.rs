@@ -109,6 +109,7 @@ fn build_disjoint_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (
         ai_memory::build_router(api_key_state, app_state),
@@ -398,6 +399,7 @@ mod live_pg {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         };
         let router = ai_memory::build_router(api_key_state, app_state);
 
@@ -485,6 +487,7 @@ mod live_pg {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         };
         let router = ai_memory::build_router(api_key_state, app_state);
 
@@ -589,6 +592,7 @@ async fn pending_approve_missing_id_returns_404_on_sqlite_1620() {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         };
         (ai_memory::build_router(api_key_state, app_state), db_path)
     };

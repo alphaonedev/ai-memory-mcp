@@ -491,6 +491,7 @@ async fn purity_pure_default_http_entry_path() {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         },
         app_state,
     );

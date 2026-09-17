@@ -122,6 +122,7 @@ fn build_router_with_embedder(embedder: Option<Embedder>) -> (axum::Router, Name
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f)

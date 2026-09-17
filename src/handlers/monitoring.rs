@@ -361,9 +361,11 @@ pub(crate) async fn metrics() -> Response {
     let m = crate::metrics::registry();
     // Explicit scalar collectors only. Never forward the global registry:
     // labels elsewhere may contain tenant-controlled strings or peer URLs.
-    let collectors: [&dyn Collector; 13] = [
+    let collectors: [&dyn Collector; 15] = [
         &m.federation_partial_quorum_total,
         &m.admission_shed_total,
+        &m.auth_failures_total,
+        &m.auth_backoff_sources,
         &m.recall_embed_degraded_total,
         &m.rerank_budget_degraded_total,
         &m.query_embed_cache_hits_total,

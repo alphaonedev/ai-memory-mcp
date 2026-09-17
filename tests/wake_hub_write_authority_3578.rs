@@ -149,6 +149,7 @@ fn router(mut app: AppState, token: Option<&str>) -> axum::Router {
             mtls_enforced: false,
             enrolled_agent_keys: enrolled,
             identity_mode: ai_memory::config::HttpIdentityMode::Enforce,
+            ..Default::default()
         },
         app,
     )

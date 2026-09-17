@@ -9457,6 +9457,7 @@ impl OneshotDaemon {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         };
         let router = ai_memory::build_router(api_key_state, app_state);
         Self { router }
@@ -13417,6 +13418,7 @@ fn build_serve_state(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (api_key_state, app_state)
 }

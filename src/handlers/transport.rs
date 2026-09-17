@@ -3,14 +3,16 @@
 
 use axum::{
     Json,
-    extract::{FromRef, FromRequest, Request, State, rejection::JsonRejection},
+    extract::{ConnectInfo, FromRef, FromRequest, Request, State, rejection::JsonRejection},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{ResolvedTtl, TierConfig};
@@ -926,6 +928,11 @@ pub struct ApiKeyState {
     /// Governs whether a presented per-agent key BINDS `X-Agent-Id` and whether
     /// a self-asserted-header/key mismatch is a `403`.
     pub identity_mode: crate::config::HttpIdentityMode,
+    /// #2502 — per-source auth-failure backoff policy (the ONE predicate,
+    /// `handlers::auth_backoff::AuthFailurePolicy`). `Clone` shares the table,
+    /// so every middleware copy decides from the same counters. Defaults to
+    /// the production bounded-LRU policy.
+    pub auth_backoff: super::auth_backoff::AuthFailurePolicy,
 }
 
 /// Constant-time byte-slice equality. Doesn't short-circuit on the
@@ -963,6 +970,53 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// #2502 — peer source for auth-failure backoff: the TCP peer IP from
+/// `ConnectInfo` (wired by `into_make_service_with_connect_info` in `serve`).
+/// NEVER a client header: the tree has no trusted-proxy setting, so a
+/// header-derived source would let an attacker lock someone else out with a
+/// forged header. `None` (a router driven without a TCP listener, as in
+/// tests) passes through to normal auth with no backoff.
+/// See `handlers::auth_backoff` for the policy.
+fn auth_backoff_source(req: &Request) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0.ip())
+}
+
+/// #2502 — the backoff refusal: `429` + `Retry-After`, ONE closed-vocabulary
+/// body. Rendered only here, so the shared-key and per-agent-key paths are
+/// byte-identical and the body never says whether the key exists or which
+/// path failed (uniform refusal).
+fn backoff_refusal(retry_after_secs: u64) -> Response {
+    let retry = axum::http::HeaderValue::from_str(&retry_after_secs.to_string())
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("1"));
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, retry)],
+        Json(json!({"error": super::auth_backoff::AUTH_BACKOFF_ERROR})),
+    )
+        .into_response()
+}
+
+/// #2502 — record one transport-auth failure for `source` and render the
+/// verdict: `Admit` keeps the pre-existing `401` (until the threshold);
+/// `Refuse` becomes the uniform `429`. A `None` source skips the counter.
+/// A broken counter admits (fail-open inside the policy) and lands on the
+/// `401` arm — degrade, never deny.
+fn record_auth_failure(auth: &ApiKeyState, source: Option<IpAddr>, now: Instant) -> Response {
+    if let Some(ip) = source
+        && let super::auth_backoff::AuthDecision::Refuse { retry_after_secs } =
+            auth.auth_backoff.on_failure(ip, now)
+    {
+        return backoff_refusal(retry_after_secs);
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "missing or invalid API key"})),
+    )
+        .into_response()
 }
 
 /// Middleware: reject requests with 401 if `api_key` is configured and the
@@ -1039,6 +1093,21 @@ pub async fn api_key_auth(
         return next.run(req).await.into_response();
     }
 
+    // #2502 — per-source auth-failure backoff, consulted BEFORE the presented
+    // key is compared: a backed-off source is refused with `429` even for a
+    // correct key, so the refusal is not a key oracle. Each refusal ALSO
+    // records (the backoff escalates while the source keeps guessing); a
+    // broken counter admits (fail-open). The `/health` + keyless + mTLS
+    // bypasses above return before this point and are never counted.
+    let source = auth_backoff_source(&req);
+    let now = Instant::now();
+    if let Some(ip) = source
+        && let super::auth_backoff::AuthDecision::Refuse { .. } =
+            auth.auth_backoff.pre_check(ip, now)
+    {
+        return record_auth_failure(&auth, source, now);
+    }
+
     // #2044 — resolve the presented credential (header only, since #2032 L1
     // removed the `?api_key=` query form). We keep the raw token so we can BOTH
     // transport-authenticate it (constant-time) AND, when it is an ENROLLED
@@ -1076,11 +1145,7 @@ pub async fn api_key_auth(
     }
 
     let Some(token) = presented else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "missing or invalid API key"})),
-        )
-            .into_response();
+        return record_auth_failure(&auth, source, now);
     };
 
     // Transport auth: accept the SHARED global key OR any ENROLLED per-agent
@@ -1100,11 +1165,13 @@ pub async fn api_key_auth(
             .cloned()
     };
     if !is_global && per_agent.is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "missing or invalid API key"})),
-        )
-            .into_response();
+        return record_auth_failure(&auth, source, now);
+    }
+
+    // #2502 — a success resets the source's failure budget (ruling 2). The
+    // `403` identity-mismatch arm below is NOT a failure: the key was valid.
+    if let Some(ip) = source {
+        auth.auth_backoff.on_success(ip);
     }
 
     // #2044 (#2032-A / H1 IDOR + M1 admin spoof) — per-agent-key PRINCIPAL

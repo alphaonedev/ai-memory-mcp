@@ -120,6 +120,7 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, Db) {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         },
         app_state,
     );

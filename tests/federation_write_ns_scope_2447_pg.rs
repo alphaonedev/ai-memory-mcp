@@ -116,6 +116,7 @@ async fn pg_router(url: &str) -> (axum::Router, Arc<dyn MemoryStore>) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (ai_memory::build_router(api_key_state, app_state), store)
 }

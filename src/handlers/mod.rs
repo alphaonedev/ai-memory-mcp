@@ -107,6 +107,7 @@ pub mod admin_role;
 pub mod agent_api_key;
 pub mod approvals;
 pub mod archive;
+pub mod auth_backoff;
 /// v1.0.0 #3549 — the HTTP caller-authority chokepoint (one middleware beneath
 /// `api_key_auth`; every route registration sits under it).
 pub mod authority;

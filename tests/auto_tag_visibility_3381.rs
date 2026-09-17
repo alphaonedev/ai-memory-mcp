@@ -231,6 +231,7 @@ async fn check_visibility(mut app: AppState) {
             mtls_enforced: false,
             enrolled_agent_keys: app.enrolled_agent_keys.clone(),
             identity_mode: app.http_identity_mode,
+            ..Default::default()
         },
         app.clone(),
     );
@@ -282,6 +283,7 @@ async fn check_visibility(mut app: AppState) {
             mtls_enforced: false,
             enrolled_agent_keys: enrolled,
             identity_mode: app.http_identity_mode,
+            ..Default::default()
         },
         app,
     );

@@ -426,6 +426,17 @@ pub struct Metrics {
     /// on every deployment that has not opted into admission control
     /// (the cap defaults to disabled).
     pub admission_shed_total: IntCounter,
+    /// #2502 — monotonic count of HTTP transport-auth failures
+    /// (missing/unknown `x-api-key`, shared-key and per-agent-key paths).
+    /// Deliberately label-free: a per-source label would hand an attacker
+    /// unbounded series cardinality. Non-zero means someone is presenting
+    /// bad credentials — a misconfigured client or a guesser; pair with the
+    /// edge-triggered `http::auth` WARN to tell them apart.
+    pub auth_failures_total: IntCounter,
+    /// #2502 — sources currently refused by the auth-failure backoff
+    /// (failure count past the threshold with a live backoff window).
+    /// Non-zero means the backoff is actively refusing someone.
+    pub auth_backoff_sources: IntGauge,
 
     /// #2577 — monotonic count of recalls whose query embedding could not
     /// be produced within [`crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS`]
@@ -1136,6 +1147,18 @@ impl Metrics {
         )?;
         registry.register(Box::new(admission_shed_total.clone()))?;
 
+        let auth_failures_total = IntCounter::new(
+            "ai_memory_auth_failures_total",
+            "Total HTTP transport-auth failures (missing or unknown API key)              since boot, all sources, no per-source label.",
+        )?;
+        registry.register(Box::new(auth_failures_total.clone()))?;
+
+        let auth_backoff_sources = IntGauge::new(
+            "ai_memory_auth_backoff_sources",
+            "Sources currently refused by the per-source auth-failure              backoff; 0 = no source is backed off.",
+        )?;
+        registry.register(Box::new(auth_backoff_sources.clone()))?;
+
         let recall_embed_degraded_total = IntCounter::new(
             "ai_memory_recall_embed_degraded_total",
             "Monotonic counter of recalls that fell back to keyword/FTS because \
@@ -1331,6 +1354,8 @@ impl Metrics {
             federation_cred_max_age_seconds,
             federation_renewal_lag_seconds,
             admission_shed_total,
+            auth_failures_total,
+            auth_backoff_sources,
             recall_embed_degraded_total,
             rerank_budget_degraded_total,
             query_embed_cache_hits_total,
@@ -1759,6 +1784,9 @@ mod tests {
             "ai_memory_federation_inbound_cred_total",
             "ai_memory_federation_cred_max_age_seconds",
             "ai_memory_federation_renewal_lag_seconds",
+            // #2502 — per-source auth-failure backoff surfaces.
+            "ai_memory_auth_failures_total",
+            "ai_memory_auth_backoff_sources",
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }
