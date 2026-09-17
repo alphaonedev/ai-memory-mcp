@@ -644,6 +644,9 @@ impl MemoryStore for SqliteStore {
     /// paths. Delegates to the sqlite SSOT `db::insert_restore_same_id`
     /// (`INSERT … ON CONFLICT(title, namespace) DO UPDATE … WHERE memories.id =
     /// excluded.id`): a same-id restore (incl. against a tombstoned row) merges,
+    /// and since #2894 a restore onto a consolidation tombstone re-opens the
+    /// row to the snapshot's visible lifecycle (the ONE re-open predicate),
+    /// so the restored original is recallable;
     /// a DIFFERENT-id owner is refused with [`StoreError::Conflict`] carrying the
     /// occupant's id, and the foreign row is never clobbered. Mirrors
     /// [`Self::store`]'s `bypass_visibility` substrate why_trace stamp so a

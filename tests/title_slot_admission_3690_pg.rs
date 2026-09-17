@@ -302,18 +302,21 @@ async fn pg_find_by_title_namespace_reports_only_the_visible_occupant_3690() {
 }
 
 /// #2887 / #3690 (vote Q3) — the same-id restore of a TOMBSTONE still merges
-/// in place (re-targeted at the PRIMARY KEY) and stays tombstoned; a restore
+/// in place (re-targeted at the PRIMARY KEY) and RE-OPENS it (#2894); a restore
 /// whose key a DIFFERENT live row now holds is refused NAMING that row; a
 /// same-id restore onto a QUARANTINED row is refused unnamed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_admin("ai:curator");
-    // tombstone, no live holder → in-place merge, stays tombstoned.
-    // CHARACTERISATION (#2887 / #2894 / #3690): identical to the pre-v100
-    // in-place CAS — same row, identity columns byte-identical, ONE row under
-    // the key, the arm's rewrites moved; and #2894 is NOT fixed here (the row
-    // is still hidden afterwards, as before).
+    // tombstone, no live holder -> in-place merge AND re-open (#2894).
+    // REQUIREMENT (converted from CHARACTERISATION by #2894): identical to
+    // the pre-v100 in-place CAS - same row, identity columns byte-identical
+    // except the lifecycle, ONE row under the key, the arm's rewrites moved -
+    // and the row is visible afterwards: the lifecycle returns to the
+    // snapshot's state via the ONE re-open predicate
+    // (`LifecycleState::restore_reopens_row`, rendered into the restore arm
+    // by `models::restore_reopen_lifecycle_assignment` on both adapters).
     let ns = uid("ns");
     let a = uid("a");
     store
@@ -330,11 +333,14 @@ async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
     assert_eq!(id, a, "the restore lands on the SAME row (CAS semantics)");
     let after = identity_of(&store, &a).await;
     assert_eq!(
-        (&after.0, &after.1, &after.2),
-        (&before.0, &before.1, &before.2),
-        "identity columns byte-identical"
+        (&after.0, &after.2),
+        (&before.0, &before.2),
+        "identity columns byte-identical (except the re-opened lifecycle)"
     );
-    assert_eq!(after.1, "tombstoned", "restore never un-tombstones");
+    assert_eq!(
+        after.1, "open",
+        "#2894: a rollback restore re-opens the consolidation tombstone"
+    );
     assert_eq!(
         after.3,
         before.3 + 1,
@@ -346,26 +352,44 @@ async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
         1,
         "never a second row beside the tombstone"
     );
-    assert!(
-        matches!(store.get(&ctx, &a).await, Err(StoreError::NotFound { .. })),
-        "#2894 is not fixed here: the restored row is still hidden (pre- and post-Unit-1 alike)"
+    assert_eq!(
+        store
+            .get(&ctx, &a)
+            .await
+            .expect("#2894: restored row visible")
+            .content,
+        "restored",
+        "#2894 FIXED: the restored original is reachable on the read path"
     );
 
-    // a different live row took the key → refused, naming it
-    let b = uid("b");
+    // a different live row holds the key → refused, naming it. (Fresh
+    // namespace: since #2894 the tombstone above re-opened, so it holds its
+    // own key again - the holder scenario needs its own key.)
+    let ns_hold = uid("ns");
+    let t = uid("t");
     store
-        .store(&ctx, &mem(&b, &ns, "slot", "newer owner"))
+        .store(&ctx, &mem(&t, &ns_hold, "slot", "original"))
         .await
-        .expect("beside");
+        .expect("seed tombstone-to-be");
+    set_state(&store, &t, "tombstoned").await;
+    let h = uid("h");
+    store
+        .store(&ctx, &mem(&h, &ns_hold, "slot", "live holder"))
+        .await
+        .expect("a tombstone holds no slot: the holder lands beside it");
     let err = store
-        .restore_or_conflict(&ctx, &mem(&a, &ns, "slot", "again"))
+        .restore_or_conflict(&ctx, &mem(&t, &ns_hold, "slot", "again"))
         .await
         .expect_err("the live holder wins");
-    assert_eq!(conflict_id(&err), b);
-    assert_eq!(raw(&store, &a).await.0, "restored");
+    assert_eq!(conflict_id(&err), h);
     assert_eq!(
-        raw(&store, &b).await,
-        ("newer owner".to_string(), "open".to_string(), 1)
+        raw(&store, &t).await,
+        ("original".to_string(), "tombstoned".to_string(), 1),
+        "refused restore touches neither the tombstone nor the holder"
+    );
+    assert_eq!(
+        raw(&store, &h).await,
+        ("live holder".to_string(), "open".to_string(), 1)
     );
 
     // quarantined same id → refused unnamed

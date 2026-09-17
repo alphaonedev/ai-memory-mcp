@@ -23288,7 +23288,10 @@ impl MemoryStore for PostgresStore {
 
     /// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
     /// paths (autonomy `reverse_rollback_entry_store`, curator
-    /// `rollback_consolidation`). Delegates to the shared
+    /// `rollback_consolidation`). Since #2894 a restore onto a consolidation
+    /// tombstone re-opens the row to the snapshot's visible lifecycle (the ONE
+    /// re-open predicate, shared with sqlite), so the restored original is
+    /// recallable. Delegates to the shared
     /// [`Self::store_with_embedding_inner`] with `embedding = None` under the
     /// [`crate::storage::InsertConflictArm::RestoreSameId`] CAS, so a same-id
     /// restore merges and a DIFFERENT-id owner of `(title, namespace)` is refused
@@ -35426,7 +35429,14 @@ impl PostgresStore {
                 -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
                 -- re-store (sqlite parity); advances go through the typed
                 -- update gate.
-                lifecycle_state = memories.lifecycle_state,
+                -- v1.0.0 #2894 — EXCEPT a rollback RESTORE onto a
+                -- consolidation tombstone, which re-opens the row to the
+                -- snapshot's visible lifecycle via the ONE re-open predicate
+                -- (`crate::models::restore_reopen_lifecycle_assignment`,
+                -- shared with the sqlite funnel). A stored visible row takes
+                -- the ELSE arm (the #1709 rule, unchanged); anything else
+                -- keeps the stored state, so a quarantine is never laundered.
+                lifecycle_state = {reopen_lifecycle},
                 -- v1.0.0 #2267 / #1834 — match the plain `store()`
                 -- claim-bitemporal contract: genesis is immutable while a
                 -- newly supplied upper bound may close the existing claim.
@@ -35459,6 +35469,7 @@ impl PostgresStore {
             RETURNING id",
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+            reopen_lifecycle = crate::models::restore_reopen_lifecycle_assignment("memories"),
             unstamped_owner_drop =
                 crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
                     crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
@@ -35491,6 +35502,8 @@ impl PostgresStore {
             // the tombstone is not in the v100 partial index, so the key does
             // not conflict; re-target the SAME arm at the PRIMARY KEY with the
             // visible-only backstop removed (the sqlite `insert_inner` twin).
+            // #2894 — the arm's lifecycle CASE re-opens the tombstone to the
+            // snapshot's visible state (it is not part of the removed backstop).
             crate::storage::InsertConflictArm::RestoreSameId
                 if slot_verdict.restore_tombstone_by_id =>
             {

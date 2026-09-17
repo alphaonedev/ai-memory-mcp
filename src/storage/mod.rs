@@ -2171,7 +2171,18 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
                 -- (typically `open`) initial state. Lifecycle ADVANCES go
                 -- through the typed `memory_update` transition gate, never a
                 -- silent upsert.
-                lifecycle_state = memories.lifecycle_state,
+                -- v1.0.0 #2894 — EXCEPT a rollback RESTORE onto a
+                -- consolidation tombstone, which re-opens the row to the
+                -- snapshot's visible lifecycle via the ONE re-open predicate
+                -- (`crate::models::restore_reopen_lifecycle_assignment`,
+                -- the statement-level twin of
+                -- `LifecycleState::restore_reopens_row` shared with the
+                -- postgres funnel). A stored visible row takes the ELSE arm
+                -- (the #1709 rule, unchanged); a stored tombstone with a
+                -- visible snapshot takes the THEN arm (the fix); anything
+                -- else keeps the stored state, so a quarantine is never
+                -- laundered.
+                lifecycle_state = {reopen_lifecycle},
                 -- #1632 — upsert-merge IS a mutation (content/tags/priority
                 -- can change), so the Gap-1 optimistic-concurrency counter
                 -- bumps here exactly like db::update. Pre-#1632 a re-store
@@ -2222,6 +2233,7 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
              RETURNING id",
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
         merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+        reopen_lifecycle = crate::models::restore_reopen_lifecycle_assignment("memories"),
         unstamped_owner =
             crate::identity::owner_stamp::sqlite_unstamped_predicate(
                 crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
@@ -2507,8 +2519,11 @@ fn insert_inner(
         //     SAME `DO UPDATE SET` arm is re-targeted `ON CONFLICT (id)` with
         //     the visible-only merge backstop removed (the occupant is, by
         //     construction, the caller's own tombstone), so the restore
-        //     merges in place exactly as before v100 and the row stays
-        //     tombstoned. Reached only when NO live row holds the key.
+        //     merges in place exactly as before v100 - and, since #2894,
+        //     the arm's lifecycle CASE re-opens the tombstone to the
+        //     snapshot's visible state (the row no longer stays tombstoned:
+        //     a restore the caller cannot see is not a restore). Reached
+        //     only when NO live row holds the key.
         let sql: std::borrow::Cow<'_, str> = match conflict_arm {
             InsertConflictArm::Merge => std::borrow::Cow::Borrowed(upsert_sql),
             InsertConflictArm::Refuse => {

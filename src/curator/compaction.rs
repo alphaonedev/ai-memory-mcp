@@ -1931,18 +1931,22 @@ mod tests {
             assert!(crate::db::get(&conn, &result_id).unwrap().is_none());
         }
 
-        /// #2894 — CHARACTERISATION (post == pre): with tombstoning ON,
-        /// `consolidate` leaves each source present and HIDDEN, and the
-        /// same-id restore keeps the stored lifecycle (the #3690 vote Q3
-        /// pins: `tests/title_slot_admission_3690*.rs`), so after the
-        /// Stage-6 rollback the rows are exactly as they were before it —
-        /// present, unreachable on the caller's read path. #2894 is NOT
-        /// fixed here. What this unit fixes is the rollback's HONESTY about
-        /// it: a row the caller cannot reach is not restored, so the rollback
-        /// is INCOMPLETE, names every such row, and RETAINS the summary —
-        /// before this the rollback counted them as restored, deleted the
-        /// summary, and reported success while the caller could reach
-        /// nothing.
+        /// #2894 - REQUIREMENT: with tombstoning ON, `consolidate`
+        /// leaves each source present and HIDDEN, but the Stage-6 rollback
+        /// RESTORES them to reachability: the same-id restore re-opens each
+        /// tombstoned source to its pre-merge (visible) lifecycle via the ONE
+        /// re-open predicate (`LifecycleState::restore_reopens_row`, rendered
+        /// into the restore arm by `models::restore_reopen_lifecycle_assignment`
+        /// on both adapters), so every original counts as restored, the
+        /// unverifiable summary is DELETED, and the read path shows the
+        /// originals again.
+        ///
+        /// Converted from CHARACTERISATION by #2894 (the Unit-2 cell pinned
+        /// the still-hidden outcome as the open state: rollback INCOMPLETE,
+        /// summary retained). The rollback's honesty rule (#2893) is
+        /// unchanged - a row the caller cannot reach still fails the
+        /// rollback - but a re-opened row IS reachable, so the rollback now
+        /// completes.
         #[tokio::test]
         async fn issue_2894_rollback_of_tombstoned_sources_is_incomplete_and_keeps_the_summary() {
             let dag = crate::test_support::LineageDagIsolation::new();
@@ -2002,36 +2006,60 @@ mod tests {
             }
             assert_eq!(read_path(&conn), vec![result_id.clone()]);
 
-            // The rollback: every restore write lands (same-id CAS) but no
-            // row is reachable afterwards — INCOMPLETE, named, summary kept.
-            let err = pass
+            // The rollback: every restore write lands (same-id CAS) AND
+            // re-opens its row, so every original is reachable afterwards -
+            // the rollback COMPLETES and the summary is deleted.
+            let restored = pass
                 .rollback_consolidation(&candidates, &result_id)
                 .await
-                .expect_err("#2894: a restored row the caller cannot reach is not restored")
-                .to_string();
-            assert!(err.starts_with(ROLLBACK_INCOMPLETE_SLUG), "{err}");
-            assert!(err.contains("2 of 2 originals not restored"), "{err}");
-            for m in &candidates {
-                assert!(err.contains(&m.id), "names {}: {err}", m.id);
-            }
-            assert!(
-                err.contains("not reachable after the restore write (pre-merge row was open"),
-                "{err}"
-            );
-            // post == pre (pre-rollback): the rows are as they were, hidden.
+                .expect("#2894: a rollback that re-opens every source completes");
+            assert_eq!(restored, 2, "both originals restored AND reachable");
+            // post == pre (pre-merge): open, reachable on the read path.
             for m in &candidates {
                 assert_eq!(
                     state_of(&conn, &m.id),
-                    "tombstoned",
-                    "characterised, not fixed"
+                    m.lifecycle_state.as_str(),
+                    "the restore re-opens the row to the pre-merge lifecycle"
                 );
-                assert!(crate::db::get(&conn, &m.id).unwrap().is_none());
+                assert_eq!(
+                    crate::db::get(&conn, &m.id)
+                        .unwrap()
+                        .expect("reachable")
+                        .content,
+                    m.content,
+                    "the restored original carries the pre-merge text"
+                );
             }
             assert!(
-                crate::db::get(&conn, &result_id).unwrap().is_some(),
-                "the summary is RETAINED: it is the only reachable copy of the merged text"
+                crate::db::get(&conn, &result_id).unwrap().is_none(),
+                "the unverifiable summary is deleted once every original is back"
             );
-            assert_eq!(read_path(&conn), vec![result_id.clone()]);
+            assert_eq!(
+                read_path(&conn),
+                pre,
+                "the read path shows the originals again"
+            );
+            // No dangling bookkeeping: the summary's derived_from edges die
+            // with it, and no atom_of pointer names the removed summary.
+            let dangling: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
+                    [&result_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(dangling, 0, "no links survive the deleted summary");
+            let atoms_pointing_at_summary: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+                    [&result_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                atoms_pointing_at_summary, 0,
+                "no atom_of pointer dangles at the removed summary"
+            );
             drop(dag);
         }
 

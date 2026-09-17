@@ -564,12 +564,21 @@ pub const RECALL_VISIBLE_LIFECYCLE_STATES: [LifecycleState; 5] = [
 /// `table_alias` is the memories-table alias in the host query (`"m"`,
 /// `"memories"`, or `""` for an unqualified column).
 #[must_use]
-pub fn lifecycle_visible_clause(table_alias: &str) -> String {
-    let col = if table_alias.is_empty() {
+/// Qualify the `lifecycle_state` column with a trusted SQL alias (bare when
+/// `table_alias` is empty) - the single spelling shared by the
+/// visibility-clause builders and the #2894 restore re-open assignment, so
+/// the alias qualification cannot drift between them (pm-v3.1
+/// hardcoded-literals ratchet: one named site, not three copies).
+fn qualified_lifecycle_col(table_alias: &str) -> String {
+    if table_alias.is_empty() {
         super::field_names::LIFECYCLE_STATE.to_string()
     } else {
         format!("{table_alias}.{}", super::field_names::LIFECYCLE_STATE)
-    };
+    }
+}
+
+pub fn lifecycle_visible_clause(table_alias: &str) -> String {
+    let col = qualified_lifecycle_col(table_alias);
     let mut list = String::new();
     for (i, state) in RECALL_VISIBLE_LIFECYCLE_STATES.iter().enumerate() {
         if i > 0 {
@@ -650,6 +659,23 @@ impl LifecycleState {
     pub fn title_slot_admission_for(raw: &str) -> TitleSlotAdmission {
         Self::from_str(raw).map_or(TitleSlotAdmission::Refused, Self::title_slot_admission)
     }
+    /// v1.0.0 #2894 - the ONE re-open predicate for a rollback restore: a
+    /// `restore_or_conflict` write that merges into a stored row re-opens it
+    /// (returns it to a caller-visible lifecycle) exactly when the STORED row
+    /// is a consolidation tombstone and the INCOMING snapshot is itself a
+    /// visible state. Every other combination keeps the stored lifecycle: a
+    /// stored visible row keeps its (possibly advanced) state (#1709 - the
+    /// plain re-store rule, unchanged), and a stored quarantined /
+    /// contaminated row is NEVER re-opened by a restore (those funnels refuse
+    /// before the statement runs, #3695). The statement-level twin
+    /// ([`crate::models::restore_reopen_lifecycle_assignment`], called by
+    /// BOTH adapters) renders this same decision into the restore `DO UPDATE`
+    /// arm so it holds atomically; this bool form is what unit tests pin
+    /// directly.
+    #[must_use]
+    pub fn restore_reopens_row(stored: Self, incoming: Self) -> bool {
+        stored == Self::Tombstoned && incoming.is_recall_visible()
+    }
 }
 
 /// #3690 — the ONE upsert conflict target for the `(title, namespace)` slot,
@@ -684,6 +710,36 @@ pub fn title_slot_merge_backstop(table_alias: &str) -> String {
 /// the merge arm at the PRIMARY KEY) splits its literal here.
 pub const TITLE_SLOT_MERGE_BACKSTOP_HEAD: &str = "WHERE 1 = 1";
 
+/// v1.0.0 #2894 - the statement-level twin of
+/// [`LifecycleState::restore_reopens_row`] for the restore `DO UPDATE` arm.
+/// Called by BOTH adapters (sqlite `storage::INSERT_UPSERT_SQL`, postgres
+/// `store_with_embedding_inner`) so the re-open decision lives at exactly
+/// ONE site: `CASE WHEN <stored> IS the consolidation tombstone AND the
+/// incoming snapshot IS a recall-visible state THEN the snapshot's lifecycle
+/// ELSE the stored lifecycle END`. The incoming-state arm reuses
+/// [`lifecycle_visible_clause`] (the same allow-list `is_recall_visible`
+/// mirrors), so a quarantined / contaminated / unknown snapshot keeps the
+/// row hidden even if it ever reached the statement, and a concurrent
+/// quarantine that lands between the funnel's admission probe and its
+/// statement still updates nothing - the guard is evaluated atomically in
+/// the statement, exactly like [`title_slot_merge_backstop`].
+///
+/// `table_alias` must be a trusted SQL alias (both adapters pass the
+/// `memories` table name their `DO UPDATE` arm already qualifies).
+#[must_use]
+pub fn restore_reopen_lifecycle_assignment(table_alias: &str) -> String {
+    let stored_col = qualified_lifecycle_col(table_alias);
+    let incoming_visible = lifecycle_visible_clause("excluded");
+    let incoming_visible = incoming_visible
+        .strip_prefix("AND ")
+        .unwrap_or(incoming_visible.as_str());
+    format!(
+        "CASE WHEN {stored_col} = '{}' AND {incoming_visible} THEN excluded.{} ELSE {stored_col} END",
+        LifecycleState::Tombstoned.as_str(),
+        super::field_names::LIFECYCLE_STATE,
+    )
+}
+
 /// Exclude quarantined rows from invalidation review queues (#3614).
 ///
 /// These queues must retain contaminated dependents for curator review (#3324),
@@ -692,11 +748,7 @@ pub const TITLE_SLOT_MERGE_BACKSTOP_HEAD: &str = "WHERE 1 = 1";
 /// `table_alias` must be a trusted SQL alias, or empty for an unqualified column.
 #[must_use]
 pub fn quarantine_hidden_clause(table_alias: &str) -> String {
-    let col = if table_alias.is_empty() {
-        super::field_names::LIFECYCLE_STATE.to_string()
-    } else {
-        format!("{table_alias}.{}", super::field_names::LIFECYCLE_STATE)
-    };
+    let col = qualified_lifecycle_col(table_alias);
     let quarantined = LifecycleState::Quarantined.as_str();
     format!("AND ({col} IS NULL OR {col} <> '{quarantined}')")
 }
@@ -2638,6 +2690,70 @@ mod tests {
             LifecycleState::title_slot_admission_for("some-future-state"),
             TitleSlotAdmission::Refused,
             "an unreadable hiding reason is never a merge target"
+        );
+    }
+
+    /// #2894 - the ONE re-open predicate: only (stored tombstone, incoming
+    /// visible) re-opens. A stored visible row never re-opens (the #1709
+    /// stored-wins rule); a stored quarantined / contaminated row never
+    /// re-opens (hidden stays hidden); a hidden incoming snapshot never
+    /// re-opens (even onto a tombstone - the row stays hidden).
+    #[test]
+    fn restore_reopens_row_only_for_tombstone_to_visible_2894() {
+        for incoming in RECALL_VISIBLE_LIFECYCLE_STATES {
+            assert!(
+                LifecycleState::restore_reopens_row(LifecycleState::Tombstoned, incoming),
+                "stored tombstone + visible {incoming:?} re-opens"
+            );
+        }
+        for stored in RECALL_VISIBLE_LIFECYCLE_STATES {
+            for incoming in LifecycleState::all() {
+                assert!(
+                    !LifecycleState::restore_reopens_row(stored, *incoming),
+                    "stored visible {stored:?} never re-opens (stored wins)"
+                );
+            }
+        }
+        for stored in [LifecycleState::Quarantined, LifecycleState::Contaminated] {
+            for incoming in LifecycleState::all() {
+                assert!(
+                    !LifecycleState::restore_reopens_row(stored, *incoming),
+                    "stored hidden {stored:?} is never re-opened"
+                );
+            }
+        }
+        for incoming in [
+            LifecycleState::Tombstoned,
+            LifecycleState::Quarantined,
+            LifecycleState::Contaminated,
+        ] {
+            assert!(
+                !LifecycleState::restore_reopens_row(LifecycleState::Tombstoned, incoming),
+                "hidden incoming {incoming:?} never re-opens, even onto a tombstone"
+            );
+        }
+    }
+
+    /// #2894 - the statement-level twin renders the same decision both
+    /// adapters execute: the stored-tombstone guard names the tombstone
+    /// literal (never a second copy of the decision), the incoming arm
+    /// reuses the shared visible allow-list, and the fallback keeps the
+    /// stored lifecycle. Mutating this rendering to keep the stored state
+    /// must turn the funnel re-open pins red (the seam-mutation proof).
+    #[test]
+    fn restore_reopen_assignment_renders_the_one_predicate_2894() {
+        let sql = restore_reopen_lifecycle_assignment("memories");
+        assert!(
+            sql.contains("memories.lifecycle_state = 'tombstoned'"),
+            "the stored-tombstone guard is the predicate's stored arm: {sql}"
+        );
+        assert!(
+            sql.contains("excluded.lifecycle_state IN ("),
+            "the incoming arm reuses the shared visible allow-list: {sql}"
+        );
+        assert!(
+            sql.contains("ELSE memories.lifecycle_state END"),
+            "the fallback keeps the stored lifecycle: {sql}"
         );
     }
 

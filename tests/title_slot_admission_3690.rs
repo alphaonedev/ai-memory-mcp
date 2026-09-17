@@ -17,7 +17,9 @@
 //!    named (#3695), and the local author's text is never written into a
 //!    peer-attributed row (#3626);
 //!  * the #2887 idempotent same-id restore of a tombstone still merges in
-//!    place (vote Q3) and still leaves the row tombstoned.
+//!    place (vote Q3) and RE-OPENS the row (#2894: a rollback restore returns
+//!    it to the snapshot's visible lifecycle - a restore the caller cannot
+//!    see is not a restore).
 //!
 //! Every cell here drives a HIDDEN-ROW case and is RED on the pre-fix tree
 //! (1ec64196b): there the full unique index let the store MERGE into the
@@ -269,26 +271,21 @@ fn conflict_modes_treat_a_tombstone_slot_as_free_3690() {
     );
 }
 
-/// #2887 / #3690 (vote Q3) / #2894 — CHARACTERISATION: the same-id restore of
-/// a TOMBSTONE behaves EXACTLY as it did before Unit 1.
+/// #2887 / #3690 (vote Q3) / #2894 - REQUIREMENT: the same-id restore of a
+/// TOMBSTONE merges in place (vote Q3: the pre-v100 in-place CAS contract -
+/// ONE row under the key before and after, never a second live row beside
+/// the tombstone; the columns the arm rewrites (content, version) moved;
+/// every identity column (id, `created_at`, `cid`) byte-identical) AND
+/// re-opens the row (#2894): the lifecycle returns to the snapshot's visible
+/// state via the ONE re-open predicate
+/// (`LifecycleState::restore_reopens_row`, rendered into the restore arm by
+/// `models::restore_reopen_lifecycle_assignment` on both adapters), so the
+/// restored original is reachable on the normal read path again. A restore
+/// the caller cannot see is not a restore.
 ///
-/// Before v100 the full unique index covered tombstoned rows, so the restore
-/// hit the `(title, namespace)` conflict and the CAS `DO UPDATE … WHERE
-/// memories.id = excluded.id` merged IN PLACE, leaving the row tombstoned.
-/// After v100 the tombstone is not in the partial index, no title conflict
-/// fires, and the funnel re-targets the SAME `DO UPDATE` arm at the PRIMARY
-/// KEY (`visibility::TitleSlotDisposition::ProceedByPrimaryKey`) to the SAME
-/// outcome — behaviour preservation across an index change, which is what
-/// an index change must be. So this cell asserts the old contract, field by
-/// field, rather than only the outcome: ONE row under the key before and
-/// after (never a second live row beside the tombstone); the columns the
-/// arm rewrites (content, version) moved; every identity column (id,
-/// `created_at`, `cid`, `lifecycle_state`) is byte-identical.
-///
-/// #2894 is NOT fixed by Unit 1 and must not be closed by association: the
-/// restored original is still HIDDEN afterwards (the row stays tombstoned
-/// and `get` returns nothing) — exactly as broken as before, no better and
-/// no worse. The last assertion pins that as the CURRENT, still-open state.
+/// Converted from CHARACTERISATION by #2894 (the Unit-2 cell pinned the
+/// still-tombstoned outcome as the open state); the in-place-merge shape is
+/// unchanged, only the lifecycle moves.
 #[test]
 fn restore_same_id_onto_a_tombstone_preserves_the_pre_v100_in_place_merge_2887_2894_3690() {
     let (_dir, conn) = open();
@@ -319,13 +316,14 @@ fn restore_same_id_onto_a_tombstone_preserves_the_pre_v100_in_place_merge_2887_2
         )
         .expect("row");
     // identity columns byte-identical (the pre-v100 in-place CAS contract)
+    // - EXCEPT the lifecycle, which #2894 re-opens to the snapshot's state.
     assert_eq!(
-        (&after.0, &after.1, &after.2, &after.3),
-        (&before.0, &before.1, &before.2, &before.3)
+        (&after.0, &after.1, &after.3),
+        (&before.0, &before.1, &before.3)
     );
     assert_eq!(
-        after.2, "tombstoned",
-        "restore never un-tombstones (pre-v100 kept memories.lifecycle_state)"
+        after.2, "open",
+        "#2894: a rollback restore re-opens the consolidation tombstone to the snapshot's visible state"
     );
     // the arm's rewrites moved
     assert_eq!(after.5, "restored");
@@ -334,16 +332,46 @@ fn restore_same_id_onto_a_tombstone_preserves_the_pre_v100_in_place_merge_2887_2
         before.4 + 1,
         "the same DO UPDATE arm ran (version bumped exactly once)"
     );
-    // ONE row under the key — the second-live-row hazard of the partial index does not occur
+    // ONE row under the key - the second-live-row hazard of the partial index does not occur
     assert_eq!(
         count_key(&conn, "slot", "team/ops"),
         1,
         "never a second row beside the tombstone"
     );
-    // #2894 — STILL OPEN: the restored original remains hidden from get.
+    // #2894 - FIXED: the restored original is reachable on the normal read
+    // path again (presence on the same sink the characterisation asserted
+    // absence on).
+    assert_eq!(
+        ai_memory::db::get(&conn, "id-a")
+            .expect("get")
+            .expect("#2894: the restored row must be visible via get")
+            .content,
+        "restored"
+    );
+}
+
+/// #2894 (c) - allowed-path control: a same-id restore of a row that was
+/// NEVER tombstoned is unchanged - the stored (advanced) lifecycle wins, the
+/// content still merges, the row stays reachable. Passes with and without
+/// the #2894 re-open arm (the arm fires only on a stored tombstone).
+#[test]
+fn restore_same_id_onto_a_visible_row_keeps_the_stored_lifecycle_2894() {
+    let (_dir, conn) = open();
+    let mut advanced = mem("id-a", "team/ops", "slot", "original");
+    advanced.lifecycle_state = LifecycleState::Active;
+    ai_memory::db::insert(&conn, &advanced).expect("seed");
+    let id =
+        ai_memory::db::insert_restore_same_id(&conn, &mem("id-a", "team/ops", "slot", "restored"))
+            .expect("same-id restore of a visible row succeeds");
+    assert_eq!(id, "id-a");
+    assert_eq!(
+        raw(&conn, "id-a"),
+        ("restored".to_string(), "active".to_string(), 2),
+        "content merges, the stored lifecycle wins, version bumps once"
+    );
     assert!(
-        ai_memory::db::get(&conn, "id-a").expect("get").is_none(),
-        "#2894 is not fixed here: the restored row is still hidden (pre- and post-Unit-1 alike)"
+        ai_memory::db::get(&conn, "id-a").expect("get").is_some(),
+        "still reachable"
     );
 }
 
