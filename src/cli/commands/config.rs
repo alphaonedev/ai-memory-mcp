@@ -105,6 +105,19 @@ pub enum ConfigAction {
         /// renders the `singleton` table.
         #[arg(long, value_name = "FILE")]
         file: Option<PathBuf>,
+        /// #3715 — print the configuration AS THE DAEMON RESOLVES IT (the
+        /// same loader `serve` boots through: file over compiled defaults,
+        /// unknown and removed keys refused), rendered as TOML with every
+        /// secret-bearing value masked.
+        #[arg(long)]
+        effective: bool,
+        /// #3715 — with --effective: one line per accepted key naming its
+        /// value and origin (`file <path>` or `compiled-default`, plus the
+        /// deprecation state), then the AI_MEMORY_* environment variables
+        /// present in this process (names only; each is consulted by its
+        /// own setting at use time).
+        #[arg(long, requires = "effective")]
+        provenance: bool,
     },
 }
 
@@ -120,7 +133,190 @@ pub fn run(_db: &Path, args: ConfigCliArgs, out: &mut CliOutput) -> Result<i32> 
             also_clean_claude_json,
         } => migrate(dry_run, also_clean_claude_json, out),
         ConfigAction::Check { file } => check_toml(file.as_deref(), out),
-        ConfigAction::Show { file } => show_shape(file.as_deref(), out),
+        ConfigAction::Show {
+            file,
+            effective: false,
+            ..
+        } => show_shape(file.as_deref(), out),
+        ConfigAction::Show {
+            file,
+            effective: true,
+            provenance,
+        } => show_effective(file.as_deref(), provenance, out),
+    }
+}
+
+/// #3715 item 4 — the provenance word for a leaf the file does not set.
+const ORIGIN_COMPILED_DEFAULT: &str = "compiled-default";
+
+/// #3715 item 4 — where the effective configuration came from.
+enum EffectiveSource {
+    File(PathBuf),
+    NoFile(Option<PathBuf>),
+    SkipConfig,
+}
+
+impl EffectiveSource {
+    fn describe(&self) -> String {
+        match self {
+            Self::File(p) => format!("loaded from {}", p.display()),
+            Self::NoFile(Some(p)) => format!("no config at {} — compiled defaults", p.display()),
+            Self::NoFile(None) => "no config path ($HOME unset) — compiled defaults".to_string(),
+            Self::SkipConfig => "AI_MEMORY_NO_CONFIG set — compiled defaults".to_string(),
+        }
+    }
+}
+
+/// #3715 item 4 — `config show --effective [--provenance]`.
+///
+/// ONE loader: [`AppConfig::try_load_from_optional`], the boot funnel, so an
+/// unknown or removed key refuses here exactly as it refuses `serve`
+/// (exit [`crate::config::EX_CONFIG`]), and what prints is what boots.
+/// Rendering goes through the #3432 redaction funnel — a secret-bearing
+/// value is masked, a URL keeps only its allowlisted parts.
+///
+/// Provenance in this cut is `file <path>` / `compiled-default` per accepted
+/// leaf plus the deprecation row; environment overrides are applied by each
+/// setting's own accessor at use time (not merged here), so they are listed
+/// by NAME as present, never attributed to a leaf and never printed by value.
+fn show_effective(file: Option<&Path>, provenance: bool, out: &mut CliOutput) -> Result<i32> {
+    use crate::config::AppConfig;
+
+    let (source, path) = match file {
+        Some(p) if p.exists() => (
+            EffectiveSource::File(p.to_path_buf()),
+            Some(p.to_path_buf()),
+        ),
+        Some(p) => (EffectiveSource::NoFile(Some(p.to_path_buf())), None),
+        None if crate::config::skip_config() => (EffectiveSource::SkipConfig, None),
+        None => match AppConfig::config_path() {
+            Some(p) if p.exists() => (EffectiveSource::File(p.clone()), Some(p)),
+            other => (EffectiveSource::NoFile(other), None),
+        },
+    };
+    let cfg = match &path {
+        Some(p) => match AppConfig::try_load_from_optional(p) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let _ = writeln!(out.stderr, "ERROR: {e:#}");
+                return Ok(crate::config::EX_CONFIG);
+            }
+        },
+        None => AppConfig::default(),
+    };
+    let serialised = toml::to_string(&cfg).context("serialising the effective configuration")?;
+    let effective: toml::Value =
+        toml::from_str(&serialised).context("re-parsing the effective configuration")?;
+    let table = effective
+        .as_table()
+        .cloned()
+        .context("the effective configuration is not a table")?;
+    let _ = writeln!(
+        out.stdout,
+        "# effective configuration: {} (the document the boot loader accepted, secrets \
+         masked; a setting absent here takes its compiled default at use)",
+        source.describe()
+    );
+    let _ = write!(
+        out.stdout,
+        "{}",
+        crate::config_redact::render_redacted_toml(&table)
+    );
+    if !provenance {
+        return Ok(0);
+    }
+
+    // The raw document decides "file" vs "compiled-default": a key the
+    // operator wrote is in the raw tree; everything else is a default.
+    let raw: Option<toml::Value> = path
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|c| toml::from_str(&c).ok());
+    let mut redacted = toml::Value::Table(table);
+    crate::config_redact::redact_toml_value(&mut redacted);
+    let _ = writeln!(out.stdout);
+    let _ = writeln!(
+        out.stdout,
+        "# provenance: <key> = <value>  # <origin>  (origin: file <path> | {ORIGIN_COMPILED_DEFAULT})"
+    );
+    for key in crate::config::unknown_keys::accepted_leaf_keys() {
+        if key.contains("<key>") || key.contains("[]") {
+            // Map / array-of-tables wildcards have no single leaf to name.
+            continue;
+        }
+        // Every top-level `AppConfig` field is an `Option`: a leaf the file
+        // does not set is ABSENT here and takes its compiled default inside
+        // its own accessor at use time — say so, rather than print a value
+        // this verb did not resolve.
+        let file_origin = match (&raw, &path) {
+            (Some(raw_tree), Some(p)) if lookup_path(raw_tree, key).is_some() => {
+                Some(format!("file {}", p.display()))
+            }
+            _ => None,
+        };
+        let (rendered, origin) = match (lookup_path(&redacted, key), file_origin) {
+            (Some(value), Some(origin)) => (render_scalar(value), origin),
+            (Some(value), None) => (render_scalar(value), ORIGIN_COMPILED_DEFAULT.to_string()),
+            // In the file but withheld by the serialiser: a secret-bearing
+            // field (`skip_serializing`). The key is real; the bytes are not
+            // this verb's to print.
+            (None, Some(origin)) => (
+                format!("{:?}", crate::config_redact::CONFIG_REDACTION_MASK),
+                origin,
+            ),
+            (None, None) => (
+                "(unset: the compiled default applies at use)".to_string(),
+                ORIGIN_COMPILED_DEFAULT.to_string(),
+            ),
+        };
+        let deprecation =
+            crate::config::deprecated_keys::lookup(key).map_or_else(String::new, |row| {
+                format!(
+                    "  # DEPRECATED since {} — use {}; removal {}",
+                    row.deprecated_in,
+                    row.replacement,
+                    row.removed_in.map_or_else(
+                        || "not scheduled".to_string(),
+                        |r| format!("scheduled for {r}")
+                    )
+                )
+            });
+        let _ = writeln!(out.stdout, "{key} = {rendered}  # {origin}{deprecation}");
+    }
+    let mut env_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| k.starts_with("AI_MEMORY_"))
+        .collect();
+    env_names.sort();
+    let _ = writeln!(out.stdout);
+    let _ = writeln!(
+        out.stdout,
+        "# environment: {} AI_MEMORY_* variable{} present (names only; each is consulted by \
+         its own setting at use time and is NOT merged into the table above)",
+        env_names.len(),
+        if env_names.len() == 1 { "" } else { "s" }
+    );
+    for name in env_names {
+        // Escaped: a name is the operator's own process state, but control
+        // characters in a NAME are pathological and this line is pasted
+        // into tickets (the #3264 S1 rule for operator-facing renders).
+        let _ = writeln!(out.stdout, "#   {name:?}");
+    }
+    Ok(0)
+}
+
+/// Walk a dotted key path through a TOML tree.
+fn lookup_path<'a>(tree: &'a toml::Value, dotted: &str) -> Option<&'a toml::Value> {
+    dotted
+        .split('.')
+        .try_fold(tree, |node, seg| node.as_table().and_then(|t| t.get(seg)))
+}
+
+/// A scalar or inline value on one line, TOML-quoted.
+fn render_scalar(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => format!("{s:?}"),
+        other => other.to_string(),
     }
 }
 
@@ -1459,7 +1655,11 @@ model = "grok-4.3"
         let code = {
             let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
             let args = ConfigCliArgs {
-                action: ConfigAction::Show { file: Some(path) },
+                action: ConfigAction::Show {
+                    file: Some(path),
+                    effective: false,
+                    provenance: false,
+                },
             };
             run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
         };
@@ -1487,6 +1687,8 @@ model = "grok-4.3"
             let args = ConfigCliArgs {
                 action: ConfigAction::Show {
                     file: Some(missing),
+                    effective: false,
+                    provenance: false,
                 },
             };
             run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
@@ -1511,11 +1713,184 @@ model = "grok-4.3"
         let code = {
             let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
             let args = ConfigCliArgs {
-                action: ConfigAction::Show { file: Some(path) },
+                action: ConfigAction::Show {
+                    file: Some(path),
+                    effective: false,
+                    provenance: false,
+                },
             };
             run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
         };
         assert_eq!(code, 3);
         assert!(String::from_utf8(stderr).unwrap().contains("production"));
+    }
+
+    fn run_show_effective(path: &std::path::Path, provenance: bool) -> (i32, String, String) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Show {
+                    file: Some(path.to_path_buf()),
+                    effective: true,
+                    provenance,
+                },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        (
+            code,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// #3715 item 4 — `--effective --provenance`: a value the file sets is
+    /// printed and attributed to the file (presence); a leaf the file does
+    /// not set is listed as unset / compiled-default (absence on the same
+    /// manifest); a secret-bearing value is masked while its key stays
+    /// (presence of the key, absence of the credential); the printed
+    /// document re-loads through the boot loader to the same configuration
+    /// and carries no key the schema does not know.
+    #[test]
+    fn issue_3715_show_effective_attributes_each_leaf_and_masks_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        // The #3432 funnel's value-shape backstop is what this cell holds
+        // load-bearing: NO accepted, serialised AppConfig field carries a
+        // secret-suffixed NAME (`api_key` / `hmac_secret` are skip-serialised;
+        // `[llm].api_key` is refused at load), so the funnel's key heuristic
+        // has nothing to mask here — but a credential parked in an INNOCENT
+        // field (an AWS access-key id as `[llm].model`) is exactly what the
+        // backstop exists for, and bypassing `render_redacted_toml` prints it.
+        crate::secret_screen::set_screen_mode(crate::secret_screen::SecretScreenMode::Redact);
+        std::fs::write(
+            &path,
+            "schema_version = 2\napi_key = \"sk-PLAINTEXT-CREDENTIAL-3715\"\n\
+             [llm]\nmodel = \"AKIAEXAMPLE3715AAAAB\"\n\
+             [storage]\ndefault_namespace = \"team-x\"\n",
+        )
+        .unwrap();
+        let (code, text, err) = run_show_effective(&path, true);
+        assert_eq!(code, 0, "{err}");
+        let file_origin = format!("# file {}", path.display());
+        assert!(
+            !text.contains("AKIAEXAMPLE3715AAAAB"),
+            "the funnel masks a credential-shaped value: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "model = {:?}",
+                crate::secret_screen::REDACTION_PLACEHOLDER
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "llm.model = {:?}  {file_origin}",
+                crate::secret_screen::REDACTION_PLACEHOLDER
+            )),
+            "the manifest carries the masked value too: {text}"
+        );
+        assert!(
+            text.contains("# effective configuration: loaded from"),
+            "{text}"
+        );
+        // Presence: the file value, in the document and in the manifest.
+        assert!(text.contains("default_namespace = \"team-x\""), "{text}");
+        assert!(
+            text.contains(&format!(
+                "storage.default_namespace = \"team-x\"  {file_origin}"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("schema_version = 2  {file_origin}")),
+            "{text}"
+        );
+        // Absence on the same manifest: an unset leaf is not attributed to
+        // the file and is not given a value this verb did not resolve.
+        assert!(
+            text.contains(
+                "storage.archive_on_gc = (unset: the compiled default applies at use)  \
+                 # compiled-default"
+            ),
+            "{text}"
+        );
+        // The credential: key present, bytes absent.
+        assert!(!text.contains("sk-PLAINTEXT-CREDENTIAL-3715"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "api_key = {:?}  {file_origin}",
+                crate::config_redact::CONFIG_REDACTION_MASK
+            )),
+            "{text}"
+        );
+        // The environment section names variables, never values.
+        assert!(text.contains("# environment: "), "{text}");
+        assert!(text.contains("names only"), "{text}");
+        // Round trip: the printed document (above the manifest) is a config
+        // the boot loader accepts with no unknown key, and it resolves to
+        // the same storage section.
+        let document: String = text
+            .lines()
+            .skip(1)
+            .take_while(|l| !l.starts_with("# provenance"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let again = dir.path().join("again.toml");
+        std::fs::write(&again, &document).unwrap();
+        let reloaded = crate::config::AppConfig::try_load_from_optional(&again)
+            .expect("the effective document re-loads through the boot loader");
+        assert_eq!(
+            reloaded
+                .storage
+                .as_ref()
+                .and_then(|s| s.default_namespace.clone())
+                .as_deref(),
+            Some("team-x")
+        );
+        assert_eq!(reloaded.schema_version, Some(2));
+        let value: toml::Value = toml::from_str(&document).unwrap();
+        assert!(
+            crate::config::unknown_keys::find_unknown_keys(&value).is_empty(),
+            "the effective document must carry no key the schema does not know"
+        );
+    }
+
+    /// #3715 item 3 through item 4: a deprecated key is shown with its
+    /// replacement on the manifest and its value still applies (control);
+    /// the boot loader's refusals reach this verb unchanged — an unknown
+    /// key exits EX_CONFIG with the unknown-key text, and the document is
+    /// not printed.
+    #[test]
+    fn issue_3715_show_effective_names_deprecations_and_refuses_like_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        std::fs::write(&path, "llm_model = \"legacy-m\"\n").unwrap();
+        let (code, text, err) = run_show_effective(&path, true);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            text.contains("llm_model = \"legacy-m\""),
+            "the value still applies: {text}"
+        );
+        assert!(
+            text.contains("# DEPRECATED since 0.7.0 — use [llm].model; removal not scheduled"),
+            "{text}"
+        );
+        // A replacement key carries no deprecation note (absence, same manifest).
+        assert!(!text.contains("llm.model = (unset: the compiled default applies at use)  # compiled-default  # DEPRECATED"), "{text}");
+
+        let bad = dir.path().join("typo.toml");
+        std::fs::write(&bad, "[storage]\ndefault_namespac = \"x\"\n").unwrap();
+        let (code, text, err) = run_show_effective(&bad, false);
+        assert_eq!(code, crate::config::EX_CONFIG, "{err}");
+        assert!(err.contains("unknown key"), "{err}");
+        assert!(err.contains("default_namespac"), "{err}");
+        assert!(
+            !text.contains("default_namespac"),
+            "nothing printed on refusal: {text}"
+        );
     }
 }

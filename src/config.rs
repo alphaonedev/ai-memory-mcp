@@ -135,6 +135,8 @@ pub use shape::{
     AtRestPolicy, DeploymentSection, DeploymentShape, Requirement, ShapeBootReport, ShapeDerived,
     StorageBackend,
 };
+/// v1.0.0 #3715 item 3 — the key deprecation lifecycle, as data.
+pub mod deprecated_keys;
 /// #3715 — unknown-key refusal at the loader, schema-derived.
 pub mod unknown_keys;
 
@@ -8452,8 +8454,42 @@ impl AppConfig {
         // repair tools (`config check`, `config migrate`,
         // `governance migrate-to-permissions`) parse through `toml::Value`
         // and never cross this funnel, so the refused state is repairable.
+        // #3715 item 3 — the deprecation lifecycle runs FIRST: a removed key
+        // is refused by name with its replacement, never as "unknown".
+        Self::enforce_deprecated_keys(path, contents)?;
         Self::refuse_unknown_keys(path, contents)?;
         Self::from_toml_contents_unchecked(path, contents)
+    }
+
+    /// #3715 item 3 — consult [`deprecated_keys::DEPRECATED_KEYS`] for the
+    /// running release: removed keys REFUSE (naming the replacement),
+    /// deprecated-but-accepted keys WARN once per process and still apply.
+    ///
+    /// # Errors
+    /// The document carries a key whose scheduled removal release the
+    /// running version has reached.
+    fn enforce_deprecated_keys(path: &Path, contents: &str) -> anyhow::Result<()> {
+        use std::sync::Once;
+        static WARN_ONCE: Once = Once::new();
+        let Ok(value) = toml::from_str::<toml::Value>(contents) else {
+            return Ok(());
+        };
+        let c =
+            deprecated_keys::classify(&value, deprecated_keys::DEPRECATED_KEYS, crate::PKG_VERSION);
+        if !c.removed.is_empty() {
+            anyhow::bail!(
+                "{}",
+                deprecated_keys::refusal_message(path, &c.removed, crate::PKG_VERSION)
+            );
+        }
+        if !c.deprecated.is_empty() {
+            WARN_ONCE.call_once(|| {
+                for f in &c.deprecated {
+                    eprintln!("{}", deprecated_keys::warn_line(path, f));
+                }
+            });
+        }
+        Ok(())
     }
 
     /// #3715 / the #2445 disposition — the EGRESS loader. `backup` / `export`
@@ -8506,18 +8542,12 @@ impl AppConfig {
         Ok(cfg)
     }
 
-    /// v0.7.x (#1146) — emit a one-shot deprecation WARN to stderr
-    /// when the loaded config carries legacy v1 flat fields that have
-    /// been superseded by the sectioned v2 schema.
+    /// v0.7.x (#1146) — emit a one-shot WARN to stderr when the loaded
+    /// config carries legacy v1 flat fields under a v2 schema version.
     ///
-    /// Two posture WARNs:
-    ///
-    /// - **Legacy-only** (no `schema_version` OR `schema_version = 1`,
-    ///   AND any of `llm_model`, `ollama_url`, `embed_url`,
-    ///   `embedding_model`, `cross_encoder`, `default_namespace`,
-    ///   `archive_on_gc`, `archive_max_days`, `max_memory_mb`,
-    ///   `auto_tag_model` set): operator running pre-#1146 config
-    ///   shape — point them at `ai-memory config migrate`.
+    /// One posture WARN (the legacy-only shape is covered per key by
+    /// `enforce_deprecated_keys`, #3715 — replacement and removal state,
+    /// one line each):
     ///
     /// - **Drift** (`schema_version >= 2` AND any legacy field set):
     ///   operator has migrated but left legacy fields in place. The
@@ -8561,32 +8591,29 @@ impl AppConfig {
 
         let v2 = matches!(self.schema_version, Some(v) if v >= 2);
 
+        // #3715 — the per-key deprecation lines (`enforce_deprecated_keys`,
+        // one per legacy key: replacement + removal state) already say "this
+        // key is deprecated, run `config migrate`" for the legacy-only shape;
+        // repeating it here was the same fact in two voices (review G1). The
+        // DRIFT arm is kept: it carries the #3385 hazard no per-key line
+        // states — under schema_version >= 2 a legacy field is still the
+        // FALLBACK for any key the sections leave unset.
+        if !v2 {
+            return;
+        }
         WARN_ONCE.call_once(|| {
-            if v2 {
-                eprintln!(
-                    "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
-                     are still present in {} (llm_model / ollama_url / embed_url / \
-                     embedding_model / cross_encoder / default_namespace / \
-                     archive_on_gc / archive_max_days / max_memory_mb / \
-                     auto_tag_model). Section values in [llm] / [embeddings] / \
-                     [reranker] / [storage] WIN, but a legacy field is still the \
-                     FALLBACK for any key the sections leave unset — it is NOT \
-                     inert (#3385). Run `ai-memory config migrate` to remove them.",
-                    self.schema_version,
-                    path.display(),
-                );
-            } else {
-                eprintln!(
-                    "ai-memory: WARN — legacy v1 flat-field configuration shape \
-                     detected in {}. The [llm] / [embeddings] / [reranker] / \
-                     [storage] sectioned schema (v2) is the canonical shape; \
-                     legacy fields continue to work in v0.7.x but will be \
-                     removed in v0.8.0. Run `ai-memory config migrate` to \
-                     upgrade in place (a timestamped .bak is written). See \
-                     https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
-                    path.display(),
-                );
-            }
+            eprintln!(
+                "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
+                 are still present in {} (llm_model / ollama_url / embed_url / \
+                 embedding_model / cross_encoder / default_namespace / \
+                 archive_on_gc / archive_max_days / max_memory_mb / \
+                 auto_tag_model). Section values in [llm] / [embeddings] / \
+                 [reranker] / [storage] WIN, but a legacy field is still the \
+                 FALLBACK for any key the sections leave unset — it is NOT \
+                 inert (#3385). Run `ai-memory config migrate` to remove them.",
+                self.schema_version,
+                path.display(),
+            );
         });
     }
 

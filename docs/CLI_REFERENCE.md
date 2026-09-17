@@ -1318,6 +1318,36 @@ ai-memory config check
 ai-memory config check --file /root/.config/ai-memory/config.toml
 ```
 
+### `config show` (v1.0.0 #3714, #3715)
+
+Without flags: the shape-derived requirement table for the declared
+`[deployment] shape` (#3714). With `--effective`: the configuration **as
+the daemon's boot loader accepts it** — the same funnel `serve` boots
+through, so an unknown or removed key refuses here with exit `78`
+(`EX_CONFIG`) and the same text — rendered as TOML with every
+secret-bearing value masked (#3432 funnel). Every top-level setting is
+optional, so a setting absent from the file is absent here and takes its
+compiled default inside its own accessor at use time.
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--file PATH` | path | resolved `~/.config/ai-memory/config.toml` | File to render. |
+| `--effective` | bool | — | Print the loader-accepted document, secrets masked. |
+| `--provenance` | bool | — | With `--effective`: one line per accepted key — `<key> = <value>  # file <path>` or `<key> = (unset: the compiled default applies at use)  # compiled-default` — each deprecated key annotated `# DEPRECATED since <release> — use <replacement>; removal <scheduled for X | not scheduled>`; then the `AI_MEMORY_*` variables present in the process, **names only** (each is consulted by its own setting at use time; they are not merged into the document). |
+
+Deprecation lifecycle (#3715 item 3): `src/config/deprecated_keys.rs` is
+the table — key, replacement, deprecated-in, removed-in. The boot loader
+WARNs once per process for each deprecated key (the value still applies)
+and **refuses** a key whose removal release the running version has
+reached, naming the replacement — never the generic unknown-key text.
+The v1 flat keys (`llm_model`, `ollama_url`, …) are deprecated since
+0.7.0 with removal not scheduled.
+
+```bash
+ai-memory config show --effective
+ai-memory config show --effective --provenance --file /etc/ai-memory/config.toml
+```
+
 ## v0.7 feature-gated commands
 
 ### `migrate` (`--features sal`)
