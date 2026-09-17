@@ -28,7 +28,7 @@ Group=ai-memory-hub
 # runtime directory, because AllowlistFile::load_from_file requires the
 # file be owned by THIS uid at exact mode 0600.
 EnvironmentFile=-/etc/ai-memory/wake-hub.env
-Environment=RUST_LOG=ai_memory=info
+Environment=RUST_LOG=info
 Environment=SOCKET=/run/ai-memory-hub/wake-hub.sock
 Environment=ALLOWLIST=/run/ai-memory-hub/hub-allow.json
 # No --tcp in the shipped ExecStart. The kernel RestrictAddressFamilies

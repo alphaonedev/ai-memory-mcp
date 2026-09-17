@@ -259,15 +259,14 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Setup</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">How tracing initializes.</h2>
-    <p class="lede">The daemon installs a <code>tracing_subscriber::fmt</code> layer with the standard <code>EnvFilter</code> chain. Default directives keep <code>ai_memory</code> + <code>tower_http</code> at <code>info</code> while honoring any <code>RUST_LOG</code> override.</p>
-    <div class="snip">// src/daemon_runtime.rs::init_tracing() — called from serve()
-tracing_subscriber::fmt()
-    .with_env_filter(
-        EnvFilter::<span class="key">from_default_env</span>()
-            .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse()?) <span class="cm">// "ai_memory=info"</span>
-            .add_directive(<span class="val">"tower_http=info"</span>.parse()?),
-    )
-    .try_init();</div>
+    <p class="lede">The daemon installs a <code>tracing_subscriber::fmt</code> layer with the standard <code>EnvFilter</code> chain. A bare <code>info</code> base admits every target (#3650), the <code>tower_http=info</code> caller extra keeps request logs, and any <code>RUST_LOG</code> override layers last so the operator wins.</p>
+    <div class="snip">// src/logging.rs::build_log_filter() — one builder serves every subscriber
+let built = crate::logging::build_log_filter(
+    crate::logging::DEFAULT_LOG_DIRECTIVE, <span class="cm">// "info": bare base admits every target (#3650)</span>
+    EXTRA_DIRECTIVES, <span class="cm">// e.g. "tower_http=info" on serve()</span>
+    OPERATOR_RUST_LOG, <span class="cm">// layered last: the operator wins</span>
+);
+tracing_subscriber::fmt().with_env_filter(built.filter).try_init();</div>
     <p class="lede" style="margin-top:1rem">To turn the volume up:</p>
     <div class="snip"><span class="cm"># quiet — only errors</span>
 RUST_LOG=ai_memory=error ai-memory serve
@@ -281,7 +280,7 @@ RUST_LOG=ai_memory::federation=debug,ai_memory=info ai-memory serve
 <span class="cm"># everything (very chatty — local dev only)</span>
 RUST_LOG=ai_memory=trace,tower_http=debug ai-memory serve</div>
     <p class="lede" style="margin-top:1.5rem"><strong>Named metadata targets (post-#1562).</strong> Most events emit under the module-path default, so an <code>ai_memory=…</code> directive matches them (including the named <code>ai_memory::</code>-prefixed targets: <code>ai_memory::subscriptions</code>, <code>ai_memory::authz</code>, <code>ai_memory::handlers::skills</code>, <code>ai_memory::federation::sync</code>, <code>ai_memory::federation::push_dlq</code>, <code>ai_memory::governance::audit</code>). But a set of subsystems emit under <em>literal</em> targets that do <strong>not</strong> start with <code>ai_memory</code> — an <code>ai_memory=debug</code> filter does NOT match these events; name them explicitly:</p>
-    <div class="snip"><span class="cm"># literal targets (RUST_LOG must name them — ai_memory=… won't match)</span>
+    <div class="snip"><span class="cm"># literal targets (post-#3650 the default admits these; name them only to tune a level)</span>
 store::postgres            <span class="cm"># postgres SAL adapter (#1562 — real metadata target)</span>
 store::postgres::kg        <span class="cm"># postgres AGE knowledge-graph ops (#1562)</span>
 schema_init                <span class="cm"># `ai-memory schema-init` CLI (#1562)</span>
@@ -392,7 +391,7 @@ ai-memory serve
   <div class="container">
     <span class="eyebrow">Level taxonomy</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">info / warn / error.</h2>
-    <p class="lede">53 of the 713 call sites are <code>debug!</code>/<code>trace!</code> diagnostics (federation sync, postgres adapter, hooks executor, migrations) — silent under the default <code>ai_memory=info</code> filter until <code>RUST_LOG</code> raises them. Default production output is the three levels below.</p>
+    <p class="lede">53 of the 713 call sites are <code>debug!</code>/<code>trace!</code> diagnostics (federation sync, postgres adapter, hooks executor, migrations) — silent under the default <code>info</code> filter until <code>RUST_LOG</code> raises them. Default production output is the three levels below.</p>
     <div class="lev-grid">
       <div class="lev info">
         <div class="lbl">info</div>

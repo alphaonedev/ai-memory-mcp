@@ -745,7 +745,7 @@ ExecStart=/usr/local/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db serve
 Restart=on-failure
 RestartPreventExitStatus=75
 RestartSec=5
-Environment=RUST_LOG=ai_memory=info
+Environment=RUST_LOG=info
 
 # Graceful shutdown checkpoints the WAL
 KillSignal=SIGINT
