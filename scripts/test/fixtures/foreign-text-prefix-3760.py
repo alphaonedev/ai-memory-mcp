@@ -25,20 +25,6 @@
 # construction sites, which is how a DSN label that reaches a 503 body is found without any
 # name matching.
 #
-# The SINK SET is DERIVED from the tree on every run, never enumerated (#3760): the HTTP sinks are
-# every handler `src/lib.rs` routes (+ `middleware::from_fn[_with_state]`) closed over the callees
-# whose return type is response-shaped; the MCP sinks are every `register_mcp_tool!` dispatch entry
-# (+ `handle_request`) closed over the callees whose error type is the wire type (`Result<_, String>`)
-# reached by VERBATIM propagation (`..)?`, a tail, a `return`, an arm value). Inside them EVERY
-# `json!()` value at ANY key and nesting is a sink, as are `(StatusCode, ..)` tuples, `err_response`,
-# `Err(..)` / `map_err` payloads and `Ok(json!(..))` results; a pushed collection is produced by its
-# pushes; a `match` value by its arms. Before #3760 the sinks were the literal key `"error"` under
-# three path prefixes and `Err(` under `src/mcp/`, which is how the import envelope's `"errors"`
-# array carrying a StoreError Display (admin.rs:1577) was never examined. A response-shaped fn no
-# route reaches is dead code, not a sink (the self-test's `unrouted_leak` control); the summary
-# prints the derived counts so a run that derived nothing cannot read as a pass. The pre-#3760
-# analyzer is frozen VERBATIM at scripts/test/fixtures/foreign-text-prefix-3760.py (R-203).
-#
 # Block bodies are judged by their EXITS (#3711 gate-7 finding): a `.map_err(|e| { ..; format!(..) })`
 # or arm body renders only its tail expression and its `return <x>` payloads, each resolved at its own
 # offset so a `let` inside the block is a binding site. Judging the whole block as one expression let
@@ -112,10 +98,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             if base == 'tests.rs' or 'test' in base and base != 'attest.rs' and re.search(r'(_|^)tests?(_|\.)', base): continue
             raw = open(os.path.join(ROOT, p), encoding='utf-8', errors='replace').read()
             txt = strip_comments(raw)
-            # #3760 — a CHAR literal (`'"'`, `'\\''`) is blanked at load (length-preserving): a lone `"`
-            # inside one opened a string for the literal-blanking regexes and swallowed the binding
-            # sites that followed (`trim_matches('"')` hid an `Err(e) =>` arm 200 lines below it).
-            txt = re.sub(r"'(?:\\\\.|[^'\\\\\\n])'", lambda m: "'" + ' ' * (len(m.group(0)) - 2) + "'", txt)
             # Blank out every test module IN PLACE (line numbers preserved): `mod tests {..}` and any
             # `#[cfg(test)] mod x {..}` — they can sit in the middle of a file with production code after.
             for m in reversed(list(re.finditer(r'(?m)^\s*(?:#\[cfg\(test\)\]\s*\n\s*)?(?:pub(?:\([a-z]+\))?\s+)?mod\s+\w+\s*\{', txt))):   # reverse: offsets stay valid
@@ -197,95 +179,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
                 if best is None or f.body_start > best.body_start: best = f
         return best
 
-    # ------------------------------------------------- derived sink functions (#3760)
-    # The set of CALLER-FACING functions is DERIVED from the tree on every run, never hand-listed
-    # and never a path prefix:
-    #   HTTP — every handler the router REGISTERS (`src/lib.rs` `.route(_, get|post|..(<h>))` and
-    #          `middleware::from_fn[_with_state](<f>)`), closed transitively over the fn index to
-    #          every callee whose return type is response-shaped (Response / IntoResponse /
-    #          `(StatusCode, ..)` / Json<..>). A response-shaped fn nothing routed reaches is dead
-    #          code, not a sink; a helper any handler reaches IS one, wherever it lives.
-    #   MCP  — every `register_mcp_tool!(_, dispatch_x)` wrapper (the `tools/call` table) plus
-    #          `handle_request`, closed over every callee whose error type is the WIRE type
-    #          (`Result<_, String>`): an `Err(String)` produced there propagates through `?` to the
-    #          tool result, so it is a sink wherever the file sits (`src/mcp/**` was the old proxy).
-    # Before #3760 the sinks were an ENUMERATION: the literal JSON key `"error"` under three path
-    # prefixes, and `Err(` under `src/mcp/`. The import envelope's `"errors": [..]` array, fed by
-    # `errors.push(format!("..{e}"))` from a StoreError, was invisible to both.
-    def last_seg(path): return path.strip().split('::')[-1]
-    HTTP_ROOTS = set(); MCP_ROOTS = set()
-    lib = files.get('src/lib.rs')
-    if lib:
-        t = lib['text']
-        for m in re.finditer(r'\.route\s*\(', t):
-            e = find_matching(t, m.end()-1, '(', ')')
-            if e < 0: continue
-            for hm in re.finditer(r'\b(?:get|post|put|delete|patch|head|options|any|trace)\s*\(\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\)', t[m.end():e]):
-                HTTP_ROOTS.add(last_seg(hm.group(1)))
-        for hm in re.finditer(r'\bfrom_fn(?:_with_state)?\s*\(\s*(?:[^,()]+,\s*)?([A-Za-z_][A-Za-z0-9_:]*)\s*\)', t):
-            HTTP_ROOTS.add(last_seg(hm.group(1)))
-    mcp = files.get('src/mcp/mod.rs')
-    if mcp:
-        for hm in re.finditer(r'register_mcp_tool!\s*\(\s*[^,]+,\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\)', mcp['text']):
-            MCP_ROOTS.add(last_seg(hm.group(1)))
-        if fns_by_name.get('handle_request'): MCP_ROOTS.add('handle_request')
-    RESP_SIG_RE = re.compile(r'->\s*(?:[^{;]*?)(?:\bResponse\b|IntoResponse|\(\s*(?:axum::http::|http::)?StatusCode\b|\bJson\s*<)')
-    WIRE_ERR_SIG_RE = re.compile(r'->\s*(?:[^{;]*?)Result\s*<.*,\s*String\s*>', re.S)
-    def reach(roots, keep, edge=None):
-        """Transitive closure over the fn index from `roots`: a callee joins the set when `keep(fn)`
-        holds for its definition AND (when `edge` is given) the CALL SITE satisfies `edge(body, m, e)`
-        — used on the MCP side to follow only VERBATIM error propagation (`..)?`), because a
-        transformed error (`.map_err(..)`) is judged at the transformation site, which is already a
-        sink, and the taint walk enters the callee from there. Name-level, so a same-named fn in
-        another impl over-approximates rather than under-approximates."""
-        # Members are DEFINITIONS, keyed (file, name): a storage fn that happens to share a
-        # handler's name (`register_agent`) is not a handler. A root joins only if its definition
-        # has the shape (`keep`); a callee joins per definition that has it.
-        seen = {(g.file, g.name) for n in roots for g in fns_by_name.get(n, []) if keep(g)}
-        frontier = list(seen)
-        for _ in range(12):
-            if not frontier: break
-            nxt = []
-            for (fp, name) in frontier:
-                for g in fns_by_name.get(name, []):
-                    if g.file != fp: continue
-                    body = files[g.file]['text'][g.body_start:g.end]
-                    for cm in _call_rx.finditer(body):
-                        c = cm.group(3)
-                        if c not in fns_by_name: continue
-                        if edge is not None:
-                            e = find_matching(body, cm.end() - 1, '(', ')')
-                            if e < 0 or not edge(body, cm, e): continue
-                        qual = cm.group(2).rstrip(':').split('::')[-1] if cm.group(2) else ''
-                        is_method = cm.group(1) == '.'
-                        cands_ = [h for h in fns_by_name[c] if keep(h)]
-                        if qual and qual != 'Self' and qual[:1].isupper():
-                            cands_ = [h for h in cands_ if h.impl_type == qual]          # `Type::new(..)` names its impl
-                        elif is_method:
-                            impls_ = {h.impl_type for h in cands_ if h.impl_type}
-                            if len(impls_) > 1: continue                                  # `x.new(..)`: receiver type unknown, name ambiguous
-                        for h in cands_:
-                            k = (h.file, h.name)
-                            if k in seen: continue
-                            seen.add(k); nxt.append(k)
-            frontier = nxt
-        return seen
-    def propagates_verbatim(body, cm, e):
-        """The callee's Result leaves the caller UNCHANGED: `callee(..)?` / `.await?`, a tail
-        expression (`{ callee(..) }`), a `return callee(..)`, or a match-arm value
-        (`Kind::X => callee(..),`). A `;`-terminated call drops it; a `.map_err(..)` transforms it
-        (and is a sink of its own)."""
-        after = body[e+1:e+16]
-        if re.match(r'\s*(?:\.await)?\s*\?', after): return True
-        tail = re.match(r'\s*(?:\.await)?\s*(\}|,|\Z)', after)   # \Z: the body slice excludes its closing brace
-        if not tail: return False
-        before = body[max(0, cm.start()-40):cm.start()].rstrip()
-        return tail.group(1) != ',' or before.endswith('=>') or before.endswith('return')
-    HTTP_FNS = reach(HTTP_ROOTS, lambda g: bool(RESP_SIG_RE.search(g.sig.replace('\n', ' '))))
-    MCP_KEEP = lambda g: bool(WIRE_ERR_SIG_RE.search(g.sig.replace('\n', ' '))) or g.name in MCP_ROOTS
-    MCP_FNS = reach(MCP_ROOTS, MCP_KEEP, propagates_verbatim)
-    DERIVED = {'http_roots': len(HTTP_ROOTS), 'http_fns': len(HTTP_FNS), 'mcp_roots': len(MCP_ROOTS), 'mcp_fns': len(MCP_FNS)}
-
     # ------------------------------------------------------------- classification
     # Typed mappers whose OUTPUT is caller-safe by construction. Anything else that
     # merely masks (redact_*, mask_*, scrub_*) is TRANSPARENT: taint passes through.
@@ -301,14 +194,12 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
     # Whole-expression scalars: a status code, a length, a constant — never text that could carry foreign bytes.
     SCALAR_RE = re.compile(r'^[\s&*(]*(?:[A-Za-z_][\w.:]*)?(?:\.(?:len|count|as_u16|as_u64|as_i64|status|status_code|code|content_length|elapsed|attempts|is_[a-z_]+|as_str_code)\(\)|StatusCode::[A-Z_]+|error_codes::[A-Z_]+|msg::[A-Z_]+|[A-Z][A-Z0-9_]{2,})[\s)]*(?:\.(?:to_string|as_u16|to_owned|clone)\(\))?[\s)]*$')
     # Values produced by our OWN code from the caller's own input (echo direction).
-    # `std::fs::canonicalize` / `.canonicalize()` RESOLVE a filesystem path (the #3713 std::fs shape) — the
-    # FOREIGN `path` head above claims them before OWN_RE's `\bcanonical` (our normalisers) can (#3760).
     OWN_RE = re.compile(r'\bvalidat|[Rr]ejection|Validator|Validation|\bparse_[a-z_]*\(|::parse\(|\.parse::<|\bauthoriz|serde_json::from_|from_str\(|is_visible|resolve_read|CallerContext|\bcaller\b|\bcanonical|\bnormali[sz]e|\bclassify|to_rfc3339|Utc::now|from_rfc3339|\bDecode\b|\bdecode_[a-z_]*\(|base64|\bhex::|\bparse\b')
     FOREIGN = [
         ('db',   re.compile(r'\bapp\.store\b|\.store\.[a-z_]+\(|\bstore\.[a-z_]+\(|\bdb::[a-z_:]*[a-z_]\(|\bstorage::[a-z_:]*[a-z_]\(|\block\.0\b|\bconn\b|\btx\b|\bsqlx\b|\brusqlite\b|\.execute\(|\.query[a-z_]*\(|\.prepare\(|\bpool\b|Connection::open')),
         ('http', re.compile(r'\breqwest\b|\.send\(\)|\.send_async|\.text\(\)|\b(?:resp|response)\.(?:bytes|json|take|read_to_string|chunk|body|text|error_for_status)\(|\.bytes\(\)\.await|\.json::<|\bclient\.(?:get|post|put|delete|request|head)\(|\bureq\b|\back_body\b|\bhyper::')),
         ('proc', re.compile(r'\bCommand::|\.output\(\)|wait_with_output|\bstdout\b|\bstderr\b|\.fire\(|run_hook|drive_exec|\bexchange\(|\bchild\b|ExecutorError|HookDecision::parse')),
-        ('path', re.compile(r'(?:std::)?fs::canonicalize\b|\.canonicalize\b|effective_db|\bdb_path\b|\bkey_dir\b|keys_dir|config_path|config_dir|\blog_dir\b|audit_dir|env::var(?:_os)?\(\s*(?:[A-Z_]*_(?:DIR|ROOT|PATH|FILE)(?:_ENV)?|"AI_MEMORY_[A-Z_]*_(?:DIR|ROOT|PATH|FILE)")|home_dir\(|data_local_dir|config_local_dir|witness_key_dir|recorder_key_dir|\.db_path|\bdb\.path|lock\.1\b|passphrase_file|erasure_dir')),
+        ('path', re.compile(r'effective_db|\bdb_path\b|\bkey_dir\b|keys_dir|config_path|config_dir|\blog_dir\b|audit_dir|env::var(?:_os)?\(\s*(?:[A-Z_]*_(?:DIR|ROOT|PATH|FILE)(?:_ENV)?|"AI_MEMORY_[A-Z_]*_(?:DIR|ROOT|PATH|FILE)")|home_dir\(|data_local_dir|config_local_dir|witness_key_dir|recorder_key_dir|\.db_path|\bdb\.path|lock\.1\b|passphrase_file|erasure_dir')),
         ('dsn',  re.compile(r'redact_url|redact_urls_in_message|\bstore_label\b|\bstore_url\b|\bdsn\b|resolve_store_url|federation_forward_url|\bbase_url\b|quorum_peers|\bpeer_url\b|\bpeers\b')),
     ]
     TEXTISH_TYPES = re.compile(r'\bstr\b|String|Cow<|Display|\bValue\b|Result<|Option<|Vec<|PathBuf|\bPath\b|Error|\[u8\]|Bytes|Outcome|Report|Decision')
@@ -328,41 +219,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
     PARSE_RE = re.compile(r'serde_json::from_|from_str\(|from_utf8|from_slice|\.parse::<|\.parse\(\)|\bparse_[a-z_]*\(|::parse\(|\bdecode|base64|\bhex::|\.get\("|\.as_str\(\)|\.trim\(\)|\.lines\(\)|\.split|\.chars\(\)|String::from_utf8|\.to_owned\(\)|\.into\(\)')
     TYPED_FROM_RE = re.compile(r'(?<!String::)(?<!Vec::)(?<!PathBuf::)(?<!HashMap::)(?<!BTreeMap::)[A-Z][A-Za-z0-9]*::(from_(?!str\b|utf8|slice|reader|value)[a-z_]+|parse|resolve|build|of)\(')
     NUMERIC_RE = re.compile(r'parse::<(u\d+|i\d+|usize|isize|f\d+)>\(\)\s*$|^\s*\d+\s*$')
-    PATH_CTOR_RE = re.compile(r'(?:(?:std::)?fs::[a-z_]+|\bPath(?:Buf)?::(?:new|from)|\.(?:join|canonicalize|with_extension|with_file_name|parent|display|to_path_buf))\s*$')
-    def blank_call_args(e):
-        """Length-preserving blank of every parenthesised ARGUMENT list at any depth — EXCEPT the
-        arguments of a PATH constructor / resolver (`std::fs::canonicalize(&key_dir)`, `Path::new(..)`,
-        `.join(..)`): a resolved path IS its argument (the #3713 std::fs shape)."""
-        out = list(e); depth = 0; in_s = False; esc = False
-        keep_depth = None   # depth at which a path-constructor argument list opened
-        for i, c in enumerate(e):
-            if keep_depth is not None:
-                if c == '(' and not in_s: depth += 1
-                elif c == ')' and not in_s:
-                    depth -= 1
-                    if depth < keep_depth: keep_depth = None
-                if c == '"' and not esc: in_s = not in_s
-                continue
-            if in_s:
-                if esc: esc = False
-                elif c == '\\': esc = True
-                elif c == '"': in_s = False
-                if depth > 0: out[i] = ' '
-                continue
-            if c == '"': in_s = True
-            if c == '(':
-                if depth == 0 and PATH_CTOR_RE.search(e[max(0, i-40):i]):
-                    keep_depth = 1; depth += 1; continue
-                depth += 1
-                if depth > 1: out[i] = ' '
-                continue
-            if c == ')':
-                depth -= 1
-                if depth > 0: out[i] = ' '
-                continue
-            if depth > 0: out[i] = ' '
-        return ''.join(out)
-
     def classify_expr(expr, side='err'):
         """Textual classification of a producing expression (string literals are NOT evidence).
         side='err'   : the expression PRODUCED AN ERROR we are about to render (its Display is the payload).
@@ -392,15 +248,10 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         if side == 'value':
             if PARSE_RE.search(expr): return None           # a parsed VALUE inherits the taint of its input
             if TYPED_FROM_RE.search(expr): return CLEAN     # a typed struct built by our own constructor
-            if re.match(r'^\s*&?(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Za-z0-9]*\s*\{', expr): return CLEAN   # a struct LITERAL of ours: its fields are judged when rendered (#3760)
             if OWN_RE.search(expr): return CLEAN
-            # #3760 — a VALUE is produced by the receiver chain and the call heads, never by what is
-            # passed INTO a call: `dispatch(ctx, db_path, ..)` does not make the result a path, and
-            # `peer_status(&p.id, ..)` does not make it a peer URL. Arguments are blanked before the
-            # marker search (the argument's own producer is judged when it is rendered).
             for kind, rx in FOREIGN:
                 if kind == 'db': continue                    # rows we read are our own data
-                m = rx.search(blank_call_args(expr))
+                m = rx.search(expr)
                 if m: return T(kind, m.group(0))
             return None
         if OWN_RE.search(expr): return CLEAN
@@ -480,19 +331,8 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
 
     def _resolve_ident(name, f, upto, depth, trail, side, key):
         text = files[f.file]['text']
-        real = text[f.body_start:upto]
-        # #3760 — binding SITES are searched on a literal-blanked copy so `source_id = ?1` inside a
-        # SQL string or `x = y` inside a message is never mistaken for an assignment; the expressions
-        # themselves are read from the real text at the same offsets (inline `{x}` names live in
-        # literals and must survive).
-        body = blank_tracing(blank_literals(real))
+        body = text[f.body_start:upto]
         nm = re.escape(name)
-        full = text[f.body_start:f.end]
-        def own_initializer(m):
-            """#3760 — a `let name = <expr>` whose initializer CONTAINS the use being resolved is not
-            its binding (`let events = { for e in events {..} kept }` reads the OUTER `events`)."""
-            span_end = m.end() + len(expr_until(full, m.end(), stop_tokens=(';',)))
-            return m.end() <= (upto - f.body_start) < span_end
         cands = []   # (position, kind, match)
         for mm in re.finditer(r'\.(map_err|or_else|unwrap_or_else|map|and_then|inspect_err|ok_or_else|filter_map)\s*\(\s*(?:move\s+)?\|\s*(?:mut\s+)?' + nm + r'\s*(?::[^|]*)?\|', body):
             cands.append((mm.start(), 'closure', mm))
@@ -503,10 +343,8 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         for mm in re.finditer(r'\b(?:if|while)?\s*let\s+(Err|Ok|Some)\s*\(\s*(?:ref\s+)?(?:mut\s+)?' + nm + r'\s*\)\s*=\s*', body):
             cands.append((mm.start(), 'let-pat', mm))
         for mm in re.finditer(r'\blet\s+(?:mut\s+)?' + nm + r'\s*(?::\s*[^=]+?)?\s*=\s*', body):
-            if own_initializer(mm): continue
             cands.append((mm.start(), 'let', mm))
         for mm in re.finditer(r'(?<![A-Za-z0-9_.])' + nm + r'\s*=\s*(?!=)', body):
-            if own_initializer(mm): continue
             cands.append((mm.start(), 'assign', mm))
         for mm in re.finditer(r'\bfor\s+(?:\(\s*\w+\s*,\s*)?' + nm + r'\)?\s+in\s+', body):
             cands.append((mm.start(), 'for', mm))
@@ -515,39 +353,24 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             pos, kind, m = max(cands, key=lambda c: c[0])
             at = f.body_start + pos
             if kind == 'closure':
-                recv = receiver_chain(real, m.start())
+                recv = receiver_chain(body, m.start())
                 cside = 'value' if m.group(1) in ('map', 'and_then', 'filter_map') else 'err'
                 res = taint_expr(recv, f, at, depth + 1, trail + [f'{name}<-closure({m.group(1)})'], cside)
             elif kind == 'arm':
-                subj = match_subject(real, m.start())
+                subj = match_subject(body, m.start())
                 if subj is not None:
                     res = taint_expr(subj, f, at, depth + 1, trail + [f'{name}<-{m.group(1)}(arm)'], 'err' if m.group(1) == 'Err' else 'value')
             elif kind == 'typed-arm':
                 res = CLEAN   # payload of one of OUR typed enum variants
             elif kind == 'let-pat':
-                expr = expr_until(real, m.end(), stop_tokens=(' else', '{', ';'))
-                # #3760 — the expression is judged at ITS OWN offset (m.end()), not the `let`'s: a
-                # `match` arm binding inside the initializer must be visible to the arm body's walk.
-                res = taint_expr(expr, f, f.body_start + m.end(), depth + 1, trail + [f'{name}<-let {m.group(1)}'], 'err' if m.group(1) == 'Err' else 'value')
+                expr = expr_until(body, m.end(), stop_tokens=(' else', '{', ';'))
+                res = taint_expr(expr, f, at, depth + 1, trail + [f'{name}<-let {m.group(1)}'], 'err' if m.group(1) == 'Err' else 'value')
             elif kind in ('let', 'assign'):
-                expr = expr_until(real, m.end(), stop_tokens=(';',))
-                res = taint_expr(expr, f, f.body_start + m.end(), depth + 1, trail + [f'{name}<-{kind}'], side)
-                # #3760 — a COLLECTION is produced by what is pushed into it, not by `Vec::new()`:
-                # `let mut errors = Vec::new(); .. errors.push(format!("..{e}")); .. "errors": errors`
-                # renders the pushed text. Every push/extend/insert between the binding and the
-                # render is a producer; the first tainted one decides.
-                if not res and COLLECTION_NEW_RE.match(expr.strip()):
-                    for pm in re.finditer(r'(?<![A-Za-z0-9_.])' + nm + r'\.(push|push_str|extend|insert|append)\s*\(', body[m.end():]):
-                        pat = m.end() + pm.start()
-                        pe = find_matching(body, m.end() + pm.end() - 1, '(', ')')
-                        if pe < 0: continue
-                        args = split_args(real[m.end() + pm.end():pe])
-                        if not args: continue
-                        r = taint_expr(args[-1], f, f.body_start + pat, depth + 1, trail + [f'{name}<-{pm.group(1)}'], 'value')
-                        if r: res = r; break
+                expr = expr_until(body, m.end(), stop_tokens=(';',))
+                res = taint_expr(expr, f, at, depth + 1, trail + [f'{name}<-{kind}'], side)
             elif kind == 'for':
-                expr = expr_until(real, m.end(), stop_tokens=('{',))
-                res = taint_expr(expr, f, f.body_start + m.end(), depth + 1, trail + [f'{name}<-for'], 'value')
+                expr = expr_until(body, m.end(), stop_tokens=('{',))
+                res = taint_expr(expr, f, at, depth + 1, trail + [f'{name}<-for'], 'value')
             return res
         # function parameter -> call sites
         for idx, (pn, pt) in enumerate(f.params):
@@ -556,7 +379,7 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             if FOREIGN_TYPES.search(pt) and not re.search(r'dyn\s+(std::fmt::)?Display|impl\s+(std::fmt::)?Display', pt):
                 res = T(kind_of_type(pt), f'param {name}: {pt}'); return res
             _tn = re.sub(r'^[&\s]*(?:mut\s+)?', '', pt).split('<')[0].split('::')[-1].strip()
-            if side == 'err' and own_type_wraps_foreign(_tn): return T('db', f'param {name}: {pt} wraps a foreign payload')   # a VALUE of one of our types is our data (#3760)
+            if own_type_wraps_foreign(_tn): return T('db', f'param {name}: {pt} wraps a foreign payload')
             if not TEXTISH_TYPES.search(pt): return CLEAN   # a handle / struct, not text
             hb = strip_tracing(text[f.body_start:f.end])
             if CLEAN_RE.search(hb) or GUARD_RE.search(hb):
@@ -568,20 +391,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             res = field_taint(f.impl_type, name, depth + 1, trail + [f'self.{name} of {f.impl_type}'])
             return res
         return CLEAN
-
-    COLLECTION_NEW_RE = re.compile(r'^(?:Vec|String|HashMap|BTreeMap|HashSet|BTreeSet|VecDeque)(?:::<[^>]*>)?::(?:new|with_capacity|default)\s*\(|^vec!\s*\[|^Vec::<[^>]*>::new')
-
-    def mapper_bound(name, f, upto):
-        """Is `name`'s NEAREST `let`/assignment initializer (before `upto`) a render through a declared
-        typed mapper (CLEAN_RE) — the one case where provenance outranks a name marker?"""
-        text = files[f.file]['text']
-        body = blank_tracing(blank_literals(text[f.body_start:upto]))
-        nm = re.escape(name); last = None
-        for mm in re.finditer(r'\blet\s+(?:mut\s+)?' + nm + r'\s*(?::\s*[^=]+?)?\s*=\s*|(?<![A-Za-z0-9_.])' + nm + r'\s*=\s*(?!=)', body):
-            last = mm
-        if last is None: return False
-        init = expr_until(text[f.body_start:f.end], last.end(), stop_tokens=(';',))
-        return CLEAN_RE.search(norm(LIT_RE.sub('""', init))) is not None
 
     def kind_of_type(pt):
         if re.search(r'reqwest', pt): return 'http'
@@ -683,17 +492,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         if tail.strip(): exits.append((start, tail))
         return exits
 
-    ERR_ADAPTER_RE = re.compile(r'\.(?:map_err|context|with_context|or_else|unwrap_or_else|inspect_err|ok_or_else|map_or_else)\s*\(')
-    def strip_err_adapters(expr):
-        out = expr
-        for _ in range(12):
-            m = ERR_ADAPTER_RE.search(out)
-            if not m: break
-            e = find_matching(out, m.end() - 1, '(', ')')
-            if e < 0: break
-            out = out[:m.start()] + out[e+1:]
-        return out
-
     def taint_expr(expr, f, at, depth, trail, side='err'):
         if not expr: return CLEAN
         if depth > MAX_DEPTH: state['exhausted'] = True; return CLEAN
@@ -708,57 +506,13 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         if st.startswith('{') and st.endswith('}') and find_matching(st, 0, '{', '}') == len(st) - 1:
             base = at + expr.find(st)
             exits = block_exits(st)
-            # #3760 — a block that INITIALISES a binding (`let x = { .. }`, a push argument) yields its
-            # tail; a `return <y>` inside it leaves the FUNCTION and is judged where it is built (S1/S3
-            # see it in the same fn). A CLOSURE body at a sink keeps every exit (#3711).
-            if side == 'value' and exits and any(re.search(r'<-(?:let|assign|push|push_str|extend|insert|append)$', t) for t in trail):
-                exits = exits[-1:] if not st[1:-1].rstrip().endswith(';') else []
-                if not exits: return CLEAN   # a block with no tail has the unit value: nothing is rendered by it
             if exits:
                 for (off, ex) in exits:
                     r = taint_expr(ex, f, base + off, depth + 1, trail + ['block-exit'], side)
                     if r: return r
                 return CLEAN
-        # #3760 — a VALUE is what the Ok/success side carries; the adapters that only SHAPE the error
-        # (`.map_err(|e| ..)`, `.context(..)`, `.or_else(..)`, `.unwrap_or_else(..)`) are stripped
-        # before the identifier walk, or the closure's `|e|` reads as a rendered ident and every
-        # `let x = store_call().map_err(..)?` value inherits the driver's error taint.
-        if side == 'value':
-            st = strip_err_adapters(st); expr = st
-            # a struct LITERAL of ours is our own construction; its fields are judged when rendered (#3760)
-            if re.match(r'^\s*&?(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Za-z0-9]*\s*\{', st) and st.endswith('}'): return CLEAN
-            # A mapped collection's VALUE is what the closure produces (`f.peers.iter().map(|p|
-            # peer_status(&p.id, ..)).collect()` renders `peer_status`'s result, not `peers`): judge
-            # the LAST `.map(|..| body)` closure body as the value.
-            mv = None
-            for mm_ in re.finditer(r'\.map\s*\(\s*(?:move\s+)?\|[^|]*\|\s*', st):
-                e_ = find_matching(st, st.rfind('(', 0, mm_.end()), '(', ')') if False else find_matching(st, mm_.start() + st[mm_.start():].find('('), '(', ')')
-                if e_ > 0: mv = (mm_.end(), e_)
-            if mv:
-                return taint_expr(st[mv[0]:mv[1]], f, at + expr.find(st[mv[0]:mv[1]]), depth + 1, trail + ['map-closure-value'], 'value')
         mm = re.match(r'match\s+(.+?)\s*\{', st, re.S)
         if mm and st.endswith('}'):
-            # #3760 — a match EXPRESSION's value is what its ARMS produce: `Err(e) => format!("..{e}")`
-            # renders the error even when the subject is a db call whose VALUE side is our own data.
-            # Each arm body is judged at its own offset (its pattern binding precedes it), then the
-            # subject decides what is left.
-            base = at + expr.find(st)
-            ob = st.find('{', mm.end() - 1); cb = find_matching(st, ob, '{', '}')
-            inner = blank_literals(st[ob+1:cb]); pos = 0
-            while True:
-                am = inner.find('=>', pos)
-                if am < 0: break
-                j = am + 2
-                while j < len(inner) and inner[j] in ' \t\n': j += 1
-                if j < len(inner) and inner[j] == '{':
-                    be = find_matching(inner, j, '{', '}'); body_txt = st[ob+1+j:ob+1+be+1]; pos = be + 1
-                else:
-                    body_txt = expr_until(inner, j, stop_tokens=(',',)); body_txt = st[ob+1+j:ob+1+j+len(body_txt)]; pos = j + len(body_txt) + 1
-                if body_txt.strip():
-                    # a `return ..` arm leaves the fn: it is not the match's VALUE (judged where it is built)
-                    if side == 'value' and re.match(r'\s*(?:return\b|continue\b|break\b)', body_txt) and any(re.search(r'<-(?:let|assign|push|push_str|extend|insert|append)$', t) for t in trail): continue
-                    r = taint_expr(body_txt, f, base + ob + 1 + j, depth + 1, trail + ['match-arm'], side)
-                    if r: return r
             return taint_expr(mm.group(1), f, at, depth + 1, trail + ['match-subject'], side)
         mm = re.match(r'(?:if|while)\s+let\s+(?:Ok|Some)\s*\([^)]*\)\s*=\s*(.+?)\s*\{', st, re.S)
         if mm: return taint_expr(mm.group(1), f, at, depth + 1, trail + ['if-let-subject'], side)
@@ -785,11 +539,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         # redact_/prefix/msg helper stays transparent (RED) per the masker/wrapper controls.
         if cm and re.search(r'(?:^|::)url_display::$', cm.group(1) or ''):
             return CLEAN
-        # #3760 — a DECLARED typed mapper (`mapper=<fn>` in the ledger, or the built-in set) is a
-        # rendering boundary by declaration: its output is caller-safe, so the walk never enters it
-        # to re-judge its arguments (the same stop the url_display module gets by module path).
-        if cm and CLEAN_RE.search(cm.group(2) + '('):
-            return CLEAN
         if cm:   # a single call only when its parentheses are the OUTERMOST pair (not `a(..).b(..)`)
             op = expr_nl.find('(', cm.start(2)); cl = find_matching(expr_nl, op, '(', ')')
             if cl < 0 or expr_nl[cl+1:].strip() not in ('', '?', '.into()', '.to_string()'): cm = None
@@ -808,17 +557,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
                 if len(ms) == 1 and not [c for c in fns_by_name.get(mm.group(2), []) if not c.impl_type]:
                     r = call_taint(ms[0], split_args(expr_nl[op+1:cl]), f, at, depth + 1, trail + [f'call .{mm.group(2)}()'], side)
                     if r is not None and r: return r
-        # #3760 — provenance before names: a BARE identifier is judged by its binding (a `peers`
-        # local built from `peer_status(..)` projections is what it was bound to, not what it is
-        # called); the name markers decide only when nothing binds it.
-        bm = re.match(r'^\s*&?\s*(?:mut\s+)?([a-z_][a-z0-9_]*)\s*(?:\.(?:clone|to_string|as_str|to_owned|as_ref)\(\))?\s*$', expr)
-        if bm and f is not None and bm.group(1) not in KEYWORDS:
-            r = resolve_ident(bm.group(1), f, at, depth + 1, trail, side)
-            if r: return r
-            # Only a binding whose initializer renders through a DECLARED typed mapper outranks the
-            # name marker (`let peers = ..map(|p| peer_status(..)).collect()`); a `store_label` bound
-            # to anything else keeps its marker (#3674 stays tracked).
-            if mapper_bound(bm.group(1), f, at): return CLEAN
         c = classify_expr(expr, side)
         if c is CLEAN: return CLEAN
         if c: return T(c.kind, c.why + ' @ ' + '>'.join(trail))
@@ -827,19 +565,7 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         # finding's source kind. Iterating the raw set let one site key as `:http` on one run and
         # `:dsn` on the next (PYTHONHASHSEED), which no ledger can track. Alphabetical is the fixed
         # tie-break; a site that renders several foreign values keys on the first by name.
-        # #3760 — an identifier the expression binds ITSELF (a closure parameter `|e|`, an arm binding
-        # `Err(e) =>` / `Some(x) =>`, an inner `let x`) is not resolved at the expression's start: the
-        # binding that precedes the expression is a different, shadowed variable.
-        inner_bound = set()
-        for cm_ in re.finditer(r'\|([^|]*)\|', expr):
-            for part in cm_.group(1).split(','):
-                mm_ = re.match(r'\s*(?:\(\s*)?(?:mut\s+)?(?:ref\s+)?([a-z_][a-z0-9_]*)', part)
-                if mm_: inner_bound.add(mm_.group(1))
-        inner_bound |= set(re.findall(r'\b(?:Ok|Err|Some)\s*\(\s*(?:ref\s+)?(?:mut\s+)?([a-z_][a-z0-9_]*)\s*\)\s*=>', expr))
-        inner_bound |= set(re.findall(r'\blet\s+(?:mut\s+)?([a-z_][a-z0-9_]*)\b', expr))
-        inner_bound |= set(re.findall(r'\bfor\s+(?:mut\s+)?([a-z_][a-z0-9_]*)\s+in\b', expr))
         for name in sorted(rendered_idents(expr)):
-            if name in inner_bound: continue
             r = resolve_ident(name, f, at, depth + 1, trail, side)
             if r: return r
         for m in re.finditer(r'(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([a-z_][a-z0-9_]*)\s*\(', expr_nl):
@@ -910,20 +636,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         """Replace every string literal's CONTENT with spaces (length-preserving), so `?`, `=` and `;`
         inside SQL / messages cannot be mistaken for operators."""
         return LIT_RE.sub(lambda m: '"' + ' ' * (len(m.group(0)) - 2) + '"', t)
-
-    def blank_tracing(t):
-        """Blank every tracing macro invocation (length-preserving, newlines kept): a log is another
-        audience, and its `field = %value` syntax is not an assignment a binding search may pick up
-        (#3760: `source_id = %source_id` inside `tracing::warn!` read as `source_id<-assign`)."""
-        out = []; i = 0
-        while True:
-            m = TRACING_RE.search(t, i)
-            if not m: out.append(t[i:]); break
-            e = find_matching(t, m.end()-1, '(', ')')
-            if e < 0: out.append(t[i:]); break
-            out.append(t[i:m.start()]); out.append(re.sub(r'[^\n]', ' ', t[m.start():e+1]))
-            i = e + 1
-        return ''.join(out)
 
     def _callee_err_sites(g, body, f, at, depth, trail):
         body = blank_literals(body)
@@ -1007,13 +719,9 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
                     if r: return r
         if CLEAN_RE.search(body) and not re.search(r'\{[a-z_]+[:}]', body): return CLEAN
         rendered_any = False
-        # #3760 — a filesystem PROBE consumes a path and yields a size / a flag, never the path's
-        # text: `std::fs::metadata(db_path).len()` in `stats` does not render `db_path`.
-        probe_body = re.sub(r'\b(?:std::fs::|fs::)?(?:metadata|symlink_metadata|exists|is_file|is_dir|read_dir|remove_file|create_dir_all|try_exists)\s*\(\s*&?\s*([a-z_][a-z0-9_]*)\s*\)', r'probe(\1_)', body)
-        probe_body = re.sub(r'\b([a-z_][a-z0-9_]*)\.(?:exists|is_file|is_dir|metadata|symlink_metadata|try_exists)\(\)', r'\1_.probe()', probe_body)
         for idx, (pn, pt) in enumerate(g.params):
             if idx >= len(args): break
-            if re.search(r'\{' + re.escape(pn) + r'[:}]|\b' + re.escape(pn) + r'\.(to_string|display|as_str|clone|to_owned)\(\)|\b' + re.escape(pn) + r'\b\s*[,)]|\bformat!\([^;]*\b' + re.escape(pn) + r'\b', probe_body):
+            if re.search(r'\{' + re.escape(pn) + r'[:}]|\b' + re.escape(pn) + r'\.(to_string|display|as_str|clone|to_owned)\(\)|\b' + re.escape(pn) + r'\b\s*[,)]|\bformat!\([^;]*\b' + re.escape(pn) + r'\b', body):
                 rendered_any = True
                 r = taint_expr(args[idx], f, at, depth + 1, trail + [f'arg#{idx}->{g.name}.{pn}'], 'value')
                 if r: return r
@@ -1103,41 +811,10 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
     def add(sev, key, file, line, fn, text):
         findings.append({'sev': sev, 'key': key, 'file': file, 'line': line, 'fn': fn, 'text': text})
 
-    def json_values(text, jstart):
-        """Every VALUE of a `json!( .. )` invocation starting at `jstart`, at ANY key and any nesting
-        (objects and arrays), as (expr, char_idx). Key-agnostic: a caller reads `"errors"`, `"detail"`,
-        `"note"` and `"warnings"` exactly as it reads `"error"` (#3760)."""
-        op = text.find('(', jstart)
-        if op < 0: return
-        e = find_matching(text, op, '(', ')')
-        if e < 0: return
-        yield from _json_walk(text, op + 1, e)
-    def _json_walk(text, a, b):
-        seg = text[a:b]; st = seg.lstrip(); off = a + (len(seg) - len(st))
-        if st.startswith('{'):
-            ce = find_matching(st, 0, '{', '}')
-            if ce < 0: return
-            body = st[1:ce]; pos = 0
-            for part in split_args(body):
-                if not part: continue
-                idx = body.find(part, pos); pos = idx + len(part)
-                km = re.match(r'\s*(?:"(?:[^"\\]|\\.)*"|\([^)]*\)|[A-Za-z_][A-Za-z0-9_:.]*)\s*:\s*', part, re.S)
-                if not km: continue
-                yield from _json_walk(text, off + 1 + idx + km.end(), off + 1 + idx + len(part))
-        elif st.startswith('['):
-            ce = find_matching(st, 0, '[', ']')
-            if ce < 0: return
-            body = st[1:ce]; pos = 0
-            for part in split_args(body):
-                if not part: continue
-                idx = body.find(part, pos); pos = idx + len(part)
-                yield from _json_walk(text, off + 1 + idx, off + 1 + idx + len(part))
-        elif st.strip():
-            yield (st.rstrip(), off)
-
+    HTTP_SCOPE = ('src/handlers/', 'src/lib.rs', 'src/federation/')
+    DENY_SCOPE = ('src/hooks/', 'src/governance/', 'src/mcp/')
     def sink_exprs_in(p):
-        """Yield (kind, expr, char_idx) for every caller-facing sink in file p. The sink FUNCTIONS
-        are the derived sets HTTP_FNS / MCP_FNS (#3760); the shapes inside them are judged by value."""
+        """Yield (kind, expr, char_idx) for every caller-facing sink in file p."""
         text = files[p]['text']
         if p.startswith('src/cli/') or p.startswith('src/bin/') or p == 'src/main.rs':
             # operator audience (TIER 2) — EXCEPT the PreToolUse decision line, which the AI host reads
@@ -1151,22 +828,13 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         def in_sink_def(idx):
             ef = enclosing_fn(p, idx)
             return ef is not None and ef.name in ('store_err_to_response', 'err_response')
-        def in_http(idx):
-            ef = enclosing_fn(p, idx)
-            return ef is not None and (ef.file, ef.name) in HTTP_FNS
-        def in_mcp(idx):
-            ef = enclosing_fn(p, idx)
-            return ef is not None and (ef.file, ef.name) in MCP_FNS
-        # S1: every value of every json!(..) built inside a derived HTTP fn (any key, any nesting), and
-        #     every value of an `Ok(json!(..))` / bare `json!(..)` payload built inside a derived MCP fn.
-        for m in re.finditer(r'\bjson!\s*\(', text):
+        # S1: json!({ "error": <expr> ...})
+        for m in (re.finditer(r'"error"\s*:\s*', text) if p.startswith(HTTP_SCOPE) else ()):
+            j = text.rfind('json!', 0, m.start())
+            if j < 0 or text.count('{', j, m.start()) - text.count('}', j, m.start()) < 1: continue
+            expr = expr_until(text, m.end(), stop_tokens=(',', '}'))
             if in_sink_def(m.start()): continue
-            if in_http(m.start()): kind = 'http-body'
-            elif in_mcp(m.start()): kind = 'mcp-result'
-            else: continue
-            for (expr, at) in json_values(text, m.start()):
-                if LIT_RE.fullmatch(expr.strip()) or re.fullmatch(r'\s*(?:true|false|null|-?\d+(?:\.\d+)?)\s*', expr): continue
-                yield (kind, expr, at)
+            yield ('http-body', expr, m.start())
         # S0: the SAFE FUNNELS — counted so a run can prove it saw them and flagged none
         for m in re.finditer(r'\b(store_err_to_response|handler_error_500|sanitize_store_err_message|sanitize_bulk_row_error)\s*\(', text):
             yield ('funnel', m.group(1) + '(', m.start())
@@ -1177,9 +845,8 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             args = split_args(text[m.end():e])
             if not args: continue
             yield ('http-body' if p.startswith('src/handlers') else 'rpc-error', args[-1], m.start())
-        # S3: (StatusCode::X, <text-expr>) tuple responses (not Json) inside a derived HTTP fn
-        for m in re.finditer(r'\(\s*StatusCode::[A-Z_]+\s*,\s*', text):
-            if not in_http(m.start()): continue
+        # S3: (StatusCode::X, <text-expr>) tuple responses (not Json)
+        for m in (re.finditer(r'\(\s*StatusCode::[A-Z_]+\s*,\s*', text) if p.startswith(HTTP_SCOPE) else ()):
             e = find_matching(text, m.start(), '(', ')')
             if e < 0: continue
             if in_sink_def(m.start()): continue   # the funnel is judged arm-by-arm; err_response's callers are the sinks
@@ -1191,28 +858,31 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
             e = find_matching(text, m.end()-1, '(', ')')
             if e < 0: continue
             yield ('memory-error', text[m.end():e], m.start())
-        # S5: MCP tool errors — Err(...) / map_err(|e| ...) inside a derived MCP fn (the wire error is String)
-        for m in re.finditer(r'\bErr\s*\(', text):
-            if not in_mcp(m.start()): continue
-            e = find_matching(text, m.end()-1, '(', ')')
-            if e < 0: continue
-            inner = text[m.end():e].strip()
-            # skip patterns (Err(e) =>), and skip if this is inside a From impl (covered by S4)
-            after = text[e+1:e+4]
-            if after.lstrip().startswith('=>') or re.match(r'^[a-z_][a-z0-9_]*$', inner) and after.lstrip().startswith('=>'): continue
-            # #3713 — `let Err(e) = ..` / `if let Err(e) = ..` / `while let Err(e) = ..` is a PATTERN too,
-            # not a re-raise expression: the ident it binds goes wherever the block sends it (usually a
-            # tracing line). Reading it as `Err(e)`-the-value made six log-only sites under src/mcp
-            # FAIL with "expr: e" while the value never reached a caller. `==` stays an expression.
-            if after.lstrip().startswith('=') and not after.lstrip().startswith('=='): continue
-            yield ('mcp-error', inner, m.start())
-        for m in re.finditer(r'\.map_err\s*\(\s*\|\s*(?:mut\s+)?([a-z_][a-z0-9_]*)\s*(?::[^|]*)?\|\s*', text):
-            if not in_mcp(m.start()): continue
-            e = find_matching(text, m.start() + len('.map_err'), '(', ')')
-            if e < 0: continue
-            yield ('mcp-error', text[m.end():e], m.end())
-        # S6: Deny { reason: <expr> } / PretoolDecision { reason } — a refusal renderer by SHAPE, wherever it lives
-        for m in re.finditer(r'\b(?:Deny|PretoolDecision)\s*\{', text):
+        # S5: MCP tool errors — Err(...) / map_err(|e| ...) / bail!/anyhow! in src/mcp/**
+        if p.startswith('src/mcp/'):
+            for m in re.finditer(r'\bErr\s*\(', text):
+                e = find_matching(text, m.end()-1, '(', ')')
+                if e < 0: continue
+                inner = text[m.end():e].strip()
+                # skip patterns (Err(e) =>), and skip if this is inside a From impl (covered by S4)
+                after = text[e+1:e+4]
+                if after.lstrip().startswith('=>') or re.match(r'^[a-z_][a-z0-9_]*$', inner) and after.lstrip().startswith('=>'): continue
+                # #3713 — `let Err(e) = ..` / `if let Err(e) = ..` / `while let Err(e) = ..` is a PATTERN too,
+                # not a re-raise expression: the ident it binds goes wherever the block sends it (usually a
+                # tracing line). Reading it as `Err(e)`-the-value made six log-only sites under src/mcp
+                # FAIL with "expr: e" while the value never reached a caller. `==` stays an expression.
+                if after.lstrip().startswith('=') and not after.lstrip().startswith('=='): continue
+                if re.match(r'^[a-z_][a-z0-9_]*$', inner):
+                    # Err(e) as an expression (re-raise) — trace the ident
+                    yield ('mcp-error', inner, m.start()); continue
+                yield ('mcp-error', inner, m.start())
+            for m in re.finditer(r'\.map_err\s*\(\s*\|\s*(?:mut\s+)?([a-z_][a-z0-9_]*)\s*(?::[^|]*)?\|\s*', text):
+                e = find_matching(text, text.rfind('(', 0, m.end()) if False else m.start() + len('.map_err'), '(', ')')
+                if e < 0: continue
+                closure_body = text[m.end():e]
+                yield ('mcp-error', closure_body, m.end())
+        # S6: Deny { reason: <expr> }
+        for m in (re.finditer(r'\b(?:Deny|PretoolDecision)\s*\{', text) if p.startswith(DENY_SCOPE) or 'PretoolDecision' in text else ()):
             e = find_matching(text, m.end()-1, '{', '}')
             if e < 0: continue
             inner = text[m.end():e]
@@ -1317,7 +987,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
 
     # ----------------------------------------------------------------- allowlist
     counts = collections.Counter()
-    for _k, _v in DERIVED.items(): counts['derived:' + _k] = _v   # #3760 — the derived sink-function sets, surfaced
     counts['files_scanned'] = len(files)   # #3711 — surface the scan denominator so a file NOT in the tree (silently unscanned) cannot read as a pass
     allow = {}
     if ALLOWF and os.path.exists(ALLOWF):
@@ -1692,16 +1361,6 @@ fn block_tail_bound_sanitiser(url: &str) -> Result<Value, String> {
         format!("parse body from {target}: {category:?} at line {line} column {column}")
     })
 }
-
-// T1 (#3760) — an Ok RESULT payload carrying a driver error under a non-error key: the tool
-// "succeeds" while the caller reads sqlx text. Only a derived, key-agnostic result walk sees it.
-fn status_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
-    let index_note = match db::fts_probe(conn) {
-        Ok(()) => "ok".to_string(),
-        Err(e) => format!("index degraded: {e}"),
-    };
-    Ok(json!({"status": "ok", "index_note": index_note}))
-}
 ''')
     _write(root, 'src/hooks/chain.rs', '''
 async fn fire(executor: &Executor, event: Event) -> ChainResult {
@@ -1747,104 +1406,6 @@ fn send(url: &str) -> Result<(), String> {
         return Err(format!("ack-status: {status_field}"));
     }
     Ok(())
-}
-''')
-    # #3760 — the fixture is DERIVED like the tree: a router registers the HTTP handlers and a
-    # dispatch table registers the MCP tools. A response-shaped fn nothing routes (`unrouted_leak`)
-    # is dead code, not a sink — the control that proves the set is derived, not enumerated.
-    _write(root, 'src/lib.rs', '''
-pub fn build_router() -> axum::Router {
-    axum::Router::new()
-        .route(handlers::routes::SIGNALS, post(handlers::coord::signal_send))
-        .route(handlers::routes::IMPORT, post(handlers::coord::import_bulk))
-        .route(handlers::routes::DETAIL, get(handlers::coord::detail_key_render).delete(handlers::coord::detail_key_render))
-        .route(handlers::routes::KEYS, get(handlers::coord::resolved_path_render))
-        .layer(axum::middleware::from_fn_with_state(state, handlers::coord::gate_layer))
-}
-''')
-    _write(root, 'src/mcp/mod.rs', '''
-macro_rules! register_mcp_tool { ($name:expr, $f:path) => { ($name, $f as DispatchFn) }; }
-pub static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = &[
-    register_mcp_tool!(tool_names::MEMORY_FORWARD, dispatch_forward),
-    register_mcp_tool!(tool_names::MEMORY_GET, dispatch_get),
-    register_mcp_tool!(tool_names::MEMORY_SANITISED, dispatch_sanitised),
-    register_mcp_tool!(tool_names::MEMORY_LOG_ONLY, dispatch_log_only),
-    register_mcp_tool!(tool_names::MEMORY_RERAISE, dispatch_reraise),
-    register_mcp_tool!(tool_names::MEMORY_ONLY_SANITISED, dispatch_only_sanitised),
-    register_mcp_tool!(tool_names::MEMORY_BLOCK_TAIL, dispatch_block_tail),
-    register_mcp_tool!(tool_names::MEMORY_BLOCK_RETURN, dispatch_block_return),
-    register_mcp_tool!(tool_names::MEMORY_BLOCK_BOUND, dispatch_block_bound),
-    register_mcp_tool!(tool_names::MEMORY_STATUS, dispatch_status),
-];
-fn dispatch_forward(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::forward_to_http(ctx.url) }
-fn dispatch_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::handle_get(ctx.conn, ctx.id) }
-fn dispatch_sanitised(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::forward_sanitised(ctx.url) }
-fn dispatch_log_only(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::log_only_if_let(ctx.conn, ctx.id) }
-fn dispatch_reraise(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::reraise_ident(ctx.conn, ctx.id) }
-fn dispatch_only_sanitised(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::only_sanitised(ctx.url) }
-fn dispatch_block_tail(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::block_tail_laundered(ctx.url) }
-fn dispatch_block_return(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::block_return_exit(ctx.url) }
-fn dispatch_block_bound(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::block_tail_bound_sanitiser(ctx.url) }
-fn dispatch_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::status_payload(ctx.conn) }
-''')
-    _write(root, 'src/handlers/import.rs', '''
-// #3760 — the import envelope: a Vec<String> assembled by push and rendered under a key that is
-// NOT "error". The pre-#3760 gate keyed the HTTP sink on the literal `"error"` and read
-// `Vec::new()` as clean, so this leak (the live admin.rs:1577 shape) was invisible to it.
-async fn import_bulk(app: AppState, body: Body) -> Response {
-    let mut errors: Vec<String> = Vec::new();
-    let mut imported = 0usize;
-    for mem in body.memories {
-        match app.store.enforce_governance_action(&mem.namespace).await {
-            Ok(()) => imported += 1,
-            Err(e) => {
-                // T1 — a StoreError Display pushed into the envelope's errors[] (#3760)
-                errors.push(format!("{}: governance error: {e}", mem.id));
-                continue;
-            }
-        }
-    }
-    (StatusCode::OK, Json(json!({"imported": imported, "errors": errors}))).into_response()
-}
-// CONTROL — a Vec of OUR OWN text under the same key is clean
-async fn import_clean(app: AppState, body: Body) -> Response {
-    let mut errors: Vec<String> = Vec::new();
-    for mem in body.memories {
-        if let Err(e) = crate::validate::validate_id(&mem.id) {
-            errors.push(format!("{}: {e}", mem.id));
-        }
-    }
-    (StatusCode::OK, Json(json!({"imported": 0, "errors": errors}))).into_response()
-}
-// T1 — foreign text under a non-"error" key ("detail"), in a routed handler (#3760)
-async fn detail_key_render(app: AppState, id: String) -> Response {
-    match app.store.get(&ctx, &id).await {
-        Ok(m) => (StatusCode::OK, Json(json!({"id": m.id, "title": m.title}))).into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"code": "NOT_FOUND", "detail": format!("{e}")}))).into_response(),
-    }
-}
-// T1 — the #3713 std::fs shape: a RESOLVED operator path (std::fs::canonicalize) under a non-"error"
-// key. The pre-#3760 gate read `canonicalize` as OUR normaliser (`\\bcanonical`) and the key was not
-// `"error"`, so it was invisible twice over.
-async fn resolved_path_render(app: AppState) -> Response {
-    let key_dir = crate::identity::keypair::default_key_dir().unwrap_or_default();
-    let resolved = std::fs::canonicalize(&key_dir).unwrap_or(key_dir);
-    (StatusCode::OK, Json(json!({"status": "ok", "keys": resolved.display().to_string()}))).into_response()
-}
-// CONTROL (derivation) — the SAME leak in a response-shaped fn nothing routes and nothing reaches:
-// dead code is not a sink. The pre-#3760 gate flagged it by path prefix; the derived gate must not.
-async fn unrouted_leak(app: AppState) -> Response {
-    if let Err(e) = app.store.get(&ctx, "x").await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-    }
-    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
-}
-// T1 — a middleware layer the router installs is a sink too (#3760)
-async fn gate_layer(req: Request, next: Next) -> Response {
-    if let Err(e) = app.store.get(&ctx, "gate").await {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("gate: {e}")}))).into_response();
-    }
-    next.run(req).await
 }
 ''')
     _write(root, 'src/cli/report.rs', '''
@@ -1907,28 +1468,6 @@ def self_test(scratch):
         expect(any(':reraise_ident:mcp-error:db' in k for k in frozen_3713), 'R-203 sanity: the frozen gate rejects the bare re-raise too, so its verdict on the pattern is the defect, not a broken run')
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
         expect(False, f'R-203 (#3713): frozen prefix gate could not be run ({ex})')
-    # #3760 — the sink set is DERIVED (router + dispatch table + reachability), never enumerated by
-    # JSON key or path prefix, and a pushed collection is produced by its pushes.
-    expect(has('src/handlers/import.rs', ':import_bulk:http-body:db'), '#3760: a StoreError Display pushed into the import envelope\'s "errors": [..] array is RED (the live admin.rs:1577 shape)')
-    expect(not has('src/handlers/import.rs', ':import_clean:'), '#3760 CONTROL: a pushed Vec of our own validator text under the same key is CLEAN')
-    expect(has('src/handlers/import.rs', ':detail_key_render:http-body:db'), '#3760: foreign text under a non-"error" key ("detail") in a ROUTED handler is RED')
-    expect(not has('src/handlers/import.rs', ':unrouted_leak:'), '#3760 DERIVATION CONTROL: the same leak in a response-shaped fn nothing routes or reaches is NOT a sink (dead code) — the set is derived, not a path prefix')
-    expect(has('src/handlers/import.rs', ':resolved_path_render:http-body:path'), '#3760 / #3713: a std::fs::canonicalize-RESOLVED operator path under a non-"error" key in a routed handler is RED (the resolver is a path producer, not our normaliser)')
-    expect(has('src/handlers/import.rs', ':gate_layer:http-body:db'), '#3760: a middleware layer the router installs (from_fn_with_state) is a derived sink')
-    expect(has('src/mcp/tools/relay.rs', ':status_payload:mcp-result:db'), '#3760: a driver error carried in an Ok RESULT payload under a non-error key is RED (key-agnostic result walk)')
-    expect(counts.get('derived:http_roots', 0) >= 3 and counts.get('derived:mcp_roots', 0) >= 10, f"#3760 CONTROL: the roots were DERIVED from the fixture router / dispatch table (http {counts.get('derived:http_roots', 0)}, mcp {counts.get('derived:mcp_roots', 0)})")
-    prefix_3760 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3760.py')
-    try:
-        import subprocess
-        out = subprocess.run([sys.executable, prefix_3760, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
-        frozen_3760 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
-        expect(not any(':import_bulk:' in k for k in frozen_3760), 'R-203: the FROZEN pre-#3760 gate (test/fixtures/foreign-text-prefix-3760.py) ACCEPTS the errors[] array — the defect reproduces')
-        expect(not any(':detail_key_render:' in k for k in frozen_3760), 'R-203: the FROZEN gate ACCEPTS foreign text under a non-"error" key — the key-literal enumeration reproduces')
-        expect(any(':unrouted_leak:' in k for k in frozen_3760), 'R-203: the FROZEN gate flags the UNROUTED fn by path prefix — the enumeration-by-path reproduces')
-        expect(not any(':resolved_path_render:' in k for k in frozen_3760), 'R-203: the FROZEN gate ACCEPTS the std::fs-resolved path under a non-"error" key — the `canonical` own-marker + key-literal blindness reproduce')
-        expect(any(':signal_insert_error:http-body:db' in k for k in frozen_3760), 'R-203 sanity: the frozen gate still rejects the #3703 shape, so its silence above is the defect, not a broken run')
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
-        expect(False, f'R-203 (#3760): frozen prefix gate could not be run ({ex})')
     expect(has('src/hooks/chain.rs', ':fire:deny-reason:proc'), 'hook subprocess text in Deny.reason (#3704)')
     expect(has('src/errors.rs', ':from:memory-error:db'), 'From<rusqlite::Error> -> MemoryError::DatabaseError(e.to_string())')
     expect(has('src/subscriptions.rs', ':send:dlq-record:http'), "receiver's ack field persisted into subscription_dlq.last_error")
@@ -2008,9 +1547,7 @@ def main(argv):
         print(f"  [{x['sev']}] {x['key']}\n         {x['file']}:{x['line']} in {x['fn']}: {x['text']}")
     by_src = collections.Counter(x['key'].rsplit(':', 1)[-1] for x in findings if x['sev'] == 'FAIL' and 'funnel-arm' not in x['key'])
     by_sink = collections.Counter(x['key'].split(':')[2] for x in findings if x['sev'] == 'FAIL')
-    print(f"\nforeign-text-to-caller: {counts['files_scanned']} src/**.rs files scanned; sink fns DERIVED from the tree: "
-          f"http {counts.get('derived:http_fns', 0)} (from {counts.get('derived:http_roots', 0)} routed handlers/middleware), "
-          f"mcp {counts.get('derived:mcp_fns', 0)} (from {counts.get('derived:mcp_roots', 0)} dispatch entries); {counts['sinks']} caller-facing sinks examined "
+    print(f"\nforeign-text-to-caller: {counts['files_scanned']} src/**.rs files scanned; {counts['sinks']} caller-facing sinks examined "
           f"({', '.join(f'{k[5:]}={v}' for k, v in sorted(counts.items()) if k.startswith('sink:'))}); "
           f"{counts['clean']} clean; {nfail} FAIL; {ninfo} INFO")
     # Rule 3: LIVE foreign renders are reported SEPARATELY from what the ledger holds. A ledger that

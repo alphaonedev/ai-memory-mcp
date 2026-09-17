@@ -972,10 +972,18 @@ jobs:
     # CALLER'S OWN input is cleared by provenance, not by name.
     #
     # scripts/check-foreign-text-to-caller.py walks every rendered identifier
-    # to its producer (the gate-8 python-core shape). The live findings on the
-    # chain-12 tree (311 instances / 170 keys) are held in
+    # to its producer (the gate-8 python-core shape). Since #3760 the SINK SET
+    # is DERIVED from the tree on every run, never enumerated: every handler
+    # `src/lib.rs` routes (+ `from_fn` middleware) closed over its
+    # response-shaped callees, and every `register_mcp_tool!` dispatch entry
+    # closed over its verbatim-propagating `Result<_, String>` callees; every
+    # json!() value at ANY key inside them is a sink (the import envelope's
+    # `"errors": [..]` array was invisible to the old `"error"`-keyed, path-
+    # prefixed enumeration). The live findings on the chain-12 tree
+    # (311 instances / 170 keys) are held in
     # scripts/qc-allowlists/foreign-text-to-caller.txt as `pending:#issue`
-    # under #3713 / #3707 / #3724 / #3708 / #3674 / #3698; the summary reports
+    # under #3713 / #3707 / #3724 / #3708 / #3674 / #3698 (+ #3760 / #3761 /
+    # #3762, what the derivation surfaced); the summary reports
     # LIVE renders separately from what the ledger holds (a green run says
     # "tracked", never "none"). A fix lands by deleting the ledger line; a
     # stale line is a NOTICE (the correction lane may land first).

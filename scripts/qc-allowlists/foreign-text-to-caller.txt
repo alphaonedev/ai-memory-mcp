@@ -26,6 +26,9 @@
 #
 # Census at chain-12 tip 8b4f65a22, gate 8ce30edf0 + this branch: 170 keys, 311 instances,
 # 0 echo, 0 mappers.
+# Census at 8b56f33e6 with the #3760 DERIVED gate: 62 live instances tracked (#3674=3, #3707=34, #3708=2,
+# #3760=2, #3761=11, #3762=10), 0 echo, 2 mappers (peer_status, identity_ref), 16 pre-existing NOTICEs
+# (fixed-or-moved entries the frozen gate reports identically).
 #   #3713  MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp)                       119 keys
 #   #3707  HTTP handler JSON bodies (http-body) + errors.rs From<...> (memory-error)                   44 keys
 #   #3724  webhook receiver text persisted into subscription_dlq.last_error (dlq-record)                1 keys
@@ -78,7 +81,8 @@ src/handlers/skills.rs:skill_delete_route:http-body:db=pending:#3707
 src/handlers/skills.rs:skill_export_route:http-body:path=pending:#3707
 src/handlers/skills.rs:skill_get_route:http-body:db=pending:#3707
 src/handlers/skills.rs:skill_promote_route:http-body:db=pending:#3707
-src/handlers/skills.rs:skill_register_route:http-body:db=pending:#3707
+# (#3760) src/handlers/skills.rs:skill_register_route re-keyed :http-body:db -> :http-body:path once the walk
+# saw the resolved import root first (deterministic first-taint-by-name); held under #3762 below.
 src/handlers/skills.rs:skill_retire_route:http-body:db=pending:#3707
 
 # ---- #3724 — webhook receiver text persisted into subscription_dlq.last_error (dlq-record) (1 keys) ----
@@ -99,3 +103,32 @@ mapper=mcp_foreign_err
 mapper=mcp_error_text
 mapper=log_foreign
 mapper=conflict_or_string
+
+# --- #3760 (2026-09-17): the gate DERIVES its sink set (router + dispatch table + reachability, key-agnostic
+# json values, pushed collections) instead of enumerating `"error"` under three path prefixes. What the
+# derivation surfaced on 8b56f33e6, each held under its issue:
+#   #3760  the import envelope's `"errors": [..]` array carrying a StoreError Display (the class that proved
+#          the enumeration was blind)                                                                2 keys
+src/handlers/admin.rs:import_memories:http-body:db=pending:#3760
+#   #3761  driver text reaching MCP callers through a `?`-propagated Result<_, String> helper OUTSIDE
+#          src/mcp (actions::create_guarded*) and through match-arm `.map_err(|e| e.to_string())` values
+#          (forget / archive / lineage / namespace)                                                  7 keys
+src/actions/mod.rs:create_guarded:mcp-error:db=pending:#3761
+src/actions/mod.rs:create_guarded_in_transaction:mcp-error:db=pending:#3761
+src/mcp/tools/archive.rs:handle_archive_restore:mcp-error:db=pending:#3761
+src/mcp/tools/forget.rs:forget_preview:mcp-error:db=pending:#3761
+src/mcp/tools/forget.rs:handle_forget:mcp-error:db=pending:#3761
+src/mcp/tools/lineage.rs:handle_lineage:mcp-error:db=pending:#3761
+src/mcp/tools/namespace.rs:handle_namespace_set_standard_inner:mcp-error:db=pending:#3761
+#   #3762  a std::fs::canonicalize-RESOLVED operator path (the skills export / import root) rendered into
+#          MCP tool errors and one HTTP body; the old OWN marker `canonical` hid the resolver        4 keys
+src/handlers/skills.rs:skill_register_route:http-body:path=pending:#3762
+src/mcp/tools/skill_export.rs:confine_export_target:mcp-error:path=pending:#3762
+src/mcp/tools/skill_export.rs:handle_skill_export_in_root:mcp-error:path=pending:#3762
+src/mcp/tools/skill_register.rs:handle_skill_register:mcp-error:path=pending:#3762
+# Typed mappers the derived walk must stop at (`GET /api/v1/monitoring/status`): `peer_status` renders a
+# peer's positional id (#2442) plus freshness NUMBERS, never its URL; `identity_ref` renders the SHA-256 hex
+# of an agent id. Both are closed-vocabulary projections; the `peers` NAME marker on the source collection
+# is what the walk would otherwise report.
+mapper=peer_status
+mapper=identity_ref
