@@ -62,7 +62,7 @@ use crate::inbox_wake::{InboxEvent, InboxWakeSink};
 use crate::wake_hub::codec::codec;
 use crate::wake_hub::frame::{
     CTX_DECODING_HUB_FRAME, CTX_HUB_CLOSED, CTX_UNPARSEABLE_REFUSAL, DEBUG_FIELD_DELEGATION_BYTES,
-    Frame, HelloPayload, Kind, decode_error,
+    ErrorCode, Frame, HelloPayload, Kind, decode_error,
 };
 use crate::wake_hub::identity::{hello_transcript, topics_hash};
 use crate::wake_hub::limits::{
@@ -459,7 +459,7 @@ async fn connect_and_pump(
                     // byte of body is buffered, so an oversize declaration
                     // lands here rather than in an allocation.
                     Some(Err(e)) => bail!("framing error from the hub: {e}"),
-                    Some(Ok(body)) => handle_hub_frame(&body, &mut write_half).await?,
+                    Some(Ok(body)) => handle_hub_frame(&body, &mut write_half, metrics).await?,
                 }
             }
             item = rx.recv() => {
@@ -468,7 +468,12 @@ async fn connect_and_pump(
                     metrics.dropped_hub_down();
                     return Err(e);
                 }
-                metrics.delivered();
+                // #3641 — this counts a frame WRITTEN to the hub (bytes out),
+                // not a confirmed delivery: the forwarder is fire-and-forget with
+                // no ack, and a frame the hub later refuses moves a `dropped_*`
+                // counter above. `delivered` is reserved for the in-process sink,
+                // which has a real delivery outcome.
+                metrics.written();
             }
         }
     }
@@ -540,7 +545,16 @@ async fn handshake(
 
 /// Frames the hub sends US. The forwarder consumes nothing but liveness and
 /// refusals; it is a producer, not a recipient.
-async fn handle_hub_frame(body: &[u8], write_half: &mut OwnedWriteHalf) -> Result<()> {
+async fn handle_hub_frame(
+    body: &[u8],
+    write_half: &mut OwnedWriteHalf,
+    metrics: &SinkMetrics,
+) -> Result<()> {
+    // A `Frame::decode` error stays FATAL: a hub whose FRAMING is corrupt cannot
+    // be trusted, so the forwarder closes and reconnects, exactly as the SERVER
+    // closes on this class (`wake_hub::conn::Conn::send_error` -> false ->
+    // read-loop close, pinned by
+    // `wake_hub_denied_3467::denied_a_malformed_frame_is_refused_and_closes_the_connection`).
     let frame = Frame::decode(body).context(CTX_DECODING_HUB_FRAME)?;
     match frame.kind {
         Kind::Ping => {
@@ -552,10 +566,37 @@ async fn handle_hub_frame(body: &[u8], write_half: &mut OwnedWriteHalf) -> Resul
         Kind::Error => {
             let (code, reason) =
                 decode_error(&frame.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
-            // A refusal is terminal for THIS connection: the hub has told us a
-            // frame was rejected, and continuing to push into a session it may
-            // have torn down would silently lose wakes.
-            bail!("the hub refused a frame: {code} {reason}");
+            // #3641 — classify by the ONE shared predicate the hub SERVER uses
+            // (`ErrorCode::is_session_fatal`, rule s). A per-message refusal the
+            // hub keeps the connection open for — `404 UnknownDestination` (a
+            // notify to an agent the hub has never seen: THE #3641 trigger),
+            // `429 RateLimited`, `507 Overflow`, `403 Forbidden`, `500 Internal`
+            // — is COUNTED on its own drop cause (mirroring `in_process.rs`, so
+            // the two sink shapes finally agree) and SKIPPED, keeping the
+            // producer connection: tearing it down on one 404 collapsed
+            // host-wide wakes to the backstop. A session-fatal code
+            // (`400`/`401`/`409`/`413`) is terminal, and closing here mirrors
+            // the server closing on exactly that set.
+            if ErrorCode::wire_is_session_fatal(code) {
+                bail!("the hub refused this session: {code} {reason}");
+            }
+            match ErrorCode::from_wire(code) {
+                Some(ErrorCode::Overflow | ErrorCode::RateLimited) => metrics.dropped_overflow(),
+                Some(ErrorCode::Internal) => metrics.dropped_hub_down(),
+                // 404 UnknownDestination + 403 Forbidden: the hub refused this
+                // destination. `dropped_unknown` mirrors `Delivery::DroppedUnknown`.
+                _ => metrics.dropped_unknown(),
+            }
+            // rule ll — log only `code` and OUR OWN enum label, never `reason`:
+            // `decode_error` UTF-8-validates the hub reason but does not
+            // length- or control-character-screen it, so it is hub-authored
+            // free text that must not reach this new log sink.
+            tracing::debug!(
+                code,
+                refusal = ?ErrorCode::from_wire(code),
+                "wake sink: the hub refused one frame per-message; the producer connection survives"
+            );
+            Ok(())
         }
         // Nothing else is meaningful to a producer. Ignore rather than close:
         // a future hub may send frames this version has no opinion about.

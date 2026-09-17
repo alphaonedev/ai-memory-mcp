@@ -800,11 +800,11 @@ impl Conn {
             .as_ref()
             .map_or_else(String::new, |a| a.agent_id.clone());
         let queued = self.send(Kind::Error, to, encode_error(code, reason));
-        queued
-            && !matches!(
-                code,
-                ErrorCode::Unauthorized | ErrorCode::Malformed | ErrorCode::TooLarge
-            )
+        // Rule s — the ONE predicate (`ErrorCode::is_session_fatal`) the wake
+        // plane classifies by. The connection is kept open for a per-message
+        // refusal and closed for a session-fatal code; every client mirrors
+        // this exact split (pinned over every variant in `tests`).
+        queued && !code.is_session_fatal()
     }
 }
 

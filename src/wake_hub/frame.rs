@@ -119,6 +119,85 @@ impl ErrorCode {
             Self::Overflow => 507,
         }
     }
+
+    /// Whether receiving this error code on an ESTABLISHED session means the
+    /// SESSION is over (close + reconnect) rather than ONE message being
+    /// refused (skip + keep reading).
+    ///
+    /// This is the ONE predicate the whole wake plane classifies by (rule s:
+    /// one predicate, two renderers). FOR AN ESTABLISHED SESSION the hub SERVER
+    /// renders it in `wake_hub::conn`'s `send_error`, which stops reading a
+    /// connection exactly for the fatal set; every CLIENT renders it in reverse —
+    /// a fatal code ends the session, a non-fatal one is a per-message refusal
+    /// the hub keeps the session open for (`403 Forbidden`, `404
+    /// UnknownDestination`, `429 RateLimited`, `500 Internal`, `507 Overflow`).
+    /// The two renderings are pinned to agree over every variant (`tests` below).
+    ///
+    /// ADMISSION EXCEPTION: during the HELLO handshake `Conn::admit` closes on
+    /// some codes this predicate calls non-fatal — e.g. `403 Forbidden` for too
+    /// many topics — because the SESSION was never established. That is not a
+    /// contradiction: a client only reaches a `Kind::Error` through `next_event`
+    /// AFTER the welcome, so on a non-fatal code it skips the message and keeps
+    /// reading; if the hub then closes the stream on its own (its choice on, say,
+    /// a refused subscribe), the client sees EOF next and reconnects — the same
+    /// correct outcome reached by a different route, and never a rendered wake.
+    ///
+    /// `Replaced` (409) is fatal by classification: the server never
+    /// `send_error`s it (a displacement is delivered on the prior session's
+    /// egress handle and that session is then closed), but a client that
+    /// receives it has been superseded and its session is done.
+    #[must_use]
+    pub const fn is_session_fatal(self) -> bool {
+        matches!(
+            self,
+            Self::Malformed | Self::Unauthorized | Self::TooLarge | Self::Replaced
+        )
+    }
+
+    /// Every variant, so the client/server predicate table can iterate them all.
+    /// Paired with the exhaustive match in the table pin: a NEW variant that is
+    /// added to the enum without a fatal disposition fails to COMPILE the pin,
+    /// so no code can slip past `from_wire` and the shared predicate.
+    pub const ALL: [Self; 9] = [
+        Self::Malformed,
+        Self::Unauthorized,
+        Self::Forbidden,
+        Self::UnknownDestination,
+        Self::Replaced,
+        Self::TooLarge,
+        Self::RateLimited,
+        Self::Internal,
+        Self::Overflow,
+    ];
+
+    /// Map a wire error value back to its variant, so a client that just
+    /// decoded a `Kind::Error` frame can classify the refusal through
+    /// [`Self::is_session_fatal`]. An UNKNOWN value has no variant; the caller
+    /// treats that conservatively as session-fatal (an error this version
+    /// cannot name is not one to keep reading through).
+    #[must_use]
+    pub const fn from_wire(code: u16) -> Option<Self> {
+        match code {
+            400 => Some(Self::Malformed),
+            401 => Some(Self::Unauthorized),
+            403 => Some(Self::Forbidden),
+            404 => Some(Self::UnknownDestination),
+            409 => Some(Self::Replaced),
+            413 => Some(Self::TooLarge),
+            429 => Some(Self::RateLimited),
+            500 => Some(Self::Internal),
+            507 => Some(Self::Overflow),
+            _ => None,
+        }
+    }
+
+    /// Classify a decoded wire error value for a client: session-fatal (close +
+    /// reconnect) or a per-message refusal (skip + keep the session). An
+    /// unknown value is fatal (see [`Self::from_wire`]).
+    #[must_use]
+    pub fn wire_is_session_fatal(code: u16) -> bool {
+        Self::from_wire(code).map_or(true, Self::is_session_fatal)
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -1015,6 +1094,50 @@ pub fn decode_error(buf: &[u8]) -> Result<(u16, String), FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ONE predicate the wake plane classifies error frames by (rule s):
+    /// the hub SERVER keeps a connection open for exactly the NON-fatal set
+    /// (`conn::Conn::send_error` -> `!is_session_fatal`) and every CLIENT skips
+    /// exactly that set (`wake_client::session`, `wake_sink::uds` -> the same
+    /// predicate). This table pins the contract over EVERY variant so the two
+    /// renderers can never drift: client-skip == server-keeps-open == !fatal.
+    #[test]
+    fn error_code_session_fatal_table_is_the_shared_client_server_predicate() {
+        for code in ErrorCode::ALL {
+            // EXHAUSTIVE match (no `_` arm): a tenth ErrorCode variant added
+            // without a disposition here fails to compile, so it cannot slip
+            // past the shared predicate. This is the F3 guard.
+            let fatal = match code {
+                ErrorCode::Malformed
+                | ErrorCode::Unauthorized
+                | ErrorCode::TooLarge
+                | ErrorCode::Replaced => true,
+                ErrorCode::Forbidden
+                | ErrorCode::UnknownDestination
+                | ErrorCode::RateLimited
+                | ErrorCode::Internal
+                | ErrorCode::Overflow => false,
+            };
+            assert_eq!(code.is_session_fatal(), fatal, "{code:?} fatal disposition");
+            // The wire value round-trips and re-classifies identically, so a
+            // client that only has the decoded u16 reaches the same verdict.
+            assert_eq!(
+                ErrorCode::from_wire(code.as_u16()),
+                Some(code),
+                "{code:?} round-trip"
+            );
+            assert_eq!(
+                ErrorCode::wire_is_session_fatal(code.as_u16()),
+                fatal,
+                "{code:?} wire classification"
+            );
+        }
+        // An unknown wire value has no variant and is treated conservatively as
+        // session-fatal (an error this version cannot name is not one to keep
+        // reading through).
+        assert_eq!(ErrorCode::from_wire(499), None);
+        assert!(ErrorCode::wire_is_session_fatal(499));
+    }
 
     fn wake(from: &str, to: &str, payload: Bytes) -> Frame {
         Frame::new(Kind::Wake, from, to, payload)

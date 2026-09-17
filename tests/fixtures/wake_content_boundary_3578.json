@@ -15,7 +15,7 @@
     "path": "src/wake_hub/conn.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "9cf3d61cb2f31337ce729e91b2dce66b79e20607c2a145b543bf0c7bb99222b8"
+    "sha256": "b19f4585f5887a43e1554835a256c930f6b3e8fd1b97575cb2d617d67986a203"
   },
   {
     "path": "src/wake_hub/delegation_verifier.rs",
@@ -27,7 +27,7 @@
     "path": "src/wake_hub/frame.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "13c85d9b3d54868ff0ab68acf3e94447bb1dc6db42b5b88c1019af9af3dd89ca"
+    "sha256": "5d237fbc52e5fff0a8cd7746517c146cb60881d8d3c45ac9644bce173e813d3f"
   },
   {
     "path": "src/wake_hub/health.rs",
@@ -99,13 +99,13 @@
     "path": "src/wake_client/mod.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "230797bdf68e1547c23eb7cadac19f75f8d82a6bc67ed34071aea9f6c9cb3740"
+    "sha256": "7b85c545a8d265773aca45e4f0de989c59ec63b5e6185f451fb4a3f33b1f0c3b"
   },
   {
     "path": "src/wake_client/session.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "91db62a326c6e46add4b1f4d33cf862aabf23c774c7adf3373eb50898d44aabe"
+    "sha256": "f74b56a0e231734044212b7c323499afd66251d17ad45ebc8cb782b1e3e45caf"
   },
   {
     "path": "src/wake_sink/boot.rs",
@@ -123,7 +123,7 @@
     "path": "src/wake_sink/mod.rs",
     "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
     "mode": "rust-production-tokens",
-    "sha256": "3c764b92ee7029ea8d817187e110aa97101572cad1676113114cf23e72de5c44"
+    "sha256": "16fa7c182666277b06eaab670ee077a08ca59af687040c09f7031906a4aa8df2"
   },
   {
     "path": "src/wake_sink/producer_identity.rs",
@@ -135,13 +135,13 @@
     "path": "src/wake_sink/uds.rs",
     "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
     "mode": "rust-production-tokens",
-    "sha256": "ff383dc5214ae44ce772e44c97461d7502fc5a272bb3c077c9f79fe049cf0731"
+    "sha256": "17ae8b6c3de09f07e733d0b266c0e94d130bcf18920694f1b5a8fa324b3878a8"
   },
   {
     "path": "src/cli/wake_listen.rs",
     "role": "Operator-resolved caller catch_up_read -> handle_inbox; metadata rendering; operator --exec via audited_tokio_command.",
     "mode": "rust-production-tokens",
-    "sha256": "d2116bdc1d9eda67c39fd8c84d9eb18403de3c0a6a7f3a25399f527daed41653"
+    "sha256": "dbbf189d791c1ad8cf2bd89905d16f0a3c1730efa97aa35120fab1d4c4c025a6"
   },
   {
     "path": "src/inbox_wake.rs",
