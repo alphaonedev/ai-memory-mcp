@@ -4316,35 +4316,25 @@ mod tests {
             .unwrap()
         };
 
-        // Run dispatch and wait for the spawned thread to record the
-        // counter bump. dispatch_event spawns a detached std::thread so
-        // we poll for up to ~5 s.
+        // Run dispatch, then wait on the dispatcher's completion signal
+        // (#3759 — same shape as the 5xx sibling: `wait_dispatch_idle`
+        // returns after the worker's guard drops, i.e. after the counter
+        // write, so no wall-clock poll bound is needed here either).
         {
             let conn = Connection::open(&db_path).unwrap();
             dispatch_event(&conn, "memory_store", "m1", "ns", None, &db_path);
         }
 
-        let path_for_poll = db_path.clone();
-        let id_for_poll = id.clone();
-        let dc = tokio::task::spawn_blocking(move || {
-            for _ in 0..50 {
-                let conn = Connection::open(&path_for_poll).unwrap();
-                let dc: i64 = conn
-                    .query_row(
-                        "SELECT dispatch_count FROM subscriptions WHERE id = ?1",
-                        params![id_for_poll],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                if dc > 0 {
-                    return dc;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            0
-        })
-        .await
-        .unwrap();
+        wait_dispatch_idle().await;
+        let dc: i64 = {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT dispatch_count FROM subscriptions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
         assert_eq!(dc, 1, "successful dispatch must increment dispatch_count");
     }
 
@@ -4376,30 +4366,30 @@ mod tests {
             dispatch_event(&conn, "memory_store", "m2", "ns", None, &db_path);
         }
 
-        // K6 retry ladder (200ms + 1s + 5s) means a final-failure
-        // counter bump can take ≈ 6.5s of wall-clock + per-attempt
-        // overhead. Poll for up to 12s to cover the worst case.
-        let path_for_poll = db_path.clone();
-        let id_for_poll = id.clone();
-        let (dc, fc) = tokio::task::spawn_blocking(move || {
-            for _ in 0..120 {
-                let conn = Connection::open(&path_for_poll).unwrap();
-                let row: (i64, i64) = conn
-                    .query_row(
-                        "SELECT dispatch_count, failure_count FROM subscriptions WHERE id = ?1",
-                        params![id_for_poll],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .unwrap();
-                if row.0 > 0 {
-                    return row;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            (0, 0)
-        })
-        .await
-        .unwrap();
+        // #3759 — observe the dispatcher's completion signal, not a wall-clock
+        // poll. `dispatch_event` increments `DISPATCH_IN_FLIGHT` SYNCHRONOUSLY
+        // (the `DispatchInFlightGuard` is created before the worker is spawned),
+        // and the guard drops only AFTER `work()` -> `record_dispatch` writes the
+        // terminal counter, so `wait_dispatch_idle` returns exactly when the bump
+        // is durable — regardless of how long the worker takes to be SCHEDULED.
+        // That scheduling latency, NOT the K6 retry ladder, is the real 1-in-5
+        // cause: this cell has `secret: None` and no server-wide hmac, so the
+        // delivery is unsigned-refused (`DeliveryOutcome::unsigned_refused`,
+        // attempts: 0) — it never sends and never enters the ladder; the bump is a
+        // ~28 ms local decision on an idle host (measured, #3759). The old 12 s
+        // poll red 1-in-5 only when a saturated blocking pool delayed the worker's
+        // start past the window. No magic number now — the wait ends on the actual
+        // worker completion (CONCURRENCY-08 SeqCst pairs with the in-flight load).
+        wait_dispatch_idle().await;
+        let (dc, fc): (i64, i64) = {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT dispatch_count, failure_count FROM subscriptions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
         assert_eq!(dc, 1, "5xx still increments dispatch_count");
         assert_eq!(fc, 1, "5xx must increment failure_count");
     }
