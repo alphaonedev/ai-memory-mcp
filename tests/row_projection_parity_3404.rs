@@ -24,7 +24,7 @@
 use ai_memory::config::ResolvedScoring;
 use ai_memory::db;
 use ai_memory::embeddings::encode_embedding_blob;
-use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
+use ai_memory::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier};
 
 mod common;
 use common::fresh_db_tempfile_conn as fresh_db;
@@ -44,6 +44,9 @@ fn fixture(id: &str, namespace: &str, nonce: &str) -> Memory {
         priority: 5,
         confidence: 0.9,
         source: "api".to_string(),
+        lifecycle_state: LifecycleState::Active,
+        valid_from: Some("2020-01-01T00:00:00Z".to_string()),
+        valid_until: Some("2030-01-01T00:00:00Z".to_string()),
         access_count: 0,
         created_at: now.clone(),
         updated_at: now,
@@ -93,6 +96,32 @@ fn assert_parity(tag: &str, truth: &Memory, got: &Memory) {
     assert_eq!(
         got.confidence_source, truth.confidence_source,
         "{tag}: source must match get"
+    );
+    assert_eq!(
+        got.lifecycle_state, truth.lifecycle_state,
+        "{tag}: lifecycle_state must match get"
+    );
+    assert_eq!(
+        got.lifecycle_state,
+        LifecycleState::Active,
+        "{tag}: lifecycle_state must be the stored Active, got {:?}",
+        got.lifecycle_state
+    );
+    assert_eq!(
+        got.valid_from, truth.valid_from,
+        "{tag}: valid_from must match get"
+    );
+    assert!(
+        got.valid_from.is_some(),
+        "{tag}: valid_from must be the stored bound, got None"
+    );
+    assert_eq!(
+        got.valid_until, truth.valid_until,
+        "{tag}: valid_until must match get"
+    );
+    assert!(
+        got.valid_until.is_some(),
+        "{tag}: valid_until must be the stored bound, got None"
     );
 }
 

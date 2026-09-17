@@ -22188,36 +22188,35 @@ pub fn memories_updated_since_counted(
     //     column cannot escape the decision;
     //   * a `Memory::FIELD_COUNT` pin — a new struct field forces the
     //     fixture to cover it.
-    const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
-                source, access_count, created_at, updated_at, last_accessed_at, expires_at, \
-                metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, \
-                source_uri, source_span, confidence_source, confidence_signals, \
-                confidence_decayed_at, encrypted_envelope, version, lifecycle_state, cid, \
-                valid_from, valid_until \
-         FROM memories ";
+    // #3404-AMEND F1 — one derivation, no shadow list: this SELECT projects
+    // the ONE canonical list via `memory_row_columns("")`, so dropping a
+    // column from `Memory::READ_COLUMNS` changes this query too (seam-mutated
+    // in the amend report). No alias in the projection → unqualified column.
+    let cols = memory_row_columns("");
+    let base = format!("SELECT {cols} FROM memories ");
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. A
     // Tombstoned/Quarantined row must not relay onward on this federation
     // catch-up outbound path (honest caveat: quarantined rows black-hole
-    // until dequarantine). No alias in COLS → unqualified column.
+    // until dequarantine). No alias in the projection → unqualified column.
     let lifecycle_vis = crate::models::lifecycle_visible_clause("");
     let rows = match since {
         None => {
             let mut stmt = conn.prepare(&format!(
-                "{COLS} WHERE 1=1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?1"
+                "{base} WHERE 1=1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?1"
             ))?;
             stmt.query_map(params![limit], row_to_memory_scan)?
                 .collect::<rusqlite::Result<Vec<_>>>()
         }
         Some(s) => {
             let mut stmt = conn.prepare(&format!(
-                "{COLS} WHERE updated_at > ?1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?2"
+                "{base} WHERE updated_at > ?1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?2"
             ))?;
             stmt.query_map(params![s, limit], row_to_memory_scan)?
                 .collect::<rusqlite::Result<Vec<_>>>()
         }
     };
     // v1.0.0 #2383 (N1) — a row this node cannot decrypt cannot be relayed
-    // (the send path MUST ship plaintext, see the COLS note above), so it is
+    // (the send path MUST ship plaintext, see the projection note above), so it is
     // SKIPPED with a WARN instead of failing the entire catch-up batch. It
     // stays on disk and replicates as soon as its keypair is restored.
     //
