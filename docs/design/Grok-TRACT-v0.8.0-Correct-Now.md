@@ -148,7 +148,7 @@ Cross-checked MCP tool count, HTTP routes, CLI subcommands, schema v70 ladder, a
 - **Provider-agnostic LLM** (#1067) — chat + embed backends unified under `AI_MEMORY_LLM_*` / `AI_MEMORY_EMBED_*`.
 - **Embedding backend migration** — `ai-memory reembed` (#1598).
 - **Query expansion** — `memory_expand_query` three-surface parity (#1443).
-- **No single-lab coupling** — substrate trademark + Apache 2.0 structural neutrality (ROADMAP §4).
+- **No single-lab coupling** — Apache 2.0 structural neutrality (ROADMAP §4).
 
 ---
 

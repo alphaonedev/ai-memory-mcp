@@ -563,7 +563,7 @@ P0-3 fed write-sig ──────────────────► v1.
 | 6 | Endpoint-resident + LLM-agnostic | Real |
 | 7 | SAL + embeddings-as-cache | CORRECT |
 | 8 | Seven-property composition as identity | Named; partial hold |
-| 9 | Apache-2.0 + trademark | Medium; dies under category confusion |
+| 9 | Apache-2.0 | Medium; dies under category confusion |
 | 10 | Recall quality / R@k | **Low** (anti-primary) |
 | — | Tool-count supremacy | **Anti-moat** |
 | — | “Perfect” grandeur brand | **Anti-moat** |

@@ -8,7 +8,6 @@
 >
 > **Anchor document:** [`docs/strategy/moonshot-synthesis.md`](docs/strategy/moonshot-synthesis.md) — the strategic anchor from which §0–§6 of this roadmap derive. The synthesis is the North Star; this document is the implementation plan that derives from it. If a future revision of the synthesis changes the anchor, this roadmap must be revised to match. The synthesis is the constraint; the roadmap is the consequence.
 >
-> **Trademark:** ai-memory™ — USPTO Serial No. 99761257
 > **License:** Apache 2.0 — permanent, non-revocable, non-relicenseable.
 > **Current release:** v1.0.0 (schema v91, 104 MCP tools at `--profile full`), the *defaults stop lying* GA — the version stamp is `Cargo.toml`'s; **no `v1.0.0*` tag is cut yet**, so the newest PUBLISHED tag is **v0.10.0** (released 2026-07-12, schema v80 — the `warn-carrier` release: deprecation WARNs only ahead of the v1.0.0 secure-default flips, with zero default flips, zero schema change and zero behavior change for any correctly-configured deployment; #1972 under the #1940 v1.0.0 epic). v0.10.0 supersedes v0.9.0 (schema v78, 101 MCP tools), a security-hardening and code-review release, which supersedes v0.8.1 (patch release, 2026-06-29) and v0.8.0 (GA, released 2026-06-25; `distributed-coordination`). The prior v0.7.1 patch line (surface area identical to v0.7.0) is itemized in §11.3.1.
 
@@ -172,7 +171,7 @@ The substrate is not these things, and the scope test in §3 derives from naming
 
 **Not cloud-hosted.** The substrate is endpoint-resident by definition. Cloud-hosted SaaS memory is a different product category. Customers can deploy the substrate on cloud infrastructure they control, but the substrate is not provided as a SaaS.
 
-**Not Anthropic-coupled, OpenAI-coupled, xAI-coupled, or any-frontier-lab-coupled.** The substrate is LLM-agnostic at every cognitive boundary. The trademark `ai-memory™` is owned by AlphaOne LLC. The license is Apache 2.0, permanent. **The substrate cannot be acquired into any frontier lab's exclusive control without breaking the bias-displacement property that is the substrate's load-bearing alignment claim.** This is structural to the moonshot, not a licensing accident.
+**Not Anthropic-coupled, OpenAI-coupled, xAI-coupled, or any-frontier-lab-coupled.** The substrate is LLM-agnostic at every cognitive boundary. The license is Apache 2.0, permanent. **The substrate cannot be acquired into any frontier lab's exclusive control without breaking the bias-displacement property that is the substrate's load-bearing alignment claim.** This is structural to the moonshot, not a licensing accident.
 
 ---
 
@@ -1161,11 +1160,9 @@ Pre-built binaries via `cargo binstall ai-memory` or direct download from GitHub
 
 ---
 
-## 20. Trademark and brand discipline
+## 20. Brand discipline
 
-`ai-memory™` is a USPTO-registered trademark owned by AlphaOne LLC. Brand-specific commercial-service-tier trademarks live outside this document.
-
-Apache 2.0 explicitly does not grant trademark rights. Forks of the codebase cannot use the name `ai-memory`. **This is the brand moat that survives even if the code becomes a commodity, and it is also the structural mechanism by which the substrate's bias-displacement and LLM-agnostic properties (§2.6 + §2.7) cannot be captured by any frontier lab.**
+Brand-specific commercial-service-tier naming lives outside this document.
 
 ---
 
@@ -1177,7 +1174,7 @@ Apache 2.0 explicitly does not grant trademark rights. Forks of the codebase can
 4. **No code-locked-behind-services.** Commercial-service-tier offerings do not require running modified substrate code. Customers can switch from a managed tier to self-managed at any time without code changes.
 5. **No frontier-lab acquisition into exclusive control.** The substrate's bias-displacement and LLM-agnostic properties (§2.6 + §2.7) require structural independence from any single frontier lab. Acquisition arrangements that would compromise this independence are incompatible with the substrate's load-bearing alignment claim and will not be entered into.
 
-If any of these commitments are ever broken, OSS users have the right to fork the last Apache 2.0 release and continue indefinitely. The trademark prevents the fork from using the `ai-memory` name; the code path remains open.
+If any of these commitments are ever broken, OSS users have the right to fork the last Apache 2.0 release and continue indefinitely. The code path remains open.
 
 ---
 

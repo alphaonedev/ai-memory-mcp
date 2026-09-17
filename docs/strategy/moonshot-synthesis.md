@@ -198,7 +198,7 @@ The substrate is not these things, and the scope test in §0 derives from naming
 
 **Not cloud-hosted.** The substrate is endpoint-resident by definition. Cloud-hosted SaaS memory is a different product category. Customers can deploy the substrate on cloud infrastructure they control, but the substrate is not provided as a SaaS.
 
-**Not Anthropic-coupled, OpenAI-coupled, xAI-coupled, or any-frontier-lab-coupled.** The substrate is LLM-agnostic at every cognitive boundary. The trademark `ai-memory™` is owned by AlphaOne LLC. The license is Apache 2.0, permanent. The substrate cannot be acquired into any frontier lab's exclusive control without breaking the bias-displacement property that is the substrate's load-bearing alignment claim. **This is structural to the moonshot, not a licensing accident.**
+**Not Anthropic-coupled, OpenAI-coupled, xAI-coupled, or any-frontier-lab-coupled.** The substrate is LLM-agnostic at every cognitive boundary. The license is Apache 2.0, permanent. The substrate cannot be acquired into any frontier lab's exclusive control without breaking the bias-displacement property that is the substrate's load-bearing alignment claim. **This is structural to the moonshot, not a licensing accident.**
 
 ---
 
@@ -279,7 +279,7 @@ This document is not a replacement for ROADMAP.md. It is an anchor document that
 4. **Rewrite the existing §1 "North Star" section** to be consistent with the §0 anchor. The current North Star ("AI endpoint memory is a primitive, not a product") is correct but incomplete by the bias-displacement and separation-of-powers axes. The revision should fold those in.
 5. **Add a §3 "Sibling repositories" section** that names what the substrate explicitly is not, with `alphaone-dev-skills` as the canonical sibling pattern.
 6. **Add a §4 "Open structural gaps" section** carrying the §2.6 gap from this document, marked as deferred-for-discussion, with reference to the heterogeneous evaluator panel as the recommended adjudication path.
-7. **Preserve everything in the existing ROADMAP** from current §3 onward (execution model, state of v0.6.3, audit findings, recovered commitments, release plan §7.1 through §7.7, quality gates, public artifacts, distribution channels, trademark, OSS commitments, §16 Policy Engine, §17 Net, §18 Vector Index Substrate). These are *implementations* of the principles in this document.
+7. **Preserve everything in the existing ROADMAP** from current §3 onward (execution model, state of v0.6.3, audit findings, recovered commitments, release plan §7.1 through §7.7, quality gates, public artifacts, distribution channels, OSS commitments, §16 Policy Engine, §17 Net, §18 Vector Index Substrate). These are *implementations* of the principles in this document.
 8. **Update §17 Net** to include the moonshot framing as the substrate's strategic anchor, alongside the current per-release ship state.
 9. **Re-evaluate v0.8 §7.4.F (WebSocket viewer) and §7.4.G (schema-change methodology) for sibling-repo relocation** under the §5 scope test. They are useful work, but they do not pass the scope test for this substrate.
 

@@ -48,7 +48,7 @@ These are not features. They are the *civilizational contract*. Break any of the
    Multi-implementation interop (§11.6 Memory Portability Spec v2) is the infinity property. Rust+SQLite is a *first carrier*, not the invariant.
 
 7. **OSS permanence + fork rights as last-resort continuity** (§21).  
-   License that cannot be unilaterally reclosed; fork-from-last-good as civilizational failsafe. Trademark may die; the code path must not.
+   License that cannot be unilaterally reclosed; fork-from-last-good as civilizational failsafe. The code path must not die.
 
 8. **Separation of powers among signers.**  
    Recorder / judge / stopper / witness / daemon keys must remain physically and cryptographically separable. A single-key cosmos is not infinity-grade governance.
