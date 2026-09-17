@@ -25,7 +25,9 @@ mod key_dir_sandbox;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use ai_memory::subscriptions::{NewSubscription, dispatch_event, dlq_reason, insert, list_dlq};
+use ai_memory::subscriptions::{
+    NewSubscription, dispatch_event, dlq_reason, insert, list_dlq, wait_dispatch_idle,
+};
 
 mod common;
 use rusqlite::Connection;
@@ -442,26 +444,23 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3697_
     {
         let conn = Connection::open(&db).expect("open");
         dispatch_event(&conn, "memory_store", "evt-3711", "ns-3711", None, &db);
-        // A failed delivery may consume four ACK windows plus the retry
-        // backoffs (~26.2 s, `subscriptions.rs`), and under the #3705 TLS
-        // floor each attempt also pays a handshake; the four deliveries run
-        // concurrently and the DNS refusal additionally waits on the
-        // resolver. Poll for all four DLQ rows past that worst case (120 s):
-        // on a loaded host the 40 s bound this used to carry landed 0 of 4.
-        let db_poll = db.clone();
-        let rows = tokio::task::spawn_blocking(move || {
-            for _ in 0..300 {
-                let conn = Connection::open(&db_poll).expect("open");
-                let all = list_dlq(&conn, None).expect("dlq");
-                if all.len() >= 4 {
-                    return all;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Vec::new()
-        })
-        .await
-        .expect("join");
+        // #3764 — observe the dispatcher's completion signal, not a wall-clock
+        // poll. `dispatch_event` creates a `DispatchInFlightGuard` SYNCHRONOUSLY
+        // per matching subscription (the loop in `dispatch_event_to_subs`), so
+        // all four workers are counted before it returns; each guard drops only
+        // AFTER `work()` -> the terminal `record_dlq` write, so
+        // `wait_dispatch_idle` returns exactly when all four DLQ rows are
+        // durable. The four deliveries pay their DNS/TLS handshakes and the K6
+        // retry ladder (ACK_TIMEOUT * 4 + RETRY_BACKOFFS ~= 26.2 s, plus the DNS
+        // refusal's resolver wait) ENTIRELY inside those guarded workers — so no
+        // wall-clock bound is needed and none could be right under the ladder
+        // worst case (the old 300 * 100 ms = 30 s poll, whose comment claimed
+        // 120 s, landed 0 of 4 under load). Deterministic, no magic number.
+        wait_dispatch_idle().await;
+        let rows = {
+            let conn = Connection::open(&db).expect("open");
+            list_dlq(&conn, None).expect("dlq")
+        };
         if rows.len() != 4 {
             eprintln!("DEBUG-LOGS:\n{}", sink.text());
         }
