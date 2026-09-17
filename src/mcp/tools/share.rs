@@ -222,7 +222,7 @@ pub fn handle_share(
         );
     }
 
-    db::insert(conn, &shared).map_err(|e| e.to_string())?;
+    db::insert(conn, &shared).map_err(|e| crate::mcp::error_text::mcp_foreign_err("share", e))?;
 
     Ok(json!({
         "shared_memory_id": shared_id,

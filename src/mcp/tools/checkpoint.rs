@@ -30,7 +30,7 @@ const RESP_CHECKPOINT: &str = "checkpoint";
 /// the created checkpoint as JSON plus its id.
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on insert failure.
+/// Insert failure renders the closed storage class (driver detail stays on the operator log).
 pub fn handle_checkpoint_create(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -159,7 +159,8 @@ pub fn handle_checkpoint_create(
         ));
     }
 
-    crate::checkpoints::insert(conn, &cp).map_err(|e| e.to_string())?;
+    crate::checkpoints::insert(conn, &cp)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("checkpoint_create", e))?;
 
     // #1722 — coordination observability: best-effort audit row for the
     // create, attributed to the creating agent (`created_by`, "" when
@@ -969,6 +970,51 @@ mod handler_tests {
         assert!(
             handle_checkpoint_create(&conn, &json!({ "namespace": "../x", "title": "t" })).is_err(),
             "path-traversal namespace refused"
+        );
+    }
+
+    #[test]
+    fn create_driver_fault_renders_closed_3766() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_test_lock();
+        let conn = fresh();
+        conn.execute_batch("DROP TABLE checkpoints")
+            .expect("drop checkpoints");
+        let err = handle_checkpoint_create(
+            &conn,
+            &json!({
+                "namespace": "_cp",
+                "title": "ship the release",
+                "condition_type": "approval",
+                "condition": {"who": "operator"},
+                "created_by": "agent-a",
+            }),
+        )
+        .expect_err("a dropped checkpoints table must fail the create");
+        assert_eq!(
+            err,
+            crate::mcp::error_text::DB_ERROR_TEXT,
+            "the caller gets the class, got: {err}"
+        );
+        assert!(
+            !err.contains("no such table") && !err.contains("checkpoints"),
+            "#3766: driver text must not cross to the caller: {err}"
+        );
+    }
+
+    #[test]
+    fn create_validation_refusal_passes_through_3766() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_test_lock();
+        let conn = fresh();
+        let err = handle_checkpoint_create(&conn, &json!({ "namespace": "", "title": "t" }))
+            .expect_err("an empty namespace must be refused");
+        assert_ne!(
+            err,
+            crate::mcp::error_text::DB_ERROR_TEXT,
+            "an own-vocabulary refusal must not be flattened to the class: {err}"
+        );
+        assert!(
+            err.contains("namespace"),
+            "the refusal must still name the bad field: {err}"
         );
     }
 

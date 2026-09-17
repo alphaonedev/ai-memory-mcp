@@ -643,7 +643,8 @@ pub fn handle_namespace_get_standard(
 
     // The binding is probed separately from the body so a DANGLING binding
     // (id set, memory deleted) keeps its distinct `warning` shape.
-    let standard_id = db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
+    let standard_id = db::get_namespace_standard(conn, namespace)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("namespace_get_standard", e))?;
     match standard_id {
         Some(id) => match super::lookup_namespace_standard(conn, namespace, caller) {
             super::StandardLookup::Visible(std) => {
