@@ -263,7 +263,7 @@ The frozen-core conformance surface. **The CC0 test-vector harness (P2-G26) is t
 
 **v0.8.0:** 100% OSS Apache-2.0 with a genuine roadmap-pledged free-forever intent (correct outcome, `ROADMAP-main.md:255-257`) — but implemented via the exact STRUCTURE TRACT rules out: **single corporate steward** (AlphaOne LLC; CODEOWNERS `* @alphaonedev`), a **mandatory CLA** (`CONTRIBUTING.md:229-236`, `CLA.md` — the capture vector that enables future relicensing), **one monolithic Apache codebase with no CC0 format carve-out**, no signed conformance-vector/two-impl gate, no foundation, and a "managed-service deployment tier" (steward-runs-infra economics). The intent is right; the anti-capture structure is absent.
 
-**Fix shape (governance, operator-decision):** carve the wire/disk format + vectors out as separately CC0; relicense the reference impl MPL-2.0; remove the CLA (DCO instead); transfer the certification mark to an N-of-M cross-jurisdiction foundation. *This is an operator/sole-authority decision, not an engineering one — flagged, not prescribed.*
+**Fix shape (governance, operator-decision):** carve the wire/disk format + vectors out as separately CC0; relicense the reference impl MPL-2.0; remove the CLA (DCO instead); place the conformance label under an N-of-M cross-jurisdiction foundation. *This is an operator/sole-authority decision, not an engineering one — flagged, not prescribed.*
 
 ---
 
