@@ -1373,6 +1373,24 @@ impl Memory {
     /// drift-blocker pattern landed in commits 960578cfd + 233e8a247.
     pub const FIELD_COUNT: usize = 30;
 
+    /// #3404 — the ONE canonical `memories` row projection. Every
+    /// `Memory`-materializing read on both backends (sqlite `storage`
+    /// via `memory_row_columns`, postgres via `MEMORY_READ_COLUMNS`)
+    /// projects exactly these columns, so `version`, `cid`,
+    /// `lifecycle_state`, the VALID-time bounds and
+    /// `confidence_source` always come from the row — never from the
+    /// `.unwrap_or(...)` fallbacks in the row mappers. 30 `Memory`
+    /// struct fields + `encrypted_envelope` (the at-rest decrypt input,
+    /// not a struct field). Keep in step with `FIELD_COUNT`; the
+    /// `pg_projection_column_fidelity_2585` census pins the same 31
+    /// names against the postgres DDL.
+    pub(crate) const READ_COLUMNS: &str = "id, tier, namespace, title, content, tags, \
+         priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, \
+         expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, \
+         citations, source_uri, source_span, confidence_source, confidence_signals, \
+         confidence_decayed_at, version, lifecycle_state, cid, valid_from, valid_until, \
+         encrypted_envelope";
+
     /// v0.7.0 #1466 — the `expires_at` value a fresh store must persist.
     /// An explicit value the caller supplied wins; otherwise a non-`Long`
     /// row is stamped with `created_at + Tier::default_ttl_secs()` so it

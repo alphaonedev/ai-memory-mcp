@@ -1068,6 +1068,28 @@ fn undecryptable_row_error(detail: String) -> rusqlite::Error {
     )
 }
 
+/// #3404 — the ONE canonical `memories` row projection. Every
+/// `Memory`-materializing `SELECT` interpolates `memory_row_columns`
+/// instead of carrying a hand-written column list, so `version`,
+/// `cid`, `lifecycle_state`, the VALID-time bounds and
+/// `confidence_source` always come from the row — never from the
+/// `.unwrap_or(...)` fallbacks in `row_to_memory_with_policy` (which
+/// exist only for pre-migration schemas mid-ladder). Extra per-path
+/// columns (`embedding`, `embedding_space`, score expressions) append
+/// AFTER it and are read by name. `SELECT *` single-row reads project
+/// the full row by construction and stay as-is.
+fn memory_row_columns(table_prefix: &str) -> String {
+    if table_prefix.is_empty() {
+        crate::models::Memory::READ_COLUMNS.to_owned()
+    } else {
+        crate::models::Memory::READ_COLUMNS
+            .split(", ")
+            .map(|column| format!("{table_prefix}{column}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Map a `memories` row into a [`Memory`], FAIL-CLOSED on an undecryptable
 /// at-rest envelope. Use this for targeted reads and completeness-critical
 /// egress; discovery scans use [`row_to_memory_scan`].
@@ -8118,13 +8140,7 @@ pub fn search_with_source_uri(
     };
 
     let sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.encrypted_envelope
+        "SELECT {cols}
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
@@ -8149,6 +8165,8 @@ pub fn search_with_source_uri(
                    THEN {soft_loser_factor} ELSE 1.0 END)
            DESC
          LIMIT ?9",
+        // #3404 — the ONE canonical row projection (aliased).
+        cols = memory_row_columns("m."),
         vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 11, 15, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
@@ -8247,13 +8265,7 @@ pub fn list_by_source_uri(
     // (visibility_clause owner-keyed private arm). The vis block + the
     // caller are the trailing placeholders, so no downstream renumber.
     let sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.version, m.encrypted_envelope
+        "SELECT {cols}
          FROM memories m
          WHERE m.source_uri = ?1
            AND (?2 IS NULL OR m.namespace = ?2)
@@ -8261,6 +8273,8 @@ pub fn list_by_source_uri(
            {lifecycle_vis}
          ORDER BY m.created_at ASC
          LIMIT ?3",
+        // #3404 — the ONE canonical row projection (aliased).
+        cols = memory_row_columns("m."),
         vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 4, 8, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
@@ -8736,17 +8750,7 @@ pub fn recall(
     };
 
     let sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                -- #228 Commit B — encrypted_envelope so row_to_memory
-                -- decrypts at-rest content on this recall path; the trailing
-                -- `score` column is read by name (not positionally) so this
-                -- insertion is safe.
-                m.encrypted_envelope,
+        "SELECT {cols},
                 ((fts.rank * -1)
                 + (m.priority * 0.5)
                 + (MIN(m.access_count, 50) * 0.1)
@@ -8781,6 +8785,8 @@ pub fn recall(
            {lifecycle_vis}
          ORDER BY score DESC
          LIMIT ?7",
+        // #3404 — the ONE canonical row projection (aliased).
+        cols = memory_row_columns("m."),
         vis = visibility_clause(crate::visibility::SqlParamStyle::Sqlite, 8, 12, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list: hides
         // Tombstoned/Quarantined (and any unknown state) from recall.
@@ -9315,18 +9321,14 @@ fn find_similar_title_candidates(
     // Form-1 synthesis curator (its text would be merged into a visible
     // memory, laundering the quarantine).
     let mut stmt = conn.prepare(&format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.encrypted_envelope
+        "SELECT {cols}
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1 AND m.namespace = ?2 {lifecycle_vis}
          ORDER BY fts.rank
          LIMIT ?3",
+        // #3404 — the ONE canonical row projection (aliased).
+        cols = memory_row_columns("m."),
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     ))?;
     let rows = stmt.query_map(
@@ -20803,24 +20805,7 @@ fn fts_keyword_phase(
     // overflow (panic in overflow-checks builds, silent wrap in release).
     let fts_limit = limit.saturating_mul(3).max(30);
     let fts_sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at, m.embedding,
-                -- #228 Commit B — encrypted_envelope rides this recall FTS
-                -- SELECT so row_to_memory decrypts at-rest content. It sits
-                -- AFTER m.embedding (positional index 25, read by row.get(25))
-                -- so the embedding index is unchanged; row_to_memory + the
-                -- fts_score read are by-name and unaffected.
-                m.encrypted_envelope,
-                -- v1.0.0 #2167 — the per-row embedding_space provenance
-                -- token (positional index 27, read by row.get(27)); the
-                -- fusion stage gates the inline cosine through
-                -- cosine_similarity_space_checked. Appended AFTER
-                -- encrypted_envelope so the embedding index 25 is unchanged.
-                m.embedding_space,
+        "SELECT {cols}, m.embedding, m.{emb_space_col},
                 (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
@@ -20841,6 +20826,10 @@ fn fts_keyword_phase(
            {lifecycle_vis}
          ORDER BY fts_score DESC
          LIMIT ?7",
+        // #3404 — the ONE canonical row projection (aliased); `embedding`
+        // + `embedding_space` append after it and are read by name.
+        cols = memory_row_columns("m."),
+        emb_space_col = field_names::EMBEDDING_SPACE,
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
         // #3279 — instant-based `created_at` since/until window (?5/?6).
         created_at_window = created_at_instant_window("m.", 5, 6),
@@ -20874,13 +20863,11 @@ fn fts_keyword_phase(
             return Ok(None);
         };
         let fts_score: f64 = row.get("fts_score")?;
-        // Index 25 = `m.embedding` (the SELECT list above places it
-        // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
-        // so legacy rows without embeddings surface as `None`.
-        let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
-        // v1.0.0 #2167 — index 27 = `m.embedding_space` (after
-        // `m.encrypted_envelope` at 26). `None` = SQL NULL (unverified).
-        let embedding_space: Option<String> = row.get(27)?;
+        // #3404 — by-name reads: the canonical projection owns every
+        // `Memory` column and the extras append after it, so no
+        // positional index can drift when the list changes.
+        let embedding_bytes: Option<Vec<u8>> = row.get("embedding")?;
+        let embedding_space: Option<String> = row.get(field_names::EMBEDDING_SPACE)?;
         Ok(Some((mem, fts_score, embedding_bytes, embedding_space)))
     };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
@@ -21247,16 +21234,10 @@ fn semantic_phase(
 
     // Fallback: linear scan over all embeddings.
     let sem_sql = format!(
-        // #228 Commit B — `encrypted_envelope` appended AFTER `embedding`
-        // so `row_to_memory` can decrypt at-rest content on this semantic
-        // linear-scan path while the positional `row.get(17)` for
-        // `embedding` (zero-based index 17) stays valid. row_to_memory
-        // reads encrypted_envelope by name, so its position is irrelevant
-        // to the decrypt; only the embedding's positional index is pinned.
-        "SELECT id, tier, namespace, title, content, tags, priority,
-                confidence, source, access_count, created_at, updated_at,
-                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding,
-                encrypted_envelope, embedding_space
+        // #3404 — the ONE canonical row projection (unqualified);
+        // `embedding` + `embedding_space` append after it and are read
+        // by name, so no positional index can drift when the list grows.
+        "SELECT {cols}, embedding, {emb_space_col}
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
@@ -21269,6 +21250,9 @@ fn semantic_phase(
            {sem_valid_at_fragment}
            {vis}
            {lifecycle_vis}",
+        // #3404 — the ONE canonical row projection (unqualified).
+        cols = memory_row_columns(""),
+        emb_space_col = field_names::EMBEDDING_SPACE,
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
         // #3279 — instant-based `created_at` since/until window (?4/?5).
         created_at_window = created_at_instant_window("", 4, 5),
@@ -21299,14 +21283,9 @@ fn semantic_phase(
         let Some(mem) = row_to_memory_scan(row)? else {
             return Ok(None);
         };
-        // v0.7.x Form 6 — `memory_kind` was inserted between
-        // `reflection_depth` and `embedding` in the SELECT list
-        // above; `embedding` sits at zero-based index 17.
-        let emb_bytes: Option<Vec<u8>> = row.get(17)?;
-        // v1.0.0 #2167 — `embedding_space` appended AFTER
-        // `encrypted_envelope` (index 18) so the pinned `row.get(17)`
-        // for `embedding` stays valid; read positionally at index 19.
-        let emb_space: Option<String> = row.get(19)?;
+        // #3404 — by-name reads (see the FTS branch above).
+        let emb_bytes: Option<Vec<u8>> = row.get("embedding")?;
+        let emb_space: Option<String> = row.get(field_names::EMBEDDING_SPACE)?;
         Ok(Some((mem, emb_bytes, emb_space)))
     };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();

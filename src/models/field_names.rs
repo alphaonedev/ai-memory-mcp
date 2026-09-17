@@ -229,6 +229,9 @@ pub const EMBEDDINGS: &str = "embeddings";
 /// `embedding_dim` — wire/row field name (#1169 dim reporting; #1598
 /// `ResolvedEmbeddings` Debug field).
 pub const EMBEDDING_DIM: &str = "embedding_dim";
+/// `embedding_space` — row column carrying the embedder space fingerprint
+/// (#2167 provenance token; #3404 canonical-projection by-name reads).
+pub const EMBEDDING_SPACE: &str = "embedding_space";
 /// `entity_id` — metadata key naming the entity a reflection is about
 /// (drives auto-persona cadence via the denormalised
 /// [`MENTIONED_ENTITY_ID`] column). Canonical spelling SSOT; the MCP
