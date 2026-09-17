@@ -1269,8 +1269,7 @@ fn forward_url_posture(url: Option<&str>) -> (String, bool) {
 #[allow(deprecated)] // the legacy flat `ollama_url` is still a live egress URL
 fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> ReportSection {
     use crate::transit_encryption::{
-        self, ENV_REQUIRE_TLS, ISSUE_TAG, MANDATE, PG_SSLMODE_FLOOR, REMEDY_ENTERPRISE_PKI,
-        REMEDY_TLS_RENEW, RequireTls,
+        self, ENV_REQUIRE_TLS, ISSUE_TAG, MANDATE, PG_SSLMODE_FLOOR, RequireTls,
     };
     let app_config = if crate::config::skip_config() {
         crate::config::AppConfig::default()
@@ -1401,76 +1400,59 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
     // undeclared promotion, it may not re-posture (promotion is an operator
     // act), and this section follows the same rule.
     let declared = app_config.effective_shape();
-    let fleet = declared != crate::config::shape::DeploymentShape::Singleton;
     let key_dir = crate::identity::keypair::resolved_default_key_dir_path();
-    let locally_minted = key_dir.as_ref().is_ok_and(|dir| {
-        dir.join(crate::tls_bootstrap::TLS_SUBDIR)
-            .join(crate::tls_bootstrap::LOCAL_CA_CERT_FILE)
-            .exists()
-    });
+    // #3709 review F2 (rule (s)) — the leaf line RENDERS the ONE listener
+    // verdict (`tls_bootstrap::listener_verdict`, the predicate `serve`
+    // refuses or serves by and `tls status` renders); doctor adds nothing
+    // of its own to the decision, only the facts around it.
     let mut leaf_warning = false;
-    let mut leaf_expired = false;
-    let mut fleet_pki_missing = false;
     let local_tls_material = match key_dir
         .as_ref()
         .map_err(|e| format!("{e:#}"))
         .and_then(|dir| crate::tls_bootstrap::leaf_status(dir).map_err(|e| format!("{e:#}")))
     {
-        Ok(status) if !status.present && fleet => {
-            fleet_pki_missing = true;
-            format!(
-                "absent — enterprise PKI required under `{}`: \
-                 {REMEDY_ENTERPRISE_PKI} — REFUSES boot without --tls-cert/--tls-key",
-                declared.config_line()
-            )
-        }
-        Ok(status) if !status.present => {
-            "absent (first boot will generate a local certificate under <key_dir>/tls/, or \
-             supply --tls-cert/--tls-key)"
-                .to_string()
-        }
-        Ok(_) if fleet && locally_minted => {
-            fleet_pki_missing = true;
-            format!(
-                "present but LOCALLY MINTED — an unmanaged CA under `{}` is an audit \
-                 finding; REFUSES at next boot; import enterprise PKI: {REMEDY_ENTERPRISE_PKI}",
-                declared.config_line()
-            )
-        }
         Ok(status) => {
-            let days = status.days_remaining.unwrap_or(0);
-            if days < 0 {
-                leaf_expired = true;
+            use crate::tls_bootstrap::ListenerVerdict;
+            let verdict = crate::tls_bootstrap::listener_verdict(&status, declared);
+            match &verdict {
+                ListenerVerdict::RefusesOperatorExpired { .. } => {
+                    refuses.push("operator-supplied TLS certificate expired".to_string());
+                }
+                ListenerVerdict::RefusesFleetNeedsPki { .. } => {
+                    refuses.push("declared non-singleton shape without enterprise PKI".to_string());
+                }
+                ListenerVerdict::RefusesCertWithoutKey => {
+                    refuses.push(
+                        "installed TLS certificate has no matching private key (#3709)".to_string(),
+                    );
+                }
+                ListenerVerdict::RefusesKeyWithoutCert => {
+                    refuses.push(
+                        "installed TLS private key has no matching certificate (#3709)".to_string(),
+                    );
+                }
+                ListenerVerdict::RenewsLocal { .. } => leaf_warning = true,
+                ListenerVerdict::MintsLocal
+                | ListenerVerdict::ServesLocal { .. }
+                | ListenerVerdict::ServesOperator { .. } => {}
+            }
+            if status.present {
                 format!(
-                    "present, EXPIRED {} day(s) ago — REFUSES at next boot; {REMEDY_TLS_RENEW}",
-                    -days
-                )
-            } else if status.within_renewal_window || days == 0 {
-                leaf_warning = true;
-                format!(
-                    "present, INSIDE the renewal window ({days} day(s) to expiry) — a locally \
-                     minted leaf renews at the next boot or by the daily task; operator material: \
-                     {REMEDY_TLS_RENEW}"
+                    "present ({}, issuer {:?}, SANs: {}) — {}",
+                    verdict.source(),
+                    status.issuer,
+                    crate::tls_bootstrap::render_sans(&status.subject_alt_names),
+                    verdict.render(declared)
                 )
             } else {
-                format!(
-                    "present, {days} day(s) to expiry, SANs: {}",
-                    if status.subject_alt_names.is_empty() {
-                        "none".to_string()
-                    } else {
-                        status.subject_alt_names.join(", ")
-                    }
-                )
+                format!("absent — {}", verdict.render(declared))
             }
         }
-        Err(e) => format!("unreadable: {e}"),
+        Err(e) => {
+            refuses.push("installed TLS certificate unreadable".to_string());
+            format!("unreadable — REFUSES at next boot: {e}")
+        }
     };
-    if leaf_expired {
-        refuses.push("local TLS certificate expired".to_string());
-    }
-    if fleet_pki_missing {
-        refuses.push("declared non-singleton shape without enterprise PKI".to_string());
-    }
     let listener_tls = format!(
         "operator --tls-cert/--tls-key (unobservable from this process) or the local \
          certificate in {}/{}; a bind without either is refused, loopback included",

@@ -114,6 +114,8 @@ pub mod shell;
 pub mod stop;
 pub mod store;
 pub mod sync;
+/// v1.0.0 #3709 item 2 — `ai-memory tls init|import|status`.
+pub mod tls;
 pub mod update;
 pub mod verify;
 pub mod verify_audit_trail;

@@ -457,6 +457,11 @@ pub enum Command {
     Identity(IdentityArgs),
     /// Inspect and prune unregistered key files.
     Keys(cli::keys::KeysArgs),
+    /// v1.0.0 #3709 item 2 — listener TLS material: `init` (mint the local
+    /// CA + leaf now, singleton shape), `import` (verify and install an
+    /// enterprise pair, any shape), `status` (what is installed and what
+    /// the next boot does with it).
+    Tls(cli::tls::TlsArgs),
     /// v0.9.0 G10.1 (#1827) — macaroon capability-token lifecycle:
     /// `keygen` (per-issuer `.caproot` mint secret, mode 0600) /
     /// `mint` (root token; mandatory-expiry lint) / `attenuate`
@@ -2155,6 +2160,16 @@ pub async fn run(
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::identity::run(&db_path, a, j, &mut out)
+        }
+        Command::Tls(a) => {
+            // v1.0.0 #3709 item 2 — DB-free; reads/writes only <key_dir>/tls/
+            // through the bootstrap module the listener itself uses.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::tls::run(a, j, app_config, &mut out)
         }
         Command::Capability(a) => {
             // v0.9.0 G10.1 (#1827) — capability-token lifecycle is
@@ -6145,15 +6160,55 @@ pub fn resolve_tls_material(
     // the bring-your-own-certificate flow; nothing is minted. The shape is
     // the operator's declaration (`[deployment] shape`), never something the
     // node observed at runtime — promotion is an operator act.
-    if tls_cert.is_none()
-        && tls_key.is_none()
-        && declared != crate::config::shape::DeploymentShape::Singleton
-    {
-        anyhow::bail!(
-            crate::transit_encryption::fleet_needs_enterprise_pki_refusal(
-                bind_host, port, declared
+    // #3709 item 2 (review F1/F2/F6) — with no flags the decision is the
+    // ONE listener verdict (`tls_bootstrap::listener_verdict`, the predicate
+    // `tls status` and `doctor` render): operator material installed by
+    // `ai-memory tls import` under `<key_dir>/tls/` IS enterprise PKI and
+    // satisfies every shape; a fleet shape without it refuses; a corrupt
+    // installed leaf is its own typed refusal, never folded into "absent".
+    if tls_cert.is_none() && tls_key.is_none() {
+        let key_dir = crate::identity::keypair::default_key_dir().with_context(|| {
+            format!(
+                "{}: no --tls-cert/--tls-key given and the key directory for the local \
+                 certificate is unusable. Fix: {}",
+                crate::transit_encryption::ISSUE_TAG,
+                crate::transit_encryption::REMEDY_SUPPLY_TLS
             )
-        );
+        })?;
+        let status = crate::tls_bootstrap::leaf_status(&key_dir).with_context(|| {
+            format!(
+                "{}: the installed certificate under {} cannot be read — refusing to bind \
+                 rather than guess what it is. Fix: re-install it with `ai-memory tls import \
+                 --cert <fullchain.pem> --key <key.pem>` or remove the file",
+                crate::transit_encryption::ISSUE_TAG,
+                key_dir.join(crate::tls_bootstrap::TLS_SUBDIR).display()
+            )
+        })?;
+        match crate::tls_bootstrap::listener_verdict(&status, declared) {
+            crate::tls_bootstrap::ListenerVerdict::RefusesFleetNeedsPki { .. } => {
+                anyhow::bail!(
+                    crate::transit_encryption::fleet_needs_enterprise_pki_refusal(
+                        bind_host, port, declared
+                    )
+                );
+            }
+            // #3709 F7 — a broken installed pair (cert without key, or key
+            // without cert) REFUSES here rather than falling through to
+            // `resolve_local_material`, which would mint a local certificate
+            // OVER the installed one and serve it `managed` while the verdict
+            // attests the installed certificate is served (a false attestation).
+            verdict @ (crate::tls_bootstrap::ListenerVerdict::RefusesOperatorExpired { .. }
+            | crate::tls_bootstrap::ListenerVerdict::RefusesCertWithoutKey
+            | crate::tls_bootstrap::ListenerVerdict::RefusesKeyWithoutCert) => {
+                anyhow::bail!(
+                    "{}: refusing to bind {bind_host}:{port}: {}",
+                    crate::transit_encryption::ISSUE_TAG,
+                    verdict.render(declared)
+                );
+            }
+            _ => {}
+        }
+        return resolve_local_material(&key_dir, bind_host);
     }
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => Ok(TlsMaterial {
@@ -6162,54 +6217,6 @@ pub fn resolve_tls_material(
             managed: false,
             ca_cert_path: None,
         }),
-        (None, None) => {
-            let key_dir = crate::identity::keypair::default_key_dir().with_context(|| {
-                format!(
-                    "{}: no --tls-cert/--tls-key given and the key directory for the local \
-                     certificate is unusable. Fix: {}",
-                    crate::transit_encryption::ISSUE_TAG,
-                    crate::transit_encryption::REMEDY_SUPPLY_TLS
-                )
-            })?;
-            let local =
-                crate::tls_bootstrap::ensure_local_tls(&key_dir, bind_host).with_context(|| {
-                    format!(
-                        "{}: could not generate or renew the local TLS certificate in {} — \
-                         refusing to bind rather than serve plaintext. Fix: {}",
-                        crate::transit_encryption::ISSUE_TAG,
-                        key_dir.join(crate::tls_bootstrap::TLS_SUBDIR).display(),
-                        crate::transit_encryption::REMEDY_SUPPLY_TLS
-                    )
-                })?;
-            match &local.outcome {
-                crate::tls_bootstrap::Outcome::Generated => tracing::warn!(
-                    target: crate::transit_encryption::TRACING_TARGET,
-                    ca = %local.ca_cert_path.display(),
-                    cert = %local.cert_path.display(),
-                    days_valid = local.leaf_days_remaining,
-                    "#3709: first boot — generated a local CA and server certificate; \
-                     the bundled clients trust this CA; federation peers never do (peer \
-                     trust is explicit)"
-                ),
-                crate::tls_bootstrap::Outcome::Renewed { reason } => tracing::warn!(
-                    target: crate::transit_encryption::TRACING_TARGET,
-                    reason = %reason,
-                    days_valid = local.leaf_days_remaining,
-                    "#3709: renewed the local server certificate"
-                ),
-                crate::tls_bootstrap::Outcome::Reused => tracing::info!(
-                    target: crate::transit_encryption::TRACING_TARGET,
-                    days_remaining = local.leaf_days_remaining,
-                    "#3709: using the local CA-issued server certificate"
-                ),
-            }
-            Ok(TlsMaterial {
-                cert_path: local.cert_path,
-                key_path: local.key_path,
-                managed: true,
-                ca_cert_path: Some(local.ca_cert_path),
-            })
-        }
         _ => anyhow::bail!(
             "{}: refusing to bind on {bind_host}: only one of --tls-cert/--tls-key was given \
              (both are needed). Fix: {}",
@@ -6217,6 +6224,64 @@ pub fn resolve_tls_material(
             crate::transit_encryption::REMEDY_SUPPLY_TLS
         ),
     }
+}
+
+/// The no-flags arm of [`resolve_tls_material`] after the listener verdict
+/// admitted the boot: mint / renew / reuse the local leaf, or hand back the
+/// operator-supplied pair as unmanaged.
+fn resolve_local_material(key_dir: &Path, bind_host: &str) -> Result<TlsMaterial> {
+    let local = crate::tls_bootstrap::ensure_local_tls(key_dir, bind_host).with_context(|| {
+        format!(
+            "{}: could not generate or renew the local TLS certificate in {} — \
+                         refusing to bind rather than serve plaintext. Fix: {}",
+            crate::transit_encryption::ISSUE_TAG,
+            key_dir.join(crate::tls_bootstrap::TLS_SUBDIR).display(),
+            crate::transit_encryption::REMEDY_SUPPLY_TLS
+        )
+    })?;
+    match &local.outcome {
+        crate::tls_bootstrap::Outcome::OperatorSupplied => {
+            tracing::info!(
+                target: crate::transit_encryption::TRACING_TARGET,
+                cert = %local.cert_path.display(),
+                days_remaining = local.leaf_days_remaining,
+                "#3709: using the operator-supplied certificate installed by `ai-memory \
+                 tls import` (not renewed by the daemon)"
+            );
+            return Ok(TlsMaterial {
+                cert_path: local.cert_path,
+                key_path: local.key_path,
+                managed: false,
+                ca_cert_path: local.ca_cert_path.exists().then_some(local.ca_cert_path),
+            });
+        }
+        crate::tls_bootstrap::Outcome::Generated => tracing::warn!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            ca = %local.ca_cert_path.display(),
+            cert = %local.cert_path.display(),
+            days_valid = local.leaf_days_remaining,
+            "#3709: first boot — generated a local CA and server certificate; \
+             the bundled clients trust this CA; federation peers never do (peer \
+             trust is explicit)"
+        ),
+        crate::tls_bootstrap::Outcome::Renewed { reason } => tracing::warn!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            reason = %reason,
+            days_valid = local.leaf_days_remaining,
+            "#3709: renewed the local server certificate"
+        ),
+        crate::tls_bootstrap::Outcome::Reused => tracing::info!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            days_remaining = local.leaf_days_remaining,
+            "#3709: using the local CA-issued server certificate"
+        ),
+    }
+    Ok(TlsMaterial {
+        cert_path: local.cert_path,
+        key_path: local.key_path,
+        managed: true,
+        ca_cert_path: Some(local.ca_cert_path),
+    })
 }
 
 /// Build all daemon state and spawn background tasks. Returns the

@@ -428,9 +428,11 @@ fn unwritable_key_dir_refuses_never_plaintext_3709() {
         err.contains("--tls-cert <fullchain.pem> --tls-key <key.pem>"),
         "{err}"
     );
+    // #3709 item 2 — the `ai-memory tls` verbs exist now, so the remedy
+    // names one (`tls import`); the inverse pin held while it was fiction.
     assert!(
-        !err.contains("ai-memory tls"),
-        "no fictional verb in a remedy: {err}"
+        err.contains("`ai-memory tls import"),
+        "the remedy names the verb that now exists: {err}"
     );
     assert!(!err.contains("listening"), "never a listener: {err}");
     assert!(

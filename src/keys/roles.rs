@@ -1045,6 +1045,10 @@ fn run_step(
                 crate::tls_bootstrap::Outcome::Generated => MintOutcome::Minted,
                 crate::tls_bootstrap::Outcome::Renewed { .. }
                 | crate::tls_bootstrap::Outcome::Reused => MintOutcome::Repaired,
+                // #3709 — the operator supplied this TLS material; we neither
+                // minted nor repaired it. #3717 added MintOutcome::OperatorSupplied
+                // (roles.rs) exactly for this case, so map to it truthfully.
+                crate::tls_bootstrap::Outcome::OperatorSupplied => MintOutcome::OperatorSupplied,
             })
         }
         RoleId::CapabilityOwner => {
