@@ -6,7 +6,6 @@
   "prepared_at_utc": "2026-05-23T16:30:22Z",
   "package": {
     "name": "ai-memory",
-    "trademark": "ai-memory™ (USPTO-registered)",
     "version": "0.7.0",
     "maintainer": "AlphaOne LLC (@alphaonedev)",
     "license": "Apache-2.0",

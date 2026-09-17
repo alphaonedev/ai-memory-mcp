@@ -53,7 +53,7 @@ install -m 0755 ai-memory %{buildroot}%{_bindir}/ai-memory
 * Sun Apr 13 2026 AlphaOne LLC <alphaonedev@users.noreply.github.com> - 0.5.4.4-1
 - Three-level rule layering (global + parent + namespace)
 - License migrated from MIT to Apache-2.0
-- OIN 2.0 membership, CLA, trademark filing
+- OIN 2.0 membership, CLA
 - Archive system, 23 MCP tools, configurable TTL, 14 security fixes
 
 * Tue Apr 08 2026 AlphaOne LLC <alphaonedev@users.noreply.github.com> - 0.5.1-1

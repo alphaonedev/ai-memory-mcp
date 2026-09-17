@@ -298,7 +298,6 @@ Before tagging a release:
 | Patent retaliation | Apache 2.0 Section 3 (attacker loses license) |
 | CLA | Required for all contributors ([CLA.md](../CLA.md)) |
 | OIN membership | Active (AlphaOne LLC, 3,900+ member cross-license) |
-| Trademark | ai-memory(TM) — USPTO Serial No. 99761257 (pending) |
 | SPDX headers | Required on all source files: `// SPDX-License-Identifier: Apache-2.0` |
 | NOTICE file | Required per Apache 2.0 Section 4(d) |
 

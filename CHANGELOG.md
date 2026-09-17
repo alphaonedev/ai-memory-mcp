@@ -6029,7 +6029,7 @@ originally triaged for v0.7.0.1 fold into v0.7.0 directly.
   PKCS#11 HSMs, Apple Secure Enclave / TEE, and AWS/GCP/Azure cloud
   KMS adapters are intentionally **not** implemented in this crate. The
   OSS path stops at file-based 0600 storage; certified hardware-backed
-  deployments live in the AgenticMem™ commercial layer per
+  deployments live in the AgenticMem commercial layer per
   `ROADMAP.md`. The OSS code never imports a hardware-token library.
 - **New deps (pure-Rust, MIT/Apache):** `ed25519-dalek = "2"` (with
   the `rand_core` feature for `SigningKey::generate`), `rand_core =
