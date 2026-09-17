@@ -428,6 +428,44 @@ fn merge_store_reusing_a_tombstones_id_is_refused_not_absorbed_3690() {
     assert_eq!(raw(&conn, "id-a").0, "old");
 }
 
+/// #2894 (amend) - the re-open CASE (`models::restore_reopen_lifecycle_assignment`,
+/// shared by both adapters) is reachable ONLY via the id-targeted restore arms:
+/// a PLAIN merge store that reuses a consolidation tombstone's own id must NOT
+/// re-open it. Observed outcome: typed `ConflictError`, unnamed, with the row
+/// byte-identical (content, lifecycle AND version - the lifecycle pin the #3690
+/// cell beside this one does not assert), still hidden on the read path (`get`
+/// is `None`) while resident at the storage level (the absence/presence pair
+/// that keeps this pin non-vacuous). Allowed-path control, not duplicated here:
+/// `restore_same_id_onto_a_tombstone_preserves_the_pre_v100_in_place_merge_2887_2894_3690`
+/// proves the `RestoreSameId` arm DOES re-open this same shape to `open`.
+#[test]
+fn plain_merge_store_onto_own_tombstone_never_reopens_2894() {
+    let (_dir, conn) = open();
+    ai_memory::db::insert(&conn, &mem("id-a", "team/ops", "slot", "old")).expect("seed");
+    set_state(&conn, "id-a", "tombstoned");
+    let err = ai_memory::db::insert(&conn, &mem("id-a", "team/ops", "slot", "new"))
+        .expect_err("a plain merge into a tombstone is refused, never re-opened");
+    assert_eq!(
+        conflict(&err).existing_id,
+        "",
+        "the tombstone is never named"
+    );
+    assert_eq!(
+        raw(&conn, "id-a"),
+        ("old".to_string(), "tombstoned".to_string(), 1),
+        "NOT re-opened: content, lifecycle and version byte-identical"
+    );
+    assert!(
+        ai_memory::db::get(&conn, "id-a").expect("get").is_none(),
+        "still hidden on the normal read path"
+    );
+    assert_eq!(
+        count_key(&conn, "slot", "team/ops"),
+        1,
+        "no second row landed beside the tombstone"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────
 // #3696 / #3712 — the SECOND axis: an occupant the viewer cannot READ
 // ───────────────────────────────────────────────────────────────────

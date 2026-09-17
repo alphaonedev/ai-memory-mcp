@@ -2182,6 +2182,7 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
                 -- visible snapshot takes the THEN arm (the fix); anything
                 -- else keeps the stored state, so a quarantine is never
                 -- laundered.
+                -- #2894 (amend): the THEN arm is reachable only via the id-targeted restore arms; pinned by plain_merge_store_onto_own_tombstone_never_reopens_2894.
                 lifecycle_state = {reopen_lifecycle},
                 -- #1632 — upsert-merge IS a mutation (content/tags/priority
                 -- can change), so the Gap-1 optimistic-concurrency counter

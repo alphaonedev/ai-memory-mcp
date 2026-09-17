@@ -35436,6 +35436,7 @@ impl PostgresStore {
                 -- shared with the sqlite funnel). A stored visible row takes
                 -- the ELSE arm (the #1709 rule, unchanged); anything else
                 -- keeps the stored state, so a quarantine is never laundered.
+                -- #2894 (amend): the THEN arm is reachable only via the id-targeted restore arms; pinned by pg_plain_embed_merge_onto_own_tombstone_never_reopens_2894.
                 lifecycle_state = {reopen_lifecycle},
                 -- v1.0.0 #2267 / #1834 — match the plain `store()`
                 -- claim-bitemporal contract: genesis is immutable while a

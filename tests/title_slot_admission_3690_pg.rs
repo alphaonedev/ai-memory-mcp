@@ -432,6 +432,47 @@ async fn pg_merge_store_reusing_a_tombstones_id_is_refused_3690() {
     assert_eq!(raw(&store, &a).await.0, "old");
 }
 
+/// #2894 (amend) - pg twin of `plain_merge_store_onto_own_tombstone_never_reopens_2894`,
+/// driven through `store_with_embedding` (the Merge arm of
+/// `store_with_embedding_inner`, where the re-open CASE lives on this backend):
+/// a plain embed-merge reusing a consolidation tombstone's own id must NOT
+/// re-open it. Observed outcome: typed `StoreError::Conflict`, unnamed, the row
+/// byte-identical, `get` folding to `NotFound` while the row stays resident.
+/// Allowed-path control, not duplicated here:
+/// `pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695` (tombstone
+/// third) proves the restore arm DOES re-open this same shape to `open`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_plain_embed_merge_onto_own_tombstone_never_reopens_2894() {
+    let Some(store) = connect().await else { return };
+    let ctx = CallerContext::for_agent("ai:tester-3690");
+    let ns = uid("ns");
+    let a = uid("a");
+    store
+        .store_with_embedding(&ctx, &mem(&a, &ns, "slot", "old"), None, None)
+        .await
+        .expect("seed");
+    set_state(&store, &a, "tombstoned").await;
+    let err = store
+        .store_with_embedding(&ctx, &mem(&a, &ns, "slot", "new"), None, None)
+        .await
+        .expect_err("a plain embed-merge into a tombstone is refused, never re-opened");
+    assert_eq!(conflict_id(&err), "", "the tombstone is never named");
+    assert_eq!(
+        raw(&store, &a).await,
+        ("old".to_string(), "tombstoned".to_string(), 1),
+        "NOT re-opened: content, lifecycle and version byte-identical"
+    );
+    assert!(
+        matches!(store.get(&ctx, &a).await, Err(StoreError::NotFound { .. })),
+        "still hidden on the normal read path"
+    );
+    assert_eq!(
+        count_key(&store, &ns).await,
+        1,
+        "no second row landed beside the tombstone"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────
 // #3691 / #3693 / #3626 — the postgres twins of the other Unit-1 lanes
 // ───────────────────────────────────────────────────────────────────
