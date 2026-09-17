@@ -29,6 +29,12 @@
 # Census at 8b56f33e6 with the #3760 DERIVED gate: 62 live instances tracked (#3674=3, #3707=34, #3708=2,
 # #3760=2, #3761=11, #3762=10), 0 echo, 2 mappers (peer_status, identity_ref), 16 pre-existing NOTICEs
 # (fixed-or-moved entries the frozen gate reports identically).
+# #3767 (receiver boundary, on 562ba56cb + #3760): the 16 stale entries above are DROPPED (each names a site
+# the tree has since closed — `checkpoint_resolve_error` renders a constant, the skills routes and the
+# create/coordination handlers render through the funnel); the census on 562ba56cb + #3760 + this
+# commit is 66 live instances (#3674=3, #3707=35, #3708=2, #3760=2, #3761=10, #3762=10, #3766=4 — the
+# namespace key's two instances plus checkpoint.rs:162 and share.rs:225), 0 NOTICEs, 0 FAIL. On the
+# #3761 tree the same gate reads #3761=0 and #3766=3 (the namespace key's surviving :566 instance).
 #   #3713  MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp)                       119 keys
 #   #3707  HTTP handler JSON bodies (http-body) + errors.rs From<...> (memory-error)                   44 keys
 #   #3724  webhook receiver text persisted into subscription_dlq.last_error (dlq-record)                1 keys
@@ -41,12 +47,6 @@
 # ---- #3707 — HTTP handler JSON bodies (http-body) + errors.rs From<...> (memory-error) (44 keys) ----
 src/errors.rs:from:memory-error:db=pending:#3707
 src/handlers/capture_turn.rs:capture_turn_write:http-body:db=pending:#3707
-src/handlers/coordination.rs:checkpoint_resolve_error:http-body:db=pending:#3707
-src/handlers/coordination.rs:local_transition_via_db:http-body:db=pending:#3707
-src/handlers/coordination.rs:local_transition_via_store:http-body:db=pending:#3707
-src/handlers/coordination.rs:signal_insert_error:http-body:db=pending:#3707
-src/handlers/create.rs:create_memory_postgres:http-body:db=pending:#3707
-src/handlers/create.rs:create_memory_write:http-body:db=pending:#3707
 src/handlers/errors.rs:attested_write_admission_response:http-body:db=pending:#3707
 src/handlers/hook_subscribers.rs:clear_namespace_standard_inner:http-body:db=pending:#3707
 src/handlers/hook_subscribers.rs:get_inbox:http-body:db=pending:#3707
@@ -59,34 +59,25 @@ src/handlers/kg.rs:kg_query:http-body:db=pending:#3707
 src/handlers/memories.rs:delete_memory:http-body:db=pending:#3707
 src/handlers/memories.rs:promote_memory:http-body:db=pending:#3707
 src/handlers/memories.rs:update_memory_write:http-body:db=pending:#3707
-src/handlers/memories_query.rs:forget_memories:http-body:db=pending:#3707
-src/handlers/power_consolidation.rs:load_family_handler:http-body:db=pending:#3707
-src/handlers/route_1111.rs:calibrate_confidence_http_via_store:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_calibrate_confidence_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_check_agent_action_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_dependents_of_invalidated_http:http-body:db=pending:#3707
-src/handlers/route_1111.rs:handle_export_reflection_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_recall_observations_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_reflect_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_reflection_origin_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_replay_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_rule_list_http:http-body:db=pending:#3707
-src/handlers/route_1111.rs:handle_smart_load_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_subscription_dlq_list_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_subscription_replay_http:http-body:db=pending:#3707
 src/handlers/route_1111.rs:handle_verify_http:http-body:db=pending:#3707
 src/handlers/share.rs:share_memory:http-body:db=pending:#3707
 src/handlers/skills.rs:skill_compose_route:http-body:db=pending:#3707
-src/handlers/skills.rs:skill_delete_route:http-body:db=pending:#3707
 src/handlers/skills.rs:skill_export_route:http-body:path=pending:#3707
-src/handlers/skills.rs:skill_get_route:http-body:db=pending:#3707
 src/handlers/skills.rs:skill_promote_route:http-body:db=pending:#3707
 # (#3760) src/handlers/skills.rs:skill_register_route re-keyed :http-body:db -> :http-body:path once the walk
 # saw the resolved import root first (deterministic first-taint-by-name); held under #3762 below.
-src/handlers/skills.rs:skill_retire_route:http-body:db=pending:#3707
 
 # ---- #3724 — webhook receiver text persisted into subscription_dlq.last_error (dlq-record) (1 keys) ----
-src/subscriptions.rs:send:dlq-record:http=pending:#3724
 
 # ---- #3708 — hook / governance Deny.reason (deny-reason) (2 keys) ----
 src/cli/governance_check_action.rs:run_from_pretool_stdin:deny-reason:db=pending:#3708
@@ -98,7 +89,6 @@ src/handlers/postgres_gate.rs:store_err_to_response:funnel-arm:StoreError::Schem
 src/handlers/postgres_gate.rs:store_err_to_response:funnel-arm:StoreError::SchemaVersionPoisoned.detail=pending:#3674
 
 # ---- #3698 — forward_to_http: peer body AND federation URL in MCP error text (one key covers both taints) (1 keys) ----
-src/mcp/tools/store/transport.rs:forward_to_http:mcp-error:http=pending:#3698
 mapper=mcp_foreign_err
 mapper=mcp_error_text
 mapper=log_foreign
@@ -112,14 +102,25 @@ mapper=conflict_or_string
 src/handlers/admin.rs:import_memories:http-body:db=pending:#3760
 #   #3761  driver text reaching MCP callers through a `?`-propagated Result<_, String> helper OUTSIDE
 #          src/mcp (actions::create_guarded*) and through match-arm `.map_err(|e| e.to_string())` values
-#          (forget / archive / lineage / namespace)                                                  7 keys
+#          (forget / archive / lineage; the namespace key is held under #3766, see below)           6 keys
 src/actions/mod.rs:create_guarded:mcp-error:db=pending:#3761
 src/actions/mod.rs:create_guarded_in_transaction:mcp-error:db=pending:#3761
 src/mcp/tools/archive.rs:handle_archive_restore:mcp-error:db=pending:#3761
 src/mcp/tools/forget.rs:forget_preview:mcp-error:db=pending:#3761
 src/mcp/tools/forget.rs:handle_forget:mcp-error:db=pending:#3761
 src/mcp/tools/lineage.rs:handle_lineage:mcp-error:db=pending:#3761
-src/mcp/tools/namespace.rs:handle_namespace_set_standard_inner:mcp-error:db=pending:#3761
+# The namespace key below carries THREE instances on the tip: the two bind-refusal `error={err}` strings
+# #3761 closes, and `db::set_namespace_standard(..).map_err(|e| e.to_string())?` (namespace.rs:566), which
+# is #3766's — the #3767 receiver boundary made it visible. One key holds one issue; it is held under
+# #3766 because that is the instance that survives #3761 (a #3761-keyed count of 0 on the #3761 tree
+# is what proves its fix; this key is not part of that count).
+src/mcp/tools/namespace.rs:handle_namespace_set_standard_inner:mcp-error:db=pending:#3766
+#   #3766  driver text `.to_string()`d at an MCP sink from a CRATE fn whose error is the driver's —
+#          `crate::checkpoints::insert` (declared rusqlite::Result) and `db::insert` (a storage anyhow
+#          chain) — hidden from the gate until #3767 bounded the receiver at a preceding block statement
+#          (proved over real stdio: `no such table: checkpoints`)                                    3 keys
+src/mcp/tools/checkpoint.rs:handle_checkpoint_create:mcp-error:db=pending:#3766
+src/mcp/tools/share.rs:handle_share:mcp-error:db=pending:#3766
 #   #3762  a std::fs::canonicalize-RESOLVED operator path (the skills export / import root) rendered into
 #          MCP tool errors and one HTTP body; the old OWN marker `canonical` hid the resolver        4 keys
 src/handlers/skills.rs:skill_register_route:http-body:path=pending:#3762

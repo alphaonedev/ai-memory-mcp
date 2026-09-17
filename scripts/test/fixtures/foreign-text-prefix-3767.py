@@ -46,20 +46,6 @@
 # the tail interpolated; the frozen pre-fix copy at scripts/test/fixtures/foreign-text-prefix-3711.py
 # is the R-203 control that still accepts that shape.
 #
-# The RECEIVER of a `.map_err(|e| ..)` chain is bounded by STATEMENTS (#3767): scanning backwards
-# from the chain, a `}` at depth 0 belongs to the receiver only when everything between it and the
-# chain is chain continuation (`.name(..)`, `?`, `.await`) — `match .. { .. }.map_err(..)`,
-# `Foo { .. }.x()`. Any other expression text in between means that `}` closes a PRECEDING block
-# statement (`if .. { return Err(..); }`) and the receiver starts after it. Before #3767 the scan
-# read every `}` as a nested closer and swallowed the preceding block into the receiver, so an
-# OWN marker inside it (`..kind_authorized(`) laundered the call that followed: the crate fns
-# `crate::checkpoints::insert` (declared `rusqlite::Result`) and `db::insert` (an anyhow chain over
-# `conn.execute(..)?`) were ALREADY classified as db sources from their signatures — the walk never
-# reached them (`memory_checkpoint_create` shipped `no such table: checkpoints`, #3766). The
-# pre-#3767 analyzer is frozen VERBATIM at scripts/test/fixtures/foreign-text-prefix-3767.py (R-203).
-# Callee resolution is deterministic: the source tree is walked in sorted order and a module-tail
-# qualifier (`db::` = `src/storage/`) resolves to the module ROOT (`mod.rs`) before any sibling file.
-#
 # Usage:
 #   scripts/check-foreign-text-to-caller.py [ROOT] [--json] [--verbose] [--only=<src/file.rs>]
 #   scripts/check-foreign-text-to-caller.py --self-test
@@ -119,8 +105,7 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
 
     files = {}   # path -> {'lines': [...], 'prod_end': n}
     for dp, dn, fn in os.walk(os.path.join(ROOT, 'src')):
-        dn.sort()   # #3767 — a deterministic index order: `find_fn`'s first candidate must not depend on the filesystem
-        for f in sorted(fn):
+        for f in fn:
             if not f.endswith('.rs'): continue
             p = os.path.relpath(os.path.join(dp, f), ROOT)
             base = os.path.basename(p)
@@ -604,26 +589,12 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         if re.search(r'ExecutorError|DecisionParseError', pt): return 'proc'
         return 'db'
 
-    # #3767 — what may sit between a `}` and the start of the chain for that `}` to still be part of
-    # the receiver: method-chain continuation only (`.name(..)`, `.name`, `?`, `.await`).
-    CHAIN_TAIL_RE = re.compile(r'\s*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*(?:::<[^>]*>)?(?:\([^;]*\))?|\?|\.await)\s*)*', re.S)
     def receiver_chain(body, at):
         """Text of the expression whose method chain ends at `at` (start of `.map_err`)."""
         i = at - 1; depth = 0
         while i >= 0:
             c = body[i]
-            if c == '}' and depth == 0:
-                # #3767 — a `}` at depth 0 is PART of the receiver only when the receiver is a method
-                # chain hanging off that block (`match .. { .. }.map_err(..)`, `Foo { .. }.x()`,
-                # `if c { a } else { b }.y()`): everything between the `}` and the chain start is
-                # chain continuation. Any other expression text in between (`if .. { return
-                # Err(..); }  crate::checkpoints::insert(conn, &cp)`) means the block is a PRECEDING
-                # STATEMENT and the receiver starts after it. Scanning through it swallowed the
-                # block's text into the receiver, and an OWN marker there (`..kind_authorized(`)
-                # laundered the call that followed (checkpoint.rs:162 / share.rs:225 — #3766).
-                if not CHAIN_TAIL_RE.fullmatch(body[i+1:at]): break
-                depth += 1
-            elif c in ')]}': depth += 1
+            if c in ')]}': depth += 1
             elif c in '([{':
                 if depth == 0: break
                 depth -= 1
@@ -1060,9 +1031,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None):
         if segs:
             tail = segs[-1]
             by_mod = [c for c in cands if re.search(r'(^|/)' + re.escape(tail) + r'(\.rs|/mod\.rs)$', c.file) or (tail == 'db' and c.file.startswith('src/storage/'))]
-            # #3767 — the module ROOT (`<tail>/mod.rs`, `src/storage/mod.rs` for the `db` alias) is the fn the
-            # qualifier names; a sibling file's same-named fn is a different function.
-            by_mod.sort(key=lambda c: (not c.file.endswith('/mod.rs'), c.file))
             if by_mod: return by_mod[:1]
             if tail[:1].isupper():   # Type::method — an inherent/impl method
                 by_impl = [c for c in cands if c.impl_type == tail]
@@ -1734,64 +1702,6 @@ fn status_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
     };
     Ok(json!({"status": "ok", "index_note": index_note}))
 }
-// T1 (#3767 / #3766) — the live checkpoint.rs:162 shape: a guard BLOCK STATEMENT precedes a call to
-// a crate fn whose DECLARED return type is rusqlite::Result, and the site `.to_string()`s the error.
-// The pre-#3767 receiver scan read the guard's `}` as a nested closer and swallowed the block into the
-// receiver; the OWN marker inside it (a `validate_*` call — on the live tree `validate_metadata` in the
-// guard before checkpoint.rs:162) laundered the whole chunk: `no such table: checkpoints` reached
-// `memory_checkpoint_create`'s caller while the gate scanned clean.
-fn checkpoint_after_guard(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
-    if !id.is_empty() {
-        crate::validate::validate_id(id).map_err(|e| e.to_string())?;
-    }
-    crate::checkpoints::insert(conn, id).map_err(|e| e.to_string())?;
-    Ok(json!({"id": id}))
-}
-// T1 (#3767 / #3766) — the live share.rs:225 shape: the same guard-block-then-call, through a STORAGE
-// anyhow chain (`db::insert` -> `insert_inner` -> `conn.execute(..)?`) instead of a declared rusqlite::Result.
-fn share_after_guard(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
-    if !id.is_empty() {
-        crate::validate::validate_id(id).map_err(|e| e.to_string())?;
-    }
-    db::insert(conn, id).map_err(|e| e.to_string())?;
-    Ok(json!({"shared": id}))
-}
-// CONTROL (#3767) — a BLOCK EXPRESSION as the receiver (`match .. { .. }.map_err(..)`, the live
-// forget.rs:41 / lineage.rs:126 shape) must STAY RED: the `}` here is part of the receiver.
-fn block_receiver(conn: &rusqlite::Connection, id: &str, owner: Option<&str>) -> Result<Value, String> {
-    let rows = match owner {
-        Some(_) => db::insert(conn, id),
-        None => db::insert(conn, id),
-    }
-    .map_err(|e| e.to_string())?;
-    Ok(json!({"rows": rows}))
-}
-// CONTROL (#3767) — a guard block followed by an OWN-vocabulary call (a validator) must stay CLEAN:
-// the boundary fix narrows the receiver, it must not manufacture a finding.
-fn own_after_guard(id: &str) -> Result<Value, String> {
-    if !id.is_empty() {
-        crate::validate::validate_id(id).map_err(|e| e.to_string())?;
-    }
-    crate::validate::validate_namespace(id).map_err(|e| e.to_string())?;
-    Ok(json!({"id": id}))
-}
-''')
-    # #3767 — a crate module whose fns DECLARE the driver's error type (the live `crate::checkpoints::insert`)
-    _write(root, 'src/checkpoints/mod.rs', '''
-pub fn insert(conn: &Connection, id: &str) -> rusqlite::Result<String> {
-    conn.execute("INSERT INTO checkpoints (id) VALUES (?1)", params![id])?;
-    Ok(id.to_string())
-}
-''')
-    # #3767 — the storage root the `db::` alias names: an anyhow chain over a driver call (the live `db::insert`)
-    _write(root, 'src/storage/mod.rs', '''
-pub fn insert(conn: &Connection, id: &str) -> Result<String> {
-    insert_inner(conn, id)
-}
-fn insert_inner(conn: &Connection, id: &str) -> Result<String> {
-    conn.execute("INSERT INTO memories (id) VALUES (?1)", params![id])?;
-    Ok(id.to_string())
-}
 ''')
     _write(root, 'src/hooks/chain.rs', '''
 async fn fire(executor: &Executor, event: Event) -> ChainResult {
@@ -1865,10 +1775,6 @@ pub static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = &[
     register_mcp_tool!(tool_names::MEMORY_BLOCK_RETURN, dispatch_block_return),
     register_mcp_tool!(tool_names::MEMORY_BLOCK_BOUND, dispatch_block_bound),
     register_mcp_tool!(tool_names::MEMORY_STATUS, dispatch_status),
-    register_mcp_tool!(tool_names::MEMORY_CHECKPOINT_CREATE, dispatch_checkpoint_after_guard),
-    register_mcp_tool!(tool_names::MEMORY_SHARE, dispatch_share_after_guard),
-    register_mcp_tool!(tool_names::MEMORY_BLOCK_RECEIVER, dispatch_block_receiver),
-    register_mcp_tool!(tool_names::MEMORY_OWN_AFTER_GUARD, dispatch_own_after_guard),
 ];
 fn dispatch_forward(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::forward_to_http(ctx.url) }
 fn dispatch_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::handle_get(ctx.conn, ctx.id) }
@@ -1880,10 +1786,6 @@ fn dispatch_block_tail(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { too
 fn dispatch_block_return(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::block_return_exit(ctx.url) }
 fn dispatch_block_bound(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::block_tail_bound_sanitiser(ctx.url) }
 fn dispatch_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::status_payload(ctx.conn) }
-fn dispatch_checkpoint_after_guard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::checkpoint_after_guard(ctx.conn, ctx.id) }
-fn dispatch_share_after_guard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::share_after_guard(ctx.conn, ctx.id) }
-fn dispatch_block_receiver(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::block_receiver(ctx.conn, ctx.id, None) }
-fn dispatch_own_after_guard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> { tools::relay::own_after_guard(ctx.id) }
 ''')
     _write(root, 'src/handlers/import.rs', '''
 // #3760 — the import envelope: a Vec<String> assembled by push and rendered under a key that is
@@ -2027,23 +1929,6 @@ def self_test(scratch):
         expect(any(':signal_insert_error:http-body:db' in k for k in frozen_3760), 'R-203 sanity: the frozen gate still rejects the #3703 shape, so its silence above is the defect, not a broken run')
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
         expect(False, f'R-203 (#3760): frozen prefix gate could not be run ({ex})')
-    # #3767 — the receiver of a `.map_err` chain is bounded by statements: a preceding guard BLOCK is not
-    # part of it, so the crate fn it precedes (declared rusqlite::Result / a storage anyhow chain) is judged.
-    expect(has('src/mcp/tools/relay.rs', ':checkpoint_after_guard:mcp-error:db'), '#3767: a guard block, then `crate::checkpoints::insert(..)` (declared rusqlite::Result) `.to_string()`d is RED (the live checkpoint.rs:162 / #3766 shape)')
-    expect(has('src/mcp/tools/relay.rs', ':share_after_guard:mcp-error:db'), '#3767: a guard block, then `db::insert(..)` (a storage anyhow chain over conn.execute) `.to_string()`d is RED (the live share.rs:225 shape)')
-    expect(has('src/mcp/tools/relay.rs', ':block_receiver:mcp-error:db'), '#3767 CONTROL: a `match .. { .. }.map_err(..)` whose ARMS are db calls stays RED — the block IS the receiver')
-    expect(not has('src/mcp/tools/relay.rs', ':own_after_guard:'), '#3767 CONTROL: a guard block followed by an OWN validator call stays CLEAN — the boundary narrows, it never manufactures')
-    prefix_3767 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3767.py')
-    try:
-        import subprocess
-        out = subprocess.run([sys.executable, prefix_3767, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
-        frozen_3767 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
-        expect(not any(':checkpoint_after_guard:' in k for k in frozen_3767), 'R-203: the FROZEN pre-#3767 gate (test/fixtures/foreign-text-prefix-3767.py) ACCEPTS the guard-then-rusqlite::Result call — the swallowed-block launder reproduces')
-        expect(not any(':share_after_guard:' in k for k in frozen_3767), 'R-203: the FROZEN gate ACCEPTS the guard-then-storage-anyhow call — the same launder reproduces')
-        expect(any(':block_receiver:mcp-error:db' in k for k in frozen_3767), 'R-203 sanity: the frozen gate still rejects the block-RECEIVER shape, so its silence above is the defect, not a broken run')
-        expect(any(':handle_get:mcp-error:db' in k for k in frozen_3767), 'R-203 sanity: the frozen gate still rejects a bare db call `.to_string()`d, so the declared-rusqlite/anyhow classes were never the gap')
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
-        expect(False, f'R-203 (#3767): frozen prefix gate could not be run ({ex})')
     expect(has('src/hooks/chain.rs', ':fire:deny-reason:proc'), 'hook subprocess text in Deny.reason (#3704)')
     expect(has('src/errors.rs', ':from:memory-error:db'), 'From<rusqlite::Error> -> MemoryError::DatabaseError(e.to_string())')
     expect(has('src/subscriptions.rs', ':send:dlq-record:http'), "receiver's ack field persisted into subscription_dlq.last_error")
