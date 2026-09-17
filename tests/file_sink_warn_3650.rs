@@ -80,8 +80,10 @@ fn run_stats_until_3650(dir: &Path, logs: &Path, needle: &str, budget: Duration)
     while Instant::now() < deadline {
         body.clear();
         if let Ok(entries) = std::fs::read_dir(logs) {
-            let mut files: Vec<PathBuf> =
-                entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).collect();
+            let mut files: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect();
             files.sort();
             for file in files {
                 if let Ok(text) = std::fs::read_to_string(&file) {

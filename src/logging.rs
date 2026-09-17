@@ -1626,20 +1626,19 @@ mod tests {
     /// `&'static` name set, which a runtime temporary cannot satisfy.
     static CENSUS_NO_FIELDS_3650: [&'static str; 0] = [];
 
-    static CENSUS_DUMMY_METADATA_3650: tracing::Metadata<'static> =
-        tracing::Metadata::new(
-            "census_dummy_3650",
-            "census_dummy_3650",
-            tracing::Level::INFO,
-            None,
-            None,
-            None,
-            tracing::field::FieldSet::new(
-                &CENSUS_NO_FIELDS_3650,
-                tracing::callsite::Identifier(&CENSUS_CALLSITE_3650),
-            ),
-            tracing::metadata::Kind::EVENT,
-        );
+    static CENSUS_DUMMY_METADATA_3650: tracing::Metadata<'static> = tracing::Metadata::new(
+        "census_dummy_3650",
+        "census_dummy_3650",
+        tracing::Level::INFO,
+        None,
+        None,
+        None,
+        tracing::field::FieldSet::new(
+            &CENSUS_NO_FIELDS_3650,
+            tracing::callsite::Identifier(&CENSUS_CALLSITE_3650),
+        ),
+        tracing::metadata::Kind::EVENT,
+    );
 
     impl tracing::callsite::Callsite for CensusCallsite3650 {
         fn set_interest(&self, _: tracing::subscriber::Interest) {}
@@ -1803,15 +1802,11 @@ mod tests {
                     if bytes[idx] == b'\n' {
                         out.push(b'\n');
                         idx += 1;
-                    } else if idx + 1 < bytes.len()
-                        && bytes[idx] == b'/'
-                        && bytes[idx + 1] == b'*'
+                    } else if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*'
                     {
                         depth += 1;
                         idx += 2;
-                    } else if idx + 1 < bytes.len()
-                        && bytes[idx] == b'*'
-                        && bytes[idx + 1] == b'/'
+                    } else if idx + 1 < bytes.len() && bytes[idx] == b'*' && bytes[idx + 1] == b'/'
                     {
                         depth -= 1;
                         idx += 2;
@@ -1853,8 +1848,7 @@ mod tests {
                 }
                 if cur < bytes.len() && bytes[cur] == b':' {
                     cur = skip_ws_3650(bytes, cur + 1);
-                    while cur < bytes.len() && !matches!(bytes[cur], b'=' | b';' | b'{' | b'(')
-                    {
+                    while cur < bytes.len() && !matches!(bytes[cur], b'=' | b';' | b'{' | b'(') {
                         cur += 1;
                     }
                     if cur >= bytes.len() || bytes[cur] != b'=' {
@@ -1882,8 +1876,7 @@ mod tests {
                         cur += 1;
                     }
                     if closed {
-                        let value =
-                            String::from_utf8_lossy(&bytes[start..cur]).into_owned();
+                        let value = String::from_utf8_lossy(&bytes[start..cur]).into_owned();
                         // One const name can hold different values in
                         // different modules (`MEMORY_SMART_LOAD` is both a
                         // route and a tool name); every candidate joins
@@ -1905,10 +1898,7 @@ mod tests {
                         }
                         last = segment;
                         cur = next;
-                        if cur + 1 < bytes.len()
-                            && bytes[cur] == b':'
-                            && bytes[cur + 1] == b':'
-                        {
+                        if cur + 1 < bytes.len() && bytes[cur] == b':' && bytes[cur + 1] == b':' {
                             cur += 2;
                         } else {
                             break;
@@ -1992,8 +1982,7 @@ mod tests {
         let bytes = text.as_bytes();
         let mut idx = 0;
         while idx + 6 <= bytes.len() {
-            if &bytes[idx..idx + 6] == b"target"
-                && (idx == 0 || !is_word_char_3650(bytes[idx - 1]))
+            if &bytes[idx..idx + 6] == b"target" && (idx == 0 || !is_word_char_3650(bytes[idx - 1]))
             {
                 let mut cur = skip_ws_3650(bytes, idx + 6);
                 if cur >= bytes.len() {
@@ -2021,9 +2010,7 @@ mod tests {
                         cur += 1;
                     }
                     if closed {
-                        targets.insert(
-                            String::from_utf8_lossy(&bytes[start..cur]).into_owned(),
-                        );
+                        targets.insert(String::from_utf8_lossy(&bytes[start..cur]).into_owned());
                     }
                     idx = cur + 1;
                     continue;
@@ -2038,10 +2025,7 @@ mod tests {
                         }
                         last = segment;
                         cur = next;
-                        if cur + 1 < bytes.len()
-                            && bytes[cur] == b':'
-                            && bytes[cur + 1] == b':'
-                        {
+                        if cur + 1 < bytes.len() && bytes[cur] == b':' && bytes[cur + 1] == b':' {
                             cur += 2;
                         } else {
                             break;
@@ -2053,15 +2037,9 @@ mod tests {
                     if !is_call && is_screaming_3650(&last) {
                         let resolved = resolve_const_3650(&last, lits, aliases);
                         if resolved.is_empty() {
-                            let line = bytes[..idx]
-                                .iter()
-                                .filter(|byte| **byte == b'\n')
-                                .count()
-                                + 1;
-                            unresolved.push(format!(
-                                "{}:{line}: {last}",
-                                path.display()
-                            ));
+                            let line =
+                                bytes[..idx].iter().filter(|byte| **byte == b'\n').count() + 1;
+                            unresolved.push(format!("{}:{line}: {last}", path.display()));
                         } else {
                             targets.extend(resolved);
                         }
@@ -2106,7 +2084,14 @@ mod tests {
         let mut targets: BTreeSet<String> = BTreeSet::new();
         let mut unresolved = Vec::new();
         for (path, text) in files.iter().zip(texts.iter()) {
-            collect_file_targets_3650(path, text, &lits, &mut aliases, &mut targets, &mut unresolved);
+            collect_file_targets_3650(
+                path,
+                text,
+                &lits,
+                &mut aliases,
+                &mut targets,
+                &mut unresolved,
+            );
         }
         assert!(
             unresolved.is_empty(),
@@ -2147,14 +2132,20 @@ mod tests {
                 }
             }
         }
+        let dropped_targets: BTreeSet<&str> = dropped
+            .iter()
+            .filter_map(|line| line.split(" at ").next())
+            .collect();
         assert!(
             dropped.is_empty(),
             "#3650: the shipped default filter ({:?}) drops {} of {} censused \
-             explicit targets at INFO/WARN/ERROR (operator-visible boot, \
-             security, replay, schema and degradation events disappear):\n{}",
+             explicit targets ({} target-level pairs at INFO/WARN/ERROR; \
+             operator-visible boot, security, replay, schema and degradation \
+             events disappear):\n{}",
             super::DEFAULT_LOG_DIRECTIVE,
-            dropped.len(),
+            dropped_targets.len(),
             targets.len(),
+            dropped.len(),
             dropped.join("\n")
         );
     }
@@ -2164,6 +2155,9 @@ mod tests {
     /// exactly it. The default must additionally be a BARE level (no
     /// `target=` prefix): a targeted default is the defect — it
     /// discards every explicit target outside its prefix.
+    /// Design lock (#3650 review NIT-2): this pin asserts the directive is a
+    /// BARE level (no `=`). A future family-directive redesign must change
+    /// this pin deliberately, together with the census above.
     #[test]
     fn shipped_units_agree_with_default_filter_ssot_3650() {
         assert!(
@@ -2199,9 +2193,7 @@ mod tests {
             );
         }
         tracing_subscriber::EnvFilter::try_new(super::DEFAULT_LOG_DIRECTIVE)
-            .unwrap_or_else(|err| {
-                panic!("DEFAULT_LOG_DIRECTIVE must parse: {err}")
-            });
+            .unwrap_or_else(|err| panic!("DEFAULT_LOG_DIRECTIVE must parse: {err}"));
     }
 
     /// #3650 — the operator wins for the target it names: `RUST_LOG`
@@ -2215,7 +2207,11 @@ mod tests {
             built.rejected
         );
         assert!(
-            filter_admits_3650(built.filter, "ai_memory::storage::migrations", tracing::Level::DEBUG),
+            filter_admits_3650(
+                built.filter,
+                "ai_memory::storage::migrations",
+                tracing::Level::DEBUG
+            ),
             "RUST_LOG=ai_memory=debug must enable ai_memory DEBUG over an info base"
         );
         // The allowed-path control on the same sink: a global
@@ -2223,12 +2219,20 @@ mod tests {
         // ERROR itself stays admitted (presence).
         let built = build_log_filter("info", &[], Some("error"));
         assert!(
-            !filter_admits_3650(built.filter, "ai_memory::storage::migrations", tracing::Level::INFO),
+            !filter_admits_3650(
+                built.filter,
+                "ai_memory::storage::migrations",
+                tracing::Level::INFO
+            ),
             "RUST_LOG=error must still suppress INFO on the same sink"
         );
         let built = build_log_filter("info", &[], Some("error"));
         assert!(
-            filter_admits_3650(built.filter, "ai_memory::storage::migrations", tracing::Level::ERROR),
+            filter_admits_3650(
+                built.filter,
+                "ai_memory::storage::migrations",
+                tracing::Level::ERROR
+            ),
             "RUST_LOG=error must still admit ERROR on the same sink"
         );
     }
