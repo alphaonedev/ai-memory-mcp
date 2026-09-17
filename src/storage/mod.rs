@@ -22469,6 +22469,47 @@ pub fn get_namespace_meta_entry(
 }
 
 /// Clear the standard for a namespace.
+/// #3176 / #3758 — read a namespace's three-state standard BINDING on
+/// sqlite, the ONE reader behind the SET and CLEAR owner gates (the SAL
+/// adapter and the MCP / HTTP funnels that hold the connection directly).
+/// `CAST(... AS TEXT)` is the sqlite analogue of postgres' `->>` (both yield
+/// the unquoted scalar as text, NULL-preserving) so a non-string `agent_id`
+/// cannot become a hard decode error on one backend and a value on the
+/// other. Keeping row-presence and owner-nullness SEPARABLE is load-bearing
+/// (#2704-F2): collapsing them makes an UNOWNED standard look UNRESOLVABLE.
+///
+/// # Errors
+///
+/// Any SQLite error.
+pub fn namespace_standard_binding(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<crate::visibility::NamespaceStandardBinding> {
+    use rusqlite::OptionalExtension;
+    let meta_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = ?1)",
+        params![namespace],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    if !meta_exists {
+        return Ok(crate::visibility::NamespaceStandardBinding::NoMetaRow);
+    }
+    let owner_row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT CAST(json_extract(m.metadata, '$.agent_id') AS TEXT) \
+             FROM namespace_meta nm \
+             JOIN memories m ON m.id = nm.standard_id \
+             WHERE nm.namespace = ?1",
+            params![namespace],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(match owner_row {
+        Some(owner) => crate::visibility::NamespaceStandardBinding::Resolved(owner),
+        None => crate::visibility::NamespaceStandardBinding::Unresolvable,
+    })
+}
+
 pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bool> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let changed = conn.execute(

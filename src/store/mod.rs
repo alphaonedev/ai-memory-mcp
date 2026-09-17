@@ -859,21 +859,7 @@ pub(crate) fn caller_may_delete_link(
 /// Keeping row-presence and owner-nullness SEPARABLE is load-bearing (#2704-F2):
 /// collapsing them makes an UNOWNED standard look UNRESOLVABLE and refuses a
 /// clear that must be allowed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NamespaceStandardBinding {
-    /// No `namespace_meta` row for this namespace at all. There is no
-    /// governance binding to disarm, so the DELETE is a no-op and the gate
-    /// does not apply on either backend.
-    NoMetaRow,
-    /// A `namespace_meta` row exists AND its `standard_id` resolves to a live
-    /// memory. The payload is that memory's `metadata.agent_id`; `None` means
-    /// the key is absent or SQL-NULL (an UNOWNED standard).
-    Resolved(Option<String>),
-    /// A `namespace_meta` row exists but its `standard_id` is SEVERED (NULL,
-    /// #2503) or DANGLING (points at no surviving row) — the bound standard
-    /// is unresolvable.
-    Unresolvable,
-}
+pub(crate) use crate::visibility::{NamespaceStandardBinding, NamespaceStandardOp};
 
 /// #2545 — wire-pinned refusal text for a clear against an UNRESOLVABLE
 /// standard. ONE declaration site (pm-v3.1 no-scattered-literal rule) shared
@@ -894,64 +880,71 @@ pub(crate) fn reason_clear_standard_not_owner() -> String {
     crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()
 }
 
-/// #3176 — the shared authorization decision for `clear_namespace_standard`.
-///
-/// Clearing a namespace's standard REVERTS the namespace to permissive
-/// allow-on-silence: it deletes the governance policy gating every
-/// delete/write/promote into that namespace. It is therefore gated exactly
-/// like SETTING one (#1777), and a namespace whose standard is unresolvable
-/// is fail-closed refused rather than silently disarmed (#2545).
-///
-/// * `bypass_visibility` contexts (admin/operator surfaces) skip the gate,
-///   the same exemption the SAL scope=private read filter takes.
-/// * An UNOWNED standard (`agent_id` absent, empty, or the `system`
-///   sentinel) is the documented unowned-PASS: a legacy / federated /
-///   pre-#929 standard stays clearable by its namespace's operators.
+/// #3176 / #3758 — the ONE authorization decision for mutating a namespace's
+/// standard binding, SET and CLEAR alike, on both adapters, mapped to the SAL
+/// error type. The decision itself is
+/// [`crate::visibility::namespace_standard_mutation_admission`] (ungated, so
+/// the MCP / HTTP sqlite funnels that hold the connection directly run the
+/// same predicate on a default-features build).
 ///
 /// # Errors
 ///
-/// [`StoreError::PermissionDenied`] on a non-owner clear or on an
-/// unresolvable standard.
+/// [`StoreError::PermissionDenied`] with the `action` = the op's label and
+/// the reason = `errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD` (a
+/// foreign named owner) or `REASON_CLEAR_STANDARD_UNRESOLVABLE` (CLEAR on an
+/// unresolvable binding).
+pub(crate) fn authorize_namespace_standard_mutation_for(
+    caller: &str,
+    bypass: bool,
+    namespace: &str,
+    binding: &NamespaceStandardBinding,
+    op: NamespaceStandardOp,
+) -> StoreResult<()> {
+    use crate::visibility::NamespaceStandardRefusal;
+    crate::visibility::namespace_standard_mutation_admission(caller, bypass, namespace, binding, op)
+        .map_err(|refusal| StoreError::PermissionDenied {
+            action: op.label().to_string(),
+            target: namespace.to_string(),
+            reason: match refusal {
+                NamespaceStandardRefusal::NotOwner => reason_clear_standard_not_owner(),
+                NamespaceStandardRefusal::Unresolvable => {
+                    REASON_CLEAR_STANDARD_UNRESOLVABLE.to_string()
+                }
+            },
+        })
+}
+
+/// [`authorize_namespace_standard_mutation_for`] over a [`CallerContext`].
+///
+/// # Errors
+///
+/// As [`authorize_namespace_standard_mutation_for`].
+pub(crate) fn authorize_namespace_standard_mutation(
+    ctx: &CallerContext,
+    namespace: &str,
+    binding: &NamespaceStandardBinding,
+    op: NamespaceStandardOp,
+) -> StoreResult<()> {
+    authorize_namespace_standard_mutation_for(
+        ctx.effective_principal(),
+        ctx.bypass_visibility,
+        namespace,
+        binding,
+        op,
+    )
+}
+
+/// #3176 — the CLEAR arm of [`authorize_namespace_standard_mutation`].
+///
+/// # Errors
+///
+/// As [`authorize_namespace_standard_mutation_for`].
 pub(crate) fn authorize_clear_namespace_standard(
     ctx: &CallerContext,
     namespace: &str,
     binding: &NamespaceStandardBinding,
 ) -> StoreResult<()> {
-    if ctx.bypass_visibility {
-        return Ok(());
-    }
-    match binding {
-        // Nothing bound → nothing to disarm.
-        NamespaceStandardBinding::NoMetaRow => Ok(()),
-        // Row exists with a NAMED owner that is not the caller → refuse.
-        NamespaceStandardBinding::Resolved(Some(owner))
-            if !owner.is_empty()
-                && owner != crate::identity::sentinels::SYSTEM_PRINCIPAL
-                && owner != ctx.effective_principal() =>
-        {
-            // #3407 — the owner is server-side evidence only (the #3426
-            // discipline): it goes to the authz trace, never into the reason.
-            tracing::warn!(
-                target: crate::handlers::AUTHZ_TRACE_TARGET,
-                "sal owner-gate refusal: {} on {namespace}: caller {} != owner {owner}",
-                crate::OP_CLEAR_NAMESPACE_STANDARD,
-                ctx.effective_principal()
-            );
-            Err(StoreError::PermissionDenied {
-                action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
-                target: namespace.to_string(),
-                reason: reason_clear_standard_not_owner(),
-            })
-        }
-        // Caller owns it, or it is unowned (absent / empty / `system`) → ALLOW.
-        NamespaceStandardBinding::Resolved(_) => Ok(()),
-        // Severed or dangling → truly unresolvable. Fail closed (#2545).
-        NamespaceStandardBinding::Unresolvable => Err(StoreError::PermissionDenied {
-            action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
-            target: namespace.to_string(),
-            reason: REASON_CLEAR_STANDARD_UNRESOLVABLE.to_string(),
-        }),
-    }
+    authorize_namespace_standard_mutation(ctx, namespace, binding, NamespaceStandardOp::Clear)
 }
 
 bitflags! {

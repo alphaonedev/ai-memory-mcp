@@ -435,6 +435,51 @@ async fn set_namespace_standard_inner(
             crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
         let caller_principal = ctx.effective_principal();
 
+        // #3758 — the REBIND gate, BEFORE any write this arm performs (the
+        // placeholder store and the governance merge below would otherwise
+        // land in the victim's namespace for a caller the bind then refuses).
+        // The standard CURRENTLY bound decides, through the same predicate
+        // CLEAR uses; the adapter re-runs it inside the upsert transaction as
+        // the fail-closed floor. A severed / dangling pointer is the SET repair
+        // path and passes; a read fault refuses.
+        let current_binding = match app
+            .store
+            .get_namespace_standard(&ownership_probe_ctx, ns)
+            .await
+        {
+            Ok(None) => crate::store::NamespaceStandardBinding::NoMetaRow,
+            Ok(Some((current_sid, _))) => {
+                match app.store.get(&ownership_probe_ctx, &current_sid).await {
+                    Ok(current) => crate::store::NamespaceStandardBinding::Resolved(
+                        current
+                            .metadata
+                            .get(crate::mcp::param_names::AGENT_ID)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                    ),
+                    Err(crate::store::StoreError::NotFound { .. }) => {
+                        crate::store::NamespaceStandardBinding::Unresolvable
+                    }
+                    Err(e) => return store_err_to_response(e),
+                }
+            }
+            Err(e) => return store_err_to_response(e),
+        };
+        if let Err(crate::store::StoreError::PermissionDenied { reason, .. }) =
+            crate::store::authorize_namespace_standard_mutation(
+                &ctx,
+                ns,
+                &current_binding,
+                crate::store::NamespaceStandardOp::Set,
+            )
+        {
+            return crate::handlers::parity::owner_gate_refusal(
+                &reason,
+                Some(caller_principal),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            );
+        }
+
         // #2542 — resolve the DECLARED parent's currently-bound standard memory
         // so the bind gate can refuse a graft onto a parent chain the caller
         // does not own (a tenant-isolation + approval-bypass hazard). Fetch it
@@ -594,6 +639,17 @@ async fn set_namespace_standard_inner(
                 })),
             )
                 .into_response(),
+            // #3758 — the adapter's own rebind refusal (a bind that raced the
+            // pre-check above), in the same closed shape with the caller.
+            Err(crate::store::StoreError::PermissionDenied { reason, .. })
+                if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD =>
+            {
+                crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                    Some(caller_principal),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                )
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -602,6 +658,42 @@ async fn set_namespace_standard_inner(
     // an `id`. S34's body is `{governance: …}` with no id — we create a
     // minimal standard memory so the governance policy has a home.
     let lock = app.db.lock().await;
+    // #3758 — the REBIND gate, BEFORE the placeholder seed below lands a row
+    // in the victim's namespace for a caller the bind then refuses. Same
+    // predicate as CLEAR and as the MCP funnel this arm delegates to (which
+    // re-runs it as the fail-closed floor); a read fault refuses.
+    {
+        let binding = match db::namespace_standard_binding(&lock.0, ns) {
+            Ok(b) => b,
+            Err(e) => {
+                drop(lock);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!(
+                        "cannot verify the current namespace-standard owner (error={e}); \
+                         refusing the bind rather than treating the standard as unowned"
+                    )})),
+                )
+                    .into_response();
+            }
+        };
+        if crate::visibility::namespace_standard_mutation_admission(
+            &caller,
+            caller == sentinels::DAEMON_PRINCIPAL,
+            ns,
+            &binding,
+            crate::visibility::NamespaceStandardOp::Set,
+        )
+        .is_err()
+        {
+            drop(lock);
+            return crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            );
+        }
+    }
     let resolved_id = if let Some(id) = body.id.clone() {
         id
     } else {
@@ -776,6 +868,16 @@ async fn set_namespace_standard_inner(
                 }
             }
             (StatusCode::CREATED, Json(v)).into_response()
+        }
+        // #3758 / #3407 — the rebind refusal raised by the shared predicate is
+        // the ONE closed shape (403 `NOT_OWNER`, `namespace` echoed, owner
+        // never named), byte-identical to the postgres arm above.
+        Err(e) if e == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD => {
+            crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            )
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }

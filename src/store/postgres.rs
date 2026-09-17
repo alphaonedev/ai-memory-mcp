@@ -18715,6 +18715,38 @@ async fn record_schema_version(
     Ok(())
 }
 
+/// #3176 / #3758 — read a namespace's three-state standard BINDING inside
+/// the caller's transaction: the ONE postgres reader behind the SET and CLEAR
+/// owner gates, mirroring `storage::namespace_standard_binding` one-for-one
+/// (`->>` yields the unquoted scalar as text, NULL-preserving) so the two
+/// backends cannot classify the same row differently.
+async fn pg_namespace_standard_binding(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    namespace: &str,
+) -> StoreResult<crate::store::NamespaceStandardBinding> {
+    let meta_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = $1)")
+            .bind(namespace)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| to_store_err("namespace_standard meta-exists", e))?;
+    if !meta_exists {
+        return Ok(crate::store::NamespaceStandardBinding::NoMetaRow);
+    }
+    let owner_row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
+         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("namespace_standard owner pre-fetch", e))?;
+    Ok(match owner_row {
+        Some(owner) => crate::store::NamespaceStandardBinding::Resolved(owner),
+        None => crate::store::NamespaceStandardBinding::Unresolvable,
+    })
+}
+
 /// #3188 — postgres twin of `crate::storage::auto_detect_parent`. Walks the
 /// `-`-truncated ancestors of `namespace` ("ai-memory-tests" → "ai-memory" →
 /// "ai") and returns the FIRST ancestor that has a namespace standard bound (a
@@ -26528,7 +26560,7 @@ impl MemoryStore for PostgresStore {
 
     async fn set_namespace_standard(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         namespace: &str,
         standard_id: &str,
         parent: Option<&str>,
@@ -26567,6 +26599,25 @@ impl MemoryStore for PostgresStore {
             Some(p) => Some(p.to_string()),
             None => pg_auto_detect_parent(&self.pool, namespace).await?,
         };
+        // #3758 — the REBIND gate: the standard CURRENTLY bound decides,
+        // through the same predicate CLEAR uses. Pre-fix this adapter
+        // discarded `ctx` and any caller could replace another tenant's
+        // governance standard. Owner read + upsert in ONE transaction (the
+        // #3237 item 5 TOCTOU discipline of the CLEAR twin).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
+        if !ctx.bypass_visibility {
+            let binding = pg_namespace_standard_binding(&mut tx, namespace).await?;
+            crate::store::authorize_namespace_standard_mutation(
+                ctx,
+                namespace,
+                &binding,
+                crate::store::NamespaceStandardOp::Set,
+            )?;
+        }
         sqlx::query(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
              VALUES ($1, $2, NOW(), $3)
@@ -26578,9 +26629,12 @@ impl MemoryStore for PostgresStore {
         .bind(namespace)
         .bind(standard_id)
         .bind(resolved_parent.as_deref())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("set_namespace_standard", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("set_namespace_standard commit", e))?;
         Ok(())
     }
 
@@ -26625,29 +26679,8 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("clear_namespace_standard begin", e))?;
         if !ctx.bypass_visibility {
-            let meta_exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = $1)",
-            )
-            .bind(namespace)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("clear_namespace_standard meta-exists", e))?;
-            let binding = if meta_exists {
-                let owner_row: Option<Option<String>> = sqlx::query_scalar(
-                    "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-                     JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
-                )
-                .bind(namespace)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?;
-                match owner_row {
-                    Some(owner) => crate::store::NamespaceStandardBinding::Resolved(owner),
-                    None => crate::store::NamespaceStandardBinding::Unresolvable,
-                }
-            } else {
-                crate::store::NamespaceStandardBinding::NoMetaRow
-            };
+            // #3758 — the ONE postgres binding reader, shared with the SET gate.
+            let binding = pg_namespace_standard_binding(&mut tx, namespace).await?;
             crate::store::authorize_clear_namespace_standard(ctx, namespace, &binding)?;
         }
         let rows_affected = sqlx::query("DELETE FROM namespace_meta WHERE namespace = $1")

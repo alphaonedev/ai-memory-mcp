@@ -2070,13 +2070,29 @@ impl MemoryStore for SqliteStore {
 
     async fn set_namespace_standard(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         namespace: &str,
         standard_id: &str,
         parent: Option<&str>,
     ) -> StoreResult<()> {
         let conn = self.state.lock().await;
-        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)
+        // #3758 — the REBIND gate: the standard CURRENTLY bound decides, through
+        // the same predicate CLEAR uses. Pre-fix this adapter discarded `ctx`
+        // and any trait-routed caller could replace another tenant's
+        // governance standard. Owner read + upsert in ONE WriteTxn (the #3237
+        // item 5 TOCTOU discipline of the CLEAR twin).
+        let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
+        if !ctx.bypass_visibility {
+            let binding = db::namespace_standard_binding(&conn, namespace).map_err(box_err)?;
+            crate::store::authorize_namespace_standard_mutation(
+                ctx,
+                namespace,
+                &binding,
+                crate::store::NamespaceStandardOp::Set,
+            )?;
+        }
+        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)?;
+        write_txn.commit().map_err(box_err)
     }
 
     async fn clear_namespace_standard(
@@ -2109,33 +2125,9 @@ impl MemoryStore for SqliteStore {
         // check and the act (TOCTOU).
         let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         if !ctx.bypass_visibility {
-            let meta_exists: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = ?1)",
-                    rusqlite::params![namespace],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map_err(box_err)?
-                != 0;
-            let binding = if meta_exists {
-                let owner_row: Option<Option<String>> = conn
-                    .query_row(
-                        "SELECT CAST(json_extract(m.metadata, '$.agent_id') AS TEXT) \
-                         FROM namespace_meta nm \
-                         JOIN memories m ON m.id = nm.standard_id \
-                         WHERE nm.namespace = ?1",
-                        rusqlite::params![namespace],
-                        |r| r.get::<_, Option<String>>(0),
-                    )
-                    .optional()
-                    .map_err(box_err)?;
-                match owner_row {
-                    Some(owner) => crate::store::NamespaceStandardBinding::Resolved(owner),
-                    None => crate::store::NamespaceStandardBinding::Unresolvable,
-                }
-            } else {
-                crate::store::NamespaceStandardBinding::NoMetaRow
-            };
+            // #3758 — the read is the ONE sqlite binding reader, shared with
+            // the SET gate above and the MCP funnel.
+            let binding = db::namespace_standard_binding(&conn, namespace).map_err(box_err)?;
             crate::store::authorize_clear_namespace_standard(ctx, namespace, &binding)?;
         }
         let cleared = db::clear_namespace_standard(&conn, namespace).map_err(box_err)?;

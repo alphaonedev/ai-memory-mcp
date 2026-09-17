@@ -1812,3 +1812,129 @@ mod sql_param_style_3507_tests {
         assert_eq!(SqlParamStyle::Postgres.text_param(3), "$3::text");
     }
 }
+
+// ---------------------------------------------------------------------------
+// #3176 / #3758 — the namespace-standard mutation gate (SET and CLEAR)
+// ---------------------------------------------------------------------------
+
+/// #3176 — a namespace's three-state standard BINDING, as read by ONE reader
+/// per backend (`storage::namespace_standard_binding` on sqlite, the
+/// in-transaction read in `PostgresStore`) and judged by ONE predicate
+/// ([`namespace_standard_mutation_admission`]).
+///
+/// Keeping row-presence and owner-nullness SEPARABLE is load-bearing
+/// (#2704-F2): collapsing them makes an UNOWNED standard look UNRESOLVABLE
+/// and refuses a clear that must be allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceStandardBinding {
+    /// No `namespace_meta` row for this namespace at all. There is no
+    /// governance binding to disarm, so the DELETE is a no-op and the gate
+    /// does not apply on either backend.
+    NoMetaRow,
+    /// A `namespace_meta` row exists AND its `standard_id` resolves to a live
+    /// memory. The payload is that memory's `metadata.agent_id`; `None` means
+    /// the key is absent or SQL-NULL (an UNOWNED standard).
+    Resolved(Option<String>),
+    /// A `namespace_meta` row exists but its `standard_id` is SEVERED (NULL,
+    /// #2503) or DANGLING (points at no surviving row) — the bound standard
+    /// is unresolvable.
+    Unresolvable,
+}
+
+/// #3758 — which namespace-standard mutation the shared gate is deciding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceStandardOp {
+    /// `set_namespace_standard`: REPLACE (or first-bind) the namespace's
+    /// standard.
+    Set,
+    /// `clear_namespace_standard`: DELETE the binding.
+    Clear,
+}
+
+impl NamespaceStandardOp {
+    /// The audit / `PermissionDenied.action` tag.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Set => crate::OP_SET_NAMESPACE_STANDARD,
+            Self::Clear => crate::OP_CLEAR_NAMESPACE_STANDARD,
+        }
+    }
+}
+
+/// Why [`namespace_standard_mutation_admission`] refused. The rendering (the
+/// SSOT reason strings, the HTTP shape) belongs to the funnel, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceStandardRefusal {
+    /// The standard currently bound is owned by a different named principal.
+    NotOwner,
+    /// CLEAR on a severed / dangling binding (#2545, fail-closed).
+    Unresolvable,
+}
+
+/// #3176 / #3758 — the ONE authorization decision for mutating a namespace's
+/// standard binding, SET and CLEAR alike, on both adapters and on the MCP /
+/// HTTP funnels that hold the sqlite connection directly.
+///
+/// Clearing a namespace's standard REVERTS the namespace to permissive
+/// allow-on-silence; REPLACING it rewrites the governance policy gating every
+/// delete/write/promote into that namespace with a policy of the caller's
+/// choosing (#3758 — the SET funnels used to authorize only the memory being
+/// bound, never the standard CURRENTLY bound, so any caller could overwrite
+/// another tenant's policy while being refused to clear it). Both are gated on
+/// the owner of the standard currently bound (#1777).
+///
+/// * `bypass` contexts (admin/operator surfaces, the daemon principal) skip
+///   the gate, the same exemption the SAL scope=private read filter takes.
+/// * An UNOWNED standard (`agent_id` absent, empty, or the `system`
+///   sentinel) is the documented unowned-PASS: a legacy / federated /
+///   pre-#929 standard stays mutable by its namespace's operators.
+/// * An UNRESOLVABLE binding (severed / dangling pointer, #2503) is refused
+///   for CLEAR (fail-closed, #2545 — nothing verifiable owns it) and ALLOWED
+///   for SET: re-pointing is the documented REPAIR path the clear refusal
+///   itself names ("re-point the standard with
+///   `memory_namespace_set_standard` first, then clear"), and a severed
+///   pointer has no owner to disclose or protect.
+///
+/// The refusal names NEITHER the caller NOR the owner (#3407 / #3426): the
+/// owner goes to the authz trace HERE, once, and the reason rendered to the
+/// caller is the bare SSOT const.
+///
+/// # Errors
+///
+/// [`NamespaceStandardRefusal`].
+pub fn namespace_standard_mutation_admission(
+    caller: &str,
+    bypass: bool,
+    namespace: &str,
+    binding: &NamespaceStandardBinding,
+    op: NamespaceStandardOp,
+) -> Result<(), NamespaceStandardRefusal> {
+    if bypass {
+        return Ok(());
+    }
+    match binding {
+        // Nothing bound → nothing to disarm or replace.
+        NamespaceStandardBinding::NoMetaRow => Ok(()),
+        // Row exists with a NAMED owner that is not the caller → refuse.
+        NamespaceStandardBinding::Resolved(Some(owner))
+            if !owner.is_empty()
+                && owner != crate::identity::sentinels::SYSTEM_PRINCIPAL
+                && owner != caller =>
+        {
+            tracing::warn!(
+                target: crate::handlers::AUTHZ_TRACE_TARGET,
+                "namespace-standard owner-gate refusal: {} on {namespace}: caller {caller} != owner {owner}",
+                op.label()
+            );
+            Err(NamespaceStandardRefusal::NotOwner)
+        }
+        // Caller owns it, or it is unowned (absent / empty / `system`) → ALLOW.
+        NamespaceStandardBinding::Resolved(_) => Ok(()),
+        // Severed or dangling: SET is the repair path; CLEAR fails closed (#2545).
+        NamespaceStandardBinding::Unresolvable => match op {
+            NamespaceStandardOp::Set => Ok(()),
+            NamespaceStandardOp::Clear => Err(NamespaceStandardRefusal::Unresolvable),
+        },
+    }
+}
