@@ -23229,8 +23229,13 @@ fn evaluate_level(
             // 'owner' for store operations"; "`memory_owner` … (delete/promote
             // paths). Pass `None` for store operations"), so this restores the
             // documented behaviour AND takes the fail-closed direction.
+            // #3638 — a REFLECT is a store-class write INTO the namespace
+            // (no memory_id, no memory owner): the namespace standard's
+            // owner is the authority, exactly as for `Store`. Pre-#3638 the
+            // arm fell to `memory_owner` (always `None` here), so an
+            // owner-level standard refused EVERYONE — its own owner included.
             let owner = match action {
-                GovernedAction::Store => namespace_owner,
+                GovernedAction::Store | GovernedAction::Reflect => namespace_owner,
                 _ => memory_owner,
             };
             match owner {

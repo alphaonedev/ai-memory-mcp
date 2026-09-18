@@ -13,6 +13,13 @@ use crate::models::{GovernedAction, Tier};
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// The governed action name a reflect write reports on the wire (the
+/// `action` field of a pending envelope, the `<action> denied by …` refusal).
+const REFLECT_ACTION: &str = "reflect";
+/// #3638 — the operator-log site name for a failed write-admission consult
+/// (the `mcp_foreign_err` funnel names the site ONCE per file).
+const REFLECT_ADMISSION_SITE: &str = "reflect_admission";
+
 /// v0.7.0 recursive-learning Task 4/8 (issue #655) — handler for the
 /// `memory_reflect` MCP tool.
 ///
@@ -557,52 +564,107 @@ pub fn handle_reflect_caller(
         });
 
         if let Some(ref ns) = target_namespace {
+            // Compute proposed depth: max(source depths) + 1 — used by BOTH
+            // gates below (the #3638 write admission queues the same
+            // pending shape the L1-8 gate does).
+            let max_src_depth = input
+                .source_ids
+                .iter()
+                .filter_map(|id| db::get(conn, id).ok().flatten())
+                .map(|m| m.reflection_depth)
+                .max()
+                .unwrap_or(0);
+            #[allow(clippy::cast_sign_loss)]
+            let new_depth_u32: u32 = max_src_depth.max(0).saturating_add(1) as u32;
+            // Serialise enough of the input to reconstruct the call when
+            // the approver resolves a pending row.
+            //
+            // v0.7.x (issue #1176): `metadata` MUST be included —
+            // `execute_reflect_from_payload` (`src/storage/mod.rs`, fn
+            // `execute_reflect_from_payload`) reads `payload["metadata"]`
+            // to rebuild the `ReflectInput.metadata` field, which the
+            // substrate then merges with the canonical `agent_id` +
+            // `reflection_metadata` blob. The pre-#1176 payload omitted
+            // `metadata` entirely, so an L1-8-gated reflection bound via
+            // `metadata.entity_id` (or any other caller-supplied key)
+            // silently lost the binding on the pending → execute
+            // round-trip — sibling defect to #1172, surfaced by the Block 1
+            // QC audit.
+            let payload = json!({
+                (field_names::SOURCE_IDS): input.source_ids,
+                "title": input.title,
+                "content": input.content,
+                "namespace": ns,
+                "tier": input.tier.as_str(),
+                "tags": input.tags,
+                "priority": input.priority,
+                (field_names::CONFIDENCE): input.confidence,
+                "agent_id": input.agent_id,
+                "metadata": input.metadata,
+                (field_names::PROPOSED_DEPTH): new_depth_u32,
+            });
+
+            // ─── #3638: write admission BEFORE any policy-derived limit ──
+            // A reflection is a WRITE into `ns`, and the caller must be
+            // admitted to write there — the same `policy.core.write` gate
+            // every `memory_store` crosses (`db::enforce_governance`,
+            // `GovernedAction::Reflect`) — BEFORE the substrate resolves the
+            // namespace's standard (an admin-context read of a possibly
+            // PRIVATE standard) to derive the depth cap or the approval
+            // threshold. Pre-#3638 a tenant could name ANY namespace as the
+            // target and have its private policy resolved and enforced
+            // against them, so the outcome of the depth cap was a 1-bit
+            // oracle on a standard the tenant could not read. Now a tenant
+            // the standard does not admit is refused HERE, with the
+            // governance refusal every write surface renders, and never
+            // reaches the cap. `Pending` queues the same payload the L1-8
+            // gate queues, so an approved reflect replays through
+            // `execute_reflect_from_payload` unchanged.
+            match db::enforce_governance(
+                conn,
+                GovernedAction::Reflect,
+                ns,
+                &input.agent_id,
+                None,
+                None,
+                &payload,
+                None,
+            )
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(REFLECT_ADMISSION_SITE, e))?
+            {
+                crate::models::GovernanceDecision::Allow => {}
+                crate::models::GovernanceDecision::Deny(refusal) => {
+                    tracing::warn!(
+                        target: crate::storage::reflect::REFLECT_TRACE_TARGET,
+                        namespace = %ns,
+                        agent_id = %input.agent_id,
+                        "reflection refused: caller not admitted to write into the target namespace: {}",
+                        refusal.reason
+                    );
+                    return Err(crate::governance::deny_message(
+                        REFLECT_ACTION,
+                        crate::governance::DenyGate::Governance,
+                        &refusal.reason,
+                    ));
+                }
+                crate::models::GovernanceDecision::Pending(pending_id) => {
+                    crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
+                    return Ok(json!({
+                        "status": "pending",
+                        (field_names::PENDING_ID): pending_id,
+                        "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+                        "action": REFLECT_ACTION,
+                        "namespace": ns,
+                    }));
+                }
+            }
+
             // L1-8: read the approval threshold directly from the
             // namespace's governance metadata blob — avoids adding a
             // new field to the GovernancePolicy struct (which would
             // require updating every GovernancePolicy { … } literal).
             if let Some(threshold) = db::resolve_require_approval_above_depth(conn, ns) {
-                // Compute proposed depth: max(source depths) + 1.
-                let max_src_depth = input
-                    .source_ids
-                    .iter()
-                    .filter_map(|id| db::get(conn, id).ok().flatten())
-                    .map(|m| m.reflection_depth)
-                    .max()
-                    .unwrap_or(0);
-                #[allow(clippy::cast_sign_loss)]
-                let new_depth_u32: u32 = max_src_depth.max(0).saturating_add(1) as u32;
-
                 if new_depth_u32 > threshold {
-                    // Serialise enough of the input to reconstruct the
-                    // call when the approver resolves the pending row.
-                    //
-                    // v0.7.x (issue #1176): `metadata` MUST be included
-                    // — `execute_reflect_from_payload` (`src/storage/mod.rs`,
-                    // fn `execute_reflect_from_payload`) reads
-                    // `payload["metadata"]` to rebuild the
-                    // `ReflectInput.metadata` field, which the
-                    // substrate then merges with the canonical
-                    // `agent_id` + `reflection_metadata` blob. The
-                    // pre-#1176 payload omitted `metadata` entirely,
-                    // so an L1-8-gated reflection bound via
-                    // `metadata.entity_id` (or any other caller-
-                    // supplied key) silently lost the binding on the
-                    // pending → execute round-trip — sibling defect
-                    // to #1172, surfaced by the Block 1 QC audit.
-                    let payload = json!({
-                        (field_names::SOURCE_IDS): input.source_ids,
-                        "title": input.title,
-                        "content": input.content,
-                        "namespace": ns,
-                        "tier": input.tier.as_str(),
-                        "tags": input.tags,
-                        "priority": input.priority,
-                        (field_names::CONFIDENCE): input.confidence,
-                        "agent_id": input.agent_id,
-                        "metadata": input.metadata,
-                        "proposed_depth": new_depth_u32,
-                    });
                     let pending_id = db::queue_pending_action(
                         conn,
                         GovernedAction::Reflect,
@@ -626,9 +688,9 @@ pub fn handle_reflect_caller(
                         "status": "pending",
                         (field_names::PENDING_ID): pending_id,
                         "reason": "governance requires approval for reflections above depth threshold",
-                        "action": "reflect",
+                        "action": REFLECT_ACTION,
                         "namespace": ns,
-                        "proposed_depth": new_depth_u32,
+                        (field_names::PROPOSED_DEPTH): new_depth_u32,
                     }));
                 }
             }
@@ -1948,5 +2010,128 @@ mod tests {
             "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded"
         );
         assert!(wire.starts_with("REFLECTION_DEPTH_EXCEEDED"));
+    }
+
+    /// #3638 — a reflection is a WRITE into the target namespace, and the
+    /// caller is admitted by the namespace standard's `write` level BEFORE
+    /// the substrate resolves that standard (an admin-context read of a
+    /// possibly PRIVATE row) to derive the depth cap. A tenant the standard
+    /// does not admit gets the governance refusal every write surface
+    /// renders — never `REFLECTION_DEPTH_EXCEEDED`, and no
+    /// `reflection.depth_exceeded` audit row is minted for the attempt — so
+    /// the cap's outcome is no longer a 1-bit oracle on a policy the tenant
+    /// cannot read. Allowed-path controls: the OWNER the standard admits
+    /// reflects into it, and a tenant reflecting into an ungoverned namespace
+    /// is byte-identical to before.
+    #[test]
+    fn write_admission_precedes_the_private_depth_cap_3638() {
+        let _agent_id_env = crate::identity::agent_id_env_test_lock();
+        let _mode = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let (conn, tmp) = fresh_db();
+        let attacker = "ai:attacker-3638";
+        let victim = "ai:victim-3638";
+        let src = seed_observation(&conn, "attacker-3638/sources", "readable source");
+        // The victim's PRIVATE standard: owner-only writes, a cap of 0 so the
+        // pre-#3638 path would have refused the tenant on the cap.
+        let std_id = seed_observation(&conn, "victim-3638/standards", "private standard");
+        let std_meta = json!({
+            "agent_id": victim,
+            "scope": "private",
+            "governance": {"write": "owner", "max_reflection_depth": 0},
+        });
+        conn.execute(
+            "UPDATE memories SET metadata = json(?1) WHERE id = ?2",
+            rusqlite::params![std_meta.to_string(), &std_id],
+        )
+        .unwrap();
+        db::set_namespace_standard(&conn, "victim-3638/private", &std_id, None).unwrap();
+        let audit_rows = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = 'reflection.depth_exceeded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        let before = audit_rows(&conn);
+        // The tenant names the victim's namespace as the target.
+        let err = handle_reflect(
+            &conn,
+            tmp.path(),
+            &json!({
+                "source_ids": [src.clone()],
+                "title": "probe",
+                "content": "probe",
+                "namespace": "victim-3638/private",
+                "agent_id": attacker,
+            }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("#3638: a tenant the standard does not admit is refused");
+        assert!(
+            err.starts_with(&crate::governance::deny_message(
+                REFLECT_ACTION,
+                crate::governance::DenyGate::Governance,
+                "",
+            )),
+            "#3638: refused at write admission, not at the cap: {err}"
+        );
+        assert!(
+            !err.contains("REFLECTION_DEPTH_EXCEEDED"),
+            "#3638: the cap's outcome must not be reachable by a tenant the standard refuses: {err}"
+        );
+        assert_eq!(
+            audit_rows(&conn),
+            before,
+            "#3638: no depth-exceeded audit row for a write that was never admitted"
+        );
+
+        // Allowed path: the owner the standard admits reaches the cap — the
+        // cap is HIS to observe (0 => depth 1 is refused there, as before).
+        let owner_err = handle_reflect(
+            &conn,
+            tmp.path(),
+            &json!({
+                "source_ids": [src.clone()],
+                "title": "owner probe",
+                "content": "owner probe",
+                "namespace": "victim-3638/private",
+                "agent_id": victim,
+            }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("cap 0 refuses depth 1 for the admitted owner");
+        assert!(
+            owner_err.starts_with("REFLECTION_DEPTH_EXCEEDED"),
+            "#3638: the admitted owner is governed by the cap: {owner_err}"
+        );
+        // Allowed path: an ungoverned target is byte-identical to before.
+        let ok = handle_reflect(
+            &conn,
+            tmp.path(),
+            &json!({
+                "source_ids": [src],
+                "title": "free",
+                "content": "free",
+                "namespace": "attacker-3638/free",
+                "agent_id": attacker,
+            }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("#3638: an ungoverned namespace still admits the tenant");
+        assert_eq!(ok["reflection_depth"].as_i64(), Some(1));
+        crate::config::clear_permissions_mode_override_for_test();
     }
 }

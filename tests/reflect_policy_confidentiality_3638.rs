@@ -115,13 +115,18 @@ async fn call(router: &axum::Router, r: Request<Body>) -> (StatusCode, Value) {
 }
 
 fn memory(owner: &str, namespace: &str, title: &str) -> Memory {
+    let id = uuid::Uuid::new_v4().to_string();
     Memory {
-        id: uuid::Uuid::new_v4().to_string(),
+        // `(title, namespace)` is the upsert key: on a PERSISTENT postgres
+        // database a second run would upsert onto the first run's row and
+        // this fresh `id` would never land ("bind standard: NotFound"), so
+        // the title carries the id.
+        title: format!("{title} {id}"),
+        id,
         tier: Tier::Long,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
         namespace: namespace.into(),
-        title: title.into(),
         content: "issue 3638 regression".into(),
         metadata: json!({"agent_id": owner, "scope": "private"}),
         ..Memory::default()
@@ -176,6 +181,107 @@ async fn exercise_private_policy_3638(
         store.get(&victim, &standard.id).await.is_ok(),
         "refusal must not mutate standard"
     );
+}
+
+/// #3638 — write admission sits IN FRONT of the admin-context policy read.
+/// A standard that admits only its owner (`write: owner`) refuses a tenant
+/// at the governance gate (403, the refusal every write surface renders)
+/// BEFORE the substrate resolves the private standard to derive the depth
+/// cap, so the cap's outcome is no longer a 1-bit oracle for a caller the
+/// standard never admitted. Allowed-path control: the owner the standard
+/// admits reflects into it and lands the row. Same cells on both backends —
+/// the gate is the backend's own `enforce_governance_action`.
+async fn exercise_write_admission_precedes_policy_read_3638(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    // The governance court only refuses under enforce mode (the
+    // `authz_named_approver_2538_pg` convention: override, never cleared —
+    // the sibling cells in this binary are mode-agnostic, and a clear racing
+    // the other backend's cell would flip its gate permissive mid-flight; a
+    // std mutex guard cannot be held across the awaits below).
+    ai_memory::config::override_active_permissions_mode_for_test(
+        ai_memory::config::PermissionsMode::Enforce,
+    );
+    let attacker = CallerContext::for_agent(ATTACKER);
+    let victim = CallerContext::for_agent(VICTIM);
+    let source = memory(ATTACKER, "attacker/sources-wa", "readable source");
+    store.store(&attacker, &source).await.expect("source");
+    let victim_source = memory(VICTIM, "victim/sources-wa", "owner source");
+    store
+        .store(&victim, &victim_source)
+        .await
+        .expect("victim source");
+    let mut standard = memory(VICTIM, "victim/standards-wa", "private owner-only standard");
+    let mut policy = ai_memory::models::GovernancePolicy::default();
+    policy.core.write = ai_memory::models::GovernanceLevel::Owner;
+    policy.core.max_reflection_depth = Some(0);
+    standard.metadata["governance"] =
+        serde_json::to_value(policy).expect("serialize complete policy");
+    store.store(&victim, &standard).await.expect("standard");
+    store
+        .set_namespace_standard(&victim, "victim/private-wa", &standard.id, None)
+        .await
+        .expect("bind standard");
+    assert!(store.get(&attacker, &standard.id).await.is_err());
+    let (router, _file) = build_router(backend, Some(Arc::clone(&store)), sqlite_path);
+
+    // The tenant names the victim's namespace: refused at write admission.
+    let (status, response) = call(&router, req("POST", "/api/v1/memory_reflect", Some(ATTACKER), Some(&json!({
+        "source_ids": [source.id], "title": "probe", "content": "probe", "namespace": "victim/private-wa"
+    })))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "#3638: {response}");
+    let error = response["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        error.starts_with("reflect denied by governance:"),
+        "#3638: the governance refusal, not the cap: {response}"
+    );
+    assert!(
+        !response.to_string().contains("REFLECTION_DEPTH_EXCEEDED"),
+        "#3638: the cap is unreachable for a caller the standard never admitted: {response}"
+    );
+    assert!(!response.to_string().contains("max_reflection_depth"));
+
+    // Allowed path: the OWNER is admitted, and is then governed by the cap
+    // (0 refuses depth 1) — the cap belongs to a caller the standard admits.
+    let (status, response) = call(&router, req("POST", "/api/v1/memory_reflect", Some(VICTIM), Some(&json!({
+        "source_ids": [victim_source.id], "title": "owner probe", "content": "owner probe", "namespace": "victim/private-wa"
+    })))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "#3638 owner reaches the cap: {response}"
+    );
+    assert_eq!(
+        response["error"], "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded",
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn issue_3638_sqlite_write_admission_precedes_policy_read() {
+    let file = NamedTempFile::new().expect("sqlite file");
+    let store = Arc::new(ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("sqlite"));
+    exercise_write_admission_precedes_policy_read_3638(
+        store,
+        StorageBackend::Sqlite,
+        Some(file.path()),
+    )
+    .await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn issue_3638_postgres_write_admission_precedes_policy_read() {
+    let url =
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("set fresh issue 3638 database URL");
+    let store = Arc::new(
+        ai_memory::store::postgres::PostgresStore::connect(&url)
+            .await
+            .expect("postgres"),
+    );
+    exercise_write_admission_precedes_policy_read_3638(store, StorageBackend::Postgres, None).await;
 }
 
 #[tokio::test]

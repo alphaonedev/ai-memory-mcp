@@ -63,6 +63,101 @@ fn err_response(e: String) -> axum::response::Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
 }
 
+/// #3638 — the postgres write-admission gate for a tenant reflect (see the
+/// call site in [`handle_reflect_http`]). Returns `Some(response)` when the
+/// reflect must NOT proceed: the governance refusal (403) or the queued
+/// approval (202). `None` means admitted — or that a source is not visible to
+/// the caller, in which case the substrate refuses at its source load before
+/// it resolves any policy, so no gate is owed here.
+#[cfg(feature = "sal")]
+async fn reflect_write_admission_pg(
+    app: &AppState,
+    caller: &crate::store::CallerContext,
+    input: &crate::storage::reflect::ReflectInput,
+) -> Option<axum::response::Response> {
+    use crate::models::GovernanceDecision;
+    let mut sources = Vec::with_capacity(input.source_ids.len());
+    for sid in &input.source_ids {
+        sources.push(app.store.get(caller, sid).await.ok()?);
+    }
+    let target_namespace = input
+        .namespace
+        .clone()
+        .or_else(|| sources.first().map(|m| m.namespace.clone()))?;
+    let max_src_depth = sources
+        .iter()
+        .map(|m| m.reflection_depth)
+        .max()
+        .unwrap_or(0);
+    #[allow(clippy::cast_sign_loss)]
+    let proposed_depth: u32 = max_src_depth.max(0).saturating_add(1) as u32;
+    // The L1-8 payload shape — what `execute_reflect_from_payload` replays.
+    let payload = json!({
+        (crate::mcp::param_names::SOURCE_IDS): input.source_ids,
+        "title": input.title,
+        "content": input.content,
+        "namespace": target_namespace,
+        "tier": input.tier.as_str(),
+        "tags": input.tags,
+        "priority": input.priority,
+        (field_names::CONFIDENCE): input.confidence,
+        "agent_id": input.agent_id,
+        "metadata": input.metadata,
+        (field_names::PROPOSED_DEPTH): proposed_depth,
+    });
+    let action = crate::models::GovernedAction::Reflect.as_str();
+    match app
+        .store
+        .enforce_governance_action(
+            crate::store::GovernedAction::Reflect,
+            &target_namespace,
+            &input.agent_id,
+            None,
+            None,
+            &payload,
+            None,
+        )
+        .await
+    {
+        Ok(GovernanceDecision::Allow) => None,
+        Ok(GovernanceDecision::Deny(refusal)) => {
+            tracing::warn!(
+                target: crate::storage::reflect::REFLECT_TRACE_TARGET,
+                namespace = %target_namespace,
+                agent_id = %input.agent_id,
+                "reflection refused: caller not admitted to write into the target namespace: {}",
+                refusal.reason
+            );
+            Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": crate::governance::deny_message(
+                        action,
+                        crate::governance::DenyGate::Governance,
+                        &refusal.reason,
+                    )})),
+                )
+                    .into_response(),
+            )
+        }
+        Ok(GovernanceDecision::Pending(pending_id)) => Some(
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "pending",
+                    (field_names::PENDING_ID): pending_id,
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+                    "action": action,
+                    "namespace": target_namespace,
+                    (field_names::STORAGE_BACKEND): "postgres",
+                })),
+            )
+                .into_response(),
+        ),
+        Err(e) => Some(crate::handlers::postgres_gate::store_err_to_response(e)),
+    }
+}
+
 /// #1552 — shared federation fanout for the reflect write path, called by both
 /// the postgres SAL branch and the sqlite branch of [`handle_reflect_http`].
 ///
@@ -403,6 +498,21 @@ pub async fn handle_reflect_http(
                 ));
             }
         }
+        // #3638 — write admission BEFORE the substrate resolves the target
+        // namespace's standard (an admin-context read of a possibly PRIVATE
+        // standard) to derive the depth cap: the same `policy.core.write`
+        // gate `POST /memories` crosses on this backend
+        // (`enforce_governance_action`, `GovernedAction::Reflect`), the
+        // postgres twin of the MCP handler's gate. A tenant the standard does
+        // not admit is refused here with the governance refusal every write
+        // surface renders (403), and never reaches the cap; `Pending` queues
+        // the L1-8 payload shape and answers 202 like the store path. The
+        // sources are read under the CALLER — when one is not visible the
+        // gate is skipped and the substrate refuses at its source load,
+        // BEFORE it resolves any policy.
+        if let Some(resp) = reflect_write_admission_pg(&app, &caller, &input).await {
+            return resp;
+        }
         let active_keypair = app.active_keypair.as_ref().as_ref();
         let outcome = match app.store.reflect(&caller, &input, active_keypair).await {
             Ok(outcome) => outcome,
@@ -462,6 +572,19 @@ pub async fn handle_reflect_http(
         authenticated_caller.as_deref(),
     );
     drop(vec_lock);
+    // #3638 — the sqlite path runs the write-admission gate inside the shared
+    // MCP handler; its refusal is the governance deny string, which on HTTP is
+    // 403 GOVERNANCE_REFUSED (the postgres branch above and every store
+    // surface), never the 400 the generic mapper renders.
+    if let Err(e) = &result
+        && e.starts_with(&crate::governance::deny_message(
+            crate::models::GovernedAction::Reflect.as_str(),
+            crate::governance::DenyGate::Governance,
+            "",
+        ))
+    {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
+    }
     // #1552 — federation fanout parity for the sqlite reflect path. Capture
     // the reflection memory + its `reflects_on` edges WHILE the db lock is
     // held; the fanout itself must run AFTER the lock drops because peers POST

@@ -421,6 +421,10 @@ pub const PARENT_NAMESPACE: &str = "parent_namespace";
 pub const PEER_ORIGIN: &str = "peer_origin";
 /// `pending_id` — wire/row field name.
 pub const PENDING_ID: &str = "pending_id";
+/// #3638 — the L1-8 reflect pending payload's proposed depth
+/// (`max(source depths) + 1`), written by the MCP reflect gates and the HTTP
+/// postgres write-admission gate, read back by `execute_reflect_from_payload`.
+pub const PROPOSED_DEPTH: &str = "proposed_depth";
 /// `persona_version` — wire/row field name.
 pub const PERSONA_VERSION: &str = "persona_version";
 /// `previous_valid_until` — wire/row field name.

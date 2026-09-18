@@ -32435,7 +32435,12 @@ impl MemoryStore for PostgresStore {
             }
             GovernanceLevel::Owner => {
                 let owner_to_compare = match action {
-                    super::GovernedAction::Store => ns_owner.as_deref(),
+                    // #3638 — a reflect is a store-class write INTO the
+                    // namespace; its authority is the standard's owner (the
+                    // sqlite twin, byte-identical).
+                    super::GovernedAction::Store | super::GovernedAction::Reflect => {
+                        ns_owner.as_deref()
+                    }
                     _ => memory_owner,
                 };
                 match owner_to_compare {
