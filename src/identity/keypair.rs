@@ -1534,7 +1534,7 @@ fn sync_dir(dir: &Path) {
 /// `chattr -i` checks, because a read-only or immutable key directory is the
 /// common cause and the bare errno points at the wrong file.
 #[cfg(unix)]
-pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1755,7 +1755,7 @@ fn archive_public_key_at(dir: &Path, agent_id: &str, pub_bytes: &[u8], ts: i64) 
 }
 
 #[cfg(not(unix))]
-pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+pub fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
     // Non-Unix: mode bits don't apply. The file inherits the parent
     // directory ACL. (Linux and macOS, the supported platforms, take the
     // unix path above; this branch is a defensive fallback only.)
