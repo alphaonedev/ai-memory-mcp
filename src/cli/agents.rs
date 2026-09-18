@@ -13,6 +13,15 @@ use anyhow::{Context as _, Result};
 use clap::{Args, Subcommand};
 use std::path::Path;
 
+/// #3781 — the non-argv channel for the `bind-api-key` token (the #1927 /
+/// `AI_MEMORY_STORE_URL_FILE` class). A token on `--token` argv is world-readable
+/// via `/proc/<pid>/cmdline` and `ps auxww`, so it is REFUSED; the token is read
+/// from a `0600` file named by `--token-file` or this owner-only env var.
+const AGENT_API_KEY_FILE_ENV: &str = "AI_MEMORY_AGENT_API_KEY_FILE";
+/// Escape hatch for the strict-permission check on the api-key token file
+/// (mirrors `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS`).
+const AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV: &str = "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS";
+
 #[derive(Args)]
 pub struct AgentsArgs {
     #[command(subcommand)]
@@ -124,10 +133,17 @@ pub enum AgentsAction {
         /// Agent identifier the presenting caller is bound to.
         #[arg(long)]
         agent_id: String,
-        /// The per-agent api-key token. Callers present it as the `X-API-Key`
-        /// header; only its SHA-256 digest is stored.
+        /// #3781 — a token on argv is REFUSED (world-readable via
+        /// `/proc/<pid>/cmdline`). Kept only so the refusal can name the flag;
+        /// supply the token via `--token-file` or `AI_MEMORY_AGENT_API_KEY_FILE`.
         #[arg(long)]
-        token: String,
+        token: Option<String>,
+        /// Path to a `0600` file whose sole contents are the per-agent api-key
+        /// token (#3781). The hygienic channel: unlike `--token`, a file path is
+        /// not the secret and never lands in `/proc/<pid>/cmdline`. Equivalent to
+        /// the `AI_MEMORY_AGENT_API_KEY_FILE` env var (the flag wins when both set).
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
         /// v1.0.0 #3418 — the data tier this enrollment is written to.
         ///
         /// Before #3418 the ONLY way to reach a postgres tier from this verb
@@ -263,6 +279,96 @@ pub enum PendingAction {
 /// answer #3418 exists to remove — the operator would believe the certified
 /// tier had the key, and the `enforce` posture there would stay unreachable
 /// for a reason nothing in the output mentions.
+/// #3781 — resolve the `bind-api-key` token from a non-argv channel, REFUSING a
+/// token supplied on argv (`--token`).
+///
+/// Resolution order (first hit wins): `--token-file <path>` > the
+/// [`AGENT_API_KEY_FILE_ENV`] file > REFUSE `--token` > error when none is given.
+///
+/// # Errors
+///
+/// - a token was supplied on argv (`--token`) — refused, naming the file forms;
+/// - no token channel was supplied;
+/// - the file cannot be read or (unix) has group/world-accessible permissions
+///   without the lax-perms opt-out ([`read_api_key_token_file`]).
+pub(crate) fn resolve_bind_api_key_token(
+    argv_token: Option<&str>,
+    token_file: Option<&Path>,
+) -> Result<String> {
+    // #3781 (rules o+s): refuse an argv `--token` as the VERY FIRST act, before
+    // any file channel is consulted. A caller who passed BOTH `--token` and a
+    // file channel has ALREADY leaked the token through /proc/<pid>/cmdline and
+    // `ps auxww`; honouring the file channel silently would accept that leak
+    // without a word of refusal. Unconditional on the presence of the argv token.
+    if argv_token.is_some() {
+        anyhow::bail!(
+            "bind-api-key: a token on `--token` (argv) is REFUSED — it is world-readable \
+             via /proc/<pid>/cmdline and `ps auxww`. Supply it via `--token-file <0600 path>` \
+             or the owner-only `{AGENT_API_KEY_FILE_ENV}` environment variable (#3781)."
+        );
+    }
+    if let Some(path) = token_file {
+        return read_api_key_token_file(path);
+    }
+    if let Some(env_path) = std::env::var_os(AGENT_API_KEY_FILE_ENV) {
+        if !env_path.is_empty() {
+            return read_api_key_token_file(Path::new(&env_path));
+        }
+    }
+    anyhow::bail!(
+        "bind-api-key: no api-key token — supply `--token-file <0600 path>` or set \
+         `{AGENT_API_KEY_FILE_ENV}` (a token on `--token` argv is refused; #3781)."
+    )
+}
+
+/// Read the api-key token from a `0600` file (the #1927 non-argv channel;
+/// mirrors [`crate::governance::capability::capability_from_file`]).
+///
+/// # Errors
+///
+/// - the file cannot be opened or read;
+/// - (unix) its mode grants group/world access and
+///   [`AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV`] is not set;
+/// - the file is empty after trimming.
+fn read_api_key_token_file(path: &Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading api-key token file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("stat api-key token file {} for permissions", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            let lax = std::env::var(AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV)
+                .map(|v| crate::security_profile::is_truthy(&v))
+                .unwrap_or(false);
+            if lax {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:o}"),
+                    "read_api_key_token_file: file is group/world-readable;                      {AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV}=1 — accepting (UNSAFE)."
+                );
+            } else {
+                anyhow::bail!(
+                    "api-key token file {} has lax permissions (mode {:o}, group/world bits set);                      tighten with `chmod 0600 {}` OR set {}=1 to opt out",
+                    path.display(),
+                    mode,
+                    path.display(),
+                    AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV,
+                );
+            }
+        }
+    }
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("api-key token file {} is empty", path.display());
+    }
+    Ok(token)
+}
+
 fn refuse_store_url_on_sqlite_path(store_url: Option<&str>, verb: &str) -> anyhow::Result<()> {
     if store_url.is_some() {
         anyhow::bail!(
@@ -516,10 +622,12 @@ pub fn run_agents(
         AgentsAction::BindApiKey {
             agent_id,
             token,
+            token_file,
             store_url,
         } => {
             refuse_store_url_on_sqlite_path(store_url.as_deref(), "bind-api-key")?;
             validate::validate_agent_id(&agent_id)?;
+            let token = resolve_bind_api_key_token(token.as_deref(), token_file.as_deref())?;
             let trimmed = token.trim();
             if trimmed.is_empty() {
                 anyhow::bail!("api-key token must not be empty");
@@ -2740,10 +2848,20 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let token = "shared-token-3535-sqlite-arm";
+        // #3781 — a token on argv is refused; enroll via a 0600 --token-file.
+        let token_file = env.db_path.parent().unwrap().join("apikey-3535.tok");
+        std::fs::write(&token_file, token).expect("write token file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+                .expect("0600 token file");
+        }
         let bind = |agent: &str| AgentsArgs {
             action: Some(AgentsAction::BindApiKey {
                 agent_id: agent.to_string(),
-                token: token.to_string(),
+                token: None,
+                token_file: Some(token_file.clone()),
                 store_url: None,
             }),
         };

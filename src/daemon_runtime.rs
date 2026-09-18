@@ -2101,8 +2101,19 @@ pub async fn run(
                     .await?;
                     return match &a.action {
                         Some(AgentsAction::BindApiKey {
-                            agent_id, token, ..
-                        }) => cli::agents::run_bind_api_key(&store, agent_id, token, j).await,
+                            agent_id,
+                            token,
+                            token_file,
+                            ..
+                        }) => {
+                            // #3781 — refuse an argv `--token`; resolve from the
+                            // non-argv file channel before the store-backed bind.
+                            let resolved = cli::agents::resolve_bind_api_key_token(
+                                token.as_deref(),
+                                token_file.as_deref(),
+                            )?;
+                            cli::agents::run_bind_api_key(&store, agent_id, &resolved, j).await
+                        }
                         Some(AgentsAction::RevokeApiKey { agent_id, .. }) => {
                             cli::agents::run_revoke_api_key(&store, agent_id, j).await
                         }
