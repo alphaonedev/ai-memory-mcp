@@ -1549,7 +1549,15 @@ fn deliver_with_retry(
                     first_failed_at = now.clone();
                 }
                 last_failed_at = now;
+                let terminal = refusal_is_terminal(&e);
                 last_error = e;
+                // #3790 — a refusal that is a pure function of the STORED URL
+                // cannot change between attempts: dead-letter it on the first
+                // one instead of sleeping the whole ladder on a bounded
+                // dispatch worker for the same verdict three more times.
+                if terminal {
+                    break;
+                }
             }
         }
     }
@@ -1560,6 +1568,22 @@ fn deliver_with_retry(
         first_failed_at,
         last_failed_at,
     }
+}
+
+/// #3790 — is this `send` refusal TERMINAL for the retry ladder, i.e. a
+/// pure function of the stored subscription URL and the process posture
+/// that no later attempt can change?
+///
+/// Only [`dlq_reason::SSRF_REJECTED`] qualifies today: the syntactic guard
+/// (`validate_url`) reads the URL bytes and the loopback knob, nothing
+/// else. [`dlq_reason::DNS_SSRF_REJECTED`] is NOT terminal — it carries
+/// both the address-class violation (deterministic) and a resolver
+/// FAILURE under the fail-closed posture (transient), and the two share
+/// one reason token; splitting them is a guard change, not a ladder
+/// change. Every ACK / HTTP / client-build reason stays retryable.
+#[must_use]
+fn refusal_is_terminal(reason: &str) -> bool {
+    reason == dlq_reason::SSRF_REJECTED
 }
 
 /// Perform one HTTP POST with SSRF-hardened URL check + signature
