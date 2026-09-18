@@ -29,7 +29,10 @@ MODEL_ID = "glm-5.3-flash"
 OPENROUTER_MODEL_SLUG = "z-ai/glm-5.3-flash"
 
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_DAEMON_BASE_URL = "http://localhost:9077"
+#: #3782 — ``https`` even on loopback: every daemon listener serves TLS and
+#: refuses to bind a plaintext one (#3705/#3709). Trust the daemon CA via
+#: ``SWARM_CA_CERT`` (see :mod:`swarm.tls`).
+DEFAULT_DAEMON_BASE_URL = "https://localhost:9077"
 #: Default bound on concurrent per-agent assessment completions (#3346).
 DEFAULT_ASSESS_CONCURRENCY = 8
 

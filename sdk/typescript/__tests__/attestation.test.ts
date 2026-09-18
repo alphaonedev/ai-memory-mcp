@@ -310,7 +310,7 @@ describe("client.store signing", () => {
         text: async () => "{}",
       };
     }) as never;
-    const client = new AiMemoryClient({ baseUrl: "http://localhost:9077" }, fetchImpl);
+    const client = new AiMemoryClient({ baseUrl: "https://localhost:9077" }, fetchImpl);
     return { client, sent: () => body };
   }
 

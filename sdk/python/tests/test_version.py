@@ -34,7 +34,7 @@ def test_dunder_version_matches_the_literal() -> None:
 
 def test_user_agent_matches_the_literal() -> None:
     kwargs = build_httpx_kwargs(
-        base_url="http://localhost:9077",
+        base_url="https://localhost:9077",
         api_key=None,
         agent_id=None,
         timeout=1.0,

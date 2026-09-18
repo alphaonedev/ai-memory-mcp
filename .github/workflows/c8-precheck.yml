@@ -298,6 +298,36 @@ jobs:
         # scan set fails CLOSED so the gate cannot no-op to green.
         run: bash scripts/check-sdk-route-paths.sh --self-test
 
+  sdk-tls-scheme-gate:
+    # #3782 (3x7 adopter lens, workstream G on PR #3769). Since
+    # #3705/#3709 `tls_bind_guard` refuses to bind a plaintext listener,
+    # loopback included, yet both SDK quickstarts, both clients' DEFAULT
+    # base URL and 36 further occurrences under `sdk/` said
+    # `http://localhost:9077` — a scheme no daemon will answer, so every
+    # adopter's FIRST call failed. The gate is a PAIR: the ABSENCE of
+    # `http://localhost` / `http://127.0.0.1` under `sdk/`, and the
+    # PRESENCE in BOTH SDK READMEs of a CA-trust section naming the
+    # daemon-generated CA (`<key_dir>/tls/local-ca.pem`) and the client
+    # option that pins it. Scheme-only would still fail the adopter, at
+    # certificate verification instead of at connect.
+    name: SDK TLS-scheme + CA-trust gate (#3782)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run SDK TLS-scheme gate
+        run: bash scripts/check-sdk-tls-scheme.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants the #3782 defect in an SDK default, an SDK source and a
+        # README quickstart, and plants each PRESENCE failure (no
+        # section, a heading-only stub, the CA file named without the
+        # pinning option, a missing README). Near-miss controls that
+        # must PASS: the corrected https loopback URLs in both host
+        # spellings, an abstract `http://mock` host, a public http URL,
+        # and `http://localhost` OUTSIDE `sdk/`. A scanner fault and an
+        # empty sdk scan set both fail CLOSED.
+        run: bash scripts/check-sdk-tls-scheme.sh --self-test
+
   ci-job-claims-gate:
     # 3x7 claims register 3.3.3 — C-21 / C-23 / C-24 / C-31, all one
     # shape: "a control was removed and the prose was not". `ci.yml`'s

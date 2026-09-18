@@ -81,7 +81,7 @@ Example
 ...     "/home/alice/.config/ai-memory/keys/ai:alice.a2a-hub.json",
 ...     hub_id="ai-memory-wake-hub",
 ... )
->>> client = AiMemoryClient(base_url="http://localhost:9077")  # doctest: +SKIP
+>>> client = AiMemoryClient(base_url="https://localhost:9077")  # doctest: +SKIP
 >>> def catch_up(signal):  # doctest: +SKIP
 ...     print(signal.reason, client.inbox(agent_id=bundle.agent_id, unread_only=True))
 >>> WakeListener("/run/user/1000/ai-memory/wake-hub.sock", bundle, catch_up).run()  # doctest: +SKIP

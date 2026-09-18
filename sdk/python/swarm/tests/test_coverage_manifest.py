@@ -128,7 +128,7 @@ def test_reconcile_reports_daemon_only_gap() -> None:
 
 def test_config_from_env_defaults_and_parsing() -> None:
     cfg = SwarmConfig.from_env({})
-    assert cfg.base_urls == ["http://localhost:9077"]
+    assert cfg.base_urls == ["https://localhost:9077"]
     assert cfg.n_agents == 4
     cfg2 = SwarmConfig.from_env(
         {"SWARM_BASE_URLS": "http://a:9077, http://b:9077/", "SWARM_N": "8"}

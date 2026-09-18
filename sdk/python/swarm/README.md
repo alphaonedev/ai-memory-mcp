@@ -64,7 +64,7 @@ choreography.*  ── scripted A2A scenarios ───────────�
 | Variable | Meaning | Default |
 |---|---|---|
 | `OPENROUTER_API_KEY` | OpenRouter credential (**required for a live run**) | — |
-| `SWARM_BASE_URLS` | Comma-separated daemon URLs (or `SWARM_BASE_URL`) | `http://localhost:9077` |
+| `SWARM_BASE_URLS` | Comma-separated daemon URLs (or `SWARM_BASE_URL`) | `https://localhost:9077` |
 | `SWARM_N` | Number of agents | `4` |
 | `SWARM_MAX_STEPS` | Per-agent loop ceiling | `6` |
 | `SWARM_STAGGER_SECS` | Inter-launch delay (anti-thundering-herd) | `0.75` |
@@ -90,7 +90,7 @@ pip install -e ".[swarm]"   # httpx (core) + cryptography (attestation)
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
-export SWARM_BASE_URL=http://localhost:9077
+export SWARM_BASE_URL=https://localhost:9077
 export SWARM_N=8
 export SWARM_JOURNAL_DIR="$PWD/swarm-journal"
 python -m swarm     # runs the population + choreographies, prints the matrix,

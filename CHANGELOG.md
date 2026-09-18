@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3782 — SDK quickstarts pointed at a scheme the daemon never serves)
+
+- **#3782 (adopter lens, 3x7 workstream G on PR #3769; GA-blocker) — every
+  SDK example, default and test now speaks `https://` and both SDK READMEs
+  say where the daemon's CA is and how to pin it.** Since #3705/#3709 the
+  daemon has no plaintext listener at all: `src/daemon_runtime.rs`
+  `tls_bind_guard` refuses to bind one (loopback included) and
+  `resolve_tls_material` refuses the boot rather than downgrade. Both SDK
+  quickstarts, `ai_memory._common.DEFAULT_BASE_URL`,
+  `swarm.config.DEFAULT_DAEMON_BASE_URL`, the TypeScript `ClientOptions.baseUrl`
+  doc and 30-odd further occurrences across `sdk/**` still said
+  `http://localhost:9077` — 37 in total, and zero `https://localhost` anywhere
+  under `sdk/`. An adopter following either quickstart therefore failed on
+  their FIRST `store(...)`. The acceptance harness carried the identical
+  defect (#3776).
+  - **Scheme alone would not have fixed it.** A zero-config daemon serves a
+    leaf issued by the local CA it generates on first boot into
+    `<key_dir>/tls/local-ca.pem` (`src/tls_bootstrap.rs`; `<key_dir>` is
+    `$AI_MEMORY_KEY_DIR`, else `~/.config/ai-memory/keys`), which no public
+    root signs. An adopter told "use https" and nothing else fails at
+    certificate verification instead of at connect. Both READMEs gained a
+    **"Trust the daemon's CA"** section naming the file, the platform paths,
+    and the client option that pins it — `verify=<path>` in python (the stock
+    `httpx` parameter, already exposed) and the **new** `caCert` option in
+    TypeScript, which passes PEM text to undici's connector `ca` and leaves
+    verification FULL: it NAMES trust anchors (Node's `ca` replaces the
+    bundled public roots rather than adding to them, which both the README
+    and the JSDoc say out loud), and there is deliberately no "accept any
+    certificate" escape hatch. `caCert` on a platform with no
+    undici `Agent` (a browser build) is a REFUSAL, not a silently dropped
+    trust anchor.
+  - The TypeScript README's mTLS section said "ai-memory itself is HTTP-only
+    by design" and proxied to `http://127.0.0.1:9077`; the proxy's backend hop
+    is HTTPS too, so the snippet now carries
+    `proxy_ssl_trusted_certificate` + `proxy_ssl_verify on`.
+  - **New gate — `scripts/check-sdk-tls-scheme.sh` (wired into
+    `c8-precheck.yml`).** A PAIR, per rule fa41723f: the ABSENCE of
+    `http://localhost` / `http://127.0.0.1` anywhere under `sdk/`, and the
+    PRESENCE in BOTH SDK READMEs of the CA-trust section naming
+    `local-ca.pem` AND that SDK's pinning option. Scheme-only greens the
+    absence half and still leaves the adopter broken, which is why the
+    presence half is not optional. RED on the pre-fix tree (39 violations:
+    37 plaintext URLs + both missing README sections), GREEN on the fix.
+    `--self-test` plants each half of the defect and carries near-miss
+    controls that must PASS (corrected https URLs in both host spellings, an
+    abstract `http://mock` host, a public http URL, and `http://localhost`
+    OUTSIDE `sdk/`); a scanner fault and an empty `sdk/` scan set both fail
+    CLOSED (#2444 / #2713 shapes).
+  - Docs and SDK defaults only — no daemon behaviour changed. SDK suites:
+    TypeScript 120 passed / 8 skipped (was 115/8, +5 new `caCert` tests),
+    python `tests/` 119 passed / 5 skipped and `swarm/tests/` 85 passed, all
+    unchanged.
+
+
 ### Added (#3654 — per-peer federation freshness)
 
 - **#3654 (observability) — a peer that stops converging is now visible

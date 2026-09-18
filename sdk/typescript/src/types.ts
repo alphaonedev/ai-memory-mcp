@@ -563,10 +563,35 @@ export interface MetricsResponse {
 
 export interface ClientOptions {
   /**
-   * Base URL, e.g. `http://localhost:9077`. The `/api/v1/` prefix is added
+   * Base URL, e.g. `https://localhost:9077`. The `/api/v1/` prefix is added
    * by the client — pass only the scheme + host + port.
+   *
+   * The scheme is `https` even on loopback: since #3705/#3709 every daemon
+   * listener serves TLS and `tls_bind_guard` refuses to bind a plaintext
+   * one, so an `http://` base URL cannot reach a daemon at all.
    */
   baseUrl: string;
+  /**
+   * PEM-encoded CA certificate(s) to trust for the TLS handshake (#3782).
+   *
+   * A zero-config daemon serves a certificate issued by the local CA it
+   * generated on first boot into `<key_dir>/tls/local-ca.pem` — no public
+   * root signs it, so a client that does not pin it fails verification.
+   * Pass the PEM **contents** (`readFileSync(caPath, "utf8")`), not the
+   * path: this option reaches the TLS layer without the SDK importing
+   * `node:fs`, so the browser build stays dependency-free.
+   *
+   * It reaches Node's TLS `ca` option, which **REPLACES** the bundled
+   * public roots rather than adding to them — that is Node's documented
+   * behaviour, not a choice this SDK makes. To trust the daemon's CA *and*
+   * the public roots (a client that also calls out to the internet), pass
+   * `[...tls.rootCertificates, pem]`.
+   *
+   * Verification stays FULL either way — this names trust anchors, it never
+   * disables hostname or chain checking. There is deliberately no "accept
+   * any certificate" escape hatch.
+   */
+  caCert?: string | string[];
   /** Optional API key (sent as `X-API-Key` header). */
   apiKey?: string;
   /**

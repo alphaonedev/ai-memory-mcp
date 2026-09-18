@@ -22,6 +22,58 @@ pip install -e "./sdk/python[attestation]"
 Requires Python 3.10+. The `attestation` extra pulls in `cryptography`, which
 you need to **store** against a default-configured daemon — see below.
 
+## Trust the daemon's CA
+
+Every daemon listener serves **TLS** — since #3705/#3709 `tls_bind_guard`
+refuses to bind a plaintext listener, loopback included, so there is no
+`http://` endpoint to talk to. Base URLs are `https://` even for
+`localhost`.
+
+On first boot a zero-config daemon generates its own local CA and issues
+itself a server certificate from it. No public root signs that certificate,
+so a client must be handed the CA explicitly:
+
+| What | Where |
+|---|---|
+| CA certificate | `<key_dir>/tls/local-ca.pem` |
+| `<key_dir>` (Linux) | `$AI_MEMORY_KEY_DIR`, else `~/.config/ai-memory/keys` |
+| `<key_dir>` (macOS) | `$AI_MEMORY_KEY_DIR`, else `~/Library/Application Support/ai-memory/keys` |
+
+So on Linux, with no `AI_MEMORY_KEY_DIR` override, the file is
+`~/.config/ai-memory/keys/tls/local-ca.pem`.
+
+Pin it with the client's `verify=` option (the stock `httpx` parameter — it
+takes the PATH of a CA bundle). Both `AiMemoryClient` and
+`AsyncAiMemoryClient` accept it:
+
+```python
+import os
+from pathlib import Path
+
+from ai_memory import AiMemoryClient
+
+key_dir = Path(os.environ.get("AI_MEMORY_KEY_DIR") or (Path.home() / ".config/ai-memory/keys"))
+ca = key_dir / "tls" / "local-ca.pem"
+
+with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client:
+    print(client.health())
+```
+
+`verify=` **replaces** the trust store with that bundle; verification stays
+full (chain + hostname — the daemon's leaf carries `localhost`, `127.0.0.1`,
+`::1` and the machine hostname as SANs). Never pass `verify=False`: that
+turns a TLS listener into an unauthenticated one. Two ways to avoid passing
+`verify=` per client:
+
+- install `local-ca.pem` into the OS trust store
+  (`update-ca-certificates`, `security add-trusted-cert`), or point
+  `SSL_CERT_FILE` at it;
+- run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
+  a CA your hosts already trust, in which case no pinning is needed at all.
+
+If the CA file is absent, the daemon has not booted yet — it is written
+before the listener binds.
+
 ## Storing requires a signature
 
 `POST /api/v1/memories` is the network write surface
@@ -35,7 +87,8 @@ from ai_memory.attestation import AgentSigningKey
 
 key = AgentSigningKey.generate()          # or .from_file("svc.priv")
 
-with AiMemoryClient(base_url="http://localhost:9077") as client:
+# `ca` is the daemon CA path resolved in "Trust the daemon's CA" above.
+with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client:
     # One-time, admin-gated: enroll the public key for this agent.
     client.bind_agent_pubkey("svc", key)  # #3464: proves possession
 
@@ -77,7 +130,8 @@ import asyncio
 from ai_memory import AsyncAiMemoryClient
 
 async def main() -> None:
-    async with AsyncAiMemoryClient(base_url="http://localhost:9077") as client:
+    # `ca`: see "Trust the daemon's CA".
+    async with AsyncAiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client:
         resp = await client.recall(context="hello")
         for memory in resp.memories:
             print(memory.title)
@@ -113,7 +167,7 @@ server writes `metadata.agent_id` accordingly (see CLAUDE.md §Agent
 Identity).
 
 ```python
-AiMemoryClient(base_url="http://localhost:9077", agent_id="ai:claude-opus-4.7@host")
+AiMemoryClient(base_url="https://localhost:9077", verify=str(ca), agent_id="ai:claude-opus-4.7@host")
 ```
 
 ## All methods
@@ -185,7 +239,8 @@ bundle = DelegationBundle.load(
     "/home/alice/.config/ai-memory/keys/ai:alice.a2a-hub.json",
     hub_id="ai-memory-wake-hub",
 )
-client = AiMemoryClient(base_url="http://localhost:9077")
+# `ca` is the daemon CA path — see "Trust the daemon's CA".
+client = AiMemoryClient(base_url="https://localhost:9077", verify=str(ca))
 
 def catch_up(signal):
     # EXACTLY ONE inbox read per signal — never one per queued hint.

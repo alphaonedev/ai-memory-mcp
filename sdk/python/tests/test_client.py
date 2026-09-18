@@ -7,7 +7,7 @@ The suite is split in two:
 * **Offline tests** (always run) — exercise the pure-Python parts: model
   serialization, webhook HMAC, error mapping.
 * **Daemon tests** (opt-in) — run only when ``AI_MEMORY_TEST_DAEMON=1`` is
-  set and a daemon is reachable at ``http://localhost:9077``. Every daemon
+  set and a daemon is reachable at ``https://localhost:9077``. Every daemon
   test writes and deletes its own namespace to avoid polluting shared state.
 """
 
@@ -31,7 +31,7 @@ from ai_memory import (
 from ai_memory.errors import raise_for_status
 from ai_memory.models import Memory
 
-TEST_BASE_URL = os.environ.get("AI_MEMORY_TEST_BASE_URL", "http://localhost:9077")
+TEST_BASE_URL = os.environ.get("AI_MEMORY_TEST_BASE_URL", "https://localhost:9077")
 DAEMON_ENABLED = os.environ.get("AI_MEMORY_TEST_DAEMON") == "1"
 
 

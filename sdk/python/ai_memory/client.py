@@ -59,12 +59,17 @@ class AiMemoryClient:
     closed, or call :meth:`close` explicitly.
 
     Args:
-        base_url: Daemon URL, default ``http://localhost:9077``.
+        base_url: Daemon URL, default ``https://localhost:9077``. The scheme
+            is ``https`` even on loopback — the daemon serves no plaintext
+            listener (#3705/#3709).
         api_key: If provided, sent as ``X-API-Key`` on every request.
         agent_id: If provided, sent as ``X-Agent-Id`` so the server stamps
             this identity on stored memories (see CLAUDE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
-        verify: ``httpx`` ``verify`` — path to server CA bundle or bool.
+        verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
+            zero-config daemon serves a certificate from the local CA it
+            wrote to ``<key_dir>/tls/local-ca.pem`` on first boot; pass that
+            path to verify it (#3782). Never ``False``.
         cert: ``httpx`` ``cert`` — client cert for mTLS (path or
             ``(cert, key)``).
         headers: Additional headers to send on every request.

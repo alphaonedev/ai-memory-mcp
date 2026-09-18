@@ -20,7 +20,7 @@ Example
 
     from ai_memory import AiMemoryClient, require_profile, ProfileNotLoaded
 
-    with AiMemoryClient(base_url="http://localhost:9077") as c:
+    with AiMemoryClient(base_url="https://localhost:9077") as c:
         try:
             require_profile(c, "graph")
         except ProfileNotLoaded as e:
