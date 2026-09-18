@@ -384,7 +384,7 @@ pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     write_with_mode(&priv_path, &private.to_bytes(), 0o600)
         .with_context(|| format!("writing private key {}", priv_path.display()))?;
     write_with_mode(&pub_path, &keypair.public.to_bytes(), 0o644)
-        .with_context(|| format!("writing public key {}", pub_path.display()))?;
+        .with_context(|| writing_public_key_context(&pub_path))?;
     Ok(())
 }
 
@@ -403,7 +403,7 @@ pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     //           pub-write closure (line 178) — reachable on EACCES/
     //           ENOSPC; not portable to unit tests on macOS/Linux.
     write_with_mode(&pub_path, &keypair.public.to_bytes(), 0o644)
-        .with_context(|| format!("writing public key {}", pub_path.display()))?;
+        .with_context(|| writing_public_key_context(&pub_path))?;
     Ok(())
 }
 
@@ -1208,7 +1208,7 @@ fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<Ensu
             // just committed, so even a concurrent self-heal writing `.pub`
             // writes byte-identical bytes — the pair cannot tear.
             write_with_mode(&pub_path, &kp.public.to_bytes(), 0o644)
-                .with_context(|| format!("writing public key {}", pub_path.display()))?;
+                .with_context(|| writing_public_key_context(&pub_path))?;
             // COVERAGE: tracing::info! lazy-format closure — the format args are
             //           constructed lazily; the closure body runs when the INFO
             //           subscriber is enabled. Documented per L0.7 playbook §3c.
@@ -1267,6 +1267,12 @@ pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
 /// is owner-only even under the `umask 0002` this fleet runs.
 #[cfg(unix)]
 const KEY_DIR_MODE: u32 = 0o700;
+
+/// One rendering of the "writing public key" context (pm-v3.1 literal
+/// ratchet: the three write sites share it instead of repeating the text).
+fn writing_public_key_context(pub_path: &std::path::Path) -> String {
+    format!("writing public key {}", pub_path.display())
+}
 
 /// The group/other WRITE bits (#3198). A key directory carrying either of them
 /// lets a second local UID unlink and replace `<agent>.priv`/`<agent>.pub`, so
