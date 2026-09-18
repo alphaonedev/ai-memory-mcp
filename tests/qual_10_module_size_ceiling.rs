@@ -1620,6 +1620,24 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // ceiling burned a full 80-minute macOS CI job. Measured 6_714; ceiling
     // 6_780 (+66 headroom). Refactor-split into `src/llm/{…}.rs` remains the
     // tracked post-ship ARCH cleanup.
+    //
+    // 2026-09-18 (#3627 retired-alias refusal) — re-MEASURED 6_775 on
+    // ec1b61c43 (`wc -l`); ceiling 6_780 UNCHANGED, 5 headroom, same as the
+    // base. Recorded rather than moved: this row is the one the #3627 review
+    // (ai:reviewer-f2r, 2026-09-14) returned the previous cut on, so the
+    // measurement belongs on the record even though the number does not move.
+    // The removal takes the file DOWN (three alias-table arms, the
+    // default-model arm and two in-file pin rows, -12); what the issue also
+    // requires — a fail-closed refusal, because deleting the arms alone would
+    // let `AppConfig::resolve_llm`'s `backend_default_base_url` catch-all hand
+    // a retired selector the loopback Ollama URL — lives in `src/config.rs`
+    // beside the resolver mirror tables it guards
+    // (`RECOGNIZED_LLM_BACKENDS` / `is_recognized_llm_backend` /
+    // `unrecognized_llm_backend_error`, +49). Only the per-funnel wrapping
+    // that cannot live elsewhere landed here (+17), so the file nets to its
+    // base LOC and this ceiling does not rise. Submodule-over-bump, the
+    // `src/store/postgres.rs` shape, applied to a file whose refactor-split
+    // is still the tracked post-ship ARCH cleanup.
     ("src/llm.rs", 6_780),
 ];
 

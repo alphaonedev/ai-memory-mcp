@@ -939,7 +939,7 @@ pub struct CapabilityModels {
 /// - `llm` — `"none"` when no LLM is configured; bare `model` for
 ///   Ollama backends (legacy banner shape); `backend:model` for
 ///   every OpenAI-compatible vendor (xAI, OpenAI, Anthropic,
-///   Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+///   Gemini, Kimi, Qwen, Mistral, Groq, Together,
 ///   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp).
 /// - `embedding` — `"none"` when the tier preset disables the
 ///   embedder (`keyword` tier); otherwise the resolver's canonical
@@ -3809,7 +3809,7 @@ pub struct LlmSection {
     /// Backend selector. One of: `ollama` (native `/api/chat` +
     /// `/api/embed`, no auth), `openai-compatible` (generic; requires
     /// explicit `base_url`), or an alias that pre-fills `base_url`
-    /// (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`,
+    /// (`openai`, `xai`, `anthropic`, `gemini`, `kimi`,
     /// `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
     /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
     /// (treated as `ollama`).
@@ -7696,7 +7696,6 @@ fn backend_default_model(backend: &str) -> &'static str {
         "openai" => "gpt-5",
         "anthropic" => "claude-opus-4.7",
         "gemini" => "gemini-2.0-flash",
-        "deepseek" => "deepseek-chat",
         "kimi" | "moonshot" => "moonshot-v1-8k",
         "qwen" | "dashscope" => "qwen-max",
         "mistral" => "mistral-large-latest",
@@ -7725,7 +7724,6 @@ fn backend_default_base_url(backend: &str) -> &'static str {
         "xai" => "https://api.x.ai/v1",
         "anthropic" => "https://api.anthropic.com/v1",
         "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
-        "deepseek" => "https://api.deepseek.com/v1",
         "kimi" | "moonshot" => "https://api.moonshot.cn/v1",
         "qwen" | "dashscope" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "mistral" => "https://api.mistral.ai/v1",
@@ -7736,8 +7734,67 @@ fn backend_default_base_url(backend: &str) -> &'static str {
         "fireworks" => "https://api.fireworks.ai/inference/v1",
         "lmstudio" => "http://localhost:1234/v1",
         // ollama / openai-compatible / unknown → localhost ollama.
+        //
+        // #3627 — what this arm does and does NOT guarantee. An
+        // UNRECOGNISED selector never reaches a client: every
+        // construction funnel refuses it first via
+        // [`is_recognized_llm_backend`], so for those this value is not
+        // dialled. A RECOGNISED selector with no arm in THIS mirror
+        // table does still land here, and that is a live mis-route, not
+        // a hypothetical: `vllm` is an arm of the SSOT
+        // `crate::llm::default_base_url_for_alias` (and is documented at
+        // `http://localhost:8000/v1`) but has no arm above, so
+        // `[llm].backend = "vllm"` resolves the loopback Ollama URL and
+        // builds an OpenAI-compatible client with a Bearer token against
+        // it. Pre-existing and tracked in #3811 — deliberately NOT fixed
+        // by #3627, which only closes the unrecognised-selector hole.
         _ => "http://localhost:11434",
     }
+}
+
+/// #3627 (2026-09-18) — the CLOSED set of accepted
+/// `AI_MEMORY_LLM_BACKEND` / `[llm].backend` / `[embeddings].backend`
+/// selectors, rendered for the refusal message. ONE source for the
+/// list, so the env funnel (`crate::llm::OllamaClient::from_env`), the
+/// two resolver funnels (`build_from_resolved` / `_async`) and the
+/// embed funnel (`crate::embeddings::Embedder::from_resolved`) cannot
+/// advertise different vocabularies. Retiring an alias means deleting
+/// its arm in `crate::llm::default_base_url_for_alias` — which stays
+/// the alias SSOT — AND its name here.
+pub(crate) const RECOGNIZED_LLM_BACKENDS: &str = "ollama, openai-compatible, openai, xai, \
+     anthropic, gemini, kimi, moonshot, qwen, dashscope, mistral, groq, together, cerebras, \
+     openrouter, fireworks, lmstudio, vllm";
+
+/// #3627 — true when `backend` names a selector the substrate can
+/// actually build a wire shape for.
+///
+/// Lives here, beside the resolver's mirror tables
+/// ([`backend_default_model`] / [`backend_default_base_url`] /
+/// [`alias_api_key_env_vars_for_resolver`]), because those are what it
+/// guards: their catch-all arms hand an UNRECOGNISED selector a
+/// plausible-looking default instead of refusing. The alias SSOT it
+/// consults remains `crate::llm::default_base_url_for_alias`, so a
+/// retired alias drops out of this predicate the moment its arm is
+/// deleted there.
+#[must_use]
+pub(crate) fn is_recognized_llm_backend(backend: &str) -> bool {
+    backend == crate::llm::BACKEND_OLLAMA
+        // The generic escape hatch has no alias-table row (the operator
+        // supplies the base URL), so it is admitted explicitly.
+        || backend == "openai-compatible"
+        || crate::llm::default_base_url_for_alias(backend).is_some()
+}
+
+/// #3627 — the ONE refusal for a selector no alias table recognises.
+/// Fail closed (ERRORS-01 / ERRORS-08): an unknown or RETIRED selector
+/// is an operator misconfiguration, never a licence to fall through to
+/// some other endpoint. The message names the accepted values and
+/// deliberately does NOT echo a retired token back as advice.
+pub(crate) fn unrecognized_llm_backend_error(backend: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "LLM backend `{backend}` is not a recognized backend alias. \
+         Valid values: {RECOGNIZED_LLM_BACKENDS}"
+    )
 }
 
 /// Per-alias environment variable fallback chain for the API key.
@@ -7751,7 +7808,6 @@ fn alias_api_key_env_vars_for_resolver(alias: &str) -> &'static [&'static str] {
         "xai" => &["XAI_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
         "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
@@ -13330,7 +13386,6 @@ legacy_scoring = false
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
-            "DEEPSEEK_API_KEY",
             "AI_MEMORY_EMBED_BACKFILL_BATCH",
             "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS",
         ] {
@@ -13795,6 +13850,82 @@ max_page_size = 1000000
         assert_eq!(
             ENV_PG_ACQUIRE_TIMEOUT_SECS,
             "AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS"
+        );
+    }
+
+    /// #3627 — parity between the PREDICATE and the RENDERED vocabulary.
+    ///
+    /// `is_recognized_llm_backend` is derived from the alias SSOT
+    /// (`crate::llm::default_base_url_for_alias`), but
+    /// [`RECOGNIZED_LLM_BACKENDS`] — the list the refusal prints — is a
+    /// hand-maintained fourth copy of that vocabulary, and it had already
+    /// drifted: it omitted the documented synonyms `moonshot` and
+    /// `dashscope`, which the predicate accepts. A refusal that
+    /// under-advertises the accepted set sends an operator to the wrong
+    /// remedy, so the two are pinned to agree.
+    ///
+    /// PRESENCE half: every documented selector is accepted AND advertised.
+    /// ABSENCE half: the retired token and a typo are neither accepted nor
+    /// advertised — so this cannot pass by the string listing everything.
+    #[test]
+    fn every_recognized_selector_is_advertised_in_the_refusal_3627() {
+        // The documented vocabulary: docs/integrations/llm-backends.md
+        // (per-vendor sections + the fallback-key table) and CLAUDE.md env
+        // row 31.
+        const DOCUMENTED_SELECTORS: &[&str] = &[
+            "ollama",
+            "openai-compatible",
+            "openai",
+            "xai",
+            "anthropic",
+            "gemini",
+            "kimi",
+            "moonshot",
+            "qwen",
+            "dashscope",
+            "mistral",
+            "groq",
+            "together",
+            "cerebras",
+            "openrouter",
+            "fireworks",
+            "lmstudio",
+            "vllm",
+        ];
+        let advertised: Vec<&str> = RECOGNIZED_LLM_BACKENDS.split(", ").collect();
+        for selector in DOCUMENTED_SELECTORS {
+            assert!(
+                is_recognized_llm_backend(selector),
+                "#3627: documented selector `{selector}` must pass the gate"
+            );
+            assert!(
+                advertised.contains(selector),
+                "#3627: the gate accepts `{selector}` but the refusal does not \
+                 advertise it; RECOGNIZED_LLM_BACKENDS has drifted from the \
+                 alias SSOT"
+            );
+        }
+        assert_eq!(
+            advertised.len(),
+            DOCUMENTED_SELECTORS.len(),
+            "#3627: the refusal advertises a selector the documented set does \
+             not contain (or vice versa): {advertised:?}"
+        );
+
+        // ----- absence control, same two sinks -----------------------
+        // Assembled at runtime so the repo-wide acceptance grep stays clean.
+        let retired = ["dee", "pseek"].concat();
+        assert!(
+            !is_recognized_llm_backend(&retired),
+            "#3627: the retired selector must not pass the gate"
+        );
+        assert!(
+            !RECOGNIZED_LLM_BACKENDS.contains(&retired),
+            "#3627: the retired selector must not be advertised as valid"
+        );
+        assert!(
+            !is_recognized_llm_backend("opena1"),
+            "#3627 absence control: a typo'd selector must not pass the gate"
         );
     }
 

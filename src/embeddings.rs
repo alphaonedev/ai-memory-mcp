@@ -1142,6 +1142,26 @@ impl Embedder {
             // Keyword tier — embeddings disabled by the tier preset.
             return Ok(None);
         };
+        // #3627 — fail closed on a RETIRED or unknown embed selector.
+        // `is_api_embed_backend` classifies EVERYTHING that is not
+        // `ollama` as an API backend, and the URL ladder in
+        // `resolve_embeddings` ends at the loopback Ollama default, so an
+        // unrecognised selector would otherwise build an
+        // OpenAI-compatible embedder pointed at the wrong endpoint and
+        // return vectors from a model the operator never chose. Wrong
+        // vectors are wrong RANKING, i.e. wrong results — refuse instead
+        // (the #1593 degrade-loudly posture applied at construction).
+        // The accepted vocabulary is the documented one (`ollama`, the
+        // #1067 vendor aliases, or `openai-compatible` for self-hosted
+        // TEI / vLLM / llama.cpp), rendered once by
+        // `crate::config::RECOGNIZED_LLM_BACKENDS`.
+        if !crate::config::is_recognized_llm_backend(&resolved.backend) {
+            return Err(
+                crate::config::unrecognized_llm_backend_error(&resolved.backend)
+                    .context("refusing to build an embedder for an unrecognized backend (#3627)"),
+            );
+        }
+
         if crate::config::is_api_embed_backend(&resolved.backend) {
             let Some(dim) = resolved.embedding_dim else {
                 // v1.0.0 #2626 — this is also where an UNUSABLE

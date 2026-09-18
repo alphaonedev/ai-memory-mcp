@@ -11,7 +11,7 @@
 //! | Variant                    | Wire shape                                        | Auth                              | Vendors                                                                                                                                                                                                                       |
 //! |----------------------------|---------------------------------------------------|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 //! | [`LlmProvider::Ollama`]    | `POST /api/chat`, `POST /api/embed`               | none                              | Ollama (native)                                                                                                                                                                                                                |
-//! | [`LlmProvider::OpenAiCompatible`] | `POST /v1/chat/completions`, `POST /v1/embeddings` | `Authorization: Bearer <key>`  | OpenAI, xAI Grok, Anthropic (via OpenAI shim), Google Gemini (`/v1beta/openai`), DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, …  |
+//! | [`LlmProvider::OpenAiCompatible`] | `POST /v1/chat/completions`, `POST /v1/embeddings` | `Authorization: Bearer <key>`  | OpenAI, xAI Grok, Anthropic (via OpenAI shim), Google Gemini (`/v1beta/openai`), Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, …  |
 //!
 //! ## Operator configuration
 //!
@@ -19,9 +19,10 @@
 //!     - `ollama` (default; backward compat)
 //!     - `openai-compatible` — generic; requires `AI_MEMORY_LLM_BASE_URL` set explicitly
 //!     - alias values that pre-fill `AI_MEMORY_LLM_BASE_URL` for known vendors:
-//!       `xai`, `openai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`,
+//!       `xai`, `openai`, `anthropic`, `gemini`, `kimi`, `qwen`,
 //!       `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
 //!       `fireworks`, `lmstudio`, `vllm`
+//!     - any other value is REFUSED (#3627) — no silent fallback
 //! - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-backend URL.
 //! - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for OpenAI-compatible
 //!   backends. Some aliases also accept per-vendor env vars as a
@@ -29,8 +30,7 @@
 //!   if backend=`openai`, `ANTHROPIC_API_KEY` if backend=`anthropic`,
 //!   `GEMINI_API_KEY` if backend=`gemini`, etc.).
 //! - `AI_MEMORY_LLM_MODEL` — model name passed through verbatim. The
-//!   selection is vendor-specific (e.g. `grok-4` for xAI,
-//!   `deepseek-chat` for DeepSeek, `qwen-max` for Qwen).
+//!   selection is vendor-specific (e.g. `grok-4` for xAI, `qwen-max` for Qwen).
 //! - Legacy `OLLAMA_BASE_URL` is still honored when backend=ollama.
 //!
 //! # Function / tool calling (#1866, §11.5 B7-FC)
@@ -48,6 +48,7 @@
 //! Ollama returns `function.arguments` as an object, OpenAI-compatible
 //! backends as a JSON string that is re-parsed on ingest.
 
+use crate::config::{is_recognized_llm_backend, unrecognized_llm_backend_error};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Mutex;
@@ -364,7 +365,6 @@ pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
         "xai" => Some("https://api.x.ai/v1"),
         "anthropic" => Some("https://api.anthropic.com/v1"),
         "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
-        "deepseek" => Some("https://api.deepseek.com/v1"),
         "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1"),
         "qwen" | "dashscope" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
         "mistral" => Some("https://api.mistral.ai/v1"),
@@ -399,7 +399,6 @@ fn alias_api_key_env_vars(alias: &str) -> &'static [&'static str] {
         "xai" => &["XAI_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
         "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
@@ -437,9 +436,9 @@ pub enum LlmProvider {
     /// OpenAI-compatible API: `POST /v1/chat/completions`, `POST
     /// /v1/embeddings`. `Authorization: Bearer <api_key>` header.
     /// Covers xAI Grok, OpenAI, Anthropic (via OpenAI shim), Google
-    /// Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
-    /// Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp
-    /// server, and any other vendor following the spec.
+    /// Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras,
+    /// OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, and any
+    /// other vendor following the spec.
     OpenAiCompatible { api_key: String },
 }
 
@@ -992,10 +991,10 @@ impl BreakerState {
 pub struct OllamaClient {
     /// #1066 (2026-05-21) — LLM provider wire shape. `Ollama` for the
     /// historical native API path; `OpenAiCompatible` for xAI, OpenAI,
-    /// Anthropic (OpenAI shim), Google Gemini, DeepSeek, Kimi, Qwen,
-    /// Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
-    /// LMStudio, vLLM, llama.cpp server, and any other vendor that
-    /// follows the OpenAI chat-completions spec. The legacy struct
+    /// Anthropic (OpenAI shim), Google Gemini, Kimi, Qwen, Mistral,
+    /// Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM,
+    /// llama.cpp server, and any other vendor that follows the OpenAI
+    /// chat-completions spec. The legacy struct
     /// name is preserved for call-site backward compatibility; a
     /// future rename to `LlmClient` is non-breaking.
     provider: LlmProvider,
@@ -1104,17 +1103,16 @@ impl OllamaClient {
     /// Reads:
     /// - `AI_MEMORY_LLM_BACKEND` — `ollama` (default) | `openai-compatible`
     ///   | one of the per-vendor aliases (`xai`, `openai`, `anthropic`,
-    ///   `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`,
-    ///   `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`,
-    ///   `vllm`).
+    ///   `gemini`, `kimi`, `qwen`, `mistral`, `groq`, `together`,
+    ///   `cerebras`, `openrouter`, `fireworks`, `lmstudio`, `vllm`).
     /// - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-alias URL.
     /// - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for the
     ///   OpenAI-compatible path. Per-alias fallback env vars are also
     ///   consulted (`XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-    ///   `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
-    ///   `DASHSCOPE_API_KEY`, etc.).
+    ///   `GEMINI_API_KEY`, `MOONSHOT_API_KEY`, `DASHSCOPE_API_KEY`,
+    ///   etc.).
     /// - `AI_MEMORY_LLM_MODEL` — model name (`grok-4`, `gpt-5`,
-    ///   `claude-opus-4.7`, `gemini-2.0-flash`, `deepseek-chat`, etc.).
+    ///   `claude-opus-4.7`, `gemini-2.0-flash`, `qwen-max`, etc.).
     /// - Legacy `OLLAMA_BASE_URL` is still honored when backend is
     ///   `ollama` (or unset).
     ///
@@ -1142,7 +1140,6 @@ impl OllamaClient {
                 "openai" => "gpt-5".to_string(),
                 "anthropic" => "claude-opus-4.7".to_string(),
                 "gemini" => "gemini-2.0-flash".to_string(),
-                "deepseek" => "deepseek-chat".to_string(),
                 "kimi" | "moonshot" => "moonshot-v1-8k".to_string(),
                 "qwen" | "dashscope" => "qwen-max".to_string(),
                 "mistral" => "mistral-large-latest".to_string(),
@@ -1192,13 +1189,7 @@ impl OllamaClient {
             }
             alias => {
                 let Some(default_url) = default_base_url_for_alias(alias) else {
-                    return Err(anyhow!(
-                        "AI_MEMORY_LLM_BACKEND={alias} is not a recognized \
-                         backend alias. Valid values: ollama, openai-compatible, \
-                         openai, xai, anthropic, gemini, deepseek, kimi, qwen, \
-                         mistral, groq, together, cerebras, openrouter, \
-                         fireworks, lmstudio, vllm"
-                    ));
+                    return Err(unrecognized_llm_backend_error(alias));
                 };
                 let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
                     .ok()
@@ -1282,8 +1273,9 @@ impl OllamaClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP client itself fails to build, or
-    /// if the Ollama-backend reachability check fails the same way
+    /// Returns an error if the backend selector is not a recognized
+    /// alias (#3627), if the HTTP client itself fails to build, or if
+    /// the Ollama-backend reachability check fails the same way
     /// [`Self::new_with_url`] already fails.
     pub fn build_from_resolved(resolved: &crate::config::ResolvedLlm) -> Result<Option<Self>> {
         // Surface the resolved provenance for operator-facing debugging
@@ -1296,6 +1288,11 @@ impl OllamaClient {
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
+
+        // #3627 — fail closed before any wire shape is built.
+        if !is_recognized_llm_backend(&resolved.backend) {
+            return Err(unrecognized_llm_backend_error(&resolved.backend));
+        }
 
         if resolved.backend == BACKEND_OLLAMA {
             return Self::new_with_url(&resolved.base_url, &resolved.model).map(Some);
@@ -1340,9 +1337,9 @@ impl OllamaClient {
     ///
     /// # Errors
     ///
-    /// Same conditions as [`Self::build_from_resolved`]: Ollama
-    /// reachability failure, missing API key for a non-Ollama
-    /// backend, or HTTP client build failure.
+    /// Same conditions as [`Self::build_from_resolved`]: unrecognized
+    /// selector (#3627), Ollama reachability, missing API key, or
+    /// client build failure.
     pub async fn build_from_resolved_async(
         resolved: &crate::config::ResolvedLlm,
     ) -> Result<Option<Self>> {
@@ -1354,6 +1351,11 @@ impl OllamaClient {
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
+
+        // #3627 — same gate as the sync twin (daemon/MCP boot path).
+        if !is_recognized_llm_backend(&resolved.backend) {
+            return Err(unrecognized_llm_backend_error(&resolved.backend));
+        }
 
         if resolved.backend == BACKEND_OLLAMA {
             return Self::new_with_url_async(&resolved.base_url, &resolved.model)
@@ -1391,8 +1393,8 @@ impl OllamaClient {
 
     /// #1066 — Construct an OpenAI-compatible client for any vendor whose
     /// `/v1/chat/completions` endpoint follows the OpenAI spec (xAI Grok,
-    /// OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi,
-    /// Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
+    /// OpenAI, Anthropic via OpenAI shim, Google Gemini, Kimi, Qwen,
+    /// Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
     /// LMStudio, vLLM, llama.cpp server, …).
     ///
     /// # Errors
@@ -2272,7 +2274,7 @@ impl OllamaClient {
     /// through [`Self::generate`] or [`Self::generate_with_model_override`]
     /// (the chat-shape `/v1/chat/completions`-compatible path) which
     /// works across Ollama AND every OpenAI-compatible vendor (xAI
-    /// Grok, OpenAI, DeepSeek, Kimi, Qwen, etc.).
+    /// Grok, OpenAI, Kimi, Qwen, etc.).
     ///
     /// Retained as a private helper for tests that exercise the
     /// legacy code path (wire_check_sole_path_pin verifies the
@@ -3011,9 +3013,9 @@ mod tests {
     /// v0.7.0 #1067 + #1113 — per-alias default base URL pin. Walks
     /// every vendor alias the LLM client advertises and asserts
     /// `default_base_url_for_alias` returns the documented host. v0.8.0
-    /// #1709 §11.4.C added the 16th alias (`vllm`).
+    /// #1709 §11.4.C added the 16th; #3627 retired one, leaving 15.
     #[test]
-    fn default_base_url_for_alias_covers_all_16_aliases_1067() {
+    fn default_base_url_for_alias_covers_all_15_aliases_1067() {
         let cases: &[(&str, Option<&str>)] = &[
             ("openai", Some("https://api.openai.com/v1")),
             ("xai", Some("https://api.x.ai/v1")),
@@ -3022,7 +3024,6 @@ mod tests {
                 "gemini",
                 Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             ),
-            ("deepseek", Some("https://api.deepseek.com/v1")),
             ("kimi", Some("https://api.moonshot.cn/v1")),
             ("moonshot", Some("https://api.moonshot.cn/v1")),
             (
@@ -3061,7 +3062,6 @@ mod tests {
             ("xai", &["XAI_API_KEY"]),
             ("anthropic", &["ANTHROPIC_API_KEY"]),
             ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
-            ("deepseek", &["DEEPSEEK_API_KEY"]),
             ("kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
             ("moonshot", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
             ("qwen", &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]),

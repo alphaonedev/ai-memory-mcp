@@ -142,7 +142,6 @@ openai      # https://api.openai.com/v1                              · OPENAI_A
 xai         # https://api.x.ai/v1                                    · XAI_API_KEY
 anthropic   # https://api.anthropic.com/v1                           · ANTHROPIC_API_KEY
 gemini      # https://generativelanguage.googleapis.com/v1beta/openai · GEMINI_API_KEY | GOOGLE_API_KEY
-deepseek    # https://api.deepseek.com/v1                            · DEEPSEEK_API_KEY
 kimi        # https://api.moonshot.cn/v1                             · MOONSHOT_API_KEY | KIMI_API_KEY
 qwen        # https://dashscope.aliyuncs.com/compatible-mode/v1      · DASHSCOPE_API_KEY | QWEN_API_KEY
 mistral     # https://api.mistral.ai/v1                              · MISTRAL_API_KEY
@@ -158,7 +157,7 @@ lmstudio    # http://localhost:1234/v1                               · (none / 
     <li><code>AI_MEMORY_LLM_BACKEND</code> &mdash; selector (see list above)</li>
     <li><code>AI_MEMORY_LLM_BASE_URL</code> &mdash; overrides the alias default URL (use for self-hosted vLLM, llama.cpp-server, etc.)</li>
     <li><code>AI_MEMORY_LLM_API_KEY</code> &mdash; Bearer key; vendor-canonical env vars (above) are also accepted</li>
-    <li><code>AI_MEMORY_LLM_MODEL</code> &mdash; model name passed through verbatim (<code>grok-4</code>, <code>gpt-4o</code>, <code>claude-3-7-sonnet</code>, <code>deepseek-chat</code>, <code>qwen-max</code>, &hellip;)</li>
+    <li><code>AI_MEMORY_LLM_MODEL</code> &mdash; model name passed through verbatim (<code>grok-4</code>, <code>gpt-4o</code>, <code>claude-3-7-sonnet</code>, <code>qwen-max</code>, &hellip;)</li>
     <li>Legacy <code>OLLAMA_BASE_URL</code> still honored when <code>AI_MEMORY_LLM_BACKEND=ollama</code></li>
   </ul>
 

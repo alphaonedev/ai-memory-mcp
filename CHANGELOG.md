@@ -21,6 +21,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The live merge gate requires a real Fable APPROVE-MERGE signal naming
   the head SHA.
 
+### Removed
+
+- **The `deepseek` LLM provider alias is removed from the product and from
+  every current doc** ([#3627](https://github.com/alphaonedev/ai-memory-mcp/issues/3627),
+  operator directive 2026-09-11).
+
+  **What changes for you.** Any backend selector the substrate does not
+  recognise — the retired token, a typo such as `opena1`, or an arbitrary
+  label like `tei` / `litellm` that used to work as long as you also set an
+  explicit `base_url` — is now REFUSED at client construction, on
+  `AI_MEMORY_LLM_BACKEND`, `[llm].backend`, `AI_MEMORY_EMBED_BACKEND` and
+  `[embeddings].backend` alike. Previously it silently built a client
+  against `http://localhost:11434` with your Bearer token attached: the
+  chat path talked OpenAI-shaped requests to the local Ollama port, and the
+  embed path returned vectors from a model you never chose, which is wrong
+  recall ranking rather than a visible failure. Refusing is the point.
+  **Remedy:** use a recognised selector, or — for a self-hosted
+  OpenAI-compatible endpoint (TEI, LiteLLM, llama.cpp server, vLLM behind a
+  proxy) — use `openai-compatible` with an explicit `AI_MEMORY_LLM_BASE_URL`
+  / `[llm].base_url`, which is the documented escape hatch and is
+  unaffected. The accepted set is unchanged otherwise: `ollama`,
+  `openai-compatible`, `openai`, `xai`, `anthropic`, `gemini`, `kimi`
+  (`moonshot`), `qwen` (`dashscope`), `mistral`, `groq`, `together`,
+  `cerebras`, `openrouter`, `fireworks`, `lmstudio`, `vllm`.
+
+  **It degrades, it does not die.** `ai-memory serve` and `ai-memory mcp`
+  still boot on a refused selector: the LLM client resolves to `None` with a
+  `WARN` naming the backend and the reason, and LLM-powered hooks become
+  no-ops; a refused *embed* selector logs `EMBEDDER LOAD FAILED … Semantic
+  recall DEGRADED to keyword` and the daemon serves keyword recall. Your
+  stored memory text, embeddings and indices are untouched. `ai-memory
+  reembed` exits `3` (`EXIT_EMBEDDER_INIT_FAILED`) rather than re-embedding
+  with the wrong model; `ai-memory atomise` returns `atomise: LLM init
+  failed (backend=…)`. **Two surfaces stay quiet about it.** `ai-memory
+  curator` discards the error (`build_from_resolved(&resolved).ok()
+  .flatten()`), so a refused selector there yields no client and no
+  message; that pre-existing swallow now also hides this error class. And
+  **`ai-memory doctor` does NOT report the refusal**: its LLM reachability
+  probe never consults the selector gate — it builds its own client and
+  still probes the resolved URL, sending your API key as a Bearer to
+  whatever that URL points at. Both are pre-existing behaviours, not
+  introduced here, and both are tracked in
+  [#3811](https://github.com/alphaonedev/ai-memory-mcp/issues/3811).
+
+  **Model-family attestation.** The retired vendor's stem also leaves the
+  `src/identity/model_family.rs` classifier. The live consequence is not the
+  removed provider: an **Ollama-served open-weights model whose name carries
+  that stem** (e.g. `AI_MEMORY_LLM_BACKEND=ollama` with
+  `AI_MEMORY_LLM_MODEL=deepseek-r1:8b`) previously received a
+  `loader_observed` family attestation from
+  `cli/curator.rs::capture_loader_attestation` and now records as CLAIMED
+  with no family. Existing rows keep their stamped family — nothing durable
+  is rewritten — so a corpus using that model becomes mixed-attestation.
+  This is the fail-safe direction: an unattestable model reads "we do not
+  know" rather than being laundered into a family.
+
+  **Why the refusal had to be general.** Deleting the alias arms alone would
+  not have failed closed: `AppConfig::resolve_llm` is infallible and its
+  `backend_default_base_url` catch-all hands an unknown alias the loopback
+  Ollama URL, so a retired selector plus any resolvable API key would still
+  have produced a live client pointed at the wrong endpoint. A refusal
+  narrowed to the one retired token would have left that hole open for every
+  other unrecognised value — and would have had to keep the token in the
+  source to name it.
+
+  The alias tables, the per-vendor key/model maps, the model-family stem,
+  the vendor-literal gate pattern and the v1.0.0 capabilities inventory all
+  drop the row. Historical release records (earlier CHANGELOG sections,
+  `.github/release-body-v0.8.0.md`,
+  `docs/compliance/_inventory/v0.7.0-capabilities.json`), the dated review
+  records under `docs/reviews/`, and two published-research citations
+  (`docs/v0.7.0/mtp-bench-2026-05-17.md`,
+  `docs/rationale/academic-context.md`) keep the name: a record or a
+  citation is not a provider alias, and rewriting one would falsify it.
+
 ### Security (#3549 — one caller-authority resolver beneath every handler)
 
 - **#3549 (SECURITY, ga-blocker) — `identity::authority::Authority { principal,
