@@ -1,0 +1,627 @@
+branch	class	ahead	behind	last_commit	open_pr	unique_patchids_not_upstream	unique_patchids_not_upstream_or_main	in_main	unique_commits	unique_nonmerge_commits	empty_diff_commits	name_issue	name_issue_seen_upstream	tip_sha	tip_subject
+chain/next	1-MERGED-ANCESTRY	0	2	2026-09-12	0	0	0	0	0	0	0	-	-1	f0175b709	Merge #3273 docs/claims: correct false review + CI-green claims on #3240/#3235 merges (grok 42a05fb0
+docs/3064-pg-unavailable-tools	1-MERGED-ANCESTRY	0	667	2026-08-31	0	0	0	0	0	0	0	3064	1	0ab8474d8	docs(postgres): reconcile pg-unavailable tools inventory to 65/17 (#3064)
+docs/3075-pg-federation-lanes	1-MERGED-ANCESTRY	0	667	2026-08-31	0	0	0	0	0	0	0	3075	1	26532baa5	docs(#3075): postgres-receiver federation lanes are sqlite-only (v1.0.0)
+docs/3595-cert-reissue	1-MERGED-ANCESTRY	0	100	2026-09-10	0	0	0	0	0	0	0	3595	1	f740ba5bf	docs(#3595): re-issue enterprise-federation certification after #3582
+docs/fable-astra-audit-2026-09-09	1-MERGED-ANCESTRY	0	241	2026-09-09	0	0	0	0	0	0	0	2026	1	403e709e3	docs(reviews): record the v1.0.0 GA freeze line and v1.1.0 as the certification release [skip ci]
+docs/g5-drift-fixes	1-MERGED-ANCESTRY	0	645	2026-08-31	0	0	0	0	0	0	0	-	-1	21085952e	docs: fix v1.0.0 GA doc-drift — stale schema/tool counts + swarm MVG omission (g5)
+docs/passes-2-3-drift	1-MERGED-ANCESTRY	0	633	2026-08-31	0	0	0	0	0	0	0	-	-1	83dfc6a5c	docs: passes 2-3 drift fixes (DOC-4/5/6/7) — federation scope, schema v94, CHANGELOG dedup
+feat/3322-swarm-rewind	1-MERGED-ANCESTRY	0	669	2026-08-31	0	0	0	0	0	0	0	3322	1	52b07b44a	fix(#3322): satisfy doc-surface + hardcoded-literal CI gates
+feat/3323-lineage-cost-accounting	1-MERGED-ANCESTRY	0	676	2026-08-30	0	0	0	0	0	0	0	3323	1	383efbef9	feat(cost): per-lineage + per-namespace token/cost accounting (#3323)
+feat/3324-contaminated-lifecycle	1-MERGED-ANCESTRY	0	674	2026-08-30	0	0	0	0	0	0	0	3324	1	ab55252f1	feat(#3324): auto-propagate `contaminated` lifecycle along derives_from on invalidate
+feat/acceptance-nhi-sqlite	1-MERGED-ANCESTRY	0	714	2026-08-30	0	0	0	0	0	0	0	-	-1	4375a1fa3	fix(acceptance): Config-1 harness passes live — admin-header-trust + valid agent_type
+feat/glm-swarm-driver	1-MERGED-ANCESTRY	0	709	2026-08-30	0	0	0	0	0	0	0	-	-1	5c1300a51	test(swarm): add GLM-5.3-Flash acceptance-swarm driver (test-only)
+fix/2555-schema-version-guard	1-MERGED-ANCESTRY	0	690	2026-08-30	0	0	0	0	0	0	0	2555	1	189140ed3	test(#2555): coverage — boot + doctor poisoned-ledger branches
+fix/3041-provenance-equal-instant	1-MERGED-ANCESTRY	0	667	2026-08-31	0	0	0	0	0	0	0	3041	1	d6508042b	fix(storage): refuse equal-instant provenance edge that closes a cycle (#3041)
+fix/3064-pg-tool-parity	1-MERGED-ANCESTRY	0	417	2026-09-05	0	0	0	0	0	0	0	3064	1	24792d71d	docs(#3064): cite #3507 for the memory_calibrate_confidence caller gate
+fix/3071-bulk-secret-screen-order	1-MERGED-ANCESTRY	0	661	2026-08-31	0	0	0	0	0	0	0	3071	1	dd3aed143	fix(#3071): screen secrets before attestation on the /bulk path (match single-create 400 secret-scre
+fix/3075-pg-federation-lanes	1-MERGED-ANCESTRY	0	406	2026-09-05	0	0	0	0	0	0	0	3075	1	8dd9d5329	fix(#3075): gate the four federated-apply trait arms explicitly for the #3175 parity scan
+fix/3111-capability-inline-tests	1-MERGED-ANCESTRY	0	684	2026-08-30	0	0	0	0	0	0	0	3111	1	f7ae94139	fix(governance): align capability.rs inline tests to #3111 terminal-Deny
+fix/3111-terminal-operator-deny	1-MERGED-ANCESTRY	0	696	2026-08-30	0	0	0	0	0	0	0	3111	1	884bfbb03	fix(governance): make an operator/rule-derived Deny terminal — never token-flippable (#3111)
+fix/3117-cert-legA-keyless	1-MERGED-ANCESTRY	0	686	2026-08-30	0	0	0	0	0	0	0	3117	1	e92df758c	fix(ci): un-red the certified-postgres cert gate under the fleet umask (#3117)
+fix/3142-db-url-scheme-refuse	1-MERGED-ANCESTRY	0	703	2026-08-30	0	0	0	0	0	0	0	3142	1	eb10d8837	fix(daemon): refuse URL-shaped --db / AI_MEMORY_DB fail-closed (#3142)
+fix/3188-namespace-governance-parity	1-MERGED-ANCESTRY	0	678	2026-08-30	0	0	0	0	0	0	0	3188	1	d756fe460	fix(#3188): cross-backend namespace governance parity + fail-closed parent auto-detection
+fix/3191-coordination-atomicity	1-MERGED-ANCESTRY	0	696	2026-08-30	0	0	0	0	0	0	0	3191	1	faf7d3c2d	fix(#3191): coordination-plane atomicity (F-1..F-5, fail-closed, both backends)
+fix/3199-signed-backup-manifests	1-MERGED-ANCESTRY	0	33	2026-09-11	0	0	0	0	0	0	0	3199	1	4d24b24c4	test(#3199): the #3553 not-SQLite-at-all restore test gains latest/allow_unsigned_manifest
+fix/3204-hardening-batch	1-MERGED-ANCESTRY	0	21	2026-09-11	0	0	0	0	0	0	0	3204	1	efda5d4ae	test(#3204): WIP 4 — rule (e) pin flip in mtls_cert_peer_binding_2045 (wire note carries no knob)
+fix/3259-pg-promote-namespace	1-MERGED-ANCESTRY	0	667	2026-08-31	0	0	0	0	0	0	0	3259	1	09d7d11bd	fix(#3259): honor to_namespace in postgres execute_pending_action promote arm
+fix/3273-merge-message-truth	1-MERGED-ANCESTRY	0	9	2026-09-11	0	0	0	0	0	0	0	3273	1	42a05fb04	docs(#3273): correct false Fable-review + CI-green claims on #3240/#3235 merges
+fix/3279-since-until-timestamp-parity	1-MERGED-ANCESTRY	0	703	2026-08-30	0	0	0	0	0	0	0	3279	1	2ae7a7c75	fix(#3279): compare search/list/recall since/until by INSTANT on sqlite
+fix/3281-invalidate-link-hash-parity	1-MERGED-ANCESTRY	0	655	2026-08-31	0	0	0	0	0	0	0	3281	1	46ed0ca7e	fix(#3281): canonicalize invalidate_link valid_until identically on both backends for audit-leaf byt
+fix/3290-pg-sever-audit-event	1-MERGED-ANCESTRY	0	659	2026-08-31	0	0	0	0	0	0	0	3290	1	6c7b4d90c	fix(#3290): emit WARN + signed audit event on postgres namespace-standard SEVER (sqlite parity)
+fix/3297-docs-claims-truthfulness	1-MERGED-ANCESTRY	0	69	2026-09-11	0	0	0	0	0	0	0	3297	1	a32a47f3e	docs(#3297): sanitize AGE capture host/database rows
+fix/3329-macos-config-path-regressions	1-MERGED-ANCESTRY	0	628	2026-09-01	0	0	0	0	0	0	0	3329	1	810675545	fix: silence config advisories for quiet boot (#3329)
+fix/3332-stats-envelope-parity	1-MERGED-ANCESTRY	0	605	2026-09-01	0	0	0	0	0	0	0	3332	1	e995a710a	fix(stats): normalize postgres count lists (#3332)
+fix/3341a-pg-get-links	1-MERGED-ANCESTRY	0	562	2026-09-02	0	0	0	0	0	0	0	-	-1	417244e42	test(perf): hoist Once out of build_pg_router (#3341a)
+fix/3343-stats-namespaces-pagination	1-MERGED-ANCESTRY	0	562	2026-09-02	0	0	0	0	0	0	0	3343	1	3111c2933	fix(perf): stats others.namespace_count (hardcoded-literal gate)
+fix/3344-embed-skip-undecryptable	1-MERGED-ANCESTRY	0	555	2026-09-03	0	0	0	0	0	0	0	3344	1	7c729d1a1	fix: v96 embed_skip memories triggers are ladder-owned, not SCHEMA (#3344)
+fix/3345-curator-report-bloat	1-MERGED-ANCESTRY	0	424	2026-09-05	0	0	0	0	0	0	0	3345	1	b0547b36d	fix(curator): route the pg daily-rollup write through the signed revision ledger (#3345 amendment)
+fix/3346-assess-concurrency	1-MERGED-ANCESTRY	0	599	2026-09-02	0	0	0	0	0	0	0	3346	1	8caaae491	perf(swarm-harness): bound rubric-assessment concurrency and stream partial evidence (#3346)
+fix/3348-system-namespace-visibility	1-MERGED-ANCESTRY	0	534	2026-09-04	0	0	0	0	0	0	0	3348	1	564b1fe02	fix(http): enforce system namespace visibility parity (#3348)
+fix/3352-boot-dedupe	1-MERGED-ANCESTRY	0	552	2026-09-02	0	0	0	0	0	0	0	3352	1	f8c26450f	docs(#3352): state boot/session_start near-duplicate clustering and similar_count
+fix/3355-test-key-dir-isolation	1-MERGED-ANCESTRY	0	446	2026-09-05	0	0	0	0	0	0	0	3355	1	6bf73e47d	fix(identity): preserve enrolled public-only keys during pruning (#3355)
+fix/3356-inbox-isolation-fail-closed	1-MERGED-ANCESTRY	0	561	2026-09-02	0	0	0	0	0	0	0	3356	1	046e0d584	test(identity): remove superseded #3356 lock helper
+fix/3357-skill-export-jail	1-MERGED-ANCESTRY	0	552	2026-09-03	0	0	0	0	0	0	0	3357	1	65251c6a2	docs(ssot): record AI_MEMORY_SKILLS_EXPORT_ROOT in the CLAUDE.md env-var census (#3357)
+fix/3358-notify-quota-accounting	1-MERGED-ANCESTRY	0	535	2026-09-03	0	0	0	0	0	0	0	3358	1	84edeab1e	fix: account notify writes against sender quota
+fix/3359-routine-run-guard-quota	1-MERGED-ANCESTRY	0	447	2026-09-05	0	0	0	0	0	0	0	3359	1	c12250c8a	fix: guard and quota routine materialisation (#3359)
+fix/3360-action-transition-lease-binding	1-MERGED-ANCESTRY	0	553	2026-09-02	0	0	0	0	0	0	0	3360	1	811fb63c0	fix(coordination): make the action-transition lease binding structural, not opt-in (#3360)
+fix/3361-lease-holder-principal	1-MERGED-ANCESTRY	0	578	2026-09-02	0	0	0	0	0	0	0	3361	1	e31bec71e	fix(mcp): bind the coordination lease holder to the resolved caller principal (#3361)
+fix/3362-reserved-namespaces	1-MERGED-ANCESTRY	0	553	2026-09-02	0	0	0	0	0	0	0	3362	1	c5ee0eb63	fix: reserve system namespaces from caller writes
+fix/3363-principal-binding	1-MERGED-ANCESTRY	0	603	2026-09-01	0	0	0	0	0	0	0	3363	1	ee883f692	fix(mcp): bind the caller principal on the 8 caller-asserted agent_id tools (#3363)
+fix/3364-signal-ack-authz	1-MERGED-ANCESTRY	0	601	2026-09-02	0	0	0	0	0	0	0	3364	1	43ed620aa	fix(coordination): restrict memory_signal_ack to the addressee and record the resolved caller (#3364
+fix/3366-rfc3339-since-until-v2	1-MERGED-ANCESTRY	0	451	2026-09-04	0	0	0	0	0	0	0	3366	1	0f3422422	fix: enforce timestamp bounds on HTTP search (#3366)
+fix/3374-param-numeric	1-MERGED-ANCESTRY	0	577	2026-09-02	0	0	0	0	0	0	0	3374	1	53b094456	fix(mcp): refuse numeric and boolean parameter shapes that contradict the schema (#3374)
+fix/3378-tools-list-capabilities-pointer	1-MERGED-ANCESTRY	0	175	2026-09-09	0	0	0	0	0	0	0	3378	1	65e2c2f64	fix(mcp): keep capabilities gist plus verbose pointer (#3378)
+fix/3378-tools-list-compact-description	1-MERGED-ANCESTRY	0	185	2026-09-09	0	0	0	0	0	0	0	3378	1	9b1b07bdc	fix(mcp): extend compact_description past dangling 32-byte cuts (#3378)
+fix/3378-tools-list-enum-wire	1-MERGED-ANCESTRY	0	179	2026-09-09	0	0	0	0	0	0	0	3378	1	eea3d0035	fix(mcp): advertise closed tools/list enums and strip trailing compact punct (#3378)
+fix/3380-tests-followup	1-MERGED-ANCESTRY	0	208	2026-09-09	0	0	0	0	0	0	0	3380	1	af08493f5	test(consolidate): align provenance fixtures with source admission (#3380)
+fix/3381-auto-tag-owner-gate-v2	1-MERGED-ANCESTRY	0	241	2026-09-09	0	0	0	0	0	0	0	3381	1	41acc0639	test(auto-tag): isolate caller seam regressions under #3523
+fix/3382-archive-read-owner-scope-v2	1-MERGED-ANCESTRY	0	243	2026-09-09	0	0	0	0	0	0	0	3382	1	92e90cc19	fix(archive): enforce caller visibility and restore ownership (#3382)
+fix/3383-archive-purge-admin-gate-v2	1-MERGED-ANCESTRY	0	243	2026-09-09	0	0	0	0	0	0	0	3383	1	68f67b344	fix(archive): check MCP admin purge and scope caller GC (#3383)
+fix/3384-bounded-duration-arithmetic	1-MERGED-ANCESTRY	0	552	2026-09-03	0	0	0	0	0	0	0	3384	1	e683ebee0	fix: preserve calibration zero-window contract
+fix/3385-archive-on-gc-v2-key	1-MERGED-ANCESTRY	0	425	2026-09-05	0	0	0	0	0	0	0	3385	1	385a01fd9	fix(#3385): make [storage].archive_on_gc govern GC, not just parse
+fix/3386-kg-query-visibility-f1	1-MERGED-ANCESTRY	0	239	2026-09-09	0	0	0	0	0	0	0	3386	1	1f656409e	fix(mcp): apply kg query visibility filters on both paths (#3386)
+fix/3388-pending-reject-gate	1-MERGED-ANCESTRY	0	601	2026-09-01	0	0	0	0	0	0	0	3388	1	a70c32a7c	fix(governance): require the same approver eligibility to reject a pending action as to approve one 
+fix/3394-remember-truthfulness	1-MERGED-ANCESTRY	0	173	2026-09-10	0	0	0	0	0	0	0	3394	1	5616391f4	fix(approvals): refuse remember=forever that cannot be honoured (#3394)
+fix/3397-grok	1-MERGED-ANCESTRY	0	239	2026-09-09	0	0	0	0	0	0	0	3397	1	7b25a0f28	docs(mcp): truth-fix quality-family tool docs (#3397)
+fix/3398-agents-post-gate-v2	1-MERGED-ANCESTRY	0	452	2026-09-04	0	0	0	0	0	0	0	3398	1	dfc5abfb0	fix(http): enforce attested roster identity and verify both backends (#3398)
+fix/3401-inbox-namespace-v98	1-MERGED-ANCESTRY	0	446	2026-09-04	0	0	0	0	0	0	0	3401	1	0f9777827	test(migrations): advance remaining schema tip pins to v98 (#3401)
+fix/3402-cli-store-funnel	1-MERGED-ANCESTRY	0	603	2026-09-01	0	0	0	0	0	0	0	3402	1	db6b86efd	fix(cli): route `ai-memory store` through the shared auto_atomise funnel (#3402)
+fix/3403-cli-event-dispatch	1-MERGED-ANCESTRY	0	602	2026-09-01	0	0	0	0	0	0	0	3403	1	d26dba5e1	fix(cli): dispatch subscription events from every CLI write verb (#3403)
+fix/3405-export-roundtrip	1-MERGED-ANCESTRY	0	603	2026-09-02	0	0	0	0	0	0	0	3405	1	e13daee62	fix(portability): export never emits a link to a memory it withheld; import reports dangling edges w
+fix/3406-capture-turn-attestation-posture	1-MERGED-ANCESTRY	0	243	2026-09-09	0	0	0	0	0	0	0	3406	1	6c226ee89	fix(http): enforce caller-bound capture attestation posture (#3406)
+fix/3411-3434-boot-doctor-readonly	1-MERGED-ANCESTRY	0	167	2026-09-10	0	0	0	0	0	0	0	3411	1	6b6683829	fix(cli): typed SCHEMA_BEHIND_READ_ONLY_REFUSAL on boot/doctor (#3411, #3434)
+fix/3411-3434-boot-doctor-readonly-followup	1-MERGED-ANCESTRY	0	156	2026-09-10	0	0	0	0	0	0	0	3411	1	510f0abbe	test(cli): re-pin boot --quiet missing-db to empty stdout (#3411)
+fix/3413-cli-malformed-since-until	1-MERGED-ANCESTRY	0	154	2026-09-10	0	0	0	0	0	0	0	3413	1	56116f36d	fix(cli): refuse malformed list --since/--until and recover --host/--transcript (#3413)
+fix/3414-cli-ux-exit-codes	1-MERGED-ANCESTRY	0	150	2026-09-10	0	0	0	0	0	0	0	3414	1	6786c6645	fix(cli): refuse missing archive restore; map MCP errors to CLI flags (#3414)
+fix/3416-grok	1-MERGED-ANCESTRY	0	239	2026-09-09	0	0	0	0	0	0	0	3416	1	5d4c17fb7	docs(http): truth-fix API_REFERENCE HTTP sweep (#3416)
+fix/3418-agent-key-hot-enroll	1-MERGED-ANCESTRY	0	517	2026-09-03	0	0	0	0	0	0	0	3418	1	a4272444e	fix(identity): carry the EnrolledAgentKeys fixture change onto post-base tests + document the refres
+fix/3419-attested-write-replay-guard	1-MERGED-ANCESTRY	0	563	2026-09-02	0	0	0	0	0	0	0	3419	1	e03bbbd51	fix(attest): admit a signed direct write exactly once (schema v95 replay ledger) (#3419)
+fix/3419-docs-v95-rung	1-MERGED-ANCESTRY	0	546	2026-09-02	0	0	0	0	0	0	0	3419	1	8c200e9a5	docs(schema): add the v95 attested_write_ledger rung row (#3419)
+fix/3419-record-stop-admit-gate	1-MERGED-ANCESTRY	0	535	2026-09-03	0	0	0	0	0	0	0	3419	1	4699def47	fix(record-stop): gate admit_attested_write on both backends (#3481)
+fix/3421-import-attestation-reconcile	1-MERGED-ANCESTRY	0	575	2026-09-02	0	0	0	0	0	0	0	3421	1	2da0daf0e	fix(import): never land a wire-asserted attestation POST /api/v1/import cannot verify (#3421)
+fix/3422-pg-created-at-roundtrip	1-MERGED-ANCESTRY	0	603	2026-09-02	0	0	0	0	0	0	0	3422	1	961bea1eb	fix(attestation): canonicalise the attested created_at so a write_signature re-derives on both backe
+fix/3424-pg-wire-shape-batch2-v2	1-MERGED-ANCESTRY	0	447	2026-09-04	0	0	0	0	0	0	0	3424	1	00eb1661e	fix(wire): share KG and duplicate response projections (#3424)
+fix/3428-api-reference-memory-graph	1-MERGED-ANCESTRY	0	188	2026-09-09	0	0	0	0	0	0	0	3428	1	5d7ce5d0b	docs(http): truth-fix API_REFERENCE memory/graph sweep (#3428)
+fix/3429-audit-db-path	1-MERGED-ANCESTRY	0	603	2026-09-01	0	0	0	0	0	0	0	3429	1	8c381e0da	fix(cli): audit verbs honour the resolved --db for reads and writes (#3429)
+fix/3430-seed-rules-signed-enable	1-MERGED-ANCESTRY	0	603	2026-09-02	0	0	0	0	0	0	0	3430	1	b92d9a0aa	fix(governance): install-defaults enables seed rules through the signed path (#3430)
+fix/3431-store-url-explicit	1-MERGED-ANCESTRY	0	535	2026-09-03	0	0	0	0	0	0	0	3431	1	d8a5aa59d	fix(cli): bind one store from parser explicitness, not the resolved --db path (#3431)
+fix/3432-config-migrate-redact	1-MERGED-ANCESTRY	0	551	2026-09-02	0	0	0	0	0	0	0	3432	1	0acb39931	fix(cli): derive Debug on the #3432 amendment-2 test fixture
+fix/3433-cli-notify-subscribe-agent-id	1-MERGED-ANCESTRY	0	144	2026-09-10	0	0	0	0	0	0	0	3433	1	12acfc1a3	fix(cli): honor global --agent-id on notify/subscribe/inbox (#3433)
+fix/3436-cli-stdout-hygiene	1-MERGED-ANCESTRY	0	577	2026-09-02	0	0	0	0	0	0	0	3436	1	0c219bc65	test(cli): behavioural half of the #3436 hygiene gates — drive the binary (#3436)
+fix/3440-rubric-repair	1-MERGED-ANCESTRY	0	601	2026-09-02	0	0	0	0	0	0	0	3440	1	ef5c9bac8	fix(swarm-harness): repair rubric packaging defects and derive mission progress from the call log (#
+fix/3441-module-local-choreo	1-MERGED-ANCESTRY	0	600	2026-09-02	0	0	0	0	0	0	0	3441	1	821852ba4	test(swarm-harness): make the offline module mock reject cross-tier consolidate (#3441)
+fix/3446-cid-created-at-canonical	1-MERGED-ANCESTRY	0	602	2026-09-02	0	0	0	0	0	0	0	3446	1	2ac5f6108	fix(cid): commit the created_at INSTANT, not its per-backend rendering, in the cid pre-image (#3446)
+fix/3448-reject-surfaces-gate	1-MERGED-ANCESTRY	0	546	2026-09-02	0	0	0	0	0	0	0	3448	1	28c7a60ba	fix(governance): gate the HTTP and CLI pending-reject surfaces on approver eligibility, with a SAL p
+fix/3456-import-sqlite-governance-parity	1-MERGED-ANCESTRY	0	565	2026-09-02	0	0	0	0	0	0	0	3456	1	04754f0bd	fix(import): enforce namespace governance on the sqlite import lane (#3456)
+fix/3457-cli-sync-attestation-reconcile	1-MERGED-ANCESTRY	0	565	2026-09-02	0	0	0	0	0	0	0	3457	1	efb51da1d	fix(sync): reconcile inbound attestation on the cli sync pull/merge legs (#3457)
+fix/3461-macos-watchdog	1-MERGED-ANCESTRY	0	565	2026-09-02	0	0	0	0	0	0	0	3461	1	a4c224275	ci(watchdog): make the #1492 per-invocation budget node-aware (macos-fed sqlite 2400s), declare line
+fix/3463-inbox-unread-limit	1-MERGED-ANCESTRY	0	553	2026-09-02	0	0	0	0	0	0	0	3463	1	e3f80b8a1	fix(inbox): apply unread_only inside the query, before the SQL LIMIT (#3463)
+fix/3464-pop-v97	1-MERGED-ANCESTRY	0	454	2026-09-04	0	0	0	0	0	0	0	3464	1	a6bd9ec65	fix(identity): bind public keys to established trust with schema v97 (#3464)
+fix/3465-agent-notified-push	1-MERGED-ANCESTRY	0	425	2026-09-05	0	0	0	0	0	0	0	3465	1	0485e0778	feat(notify): agent_notified write event, in-process wake bus and GET /api/v1/inbox/stream (#3465)
+fix/3467-wake-hub-core	1-MERGED-ANCESTRY	0	535	2026-09-03	0	0	0	0	0	0	0	3467	1	4ec119b27	feat(wake-hub): same-host content-free agent wake plane over a 0600 UDS (#3467)
+fix/3468-wake-hub-identity-v2	1-MERGED-ANCESTRY	0	447	2026-09-04	0	0	0	0	0	0	0	3468	1	107b314a1	fix(wake-hub): bind scoped delegations to v97 identity (#3468)
+fix/3469-wake-hub-bus-sink	1-MERGED-ANCESTRY	0	408	2026-09-05	0	0	0	0	0	0	0	3469	1	c524fc963	fix(#3469): make the operator ceremony real — `identity hub-cache --daemon-producer` publishes the p
+fix/3470-wake-listen-client	1-MERGED-ANCESTRY	0	401	2026-09-05	0	0	0	0	0	0	0	3470	1	0e7fc38ff	fix(#3470): route the --exec wake hook through the #1937 spawn-audit chokepoint
+fix/3471-wake-hub-ops	1-MERGED-ANCESTRY	0	392	2026-09-06	0	0	0	0	0	0	0	3471	1	c59b4c564	fix(#3471): close the inode-recycling unlink race, and make the census race deterministic
+fix/3472-wake-hub-cert-ssot	1-MERGED-ANCESTRY	0	276	2026-09-08	0	0	0	0	0	0	0	3472	1	50bad24c3	docs(cert): §6 NOT-COVERED entry for the wake plane + a removal-proof row that proves the hub is rem
+fix/3473-wake-latency-harness	1-MERGED-ANCESTRY	0	274	2026-09-08	0	0	0	0	0	0	0	3473	1	1b4b9e38e	fix(bench): #3473 drop the impossible schema-init step; register the wake module before exec
+fix/3474-api-key-admin-route	1-MERGED-ANCESTRY	0	357	2026-09-06	0	0	0	0	0	0	0	3474	1	719c5ecaa	docs(#3474): route/path SSOT re-derived on baf6313f + the two api-key endpoints
+fix/3475-lib-test-env-isolation	1-MERGED-ANCESTRY	0	553	2026-09-02	0	0	0	0	0	0	0	3475	1	04e8ac604	fix(tests): confine AI_MEMORY_AGENT_ID installs to their own test binary (#3475)
+fix/3496-coverage-floor	1-MERGED-ANCESTRY	0	461	2026-09-04	0	0	0	0	0	0	0	3496	1	7fe0c231a	test: restore coverage floors (#3496)
+fix/3497-ci-atomise-env	1-MERGED-ANCESTRY	0	459	2026-09-04	0	0	0	0	0	0	0	3497	1	1d523a04d	test: isolate atomise curator construction (#3497)
+fix/3498-followup-anchor-contracts	1-MERGED-ANCESTRY	0	235	2026-09-09	0	0	0	0	0	0	0	3498	1	b304e7fab	fix(security): restore explicit graph anchor contracts (#3498)
+fix/3498-graph-read-funnels-substrate-visibility	1-MERGED-ANCESTRY	0	243	2026-09-09	0	0	0	0	0	0	0	3498	1	13a3af5f3	fix: enforce substrate visibility in graph read funnels (#3498)
+fix/3499-as-agent-read-confinement	1-MERGED-ANCESTRY	0	239	2026-09-09	0	0	0	0	0	0	0	3499	1	877cdbde4	fix(reads): confine as_agent to caller-bound scope narrowing (#3499)
+fix/3503-ci-impact-security-suites	1-MERGED-ANCESTRY	0	447	2026-09-04	0	0	0	0	0	0	0	3503	1	c60720a31	fix(ci): retain full security suites in impact selection (#3503)
+fix/3504-allowlist-cache-refresh	1-MERGED-ANCESTRY	0	392	2026-09-05	0	0	0	0	0	0	0	3504	1	3601c5330	feat(#3504): reuse the wake-hub allowlist snapshot by inode/mtime, and ship the refresher
+fix/3505-topic-read-scopes	1-MERGED-ANCESTRY	0	390	2026-09-05	0	0	0	0	0	0	0	3505	1	1287e9244	feat(#3505): gate topic SENDS, and carry proven read PREFIXES not an expanded list
+fix/3506-routine-run-caller-authorization	1-MERGED-ANCESTRY	0	239	2026-09-09	0	0	0	0	0	0	0	3506	1	118ae78cd	fix(routines): admit the owner before run side effects (#3506)
+fix/3507-calibrate-confidence-caller-gate	1-MERGED-ANCESTRY	0	346	2026-09-07	0	0	0	0	0	0	0	3507	1	75c36619d	fix(tests): pass the CallerContext to calibrate_confidence_report in the #3521 default-arm sweep (#3
+fix/3510-sqlite-integrity-partial-check	1-MERGED-ANCESTRY	0	373	2026-09-06	0	0	0	0	0	0	0	3510	1	e93566789	docs: state what the restore gate and the power-loss harness actually check (#3510)
+fix/3511-delegation-stamp-and-test-pins	1-MERGED-ANCESTRY	0	402	2026-09-05	0	0	0	0	0	0	0	3511	1	65042897a	test(#3512): pin every base64 value arg against a leading `-` and `_`
+fix/3515-federation-hook-state-isolation	1-MERGED-ANCESTRY	0	375	2026-09-06	0	0	0	0	0	0	0	3515	1	3fa0c8147	test(federation): seed the wire-action gate in the federation test fixtures so the quorum slice stop
+fix/3517-agent-id-env-lock	1-MERGED-ANCESTRY	0	376	2026-09-06	0	0	0	0	0	0	0	3517	1	98668ea9e	test(#3517): guard six more env-first caller READERS in mcp::pending / mcp::promote
+fix/3519-pg-bootstrap-lock-wait-rebased	1-MERGED-ANCESTRY	0	377	2026-09-06	0	0	0	0	0	0	0	3519	1	81f508518	fix(postgres): poll pg_try_advisory_lock so a migration waiter never pins a snapshot (#3519)
+fix/3521-coverage-floors	1-MERGED-ANCESTRY	0	375	2026-09-06	0	0	0	0	0	0	0	3521	1	5da4de1e4	test(coverage): restore the five breached per-module floors, lift the three canaries (#3521)
+fix/3522-refresher-unit-wal-paths	1-MERGED-ANCESTRY	0	364	2026-09-06	0	0	0	0	0	0	0	3522	1	33bbee2ec	fix(wake-client): read the delegation bundle from the descriptor its permissions were proven on (#35
+fix/3525-pg-connect-reprobe	1-MERGED-ANCESTRY	0	371	2026-09-06	0	0	0	0	0	0	0	3525	1	9bc0aced7	fix(pg): bound the migration-lock probe overshoot to a fraction of the wait (#3525)
+fix/3526-rollback-priority-claims-truth	1-MERGED-ANCESTRY	0	276	2026-09-08	0	0	0	0	0	0	0	3526	1	264d501d1	test(autonomy): pin the rollback priority reversal on both twins and both backends (#3526)
+fix/3527-audit-chain-append-race	1-MERGED-ANCESTRY	0	370	2026-09-06	0	0	0	0	0	0	0	3527	1	e2265d371	test(store/postgres): deterministically provoke the chain-append race (#3527)
+fix/3529-api-key-followups	1-MERGED-ANCESTRY	0	350	2026-09-07	0	0	0	0	0	0	0	3529	1	d2f274221	fix(store/postgres): gate the revoke_unless_last wrapper for the #3175 B8 scan (#3529)
+fix/3532-wake-hub-subscribe-ack	1-MERGED-ANCESTRY	0	345	2026-09-07	0	0	0	0	0	0	0	3532	1	756323685	docs(#3532): the subscribe acknowledgement, in the protocol and client sections
+fix/3535-api-key-deputy-advisories	1-MERGED-ANCESTRY	0	271	2026-09-08	0	0	0	0	0	0	0	3535	1	b0b42ccdf	docs(agent-api-key): state the 2N bound of the FIXED-window mint rate limit (#3535 advisory 4)
+fix/3537-hardcoded-literals-awk-portable	1-MERGED-ANCESTRY	0	277	2026-09-08	0	0	0	0	0	0	0	3537	1	c5d97e920	fix(ci-gate): make check-hardcoded-literals.sh locale/awk-portable (#3537)
+fix/3538-ci-once-leg-budget	1-MERGED-ANCESTRY	0	277	2026-09-08	0	0	0	0	0	0	0	3538	1	48403cca9	ci(#3538): raise the once leg's job cap to 75 min and the hosted-sqlite watchdog to 2100 s — the FUL
+fix/3540-wake-hub-delegate-bound-at	1-MERGED-ANCESTRY	0	247	2026-09-08	0	0	0	0	0	0	0	3540	1	8edbe4e92	style(#3540): cargo fmt --all
+fix/3541-cloud-init-ascii-portable	1-MERGED-ANCESTRY	0	245	2026-09-08	0	0	0	0	0	0	0	3541	1	b98dda3c3	fix: make cloud-init ASCII gate portable (#3541)
+fix/3543-fail-closed-predicates	1-MERGED-ANCESTRY	0	21	2026-09-11	0	0	0	0	0	0	0	3543	1	380c033ec	fix(harness): fail-closed predicates for Big-10, continuity, attest, swarm (#3543)
+fix/3546-release-qualified-tree	1-MERGED-ANCESTRY	0	46	2026-09-11	0	0	0	0	0	0	0	3546	1	800806b3b	fix(#3546): drop the --republish leg after #3611 retired mobile-ios-republish.yml
+fix/3547-evidence-producers	1-MERGED-ANCESTRY	0	24	2026-09-11	0	0	0	0	0	0	0	3547	1	3d4072fd9	fix(evidence): track producers + run-id→binary-sha binding (#3547)
+fix/3549-shared-authority-resolver	1-MERGED-ANCESTRY	0	88	2026-09-11	0	0	0	0	0	0	0	3549	1	d1ca010af	fix(#3549): WIP 8 — dispatch matrix `call` takes &Value (needless_pass_by_value)
+fix/3550-restore-publish-ordering	1-MERGED-ANCESTRY	0	88	2026-09-11	0	0	0	0	0	0	0	3550	1	50487cffd	wip(#3550): review follow-up — degraded arms fail closed, real-abort crash matrix
+fix/3551-reflection-source-visibility	1-MERGED-ANCESTRY	0	196	2026-09-09	0	0	0	0	0	0	0	3551	1	d6b265f12	test(#3551): encode reflection ownership in metadata
+fix/3552-certified-pin-required-contexts	1-MERGED-ANCESTRY	0	74	2026-09-11	0	0	0	0	0	0	0	3552	1	9533d07eb	fix(#3552): declare certified-pin jobs as required contexts
+fix/3553-doctor-synchronous-posture	1-MERGED-ANCESTRY	0	58	2026-09-11	0	0	0	0	0	0	0	3553	1	8ad3f3ffa	fix(#3553): WIP 7 — battery fallout: the #2444 restore fixture now IS a foreign SQLite db; garbage-b
+fix/3554-required-contexts-live-drift	1-MERGED-ANCESTRY	0	95	2026-09-11	0	0	0	0	0	0	0	3554	1	e106305fa	fix(#3554): pin declared required contexts to live branch protection
+fix/3577-followup	1-MERGED-ANCESTRY	0	196	2026-09-09	0	0	0	0	0	0	0	3577	1	75a3369ec	fix(#3577): document CONCURRENCY-20 exception for two tokio lineage guards
+fix/3577-lineage-dag-isolation	1-MERGED-ANCESTRY	0	239	2026-09-09	0	0	0	0	0	0	0	3577	1	d72d43055	fix(#3577): isolate LINEAGE_DAG seeders behind restore-on-drop funnel
+fix/3578-sysusers	1-MERGED-ANCESTRY	0	191	2026-09-09	0	0	0	0	0	0	0	3578	1	b8dd7b7a5	fix(#3578): sysusers fragment creates ai-memory and ai-memory-hub
+fix/3578-wake-hub-process-isolation	1-MERGED-ANCESTRY	0	196	2026-09-09	0	0	0	0	0	0	0	3578	1	9534c2536	fix(#3578): wake-hub process isolation, threat-model rows, red-team cases
+fix/3582-peer-allowlist-posture	1-MERGED-ANCESTRY	0	134	2026-09-10	0	0	0	0	0	0	0	3582	1	3056c39e6	fix(federation): limit enrollment warning to absent allowlists (#3582)
+fix/3584-test-key-dir-ambient-isolation	1-MERGED-ANCESTRY	0	148	2026-09-10	0	0	0	0	0	0	0	3584	1	c22ce149b	test(identity): isolate test_key_dir from ambient AI_MEMORY_KEY_DIR (#3584)
+fix/3585-curator-self-signal-race	1-MERGED-ANCESTRY	0	156	2026-09-10	0	0	0	0	0	0	0	3585	1	0bf9fb665	test(curator): handshake + subprocess isolation for daemon self-signal (#3585)
+fix/3587-u2-watch-line-file	1-MERGED-ANCESTRY	0	133	2026-09-10	0	0	0	0	0	0	0	3587	1	803502e5f	fix(watch): R1-R5 line-file ingest + symlink-refusal helper (#3587 U2)
+fix/3587-u5a-ceilings-ruling-key	1-MERGED-ANCESTRY	0	141	2026-09-10	0	0	0	0	0	0	0	3587	1	e96d79dc3	chore(#3587): U5a QUAL-10 lockstep ceilings + field_names::RULING_KEY
+fix/3587-u5b-docs-ssot	1-MERGED-ANCESTRY	0	129	2026-09-10	0	0	0	0	0	0	0	3587	1	ac013dbf9	docs(#3587): U5b SSOT for watch line-file + QUAL-10 ceilings
+fix/3587-u6-watch-wiring	1-MERGED-ANCESTRY	0	122	2026-09-10	0	0	0	0	0	0	0	3587	1	f540224d9	docs(#3587): U6 PREP watch line-file systemd/launchd wiring templates
+fix/3589-test-hygiene-dispatch-wait	1-MERGED-ANCESTRY	0	97	2026-09-11	0	0	0	0	0	0	0	3589	1	4a1c83f83	fix(#3589): wait on dispatcher idle Notify instead of a 30s sink poll
+fix/3591-ci-permissions	1-MERGED-ANCESTRY	0	126	2026-09-10	0	0	0	0	0	0	0	3591	1	71a05c720	ci(#3591): pin GITHUB_TOKEN to contents: read on 8 workflows
+fix/3592-sdk-ts-polynomial-redos	1-MERGED-ANCESTRY	0	124	2026-09-10	0	0	0	0	0	0	0	3592	1	75948d86b	fix(sdk/typescript): linear baseUrl trailing-slash trim (#3592)
+fix/3593-test-hygiene-pg-isolation	1-MERGED-ANCESTRY	0	102	2026-09-10	0	0	0	0	0	0	0	3593	1	270c7df86	test(#3593): isolate live-PG covenant env and sever-audit counts at --test-threads=4
+fix/3596-ungated-mcp-read-tools	1-MERGED-ANCESTRY	0	29	2026-09-11	0	0	0	0	0	0	0	3596	1	2428a738b	fix(#3596-#3601): WIP 3 — plain comment on the pg_test! invocation (clippy sal-postgres: unused doc 
+fix/3603-noconfig-shadow-warn	1-MERGED-ANCESTRY	0	74	2026-09-11	0	0	0	0	0	0	0	3603	1	49e5c13b7	fix(#3603): AI_MEMORY_NO_CONFIG silences the config-path WARNs
+fix/3608-ci-flake-pipefail-grep	1-MERGED-ANCESTRY	0	67	2026-09-11	0	0	0	0	0	0	0	3608	1	67b0df8b9	fix(#3608): pipefail-safe membership in required-context gates
+fix/3611-retire-ios-republish	1-MERGED-ANCESTRY	0	55	2026-09-11	0	0	0	0	0	0	0	3611	1	be417691a	ci(#3611): retire standalone iOS xcframework re-publisher
+fix/3615-integration-wait-for-health	1-MERGED-ANCESTRY	0	26	2026-09-11	0	0	0	0	0	0	0	3615	1	63f9bb49e	fix(#3615): raise integration wait_for_health 10s→60s + stderr tail
+fix/b7-allowlist-usd-string	1-MERGED-ANCESTRY	0	635	2026-08-31	0	0	0	0	0	0	0	-	-1	934fddacc	fix(b7): allowlist cost::usd_string — reviewed false positive (pure formatter, no SQL)
+fix/clippy-tests-pedantic	1-MERGED-ANCESTRY	0	647	2026-08-31	0	0	0	0	0	0	0	-	-1	ba8d3cd7e	test(clippy): clear latent pedantic debt in two test files for CI legs
+fix/default-features-test-pins	1-MERGED-ANCESTRY	0	639	2026-08-31	0	0	0	0	0	0	0	-	-1	c79901c09	fix(tests): reconcile default-features pins for memory_swarm_rewind + Z valid_until
+fix/g4-polish-batch	1-MERGED-ANCESTRY	0	649	2026-08-31	0	0	0	0	0	0	0	-	-1	ca2d479a0	fix(storage,bulk): fail-closed GA-review polish batch g4 (#3327 Sec-F2/F3/F4/F6)
+fix/ga-boot-backfill-config-path	1-MERGED-ANCESTRY	0	631	2026-08-31	0	0	0	0	0	0	0	-	-1	17467c3e7	fix(#3329): non-blocking MCP boot backfill + macOS config-path resolution
+fix/hardcoded-literal-validation-failed	1-MERGED-ANCESTRY	0	641	2026-08-31	0	0	0	0	0	0	0	-	-1	e2fc287a7	fix(handlers): dedupe "validation failed" label into one const (pm-v3.1 gate)
+fix/invalidate-link-valid-until-verbatim	1-MERGED-ANCESTRY	0	637	2026-08-31	0	0	0	0	0	0	0	-	-1	8e7f993d4	fix(#3281 followup): store valid_until verbatim on invalidate; canonicalize only for the audit hash
+fix/mvg-recall-purity-export-golden	1-MERGED-ANCESTRY	0	672	2026-08-31	0	0	0	0	0	0	0	-	-1	0db5e8783	fix: recall-purity for #3323 cost accounting + regen export golden to v94
+fix/pg-acyclicity-equal-instant	1-MERGED-ANCESTRY	0	653	2026-08-31	0	0	0	0	0	0	0	-	-1	252555569	fix(#3041 pg-twin): close postgres equal-instant lineage fail-open + >5-hop completeness gap
+fix/token-budget-ceiling-lockstep	1-MERGED-ANCESTRY	0	643	2026-08-31	0	0	0	0	0	0	0	-	-1	8c89d6300	fix(ci): lockstep token-budget workflow ceiling 7650 -> 7760 (#3266/#3322)
+fix/v93-stamp-literal	1-MERGED-ANCESTRY	0	653	2026-08-31	0	0	0	0	0	0	0	-	-1	528999f91	fix(postgres): migrate_v93 stamps literal 93, not CURRENT_SCHEMA_VERSION (crash-consistency)
+handoff/codex-conductor	1-MERGED-ANCESTRY	0	479	2026-09-03	0	0	0	0	0	0	0	-	-1	02fe0cabf	docs(handoff): Codex Conductor handoff — graph-engineering orchestration framework, gate procedure v
+hotfix/3502-v97-acceptance-and-attest-parity	1-MERGED-ANCESTRY	0	446	2026-09-05	0	0	0	0	0	0	0	3502	1	74e3ae77d	docs(#3502): record the §7 enterprise-federation certification expiry (VOID as of 2026-09-05) for th
+integration/f1	1-MERGED-ANCESTRY	0	2	2026-09-12	0	0	0	0	0	0	0	-	-1	f0175b709	Merge #3273 docs/claims: correct false review + CI-green claims on #3240/#3235 merges (grok 42a05fb0
+rehearsal/v1.0.0-resolved-full	1-MERGED-ANCESTRY	243	2	2026-09-16	3754	0	0	0	0	0	0	-	-1	d9ab98672	fix(#3707): name each caller-facing failure body once — the literal ratchet caught four spellings of
+staging/final-tip-d4c5e243	1-MERGED-ANCESTRY	0	383	2026-09-06	0	0	0	0	0	0	0	-	-1	d4c5e2434	test(pg): drop the no-op `outcome;` path statement in curator_report_bloat_3345_pg (clippy -D warnin
+campaign/2194-docs-drift	2-MERGED-PATCHID	2831	4646	2026-07-18	0	0	0	0	2831	2562	3	2194	1	12cfffd28	docs(#2194): fix stale #2181 comment + #2205-audit CLAUDE.md drift
+campaign/2198-guardrail-d-arm-lane	2-MERGED-PATCHID	2829	4646	2026-07-18	0	0	0	0	2829	2560	3	2198	1	3b18b8275	fix(#2198): guardrail-D arm-lane hardening — see const-phrased ladder arms
+campaign/2215-import-lineage-mirror	2-MERGED-PATCHID	2839	4646	2026-07-19	0	0	0	0	2839	2569	3	2215	1	4324c1b9a	Merge remote-tracking branch 'origin/release/v1.0.0' into campaign/2215-import-lineage-mirror
+campaign/2230-windows-erasure-fsync	2-MERGED-PATCHID	2837	4646	2026-07-19	0	0	0	0	2837	2568	3	2230	1	331393c0f	fix(#2230): windows fsync-file uses a write handle (FlushFileBuffers needs GENERIC_WRITE)
+campaign/2240-impact-tokenise-fix	2-MERGED-PATCHID	2844	4646	2026-07-19	0	0	0	0	2844	2575	3	2240	1	6143fa63e	fix(#2240): correct tr reverse-range in ci-test-impact.sh tokenise
+campaign/2242-reanchor-verify-head	2-MERGED-PATCHID	2847	4646	2026-07-19	0	0	0	0	2847	2578	3	2242	1	d14080451	fix(#2242): re-anchor ceremony verifies the chain before countersigning it
+campaign/2256-2257-vectorlite-pins	2-MERGED-PATCHID	2855	4646	2026-07-19	0	0	0	0	2855	2585	3	2256	1	9c38bb964	merge: fold release/v1.0.0 after #2270
+campaign/B5-sdk-shim-quality	2-MERGED-PATCHID	2856	4646	2026-07-19	0	0	0	0	2856	2586	3	-	-1	eed2715c9	merge: fold release/v1.0.0 after #2268
+campaign/preship-sdk-shim-ci	2-MERGED-PATCHID	2846	4646	2026-07-19	0	0	0	0	2846	2577	3	-	-1	1329b0ed0	ci: run SDK shim tests in CI + gate publish on them (pre-ship 3x7)
+cert-claims-2879-2880-2881	2-MERGED-PATCHID	2	1371	2026-08-11	0	0	0	0	2	1	0	2879	1	963a82d68	Merge remote-tracking branch 'origin/release/v1.0.0' into cert-claims-2879-2880-2881
+chore/2473-protection-evidence	2-MERGED-PATCHID	2964	4646	2026-07-30	0	0	0	0	2964	2670	3	2473	1	a18b5d19b	chore(governance,#2473): record the L3-boundary context rename before/after
+chore/2494-protection-evidence	2-MERGED-PATCHID	2944	4646	2026-07-30	0	0	0	0	2944	2659	3	2494	1	93b978172	Merge branch 'release/v1.0.0' into chore/2494-protection-evidence
+chore/control-plane-publish-envs	2-MERGED-PATCHID	2931	4646	2026-07-30	0	0	0	0	2931	2654	3	-	-1	a6ab4557b	Merge branch 'release/v1.0.0' into chore/control-plane-publish-envs
+ci/2443-branch-protection-reconcile	2-MERGED-PATCHID	2970	4646	2026-07-30	0	0	0	0	2970	2672	3	2443	1	3c623c318	Merge remote-tracking branch 'origin/release/v1.0.0' into ci/2443-branch-protection-reconcile
+ci/2473-truncated-context	2-MERGED-PATCHID	2962	4646	2026-07-30	0	0	0	0	2962	2669	3	2473	1	ea26c2e99	fix(#2473): rule (e) was BLIND — `read` with a tab IFS collapsed the empty `needs` field
+ci/2506-token-budget-pr-coverage	2-MERGED-PATCHID	2955	4646	2026-07-30	0	0	0	0	2955	2665	3	2506	1	b2d5f7d02	Merge branch 'release/v1.0.0' into ci/2506-token-budget-pr-coverage
+ci/2508-structural-gate-rule	2-MERGED-PATCHID	2959	4646	2026-07-30	0	0	0	0	2959	2667	3	2508	1	56e7ffb22	ci(#2508): drop the token-budget pending-fix ledger entry — #2506 landed via #2522 (98a2bc31)
+ci/remove-native-age-nightly	2-MERGED-PATCHID	2987	4646	2026-07-31	0	0	0	0	2987	2678	3	-	-1	da3fb9cc5	ci: delete the nightly native AGE stack build (operator directive)
+develop	2-MERGED-PATCHID	284	4646	2026-04-24	0	0	0	0	284	255	2	-	-1	ad41aba9d	Merge pull request #373 from alphaonedev/release/v0.6.2
+do-reverify-2860	2-MERGED-PATCHID	1	1382	2026-08-10	0	0	0	0	1	1	0	2860	1	61678dd4b	docs(cert/#2860): DO 2-node re-verify — convergence PROVEN on real mesh; residual #2863
+docs/2034-pages-consolidate	2-MERGED-PATCHID	2812	4646	2026-07-18	0	0	0	0	2812	2550	3	2034	1	af506b8b0	docs(#2034): consolidate GitHub Pages to v0.8.1-v1.0.0 + retire legacy test-campaign Pages links
+docs/2888-longmemeval-keyword-v100-remeasure	2-MERGED-PATCHID	3	1366	2026-08-11	0	0	0	0	3	1	0	2888	1	a0de8ea74	Merge remote-tracking branch 'origin/release/v1.0.0' into docs/2888-longmemeval-keyword-v100-remeasu
+docs/cert-note-tip-b95ad978	2-MERGED-PATCHID	3117	4646	2026-08-03	0	0	0	0	3117	2747	4	-	-1	cd0d5348e	docs(cert): align ready-to-tag tip SHA to b95ad978 (never cut d742f331)
+docs/cert-residual-2504-closed	2-MERGED-PATCHID	3153	4646	2026-08-04	0	0	0	0	3153	2761	4	2504	1	9f355d3f2	docs(cert): strike #2504 from Gate1 residual list after #2692
+docs/cert-residual-capacity-sync	2-MERGED-PATCHID	3138	4646	2026-08-04	0	0	0	0	3138	2753	4	-	-1	3ac8f1f79	docs(cert): residual §6 lists only still-open capacity PRs #2663 #2673
+docs/cert-residual-from-inventory	2-MERGED-PATCHID	3140	4646	2026-08-04	0	0	0	0	3140	2754	4	-	-1	f071c397c	docs(cert): residual §6 from mechanical inventory (#2673 only open)
+docs/cert-tidy-2450	2-MERGED-PATCHID	1	1365	2026-08-11	0	0	0	0	1	1	0	2450	1	2ca80c874	docs(cert): tidy residuals for #2438/#2450/#2451
+docs/ready-to-tag-cert-note	2-MERGED-PATCHID	3115	4646	2026-08-03	0	0	0	0	3115	2746	4	-	-1	40a4890bd	docs(cert): ready-to-tag note for v1.0.0 tip d742f331 (#2682)
+docs/session-markdown-reviews	2-MERGED-PATCHID	2473	4646	2026-06-28	0	0	0	0	2473	2237	3	-	-1	de8922e09	docs: session markdown — RQGM/Red Queen reviews + v0.9 roadmap + Grok Build
+docs/track-b-a2a-results	2-MERGED-PATCHID	2	1394	2026-08-09	0	0	0	0	2	1	0	-	-1	a008cff1a	Merge branch 'release/v1.0.0' into docs/track-b-a2a-results
+docs/v100-security-assessment	2-MERGED-PATCHID	2749	4646	2026-07-15	0	0	0	0	2749	2492	3	-	-1	1cb2be202	Merge remote-tracking branch 'origin/release/v1.0.0' into docs/v100-security-assessment
+easy/2176-2177-2055-fingerprint-relation-docs	2-MERGED-PATCHID	2806	4646	2026-07-18	0	0	0	0	2806	2547	3	2176	1	f7413c0fe	test(#2176,#2177,#2055): pin fingerprint-gate degenerate/model-implied axes + link-relation footgun 
+feat/1390-sdk-shims-clean	2-MERGED-PATCHID	2827	4646	2026-07-18	0	0	0	0	2827	2558	3	1390	1	2ef63a18a	feat(#1390): Direct-API SDK shims — Anthropic + OpenAI, Python + TypeScript
+feat/2676-feature-self-report	2-MERGED-PATCHID	3113	4646	2026-08-03	0	0	0	0	3113	2745	4	2676	1	75ab04db8	feat(#2676): ai-memory features self-report for Gate 3 packaging
+feat/3714-shape-v1	2-MERGED-PATCHID	43	2	2026-09-13	0	0	0	0	43	33	0	3714	1	77357e1b4	fix(#3715): egress verbs load a refused config with the KNOWN keys applied (the #2445 disposition); 
+feat/5.4-cert-artifacts	2-MERGED-PATCHID	1	1352	2026-08-12	0	0	0	0	1	1	0	-	-1	abcdefd72	docs(cert): §5.4 falsifiability artifacts — canonical cert doc + removal-proof harness
+feat/gate1-remaining-ns	2-MERGED-PATCHID	3083	4646	2026-08-03	0	0	0	0	3083	2732	4	-	-1	925f44a7c	test(#2649,#2650): pin inbound_write_namespace on crypto lane tokens
+feat/gate1-structural-confinement	2-MERGED-PATCHID	3080	4646	2026-08-03	0	0	0	0	3080	2730	4	-	-1	912a02cb0	fix(federation): Gate1 — single LANE_* SSOT for wire field literals (pm-v3.1)
+feat/migration-ladder-gate-guardrail-d	2-MERGED-PATCHID	2821	4646	2026-07-18	0	0	0	0	2821	2554	3	-	-1	1d3b640eb	feat(ci): fail-closed migration-ladder-uniqueness gate (guardrail-D, 2x5 vote b682c76a)
+fix/1993-2019-coverage-ci	2-MERGED-PATCHID	2748	4646	2026-07-15	0	0	0	0	2748	2492	3	1993	1	443398e00	ci(coverage): consolidate coverage into coverage.yml (#1993) + verify staged HF cache (#2019)
+fix/1994-serve-readiness-poll	2-MERGED-PATCHID	2753	4646	2026-07-15	0	0	0	0	2753	2497	3	1994	1	eae86c2b4	test(serve): retry a test's first request past the readiness gate (#1994)
+fix/2000-signed-bulk-emit-test	2-MERGED-PATCHID	2748	4646	2026-07-15	0	0	0	0	2748	2492	3	2000	1	72166b9b9	test(#2000): HTTP signed-bulk write-signature EMIT integration test
+fix/2032-tranche3	2-MERGED-PATCHID	2753	4646	2026-07-15	0	0	0	0	2753	2497	3	2032	1	cc687cf53	fix(#2032): security hardening tranche 3 — L1 query-key removal, M2 TLS bind WARN, LM3 require_nonce
+fix/2119-2035-curator-sigterm-archive-valid-time	2-MERGED-PATCHID	2819	4646	2026-07-18	0	0	0	0	2819	2553	3	2119	1	ecd808564	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2119-2035-curator-sigterm-archive-vali
+fix/2163-2162-gate-evasions	2-MERGED-PATCHID	2806	4646	2026-07-18	0	0	0	0	2806	2547	3	2163	1	52857d6d9	fix(scripts): close #2163 naked-$HOME + #2162 TAB-alias gate evasions
+fix/2165-2159-test-isolation	2-MERGED-PATCHID	2806	4646	2026-07-18	0	0	0	0	2806	2547	3	2165	1	306cddae6	test(#2165,#2159): serialize env/permissions test races onto the crate-canonical locks
+fix/2181-2183-embedding-space-residual	2-MERGED-PATCHID	2813	4646	2026-07-18	0	0	0	0	2813	2550	3	2181	1	7fcfe411f	Merge remote-tracking branch 'origin/release/v1.0.0' into HEAD
+fix/2188-2190-embedding-space-residuals	2-MERGED-PATCHID	2817	4646	2026-07-18	0	0	0	0	2817	2552	3	2188	1	2e58dc2d3	fix(#2188,#2189,#2190): embedding-space cosine-gating residuals from the #2187 Fable audit
+fix/2290-sync-since-signing	2-MERGED-PATCHID	2866	4646	2026-07-21	0	0	0	0	2866	2597	3	2290	1	e7c21c930	fix(#2290): sign federation /sync/since catch-up pull so enrolled-peer catch-up works under FED_REQU
+fix/2297-sync-push-signing	2-MERGED-PATCHID	2870	4646	2026-07-21	0	0	0	0	2870	2601	3	2297	1	92ef71e64	fix(#2297): sign sync_cycle_once push so enrolled-peer push works under FED_REQUIRE_SIG=1
+fix/2301-sqlite-consolidate-seal	2-MERGED-PATCHID	2872	4646	2026-07-21	0	0	0	0	2872	2603	3	2301	1	09bdf3d8e	fix(#2301): seal consolidated content on sqlite (at-rest encryption parity)
+fix/2308-fold-before-gc	2-MERGED-PATCHID	2876	4646	2026-07-22	0	0	0	0	2876	2607	3	2308	1	d5e61b3c1	fix(#2308): fold-before-gc on MCP memory_gc + gc_if_needed + gc() so recall TTL extensions are appli
+fix/2384-fed-catchup-full-columns	2-MERGED-PATCHID	2903	4646	2026-07-28	0	0	0	0	2903	2634	3	2384	1	697321cb1	fix(#2384): sqlite federation catch-up sends all 31 durable columns, not 16
+fix/2391-fed-outbound-checkpoint-broadcast	2-MERGED-PATCHID	2905	4646	2026-07-28	0	0	0	0	2905	2636	3	2391	1	59c535463	fix(#2391): wire the checkpoint-resolution federation outbound leg
+fix/2396-checkpoint-cas	2-MERGED-PATCHID	2897	4646	2026-07-24	0	0	0	0	2897	2628	3	2396	1	b4e400ee8	fix(checkpoints): CAS the inbound resolution write so a resolved checkpoint cannot be clobbered (#23
+fix/2418-expires-at-canon	2-MERGED-PATCHID	2906	4646	2026-07-28	0	0	0	0	2906	2637	3	2418	1	99835684a	fix(#2418): canonicalize expires_at at the TTL-extension + archive-restore funnels
+fix/2441-sync-since-watermark	2-MERGED-PATCHID	3136	4646	2026-08-04	0	0	0	0	3136	2752	4	2441	1	053de1e5e	merge(release/v1.0.0): sync post-#2662 into sync-since watermark #2663
+fix/2442-stable-peer-id	2-MERGED-PATCHID	3054	4646	2026-08-01	0	0	0	0	3054	2714	4	2442	1	aac33034f	docs(federation): state the #2672 classifier-laundering mechanism precisely
+fix/2445-schema-downgrade-guard	2-MERGED-PATCHID	2992	4646	2026-07-31	0	0	0	0	2992	2681	3	2445	1	60eb1b595	test(#2445): always-run structural guard that both backends still gate BEFORE their bootstrap DDL
+fix/2446-erasure-replication	2-MERGED-PATCHID	3145	4646	2026-08-04	0	0	0	0	3145	2757	4	2446	1	0dcbe67c7	fix(#2673): QUAL-10 bump daemon_runtime ceiling for erasure-outbox wiring
+fix/2467-publish-sdks-prerelease-guard	2-MERGED-PATCHID	2927	4646	2026-07-30	0	0	0	0	2927	2653	3	2467	1	4671610fa	Merge branch 'release/v1.0.0' into fix/2467-publish-sdks-prerelease-guard
+fix/2477-plaintext-peer-refusal	2-MERGED-PATCHID	3061	4646	2026-08-01	0	0	0	0	3061	2716	4	2477	1	d89ddc520	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2477-plaintext-peer-refusal
+fix/2478-pending-decisions-confinement	2-MERGED-PATCHID	2967	4646	2026-07-30	0	0	0	0	2967	2671	3	2478	1	b08672169	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2478-pending-decisions-confinement
+fix/2479-namespace-meta-confinement	2-MERGED-PATCHID	2977	4646	2026-07-30	0	0	0	0	2977	2674	3	2479	1	d739b4a30	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2479-namespace-meta-confinement
+fix/2480-catchup-namespace-scope	2-MERGED-PATCHID	3086	4646	2026-08-03	0	0	0	0	3086	2734	4	2480	1	ee6b0f1fd	refactor(#2480): single catchup_memory_namespace_authorized choke + unit pins
+fix/2490-export-import-false-success	2-MERGED-PATCHID	2999	4646	2026-07-31	0	0	0	0	2999	2685	3	2490	1	fe146a6c6	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2490-export-import-false-success
+fix/2494-required-classify-contexts	2-MERGED-PATCHID	2937	4646	2026-07-30	0	0	0	0	2937	2656	3	2494	1	0397dc2c2	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2494-required-classify-contexts
+fix/2496-2494-ci-classifier-wedge	2-MERGED-PATCHID	2922	4646	2026-07-30	0	0	0	0	2922	2651	3	2496	1	3fa45067d	Merge branch 'release/v1.0.0' into fix/2496-2494-ci-classifier-wedge
+fix/2498-delete-lane-dlq	2-MERGED-PATCHID	3132	4646	2026-08-04	0	0	0	0	3132	2751	4	2498	1	758dd1c84	merge(release): re-sync fix/2498-delete-lane-dlq onto 9136b5a3 after #2689
+fix/2503-delete-governance-strip	2-MERGED-PATCHID	2985	4646	2026-07-30	0	0	0	0	2985	2677	3	2503	1	63f055e50	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2503-delete-governance-strip
+fix/2504-peer-attestation-fail-closed	2-MERGED-PATCHID	3151	4646	2026-08-04	0	0	0	0	3151	2760	4	2504	1	10152e34f	fix(#2504): peer-attestation parse error fails closed, not zero-config
+fix/2508-tool-count-drift-push-branches	2-MERGED-PATCHID	2934	4646	2026-07-30	0	0	0	0	2934	2655	3	2508	1	24c5b3fa0	Merge branch 'release/v1.0.0' into fix/2508-tool-count-drift-push-branches
+fix/2511-age-cypher-typed-param	2-MERGED-PATCHID	2952	4646	2026-07-30	0	0	0	0	2952	2664	3	2511	1	73282501d	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2511-age-cypher-typed-param
+fix/2512-paste-rev-unreachable	2-MERGED-PATCHID	2941	4646	2026-07-30	0	0	0	0	2941	2658	3	2512	1	101944734	Merge branch 'release/v1.0.0' into fix/2512-paste-rev-unreachable
+fix/2529-pending-resurrection	2-MERGED-PATCHID	3156	4646	2026-08-04	0	0	0	0	3156	2763	4	2529	1	0d464337b	fix(#2529): clippy needless_pass_by_value on pending_wire approvals
+fix/2531-pg-fed-embed-space-v2	2-MERGED-PATCHID	1	1355	2026-08-11	0	0	0	0	1	1	0	2531	1	c72d1b40b	fix(#2531): tolerate the deferred-embed fallback in the pg shipped-embedding-stamp test
+fix/2532-reject-namespace-gate	2-MERGED-PATCHID	3165	4646	2026-08-04	0	0	0	0	3165	2768	4	2532	1	2538a1068	fix(#2532): namespace-confine federated pending REJECT
+fix/2536-namespace-meta-descendant-inheritance	2-MERGED-PATCHID	3161	4646	2026-08-04	0	0	0	0	3161	2766	4	2536	1	0f920c5bd	fix(#2536): clippy semicolon_if_nothing_returned in test posture
+fix/2537-namespace-standard-read-leak	2-MERGED-PATCHID	2981	4646	2026-07-30	0	0	0	0	2981	2675	3	2537	1	580ba4146	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2537-namespace-standard-read-leak
+fix/2569-2570-import-roundtrip	2-MERGED-PATCHID	2	1364	2026-08-11	0	0	0	0	2	1	0	2569	1	d92e2a282	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2569-2570-import-roundtrip
+fix/2613-age-find-paths-honesty	2-MERGED-PATCHID	2	1423	2026-08-07	0	0	0	0	2	2	1	2613	1	576738d7b	ci: re-trigger CI (windows Check flake post-outage) [#2613]
+fix/2621-pg-memories-gauge	2-MERGED-PATCHID	1	1425	2026-08-07	0	0	0	0	1	1	0	2621	1	31afe3efd	fix(metrics): ai_memory_memories gauge counts the served postgres corpus, not the sqlite sidecar (#2
+fix/2635-2636-gates	2-MERGED-PATCHID	3025	4646	2026-08-01	0	0	0	0	3025	2699	3	2635	1	e1f865146	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2635-2636-gates
+fix/2637-precompaction-prearchive-firesite	2-MERGED-PATCHID	1	1424	2026-08-07	0	0	0	0	1	1	0	2637	1	4ff465f2e	fix(hooks): wire PreCompaction fire site, remove vestigial PreArchive (#2637)
+fix/2645-pg-parity-fresh-db	2-MERGED-PATCHID	1	1429	2026-08-06	0	0	0	0	1	1	0	2645	1	07677922b	fix(test): make the postgres store_parity_gaps inbox carve-out cell hermetic (#2645)
+fix/2646-sdk-storebulk	2-MERGED-PATCHID	1	1426	2026-08-06	0	0	0	0	1	1	0	2646	1	9f893e26f	fix(sdk): storeBulk sends a bare array and types the true BulkCreateResponse (#2646)
+fix/2657-pg-watchdog-compile-window	2-MERGED-PATCHID	3056	4646	2026-08-01	0	0	0	0	3056	2715	4	2657	1	7ad1a5179	ci(#2657): hoist the sal-postgres test compile out of the 2100s watchdog window
+fix/2658-do-hive-scram-certs	2-MERGED-PATCHID	1	1372	2026-08-11	0	0	0	0	1	1	0	2658	1	ab43f355a	fix(do-hive): RSA cert chain for pg scram channel binding + scram test leg (Progresses #2658)
+fix/2658-hostssl-fail-closed	2-MERGED-PATCHID	1	1378	2026-08-10	0	0	0	0	1	1	0	2658	1	30de95c1a	infra(#2658): fail-CLOSED hostssl arming in the certified provisioning lanes
+fix/2667-federation-dlq-lanes	2-MERGED-PATCHID	2	1376	2026-08-10	0	0	0	0	2	1	0	2667	1	5a90525c0	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2667-federation-dlq-lanes
+fix/2678-default-dlq	2-MERGED-PATCHID	3076	4646	2026-08-03	0	0	0	0	3076	2727	4	2678	1	6ae9a8eb2	merge(release/v1.0.0): integrate #2680; fix sal-postgres DLQ warn syntax
+fix/2679-store-url-fail-closed	2-MERGED-PATCHID	3069	4646	2026-08-03	0	0	0	0	3069	2722	4	2679	1	919837e3e	refactor(#2679): extract store_url module for QUAL-10 ceiling
+fix/2726-2727-audit-sha-pins	2-MERGED-PATCHID	1	1431	2026-08-06	0	0	0	0	1	1	0	2726	1	7c283bb34	docs(cert,audit): pin exact cut SHA (#2726) + remap non-ancestor audit citations (#2727)
+fix/2843-test-isolation	2-MERGED-PATCHID	1	1389	2026-08-09	0	0	0	0	1	1	0	2843	1	7c7888c46	test(#2843): make pg_head_hash_clean_chain order-independent on shared parity DB
+fix/2857-reflect-pg-caller-identity	2-MERGED-PATCHID	2	1385	2026-08-10	0	0	0	0	2	1	0	2857	1	9f7876765	Merge branch 'release/v1.0.0' into fix/2857-reflect-pg-caller-identity
+fix/2863-fed-consolidate-source-attest-parity	2-MERGED-PATCHID	2	1381	2026-08-10	0	0	0	0	2	1	0	2863	1	25051edd6	Merge branch 'release/v1.0.0' into fix/2863-fed-consolidate-source-attest-parity
+fix/2865-fed-enrollment-writesig	2-MERGED-PATCHID	1	1380	2026-08-10	0	0	0	0	1	1	0	2865	1	c4101932a	fix(federation/#2865): converge daemon-authored consolidations at agent_attested out-of-box via push
+fix/2872-pgvector-pin-reconcile	2-MERGED-PATCHID	1	1374	2026-08-11	0	0	0	0	1	1	0	2872	1	095f58677	infra(#2872): unify pgvector pin across both certified provisioning lanes to 0.8.5
+fix/2874-bulk-create-no-overwrite	2-MERGED-PATCHID	2	1373	2026-08-11	0	0	0	0	2	1	0	2874	1	4b2ac7860	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2874-bulk-create-no-overwrite
+fix/2878-mcp-import-lost-update	2-MERGED-PATCHID	3	1370	2026-08-11	0	0	0	0	3	1	0	2878	1	88020f558	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2878-mcp-import-lost-update
+fix/2882-pg-dlq-replay	2-MERGED-PATCHID	4	1369	2026-08-11	0	0	0	0	4	1	0	2882	1	420d73d11	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2882-pg-dlq-replay
+fix/2889-dlq-replay-comment-clarify	2-MERGED-PATCHID	1	1368	2026-08-11	0	0	0	0	1	1	0	2889	1	3ba46033c	docs(#2889): clarify #2882 DLQ test proves SENDER-side replay, not pg-receiver convergence
+fix/3124-unstamped-rows-policy	2-MERGED-PATCHID	9	2	2026-09-12	0	0	0	0	9	9	0	3124	1	010ee0114	docs(#3124): WIP 9 — cert-3607 27/27 evidence labelled pre-#3124 after rebase onto f0175b70
+fix/3288-3427-export-bounded-scoped	2-MERGED-PATCHID	7	2	2026-09-14	0	0	0	0	7	7	0	3288	1	1d83b6f15	test(export): clippy `assigning_clones` in the pg paging walk helper (#3288, #3427)
+fix/3288-pg-export-bounded	2-MERGED-PATCHID	2	2	2026-09-13	0	0	0	0	2	2	0	3288	1	9c03c771c	WIP fix(#3288): explicit &dyn ToSql casts in sqlite export binds
+fix/3340-capabilities-atomisation-truth	2-MERGED-PATCHID	1	2	2026-09-14	0	0	0	0	1	1	0	3340	1	112ea3df5	fix(http): capabilities.atomisation is honest on a postgres-backed daemon — engine fields read unsup
+fix/3354-visible-degradation	2-MERGED-PATCHID	50	2	2026-09-14	0	0	0	0	50	40	0	3354	1	00f85357a	test(audit): the sqlite tombstone proof drives `delete --hard` — the archive-first `delete` writes n
+fix/3354-visible-degradation-v2	2-MERGED-PATCHID	55	2	2026-09-14	0	0	0	0	55	44	0	3354	1	9ff03deeb	docs(#3354): the require-mode limitation is stated where the operator reads it — verify-audit-trail 
+fix/3354-visible-degradation-v3	2-MERGED-PATCHID	56	2	2026-09-14	0	0	0	0	56	45	0	3354	1	b5a87a350	fix(#3354): `keys prune` never reaps the key the ledger is signed with
+fix/3354-visible-degradation-v4	2-MERGED-PATCHID	57	2	2026-09-15	0	0	0	0	57	46	0	3354	1	72af76d23	test(#3354): the postgres twin probes the daemon over TLS, so it measures the same claim after #3705
+fix/3365-param-shapes	2-MERGED-PATCHID	1	602	2026-09-02	0	0	0	0	1	1	0	3365	1	93a41e18a	fix(mcp): refuse contradictory coordination read parameter shapes (#3365)
+fix/3367-action-claims-truth	2-MERGED-PATCHID	3	2	2026-09-14	0	0	0	0	3	3	0	3367	1	4bc20f5af	test(#3367): helper-routed env-mutation baseline 9 -> 10 for src/mcp/tools/action.rs, measured on th
+fix/3372-agent-claims-truth-v2	2-MERGED-PATCHID	6	2	2026-09-14	0	0	0	0	6	6	0	3372	1	0b7d9ded3	fix(mcp): agent register reads `update` type-strictly and looks the agent up by key, not by scanning
+fix/3372-agent-claims-truth-v3	2-MERGED-PATCHID	7	2	2026-09-15	0	0	0	0	7	7	0	3372	1	1daff6ac3	fix(#3372): declare the honoured `update` key on memory_agent_register (#3171 gate)
+fix/3373-load-family-projection	2-MERGED-PATCHID	2	2	2026-09-14	0	0	0	0	2	2	0	3373	1	0f70e647f	fix(mcp): memory_load_family is a discovery scan — an undecryptable sealed row is skipped, never fai
+fix/3379-share-caller-owns-source-v2	2-MERGED-PATCHID	4	240	2026-09-09	0	0	0	0	4	1	0	3379	1	98d19435f	fix(share): require caller visibility and source ownership (#3379)
+fix/3381-auto-tag-owner-gate	2-MERGED-PATCHID	1	528	2026-09-03	0	0	0	0	1	1	0	3381	1	25f705900	fix(mcp): gate memory_auto_tag on the caller-scoped read and route its write through the governed up
+fix/3387-contradiction-scope	2-MERGED-PATCHID	1	602	2026-09-02	0	0	0	0	1	1	0	3387	1	d59974f03	fix(mcp): scope memory_detect_contradiction's two reads to the caller before any LLM call (#3387)
+fix/3390-reflect-type-strict-optionals	2-MERGED-PATCHID	2	2	2026-09-14	0	0	0	0	2	2	0	3390	1	5158624e7	fix(mcp): reflect optionals are parsed once for both entry points, and an out-of-range priority is r
+fix/3392-offload-ttl-read-gate	2-MERGED-PATCHID	3	2	2026-09-14	0	0	0	0	3	3	0	3392	1	8f927bf2e	fix(offload): an explicitly-zero TTL expires immediately on read, as the sweep already reads it (#33
+fix/3393-visible-degradation	2-MERGED-PATCHID	4	2	2026-09-14	0	0	0	0	4	4	0	3393	1	c6427b07b	test(#3393): QUAL-10 — src/mcp/mod.rs ceiling 17_400 -> 17_447, exact to the measured actual on this
+fix/3393-visible-degradation-v2	2-MERGED-PATCHID	5	2	2026-09-15	0	0	0	0	5	5	0	3393	1	2f67df329	refactor(#3393): handle_capture_turn_mcp is anyhow-typed — QUAL-6 goes back to its ceiling, nothing 
+fix/3398-agents-post-gate	2-MERGED-PATCHID	1	540	2026-09-03	0	0	0	0	1	1	0	3398	1	2bb11f410	fix(http): bind POST /api/v1/agents to the authenticated caller (#3398)
+fix/3409-visible-degradation	2-MERGED-PATCHID	1	2	2026-09-13	0	0	0	0	1	1	0	3409	1	1b438d1ac	fix(cli): store --sign refuses visibly when no public key is bound (#3409)
+fix/3409-visible-degradation-v2	2-MERGED-PATCHID	2	2	2026-09-15	0	0	0	0	2	2	0	3409	1	c742c383a	test(#3409): the fixture constructs "exists and unbound" deliberately, so it measures the same claim
+fix/3426-authz-refusal-leak-v2	2-MERGED-PATCHID	41	2	2026-09-13	0	0	0	0	41	31	0	3426	1	451cd041d	fix(#3426): owner-gate refusals never name the owning agent; hidden rows refuse writes as 404 (folds
+fix/3426-authz-refusal-leak-v3	2-MERGED-PATCHID	42	2	2026-09-15	0	0	0	0	42	32	0	3426	1	70a48e47e	test(#3426): the three inherited owner-gate pins state which case they are — hidden row → 404, reada
+fix/3435-migrate-sync-order-independent-v2	2-MERGED-PATCHID	41	2	2026-09-13	0	0	0	0	41	31	0	3435	1	961788adf	fix(#3435): migrate/sync import a valid lineage DAG order-independently and never mint a store they 
+fix/3458-atomise-coverage	2-MERGED-PATCHID	1	2	2026-09-14	0	0	0	0	1	1	0	3458	1	eef2d43ba	test(coverage): #3458 — cover the CLI atomise verb's run_with_curator path
+fix/3519-pg-bootstrap-lock-wait	2-MERGED-PATCHID	1	379	2026-09-06	0	0	0	0	1	1	0	3519	1	e5cfe011a	fix(postgres): poll pg_try_advisory_lock so a migration waiter never pins a snapshot (#3519)
+fix/3520-pg-deadlock-retry	2-MERGED-PATCHID	26	306	2026-09-07	0	0	0	0	26	17	0	3520	1	fdc295a69	fix(store/postgres): the bootstrap catalog probe must ask about the connection's own schema (#3520)
+fix/3523-seam-gate-skips-cfg-test-regions	2-MERGED-PATCHID	1	2	2026-09-15	0	0	0	0	1	1	0	3523	1	14b3dcf3e	test(#3523): the seam gate skips #[cfg(test)] regions — a unit test in the same file is not producti
+fix/3523-test-env-hygiene	2-MERGED-PATCHID	16	322	2026-09-07	0	0	0	0	16	14	0	3523	1	854a68ab5	test(#3523): construct the *_3387 mock client without the health probe (load-flake class #3509)
+fix/3544-shim-status	2-MERGED-PATCHID	1	2	2026-09-14	0	0	0	0	1	1	0	3544	1	12aa5992c	fix(clients): #3544 — shim distinguishes governance Ask (lost) from Pending (queued)
+fix/3548-attestation-split-claims-truth-v2	2-MERGED-PATCHID	4	2	2026-09-14	0	0	0	0	4	4	0	3548	1	0aa808da5	test(#3548): fix the pedantic doc_markdown red and make the changelog fragment agree with the ruling
+fix/3555-durability-receipts	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3555	1	70f9adbc0	fix(receipts): declare observed write durability (#3555)
+fix/3614-quarantined-dependents	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3614	1	e2a3c21d5	fix: hide quarantined invalidation dependents on both backends (#3614)
+fix/3616-signing-domain-tags	2-MERGED-PATCHID	2	2	2026-09-12	0	0	0	0	2	2	0	3616	1	84ae81d35	fix(routines): refuse invalid freeze attestations with recovery guidance (#3616)
+fix/3623-production-gate-coverage	2-MERGED-PATCHID	18	2	2026-09-12	0	0	0	0	18	14	0	3623	1	82a7becb6	fix(gates): restore production coverage and document baseline correction (#3623)
+fix/3627-remove-deepseek-alias	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3627	1	ad9d035c8	fix(#3627): refuse the retired LLM provider alias (no silent fallback)
+fix/3631-fed-inbox-wake-fable	2-MERGED-PATCHID	4	2	2026-09-12	0	0	0	0	4	4	0	3631	1	bb944d085	test(#3631): own the sqlite receiver store with a TempDir, not a leaked temp file
+fix/3636-a2a-integration	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3636	1	93d5c575d	docs: integrate arbitrary agents with the A2A wake plane (#3636)
+fix/3638-reflect-policy-redaction	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3638	1	d77b5281e	fix(reflect): redact private policy diagnostics (#3638)
+fix/3639-visible-degradation	2-MERGED-PATCHID	3	2	2026-09-14	0	0	0	0	3	3	0	3639	1	fe1a66303	test(notify): the branch's own cells assert the wire contract — `title` is the subject, uniqueness i
+fix/3639-visible-degradation-v2	2-MERGED-PATCHID	4	2	2026-09-15	0	0	0	0	4	4	0	3639	1	d80621e40	test(#3639): adapt the inherited fanout pin to the stored-title contract
+fix/3646-health-monitoring-api	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3646	1	f6fe9f625	feat: expose scoped TLS health monitoring API (#3646)
+fix/3647-forensic-payload-redaction-fable	2-MERGED-PATCHID	3	2	2026-09-13	0	0	0	0	3	3	0	3647	1	eece869cf	fix(#3647): decision rows are written whenever the sink is up (Conductor ruling)
+fix/3648-provider-error-redaction	2-MERGED-PATCHID	2	2	2026-09-12	0	0	0	0	2	2	0	3648	1	e691ee44a	fix(observability): preserve operator failure causes (#3648)
+fix/3649-http-span-route-template	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3649	1	dde166b38	fix(#3649): build the HTTP diagnostic span from the matched route, never the URI
+fix/3654-per-peer-federation-freshness	2-MERGED-PATCHID	4	2	2026-09-13	0	0	0	0	4	4	0	3654	1	04b564773	fix(#3654): exact per-peer DLQ oldest-failure seconds on sqlite; test both sinks
+fix/3654-per-peer-federation-freshness-v2	2-MERGED-PATCHID	8	2	2026-09-13	0	0	0	0	8	8	0	3654	1	16c35dc2f	fix(#3654): per-peer observed values are signal objects; value-free test binding names; #3654 doc dr
+fix/3655-doctor-sync-freshness-v2	2-MERGED-PATCHID	9	2	2026-09-13	0	0	0	0	9	9	0	3655	1	39f471bee	fix(#3655): v3 review — enumerate peers from the union of sync_state and sync_peer_contact; redact p
+fix/3659-webhook-audit-status-observed	2-MERGED-PATCHID	2	2	2026-09-14	0	0	0	0	2	2	0	3659	1	ce05714ed	docs(#3659): say at the field what `pending` can mean — the terminal status write may have failed
+fix/3659-webhook-audit-status-observed-v2	2-MERGED-PATCHID	3	2	2026-09-15	0	0	0	0	3	3	0	3659	1	de682e294	test(#3659): two reviewed B7 allowlist rows for the moved delivery-audit writes, with the reason
+fix/3667-allowlist-render-3711-idiom	2-MERGED-PATCHID	60	2	2026-09-14	0	0	0	0	60	50	0	3667	1	d26ad7400	fix(#3667): render every #3667 site from the URL allowlist, never a masker (reconciliation item one)
+fix/3667-allowlist-render-3711-idiom-v2	2-MERGED-PATCHID	61	2	2026-09-15	0	0	0	0	61	51	0	3667	1	36d1c4e72	fix(#3667): end the module-doc lazy continuation so the cfg-stripped clippy pass is green
+fix/3667-allowlist-render-3711-idiom-v3	2-MERGED-PATCHID	62	2	2026-09-15	0	0	0	0	62	52	0	3667	1	2479a5914	fix(#3667): the doctor connect-error arm renders from the allowlist; the collision refusal is pinned
+fix/3690-merge-pins-cannot-read-cannot-merge	2-MERGED-PATCHID	235	2	2026-09-15	0	0	0	0	235	193	1	3690	1	16bb4550c	test(#3690 #3696): the merge cell merges as the OWNER; a paired cell pins cannot-read ⇒ cannot-merge
+fix/3690-p4-guard-follows-conflict-target	2-MERGED-PATCHID	235	2	2026-09-15	0	0	0	0	235	193	1	3690	1	48c339fb0	test(#3690): the append-only P4 guard follows the {conflict_target} indirection; the two upsert stat
+fix/3690-schema-tip-pins-v100	2-MERGED-PATCHID	234	2	2026-09-15	0	0	0	0	234	192	1	3690	1	d65275dca	test(#3690): advance the three remaining schema-tip pins to v100
+fix/3700-shape-derived-posture-v2	2-MERGED-PATCHID	46	2	2026-09-14	0	0	0	0	46	36	0	3700	1	cf17b42f6	test(#3700): env-mutation baseline 65 -> 69 for src/daemon_runtime.rs, measured on this branch
+fix/3705-encrypted-transit-only	2-MERGED-PATCHID	51	2	2026-09-14	0	0	0	0	51	41	0	3705	1	3749b2221	test(#3705): env-mutation baseline 6 -> 7 for src/tls.rs, the one row this branch widens
+fix/3705-encrypted-transit-only-v2	2-MERGED-PATCHID	52	2	2026-09-14	0	0	0	0	52	42	0	3705	1	8282552f2	test(#3705): the #3646 lane-database guard reads the DSN path — #3705 pins sslmode on every DSN
+fix/3705-encrypted-transit-only-v3	2-MERGED-PATCHID	53	2	2026-09-14	0	0	0	0	53	43	0	3705	1	af331d53a	test(#3705): provision the daemon signing key before the read-only key-dir cell — #3354 generates it
+fix/3705-encrypted-transit-only-v4	2-MERGED-PATCHID	54	2	2026-09-15	0	0	0	0	54	44	0	3705	1	9c8ca178e	test(#3705): the eleven inherited dispatch/daemon fixtures speak TLS — the product's refusal stands,
+fix/3705-encrypted-transit-only-v5	2-MERGED-PATCHID	55	2	2026-09-15	0	0	0	0	55	45	0	3705	1	e2b9c3562	refactor(#3705): tls_bind_guard returns anyhow::Result — the QUAL-7 count goes back to its ceiling
+fix/3711-3464-pg-feature-lib-pins	2-MERGED-PATCHID	238	2	2026-09-15	0	0	0	0	238	196	1	3711	1	e09095926	test(#3711 #3464): two sal,sal-postgres lib pins — the boot line's allowlist rendering (present + ab
+fix/3711-credential-to-sink-allowlist-v2	2-MERGED-PATCHID	57	2	2026-09-14	0	0	0	0	57	47	0	3711	1	60bbd4f90	test(#3711): the webhook cell polls for its two DLQ rows past the documented worst case
+fix/3711-credential-to-sink-allowlist-v3	2-MERGED-PATCHID	59	2	2026-09-14	0	0	0	0	59	49	0	3711	1	1a338d957	test(#3711): the webhook cell polls for its two DLQ rows past the documented worst case
+fix/3711-credential-to-sink-allowlist-v4	2-MERGED-PATCHID	60	2	2026-09-15	0	0	0	0	60	50	0	3711	1	f1c598ce2	fix(#3711): the three inherited pins the full sweep named — B7 allowlist, foreign-body echo, and the
+fix/3711-credential-to-sink-allowlist-v5	2-MERGED-PATCHID	61	2	2026-09-15	0	0	0	0	61	51	0	3711	1	3fe65e8d2	test(#3711): the wake-hub write-authority pin reads the forwarded refusal as status, not as the peer
+fix/3712-store-response-never-names-an-invisible-row	2-MERGED-PATCHID	235	2	2026-09-16	0	0	0	0	235	193	1	3712	1	430b4caf8	fix(#3712): a store response never names a row the caller cannot read — the contradiction hint takes
+fix/3713-mcp-error-text	2-MERGED-PATCHID	234	2	2026-09-15	0	0	0	0	234	192	1	3713	1	a259d8615	fix(#3713): MCP tool errors render from a closed vocabulary — one funnel, foreign text stays with th
+fix/3718-read-never-mints	2-MERGED-PATCHID	3	2	2026-09-14	0	0	0	0	3	3	0	3718	1	57462d190	chore(qual-10): lockstep ceiling bump for src/store/postgres.rs — the seal-path guard lands +58 net 
+fix/3718-read-never-mints-v2	2-MERGED-PATCHID	4	2	2026-09-15	0	0	0	0	4	4	0	3718	1	bcb1d041f	test(#3718): scope the key-dir listing assertions to seal material; the precise no-impostor-.priv pi
+fix/3743-identity-generate-not-preempted	2-MERGED-PATCHID	58	2	2026-09-15	0	0	0	0	58	47	0	3743	1	6de1bc656	fix(#3743): the boot key-ensure does not pre-empt the provisioning verbs; the unsigned-ledger remedy
+fix/3752-audit-status-counters-instance	2-MERGED-PATCHID	235	2	2026-09-16	0	0	0	0	235	193	1	3752	1	962d5dd39	test(#3752): the audit-status cells count on a set they own, never a delta across the process-global
+fix/authz-2538-2633	2-MERGED-PATCHID	3126	4646	2026-08-03	0	0	0	0	3126	2749	4	2538	1	dc8fa5ddc	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/authz-2538-2633
+fix/b17-l1-3064d-replay	2-MERGED-PATCHID	1	742	2026-08-29	0	0	0	0	1	1	0	-	-1	a5458cd16	fix(store,http): #3064 batch D — memory_replay on postgres
+fix/bulk-create-funnel-signed	2-MERGED-PATCHID	3128	4646	2026-08-03	0	0	0	0	3128	2750	4	-	-1	ae6799620	fix(#2550,#2551,#2552,#2588,#2594): bulk_create reuses create funnel + honest envelope
+fix/consolidation-unit-1-lifecycle-admission-v2	2-MERGED-PATCHID	227	2	2026-09-15	0	0	0	0	227	185	1	-	-1	0daf6b51a	refactor(mcp/store): the request-echo default is eager — no fallback closure left for a defect vehic
+fix/gitattributes-lineending-restore	2-MERGED-PATCHID	1	1427	2026-08-06	0	0	0	0	1	1	0	-	-1	4fb8bb080	fix(ci): restore line-ending .gitattributes clobbered by the CHANGELOG union commit
+fix/ironclaw-1.1.0-cloudinit-bootstrap	2-MERGED-PATCHID	3	1392	2026-08-09	0	0	0	0	3	1	0	-	-1	5d091a799	Merge branch 'release/v1.0.0' into fix/ironclaw-1.1.0-cloudinit-bootstrap
+fix/secret-screen-pem-dos	2-MERGED-PATCHID	2876	4646	2026-07-22	0	0	0	0	2876	2607	3	-	-1	12a4a89d4	fix(security): terminate multi-block PEM scan in redact_pem_blocks (FBL-16 write-path DoS)
+gates/3688-recurring-classes-2-4-5	2-MERGED-PATCHID	58	2	2026-09-14	0	0	0	0	58	48	1	3688	1	fdb94f9ad	gates(#3688/2): empty the gate-2 pending ledger — the six #3710 sinks are fixed by fix/3711, which l
+infra/2298-ironclaw-nearai-grok45	2-MERGED-PATCHID	2867	4646	2026-07-21	0	0	0	0	2867	2598	3	2298	1	b001ea440	infra(#2298): point do-hive IronClaw at nearai/ironclaw v0.29.1 + grok-4.5
+infra/2848-lan-parity-per-binary-db	2-MERGED-PATCHID	1	1387	2026-08-10	0	0	0	0	1	1	0	2848	1	8f059075a	infra(lan-parity): give each live-pg test binary its own DB in Pass 2 (#2848)
+lane-e/claims-api	2-MERGED-PATCHID	3092	4646	2026-08-03	0	0	0	0	3092	2735	4	-	-1	f35e89806	merge(release/v1.0.0): sync post-Gate1 #2685 into claims-api #2655
+lane-e/claims-gate	2-MERGED-PATCHID	3111	4646	2026-08-03	0	0	0	0	3111	2744	4	-	-1	3b00ed252	fix(claims-gate): repoint CLAUDE.md FederationConfig anchor for #2629 gate
+lane-e/claims-gate-2	2-MERGED-PATCHID	3047	4646	2026-08-01	0	0	0	0	3047	2711	4	-	-1	ee22a7d8d	Merge release/v1.0.0 (cb09bb07) into this claim lane
+lane-e/claims-nsa-html	2-MERGED-PATCHID	3032	4646	2026-08-01	0	0	0	0	3032	2702	3	-	-1	1ac9ad32f	Merge remote-tracking branch 'origin/release/v1.0.0' into lane-e/claims-nsa-html
+lane-e/claims-perf	2-MERGED-PATCHID	3028	4646	2026-08-01	0	0	0	0	3028	2700	3	-	-1	c56dd3728	Merge origin/release/v1.0.0 into this claim lane (CHANGELOG both-added)
+lane-e/claims-readme	2-MERGED-PATCHID	3030	4646	2026-08-01	0	0	0	0	3030	2702	3	-	-1	3fc0747ce	docs(readme): make the benchmark-image note merge-order-independent
+lane-e/claims-readme-svg-note	2-MERGED-PATCHID	3030	4646	2026-08-01	0	0	0	0	3030	2702	3	-	-1	3fc0747ce	docs(readme): make the benchmark-image note merge-order-independent
+lane-e/claims-register-errata	2-MERGED-PATCHID	3102	4646	2026-08-03	0	0	0	0	3102	2739	4	-	-1	5ab72ca03	Merge remote-tracking branch 'origin/release/v1.0.0' into lane-e/claims-register-errata
+lane-e/claims-relnotes	2-MERGED-PATCHID	3040	4646	2026-08-01	0	0	0	0	3040	2705	3	-	-1	eea26ec74	Merge remote-tracking branch 'origin/release/v1.0.0' into lane-e/claims-relnotes
+lane-e/claims-security	2-MERGED-PATCHID	3099	4646	2026-08-03	0	0	0	0	3099	2738	4	-	-1	08099ad0a	merge(release): re-sync lane-e/claims-security onto 364d8129 after #2655
+perf/2576-2577-rerank-embed	2-MERGED-PATCHID	3020	4646	2026-08-01	0	0	0	0	3020	2697	3	2576	1	aa8435eaa	Merge remote-tracking branch 'origin/release/v1.0.0' into perf/2576-2577-rerank-embed
+perf/health-metrics-o-corpus	2-MERGED-PATCHID	3007	4646	2026-07-31	0	0	0	0	3007	2690	3	-	-1	862f106d0	Merge remote-tracking branch 'origin/release/v1.0.0' into perf/health-metrics-o-corpus
+perf/load-family-cli-startup	2-MERGED-PATCHID	3002	4646	2026-07-31	0	0	0	0	3002	2687	3	-	-1	194418cbf	docs(#2580,#2584): record the measured end-to-end results and the namespace-omitted blast radius
+perf/pg-query-shapes	2-MERGED-PATCHID	3015	4646	2026-07-31	0	0	0	0	3015	2695	3	-	-1	b8112642e	docs: CLAUDE.md said the postgres ladder ends at migrate_v87()
+plan/v0.9.0-epic	2-MERGED-PATCHID	2531	4646	2026-06-30	0	0	0	0	2531	2294	3	-	-1	6d0c161ef	docs(v0.9.0): AI-NHI autonomous development EPIC master prompt
+rehearsal/pre-resign-2423af6e3	2-MERGED-PATCHID	242	2	2026-09-16	0	0	0	0	242	200	1	-	-1	2423af6e3	fix(#3712): a store response never names a row the caller cannot read — the contradiction hint takes
+test/2525-mcp-subprocess-read-timeout	2-MERGED-PATCHID	2974	4646	2026-07-30	0	0	0	0	2974	2673	3	2525	1	638a7e610	Merge remote-tracking branch 'origin/release/v1.0.0' into test/2525-mcp-subprocess-read-timeout
+wt-2887-restore-cas	2-MERGED-PATCHID	2	1367	2026-08-11	0	0	0	0	2	1	0	2887	1	92fe7b419	Merge remote-tracking branch 'origin/release/v1.0.0' into wt-2887-restore-cas
+dependabot/npm_and_yarn/sdk/typescript/baseline-browser-mapping-2.11.22	3-OPEN-PR	53	1900	2026-09-11	3594	46	1	0	53	50	0	-	-1	8112aa2ae	build(deps-dev): bump baseline-browser-mapping in /sdk/typescript
+dependabot/npm_and_yarn/sdk/typescript/browserslist-4.28.9	3-OPEN-PR	53	1900	2026-09-07	3534	46	1	0	53	50	0	-	-1	d68fcea7d	build(deps-dev): bump browserslist in /sdk/typescript
+dependabot/npm_and_yarn/sdk/typescript/js-yaml-3.15.2	3-OPEN-PR	53	1900	2026-09-13	3689	46	1	0	53	50	0	-	-1	82f60e824	build(deps): bump js-yaml from 3.14.2 to 3.15.2 in /sdk/typescript
+dependabot/npm_and_yarn/sdk/typescript/brace-expansion-1.1.18	3-OPEN-PR	39	1900	2026-08-26	3262	34	1	0	39	38	0	-	-1	c960a46a3	build(deps): bump brace-expansion in /sdk/typescript
+dependabot/npm_and_yarn/sdk/typescript/undici-6.28.0	3-OPEN-PR	39	1900	2026-08-26	3261	34	1	0	39	38	0	-	-1	d917879b1	build(deps): bump undici from 6.26.0 to 6.28.0 in /sdk/typescript
+docs/reaudit-nhi-2026-08-15	3-OPEN-PR	39	1900	2026-08-15	2950	34	1	0	39	38	0	2026	1	6ab6f9279	docs(reviews): §0 re-audit at HEAD 2026-08-15 — 08-14 AI-NHI findings closure + now-vs-v1.1.0
+campaign/2271-deferred-audit-restart	4-UNMERGED	2932	4646	2026-07-21	0	75	75	0	2932	2663	3	2271	1	08b7ad2f4	test(daemon): split shutdown coverage below size ceiling
+docs/remove-certification-mark-language	4-UNMERGED	55	1900	2026-09-17	0	46	0	1	55	51	0	-	-1	aad599465	docs: replace certification-mark language with conformance label in design and assessment documents
+docs/remove-trademark-notices	4-UNMERGED	53	1900	2026-09-17	0	46	0	1	53	50	0	-	-1	86be0beea	docs: remove trademark and USPTO notices across docs, pages, and comments
+docs/engineering-page-and-nav-consistency	4-UNMERGED	49	1900	2026-09-01	0	43	0	1	49	47	0	-	-1	9ed4365cb	docs(site): extend LIVE banner + Live Testing/Test Results nav to remaining audience pages
+fix/3587-u1-deterministic-supersession-fable	4-UNMERGED	31	2	2026-09-12	0	31	31	0	31	31	0	3587	1	96c343fae	docs(3587): changelog states the CLI resolve compatibility change in operator language
+docs/audits-nhi-3x7-2026-08-07	4-UNMERGED	35	1900	2026-08-07	0	30	0	1	35	34	0	2026	1	5e2349af4	docs(audits): NHI 3×7 adversarial reassessment of endpoint-memory claims [skip ci]
+feat/1875-curator-parity-disclosure	4-UNMERGED	2775	4646	2026-07-16	0	29	29	0	2775	2519	3	1875	1	eaad65778	fix(#2109): keep the HF cache path literal inside hf_hub — vendor-monoculture gate
+docs/audit-open-issues-board-2026-08-04	4-UNMERGED	2777	4646	2026-08-04	0	28	0	0	2777	2521	3	2026	1	e0e654662	docs(audit): open-issues post-GA board + burn-down analysis (2026-08-04)
+docs/graph-eng-gaps	4-UNMERGED	2770	4646	2026-07-28	0	23	0	0	2770	2514	3	-	-1	d105c6c04	docs(graph-engineering): node contracts, pipeline-by-default, convergent loops, R-207 [skip ci]
+fix/2512-main-paste-forwardport	4-UNMERGED	2771	4646	2026-07-30	0	23	0	0	2771	2515	3	2512	1	66e4ac6ce	fix(#2050): vendor paste 1.0.15 in-tree — restore CI (deleted fork unfetchable) (#2051)
+docs/ga-review-wave2-corrections	4-UNMERGED	2769	4646	2026-07-28	0	22	0	0	2769	2513	3	-	-1	988cfafd7	docs(reviews): AMEND GA review — Wave 2 + 1x5 overturn the consensus [skip ci]
+docs/v100-ga-findings-review	4-UNMERGED	2768	4646	2026-07-27	0	21	0	0	2768	2512	3	-	-1	aed8fe19d	docs(reviews): v1.0.0 GA gap vote, ROADMAP cross-correlation, retractions [skip ci]
+feat/2024-skill-retire	4-UNMERGED	2766	4646	2026-07-15	0	20	20	0	2766	2510	3	2024	1	4ff9bc55d	feat(#2024): memory_skill_retire — reversible operator-authorized skill lifecycle
+feat/1969-reranker-offline-guard	4-UNMERGED	2765	4646	2026-07-15	0	19	19	0	2765	2509	3	1969	1	906328f82	feat(#1969): reranker honors AI_MEMORY_EMBED_OFFLINE (fail-loud, no silent fetch)
+docs/v1.0.0-3x7-review	4-UNMERGED	2765	4646	2026-07-22	0	18	0	0	2765	2509	3	-	-1	662214b39	docs(reviews): v1.0.0 3×7 Grok 4.5 dogfood full-spectrum audit
+feat/1707-recall-utility-shadow	4-UNMERGED	2764	4646	2026-07-15	0	18	18	0	2764	2508	3	1707	1	76178d32c	feat(#1707): shadow consume-vs-access divergence evidence (observe-only)
+feat/1390-sdk-shims	4-UNMERGED	2763	4646	2026-07-18	0	17	17	0	2763	2507	3	1390	1	942647a6b	chore(#1390): finalize SDK shims — hygiene, gitignores, publish workflow
+feat/1979-claude-plugin	4-UNMERGED	2763	4646	2026-07-15	0	17	17	0	2763	2507	3	1979	1	c53fc1cee	feat(#1979): Claude Code plugin marketplace manifest (.claude-plugin/)
+fix/storage-chain	4-UNMERGED	2901	4646	2026-07-23	0	15	15	0	2901	2630	3	-	-1	f7fde79af	Merge remote-tracking branch 'origin/release/v1.0.0' into wt-2354-fix
+fix/postgres-parity-chain	4-UNMERGED	2901	4646	2026-07-24	0	13	13	0	2901	2631	3	-	-1	f7294cfc0	test(store): qual_10 lockstep — store/postgres.rs ceiling 29_020 -> 29_900
+feat/1834-claim-bitemporal	4-UNMERGED	2758	4646	2026-07-14	0	12	12	0	2758	2502	3	1834	1	16c81a0ea	feat(#1834): schema v82 — archive→restore round-trips claim-bitemporal valid_from/valid_until (#2035
+feat/1974-patch-primitive	4-UNMERGED	2758	4646	2026-07-15	0	12	12	0	2758	2502	3	1974	1	223fb502c	feat(#1974): content patch primitive (append / unique-match replace) for memory_update
+fix/2044-per-agent-key	4-UNMERGED	2771	4646	2026-07-16	0	12	12	0	2771	2512	3	2044	1	271fe2a69	refactor(#2095): extract api-key verb logic to cli::agents helpers (daemon_runtime coverage floor)
+fix/3587-u1-deterministic-supersession	4-UNMERGED	12	27	2026-09-11	0	12	12	0	12	12	0	3587	1	7b233ee70	fix(supersession): audit final store and resolve errors (#3587)
+feat/1868-streaming	4-UNMERGED	2757	4646	2026-07-15	0	11	11	0	2757	2501	3	1868	1	e9b2a64ed	feat(#1868): B7-STREAM disposition — MCP tool responses single-terminal; streaming feasible but defe
+feat/1864-bridge-capability	4-UNMERGED	2756	4646	2026-07-15	0	10	10	0	2756	2500	3	1864	1	6447d60f9	feat(#1864): TRACT G10.4 bridge-capability — honest §14 (namespace is a filter, not a boundary) + ch
+feat/1863-promotion-court	4-UNMERGED	2755	4646	2026-07-15	0	9	9	0	2755	2499	3	1863	1	eda325515	feat(#1863): TRACT G10.3 promotion-court — honest §13 (3 lanes to long) + characterization tests
+feat/2006-integrity-exporter	4-UNMERGED	2755	4646	2026-07-15	0	9	9	0	2755	2499	3	2006	1	f04132b12	docs(#2006): update PORTABILITY-V2 §V2-7 ledger — integrity exporter SHIPPED
+fix/2502-auth-failure-backoff	4-UNMERGED	9	2	2026-09-13	0	9	9	0	9	9	0	2502	0	ee05835ae	fix(#2502): WIP 3 — Conductor rulings: declared trusted proxies, blocked sources never evicted, IPv6
+cert-ci-evidence-cluster	4-UNMERGED	8	1358	2026-08-11	0	8	8	0	8	8	0	-	-1	eef677128	docs(cert): reconcile summary-level cert-job descriptions to the built-deploy-image mechanism (Fable
+feat/1862-refusal-claim	4-UNMERGED	2754	4646	2026-07-15	0	8	8	0	2754	2498	3	1862	1	b58ccf077	feat(#1862): TRACT G10.2 refusal-as-Claim — wired RefusalClaim anchor + §12 (defer persist)
+feat/2059-2060-covenant-gates	4-UNMERGED	2771	4646	2026-07-16	0	8	8	0	2771	2512	3	2059	1	adf4888dc	Merge remote-tracking branch 'origin/release/v1.0.0' into feat/2059-2060-covenant-gates
+campaign/docs-disclosure-bundle	4-UNMERGED	2832	4646	2026-07-18	0	7	7	0	2832	2562	3	-	-1	459d63b36	Merge remote-tracking branch 'origin/release/v1.0.0' into campaign/docs-disclosure-bundle
+docs/2405-2411-truthfulness	4-UNMERGED	2903	4646	2026-07-24	0	7	7	0	2903	2634	3	2405	1	5fce753c5	docs(#2405,#2406,#2407,#2408,#2409,#2411): CHANGELOG [Unreleased] Documentation entry
+docs/3x7-integration-2026-08-09	4-UNMERGED	17	1391	2026-08-09	0	7	7	0	17	8	1	2026	1	ea2f4df01	merge: #2814 playbook/power/load_family/nsa-csi drift into 3x7 integration
+feat/1839-latency-degrade	4-UNMERGED	2753	4646	2026-07-15	0	7	7	0	2753	2497	3	1839	1	bcd3951cf	feat(#1839): TRACT G31 latency-degrade honesty — wire dead p95 metric + const-ify mode + §11
+fix/2024-skill-retire-lifecycle	4-UNMERGED	2759	4646	2026-07-15	0	7	7	0	2759	2501	3	2024	1	f6f6769dd	test(#2024): bump qual_6 legacy-error-type ceiling 114->116 for 2 new skill handlers
+fix/2448-fed-outbound-server-verify	4-UNMERGED	2923	4646	2026-07-29	0	7	7	0	2923	2650	3	2448	1	574cd0f63	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2448-fed-outbound-server-verify
+fix/2449-supplychain-checksums	4-UNMERGED	2915	4646	2026-07-29	0	7	7	0	2915	2646	3	2449	1	de24c43a8	fix(#2449): verify the COPR source tarballs against their published .sha256
+fix/2455-sdk-release-gate	4-UNMERGED	2915	4646	2026-07-28	0	7	7	0	2915	2645	3	2455	1	e1f16679c	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2455-sdk-release-gate
+fix/3152-sal-update-single-commit-v2	4-UNMERGED	7	10	2026-09-11	0	7	7	0	7	7	0	3152	1	75d3d2f3b	test(#3152): spawn_test_child forwards LLVM_PROFILE_FILE into the env_clear child
+fix/3152-sal-update-single-commit-v3	4-UNMERGED	7	2	2026-09-12	0	7	7	0	7	7	0	3152	1	f7cb01d39	test(#3152): spawn_test_child forwards LLVM_PROFILE_FILE into the env_clear child
+fix/3700-shape-derived-posture	4-UNMERGED	7	2	2026-09-13	0	7	7	0	7	7	0	3700	1	d3bfa4f7a	fix(#3700): pedantic clippy — case-insensitive forensic file extension check in the posture test
+fix/bulk-create-funnel	4-UNMERGED	3134	4646	2026-08-03	0	7	7	0	3134	2756	4	-	-1	ac051714d	fix(#2588): correct the bulk envelope assertion in valid_from_write_surface_2258
+campaign/2064-erasure-cold-tier	4-UNMERGED	2845	4646	2026-07-18	0	6	6	0	2845	2572	3	2064	1	9f1e38314	Merge remote-tracking branch 'origin/release/v1.0.0' into campaign/2064-erasure-cold-tier
+campaign/B3-valid-time-parity	4-UNMERGED	2864	4646	2026-07-21	0	6	6	0	2864	2595	3	-	-1	06d7ca7a3	test(qual-10): ratchet valid-time module ceilings
+docs/perfection-wave2-2026-08-09	4-UNMERGED	8	1388	2026-08-09	0	6	6	0	8	6	0	2026	1	d3463a2a1	Merge branch 'release/v1.0.0' into docs/perfection-wave2-2026-08-09
+feat/1829-cost-of-access	4-UNMERGED	2752	4646	2026-07-15	0	6	6	0	2752	2496	3	1829	1	a41800964	feat(#1829): TRACT G15 retention-model anchor (discrete TTL tiers, no cost gradient)
+fix/2447-fed-write-ns-scope	4-UNMERGED	2918	4646	2026-07-29	0	6	6	0	2918	2647	3	2447	1	edf993a10	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2447-fed-write-ns-scope
+fix/3152-sal-update-single-commit	4-UNMERGED	6	15	2026-09-11	0	6	6	0	6	6	0	3152	1	4ecdf0956	test(#3152): route the re-exec test child through the #1937 spawn chokepoint
+fix/3200-truthy-grammar-ssot-v3	4-UNMERGED	6	2	2026-09-12	0	6	6	0	6	6	0	3200	1	4ca892498	fix(#3200): WIP 6 — rule (e) re-pins from the 776c2ead battery; QUAL-10 by split, not bump
+fix/3587-u3-stale-rulings	4-UNMERGED	6	32	2026-09-11	0	6	6	0	6	6	0	3587	1	4abfecc80	fix(#3587 U3 r3): single deterministic-id state row; read it by id
+fix/config-daemon-defaults	4-UNMERGED	2885	4646	2026-07-23	0	6	6	0	2885	2616	3	-	-1	7f7605c1d	qc(c8): allowlist the FBL-22 daemon maintenance for_admin bypass (#2342)
+campaign/2036-bitemporal-residual	4-UNMERGED	2837	4646	2026-07-18	0	5	5	0	2837	2564	3	2036	1	041fd2468	Merge remote-tracking branch 'origin/release/v1.0.0' into campaign/2036-bitemporal-residual
+campaign/2042-portability-v2	4-UNMERGED	2842	4646	2026-07-18	0	5	5	0	2842	2568	3	2042	0	49d3515b4	Merge origin/release/v1.0.0 (4a277bc8: #2219 vectorlite scaffolding) into campaign/2042-portability-
+feat/1830-erasure-cold-tier	4-UNMERGED	2751	4646	2026-07-15	0	5	5	0	2751	2495	3	1830	1	0e8eee0db	feat(#1830): TRACT G16 durability-model disclosure anchor (no erasure cold tier)
+fix/2032-security-hardening	4-UNMERGED	2757	4646	2026-07-15	0	5	5	0	2757	2499	3	2032	1	025918ca7	test(#2032): bump qual_10 module-size ceilings in lockstep with tranche additions
+fix/2383-encrypt-upsert-key	4-UNMERGED	2904	4646	2026-07-24	0	5	5	0	2904	2635	3	2383	1	ca9cf884e	test(#2383): bump the postgres ceiling to the real post-rebase size (30_906)
+fix/2393-2397-pg-parity	4-UNMERGED	2906	4646	2026-07-26	0	5	5	0	2906	2637	3	2393	1	577359f1f	fix(test): make the #2393/#2397 span extractor CRLF-correct (Windows CI red)
+fix/3200-truthy-grammar-ssot	4-UNMERGED	5	25	2026-09-11	0	5	5	0	5	5	0	3200	1	93897d460	docs(#3200): WIP 5 — no comment or doc names a removed grammar helper
+fix/3200-truthy-grammar-ssot-v2	4-UNMERGED	5	10	2026-09-11	0	5	5	0	5	5	0	3200	1	7db2b5d14	docs(#3200): WIP 5 — no comment or doc names a removed grammar helper
+fix/consolidation-unit-1-lifecycle-admission	4-UNMERGED	208	2	2026-09-15	0	5	5	0	208	166	1	-	-1	11fa93cba	chore(lint): name the surviving-row metadata column once; read lifecycle_state by its field-name con
+fix/docs-ssot-drift	4-UNMERGED	2880	4646	2026-07-22	0	5	5	0	2880	2611	3	-	-1	7e8b03a84	infra(#2322): guard check-migration-ladder.sh + check-hardcoded-literals.sh against bash < 4
+campaign/B1-erasure-sweep-hardening	4-UNMERGED	2864	4646	2026-07-21	0	4	4	0	2864	2595	3	-	-1	4f32c0a67	fix(erasure): close purge and recovery audit findings
+docs/fable5-handoff	4-UNMERGED	2927	4646	2026-07-30	0	4	4	0	2927	2655	3	-	-1	9339d6460	docs(handoff): the false cleanliness claim appeared TWICE — header still carried it
+docs/v100-release-engineering	4-UNMERGED	2867	4646	2026-07-21	0	4	4	0	2867	2598	3	-	-1	d02136a82	docs(roadmap): fix stale schema-85 claim + harden docs-vs-ssot gate
+feat/1832-covenant-clauses	4-UNMERGED	2750	4646	2026-07-15	0	4	4	0	2750	2494	3	1832	1	afc4c618d	docs(#1832): wire deferred-clause issue numbers (#2059-#2062) into contract §8.3
+feat/1873-audit-head-hash-anchor	4-UNMERGED	2750	4646	2026-07-14	0	4	4	0	2750	2494	3	1873	1	7a206b0ec	feat(#1873): fold the witness dual-head lane into the audit head-hash anchor
+feat/5.3-doctor-posture	4-UNMERGED	5	1353	2026-08-12	0	4	4	0	5	4	0	-	-1	b80e7fff4	Merge remote-tracking branch 'origin/release/v1.0.0' into feat/5.3-doctor-posture
+feat/do-hive-multinode-federation	4-UNMERGED	6	1393	2026-08-09	0	4	4	0	6	4	0	-	-1	83a52838c	docs(do-hive): disclose the TOFU residual on the SSH channel that carries the CA + leaf keys (#2812)
+fix/2280-2281-validtime-parity	4-UNMERGED	2869	4646	2026-07-21	0	4	4	0	2869	2599	3	2280	1	3107f41c2	docs(changelog): fold #2280/#2281/#2287 entries into the [1.0.0] section layout
+fix/2288-2289-store-batch-parity	4-UNMERGED	2873	4646	2026-07-21	0	4	4	0	2873	2601	3	2288	1	abf41943c	test(#2287): pending_list test establishes its own pending_actions precondition
+fix/2390-prelink-ns-hook	4-UNMERGED	2900	4646	2026-07-24	0	4	4	0	2900	2631	3	2390	1	e362514fc	docs(hooks): #2390 — document namespace scoping on pre-* events
+fix/2444-backup-fail-closed	4-UNMERGED	2913	4646	2026-07-29	0	4	4	0	2913	2644	3	2444	1	c70eac8b5	test(#2444): simplify the refused-backup no-snapshot assertion
+fix/2567-pg-auto-migrate-embedder-gate	4-UNMERGED	7	1362	2026-08-11	0	4	4	0	7	4	0	2567	1	c32fe5484	test(qual-10): re-add postgres.rs ceiling bump 33_150->33_280 for #2567 (dropped by --theirs merge)
+fix/2771-create-error-atomic	4-UNMERGED	7	1375	2026-08-10	0	4	4	0	7	4	0	2771	1	feaa4d2f4	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2771-create-error-atomic
+fix/3342-async-batch-embed	4-UNMERGED	4	554	2026-09-02	0	4	4	0	4	4	0	3342	0	4eaf70f26	fix(perf): sal-gate the #3342 embed-backfill worker module
+fix/3667-url-query-password-redaction-v2	4-UNMERGED	4	2	2026-09-12	0	4	4	0	4	4	0	3667	1	ffd972192	fix(#3667): bound URL userinfo at whitespace; mask ambiguous tokens, not messages
+fix/3669-temp-guard-leak	4-UNMERGED	4	2	2026-09-13	0	4	4	0	4	4	0	3669	1	27c488555	WIP(#3669): governance temp roots read from the seed; gate has no exception
+fix/3711-two-dsn-cells-cannot-pass-vacuously	4-UNMERGED	206	2	2026-09-15	0	4	4	0	206	164	1	3711	1	1e2b3c7cd	test(#3711): the two DSN cells that could not fail now assert the rendering is present, on the build
+fix/3720-encrypt-at-rest-row-37	4-UNMERGED	54	2	2026-09-14	0	4	4	0	54	43	0	3720	0	7cb649f2b	docs(#3720): row 37 — AAD binding, the 0x02 vs 0x03 erasability distinction, and the federation clau
+fix/3730-inbox-drain-not-touch-r2	4-UNMERGED	68	2	2026-09-14	0	4	4	0	68	55	0	3730	1	4754dc8c9	test(#3730): QUAL-10 — src/store/postgres.rs ceiling 42_500 -> 42_513, exact to the measured actual 
+fix/3744-userinfo-strips-before-the-ssrf-host-check	4-UNMERGED	205	2	2026-09-15	0	4	4	0	205	163	1	3744	1	5e546b86f	fix(#3744): strip userinfo before either SSRF guard extracts the host
+fix/3744-userinfo-strips-before-the-ssrf-host-check-v2	4-UNMERGED	204	2	2026-09-15	0	4	4	0	204	162	1	3744	1	5d0653386	fix(#3744): strip userinfo before either SSRF guard extracts the host
+fix/n7-n8-n23-n24-egress-gate-strict	4-UNMERGED	2899	4646	2026-07-24	0	4	4	0	2899	2629	4	-	-1	3d51c87e8	Merge branch 'release/v1.0.0' of https://github.com/alphaonedev/ai-memory-mcp into fix/n7-n8-n23-n24
+campaign/2039-crypto-reanchor	4-UNMERGED	2830	4646	2026-07-18	0	3	3	0	2830	2561	3	2039	0	9dd5d9434	fix(#2004): PR #2214 crypto-audit findings F1-F4 — claim re-lock, sqlite-scope honesty, true read-ba
+campaign/2078-content-patch	4-UNMERGED	2830	4646	2026-07-18	0	3	3	0	2830	2559	3	2078	1	f23337b6f	test(#1974): bless D1.7 tools/list snapshots for content-patch params (closes #2206)
+campaign/2258-valid-from-write	4-UNMERGED	2856	4646	2026-07-19	0	3	3	0	2856	2586	3	2258	1	d3014470f	test(#2258): pin valid-time store schema extension
+campaign/preship-validtime-canonicalize	4-UNMERGED	2854	4646	2026-07-19	0	3	3	0	2854	2583	4	-	-1	19e13a94e	test(conformance): regenerate #2030 export golden under v86 valid-time canonicalization
+campaign/tract-l1-covenant	4-UNMERGED	2844	4646	2026-07-19	0	3	3	0	2844	2574	3	-	-1	b0144d925	fix(tests): carry the #2229 MemoryLink source_cid/target_cid fields in the claim-view test literal
+cb19-2721-reserved-sentinel-wire	4-UNMERGED	3	1422	2026-08-07	0	3	3	0	3	3	0	2721	1	c2196e69d	ci: strip CHANGELOG for conflict-free batch drain (entry re-added in the drain CHANGELOG PR) [2747]
+feat/1978-notify-watch	4-UNMERGED	2854	4646	2026-07-19	0	3	3	0	2854	2577	3	1978	1	be6e7a7fc	chore: merge release/v1.0.0 (post #2232) — CHANGELOG keep-all
+fix/2045-mtls-san-peerid	4-UNMERGED	2758	4646	2026-07-15	0	3	3	0	2758	2501	3	2045	1	a3f86214d	fix(#2045): address #2094 review — tower-service, TLS-glue tests, boot WARNs
+fix/2292-encryption-funnel-class	4-UNMERGED	2871	4646	2026-07-21	0	3	3	0	2871	2602	3	2292	1	aee5289ca	fix(#2292): seal the 9th funnel — postgres trait update() (silent-data-loss + leak)
+fix/2293-2295-infra-test	4-UNMERGED	2877	4646	2026-07-22	0	3	3	0	2877	2607	3	2293	1	171a2db9a	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2293-2295-infra-test
+fix/2400-2401-compliance-capability-truth	4-UNMERGED	4	1363	2026-08-11	0	3	3	0	4	3	0	2400	1	701549e87	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2400-2401-compliance-capability-truth
+fix/2419-lease-expiry-requeue	4-UNMERGED	2907	4646	2026-07-28	0	3	3	0	2907	2637	3	2419	1	da1b3d340	Merge branch 'release/v1.0.0' into fix/2419-lease-expiry-requeue
+fix/2571-export-completeness	4-UNMERGED	3	1356	2026-08-11	0	3	3	0	3	3	0	2571	1	7671abd10	docs(#2571): correct CHANGELOG claim to reflect F2 at-rest reseal, not raw byte-preservation
+fix/3354-3198-integration-fixture-isolation	4-UNMERGED	204	2	2026-09-15	0	3	3	0	204	162	1	3354	1	3e8b8789e	test(#3354/#3198): isolate tests/integration.rs — HOME + 0700 key dir + race-free daemon-key pre-gen
+fix/3372-rebless-tools-list-snapshot	4-UNMERGED	204	2	2026-09-15	0	3	3	0	204	162	1	3372	1	5ee207b93	test(#3372): re-bless the tools/list full-profile snapshot for the new `update` property
+fix/3555-write-receipt-tests-do-not-require-cargo-target-dir	4-UNMERGED	204	2	2026-09-15	0	3	3	0	204	162	1	3555	1	9e36434e1	test(#3555): the four write-receipt targets no longer require CARGO_TARGET_DIR
+fix/3652-log-rotation-contract	4-UNMERGED	3	2	2026-09-13	0	3	3	0	3	3	0	3652	1	0d293b109	WIP fix(#3652): rotation=never refuses boot, rotation=external declares the operator's bound
+fix/3657-wake-counters	4-UNMERGED	3	2	2026-09-13	0	3	3	0	3	3	0	3657	0	15d110d91	fix(#3657): review rework — the fallback gauge has one owner; CONNECTING is stamped before the task 
+fix/3663-operation-correlation	4-UNMERGED	3	2	2026-09-13	0	3	3	0	3	3	0	3663	0	9c0087b1c	fix(#3663): absent X-Peer-Id records no peer_id field, never ""
+fix/3667-url-query-password-redaction	4-UNMERGED	3	2	2026-09-12	0	3	3	0	3	3	0	3667	1	8c7025618	fix(#3667): drop request URLs from LLM transport errors; rustfmt (WIP 3)
+fix/3697-webhook-warn-path-named	4-UNMERGED	204	2	2026-09-15	0	3	3	0	204	162	1	3697	1	4a8e36946	test(#3697): name #3697 in the webhook cell and drive its two guard-refusal warn lines
+fix/3711-credential-to-sink-allowlist	4-UNMERGED	44	2	2026-09-14	0	3	3	0	44	34	0	3711	1	96f887b7d	docs(#3711): the changelog names #3697 as the sixth folded issue
+fix/3711-two-dsn-cells-cannot-pass-vacuously-v2	4-UNMERGED	205	2	2026-09-15	0	3	3	0	205	163	1	3711	1	3ec1dd0ef	test(#3711): the two DSN cells that could not fail now assert the rendering is present, on the build
+fix/3711-two-dsn-cells-cannot-pass-vacuously-v3	4-UNMERGED	206	2	2026-09-15	0	3	3	0	206	164	1	3711	1	297894bda	test(#3711): DSN_RENDERED carries the cfg of the two cells it exists for
+fix/3730-inbox-drain-not-touch-r3	4-UNMERGED	66	2	2026-09-14	0	3	3	0	66	56	0	3730	1	7e68e776e	test(#3730): r3 — re-measure the postgres.rs ceiling on the rebased tree (unchanged at 42_513)
+fix/3730-parity-funnels-defends-the-gate	4-UNMERGED	204	2	2026-09-15	0	3	3	0	204	162	1	3730	1	9d1cbd804	test(#3730): parity_write_funnels defends the derived gate instead of the hole it pinned
+fix/3730-parity-funnels-defends-the-gate-v2	4-UNMERGED	205	2	2026-09-15	0	3	3	0	205	163	1	3730	1	7f0617ffa	test(#3730): the parity file carries the postgres twin of the non-inbox refusal
+fix/3733-keydir-fixtures-guard-r2	4-UNMERGED	55	2	2026-09-14	0	3	3	0	55	43	0	3733	1	48ac6d52b	Merge commit '40de3a419' into fix/3733-keydir-fixtures-guard-r2
+fix/3744-userinfo-strips-before-the-ssrf-host-check-v3	4-UNMERGED	204	2	2026-09-15	0	3	3	0	204	162	1	3744	1	6775e8e4e	fix(#3744): strip userinfo before either SSRF guard extracts the host
+fix/federation-ack-attest	4-UNMERGED	2884	4646	2026-07-23	0	3	3	0	2884	2614	3	-	-1	3b3c1caf0	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/federation-ack-attest
+fix/routing-quota	4-UNMERGED	2885	4646	2026-07-23	0	3	3	0	2885	2615	3	-	-1	c8c206ada	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/routing-quota
+fix/singletons-hnsw-egress-lease	4-UNMERGED	2882	4646	2026-07-23	0	3	3	0	2882	2612	3	-	-1	dc31dec4d	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/singletons-hnsw-egress-lease
+gates/3688-recurring-classes	4-UNMERGED	43	2	2026-09-13	0	3	3	0	43	33	0	3688	1	98fe07055	test(qual-10): set migrations.rs headroom from the QUEUE, not just the current actual
+wt-2392-fts-tags	4-UNMERGED	3	1361	2026-08-11	0	3	3	0	3	3	0	2392	1	d8d351ea1	test(qual-10): re-measure postgres.rs ceiling for #2392+#2567 combined (rebase)
+campaign/2030-v2-roundtrip-fixture	4-UNMERGED	2840	4646	2026-07-19	0	2	2	0	2840	2570	3	2030	1	955dc43ce	Merge remote-tracking branch 'origin/release/v1.0.0' into campaign/2030-v2-roundtrip-fixture
+campaign/2038-audit-head-anchor	4-UNMERGED	2828	4646	2026-07-18	0	2	2	0	2828	2558	3	2038	1	b8583b0e1	fix(#2202,#2203): head-hash anchor — compare AT the anchored sequence + pg precision skew (CWE-354)
+campaign/2195-archive-parity	4-UNMERGED	2835	4646	2026-07-18	0	2	2	0	2835	2565	3	2195	1	da2d563b0	Merge remote-tracking branch 'origin/release/v1.0.0' into campaign/2195-archive-parity
+campaign/2225-poison-skip-set	4-UNMERGED	2844	4646	2026-07-19	0	2	2	0	2844	2573	3	2225	1	07f46588d	chore: merge release/v1.0.0 (post #2228/#2229/#2226 drain) — CHANGELOG keep-all
+campaign/2233-lineage-dag-boot-seed	4-UNMERGED	2847	4646	2026-07-19	0	2	2	0	2847	2577	3	2233	1	b3a961342	chore: merge release/v1.0.0 (post-drain) — CHANGELOG keep-all
+campaign/B2-import-transaction-hardening	4-UNMERGED	2861	4646	2026-07-21	0	2	2	0	2861	2592	3	-	-1	afd1b540d	fix(import): close attestation and trust snapshot gaps
+campaign/B4-trust-anchor-export	4-UNMERGED	2853	4646	2026-07-20	0	2	2	0	2853	2584	3	-	-1	83aa4b5d9	fix(portability): keep anchor export public-only
+campaign/B6-build-script-vetting	4-UNMERGED	2858	4646	2026-07-19	0	2	2	0	2858	2588	3	-	-1	2a78380a9	ci(#2259): prefetch locked cross-platform metadata graph
+campaign/preship-docs-reconcile	4-UNMERGED	2847	4646	2026-07-19	0	2	2	0	2847	2578	3	-	-1	423db00f0	docs(v1.0.0): align README:216 CLI history — add #1955 Stop alongside #1978 Watch
+campaign/preship-erasure-gc-unblock	4-UNMERGED	2855	4646	2026-07-19	0	2	2	0	2855	2584	3	-	-1	110473b3d	merge: fold release/v1.0.0 into #2262
+campaign/preship-import-hardening	4-UNMERGED	2854	4646	2026-07-19	0	2	2	0	2854	2583	3	-	-1	7ef9bb91a	chore: fold release/v1.0.0 after #2265
+docs-cert-truthfulness	4-UNMERGED	2	1360	2026-08-11	0	2	2	0	2	2	0	-	-1	2ff8cbb3b	docs(cert): complete trust_domain retire — restate zero-touch-trust.html credential table (Fable B-1
+docs/tracka-remint-2026-08-09	4-UNMERGED	2	1395	2026-08-09	0	2	2	0	2	2	0	2026	1	dc201e345	docs(v1.0.0): record the concrete pg-route-inventory gate result in the Track A re-mint
+feat/1833-open-predicate-relations	4-UNMERGED	2748	4646	2026-07-15	0	2	2	0	2748	2492	3	1833	1	95b507cb4	feat(#1833): TRACT L1 open-predicate relation contract (G19) + provisional drift-gate
+feat/1860-vectorlite	4-UNMERGED	2836	4646	2026-07-18	0	2	2	0	2836	2564	3	1860	1	7adc5cdf1	Merge remote-tracking branch 'origin/release/v1.0.0' into feat/1860-vectorlite
+feat/2004-re-anchor-ceremony	4-UNMERGED	2748	4646	2026-07-14	0	2	2	0	2748	2492	3	2004	1	bf4ad6ab8	feat(#2004): wire the crypto-agility re-anchor ceremony into a signed checkpoint
+feat/2086-reranker-prestage	4-UNMERGED	2762	4646	2026-07-16	0	2	2	0	2762	2505	3	2086	1	eaff7adb3	Merge remote-tracking branch 'origin/release/v1.0.0' into feat/2086-reranker-prestage
+feat/2438-measurement-scaffolding	4-UNMERGED	3	1422	2026-08-07	0	2	2	0	3	3	1	2438	1	bed95e088	ci: strip CHANGELOG for conflict-free batch drain (entry re-added in the drain CHANGELOG PR) [2752]
+feat/2608-rerank-budget-scorer-seam	4-UNMERGED	2	1422	2026-08-07	0	2	2	0	2	2	0	2608	1	658f3a3ec	ci: strip CHANGELOG for conflict-free batch drain (entry re-added in the drain CHANGELOG PR) [2761]
+feat/2648-create-extension-allowlist	4-UNMERGED	2	1422	2026-08-07	0	2	2	0	2	2	0	2648	1	38edfe25d	ci: strip CHANGELOG for conflict-free batch drain (entry re-added in the drain CHANGELOG PR) [2755]
+fix/1989-suite-wedge	4-UNMERGED	2756	4646	2026-07-16	0	2	2	0	2756	2500	3	1989	1	fb0eba573	test-infra(#1989): narrow the stdin-gate carve-out to the helper fn + scan examples/
+fix/2050-vendor-paste	4-UNMERGED	2748	4646	2026-07-15	0	2	2	0	2748	2492	3	2050	1	8924c3433	infra(#2050): COPY vendor/ into the Docker build context
+fix/2111-content-patch-overlap	4-UNMERGED	2864	4646	2026-07-21	0	2	2	0	2864	2594	3	2111	1	bf6ad7961	test(#2111): audit polish — multibyte overlap pin + deletion-form comment + helper debug_assert
+fix/2424-pg-ladder-bootstrap-parity	4-UNMERGED	2909	4646	2026-07-28	0	2	2	0	2909	2639	3	2424	1	3b4877871	Merge branch 'release/v1.0.0' into fix/2424-pg-ladder-bootstrap-parity
+fix/2445-downgrade-guard	4-UNMERGED	2911	4646	2026-07-29	0	2	2	0	2911	2642	3	2445	1	91573bdbe	test(#2445): WIP downgrade-guard regression coverage (orchestrator-preserved)
+fix/2452-conformance-reader-proof	4-UNMERGED	2914	4646	2026-07-29	0	2	2	0	2914	2644	3	2452	1	e0908a1e6	Merge branch 'release/v1.0.0' into fix/2452-conformance-reader-proof
+fix/2462-2463-expires-at-utc-ceiling	4-UNMERGED	2	2	2026-09-13	0	2	2	0	2	2	0	2462	1	5b180c9d3	test(qual-10): #2462/#2463 lockstep ceiling for migrations.rs (7_300 -> 7_440)
+fix/2486-signing-posture	4-UNMERGED	2	1357	2026-08-11	0	2	2	0	2	2	0	2486	1	3cf5071da	fix(#2486): cite real vote record, explicit fail-closed registry guard, N1-N3 fixes
+fix/2587-async-autotag-write	4-UNMERGED	3	1354	2026-08-12	0	2	2	0	3	2	0	2587	1	dc54c39b0	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2587-async-autotag-write
+fix/2710-2720-fed-pending-identity-quorum	4-UNMERGED	3	1422	2026-08-07	0	2	2	0	3	3	1	2710	1	35fa18c5d	ci: strip CHANGELOG for conflict-free batch drain (entry re-added in the drain CHANGELOG PR) [2753]
+fix/2713-claims-gate-fail-closed	4-UNMERGED	2	1430	2026-08-06	0	2	2	0	2	2	0	2713	1	5c62bcd92	chore(repo): union-merge CHANGELOG.md to eliminate the recurring [Unreleased]-append conflict
+fix/2716-erasure-restore-race	4-UNMERGED	2	1422	2026-08-07	0	2	2	0	2	2	0	2716	1	454ed5d69	ci: strip CHANGELOG for conflict-free batch drain (entry re-added in the drain CHANGELOG PR) [2754]
+fix/2728-2729-release-html-ssot	4-UNMERGED	2	1422	2026-08-07	0	2	2	0	2	2	0	2728	1	4ea387581	ci: strip CHANGELOG for conflict-free batch drain (entry re-added in the drain CHANGELOG PR) [2749]
+fix/2860-fed-consolidate-converge	4-UNMERGED	3	1383	2026-08-10	0	2	2	0	3	2	0	2860	1	03b1d9eb4	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2860-fed-consolidate-converge
+fix/3350-check-duplicate-failclosed	4-UNMERGED	2	536	2026-09-03	0	2	2	0	2	2	0	3350	0	a3d0f1e89	fix(dedup): an empty candidate scope is an evaluated verdict, not a degraded one (#3350)
+fix/3380-consolidate-caller-owns-source-v2	4-UNMERGED	2	236	2026-09-09	0	2	2	0	2	2	0	3380	1	be6be261b	fix(consolidate): apply current caller visibility across existing surfaces (#3380)
+fix/3660-read-audit-evidence-v2	4-UNMERGED	2	2	2026-09-14	0	2	2	0	2	2	0	3660	0	c69486456	fix(#3660): last_gap is absent until the first gap; forensic residence is a queue accept; strict kno
+fix/3661-restore-evidence	4-UNMERGED	2	2	2026-09-13	0	2	2	0	2	2	0	3661	0	801a92191	fix(#3661): review rework — the evidence journal is never rewritten; import state lives in a sidecar
+fix/3662-nonce-cache-health-v2	4-UNMERGED	2	2	2026-09-14	0	2	2	0	2	2	0	3662	1	27066f8a5	fix(#3662): last_persisted_at_seconds is absent until the first successful write; drop the racy glob
+fix/3730-inbox-drain-not-touch-r1	4-UNMERGED	62	2	2026-09-14	0	2	2	0	62	50	0	3730	1	bd1d41e79	sdk(#3730): drop the inbox `read` field from the TypeScript and Python models; document unread_only 
+fix/3730-inbox-drain-not-touch-r4	4-UNMERGED	197	2	2026-09-15	0	2	2	0	197	155	1	3730	1	14748e776	test(#3730): the postgres drain pin reads the archive through a probe store, not the admin-only rout
+fix/3730-inbox-drain-not-touch-r5	4-UNMERGED	199	2	2026-09-15	0	2	2	0	199	157	1	3730	1	0cb42ce43	test(#3730): retarget #3639's two `read`-field pins to the retired marker — the reconciliation the l
+fix/3733-keydir-fixtures-guard-r1	4-UNMERGED	53	2	2026-09-14	0	2	2	0	53	42	0	3733	1	c387136e0	ci(#3733): declare test-keydir-mode-gate in the not-required ledger — a dated decision record, promo
+fix/3733-keydir-fixtures-guard-r3	4-UNMERGED	199	2	2026-09-15	0	2	2	0	199	157	1	3733	1	a499b7430	ci(#3733): declare test-keydir-mode-gate in the not-required ledger — a dated decision record, promo
+fix/3733-keydir-fixtures-guard-r4	4-UNMERGED	200	2	2026-09-15	0	2	2	0	200	158	1	3733	1	ef9ad26c2	test(#3733): the three key-dir fixtures the v1.0.0 order added after this branch was cut
+fix/3733-keydir-fixtures-guard-r5	4-UNMERGED	202	2	2026-09-15	0	2	2	0	202	160	1	3733	1	e2e37f7b0	test(#3733): the three key-dir fixtures the v1.0.0 order added after this branch was cut
+fix/determinism-ordering-2602-2615	4-UNMERGED	2	1359	2026-08-11	0	2	2	0	2	2	0	2602	1	091e4d9c6	fix(#2602,#2615): collation-stable postgres tiebreaks close cross-backend order drift
+fix/n5-n6-setvar-redact	4-UNMERGED	2894	4646	2026-07-24	0	2	2	0	2894	2625	3	-	-1	5a478c28b	fix(#2387): bound each PEM redaction span to its own BEGIN..END block
+fix/pg-pending-timeout-sweep	4-UNMERGED	2897	4646	2026-07-24	0	2	2	0	2897	2627	3	-	-1	21d30fa2f	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/pg-pending-timeout-sweep
+fix/pg-put-quota-charge	4-UNMERGED	2899	4646	2026-07-24	0	2	2	0	2899	2629	3	-	-1	78c64216d	test(#2378): cover charge_update_growth trait default (store/mod.rs coverage floor)
+rehearsal/v1.0.0-resolved-29	4-UNMERGED	192	2	2026-09-15	0	2	2	0	192	150	1	-	-1	c3ba52943	MERGE-STEP: QUAL-10 merger ceiling bump
+campaign/2079-content-patch-cli	4-UNMERGED	2846	4646	2026-07-19	0	1	1	0	2846	2574	3	2079	1	531526a77	chore: merge release/v1.0.0 (post #2231/#2227) — CHANGELOG keep-all
+campaign/2221-supersede-archive-parity	4-UNMERGED	2839	4646	2026-07-19	0	1	1	0	2839	2569	3	2221	1	df0bb51b0	Merge remote-tracking branch 'origin/release/v1.0.0' into campaign/2221-supersede-archive-parity
+chain/12-publish	4-UNMERGED	41	2	2026-09-13	0	1	1	0	41	31	0	-	-1	37cacaaa5	cert(#3556): VOID the enterprise-federation certificate — the certified surface drifted
+docs/c3-cert-55-20check-b	4-UNMERGED	1	809	2026-08-28	0	1	1	0	1	1	0	-	-1	076ebb139	docs(cert): recapture enterprise-fed §2 20-check evidence at f61dcab2
+docs/capacity-claims-cert-2869	4-UNMERGED	2	1377	2026-08-10	0	1	1	0	2	1	0	2869	1	7750246bc	Merge remote-tracking branch 'origin/release/v1.0.0' into docs/capacity-claims-cert-2869
+docs/rlt-latent-vs-durable	4-UNMERGED	1	2	2026-09-13	0	1	1	0	1	1	0	-	-1	edbbf1e14	docs(reviews): cite Recurrent Looped Transformer, and why latent state is not memory
+feat/1803-ironclaw-peerkey	4-UNMERGED	2765	4646	2026-07-16	0	1	1	0	2765	2506	3	1803	1	d815ec107	Merge remote-tracking branch 'origin/release/v1.0.0' into feat/1803-ironclaw-peerkey
+feat/1836-six-verb-claim-algebra	4-UNMERGED	2747	4646	2026-07-15	0	1	1	0	2747	2491	3	1836	1	513e35897	feat(#1836): TRACT L1 Claim contract (G22) + non-authoritative ClaimView divergence anchor
+feat/1980-signed-rule-pack-template	4-UNMERGED	2747	4646	2026-07-15	0	1	1	0	2747	2491	3	1980	1	1965c2676	feat(#1980): signed-rule-pack refuse-by-default template + workflow docs
+feat/1987-bench-baseline-ci	4-UNMERGED	2747	4646	2026-07-15	0	1	1	0	2747	2491	3	1987	1	c3b1633bc	feat(#1987): wire bench --baseline regression guard into CI + baseline recipe
+fix/2355-approval-quorum-all-surfaces	4-UNMERGED	2910	4646	2026-07-29	0	1	1	0	2910	2641	3	2355	1	4edccbc2e	fix(#2355): WIP — route every approve surface through verify_quorum (orchestrator-preserved)
+fix/2462-2463-expires-at-utc	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	2462	1	3250ce647	fix(#2462,#2463): canonical Z v54 backfill + sqlite TTL instant-MAX self-heal
+fix/2708-checkpoint-xns-resolution	4-UNMERGED	1	1429	2026-08-06	0	1	1	0	1	1	0	2708	1	62cf6acef	fix(federation): confine inbound checkpoint resolution to the STORED namespace (#2708, CB-3)
+fix/2856-fed-consolidate-replicate	4-UNMERGED	3	1384	2026-08-10	0	1	1	0	3	1	0	2856	1	330669fbd	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/2856-fed-consolidate-replicate
+fix/3068-empty-chain-watermark-bleed	4-UNMERGED	1	1224	2026-08-19	0	1	1	0	1	1	0	3068	1	a4bf9b8e8	fix(#3068): identity-less audit reader must not bleed a sibling's forensic watermark
+fix/3277-config-parse-secret-leak	4-UNMERGED	1	854	2026-08-27	0	1	1	0	1	1	0	3277	1	a34c84088	fix(config): #3277 do not echo api_key on TOML parse error
+fix/3341-read-path-serialization	4-UNMERGED	1	604	2026-09-01	0	1	1	0	1	1	0	3341	1	8f74eb2e4	fix(perf): GET-by-id uses per-anchor links; scale PG/WAL read pools
+fix/3354-signed-events-failclosed	4-UNMERGED	1	554	2026-09-03	0	1	1	0	1	1	0	3354	1	aca861051	fix(audit): refuse and surface a silently-UNSIGNED signed_events ledger (#3354)
+fix/3372-agent-claims-truth	4-UNMERGED	2	2	2026-09-14	0	1	1	0	2	2	0	3372	1	1690e584a	fix(mcp): agent register reads `update` type-strictly and looks the agent up by key, not by scanning
+fix/3379-share-caller-owns-source	4-UNMERGED	1	528	2026-09-03	0	1	1	0	1	1	0	3379	1	5f30a417c	fix(mcp-share): resolve the memory_share source through the caller-scoped read funnel (#3379)
+fix/3380-consolidate-caller-owns-source	4-UNMERGED	1	528	2026-09-03	0	1	1	0	1	1	0	3380	1	3fe472f4a	fix(consolidate): resolve every consolidation source through the caller-scoped read and ownership ga
+fix/3382-archive-read-owner-scope	4-UNMERGED	1	528	2026-09-03	0	1	1	0	1	1	0	3382	1	42b913711	fix(mcp-archive): owner-scope memory_archive_list / _stats and route _restore through the gated call
+fix/3383-archive-purge-admin-gate	4-UNMERGED	1	528	2026-09-03	0	1	1	0	1	1	0	3383	1	f055d6806	fix(mcp-archive): check memory_archive_purge as_admin against [admin].agent_ids, admin-gate the memo
+fix/3386-kg-query-visibility	4-UNMERGED	1	554	2026-09-02	0	1	1	0	1	1	0	3386	1	23bfae025	fix(mcp): honour kg_query namespace + as_agent on every traversal path (#3386)
+fix/3398-agent-registration-authorization	4-UNMERGED	1	554	2026-09-02	0	1	1	0	1	1	0	3398	1	9f64233ae	fix: authorize HTTP agent registration
+fix/3399-notify-sender-identity	4-UNMERGED	1	554	2026-09-02	0	1	1	0	1	1	0	3399	0	051819ce5	fix: preserve HTTP notify sender identity (#3399)
+fix/3400-postgres-wire-shapes	4-UNMERGED	1	536	2026-09-03	0	1	1	0	1	1	0	3400	0	bd7f1d487	fix: normalize postgres administrative wire shapes (#3400)
+fix/3404-canonical-row-projection	4-UNMERGED	1	554	2026-09-03	0	1	1	0	1	1	0	3404	1	7bb73eb09	fix: preserve canonical memory row fields
+fix/3420-update-drops-stale-attestation	4-UNMERGED	1	564	2026-09-02	0	1	1	0	1	1	0	3420	1	87c6928b4	fix(update): drop the attestation an update's rewritten envelope invalidated (#3420)
+fix/3423-reflect-owner-parity	4-UNMERGED	1	554	2026-09-02	0	1	1	0	1	1	0	3423	1	5e9ecceb7	fix(http): reflect owner + reflects_on edge attestation are backend-identical (#3423)
+fix/3433-cli-agent-identity	4-UNMERGED	1	536	2026-09-03	0	1	1	0	1	1	0	3433	1	284251582	fix: bind FX-C3 CLI commands to caller identity
+fix/3434-doctor-readonly-identity	4-UNMERGED	1	536	2026-09-03	0	1	1	0	1	1	0	3434	1	05ba397ec	fix: make doctor read-only and caller-aware
+fix/3545-wrap-codex-system	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3545	0	e4b99e3c0	fix(#3545): wrap codex fail-closed outside the tested CLI range (U1)
+fix/3548-attestation-split-claims-truth	4-UNMERGED	1	2	2026-09-14	0	1	1	0	1	1	0	3548	1	148dc3134	fix(recall): content attestation is named apart from link attestation, and the confidence claim trav
+fix/3556-cert-expiry-watch-void	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3556	1	e945b1a78	fix(#3556): cert-expiry watches §5 surface, VOID banner, bind-SHA ancestor
+fix/3587-u3-stale-rulings-opus2	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3587	1	5d0557ea4	feat(#3587 U3): curator stale-ruling sweep (sqlite + store-backed), 24 h floor, deterministic state 
+fix/3632-helper-param-scanner	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3632	0	7af024783	test(mcp): audit const parameter reads through helpers (#3632)
+fix/3645-observability-audit	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3645	1	ebdc14885	docs(audit): report observability gaps for #3645
+fix/3650-default-log-filter-fable	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3650	1	74af5c8e6	fix(#3650): default log filter covers every target; RUST_LOG layered last
+fix/3651-logging-pipeline-failures	4-UNMERGED	1	2	2026-09-13	0	1	1	0	1	1	0	3651	1	ea76c1e71	fix(logging): a failed log sink refuses boot and delivery loss is counted (#3651)
+fix/3655-b7-allowlist-sync-peer-contact	4-UNMERGED	10	2	2026-09-15	0	1	1	0	10	10	0	3655	1	b1330e40e	test(record-stop): B7 allowlist row for storage::sync_peer_record_contact, with the reason (#3655)
+fix/3655-doctor-sync-freshness	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3655	1	efe6e1ecf	fix(#3655): doctor Sync keeps unreadable / invalid / empty distinct and ages peers against now
+fix/3656-remote-doctor-health	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3656	0	578533cdd	fix(#3656): remote doctor probes /health and reads the fleet counters
+fix/3658-dlq-bookkeeping-failures	4-UNMERGED	1	2	2026-09-12	0	1	1	0	1	1	0	3658	0	45d24ed5e	fix(#3658): handle, count and name federation DLQ bookkeeping failures
+fix/3660-read-audit-evidence	4-UNMERGED	1	2	2026-09-13	0	1	1	0	1	1	0	3660	0	cd818ee1f	fix(#3660): engaged read decisions — the "DLQ-backed" claim was false; measure the gap, add the stri
+fix/3662-nonce-cache-health	4-UNMERGED	1	2	2026-09-13	0	1	1	0	1	1	0	3662	1	5ac733859	fix(#3662): nonce cache reports what it measures on /health, /metrics and doctor
+fix/3665-vector-index-rejections-classified	4-UNMERGED	1	2	2026-09-14	0	1	1	0	1	1	0	3665	0	afd875842	fix(#3665): classify vector-index insert rejections — invalid input is WARN + counter, index loss st
+fix/3674-dsn-screen-before-sqlx	4-UNMERGED	1	2	2026-09-13	0	1	1	0	1	1	0	3674	1	f64d337bb	WIP fix(#3674): screen store DSN before sqlx parses it
+fix/3730-inbox-drain-not-touch	4-UNMERGED	1	2	2026-09-14	0	1	1	0	1	1	0	3730	1	f41a57ea5	fix(#3730): the inbox has a handled state — drain by deleting; reads never mark; inbox deletes archi
+fix/3733-keydir-fixtures-guard	4-UNMERGED	1	2	2026-09-14	0	1	1	0	1	1	0	3733	1	337b276ae	test(#3733): key-dir fixtures use mkdir_0700; gate refuses bare-created key dirs
+fix/age-deferred-cluster	4-UNMERGED	2896	4646	2026-07-24	0	1	1	0	2896	2625	3	-	-1	3501a251c	Merge remote-tracking branch 'origin/release/v1.0.0' into fix/age-deferred-cluster
+infra/do-perf-tls	4-UNMERGED	3031	4646	2026-08-01	0	1	1	0	3031	2702	3	-	-1	353fb2fd1	infra(do-perf): dedicated measurement tier spliced from the certified stack, with PostgreSQL TLS enf
+refactor/1802-s1-doctor	4-UNMERGED	2774	4646	2026-07-17	0	1	1	0	2774	2518	3	1802	1	d7e2913f9	refactor(#1802): S1 — extract storage/doctor.rs from the storage/mod.rs monolith (R-05 proof-of-appr
+refactor/1802-s1-doctor-v2	4-UNMERGED	2864	4646	2026-07-21	0	1	1	0	2864	2594	3	1802	1	d522edca5	chore: fold onto release HEAD
+test/2285-synthesis-telemetry-lock	4-UNMERGED	2864	4646	2026-07-21	0	1	1	0	2864	2595	3	2285	1	419488431	test(#2285): serialize synthesis prompt-telemetry tests behind a shared lock
+test/2303-fed-send-decrypts-pin	4-UNMERGED	2874	4646	2026-07-21	0	1	1	0	2874	2604	3	2303	1	a922ee30a	Merge remote-tracking branch 'origin/release/v1.0.0' into test/2303-fed-send-decrypts-pin
+main	5-PROTECTED	56	1900	2026-09-17	0	46	0	1	56	51	0	-	-1	96b8c6948	Merge pull request #3765 from alphaonedev/docs/remove-certification-mark-language
+release/v0.8.1	5-PROTECTED	2511	4646	2026-06-29	0	1	1	0	2511	2276	3	-	-1	44565a781	docs(pages): fix current-facing schema-version drift v70->v71
+rehearsal/audit-wip	5-PROTECTED	283	2	2026-09-17	3769	0	0	0	0	0	0	-	-1	436459898	fix(#3404-amend): derive sync-since projection from the canonical row list
+release/v0.7.0	5-PROTECTED	2108	4646	2026-06-12	0	0	0	0	2108	1893	3	-	-1	4d563a485	docs(release): add world-class v0.7.0 GA release-body page
+release/v0.7.1	5-PROTECTED	2187	4646	2026-06-15	0	0	0	0	2187	1955	3	-	-1	9b460a227	docs(pages): add Distribution channels section to v0.7.1 release page
+release/v0.8.0	5-PROTECTED	2474	4646	2026-06-28	0	0	0	0	2474	2239	3	-	-1	d984544df	docs(v0.8.1): carve out the pre-v0.9.0 defect-closure work prompt (Patch 1) [skip ci]
+release/v0.9.0	5-PROTECTED	2620	4646	2026-07-08	0	0	0	0	2620	2383	3	-	-1	59695ad08	docs: warn all users — non-signing MCP clients (Claude Code) 403 under required attestation
+release/v1.0.0	5-PROTECTED	0	0	2026-09-18	0	0	0	0	0	0	0	-	-1	79d516d2a	Merge pull request #3779 from alphaonedev/docs/reviews-c2c-3x7
