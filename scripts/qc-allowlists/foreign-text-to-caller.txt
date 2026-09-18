@@ -35,14 +35,15 @@
 # commit is 66 live instances (#3674=3, #3707=35, #3708=2, #3760=2, #3761=10, #3762=10, #3766=4 — the
 # namespace key's two instances plus checkpoint.rs:162 and share.rs:225), 0 NOTICEs, 0 FAIL. On the
 # #3761 tree the same gate reads #3761=0 and #3766=3 (the namespace key's surviving :566 instance).
-#   #3713  MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp)                       119 keys
+#   #3713  MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp) — CLOSED on the tip:
+#          every site renders through `mcp::error_text::mcp_error_text` (f948d38ce, 74cbaeaff, #3761)   0 keys
 #   #3707  HTTP handler JSON bodies (http-body) + errors.rs From<...> (memory-error)                   44 keys
 #   #3724  webhook receiver text persisted into subscription_dlq.last_error (dlq-record)                1 keys
 #   #3708  hook / governance Deny.reason (deny-reason)                                                  2 keys
 #   #3674  store_err_to_response schema arms carrying a path / DSN label (funnel-arm)                   3 keys
 #   #3698  forward_to_http: peer body AND federation URL in MCP error text (one key covers both taints)   1 keys
 
-# ---- #3713 — MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp) (119 keys) ----
+# ---- #3713 — MCP tool errors (mcp-error / rpc-error / memory-error under src/mcp) (0 keys; closed) ----
 
 # ---- #3707 — HTTP handler JSON bodies (http-body) + errors.rs From<...> (memory-error) (44 keys) ----
 src/errors.rs:from:memory-error:db=pending:#3707
@@ -102,13 +103,9 @@ mapper=conflict_or_string
 src/handlers/admin.rs:import_memories:http-body:db=pending:#3760
 #   #3761  driver text reaching MCP callers through a `?`-propagated Result<_, String> helper OUTSIDE
 #          src/mcp (actions::create_guarded*) and through match-arm `.map_err(|e| e.to_string())` values
-#          (forget / archive / lineage; the namespace key is held under #3766, see below)           6 keys
-src/actions/mod.rs:create_guarded:mcp-error:db=pending:#3761
-src/actions/mod.rs:create_guarded_in_transaction:mcp-error:db=pending:#3761
-src/mcp/tools/archive.rs:handle_archive_restore:mcp-error:db=pending:#3761
-src/mcp/tools/forget.rs:forget_preview:mcp-error:db=pending:#3761
-src/mcp/tools/forget.rs:handle_forget:mcp-error:db=pending:#3761
-src/mcp/tools/lineage.rs:handle_lineage:mcp-error:db=pending:#3761
+#          (forget / archive / lineage) — CLOSED by 12d96160e on the tip; its six lines are dropped
+#          (they read as NOTICEs once the fix and the #3767 gate met on one tree). The namespace key
+#          is held under #3766, see below.                                                          0 keys
 # The namespace key below carries THREE instances on the tip: the two bind-refusal `error={err}` strings
 # #3761 closes, and `db::set_namespace_standard(..).map_err(|e| e.to_string())?` (namespace.rs:566), which
 # is #3766's — the #3767 receiver boundary made it visible. One key holds one issue; it is held under
