@@ -156,8 +156,11 @@ fn http_client() -> reqwest::blocking::Client {
 /// so one CA validates every daemon this suite spawns. Returns `None` until the
 /// daemon has written the CA (early boot, before it binds), so the readiness loop
 /// can call it every tick and start probing the moment TLS material exists.
-fn local_ca_client(timeout: Duration) -> Option<reqwest::blocking::Client> {
-    let ca_path = key_dir_sandbox::pin()
+fn local_ca_client(
+    key_dir: &std::path::Path,
+    timeout: Duration,
+) -> Option<reqwest::blocking::Client> {
+    let ca_path = key_dir
         .join(ai_memory::tls_bootstrap::TLS_SUBDIR)
         .join(ai_memory::tls_bootstrap::LOCAL_CA_CERT_FILE);
     let pem = std::fs::read(&ca_path).ok()?;
@@ -198,17 +201,41 @@ fn real_hf_home() -> Option<String> {
 /// — it `env_remove`s it so the compiled default posture is in force
 /// (HTTP-direct fails CLOSED), which is exactly the shipped default this
 /// acceptance harness must exercise.
+/// #3817 — a PER-CELL key dir under the cell's own db tempdir. Every
+/// daemon-spawning cell used to share `key_dir_sandbox::pin()` (one
+/// process-wide sandbox), so under `cargo test` parallelism two first-boot
+/// daemons raced the #3705/#3709 auto-TLS mint/renew in ONE `<key_dir>/tls`:
+/// a concurrent `server.key` replace ENOENTs a peer -> #3705 fail-closed ->
+/// exit 75; or a CA regenerated under a live daemon leaves the verify-full
+/// probe trusting a CA that no longer matches the served leaf -> 60s timeout.
+/// Deriving from `db.parent()` isolates each cell while keeping the SAME dir
+/// across a same-db restart, so the #3776 durability cell still adopts one
+/// identity + one local CA.
+fn acc_key_dir(db: &std::path::Path) -> std::path::PathBuf {
+    db.parent().expect("fixture database parent").join("keys")
+}
+
 fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChild {
+    // #3817 — arm the #3516 key-dir guard for children (idempotent, process-wide),
+    // then hand this daemon its OWN 0700 key dir instead of the shared sandbox.
+    let _ = key_dir_sandbox::pin();
+    let key_dir = acc_key_dir(db);
+    key_dir_sandbox::mkdir_0700(&key_dir);
+    // #3817 — HOME is a per-cell SUBDIR (sibling of the key dir), never the db
+    // tempdir itself, so `key_dir` (db.parent()/keys) does NOT resolve under HOME
+    // and the #3355 `assert_isolated` guard admits this isolated key dir.
+    let home_dir = db.parent().expect("fixture database parent").join("home");
+    std::fs::create_dir_all(&home_dir).expect("#3817 mkdir per-cell home");
     let mut last_stderr = String::new();
     for attempt in 1..=BIND_RETRY_ATTEMPTS {
         let port = free_port();
         let port_s = port.to_string();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.env("AI_MEMORY_NO_CONFIG", "1")
-            .env("HOME", db.parent().expect("fixture database parent"))
+            .env("HOME", &home_dir)
             // #3198 — sandboxed 0700 keystore so the daemon never touches the
             // host operator keys and never fails closed on a 0775 host dir.
-            .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())
+            .env("AI_MEMORY_KEY_DIR", &key_dir)
             // Use the COMPILED default attestation posture (HTTP-direct
             // required / fail-closed). Clear any inherited opt-out.
             .env_remove("AI_MEMORY_REQUIRE_AGENT_ATTESTATION")
@@ -279,6 +306,7 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
         // `first_boot_daemon_refuses_plain_http_3776`).
         let health_url = format!("https://127.0.0.1:{port}/api/v1/health");
         let mut probe: Option<reqwest::blocking::Client> = None;
+        let mut last_probe_err = String::from("(no probe attempt yet)");
         let deadline = Instant::now() + SPAWN_TIMEOUT;
         loop {
             if Instant::now() >= deadline {
@@ -288,23 +316,41 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
+                let ca_path = key_dir
+                    .join(ai_memory::tls_bootstrap::TLS_SUBDIR)
+                    .join(ai_memory::tls_bootstrap::LOCAL_CA_CERT_FILE);
                 panic!(
-                    "daemon never became ready within {SPAWN_TIMEOUT:?}\n--- stderr ---\n{stderr}"
+                    "daemon never became ready within {SPAWN_TIMEOUT:?}\n\
+                     [F2H-INSTRUMENT] probe_built={} ca_path={} ca_exists={}\n\
+                     [F2H-INSTRUMENT] last_probe_err={last_probe_err}\n--- stderr ---\n{stderr}",
+                    probe.is_some(),
+                    ca_path.display(),
+                    ca_path.exists()
                 );
             }
             if probe.is_none() {
-                probe = local_ca_client(READINESS_PROBE_TIMEOUT);
+                probe = local_ca_client(&key_dir, READINESS_PROBE_TIMEOUT);
             }
-            if let Some(p) = probe.as_ref()
-                && let Ok(resp) = p.get(&health_url).send()
-                && resp.status().is_success()
-            {
-                return DaemonChild {
-                    child: Some(child),
-                    port,
-                    stderr: stderr_buf,
-                    stderr_handle,
-                };
+            if let Some(p) = probe.as_ref() {
+                match p.get(&health_url).send() {
+                    Ok(resp) if resp.status().is_success() => {
+                        return DaemonChild {
+                            child: Some(child),
+                            port,
+                            stderr: stderr_buf,
+                            stderr_handle,
+                        };
+                    }
+                    Ok(resp) => {
+                        last_probe_err = format!("GET {health_url} -> HTTP {}", resp.status());
+                    }
+                    Err(e) => {
+                        last_probe_err = format!("GET {health_url} -> ERR {e}");
+                    }
+                }
+            } else {
+                last_probe_err =
+                    String::from("local_ca_client returned None (CA not readable yet)");
             }
             if let Ok(Some(status)) = child.try_wait() {
                 if let Some(h) = stderr_handle {
@@ -524,7 +570,7 @@ fn config1_full_surface_attested_nhi_e2e() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("acc-nhi.db");
     let daemon = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
-    let client = local_ca_client(REQUEST_TIMEOUT)
+    let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
         .expect("#3709 zero-config local CA present after the daemon became ready");
     let kp = ai_memory::identity::keypair::generate(NHI_AGENT).expect("nhi keypair");
     let ns = "acc-nhi";
@@ -896,7 +942,7 @@ fn config1_durability_across_daemon_restart() {
         // #3776 — build the verify-full client AFTER the daemon wrote its #3709
         // local CA (spawn_daemon returns only once its CA-trusting readiness
         // probe passed, so the CA is on disk here).
-        let client = local_ca_client(REQUEST_TIMEOUT)
+        let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
             .expect("#3709 local CA present after the daemon became ready");
         register_and_enroll(&client, &daemon, &kp);
         let id = store_signed(
@@ -919,9 +965,10 @@ fn config1_durability_across_daemon_restart() {
     // Boot #2: same on-disk DB, brand-new process → the row is still there,
     // byte-for-byte, and still attributable to the same NHI principal.
     let daemon2 = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
-    // #3776 — same-CA verify-full client for the restarted daemon (the process-wide
-    // key-dir sandbox shares one #3709 local CA across every daemon this suite spawns).
-    let client = local_ca_client(REQUEST_TIMEOUT)
+    // #3776/#3817 — same-CA verify-full client for the restarted daemon: the
+    // restart reuses this cell's OWN key dir (acc_key_dir(&db)), so daemon2 adopts
+    // the identity + #3709 local CA daemon wrote there.
+    let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
         .expect("#3709 local CA present after the daemon became ready");
     let got = get_memory(&client, &daemon2, &id)
         .expect("durable memory must survive a daemon restart on the same DB");
@@ -964,7 +1011,7 @@ fn config1_encryption_at_rest_http_roundtrip() {
         );
         // #3776 — build the verify-full client AFTER the daemon wrote its #3709
         // local CA.
-        let client = local_ca_client(REQUEST_TIMEOUT)
+        let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
             .expect("#3709 local CA present after the daemon became ready");
         let resp = client
             .post(daemon.url("/api/v1/memories"))
