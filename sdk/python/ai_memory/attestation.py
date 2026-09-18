@@ -71,6 +71,20 @@ Known limits (stated rather than hidden)
 * The signature commits to those six fields ONLY — not tags, priority, or
   metadata.
 
+The key file on disk (#3784)
+----------------------------
+
+:meth:`AgentSigningKey.from_file` loads the raw 32-byte seed through the
+SDK's ONE owner-only reader (:mod:`ai_memory._ownedfile`): open once with
+``O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC``, ``fstat`` that descriptor, refuse a
+symlink / a non-regular file / ``mode & 0o077`` / another owner, and read the
+bytes from the same descriptor. Before #3784 this was a bare
+``Path(path).read_bytes()``, so a key left world-readable by a copy, a backup
+or a bad umask signed attestations with a key any local uid could read — while
+the daemon's own loader (``src/identity/keypair.rs::read_private_key_file``)
+refused the identical file. Refusals raise :class:`KeyFileError`; each names
+the path and the reason and never renders key material.
+
 Optional dependency
 -------------------
 
@@ -91,9 +105,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ._ownedfile import read_owner_only_bytes
+from .errors import AiMemoryError
+
 __all__ = [
     "DOMAIN_SEPARATION_TAG",
     "AgentSigningKey",
+    "KeyFileError",
     "attestation_fields",
     "canonical_cbor_write",
     "canonicalize_created_at",
@@ -104,6 +122,19 @@ __all__ = [
 
 #: The ``_dst`` domain-separation value for the write envelope (#1931).
 DOMAIN_SEPARATION_TAG = "ai-memory/write/v1"
+
+
+class KeyFileError(AiMemoryError):
+    """The on-disk agent private key was refused (#3784).
+
+    Raised by :meth:`AgentSigningKey.from_file` when the file is reached
+    through a symlink, is not a regular file, carries any group/other bit, or
+    is owned by another uid. Every one of these is fail-closed: the SDK
+    refuses rather than sign with a key another local user can read. A
+    subclass of :class:`~ai_memory.errors.AiMemoryError`, so one ``except``
+    still catches it.
+    """
+
 
 #: Length of an Ed25519 seed / public key in bytes.
 _KEY_LEN = 32
@@ -301,8 +332,38 @@ class AgentSigningKey:
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> AgentSigningKey:
-        """Load a 32-raw-byte ``<agent_id>.priv`` file."""
-        return cls(Path(path).read_bytes())
+        """Load a 32-raw-byte ``<agent_id>.priv`` file, owner-only (#3784).
+
+        The bytes are read through the SDK's ONE descriptor-bound owner-only
+        reader (:func:`ai_memory._ownedfile.read_owner_only_bytes`), the same
+        one the wake delegation-bundle loader uses (#3780): the file is opened
+        once with ``O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC``, the checks are proven on
+        THAT descriptor's ``fstat``, and the seed is read from it — so no
+        symlink, FIFO or file swap can land between the check and the read.
+
+        This is the standard the daemon already applies to the identical file
+        (``src/identity/keypair.rs::read_private_key_file`` refuses any
+        ``mode & 0o077``). Before #3784 the SDK applied none of it and signed
+        happily with a world-readable key.
+
+        Raises:
+            KeyFileError: symlink, not a regular file, group/other-readable,
+                or owned by another uid. The message names the path and the
+                reason; it never renders key material.
+            ValueError: the file is not exactly 32 bytes.
+        """
+        p = Path(path)
+        return cls(
+            read_owner_only_bytes(
+                p,
+                error=KeyFileError,
+                mode_advice=(
+                    "an agent private key must be 0600, or another local user can read "
+                    "it and forge this agent's write attestations; restore with: "
+                    f"chmod 0600 {p}"
+                ),
+            )
+        )
 
     @classmethod
     def from_base64(cls, seed_b64: str) -> AgentSigningKey:

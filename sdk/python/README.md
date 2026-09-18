@@ -86,6 +86,9 @@ from ai_memory import AiMemoryClient, Tier
 from ai_memory.attestation import AgentSigningKey
 
 key = AgentSigningKey.generate()          # or .from_file("svc.priv")
+# `.from_file` refuses a key that is not a regular file, is reached through a
+# symlink, has any group/other bit, or is owned by another uid (#3784) — the
+# same standard the daemon applies to `<key_dir>/<agent_id>.priv`.
 
 # `ca` is the daemon CA path resolved in "Trust the daemon's CA" above.
 with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client:

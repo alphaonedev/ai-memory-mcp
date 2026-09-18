@@ -159,7 +159,7 @@
     "path": "sdk/python/ai_memory/wake.py",
     "role": "Python decoder -> metadata WakeSignal -> operator-provided on_signal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "d488d9e67b4df038844125259d9870647e139509bb847157c003a80a4c3cf8af"
+    "sha256": "922e8e30300f43afb2ce977dca16fd66e6b981b0241a3cac986745d749098e22"
   },
   {
     "path": "sdk/python/swarm/wake.py",
@@ -171,6 +171,6 @@
     "path": "sdk/typescript/src/wake.ts",
     "role": "TypeScript decoder/state machine -> metadata WakeSignal -> operator-provided onSignal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "10bdca0697a5d9478cd8801ea3032ab44fa9b52d6a2b306ee2464839bc6a9be1"
+    "sha256": "de28c5a4f2315a1b150437d8714db79a01c41c654beebb9c52753db693630a3d"
   }
 ]
