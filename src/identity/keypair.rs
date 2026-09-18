@@ -1170,17 +1170,75 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
 /// a four-way state table.
 fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<EnsureOutcome> {
     let kp = generate(agent_id)?;
-    save(&kp, dir)?;
-    // COVERAGE: tracing::info! lazy-format closure (lines 411-417)
-    //           — the format args are constructed lazily; the closure
-    //           body runs when the INFO subscriber is enabled. Coverage
-    //           depends on test subscriber config. Documented per L0.7
-    //           playbook §3c.
-    tracing::info!(
-        "auto-generated identity keypair at {} — consider backing up",
-        pub_path.display()
-    );
-    Ok(EnsureOutcome::Generated { pub_path })
+    let priv_path = agent_priv_path(dir, agent_id);
+    // #3772 — CONCURRENT-GENERATE RACE. `serve`, `curator`, and one-shot CLI
+    // invocations SHARE one key directory (CLAUDE.md: "MCP stdio, curator,
+    // serve and every CLI invocation share one" per host), and several can boot
+    // at once — the macOS `Check (macos-fed,sqlite)` acceptance suite spawns
+    // parallel `serve` children against ONE process-wide `test_key_dir::install`
+    // sandbox. Two callers that both observed `(false, false)` in the gate above
+    // each `generate()` a DIFFERENT keypair; the prior `save()` wrote each half
+    // with a CLOBBERING rename, so their `.priv`/`.pub` writes could interleave
+    // into a TORN pair (`.priv` from one identity, `.pub` from the other).
+    // `load`'s private-derives-public cross-check then bails,
+    // `governance::audit::load_daemon_signing_key` maps that `Err` to `Ok(None)`,
+    // and the daemon refuses to start with "#3354 … no key was loadable after
+    // the ensure step" — a key it had just generated.
+    //
+    // The fix CLAIMS `.priv` with an atomic first-writer-wins primitive
+    // ([`claim_new_with_mode`]: stage the fully-written bytes, then `hard_link`
+    // them onto the final name). The FIRST caller wins the identity; every
+    // losing caller's claim fails with `AlreadyExists` and re-resolves through
+    // `ensure_keypair` to ADOPT the winner's key, so the on-disk pair is ALWAYS
+    // consistent. Private-first (#3146) and the both-halves gate (#3147) are
+    // preserved: `.priv` is committed (complete — the link never exposes a
+    // zero-byte name) before `.pub`, and a losing caller that observes the
+    // winner's `.priv` with a not-yet-written `.pub` self-heals `.pub` FROM that
+    // `.priv`, byte-identical to what the winner writes, so no torn pair results.
+    ensure_parent(&priv_path)?;
+    ensure_parent(&pub_path)?;
+    enforce_key_path_chain_secure(dir, &priv_path)?;
+    let private = kp
+        .private
+        .as_ref()
+        .ok_or_else(|| anyhow!("generated keypair for {agent_id} has no private key"))?;
+    match claim_new_with_mode(&priv_path, &private.to_bytes(), 0o600) {
+        Ok(()) => {
+            // Won the claim. `.pub` is a deterministic function of the `.priv`
+            // just committed, so even a concurrent self-heal writing `.pub`
+            // writes byte-identical bytes — the pair cannot tear.
+            write_with_mode(&pub_path, &kp.public.to_bytes(), 0o644)
+                .with_context(|| format!("writing public key {}", pub_path.display()))?;
+            // COVERAGE: tracing::info! lazy-format closure — the format args are
+            //           constructed lazily; the closure body runs when the INFO
+            //           subscriber is enabled. Documented per L0.7 playbook §3c.
+            tracing::info!(
+                "auto-generated identity keypair at {} — consider backing up",
+                pub_path.display()
+            );
+            Ok(EnsureOutcome::Generated { pub_path })
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Lost the race: another caller claimed `.priv` first. Discard the
+            // key just generated and re-resolve — the on-disk `.priv` is the
+            // winner's identity, and `ensure_keypair`'s existing/self-heal arms
+            // adopt it (its `.pub` is loaded if present, or re-derived from the
+            // winner's complete `.priv` if still mid-write). `.priv` now exists,
+            // so the re-entry can only hit `(true,true)` or `(false,true)` and
+            // terminates in one step.
+            tracing::warn!(
+                target: KEYPAIR_TRACE_TARGET,
+                "identity: lost the first-run key-generation race for {} — another \
+                 process claimed {} first; adopting the existing identity (#3772).",
+                agent_id,
+                priv_path.display(),
+            );
+            ensure_keypair(agent_id, dir, false)
+        }
+        Err(e) => {
+            Err(anyhow!(e)).with_context(|| format!("claiming private key {}", priv_path.display()))
+        }
+    }
 }
 
 /// Create the parent directory of `path` (recursive `mkdir`).
@@ -1562,6 +1620,88 @@ fn create_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()>
             Err(e)
         }
     }
+}
+
+/// #3772 — atomically CLAIM `path` for `bytes` at `mode`, FIRST-WRITER-WINS,
+/// exposing the final name only ever as a COMPLETE file.
+///
+/// This is the concurrent-safe key-generation primitive. Its two siblings are
+/// each wrong for that job on their own:
+///
+/// * [`write_with_mode`] stages then `rename`s, and a `rename` CLOBBERS — two
+///   concurrent generators writing DIFFERENT keys can interleave their
+///   `.priv`/`.pub` writes into a torn pair (`.priv` from one, `.pub` from the
+///   other), which [`load`]'s private-derives-public cross-check then rejects
+///   (the #3772 macOS boot refusal);
+/// * [`create_new_with_mode`] makes the FINAL name visible at `create_new` time
+///   — i.e. as a ZERO-BYTE file, BEFORE the bytes are written — so a concurrent
+///   reader (a sibling's `load`/self-heal) can observe a truncated key.
+///
+/// The claim here stages the fully-written, `fsync`'d bytes under a unique
+/// sibling and then `hard_link`s that inode onto `path`. The link is atomic and
+/// fails with [`io::ErrorKind::AlreadyExists`] when another caller already
+/// claimed the name, so only the FIRST caller wins and the final file is never
+/// observed incomplete. The staging sibling is always unlinked (the winning
+/// link keeps the inode alive through `path`).
+#[cfg(unix)]
+fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = key_file_dir(path)?;
+    let staged = staging_sibling(path);
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&staged)
+        .map_err(|e| annotate_staging_error(&e, &dir, path))?;
+
+    let commit = || -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // Atomic exclusive-create of the FINAL name pointing at the complete
+        // inode: `hard_link` fails with `AlreadyExists` if the name is taken.
+        fs::hard_link(&staged, path)?;
+        sync_dir(&dir);
+        Ok(())
+    };
+    let result = commit();
+    // The staging sibling is ours to remove on every path: on success the hard
+    // link keeps the key inode alive through `path`; on failure it is a partial
+    // temp that must not linger.
+    let _ = fs::remove_file(&staged);
+    result
+}
+
+/// #3772 — non-Unix twin of [`claim_new_with_mode`]. `hard_link` is
+/// cross-platform, so the same stage-then-link atomic claim holds; the Unix
+/// mode bits do not apply.
+#[cfg(not(unix))]
+fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+    use std::io::Write;
+
+    let dir = key_file_dir(path)?;
+    let staged = staging_sibling(path);
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+
+    let commit = || -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&staged, path)?;
+        sync_dir(&dir);
+        Ok(())
+    };
+    let result = commit();
+    let _ = fs::remove_file(&staged);
+    result
 }
 
 /// #3146 — archive `pub_bytes` as a timestamped, PUBLIC-ONLY sibling of
