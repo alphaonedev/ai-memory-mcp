@@ -59,6 +59,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     TypeScript 120 passed / 8 skipped (was 115/8, +5 new `caCert` tests),
     python `tests/` 119 passed / 5 skipped and `swarm/tests/` 85 passed, all
     unchanged.
+### Fixed (#3544 — the TypeScript shims and the host-adapter trio complete the shim set)
+
+- **#3544 (bug, ga-blocker) — the two published TypeScript shims now return
+  `true` only for a turn the substrate confirms it PERSISTED.**
+  `captureTurn()` (`clients/openai-shim-ts/src/index.ts:145`,
+  `clients/anthropic-shim-ts/src/index.ts:143`) and — the arm wrapped clients
+  actually take — `captureTurnAsync()` (`:203` / `:201`) reached `true` after
+  screening only the spawn error, the exit status, a missing `id:2` frame, the
+  JSON-RPC `error` member and `result.isError`. `memory_id` was never read and
+  `status` was never consulted at all, so governance `ask` (nothing persisted,
+  no recovery handle), governance `pending` (durably queued, NOT persisted), an
+  unreadable payload and any `status` a later substrate release adds all came
+  back to the caller as a captured turn. Both packages now share ONE predicate,
+  `src/captureOutcome.ts` — vendored byte-identically into each and pinned as
+  byte-identical by `__tests__/capture_outcome_parity.test.ts` in both, so the
+  two published npm packages cannot disagree about what "captured" means. It is
+  the *presence* form — **captured if and only if the payload carries a
+  non-empty `memory_id`** (`src/mcp/tools/capture_turn.rs`; the field RFC-0001
+  lists as `required`) — so an unrecognised envelope fails CLOSED. `status` is
+  read only to say WHY and to carry the recovery handle: `ask` reports that
+  NOTHING was persisted and names no recovery that does not exist; `pending`
+  reports the turn as durably QUEUED, not lost, and surfaces the `pending_id`
+  that redeems it via `memory_pending_approve`. Public API, return types and
+  wire shape are unchanged (`captureTurn` is still `-> boolean`).
+- **#3544 — the three reference host-adapter shims
+  (`clients/host-adapter-shim/{python,node,bash}`) now exit `0` only for a
+  persisted turn.** `python/capture_turn.py:180`, `node/capture-turn.mjs:206`
+  and `bash/capture-turn.sh:173-176` all exited `0` unless the substrate exited
+  non-zero, emitted no usable frame, or set `result.isError` — so a host hook
+  received "captured" for an `ask`, a `pending`, or a receipt it could not read,
+  and had no signal that its transcript was not durable. All three now
+  implement the same presence predicate and are pinned to the **same exit code
+  and byte-identical stderr text** by a new hermetic cross-language conformance
+  suite (`clients/host-adapter-shim/tests/`), whose `envelopes.py` is the single
+  source of truth for the receipt vocabulary. The **exit-code set is unchanged**
+  (`0` persisted, `1` usage, `2` not persisted, `3` content unreadable); what
+  changes is the meaning of `0`, which is the defect. `2` now also covers `ask`,
+  `pending`, an unreadable receipt and an unknown `status`; the stderr `WARN`
+  line, not the exit code, distinguishes "not stored" from "lost", and a
+  `pending` receipt prints the `pending_id` that redeems it.
+  **The bash adapter now requires `jq`**: reading the receipt is a two-level
+  JSON parse (the payload rides inside `result.content[0].text` as a JSON
+  *string*), which `grep` cannot do correctly, so without `jq` the shim exits
+  `2` and says it cannot verify the turn rather than claiming a success it
+  cannot prove.
+- **#3544 (CI gap) — `clients-ci.yml` now runs the host-adapter trio.** The
+  workflow's `clients/**` path filter already matched
+  `clients/host-adapter-shim/**`, but no job executed it: the trio had no tests
+  at all, so the defect above could never have been caught by a gate. A new
+  `host-adapter-shims` job runs the conformance suite (and asserts the
+  python/node/bash/jq runtimes are present, so a missing runtime cannot pass as
+  a silent skip). The `ts-shims` job also gained `npm run build`, the step
+  `publish-sdk-shims.yml` ships with, so a tsc emit break cannot first surface
+  during a tag-triggered publish.
 
 ### Fixed (#3544 — the Python shims no longer report an unstored turn as captured)
 

@@ -61,6 +61,30 @@ const client = wrap(new Anthropic(), {
   wrapped client; pass a stable `hostSessionId` (as above) to deduplicate
   across process re-runs.
 
+## What `captureTurn` returns (#3544)
+
+`captureTurn()` / `captureTurnAsync()` return `true` **only when the substrate
+confirms the turn was persisted** — that is, when the `memory_capture_turn`
+envelope carries a non-empty `memory_id` (`src/mcp/tools/capture_turn.rs`; the
+field RFC-0001 lists in the tool result's `required` set). Every other outcome
+returns `false` and names itself on stderr:
+
+| Envelope | Returns | Meaning |
+| --- | --- | --- |
+| `memory_id` present (`dedup_hit` either way) | `true` | The turn is stored. A dedup hit is an idempotent re-delivery of a turn that is already stored. |
+| `status: "ask"` | `false` | Governance asked for approval. **Nothing was persisted and there is no recovery handle** — re-send the turn if you need it. |
+| `status: "pending"` | `false` | The write is **durably queued, not lost**. The `pending_id` is printed on stderr; redeem the turn with `memory_pending_approve`. |
+| anything else | `false` | Transport fault, unreadable payload, or an envelope this shim does not recognise. It fails **closed** rather than claim a success it cannot prove. |
+
+`false` is therefore "this turn is not stored", never "this turn is lost" — the
+stderr line is what tells those apart. Every release before this one returned
+`true` for `ask`, for `pending`, and for every envelope it did not enumerate.
+
+The predicate lives in `src/captureOutcome.ts`, which is byte-identical in the
+OpenAI and Anthropic shim packages and pinned as such by
+`__tests__/capture_outcome_parity.test.ts` in both — the two published packages
+cannot drift into disagreeing about what "captured" means.
+
 ## Tests
 
 The offline suite runs with Node's built-in test runner + type-stripping — no
