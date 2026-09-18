@@ -10,7 +10,7 @@
 >
 > **Trademark:** ai-memory™ — USPTO Serial No. 99761257
 > **License:** Apache 2.0 — permanent, non-revocable, non-relicenseable.
-> **Current release:** v1.0.0 (schema v98, 104 MCP tools at `--profile full`), the *defaults stop lying* GA — the version stamp is `Cargo.toml`'s; **no `v1.0.0*` tag is cut yet**, so the newest PUBLISHED tag is **v0.10.0** (released 2026-07-12, schema v80 — the `warn-carrier` release: deprecation WARNs only ahead of the v1.0.0 secure-default flips, with zero default flips, zero schema change and zero behavior change for any correctly-configured deployment; #1972 under the #1940 v1.0.0 epic). v0.10.0 supersedes v0.9.0 (schema v78, 101 MCP tools), a security-hardening and code-review release, which supersedes v0.8.1 (patch release, 2026-06-29) and v0.8.0 (GA, released 2026-06-25; `distributed-coordination`). The prior v0.7.1 patch line (surface area identical to v0.7.0) is itemized in §11.3.1.
+> **Current release:** v1.0.0 (schema v98 on `release/v1.0.0`, 104 MCP tools at `--profile full`; the rehearsal branch `rehearsal/audit-wip` is already at schema v100 and this header follows the promotion, not the rehearsal), the *defaults stop lying* GA — the version stamp is `Cargo.toml`'s; **no `v1.0.0*` tag is cut yet**, so the newest PUBLISHED tag is **v0.10.0** (released 2026-07-12, schema v80 — the `warn-carrier` release: deprecation WARNs only ahead of the v1.0.0 secure-default flips, with zero default flips, zero schema change and zero behavior change for any correctly-configured deployment; #1972 under the #1940 v1.0.0 epic). v0.10.0 supersedes v0.9.0 (schema v78, 101 MCP tools), a security-hardening and code-review release, which supersedes v0.8.1 (patch release, 2026-06-29) and v0.8.0 (GA, released 2026-06-25; `distributed-coordination`). The prior v0.7.1 patch line (surface area identical to v0.7.0) is itemized in §11.3.1.
 
 ---
 
@@ -989,7 +989,7 @@ Full policy: [`docs/telemetry.md`](docs/telemetry.md).
 - **Auto-discovery** — mDNS for local-network peer discovery; hardcoded peer list fallback. **DEFERRED to v1.x** per the ruling above; **carried to §11.7 only** — no carrier issue, not in §11.8 and not in §11.9.
 - **End-to-end encryption** — operator-side keys for federation push/pull beyond mTLS. **DEFERRED to v1.x** per the ruling above (F-53 / [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968), OPEN) — **ZERO implementation at v1.0.0**. **Carried to §11.7 only** — #1968 stays open against the v1.x bucket; this revision places it in neither §11.8 nor §11.9. What v1.0.0 actually protects federated content with is **transport mTLS only**, plus optional **per-node at-rest** encryption at each end: `src/encryption/mod.rs` is explicitly "per-node at-rest" and states "**NOT end-to-end across federation (#1809):** … federation catch-up (`memories_updated_since`) decrypts `content` and the receiving peer re-seals under its own per-node key, so a federated peer holds plaintext transiently at apply time" (`src/encryption/mod.rs:4-16`; `grep -rni 'content_encryption\|e2e_encrypt' src/` = 0 hits). #1809 (CLOSED) was the docs-drift fix that stopped the at-rest primitive being *labelled* E2E; it shipped no E2E mechanism.
 - **MVCC strict-consistency mode** — opt-in per namespace for CP rather than AP. CRDTs from v0.8 remain default. **DEFERRED to v1.x** per the ruling above; **carried to §11.7 only** — no carrier issue, not in §11.8 and not in §11.9.
-- **OpenTelemetry standardization** — all internal tracing converts to OTel spans. **DEFERRED to v1.x** per the ruling above — ZERO implementation at v1.0.0 (no `opentelemetry`/OTLP dependency, no exporter in `src/`, no `OTEL_*` env surface). §11.5's telemetry paragraph and [`docs/telemetry.md`](docs/telemetry.md) §6 are reconciled to this ([#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407), CLOSED — that issue was the docs-drift reconciliation, **not** an implementation carrier). **Carried to §11.9** as a commercial/operability line item; it has **no open implementation carrier issue** at the time of this revision.
+- **OpenTelemetry standardization** — all internal tracing converts to OTel spans. **DEFERRED to v1.x** per the ruling above — ZERO implementation at v1.0.0 (no `opentelemetry`/OTLP dependency, no exporter in `src/`, no `OTEL_*` env surface). §11.5's telemetry paragraph and [`docs/telemetry.md`](docs/telemetry.md) §6 are reconciled to this ([#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407), CLOSED — that issue was the docs-drift reconciliation, **not** an implementation carrier). **Carried to §11.9** as a commercial/operability line item, with [#3800](https://github.com/alphaonedev/ai-memory-mcp/issues/3800) as the open implementation carrier.
 - **Strict semver discipline** — breaking changes require major-version bumps from v1.0.
 - **Memory Portability Spec v2** — multi-implementation interop tests. Reference implementations in two languages besides Rust.
 - **Public security audit** — by named third-party firm, full report published. Specifically tests: namespace-inheritance enforcement, signature verification, approval timeout sweeper, HMAC coverage on every privileged endpoint, attestation chain integrity, federation tamper-evidence. *(SUPERSEDED FOR THE v1.0.0 EPIC — Sprint-0 W5 reconciliation, operator correction 2026-07-09 memory 9a62049d: the v1.0.0 security review is AI-NHI multi-agent (§27 Gate 3), NOT an external firm; this line remains the v1.x+ aspiration.)*
@@ -1092,18 +1092,19 @@ claims about the source) + §2.2 + fleet manageability.**
   retention anywhere — signals/actions/action_edges/checkpoints/routine_runs never pruned.” *Cost until done:*
   G5's growth budget cannot be met for those tables at all, because nothing prunes them — an operator running
   the coordination plane has unbounded growth with no knob.
-- **G6 — reproducible build and the negative release fixtures.** **No carrier issue is filed for this gate at
-  the 2026-09-18 revision**; it is named in the standard's §6 `cert` track (items 11b) and is owed a carrier.
-  *Cost until done:* a published number cannot be re-derived by a third party from the same source.
+- **G6 — reproducible build and the negative release fixtures.** [#3799](https://github.com/alphaonedev/ai-memory-mcp/issues/3799) “[v1.1.0][cert G6 / item
+  11b] reproducible build + the four negative release fixtures (tampered tag, unsigned tag, unpinned tool, digest
+  drift).” *Cost until done:* a published number cannot be re-derived by a third party from the same source, and
+  the four ways a release can be tampered with have no fixture that proves the pipeline rejects them.
 - **G8 — certificate expiry and re-issue.** [#3556](https://github.com/alphaonedev/ai-memory-mcp/issues/3556) “check-cert-expiry.sh is green with a VOID
   certificate — widen the watch set, add banner-and-ancestor check” and [#3501](https://github.com/alphaonedev/ai-memory-mcp/issues/3501) “cert §7
   re-validation and re-issue after #3464.” *Cost until done:* the one certificate in the tree claims LIVE
   against a watched surface that has since moved, and the gate that should have caught it passes.
-- **Artifact binding.** `binary_sha256` + `source_commit` published on `/api/v1/capabilities`, plus
-  **`envelope_ref` enforcement** in the evidence-bundle validator (a run record whose `envelope_ref` is not the
-  pinned hash must be refused, with a negative fixture). **No carrier issue is filed at the 2026-09-18
-  revision** — both are §6 `cert`-track item 3b. *Cost until done:* no published measurement can be tied to the
-  binary that produced it, which is the premise the rest of the standard rests on.
+- **Artifact binding.** [#3798](https://github.com/alphaonedev/ai-memory-mcp/issues/3798) “[v1.1.0][cert 3b] artifact binding: the daemon reports
+  `binary_sha256` + `source_commit` on `/api/v1/capabilities`; evidence runs bind to it; `envelope_ref` enforced
+  by the bundle validator.” *Cost until done:* no published measurement can be tied to the binary that produced
+  it — which is the premise the rest of the standard rests on — and the declaration's core FAIL sentence has no
+  enforcer, because a run record whose `envelope_ref` is not the pinned hash is accepted today.
 - **Assessor independence.** At least one wave-3 ballot from a reviewer independent of the vendor and of the
   authoring model family, so the **VENDOR SELF-CERTIFIED** label of §9.8 can be dropped. No carrier issue;
   process, not code.
@@ -1161,9 +1162,11 @@ experiment behind it.
   app.principal_id` as an independent second plane.” *Cost until done:* one bug in one plane is the whole of
   tenant isolation.
 - **OpenTelemetry export.** Ruled DEFERRED to v1.x by the §11.6 disposition ruling and carried here.
-  **There is no open implementation carrier issue** — [#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407) is CLOSED and was the docs-drift
-  reconciliation, not an implementation carrier; one is owed. *Cost until done:* an operator with an existing
-  OTLP collector has no standard export and must scrape the Prometheus surface instead.
+  [#3800](https://github.com/alphaonedev/ai-memory-mcp/issues/3800) “[v1.1.0][enterprise] OpenTelemetry export (OTLP traces + metrics) — the deferred §11.6 item
+  has no open carrier since #2407 closed as a docs fix” is the implementation carrier; [#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407) is
+  CLOSED and was the docs-drift reconciliation only, never an implementation carrier. *Cost until done:* an
+  operator with an existing OTLP collector has no standard export and must scrape the Prometheus surface
+  instead.
 
 ---
 
