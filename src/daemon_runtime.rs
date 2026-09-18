@@ -10276,7 +10276,18 @@ mod tests {
     }
 
     fn keyword_app_state(db_path: &Path) -> AppState {
-        let conn = db::open(db_path).unwrap();
+        // #3539 — hold the crate passphrase window across this plain-store open so
+        // a concurrent b11-style passphrase seeder (which holds the same env mutex)
+        // cannot poison it: the sqlcipher gate is an OPEN-TIME check, so once the
+        // connection is open the guard can drop. Every caller of this helper opens
+        // WITHOUT holding the window itself, so a lib-parallel seeder would otherwise
+        // race this open (the #3539 mtls-router flake). Safe from self-deadlock: no
+        // caller holds `env_lock` before calling this helper (env_lock is a
+        // non-reentrant Mutex).
+        let conn = {
+            let _no_pass = crate::test_support::no_passphrase_guard();
+            db::open(db_path).unwrap()
+        };
         let db_state: Db = Arc::new(Mutex::new((
             conn,
             db_path.to_path_buf(),
