@@ -9362,6 +9362,17 @@ impl OneshotDaemon {
     /// against in-process mock peers (see `spawn_inproc_mock_peer`).
     #[allow(dead_code)]
     fn with_federation(federation: Option<ai_memory::federation::FederationConfig>) -> Self {
+        // #3778 — the in-process leader gets the SAME attestation opt-out the
+        // spawned children get from `cmd()` (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION
+        // = 0`, the #1751/#1985 documented permissive posture), declared HERE.
+        // Before this line the in-process HTTP-direct writes of this binary
+        // only passed when a SIBLING test had already called
+        // `common::free_port()` (which pins the same `Once`) earlier in the
+        // same process — an ambient, order-dependent coupling: a filtered run
+        // (`--test integration http_smoke_matrix_phases_1_3`) failed at
+        // `create_memory` with ATTESTATION_FAILED before reaching the cell
+        // under test. Nothing in CI supplies the value; the sibling did.
+        common::permissive_attestation_for_tests();
         // #1570 — these tests model an AUTHENTICATED deployment (api_key
         // configured at boot), the pre-#1570 implicit posture, so the admin
         // header role-claims they assert keep working. The #1570 secure
@@ -11731,6 +11742,24 @@ fn curl_put(
 ///
 /// Phase 3 (6 governance/webhook): `approve_pending`, `reject_pending`, `register_agent`,
 /// notify, subscribe, unsubscribe.
+/// #3778 — `OneshotDaemon::new()` itself declares the permissive attestation
+/// posture for the in-process HTTP-direct surface: after construction the
+/// resolver reads "permissive" whether or not any sibling test ran first.
+/// (The strict posture — an unsigned `POST /api/v1/memories` refused with
+/// `ATTESTATION_FAILED` when attestation is required — is pinned in its own
+/// process by `tests/oneshot_daemon_attestation_3778.rs`, because that
+/// binary may mutate the env; this one never sets it to a strict value.)
+#[tokio::test]
+async fn oneshot_daemon_declares_the_attestation_opt_out_3778() {
+    let _d = OneshotDaemon::new();
+    assert!(
+        !ai_memory::identity::attest::require_agent_attestation_for(
+            ai_memory::identity::attest::WriteSurface::HttpDirect
+        ),
+        "OneshotDaemon::new must leave the HTTP-direct surface permissive"
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // smoke matrix: 30+ HTTP scenarios driven by one runtime
 async fn http_smoke_matrix_phases_1_3() {
