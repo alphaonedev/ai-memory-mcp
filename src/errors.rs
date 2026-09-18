@@ -225,6 +225,60 @@ pub mod msg {
     /// occurrences (the pm-v3.1 hardcoded-literal ratchet).
     pub const QUOTA_CHECK_FAILED: &str = "quota check failed";
 
+    // ---- skills jail caller text (issue #3762) ----------------------------------
+    /// #3762 — which skills jail a caller-facing message talks about.
+    ///
+    /// The skills IMPORT jail (read side, `AI_MEMORY_SKILLS_IMPORT_ROOT`) and
+    /// the skills EXPORT jail (write side, `AI_MEMORY_SKILLS_EXPORT_ROOT`)
+    /// render caller-facing refusals from the ONE renderer
+    /// ([`skills_root_label`]) so the MCP tool surface and the HTTP surface
+    /// say the same thing. A configured ABSOLUTE path is operator detail: it
+    /// goes to the operator log at the refusal site, never into the returned
+    /// text (the #3713 "std::fs resolved path crossing to a caller" shape).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SkillsJail {
+        Export,
+        Import,
+    }
+
+    /// #3762 — the closed-vocabulary label for a skills jail root.
+    ///
+    /// Returns a stable `'static` label (`"skills-export root"` /
+    /// `"skills-import root"`), never the configured absolute path. Shared by
+    /// the MCP tools (`src/mcp/tools/skill_export.rs`,
+    /// `src/mcp/tools/skill_register.rs`); the HTTP handlers
+    /// (`src/handlers/skills.rs`) forward the same text, so both surfaces
+    /// stay byte-identical.
+    #[must_use]
+    pub const fn skills_root_label(jail: SkillsJail) -> &'static str {
+        match jail {
+            SkillsJail::Export => "skills-export root",
+            SkillsJail::Import => "skills-import root",
+        }
+    }
+
+    /// #3762 — stable caller-facing word for a filesystem failure class
+    /// inside a skills jail.
+    ///
+    /// A `std::io::Error`'s `Display` carries the OS message for the
+    /// operator's absolute path, so it must never be interpolated into
+    /// caller-facing text. Render the class instead; the refusal site logs
+    /// the full error plus the absolute path for the operator. Keyed by
+    /// [`std::io::ErrorKind`] so the text is stable across platforms and OS
+    /// versions.
+    #[must_use]
+    pub fn skills_io_kind(kind: std::io::ErrorKind) -> &'static str {
+        if kind == std::io::ErrorKind::NotFound {
+            "not found"
+        } else if kind == std::io::ErrorKind::PermissionDenied {
+            "permission denied"
+        } else if kind == std::io::ErrorKind::AlreadyExists {
+            "already exists"
+        } else {
+            "input/output error"
+        }
+    }
+
     // ---- governance ------------------------------------------------------------
     pub const GOVERNANCE_REQUIRES_APPROVAL: &str = "governance requires approval";
     pub const GOVERNANCE_CHECK_FAILED: &str = "governance check failed";

@@ -121,12 +121,13 @@ src/mcp/tools/namespace.rs:handle_namespace_set_standard_inner:mcp-error:db=pend
 #          (proved over real stdio: `no such table: checkpoints`)                                    3 keys
 src/mcp/tools/checkpoint.rs:handle_checkpoint_create:mcp-error:db=pending:#3766
 src/mcp/tools/share.rs:handle_share:mcp-error:db=pending:#3766
-#   #3762  a std::fs::canonicalize-RESOLVED operator path (the skills export / import root) rendered into
-#          MCP tool errors and one HTTP body; the old OWN marker `canonical` hid the resolver        4 keys
-src/handlers/skills.rs:skill_register_route:http-body:path=pending:#3762
-src/mcp/tools/skill_export.rs:confine_export_target:mcp-error:path=pending:#3762
-src/mcp/tools/skill_export.rs:handle_skill_export_in_root:mcp-error:path=pending:#3762
-src/mcp/tools/skill_register.rs:handle_skill_register:mcp-error:path=pending:#3762
+#   #3762  CLOSED by 229f6d8ee + its amend (re-cut on 1bc8d454f): the resolved skills export / import root
+#          no longer reaches a caller on either surface (the three MCP keys and the HTTP path key are
+#          gone). The HTTP body of skill_register_route now shows the db taint the path taint MASKED
+#          (first-taint-by-name, see the #3760 note above): `resolve_governance_subject(..).map_err(|e|
+#          e.to_string())?` and the rusqlite-bound register path — the #3707 class, re-keyed back to
+#          where #3760 found it.                                                                    1 key
+src/handlers/skills.rs:skill_register_route:http-body:db=pending:#3707
 # Typed mappers the derived walk must stop at (`GET /api/v1/monitoring/status`): `peer_status` renders a
 # peer's positional id (#2442) plus freshness NUMBERS, never its URL; `identity_ref` renders the SHA-256 hex
 # of an agent id. Both are closed-vocabulary projections; the `peers` NAME marker on the source collection

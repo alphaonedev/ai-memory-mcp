@@ -34,6 +34,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::errors::msg::{SkillsJail, skills_io_kind, skills_root_label};
 use crate::identity::keypair::AgentKeypair;
 use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
 
@@ -128,7 +129,9 @@ fn resolve_export_root(configured_root: Option<&str>, db_path: &Path) -> Result<
     if let Some(root) = configured_root.map(str::trim).filter(|s| !s.is_empty()) {
         // #3713 — the configured root is OPERATOR config: its path goes to the
         // operator log, the caller gets the verdict.
-        let canonical = std::fs::canonicalize(Path::new(root)).map_err(|e| {
+        // #3762 — bind the raw io::Result first, so `?` below propagates only the mapped error.
+        let raw_root = std::fs::canonicalize(Path::new(root));
+        let canonical = raw_root.map_err(|e| {
             tracing::error!(
                 target: crate::mcp::error_text::TRACE_TARGET,
                 root,
@@ -183,7 +186,9 @@ fn resolve_export_root(configured_root: Option<&str>, db_path: &Path) -> Result<
             )
         })?;
     }
-    let canonical = std::fs::canonicalize(&default_root).map_err(|e| {
+    // #3762 — bind the raw io::Result first, so `?` below propagates only the mapped error.
+    let raw_default = std::fs::canonicalize(&default_root);
+    let canonical = raw_default.map_err(|e| {
         tracing::error!(
             target: crate::mcp::error_text::TRACE_TARGET,
             root = %default_root.display(),
@@ -219,12 +224,18 @@ fn resolve_export_root(configured_root: Option<&str>, db_path: &Path) -> Result<
 ///
 /// # Errors
 /// When the walk runs out of ancestors without finding one that resolves.
-fn resolve_existing_prefix(path: &Path) -> Result<PathBuf, String> {
-    fn unresolvable(path: &Path) -> String {
-        format!(
-            "cannot resolve target_folder '{}': no existing parent directory",
-            path.display()
-        )
+fn resolve_existing_prefix(path: &Path, target_str: &str) -> Result<PathBuf, String> {
+    // #3762 amend — `path` is the root-anchored (resolved) spelling: operator
+    // log only; the caller gets its own `target_folder` echo. Unreachable on
+    // Unix (`/` always canonicalizes) but the same rule as every other site.
+    fn unresolvable(path: &Path, target_str: &str) -> String {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            anchored = %path.display(),
+            "cannot resolve target_folder: no existing parent directory"
+        );
+        format!("cannot resolve target_folder '{target_str}': no existing parent directory")
     }
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path;
@@ -236,9 +247,13 @@ fn resolve_existing_prefix(path: &Path) -> Result<PathBuf, String> {
             }
             return Ok(resolved);
         }
-        let name = cursor.file_name().ok_or_else(|| unresolvable(path))?;
+        let name = cursor
+            .file_name()
+            .ok_or_else(|| unresolvable(path, target_str))?;
         tail.push(name.to_os_string());
-        cursor = cursor.parent().ok_or_else(|| unresolvable(path))?;
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| unresolvable(path, target_str))?;
     }
 }
 
@@ -281,12 +296,20 @@ fn confine_export_target(target_str: &str, root: &Path) -> Result<PathBuf, Strin
     } else {
         root.join(requested)
     };
-    let resolved = resolve_existing_prefix(&anchored)?;
+    let resolved = resolve_existing_prefix(&anchored, target_str)?;
     if !resolved.starts_with(root) {
+        // #3762 — the resolved ROOT is operator detail: it goes to the
+        // operator log, the caller gets the jail label.
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            root = %root.display(),
+            "confine_export_target: path-escape refused (resolved target outside the jail)"
+        );
         return Err(format!(
-            "refusing target_folder '{target_str}': resolves outside the skills-export root \
-             '{}' (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
-            root.display()
+            "refusing target_folder '{target_str}': resolves outside the {} \
+             (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
+            skills_root_label(SkillsJail::Export)
         ));
     }
     Ok(resolved)
@@ -357,16 +380,32 @@ pub fn handle_skill_export_in_root(
     // directory before any containment decision is made against it. Argument
     // -shape refusals above keep precedence (they are cheaper and more useful
     // to the caller); the root is still settled before any I/O.
-    let export_root = std::fs::canonicalize(export_root).map_err(|_| {
+    // #3762 — the passed-in root (and its canonicalize failure) is operator
+    // detail: the absolute path goes to the operator log, the caller gets
+    // the jail label.
+    // #3762 — bind the raw io::Result first, so `?` below propagates only the mapped error.
+    let raw_root = std::fs::canonicalize(export_root);
+    let export_root = raw_root.map_err(|e| {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            root = %export_root.display(),
+            error = %e,
+            "cannot resolve the skills-export root"
+        );
         format!(
-            "skills-export root '{}' is not a directory or does not exist",
-            export_root.display()
+            "{} is not a directory or does not exist",
+            skills_root_label(SkillsJail::Export)
         )
     })?;
     if !export_root.is_dir() {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            root = %export_root.display(),
+            "the skills-export root is not a directory"
+        );
         return Err(format!(
-            "skills-export root '{}' is not a directory",
-            export_root.display()
+            "{} is not a directory",
+            skills_root_label(SkillsJail::Export)
         ));
     }
     let target = confine_export_target(target_str, &export_root)?;
@@ -509,25 +548,62 @@ pub fn handle_skill_export_in_root(
             refusal.reason
         ));
     }
-    std::fs::create_dir_all(&target).map_err(|e| format!("create_dir_all '{target_str}': {e}"))?;
+    // #3762 — the `io::Error` Display carries the OS path text: log it for
+    // the operator, render the failure class to the caller.
+    std::fs::create_dir_all(&target).map_err(|e| {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            path = %target.display(),
+            error = %e,
+            "cannot create the export target directory"
+        );
+        let kind = skills_io_kind(e.kind());
+        format!("cannot create target_folder '{target_str}': {kind}")
+    })?;
     // #3357 — re-assert containment AFTER the directory exists. `create_dir_all`
     // is the first moment the target is a real inode, so this closes the
     // create-then-swap window in which a co-located attacker replaces a freshly
     // created component with a symlink out of the root between the pre-flight
     // check and the write below. Fail closed: the directory is left in place
     // (creating it is not the dangerous half) but nothing is written.
-    let target = std::fs::canonicalize(&target)
-        .map_err(|e| format!("cannot resolve target_folder '{target_str}' after creation: {e}"))?;
+    // #3762 — bind the raw io::Result first, so `?` below propagates only the mapped error.
+    let raw_target = std::fs::canonicalize(&target);
+    let target = raw_target.map_err(|e| {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            error = %e,
+            "cannot resolve the export target after creation"
+        );
+        let kind = skills_io_kind(e.kind());
+        format!("cannot resolve target_folder '{target_str}' after creation: {kind}")
+    })?;
     if !target.starts_with(&export_root) {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            root = %export_root.display(),
+            "path-escape refused after creation (resolved target outside the jail)"
+        );
         return Err(format!(
-            "refusing target_folder '{target_str}': resolves outside the skills-export root \
-             '{}' (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
-            export_root.display()
+            "refusing target_folder '{target_str}': resolves outside the {} \
+             (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
+            skills_root_label(SkillsJail::Export)
         ));
     }
     let skill_md_path = target.join("SKILL.md");
-    std::fs::write(&skill_md_path, skill_md_content.as_bytes())
-        .map_err(|e| format!("write SKILL.md: {e}"))?;
+    std::fs::write(&skill_md_path, skill_md_content.as_bytes()).map_err(|e| {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            path = %skill_md_path.display(),
+            error = %e,
+            "cannot write the exported SKILL.md"
+        );
+        let kind = skills_io_kind(e.kind());
+        format!("cannot write SKILL.md for target_folder '{target_str}': {kind}")
+    })?;
 
     // -----------------------------------------------------------------------
     // Export resources
@@ -610,11 +686,27 @@ pub fn handle_skill_export_in_root(
                 ));
             }
             if let Some(parent) = res_file.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create_dir_all for resource: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    tracing::error!(
+                        target: crate::mcp::error_text::TRACE_TARGET,
+                        path = %parent.display(),
+                        error = %e,
+                        "cannot create the export resource directory"
+                    );
+                    let kind = skills_io_kind(e.kind());
+                    format!("cannot create resource directory: {kind}")
+                })?;
             }
-            std::fs::write(&res_file, &content)
-                .map_err(|e| format!("write resource '{res_path}': {e}"))?;
+            std::fs::write(&res_file, &content).map_err(|e| {
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    path = %res_file.display(),
+                    error = %e,
+                    "cannot write the exported resource"
+                );
+                let kind = skills_io_kind(e.kind());
+                format!("cannot write resource '{res_path}': {kind}")
+            })?;
             exported_resources.push(res_path);
         }
     }
@@ -1596,5 +1688,139 @@ mod jail_3357_tests {
         .expect("the root itself must be exportable");
         assert_eq!(v["exported"], json!(true));
         assert!(root.join("SKILL.md").is_file());
+    }
+}
+
+#[cfg(test)]
+mod jail_3762_tests {
+    //! #3762 — the skills-export jail renders the jail RELATIONSHIP, not the
+    //! jail.
+    //!
+    //! The export / register tools rendered a `std::fs::canonicalize`-resolved
+    //! operator path to the caller (the #3713 "std::fs resolved path crossing
+    //! to a caller" shape): the resolved export root in refusals, and the
+    //! `std::io::Error` `Display` (which carries the OS path text) of
+    //! `create_dir_all` / `canonicalize` / `write`. The fix renders a closed
+    //! vocabulary — the stable `"skills-export root"` label plus the caller's
+    //! own `target_folder` echo — and keeps the absolute path on the operator
+    //! log only. Each refusal pins absence (no resolved absolute root) WITH
+    //! presence (the label) on the same sink; the succeeding call is the
+    //! allowed-path control (the caller-supplied relative name may appear).
+
+    use super::*;
+    use rusqlite::params;
+
+    fn open_db() -> (rusqlite::Connection, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ai-memory.db");
+        let conn = crate::db::open(&path).expect("db::open");
+        (conn, dir, path)
+    }
+
+    fn seed_skill(conn: &rusqlite::Connection, id: &str) {
+        let body_blob = zstd::encode_all("Body.\n".as_bytes(), 3).expect("zstd");
+        let digest = vec![0xcd_u8; 32];
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, 'ns-jail', 'jailed', 'desc', '{}', ?2, ?3, 0)",
+            params![id, body_blob, digest],
+        )
+        .expect("insert skill");
+    }
+
+    #[test]
+    fn unresolvable_export_root_renders_label_not_path_3762() {
+        let (conn, dir, _db_path) = open_db();
+        let id = "3762aaaa-0000-0000-0000-000000000001";
+        seed_skill(&conn, id);
+        let missing = dir.path().join("no-such-root-3762");
+        let missing_spelling = missing.to_str().expect("utf8").to_owned();
+
+        let err = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": "out"}),
+            None,
+            &missing,
+        )
+        .expect_err("an unresolvable root must fail closed");
+        assert!(
+            !err.contains(&missing_spelling),
+            "the resolved root path must not reach the caller: {err}"
+        );
+        assert!(
+            err.contains("skills-export root"),
+            "the caller gets the jail label: {err}"
+        );
+        assert_eq!(
+            err, "skills-export root is not a directory or does not exist",
+            "closed vocabulary, byte-pinned: {err}"
+        );
+    }
+
+    #[test]
+    fn escape_refusal_renders_label_not_path_3762() {
+        let (conn, dir, _db_path) = open_db();
+        let id = "3762bbbb-0000-0000-0000-000000000002";
+        seed_skill(&conn, id);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        let canon_root = std::fs::canonicalize(&root).expect("canon root");
+        let canon_spelling = canon_root.to_str().expect("utf8").to_owned();
+        let outside = dir.path().join("elsewhere-3762");
+        let outside_spelling = outside.to_str().expect("utf8").to_owned();
+
+        let err = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": outside_spelling}),
+            None,
+            &root,
+        )
+        .expect_err("an out-of-root target must be refused");
+        assert!(
+            !err.contains(&canon_spelling),
+            "the resolved root path must not reach the caller: {err}"
+        );
+        assert!(
+            err.contains("skills-export root"),
+            "the caller gets the jail label: {err}"
+        );
+        assert_eq!(
+            err,
+            format!(
+                "refusing target_folder '{outside_spelling}': resolves outside the \
+                 skills-export root (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} \
+                 to export elsewhere)"
+            ),
+            "closed vocabulary, byte-pinned: {err}"
+        );
+    }
+
+    #[test]
+    fn success_echoes_caller_spelling_without_root_3762() {
+        let (conn, dir, db_path) = open_db();
+        let id = "3762cccc-0000-0000-0000-000000000003";
+        seed_skill(&conn, id);
+        let root = resolve_export_root(None, &db_path).expect("default root");
+        let canon_spelling = root.to_str().expect("utf8").to_owned();
+
+        let v = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": "nested/3762-ok"}),
+            None,
+            &root,
+        )
+        .expect("in-root relative export must succeed");
+        assert_eq!(v["exported"], json!(true));
+        assert_eq!(
+            v[field_names::TARGET_FOLDER].as_str().expect("target"),
+            "nested/3762-ok",
+            "the echo stays the caller's spelling"
+        );
+        assert!(
+            !v.to_string().contains(&canon_spelling),
+            "the success response names no resolved root"
+        );
+        assert!(root.join("nested/3762-ok/SKILL.md").is_file());
+        let _ = dir;
     }
 }
