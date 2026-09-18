@@ -89,6 +89,7 @@ Example
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import random
@@ -458,6 +459,92 @@ class _Certificate:
         )
 
 
+def _check_bundle_stat(p: Path, st: os.stat_result) -> None:
+    """Apply the bundle's on-disk standard to an ALREADY-OBTAINED stat.
+
+    Split out so the descriptor-bound path (:func:`os.fstat`) and the Windows
+    path-based fallback refuse with the SAME words. ``p`` is only ever used to
+    word the message; nothing here resolves it again.
+    """
+    if not stat.S_ISREG(st.st_mode):
+        raise WakeError(f"{p} is not a regular file")
+    if st.st_mode & 0o077:
+        raise WakeError(
+            f"{p} is mode {st.st_mode & 0o7777:04o}; a bundle holding a private key "
+            "must be 0600, or another local user can join the hub as this agent"
+        )
+    if st.st_uid != os.geteuid():
+        raise WakeError(f"{p} is owned by uid {st.st_uid}, not by the caller")
+
+
+def _read_owner_only(p: Path) -> str:
+    """Read a credential no other local user could read or replace, through
+    ONE descriptor (#3780).
+
+    ``p.lstat()`` followed by ``p.read_text()`` resolves the path TWICE, and
+    the bytes that are read are not the bytes that were checked. A local user
+    who can write in the key directory wins that window twice over: swap a
+    symlink in and the SDK reads a file it refused a moment earlier
+    (confused-deputy read); swap a FIFO in and the second open PARKS the
+    process, with no credential needed (availability). So: open ONCE,
+    ``fstat`` THAT descriptor, apply every check to it, and read from it.
+
+    ``O_NOFOLLOW`` refuses a symlink AT THE OPEN, so a link in the key
+    directory can never have its permissions checked on the target.
+    ``O_NONBLOCK`` keeps a FIFO planted at this path from parking the open; the
+    regular-file check then refuses it. ``O_CLOEXEC`` keeps the descriptor out
+    of any child this process spawns while the bundle is being read. This is
+    the pattern the Rust tree already ships in ``src/wake_client/bundle.rs``
+    (``open_owner_only``), modelled in turn on ``AllowlistCache::open_checked``
+    (#3504).
+
+    **Platform caveat:** Windows has no ``O_NOFOLLOW`` and no ``O_NONBLOCK``,
+    so there is no way to bind the check to the descriptor there. That leg
+    keeps the historical path-based check-then-read, unchanged and still racy
+    (and, as before #3780, still requiring a POSIX ``os.geteuid``), and says so
+    rather than pretending otherwise. The hub socket and the key directory this
+    loader serves are POSIX-only surfaces today.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    non_block = getattr(os, "O_NONBLOCK", 0)
+    if not no_follow:
+        # Windows. Documented above: the pre-#3780 shape, verbatim.
+        st = p.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            raise WakeError(
+                f"{p} is a symlink: a credential reached through a link is one whose "
+                "permissions were checked on the wrong file"
+            )
+        _check_bundle_stat(p, st)
+        return p.read_text(encoding="utf-8")
+
+    flags = os.O_RDONLY | no_follow | non_block | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(p, flags)
+    except OSError as err:
+        # ELOOP is what O_NOFOLLOW reports for a symlink on Linux and macOS
+        # (EMLINK on the BSDs). Kept as its own refusal so the operator is told
+        # what is actually wrong rather than handed a bare errno.
+        if err.errno in (errno.ELOOP, errno.EMLINK):
+            raise WakeError(
+                f"{p} is a symlink: a credential reached through a link is one whose "
+                "permissions were checked on the wrong file"
+            ) from err
+        raise
+    try:
+        # fstat on the descriptor just opened — never a second look at the path.
+        _check_bundle_stat(p, os.fstat(fd))
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        os.close(fd)
+
+
 class DelegationBundle:
     """The scoped ``a2a-hub/join/v1`` credential, loaded from the key dir.
 
@@ -503,25 +590,15 @@ class DelegationBundle:
         hub_id: str = DEFAULT_HUB_ID,
         now: float | None = None,
     ) -> "DelegationBundle":
-        """Load and check a bundle. Every failure is a refusal."""
+        """Load and check a bundle. Every failure is a refusal.
+
+        The checks are proven against ONE descriptor and the bytes are read
+        from that SAME descriptor (:func:`_read_owner_only`). There is
+        deliberately no second resolution of ``path`` between check and read.
+        """
         p = Path(path)
-        st = p.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            raise WakeError(
-                f"{p} is a symlink: a credential reached through a link is one whose "
-                "permissions were checked on the wrong file"
-            )
-        if not stat.S_ISREG(st.st_mode):
-            raise WakeError(f"{p} is not a regular file")
-        if st.st_mode & 0o077:
-            raise WakeError(
-                f"{p} is mode {st.st_mode & 0o7777:04o}; a bundle holding a private key "
-                "must be 0600, or another local user can join the hub as this agent"
-            )
-        if st.st_uid != os.geteuid():
-            raise WakeError(f"{p} is owned by uid {st.st_uid}, not by the caller")
         return cls.from_mapping(
-            json.loads(p.read_text(encoding="utf-8")),
+            json.loads(_read_owner_only(p)),
             hub_id=hub_id,
             source=str(p),
             now=now,

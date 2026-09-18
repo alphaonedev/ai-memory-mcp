@@ -15,6 +15,7 @@ Two layers, on purpose:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import struct
@@ -22,6 +23,7 @@ import threading
 import time
 from base64 import urlsafe_b64encode
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -330,6 +332,211 @@ def test_a_group_readable_or_symlinked_bundle_is_refused(tmp_path: Path) -> None
     link.symlink_to(path)
     with pytest.raises(WakeError, match="symlink"):
         DelegationBundle.load(link, hub_id=HUB_ID)
+
+
+# ---------------------------------------------------------------------------
+# #3780 — the check and the read must be the SAME file
+#
+# Before #3780 `DelegationBundle.load` did `p.lstat()` and then
+# `p.read_text()`: TWO resolutions of the same path, so the bytes that were
+# read were never the bytes that were checked. These cells make that window
+# DETERMINISTIC — an attacker who replaces what the path names the instant the
+# loader first resolves it — and pin that a loader which opens ONCE and reads
+# from the descriptor it fstat-ed is immune by construction.
+# ---------------------------------------------------------------------------
+
+
+def _same_path(candidate: object, target: Path) -> bool:
+    """True when an `os` call is aimed at exactly `target` (never an fd)."""
+    if isinstance(candidate, int):
+        return False
+    try:
+        return os.fspath(candidate) == str(target)  # type: ignore[arg-type]
+    except TypeError:
+        return False
+
+
+@contextlib.contextmanager
+def _swap_on_first_touch(
+    target: Path, swap: Callable[[], None], *, open_timing: str = "before"
+):
+    """Run `swap` at the last instant before the loader fetches the bytes.
+
+    This is the TOCTOU window, made deterministic rather than raced for. The
+    hook is installed on every `os` entry point either shape of the loader can
+    reach the path through, and fires exactly ONCE:
+
+    * `os.stat` / `os.lstat` — what `Path.lstat()` calls. The hook fires AFTER
+      the real call, so the pre-#3780 loader checks the good file and is then
+      handed a different one to `read_text()`.
+    * `os.open` — what the descriptor-bound loader calls. With
+      ``open_timing="before"`` the hook fires BEFORE the real call, which is
+      the SAME attacker: swapping at the last instant before the bytes are
+      fetched. With ``open_timing="after"`` the swap lands just after the
+      descriptor is bound, which pins the other half of the property — a
+      descriptor cannot be re-pointed once it is open.
+
+    `p.read_text()` reaches the filesystem through `io.open` in C and never
+    through `os.open`, so hooking `os.open` can never disturb the pre-#3780
+    read: the RED run and the GREEN run see the same attacker.
+
+    Yields the fire counter: a cell that asserts on it can never pass
+    vacuously because the interposition silently failed to install.
+    """
+    assert open_timing in ("before", "after")
+    fired = {"n": 0}
+    real = {name: getattr(os, name) for name in ("open", "stat", "lstat")}
+
+    def make(name: str) -> Callable[..., object]:
+        fn = real[name]
+        early = name == "open" and open_timing == "before"
+
+        def hooked(path: object, *args: object, **kwargs: object) -> object:
+            aimed = _same_path(path, target) and fired["n"] == 0
+            if aimed and early:
+                fired["n"] = 1
+                swap()
+            result = fn(path, *args, **kwargs)  # type: ignore[operator]
+            if aimed and not early:
+                fired["n"] = 1
+                swap()
+            return result
+
+        return hooked
+
+    for name in real:
+        setattr(os, name, make(name))
+    try:
+        yield fired
+    finally:
+        for name, fn in real.items():
+            setattr(os, name, fn)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="O_NOFOLLOW is POSIX-only (#3780)")
+@pytest.mark.parametrize("open_timing", ["before", "after"])
+def test_a_symlink_swapped_in_after_the_check_is_never_read(
+    tmp_path: Path, open_timing: str
+) -> None:
+    import json
+
+    mine, _ = make_bundle()
+    theirs, _ = make_bundle(principal="ai:attacker-3780")
+
+    path = tmp_path / "b.json"
+    path.write_text(json.dumps(mine), encoding="utf-8")
+    path.chmod(0o600)
+
+    # A bundle the loader would refuse on its own merits: world-readable, and
+    # not this agent. Reaching it through a link is the confused deputy.
+    theirs_path = tmp_path / "theirs.json"
+    theirs_path.write_text(json.dumps(theirs), encoding="utf-8")
+    theirs_path.chmod(0o644)
+
+    def swap() -> None:
+        path.unlink()
+        path.symlink_to(theirs_path)
+
+    loaded: str | None = None
+    with _swap_on_first_touch(path, swap, open_timing=open_timing) as fired:
+        try:
+            loaded = DelegationBundle.load(path, hub_id=HUB_ID).agent_id
+        except WakeError:
+            loaded = None
+
+    assert fired["n"] == 1, "the interposition never fired, so this pins nothing"
+    # Either refusal or the file that was actually CHECKED — never the swap.
+    assert loaded != "ai:attacker-3780"
+    assert loaded in (None, AGENT_ID)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="O_NONBLOCK is POSIX-only (#3780)")
+def test_a_fifo_swapped_in_after_the_check_does_not_park_the_loader(
+    tmp_path: Path,
+) -> None:
+    import json
+    import subprocess
+    import sys
+
+    mine, _ = make_bundle()
+    theirs, _ = make_bundle(principal="ai:attacker-3780")
+
+    path = tmp_path / "b.json"
+    path.write_text(json.dumps(mine), encoding="utf-8")
+    path.chmod(0o600)
+
+    # The writer appears only after 2s. A loader that PARKS on the FIFO waits
+    # for it (and then swallows whatever it is fed); a loader that opens
+    # O_NONBLOCK and refuses a non-regular file never sees it at all.
+    writer_src = (
+        "import os, sys, time\n"
+        "time.sleep(2)\n"
+        "fd = os.open(sys.argv[1], os.O_WRONLY)\n"
+        "os.write(fd, sys.argv[2].encode())\n"
+        "os.close(fd)\n"
+    )
+    writer: subprocess.Popen[bytes] | None = None
+
+    def swap() -> None:
+        nonlocal writer
+        path.unlink()
+        os.mkfifo(path, 0o600)
+        writer = subprocess.Popen(
+            [sys.executable, "-c", writer_src, str(path), json.dumps(theirs)]
+        )
+
+    loaded: str | None = None
+    refusal = ""
+    started = time.monotonic()
+    try:
+        with _swap_on_first_touch(path, swap) as fired:
+            try:
+                loaded = DelegationBundle.load(path, hub_id=HUB_ID).agent_id
+            except WakeError as err:
+                refusal = str(err)
+        elapsed = time.monotonic() - started
+    finally:
+        if writer is not None:
+            writer.kill()
+            writer.wait(timeout=10)
+
+    assert fired["n"] == 1, "the interposition never fired, so this pins nothing"
+    assert elapsed < 1.5, f"the loader parked on the FIFO for {elapsed:.2f}s"
+    assert loaded is None, "a FIFO is not a credential; it must be refused"
+    assert "not a regular file" in refusal
+
+
+@pytest.mark.skipif(os.name != "posix", reason="O_NOFOLLOW is POSIX-only (#3780)")
+def test_the_descriptor_bound_read_keeps_every_refusal_and_the_allowed_path(
+    tmp_path: Path,
+) -> None:
+    """The allowed-path control, plus the refusals that must not have moved."""
+    import json
+
+    mine, _ = make_bundle()
+    path = tmp_path / "b.json"
+    path.write_text(json.dumps(mine), encoding="utf-8")
+
+    # (c) a regular, caller-owned 0600 file still reads, through the fd.
+    path.chmod(0o600)
+    assert DelegationBundle.load(path, hub_id=HUB_ID).agent_id == AGENT_ID
+
+    # Still refused, now on the DESCRIPTOR's stat rather than the path's.
+    path.chmod(0o644)
+    with pytest.raises(WakeError, match="must be 0600"):
+        DelegationBundle.load(path, hub_id=HUB_ID)
+    path.chmod(0o600)
+
+    # O_NOFOLLOW turns a link into ELOOP at the open; the refusal must still
+    # say "symlink" rather than leak a bare errno.
+    link = tmp_path / "link.json"
+    link.symlink_to(path)
+    with pytest.raises(WakeError, match="symlink"):
+        DelegationBundle.load(link, hub_id=HUB_ID)
+
+    # A directory is not a credential either.
+    with pytest.raises(WakeError, match="not a regular file"):
+        DelegationBundle.load(tmp_path, hub_id=HUB_ID)
 
 
 def test_the_default_bundle_path_is_the_one_identity_delegate_writes() -> None:

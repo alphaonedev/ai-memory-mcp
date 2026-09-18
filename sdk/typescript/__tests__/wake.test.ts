@@ -16,7 +16,15 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, symlinkSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  chmodSync,
+  symlinkSync,
+  unlinkSync,
+} from "node:fs";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -314,6 +322,204 @@ describe("delegation bundle", () => {
       const link = join(dir, "link.json");
       symlinkSync(path, link);
       expect(() => DelegationBundle.load(link, { hubId: HUB_ID })).toThrow(/symlink/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // #3780 — the check and the read must be the SAME file
+  //
+  // Before #3780 `DelegationBundle.load` did `lstatSync(path)` and then
+  // `readFileSync(path)`: TWO resolutions of the same path, so the bytes that
+  // were read were never the bytes that were checked. These cells make that
+  // window DETERMINISTIC — an attacker who replaces what the path names at the
+  // last instant before the bytes are fetched — and pin that a loader which
+  // opens ONCE and reads from the descriptor it fstat-ed is immune.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run `swap` at the last instant before the loader fetches the bytes.
+   *
+   * The hook is installed on every `node:fs` entry point either shape of the
+   * loader can reach the path through, and fires exactly ONCE:
+   *
+   * - `lstatSync` / `statSync` — what the pre-#3780 loader checks with. The
+   *   hook fires AFTER the real call, so the loader checks the good file and
+   *   is then handed a different one to `readFileSync(path)`.
+   * - `openSync` — what the descriptor-bound loader calls. With
+   *   `openTiming: "before"` the hook fires BEFORE the real call: the SAME
+   *   attacker, swapping just before the bytes are fetched. With `"after"` the
+   *   swap lands once the descriptor is bound, pinning the other half of the
+   *   property — a descriptor cannot be re-pointed after it is open.
+   *
+   * It returns the fire counter, so a cell that asserts on it can never pass
+   * vacuously because the interposition silently failed to install.
+   */
+  function withSwapOnFirstTouch(
+    target: string,
+    swap: () => void,
+    openTiming: "before" | "after",
+    body: () => void,
+  ): number {
+    const fs = jest.requireActual<typeof import("node:fs")>("node:fs");
+    const names = ["openSync", "lstatSync", "statSync"] as const;
+    const real: Record<string, unknown> = {};
+    for (const name of names) real[name] = fs[name];
+    let fired = 0;
+    for (const name of names) {
+      const fn = real[name] as (...a: unknown[]) => unknown;
+      const early = name === "openSync" && openTiming === "before";
+      (fs as unknown as Record<string, unknown>)[name] = (...args: unknown[]) => {
+        const aimed = args[0] === target && fired === 0;
+        if (aimed && early) {
+          fired += 1;
+          swap();
+        }
+        const result = fn(...args);
+        if (aimed && !early) {
+          fired += 1;
+          swap();
+        }
+        return result;
+      };
+    }
+    try {
+      body();
+    } finally {
+      for (const name of names) {
+        (fs as unknown as Record<string, unknown>)[name] = real[name];
+      }
+    }
+    return fired;
+  }
+
+  const posixOnly = process.platform === "win32" ? it.skip : it;
+
+  posixOnly.each(["before", "after"] as const)(
+    "never reads a symlink swapped in at the last instant (swap %s the open)",
+    (openTiming) => {
+      const dir = mkdtempSync(join(tmpdir(), "wake-3780-"));
+      try {
+        const mine = makeBundle().file;
+        const path = join(dir, "b.json");
+        writeFileSync(path, JSON.stringify(mine));
+        chmodSync(path, 0o600);
+
+        // A bundle the loader would refuse on its own merits: world-readable,
+        // and not this agent. Reaching it through a link is the confused deputy.
+        const theirs = makeBundle({ principal: "ai:attacker-3780" }).file;
+        const theirsPath = join(dir, "theirs.json");
+        writeFileSync(theirsPath, JSON.stringify(theirs));
+        chmodSync(theirsPath, 0o644);
+
+        let loaded: string | null = null;
+        const fired = withSwapOnFirstTouch(
+          path,
+          () => {
+            unlinkSync(path);
+            symlinkSync(theirsPath, path);
+          },
+          openTiming,
+          () => {
+            try {
+              loaded = DelegationBundle.load(path, { hubId: HUB_ID }).agentId;
+            } catch {
+              loaded = null;
+            }
+          },
+        );
+
+        expect(fired).toBe(1);
+        // Either a refusal or the file that was actually CHECKED — never the swap.
+        expect(loaded).not.toBe("ai:attacker-3780");
+        expect([null, AGENT_ID]).toContain(loaded);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  posixOnly("does not park on a FIFO swapped in at the last instant", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wake-3780-"));
+    let writer: ChildProcess | null = null;
+    try {
+      const mine = makeBundle().file;
+      const path = join(dir, "b.json");
+      writeFileSync(path, JSON.stringify(mine));
+      chmodSync(path, 0o600);
+      const theirs = JSON.stringify(makeBundle({ principal: "ai:attacker-3780" }).file);
+
+      let loaded: string | null = null;
+      let refusal = "";
+      const started = Date.now();
+      const fired = withSwapOnFirstTouch(
+        path,
+        () => {
+          unlinkSync(path);
+          execFileSync("mkfifo", ["-m", "600", path]);
+          // The writer appears only after 2 s. A loader that PARKS on the FIFO
+          // waits for it (and then swallows whatever it is fed); a loader that
+          // opens O_NONBLOCK and refuses a non-regular file never sees it.
+          writer = spawn(
+            process.execPath,
+            [
+              "-e",
+              "const fs=require('node:fs');" +
+                "setTimeout(()=>{fs.writeFileSync(process.argv[1],process.argv[2]);},2000);",
+              path,
+              theirs,
+            ],
+            { stdio: "ignore" },
+          );
+        },
+        "before",
+        () => {
+          try {
+            loaded = DelegationBundle.load(path, { hubId: HUB_ID }).agentId;
+          } catch (err) {
+            refusal = String(err);
+          }
+        },
+      );
+      const elapsed = Date.now() - started;
+
+      expect(fired).toBe(1);
+      expect(elapsed).toBeLessThan(1500);
+      expect(loaded).toBeNull();
+      expect(refusal).toMatch(/not a regular file/);
+    } finally {
+      writer?.kill("SIGKILL");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("keeps every refusal and the allowed path on the descriptor-bound read", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wake-3780-"));
+    try {
+      const { file } = makeBundle();
+      const path = join(dir, "b.json");
+      writeFileSync(path, JSON.stringify(file));
+
+      // The allowed-path control: a regular, caller-owned 0600 file still reads.
+      chmodSync(path, 0o600);
+      expect(DelegationBundle.load(path, { hubId: HUB_ID }).agentId).toBe(AGENT_ID);
+
+      // Still refused, now on the DESCRIPTOR's stat rather than the path's.
+      chmodSync(path, 0o644);
+      expect(() => DelegationBundle.load(path, { hubId: HUB_ID })).toThrow(/must be 0600/);
+      chmodSync(path, 0o600);
+
+      // O_NOFOLLOW turns a link into ELOOP at the open; the refusal must still
+      // say "symlink" rather than leak a bare errno.
+      const link = join(dir, "link.json");
+      symlinkSync(path, link);
+      expect(() => DelegationBundle.load(link, { hubId: HUB_ID })).toThrow(/symlink/);
+
+      // A directory is not a credential either.
+      expect(() => DelegationBundle.load(dir, { hubId: HUB_ID })).toThrow(
+        /not a regular file/,
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
