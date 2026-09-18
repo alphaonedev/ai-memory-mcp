@@ -1544,7 +1544,7 @@ fn tools_verbose_env_enabled() -> bool {
     *CACHED.get_or_init(|| {
         std::env::var("AI_MEMORY_TOOLS_VERBOSE")
             .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .is_some_and(|v| crate::security_profile::is_truthy(&v))
     })
 }
 

@@ -43,3 +43,4 @@
 10 src/storage/connection.rs
 1 src/storage/migrations.rs
 6 src/test_support.rs
+4 src/transit_encryption.rs

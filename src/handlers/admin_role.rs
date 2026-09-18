@@ -73,7 +73,7 @@ pub const ENV_ADMIN_HEADER_TRUST: &str = "AI_MEMORY_ADMIN_HEADER_TRUST";
 #[must_use]
 pub fn admin_header_trust_enabled() -> bool {
     std::env::var(ENV_ADMIN_HEADER_TRUST)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| crate::security_profile::is_truthy(&v))
         .unwrap_or(false)
 }
 

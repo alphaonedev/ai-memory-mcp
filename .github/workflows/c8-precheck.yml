@@ -118,6 +118,25 @@ jobs:
         # allowlist, a broken test-boundary heuristic) trips here.
         run: bash scripts/check-vendor-literals.sh --self-test
 
+  # QUOTED (rule e): the job name contains ` #`, which unquoted opens a YAML
+  # comment and truncates the reported check-run name.
+  truthy-grammar-gate:
+    name: "Truthy-grammar consolidation gate (#3200)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run truthy-grammar gate
+        # #3200 — HARD-BLOCK the narrow 2-term truthy/falsy env grammar
+        # (`== "1" || eq_ignore_ascii_case("true")` and the falsy twin) that
+        # silently dropped `yes`/`on`|`no`/`off`. Every env boolean routes
+        # through security_profile::{is_truthy,is_falsy}; the ONE documented
+        # deliberate-narrow exception (governance_fail_open, #3168) is
+        # allowlisted in scripts/qc-allowlists/truthy-grammar-narrow-allow.txt.
+        run: bash scripts/check-truthy-grammar.sh
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-truthy-grammar.sh --self-test
+
   l3-boundary-gate:
     # QUOTED DELIBERATELY (#2473). Unquoted, the ` #1853)` opened a YAML
     # comment and the job name parsed as 44 chars — GitHub reported the

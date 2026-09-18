@@ -3262,7 +3262,7 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
         let lax_bits = mode & 0o077;
         if lax_bits != 0 {
             let fail_open = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .map(|v| crate::security_profile::is_truthy(&v))
                 .unwrap_or(false);
             if fail_open {
                 tracing::warn!(
@@ -5548,7 +5548,7 @@ pub(crate) fn install_governance_pre_write_hook(
                     // detect the legacy-permissive mode.
                     let reason = format!("governance:consultation_failed: {e}");
                     let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .map(|v| governance_fail_open_value_enabled(&v))
                         .unwrap_or(false);
                     // Emit a governance.refusal-shaped row to the
                     // deferred audit queue regardless of the
@@ -5703,7 +5703,7 @@ pub(crate) fn install_governance_pre_action_hook(
                     // env escape hatch AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1.
                     let reason = format!("governance:consultation_failed: {e}");
                     let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .map(|v| governance_fail_open_value_enabled(&v))
                         .unwrap_or(false);
                     let synthetic_refusal = RuleDecision::Refuse {
                         rule_id: "governance:consultation_failed".to_string(),
@@ -5872,7 +5872,7 @@ fn require_api_key_strict() -> bool {
 /// `serve_bootstrap_failure_returns_typed_fatal_shutdown`.
 fn require_api_key_strict_value(value: Option<&str>) -> bool {
     value
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| crate::security_profile::is_truthy(v))
         .unwrap_or(false)
 }
 
@@ -10233,12 +10233,18 @@ mod tests {
     /// transient value (this was the SOLE writer of that var in the crate).
     #[test]
     fn require_api_key_strict_env_parse_1458() {
+        // #3200 — REQUIRE_API_KEY is a HARDENING knob: the house truthy grammar
+        // (1/true/yes/on, trimmed, case-insensitive) applies, so `=yes`/`=on`
+        // now REQUIRE the key (more secure), no longer silently inert.
         assert!(!require_api_key_strict_value(None));
         assert!(require_api_key_strict_value(Some("1")));
         assert!(require_api_key_strict_value(Some("TRUE")));
         assert!(require_api_key_strict_value(Some("true")));
+        assert!(require_api_key_strict_value(Some("yes")));
+        assert!(require_api_key_strict_value(Some("on")));
+        assert!(require_api_key_strict_value(Some("  true  ")));
         assert!(!require_api_key_strict_value(Some("0")));
-        assert!(!require_api_key_strict_value(Some("yes")));
+        assert!(!require_api_key_strict_value(Some("no")));
         assert!(!require_api_key_strict_value(Some("")));
     }
 

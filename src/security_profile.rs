@@ -223,6 +223,21 @@ pub(crate) fn is_truthy(v: &str) -> bool {
     )
 }
 
+/// A falsy env token (the negative half of the substrate-wide
+/// `0`/`false`/`no`/`off` convention) — the mirror of [`is_truthy`].
+///
+/// #3200 — the tri-state env resolvers (`resolve_compaction_enabled`,
+/// the `append_only`/`lineage` ladders, `resolve_require_agent_attestation`)
+/// used a narrow `== "0" || eq_ignore_ascii_case("false")` arm that silently
+/// dropped `no`/`off`, the falsy sibling of the narrow truthy grammar. Both
+/// arms now resolve through THIS module's one grammar.
+pub(crate) fn is_falsy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 /// #3124 — `AI_MEMORY_UNSTAMPED_MUTATION` floor: whatever the LIVE resolver
 /// ([`crate::identity::owner_stamp::UnstampedMutationMode::parse`]) resolves to
 /// `refuse` clears it. `warn` and a blank value (resolved as unset → `warn`)
@@ -740,6 +755,33 @@ pub fn runtime_boot_report() -> Result<(SecurityPosture, Vec<PinReport>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_truthy_and_is_falsy_are_the_one_house_grammar_3200() {
+        // #3200 — the ONE house truthy/falsy grammar: `1`/`true`/`yes`/`on`
+        // (trimmed, case-insensitive) is truthy; `0`/`false`/`no`/`off` is falsy;
+        // everything else is NEITHER. The narrow 2-term copies that silently
+        // dropped `yes`/`on` (e.g. `AI_MEMORY_REQUIRE_TLS=yes` was inert) are gone
+        // (pinned by scripts/check-truthy-grammar.sh).
+        for t in [
+            "1", "true", "TRUE", "TrUe", "yes", "YES", "on", "ON", " on ", "\tyes\n", "  1  ",
+        ] {
+            assert!(is_truthy(t), "must be truthy: {t:?}");
+            assert!(!is_falsy(t), "must not be falsy: {t:?}");
+        }
+        for f in [
+            "0", "false", "FALSE", "no", "NO", "off", "OFF", " off ", "  0  ",
+        ] {
+            assert!(is_falsy(f), "must be falsy: {f:?}");
+            assert!(!is_truthy(f), "must not be truthy: {f:?}");
+        }
+        for n in [
+            "", "   ", "2", "banana", "tru", "ye", "onn", "enabled", "disabled",
+        ] {
+            assert!(!is_truthy(n), "must not be truthy: {n:?}");
+            assert!(!is_falsy(n), "must not be falsy: {n:?}");
+        }
+    }
 
     /// Serialize env mutations against every other `AI_MEMORY_*`-mutating
     /// test in the crate, not just this module's own tests (#2159, residual

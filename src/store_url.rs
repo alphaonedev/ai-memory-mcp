@@ -80,7 +80,7 @@ pub fn store_url_from_file(path: &Path) -> Result<String> {
         let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             let fail_open = std::env::var("AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .map(|v| crate::security_profile::is_truthy(&v))
                 .unwrap_or(false);
             if fail_open {
                 tracing::warn!(

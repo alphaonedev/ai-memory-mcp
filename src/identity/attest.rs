@@ -223,7 +223,7 @@ pub const ENV_REQUIRE_AGENT_ATTESTATION: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTA
 pub fn global_strict_attestation_enabled() -> bool {
     matches!(
         std::env::var(ENV_REQUIRE_AGENT_ATTESTATION).ok().as_deref(),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true")
+        Some(v) if crate::security_profile::is_truthy(v)
     )
 }
 
@@ -311,7 +311,7 @@ pub fn stamp_claimed_if_absent(metadata: &mut serde_json::Value) {
 fn resolve_require_agent_attestation(value: Option<&str>, surface: WriteSurface) -> bool {
     match value {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Some(v) if crate::security_profile::is_truthy(v) => true,
         _ => matches!(surface, WriteSurface::HttpDirect),
     }
 }

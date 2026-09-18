@@ -1922,7 +1922,7 @@ pub(crate) fn validate_url_dns_resolved(
 /// hostname-shape branch so the two read the override identically.
 fn ssrf_dns_fail_open() -> bool {
     std::env::var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| crate::security_profile::is_truthy(&v))
         .unwrap_or(false)
 }
 

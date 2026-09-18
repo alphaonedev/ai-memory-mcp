@@ -9815,10 +9815,10 @@ impl AppConfig {
     pub fn resolve_compaction_enabled(&self) -> bool {
         if let Ok(v) = std::env::var(ENV_COMPACTION_ENABLED) {
             let t = v.trim();
-            if t == "1" || t.eq_ignore_ascii_case("true") {
+            if crate::security_profile::is_truthy(t) {
                 return true;
             }
-            if t == "0" || t.eq_ignore_ascii_case("false") {
+            if crate::security_profile::is_falsy(t) {
                 return false;
             }
             // Any other value: fall through to config / default.
@@ -9840,10 +9840,10 @@ impl AppConfig {
     pub fn resolve_transcript_classify_enabled(&self) -> bool {
         if let Ok(v) = std::env::var(ENV_TRANSCRIPT_CLASSIFY_ENABLED) {
             let t = v.trim();
-            if t == "1" || t.eq_ignore_ascii_case("true") {
+            if crate::security_profile::is_truthy(t) {
                 return true;
             }
-            if t == "0" || t.eq_ignore_ascii_case("false") {
+            if crate::security_profile::is_falsy(t) {
                 return false;
             }
             // Any other value: fall through to config / default.
@@ -10065,9 +10065,9 @@ impl AppConfig {
         let append_only = {
             let env = std::env::var(ENV_APPEND_ONLY).ok().and_then(|v| {
                 let t = v.trim();
-                if t == "1" || t.eq_ignore_ascii_case("true") {
+                if crate::security_profile::is_truthy(t) {
                     Some(true)
-                } else if t == "0" || t.eq_ignore_ascii_case("false") {
+                } else if crate::security_profile::is_falsy(t) {
                     Some(false)
                 } else {
                     None
@@ -10085,9 +10085,9 @@ impl AppConfig {
         let parse_bool_env = |name: &str| -> Option<bool> {
             std::env::var(name).ok().and_then(|v| {
                 let t = v.trim();
-                if t == "1" || t.eq_ignore_ascii_case("true") {
+                if crate::security_profile::is_truthy(t) {
                     Some(true)
-                } else if t == "0" || t.eq_ignore_ascii_case("false") {
+                } else if crate::security_profile::is_falsy(t) {
                     Some(false)
                 } else {
                     None

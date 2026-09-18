@@ -318,6 +318,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn require_tls_honours_the_house_truthy_grammar_3200() {
+        // #3200 — the flagship symptom: `AI_MEMORY_REQUIRE_TLS=yes`/`on` must be
+        // HONOURED (Affirmed), not silently inert (a pre-#3200 narrow reader
+        // dropped `yes`/`on`). With TLS a floor (#3705), an affirmed/allowed token
+        // still refuses any plaintext listener; a downgrade or unrecognised token
+        // refuses boot rather than widening the control.
+        // Serialise env mutation through the suite lock, then the RAII EnvGuard
+        // snapshots + restores ENV_REQUIRE_TLS; `.set` is the safe setter (edition
+        // 2024 makes bare `std::env::set_var` unsafe). ONE lock, ONE guard — no
+        // EnvVarGuard stacking.
+        let _lock = crate::test_support::env_lock();
+        let g = crate::test_support::EnvGuard::capture(ENV_REQUIRE_TLS);
+        for tok in ["yes", "on", "YES", " on ", "1", "true"] {
+            g.set(tok);
+            assert!(
+                matches!(require_tls_token(), RequireTls::Affirmed),
+                "{tok:?} must AFFIRM (honoured), not be Unrecognised"
+            );
+            assert!(
+                enforce_require_tls_token().is_ok(),
+                "{tok:?} is an allowed path (the TLS floor still refuses plaintext)"
+            );
+        }
+        for tok in ["no", "off", "0", "false"] {
+            g.set(tok);
+            assert!(matches!(
+                require_tls_token(),
+                RequireTls::DowngradeRequested(_)
+            ));
+            assert!(
+                enforce_require_tls_token().is_err(),
+                "{tok:?} downgrade must be refused"
+            );
+        }
+        g.set("banana");
+        assert!(matches!(require_tls_token(), RequireTls::Unrecognised(_)));
+        assert!(
+            enforce_require_tls_token().is_err(),
+            "an unrecognised token never widens the control"
+        );
+    }
+
+    #[test]
     fn dsn_floor_takes_the_last_sslmode_3705() {
         assert!(dsn_pins_sslmode_verify_full(
             "postgres://u@h/db?sslmode=verify-full"
