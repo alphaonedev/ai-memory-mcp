@@ -459,10 +459,16 @@ jobs:
           # the runner's uid, so the key is copied and chowned before exec.
           TLS_DIR="$GITHUB_WORKSPACE/.ci/pg-tls"
           mkdir -p "$TLS_DIR"
-          openssl genpkey -algorithm ed25519 -out "$TLS_DIR/ca.key"
+          # #3770 — P-256, not ed25519: the verify-full psql probe below runs
+          # SCRAM-SHA-256-PLUS (channel binding), and libpq derives the
+          # tls-server-end-point hash from the server certificate's SIGNATURE
+          # digest; an ed25519 signature has none, so noble's psql 16 fails
+          # with "could not find digest for NID UNDEF". Channel binding stays
+          # on (never `channel_binding=disable`); the key type is the fix.
+          openssl ecparam -name prime256v1 -genkey -noout -out "$TLS_DIR/ca.key"
           openssl req -x509 -new -key "$TLS_DIR/ca.key" -days 1 \
             -subj "/CN=ai-memory coverage throwaway CA (#3705)" -out "$TLS_DIR/ca.crt"
-          openssl genpkey -algorithm ed25519 -out "$TLS_DIR/server.key"
+          openssl ecparam -name prime256v1 -genkey -noout -out "$TLS_DIR/server.key"
           openssl req -new -key "$TLS_DIR/server.key" -subj "/CN=localhost" -out "$TLS_DIR/server.csr"
           printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' \
             > "$TLS_DIR/server.ext"
