@@ -508,6 +508,15 @@ pg_test!(pg_check_duplicate_hides_private, url, {
     // private row (existence + similarity oracle). CALLER is on the
     // admin allowlist but `is_admin_caller_trusted` stays false here
     // (keyless + no `AI_MEMORY_ADMIN_HEADER_TRUST`), so the mask runs.
+    // #3789 — that posture is ESTABLISHED under the lock, not assumed:
+    // the taxonomy tests flip the process-global header-trust env for
+    // their window, and an interleaving made CALLER admin-trusted, so
+    // the mask was bypassed and the probe flagged the private row.
+    let _g = ADMIN_ENV_LOCK.lock().await;
+    // SAFETY: this test owns the process env for the lock's duration.
+    unsafe {
+        std::env::remove_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST);
+    }
     let r = pg_router(&url).await;
     let ns = uniq_ns();
     let title = "cov-ga2 private dup 3234";
