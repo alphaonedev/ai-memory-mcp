@@ -874,6 +874,19 @@ pub fn anonymous_request_id() -> String {
     format!("{}{}", sentinels::ANONYMOUS_REQ_PREFIX, short_uuid())
 }
 
+/// #3775 — the ONE predicate for "this HTTP principal was minted by
+/// [`anonymous_request_id`], not asserted by the caller". A per-request
+/// anonymous id is fresh on every request, so it can never be the durable
+/// OWNER of anything that a later request must be able to find again;
+/// every write that stores the caller as an owner (webhook subscriptions,
+/// #3775) refuses through this predicate, and every read of the same
+/// question (`identity::authority::Authority::is_anonymous`) delegates to
+/// it, so create and delete cannot disagree about what "anonymous" means.
+#[must_use]
+pub fn is_anonymous_request_id(id: &str) -> bool {
+    id.starts_with(sentinels::ANONYMOUS_REQ_PREFIX)
+}
+
 pub fn resolve_http_agent_id(body: Option<&str>, header: Option<&str>) -> Result<String> {
     // 1. Header is authoritative — resolve it first (validate if
     //    present; synthesize anonymous fallback otherwise).

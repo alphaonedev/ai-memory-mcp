@@ -350,8 +350,8 @@ impl Authority {
     /// anonymous id was minted.
     #[must_use]
     pub fn is_anonymous(&self) -> bool {
-        self.principal
-            .starts_with(crate::identity::sentinels::ANONYMOUS_REQ_PREFIX)
+        // #3775 — ONE predicate; the string form is the SSOT.
+        crate::identity::is_anonymous_request_id(&self.principal)
     }
 
     /// The READ-visibility caller for the per-row scope predicate

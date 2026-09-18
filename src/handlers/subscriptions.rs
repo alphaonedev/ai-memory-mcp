@@ -366,6 +366,32 @@ pub async fn subscribe(
         )
             .into_response();
     }
+    // #3775 — a subscription is a durable OWNER-bound registration: `created_by`
+    // is the caller, and `list` / `unsubscribe` are scoped to the caller
+    // (#870 / #874 / #3407). A per-request `anonymous:req-<uuid8>` principal
+    // is fresh on every request, so an anonymous create would store an owner
+    // that no later request — not even the creator's next one — can resolve:
+    // the webhook could never be listed or removed through the API, while the
+    // #3407 owner gate on DELETE (correctly) refuses everyone. The ONE
+    // predicate (`identity::is_anonymous_request_id`, also behind
+    // `Authority::is_anonymous`) decides here, BEFORE the backend branch, so
+    // sqlite and postgres answer byte-identically. Closed shape: 403
+    // `{error, code: IDENTITY_REQUIRED}` — no row exists yet, so this is not
+    // the `NOT_OWNER` cross-owner refusal (#3426).
+    if crate::identity::is_anonymous_request_id(&caller) {
+        tracing::warn!(
+            target: super::AUTHZ_TRACE_TARGET,
+            "POST /subscriptions 403: no X-Agent-Id asserted (anonymous principal {caller}); a subscription needs a resolvable owner"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": crate::errors::msg::SUBSCRIBE_REQUIRES_IDENTITY,
+                "code": crate::errors::error_codes::IDENTITY_REQUIRED,
+            })),
+        )
+            .into_response();
+    }
 
     // R3-S1.HMAC (v0.7.0 fix campaign 2026-05-13): refuse to register a
     // subscription when neither a per-subscription `secret` nor a

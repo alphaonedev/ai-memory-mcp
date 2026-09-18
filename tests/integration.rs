@@ -12030,6 +12030,14 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // POST /api/v1/subscriptions — subscribe
     // R3-S1.HMAC (2026-05-13): supply per-sub secret.
+    // #3775 — the caller is NAMED on both calls: a subscription is
+    // owner-bound (`created_by`; list/unsubscribe are caller-scoped), so an
+    // anonymous POST is refused 403 IDENTITY_REQUIRED and the pre-#3775
+    // anonymous shape of this cell passed vacuously (the anonymous DELETE
+    // resolved a fresh `anonymous:req-*` principal, matched nothing, and
+    // answered `200 removed:false` until #3407 made that a 403). The
+    // unsubscribe now asserts `removed: true`, so the smoke matrix proves
+    // the round trip instead of merely surviving it.
     {
         let (code, body) = route_post(
             &d,
@@ -12039,17 +12047,26 @@ async fn http_smoke_matrix_phases_1_3() {
                 "events": "*",
                 "secret": "smoke-secret",
             }),
-            None,
+            Some("ai:smoke-agent"),
         )
         .await;
         assert_eq!(code, "201", "subscribe: {body}");
-        let sub_id = body.get("id").map(|v| v.as_str().unwrap().to_string());
+        let sub_id = body["id"].as_str().expect("subscription id").to_string();
 
-        // DELETE /api/v1/subscriptions — unsubscribe
-        if let Some(id) = sub_id {
-            let code = route_delete(&d, &format!("/api/v1/subscriptions?id={id}"), None).await;
-            assert!(code == "204" || code == "200", "unsubscribe code: {code}");
-        }
+        // DELETE /api/v1/subscriptions — unsubscribe, by the creator.
+        let (status, body) = d
+            .request(
+                "DELETE",
+                &format!("/api/v1/subscriptions?id={sub_id}"),
+                None,
+                Some("ai:smoke-agent"),
+            )
+            .await;
+        assert_eq!(status.as_u16(), 200, "unsubscribe: {body}");
+        assert_eq!(
+            body["removed"], true,
+            "unsubscribe must remove the row it created: {body}"
+        );
     }
 
     // POST /api/v1/pending/{id}/approve — test with nonexistent id.

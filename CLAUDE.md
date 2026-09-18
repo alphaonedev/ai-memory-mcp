@@ -940,7 +940,14 @@ with agent registration (Task 1.3, upcoming).
 
 1. `agent_id` field in `POST /api/v1/memories` body
 2. `X-Agent-Id` request header
-3. Per-request `anonymous:req-<uuid8>` (logged at WARN)
+3. Per-request `anonymous:req-<uuid8>` (logged at WARN). **Exception (#3775):**
+   `POST /api/v1/subscriptions` refuses an anonymous caller with `403
+   {"error", "code": "IDENTITY_REQUIRED"}` — a subscription is owner-bound
+   (`created_by`; list/unsubscribe are caller-scoped, #870/#874/#3407) and a
+   per-request principal could never resolve the row it created, so the
+   webhook would dispatch forever with no API-reachable teardown. The ONE
+   predicate is `identity::is_anonymous_request_id` (behind
+   `Authority::is_anonymous`).
 
 **Validation:** `^[A-Za-z0-9_\-:@./]{1,128}$` — permits prefixed forms
 (`ai:`, `host:`, `anonymous:`), `@` scope separator, `/` for future SPIFFE-style

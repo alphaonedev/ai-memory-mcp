@@ -98,6 +98,14 @@ pub mod error_codes {
     /// identity oracle for any caller holding a row id it was not entitled to.
     pub const NOT_OWNER: &str = "NOT_OWNER";
 
+    /// v1.0.0 #3775 — a write that would store the caller as the durable
+    /// OWNER of a resource (a webhook subscription) was refused because no
+    /// identity was asserted: the per-request `anonymous:req-<uuid8>`
+    /// principal is fresh on every request and could never satisfy the
+    /// owner gate (#3407 `NOT_OWNER`) on the row it would create. Distinct
+    /// from `NOT_OWNER`: no row exists, and no owner is being compared.
+    pub const IDENTITY_REQUIRED: &str = "IDENTITY_REQUIRED";
+
     /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
     /// exceed the materialised-prefix budget
     /// ([`crate::storage::FIND_PATHS_MAX_PREFIXES`]). Shared slug for the SAL
@@ -307,6 +315,10 @@ pub mod msg {
     /// `handlers::parity::owner_gate_refusal` shape (403 `NOT_OWNER`); the
     /// sqlite arm used to answer `200 {"removed": false}` for the same act.
     pub const CALLER_DOES_NOT_OWN_SUBSCRIPTION: &str = "caller does not own this subscription";
+    /// #3775 — the `error` text beside `error_codes::IDENTITY_REQUIRED` on the
+    /// anonymous-subscribe refusal (403), byte-identical on both backends.
+    pub const SUBSCRIBE_REQUIRES_IDENTITY: &str =
+        "subscribe requires an asserted caller identity: set the X-Agent-Id header";
 
     // ---- validation -------------------------------------------------------------
     pub const FORGET_FILTER_REQUIRED: &str =
