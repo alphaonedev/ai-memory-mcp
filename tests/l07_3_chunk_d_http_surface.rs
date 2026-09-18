@@ -2280,8 +2280,15 @@ async fn http_metrics_returns_prom_text() {
 // Hook subscribers — POST/GET/DELETE /api/v1/subscriptions + /notify + /inbox.
 // ---------------------------------------------------------------------------
 
+/// R3-S1.HMAC — a NAMED caller who supplies neither a per-subscription
+/// `secret` nor a server-wide HMAC secret is refused 400. #3775 follow-up:
+/// this cell used to POST anonymously, which the handler now refuses FIRST
+/// with 403 `IDENTITY_REQUIRED` (identity before body validation — the
+/// correct order; the anonymous arm is pinned by
+/// `tests/anonymous_subscribe_refusal_3775.rs`), so the caller is named here
+/// to reach the HMAC-secret check the cell is about.
 #[tokio::test]
-async fn http_subscribe_no_secret_no_global_hmac_400() {
+async fn http_subscribe_named_caller_no_secret_no_global_hmac_400() {
     let _g = lock_hmac();
     ai_memory::config::set_active_hooks_hmac_secret(None);
     let (router, _f) = build_router_fixture();
@@ -2289,8 +2296,9 @@ async fn http_subscribe_no_secret_no_global_hmac_400() {
         "url": "https://example.com/hook",
         "events": "store",
     });
-    let (status, payload) = post_json(&router, "/api/v1/subscriptions", body).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, payload) =
+        post_json_with_agent(&router, "/api/v1/subscriptions", body, "ai:subscriber").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={payload}");
     assert!(
         payload
             .get("error")
