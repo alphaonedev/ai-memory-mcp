@@ -92,3 +92,68 @@ fn registration_still_accepts_a_public_host_with_userinfo_3744() {
     register(&conn, "https://a:b@hooks.example.com/services/T/B/X")
         .expect("#3744: a public host behind userinfo still registers");
 }
+
+/// #3744 — the dispatch cell the issue asked for, on the ONE row shape that
+/// can still carry the defect: a subscription registered BEFORE the fix
+/// (the table holds it verbatim; the guard at `insert` never ran on this
+/// URL). With loopback DISALLOWED the syntactic guard `send` runs first
+/// must refuse it under the SSRF reason — `ssrf_rejected`, the class the
+/// row belongs to — never `dns_ssrf_rejected` (the accidental refusal the
+/// pre-fix guard produced by failing to RESOLVE the username), and the
+/// loopback listener must see no connection at all. RED with f1fbfe312's
+/// `authority_without_userinfo` reverted (the DLQ row reads
+/// `dns_ssrf_rejected`), GREEN on the tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_userinfo_row_is_refused_at_dispatch_as_ssrf_not_dns_3744() {
+    use ai_memory::subscriptions::{dispatch_event, dlq_reason, list_dlq, wait_dispatch_idle};
+
+    ai_memory::config::set_allow_loopback_webhooks(false);
+    let (_dir, db) = fresh_db();
+    // A listener on loopback that must never be reached: a refusal that
+    // happens in the guard costs no connect.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let legacy_url = format!("https://a:b@127.0.0.1:{port}/hook");
+    let sub_id = {
+        let conn = Connection::open(&db).expect("open");
+        // The guard at `insert` refuses the legacy shape on this tip, so the
+        // pre-fix row can only reach the table around it: register a public
+        // target, then rewrite the stored URL the way a pre-fix `insert`
+        // would have stored it.
+        let id = register(&conn, "https://hooks.example.com/services/T/B/legacy")
+            .expect("a public target registers");
+        conn.execute(
+            "UPDATE subscriptions SET url = ?1 WHERE id = ?2",
+            rusqlite::params![legacy_url, id],
+        )
+        .expect("rewrite the stored URL to the pre-fix userinfo shape");
+        id
+    };
+    {
+        let conn = Connection::open(&db).expect("open");
+        dispatch_event(&conn, "memory_store", "evt-3744", "ns-3744", None, &db);
+        // #3764 — the dispatcher's own completion signal, not a wall-clock poll.
+        wait_dispatch_idle().await;
+    }
+    let rows = {
+        let conn = Connection::open(&db).expect("open");
+        list_dlq(&conn, Some(sub_id.as_str())).expect("dlq")
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "#3744: one DLQ row for the refused delivery: {rows:?}"
+    );
+    assert_eq!(
+        rows[0].last_error,
+        dlq_reason::SSRF_REJECTED,
+        "#3744: a legacy userinfo row to loopback is refused as an SSRF violation, \
+         not as a resolver miss"
+    );
+    assert_ne!(rows[0].last_error, dlq_reason::DNS_SSRF_REJECTED);
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("#3744: the loopback listener must never be connected to: {other:?}"),
+    }
+}
