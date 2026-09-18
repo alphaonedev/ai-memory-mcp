@@ -80,7 +80,11 @@ pub fn cmd_inbox(
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let conn = db::open(db_path)?;
+    // #3730 (#2572 class) — REFUSE on a Postgres store BEFORE opening the local
+    // sqlite: the inbox lives in the served store, and reading the sidecar
+    // here reported an EMPTY inbox while messages waited in Postgres.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "inbox", out)?;
+    let conn = db::open(&db_path)?;
     let caller = crate::identity::resolve_agent_id(cli_agent_id, None)
         .map_err(|e| anyhow::anyhow!(crate::errors::msg::inbox(e)))?;
 

@@ -259,7 +259,16 @@ pub async fn catch_up_read(
     unread_only: bool,
     limit: Option<u32>,
 ) -> Result<Value> {
-    let db_path = db_path.to_path_buf();
+    // #3730 (#2572 class) — the catch-up read is the same inbox read `ai-memory
+    // inbox` makes: refuse a Postgres store before opening the sidecar.
+    let db_path = {
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let mut so = stdout.lock();
+        let mut se = stderr.lock();
+        let mut out = crate::cli::CliOutput::from_std(&mut so, &mut se);
+        crate::cli::backup::refuse_pg_store(db_path, "inbox", &mut out)?
+    };
     let agent_id = agent_id.to_owned();
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::open(&db_path)?;
