@@ -282,7 +282,7 @@ async fn set_namespace_standard_inner(
         "namespace_set_standard",
         "",
         crate::governance::audit::ForensicPayload::new()
-            .ident("namespace", &ns)
+            .ident_or_commit("namespace", &ns)
             .opt_ident(field_names::STANDARD_ID, body.id.as_deref())
             .opt_ident("parent", body.parent.as_deref())
             .flag("has_governance", body.governance.is_some()),
@@ -1244,7 +1244,7 @@ async fn clear_namespace_standard_inner(
         "allow",
         crate::mcp::AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        crate::governance::audit::ForensicPayload::new().ident("namespace", &ns),
+        crate::governance::audit::ForensicPayload::new().ident_or_commit("namespace", &ns),
     );
 
     // v0.7.0 Wave-3 Continuation 2 (Phase 11) — postgres-backed clear.

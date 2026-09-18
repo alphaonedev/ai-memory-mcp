@@ -525,7 +525,7 @@ pub fn handle_skill_register(
         "skill_register",
         "",
         crate::governance::audit::ForensicPayload::new()
-            .ident("namespace", &manifest.namespace)
+            .ident_or_commit("namespace", &manifest.namespace)
             .ident("name", &manifest.name)
             .number("resource_count", resource_files.len())
             .flag("signed", active_keypair.is_some()),

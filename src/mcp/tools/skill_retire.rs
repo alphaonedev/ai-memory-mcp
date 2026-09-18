@@ -142,7 +142,7 @@ pub fn handle_skill_retire(
         },
         "",
         crate::governance::audit::ForensicPayload::new()
-            .ident("namespace", &namespace)
+            .ident_or_commit("namespace", &namespace)
             .ident("name", &name)
             .opt_ident("skill_id", single_id.as_deref())
             .opt_commit("reason", reason),
@@ -366,7 +366,7 @@ pub fn handle_skill_delete(
         "skill_delete",
         "",
         crate::governance::audit::ForensicPayload::new()
-            .ident("namespace", &namespace)
+            .ident_or_commit("namespace", &namespace)
             .ident("name", &name)
             .idents("skill_ids", &skill_ids)
             .flag("force", force),

@@ -1050,7 +1050,7 @@ pub fn audit_grant_outcome(req: &CapRequest, base_kind: &'static str, outcome: &
                 crate::governance::audit::ForensicPayload::new()
                     .ident("issuer", issuer)
                     .label("op_level", op_level.as_str())
-                    .ident("namespace", &req.namespace)
+                    .ident_or_commit("namespace", &req.namespace)
                     .ident("action", &req.action)
                     .label("flipped_from", base_kind),
             );
@@ -1062,7 +1062,7 @@ pub fn audit_grant_outcome(req: &CapRequest, base_kind: &'static str, outcome: &
                 AUDIT_KIND_REJECT,
                 rej.code(),
                 crate::governance::audit::ForensicPayload::new()
-                    .ident("namespace", &req.namespace)
+                    .ident_or_commit("namespace", &req.namespace)
                     .ident("action", &req.action)
                     .commit("reason", &rej.to_string()),
             );

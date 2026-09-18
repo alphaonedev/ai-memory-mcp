@@ -422,7 +422,8 @@ fn emit_why_trace_signal(mem: &Memory, refused: bool) {
             // #3647 — the title is tenant content: commitment only.
             crate::governance::audit::ForensicPayload::new()
                 .commit("title", &mem.title)
-                .ident("namespace", &mem.namespace),
+                // #3774 — `_shared/<from>→<to>/` (and any Unicode namespace) MAY not be an identifier.
+                .ident_or_commit("namespace", &mem.namespace),
         );
     }
 }
@@ -24650,6 +24651,8 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
     Ok(Some(outcome.id))
 }
 
+#[cfg(test)]
+mod forensic_ident_namespace_3774_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

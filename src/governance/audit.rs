@@ -678,6 +678,13 @@ impl ForensicPayload {
         self.push(key, ident_field(value))
     }
 
+    /// #3774 — the optional twin of [`Self::ident_or_commit`]: `None` renders
+    /// `null`, `Some(value)` is routed by shape, nothing declared.
+    pub fn opt_ident_or_commit(self, key: &'static str, value: Option<&str>) -> Self {
+        let field = value.map_or(ForensicField::Value(serde_json::Value::Null), ident_field);
+        self.push(key, field)
+    }
+
     /// #3739 — the list twin of [`Self::ident_or_commit`]: each item routed
     /// by shape, none declared.
     pub fn idents_or_commit<I, S>(self, key: &'static str, values: I) -> Self

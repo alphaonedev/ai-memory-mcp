@@ -480,7 +480,7 @@ fn handle_namespace_set_standard_inner(
         "namespace_set_standard",
         "",
         crate::governance::audit::ForensicPayload::new()
-            .ident("namespace", namespace)
+            .ident_or_commit("namespace", namespace)
             .ident(field_names::STANDARD_ID, id)
             .opt_ident("parent", parent)
             .flag(
@@ -796,7 +796,7 @@ fn record_clear_refusal(caller: &str, namespace: &str) {
         "refuse",
         AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        crate::governance::audit::ForensicPayload::new().ident("namespace", namespace),
+        crate::governance::audit::ForensicPayload::new().ident_or_commit("namespace", namespace),
     );
 }
 
@@ -956,7 +956,7 @@ fn handle_namespace_clear_standard_inner(
         "allow",
         AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        crate::governance::audit::ForensicPayload::new().ident("namespace", namespace),
+        crate::governance::audit::ForensicPayload::new().ident_or_commit("namespace", namespace),
     );
 
     let cleared = db::clear_namespace_standard(conn, namespace)

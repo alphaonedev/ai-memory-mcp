@@ -214,7 +214,7 @@ pub fn run(
                 "",
                 crate::governance::audit::ForensicPayload::new()
                     .opt_number(field_names::OLDER_THAN_DAYS, older_than_days)
-                    .opt_ident("namespace", namespace.as_deref()),
+                    .opt_ident_or_commit("namespace", namespace.as_deref()),
             );
 
             let purged = db::purge_archive_scoped(&conn, namespace.as_deref(), older_than_days)?;
