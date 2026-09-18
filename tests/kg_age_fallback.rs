@@ -262,25 +262,91 @@ async fn drop_age_extension(url: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// Restore AGE after the failure-injection portion so the next test
-/// run starts from a known-good state. Idempotent on re-runs.
+/// run — and every LATER test binary sharing this database — starts
+/// from a known-good state. Idempotent on re-runs.
+///
+/// Every statement runs on ONE acquired connection: `LOAD 'age'` and
+/// `SET search_path` are session GUCs, so a `create_graph` issued on a
+/// different pooled session would not resolve the function at all.
+/// The graph is created only when `ag_catalog.ag_graph` says it is
+/// absent (so re-runs stay idempotent without swallowing the
+/// `create_graph` error the way the pre-#1735-triage version did), and
+/// the result is then VERIFIED on a fresh session — the shape the next
+/// binary observes — by [`verify_age_graph_ready`].
 async fn restore_age_extension(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(url)
         .await?;
+    let mut conn = pool.acquire().await?;
     sqlx::query("CREATE EXTENSION IF NOT EXISTS age")
-        .execute(&pool)
+        .execute(&mut *conn)
         .await?;
-    sqlx::query("LOAD 'age'").execute(&pool).await?;
+    sqlx::query("LOAD 'age'").execute(&mut *conn).await?;
     sqlx::query("SET search_path = ag_catalog, \"$user\", public")
-        .execute(&pool)
+        .execute(&mut *conn)
         .await?;
-    // Recreate the graph projection. `create_graph` raises if the
-    // graph already exists; the `DROP EXTENSION ... CASCADE` removes
-    // the projection along with the catalog so this is safe.
-    let _ = sqlx::query("SELECT create_graph('memory_graph')")
-        .execute(&pool)
-        .await;
+    let graph_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1::name)",
+    )
+    .bind(AGE_GRAPH)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !graph_exists {
+        sqlx::query(&format!("SELECT create_graph('{AGE_GRAPH}')"))
+            .execute(&mut *conn)
+            .await?;
+    }
+    drop(conn);
+    verify_age_graph_ready(url).await
+}
+
+/// The graph projection every AGE-routed test in this database walks.
+const AGE_GRAPH: &str = "memory_graph";
+
+/// Prove, on a FRESH session, that AGE is usable again the way a later
+/// test binary will use it: the extension row is back in `pg_extension`,
+/// `LOAD` + the `ag_catalog` search_path resolve, `memory_graph` is in
+/// `ag_catalog.ag_graph`, and a cypher round trip against it answers.
+/// Any miss is an `Err` naming the missing piece — the caller turns it
+/// into a panic, because a restore that silently left the database
+/// without its graph is exactly the state that reads as an unrelated red
+/// in whichever AGE test happens to run next.
+async fn verify_age_graph_ready(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await?;
+    let mut conn = pool.acquire().await?;
+    let extension_present: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'age')")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !extension_present {
+        return Err("AGE restore verification: extension 'age' is absent from pg_extension".into());
+    }
+    sqlx::query("LOAD 'age'").execute(&mut *conn).await?;
+    sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        .execute(&mut *conn)
+        .await?;
+    let graph_present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1::name)",
+    )
+    .bind(AGE_GRAPH)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !graph_present {
+        return Err(format!(
+            "AGE restore verification: graph '{AGE_GRAPH}' is absent from ag_catalog.ag_graph"
+        )
+        .into());
+    }
+    let sql = format!(
+        "SELECT * FROM cypher('{AGE_GRAPH}', $$ MATCH (n) RETURN count(n) $$) AS (c agtype)"
+    );
+    sqlx::query(&sql).fetch_one(&mut *conn).await.map_err(|e| {
+        format!("AGE restore verification: cypher round trip against '{AGE_GRAPH}' failed: {e}")
+    })?;
     Ok(())
 }
 
@@ -446,8 +512,14 @@ async fn age_to_cte_fallback_clears_a2a1_3() {
         "phase-2: kg_invalidate fallback must locate the targeted edge"
     );
 
-    // Restore AGE so a follow-up `cargo test` re-run starts clean.
-    if let Err(e) = restore_age_extension(&url).await {
-        eprintln!("warning: failed to restore AGE extension after fallback test: {e}");
-    }
+    // Restore AGE so a follow-up `cargo test` re-run — and every later
+    // AGE test binary sharing this database — starts clean. A failed
+    // restore is THIS test's failure, loudly: reporting it as a warning
+    // and returning green left the database without AGE / without
+    // `memory_graph` for whichever test ran next, which surfaced as an
+    // unrelated red (the #1735 deferred-drain cell on the promotion
+    // head) with no trace back to here.
+    restore_age_extension(&url)
+        .await
+        .expect("restore AGE extension + memory_graph after the fallback test");
 }
