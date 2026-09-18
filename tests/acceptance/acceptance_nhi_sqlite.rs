@@ -100,7 +100,7 @@ struct DaemonChild {
 
 impl DaemonChild {
     fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{}", self.port, path)
+        format!("https://127.0.0.1:{}{}", self.port, path)
     }
 
     /// Captured child stderr so far (for panic diagnostics).
@@ -142,6 +142,29 @@ fn http_client() -> reqwest::blocking::Client {
         .timeout(REQUEST_TIMEOUT)
         .build()
         .expect("build blocking http client")
+}
+
+/// #3776 / #3709 — a blocking client that trusts the daemon's ZERO-CONFIG local
+/// CA (`<key_dir>/tls/local-ca.pem`, written on first boot; the CA-issued leaf's
+/// SANs cover `127.0.0.1`) for FULL verification — NOT `danger_accept_invalid_certs`.
+/// `key_dir` is the process-wide `AI_MEMORY_KEY_DIR` sandbox every daemon shares,
+/// so one CA validates every daemon this suite spawns. Returns `None` until the
+/// daemon has written the CA (early boot, before it binds), so the readiness loop
+/// can call it every tick and start probing the moment TLS material exists.
+fn local_ca_client(timeout: Duration) -> Option<reqwest::blocking::Client> {
+    let ca_path = key_dir_sandbox::pin()
+        .join(ai_memory::tls_bootstrap::TLS_SUBDIR)
+        .join(ai_memory::tls_bootstrap::LOCAL_CA_CERT_FILE);
+    let pem = std::fs::read(&ca_path).ok()?;
+    let ca = reqwest::Certificate::from_pem(&pem).ok()?;
+    Some(
+        reqwest::blocking::Client::builder()
+            .use_rustls_tls()
+            .add_root_certificate(ca)
+            .timeout(timeout)
+            .build()
+            .expect("build verify-full client trusting the #3709 local CA"),
+    )
 }
 
 /// Spawn `ai-memory --db <db> serve --host 127.0.0.1 --port <p>` with
@@ -214,11 +237,15 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
             })
         });
 
-        let probe = reqwest::blocking::Client::builder()
-            .timeout(READINESS_PROBE_TIMEOUT)
-            .build()
-            .expect("build readiness probe client");
-        let health_url = format!("http://127.0.0.1:{port}/api/v1/health");
+        // #3776 — the #3709 first-boot daemon serves HTTPS from a local CA it
+        // writes early in boot; probe the scheme it ANNOUNCES, trusting that CA
+        // (verify-full), never plaintext. `probe` is built lazily the moment the
+        // CA file appears (before the daemon binds), so the loop covers the
+        // CA-write -> bind window; a plain-http probe here would never see this
+        // daemon ready (that refusal is pinned by
+        // `first_boot_daemon_refuses_plain_http_3776`).
+        let health_url = format!("https://127.0.0.1:{port}/api/v1/health");
+        let mut probe: Option<reqwest::blocking::Client> = None;
         let deadline = Instant::now() + SPAWN_TIMEOUT;
         loop {
             if Instant::now() >= deadline {
@@ -232,7 +259,11 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
                     "daemon never became ready within {SPAWN_TIMEOUT:?}\n--- stderr ---\n{stderr}"
                 );
             }
-            if let Ok(resp) = probe.get(&health_url).send()
+            if probe.is_none() {
+                probe = local_ca_client(READINESS_PROBE_TIMEOUT);
+            }
+            if let Some(p) = probe.as_ref()
+                && let Ok(resp) = p.get(&health_url).send()
                 && resp.status().is_success()
             {
                 return DaemonChild {
@@ -460,7 +491,8 @@ fn config1_full_surface_attested_nhi_e2e() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("acc-nhi.db");
     let daemon = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
-    let client = http_client();
+    let client = local_ca_client(REQUEST_TIMEOUT)
+        .expect("#3709 zero-config local CA present after the daemon became ready");
     let kp = ai_memory::identity::keypair::generate(NHI_AGENT).expect("nhi keypair");
     let ns = "acc-nhi";
 
@@ -824,11 +856,15 @@ fn config1_durability_across_daemon_restart() {
     let ns = "acc-restart";
     let content = "durable truth survives a daemon restart — TEXT is the source of truth";
     let kp = ai_memory::identity::keypair::generate(NHI_AGENT).expect("nhi keypair");
-    let client = http_client();
 
     // Boot #1: enroll + attested store, confirm readable.
     let id = {
         let daemon = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
+        // #3776 — build the verify-full client AFTER the daemon wrote its #3709
+        // local CA (spawn_daemon returns only once its CA-trusting readiness
+        // probe passed, so the CA is on disk here).
+        let client = local_ca_client(REQUEST_TIMEOUT)
+            .expect("#3709 local CA present after the daemon became ready");
         register_and_enroll(&client, &daemon, &kp);
         let id = store_signed(
             &client,
@@ -850,6 +886,10 @@ fn config1_durability_across_daemon_restart() {
     // Boot #2: same on-disk DB, brand-new process → the row is still there,
     // byte-for-byte, and still attributable to the same NHI principal.
     let daemon2 = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
+    // #3776 — same-CA verify-full client for the restarted daemon (the process-wide
+    // key-dir sandbox shares one #3709 local CA across every daemon this suite spawns).
+    let client = local_ca_client(REQUEST_TIMEOUT)
+        .expect("#3709 local CA present after the daemon became ready");
     let got = get_memory(&client, &daemon2, &id)
         .expect("durable memory must survive a daemon restart on the same DB");
     assert_eq!(
@@ -872,7 +912,6 @@ fn config1_encryption_at_rest_http_roundtrip() {
     let db = tmp.path().join("acc-encrypted.db");
     let ns = "acc-crypt";
     let secret = "at-rest secret content that must NOT be plaintext on disk";
-    let client = http_client();
 
     let id = {
         // Permissive attestation for THIS test only: the at-rest envelope
@@ -890,6 +929,10 @@ fn config1_encryption_at_rest_http_roundtrip() {
                 ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0"),
             ],
         );
+        // #3776 — build the verify-full client AFTER the daemon wrote its #3709
+        // local CA.
+        let client = local_ca_client(REQUEST_TIMEOUT)
+            .expect("#3709 local CA present after the daemon became ready");
         let resp = client
             .post(daemon.url("/api/v1/memories"))
             .header("X-Agent-Id", NHI_AGENT)
@@ -1237,4 +1280,32 @@ fn config1_mcp_stdio_full_profile_smoke() {
         recall_text.contains("mcpacctoken") || recall_text.contains("mcp-acc"),
         "recall must return the stored memory: {recall_text}"
     );
+}
+
+/// #3776 — ABSENCE PIN. The #3709 first-boot daemon auto-generates a local CA
+/// and is HTTPS-ONLY (it refuses to serve plaintext, loopback included). A
+/// PLAIN-HTTP GET to its port must therefore NOT succeed — this is what makes
+/// the harness's https+verify-full readiness probe load-bearing rather than
+/// incidental: the pre-#3776 plain-http probe could never observe this daemon
+/// as ready, which was the whole `config1_*` "never became ready" failure.
+#[test]
+fn first_boot_daemon_refuses_plain_http_3776() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("acc-http-refused.db");
+    // spawn_daemon's own probe already proved the daemon is up over HTTPS.
+    let daemon = spawn_daemon(&db, &[]);
+    let plain = http_client();
+    let http_url = format!("http://127.0.0.1:{}/api/v1/health", daemon.port);
+    match plain.get(&http_url).send() {
+        // A TLS listener handed a plaintext HTTP request resets / fails the
+        // handshake; reqwest surfaces a transport error. That IS the refusal.
+        Err(_) => {}
+        // If any bytes come back, they must never be a healthy 2xx.
+        Ok(resp) => assert!(
+            !resp.status().is_success(),
+            "#3776: a plain-http GET against the first-boot HTTPS daemon must not \
+             return success, got {}",
+            resp.status()
+        ),
+    }
 }
