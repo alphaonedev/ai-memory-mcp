@@ -159,7 +159,7 @@
     "path": "sdk/python/ai_memory/wake.py",
     "role": "Python decoder -> metadata WakeSignal -> operator-provided on_signal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "922e8e30300f43afb2ce977dca16fd66e6b981b0241a3cac986745d749098e22"
+    "sha256": "3f4a521bbf4aa0bb3e090708dcbe1c134b9b2214296870f803d19997157e93fb"
   },
   {
     "path": "sdk/python/swarm/wake.py",
