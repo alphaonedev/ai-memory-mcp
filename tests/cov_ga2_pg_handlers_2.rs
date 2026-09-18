@@ -999,6 +999,26 @@ pg_test!(
             assert!(status.is_success(), "seed status={status} body={body}");
             ids.push(body["id"].as_str().expect("seed id").to_string());
         }
+        // #3614 (transitive arm) — a depth-2 row derived FROM the (soon to be)
+        // quarantined node: linked BEFORE the stamp (a hidden target cannot be
+        // linked to), so the walk passes through the hidden node and lists it.
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/memories",
+            json!({"title": "grandchild-3614", "content": "body", "namespace": ns, "agent_id": owner}),
+            owner,
+        )
+        .await;
+        assert!(status.is_success(), "seed status={status} body={body}");
+        let grandchild = body["id"].as_str().expect("seed id").to_string();
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/links",
+            json!({"source_id": grandchild, "target_id": ids[3], "relation": "derived_from"}),
+            owner,
+        )
+        .await;
+        assert!(status.is_success(), "seed link status={status} body={body}");
         for (id, state) in ids[1..].iter().zip(["open", "contaminated", "quarantined"]) {
             let (status, body) = post_json_as(
                 &r,
@@ -1026,6 +1046,44 @@ pg_test!(
             2,
             "#3614 unscoped lister must hide quarantine"
         );
+        // The unscoped lineage walk (the `transitive` arm on BOTH surfaces):
+        // quarantined hidden, open + contaminated at depth 1, the grandchild
+        // at depth 2 through the hidden node.
+        let walk = store
+            .lineage_descendants(&ids[0], ai_memory::db::LINEAGE_MAX_DEPTH)
+            .await
+            .expect("lineage descendants");
+        let listed: Vec<(&str, usize)> = walk.iter().map(|n| (n.id.as_str(), n.depth)).collect();
+        assert!(
+            !listed.iter().any(|(id, _)| *id == ids[3]),
+            "#3614 transitive: a quarantined descendant must never render: {listed:?}"
+        );
+        assert!(listed.contains(&(ids[1].as_str(), 1)), "{listed:?}");
+        assert!(listed.contains(&(ids[2].as_str(), 1)), "{listed:?}");
+        assert!(
+            listed.contains(&(grandchild.as_str(), 2)),
+            "#3614 transitive: the walk passes through the hidden node: {listed:?}"
+        );
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/memory_dependents_of_invalidated",
+            json!({"memory_id": ids[0], "transitive": true}),
+            owner,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let rendered: Vec<&str> = body["transitive_suspects"]
+            .as_array()
+            .expect("transitive_suspects")
+            .iter()
+            .map(|n| n["id"].as_str().expect("id"))
+            .collect();
+        assert!(
+            !rendered.contains(&ids[3].as_str()),
+            "#3614 transitive HTTP: {body}"
+        );
+        assert!(rendered.contains(&grandchild.as_str()), "{body}");
+        assert_eq!(body["transitive_count"], json!(3), "{body}");
         assert!(
             dependents
                 .iter()

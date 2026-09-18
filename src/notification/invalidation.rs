@@ -433,6 +433,91 @@ mod tests {
         Ok(())
     }
 
+    /// #3614 (transitive arm) — the same quarantine rule on the `transitive`
+    /// walk (`db::transitive_suspects` = the lineage-descendants CTE, the
+    /// walk `memory_lineage` also renders): a quarantined descendant never
+    /// renders (id, cid, relation, depth), the walk still passes THROUGH it
+    /// (a row derived from the quarantined one keeps its depth-2 listing),
+    /// and open / contaminated / tombstoned descendants are listed — the
+    /// allowed-path control. The MCP tool's `transitive: true` render is
+    /// asserted on the same fixture.
+    #[test]
+    fn transitive_suspects_hide_quarantined_pass_through_keep_the_rest_3614() -> Result<()> {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
+        let conn = fresh_conn();
+        let root = db::insert(
+            &conn,
+            &make_mem("root-t-3614", "ns-root", MemoryKind::Reflection),
+        )?;
+        let mut by_state = std::collections::BTreeMap::new();
+        for state in ["open", "contaminated", "quarantined", "tombstoned"] {
+            let id = db::insert(
+                &conn,
+                &make_mem(
+                    state,
+                    &format!("ns-{state}-t-3614"),
+                    MemoryKind::Observation,
+                ),
+            )?;
+            db::create_link(&conn, &id, &root, "reflects_on")?;
+            conn.execute(
+                "UPDATE memories SET lifecycle_state = ?1 WHERE id = ?2",
+                params![state, id],
+            )?;
+            by_state.insert(state, id);
+        }
+        // Depth 2, hanging off the QUARANTINED node: the walk passes through.
+        let grandchild = db::insert(
+            &conn,
+            &make_mem(
+                "grandchild",
+                "ns-grandchild-t-3614",
+                MemoryKind::Observation,
+            ),
+        )?;
+        db::create_link(&conn, &grandchild, &by_state["quarantined"], "derived_from")?;
+
+        let suspects = db::transitive_suspects(&conn, &root, db::LINEAGE_MAX_DEPTH)?;
+        let listed: Vec<(&str, usize)> =
+            suspects.iter().map(|n| (n.id.as_str(), n.depth)).collect();
+        assert!(
+            !listed.iter().any(|(id, _)| *id == by_state["quarantined"]),
+            "#3614: a quarantined descendant must never render: {listed:?}"
+        );
+        for state in ["open", "contaminated", "tombstoned"] {
+            assert!(
+                listed.contains(&(by_state[state].as_str(), 1)),
+                "#3614 allowed path: the {state} descendant is listed at depth 1: {listed:?}"
+            );
+        }
+        assert!(
+            listed.contains(&(grandchild.as_str(), 2)),
+            "#3614: the walk passes through the hidden node: {listed:?}"
+        );
+
+        // The MCP tool renders the same set under `transitive: true`.
+        let out = crate::mcp::handle_dependents_of_invalidated(
+            &conn,
+            &serde_json::json!({"memory_id": root, "transitive": true}),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        let rendered: Vec<&str> = out["transitive_suspects"]
+            .as_array()
+            .expect("transitive_suspects")
+            .iter()
+            .map(|n| n["id"].as_str().expect("id"))
+            .collect();
+        assert!(
+            !rendered.contains(&by_state["quarantined"].as_str()),
+            "{out}"
+        );
+        assert!(rendered.contains(&by_state["open"].as_str()), "{out}");
+        assert!(rendered.contains(&grandchild.as_str()), "{out}");
+        assert_eq!(out["transitive_count"], serde_json::json!(4), "{out}");
+        Ok(())
+    }
+
     #[test]
     fn propagate_writes_one_notification_per_dependent() {
         let _lineage = crate::test_support::no_lineage_dag_guard();

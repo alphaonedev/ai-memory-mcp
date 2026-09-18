@@ -13285,8 +13285,15 @@ fn lineage_traverse(
          SELECT t.node_id, COALESCE(t.edge_cid, m.cid), t.relation, MIN(t.depth) AS depth \
          FROM lineage t \
          LEFT JOIN memories m ON m.id = t.node_id \
+         WHERE 1 = 1 {quarantine_hidden} \
          GROUP BY t.node_id \
          ORDER BY depth ASC, t.node_id ASC",
+        // #3614 (transitive arm) — a #1948 QUARANTINED node is hidden from every
+        // read/egress lane; the walk still passes THROUGH it (its descendants
+        // keep their depth) but its id / cid never render. Tombstoned nodes
+        // stay (a conserved lineage is the point, #1859). A dangling link with
+        // no `memories` row keeps its pre-#3614 listing (`m.*` is NULL).
+        quarantine_hidden = crate::models::quarantine_hidden_clause("m"),
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -13309,7 +13316,10 @@ fn lineage_traverse(
 /// memories this one was derived from, transitively up to `max_depth`.
 /// Each node reports the shortest hop distance and the relation on the
 /// edge that reached it. Tombstoned ancestors ARE included (a conserved
-/// lineage is the point).
+/// lineage is the point); a #1948 QUARANTINED node is never rendered on
+/// either walk (#3614 — the walk passes through it, its neighbours keep
+/// their depth), on both backends, through the one
+/// [`crate::models::quarantine_hidden_clause`].
 ///
 /// # Errors
 ///
