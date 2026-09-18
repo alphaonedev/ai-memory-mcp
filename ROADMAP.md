@@ -2,7 +2,7 @@
 
 > **Document classification:** Public-facing strategic roadmap. This is the **canonical, singular roadmap**.
 >
-> **Date:** 2026-05-25 (moonshot-aligned revision). Prior 2026-04-29 revision (charter-set reconciliation) and 2026-05-21 revision (ROADMAP2.md retirement) are preserved historically via git but are subsumed by this revision.
+> **Date:** 2026-09-18 (release-line revision: records the 2026-09-09 operator freeze ruling in §9.8 and opens the §11.8 v1.0.x and §11.9 v1.1.0 lines). Prior revisions — 2026-05-25 (moonshot-aligned), 2026-05-21 (ROADMAP2.md retirement) and 2026-04-29 (charter-set reconciliation) — are preserved historically via git but are subsumed by this revision.
 >
 > **Supersedes:** all prior ROADMAP revisions. Where they conflict, this document wins.
 >
@@ -10,7 +10,7 @@
 >
 > **Trademark:** ai-memory™ — USPTO Serial No. 99761257
 > **License:** Apache 2.0 — permanent, non-revocable, non-relicenseable.
-> **Current release:** v1.0.0 (schema v91, 104 MCP tools at `--profile full`), the *defaults stop lying* GA — the version stamp is `Cargo.toml`'s; **no `v1.0.0*` tag is cut yet**, so the newest PUBLISHED tag is **v0.10.0** (released 2026-07-12, schema v80 — the `warn-carrier` release: deprecation WARNs only ahead of the v1.0.0 secure-default flips, with zero default flips, zero schema change and zero behavior change for any correctly-configured deployment; #1972 under the #1940 v1.0.0 epic). v0.10.0 supersedes v0.9.0 (schema v78, 101 MCP tools), a security-hardening and code-review release, which supersedes v0.8.1 (patch release, 2026-06-29) and v0.8.0 (GA, released 2026-06-25; `distributed-coordination`). The prior v0.7.1 patch line (surface area identical to v0.7.0) is itemized in §11.3.1.
+> **Current release:** v1.0.0 (schema v98 on `release/v1.0.0`, 104 MCP tools at `--profile full`; the rehearsal branch `rehearsal/audit-wip` is already at schema v100 and this header follows the promotion, not the rehearsal), the *defaults stop lying* GA — the version stamp is `Cargo.toml`'s; **no `v1.0.0*` tag is cut yet**, so the newest PUBLISHED tag is **v0.10.0** (released 2026-07-12, schema v80 — the `warn-carrier` release: deprecation WARNs only ahead of the v1.0.0 secure-default flips, with zero default flips, zero schema change and zero behavior change for any correctly-configured deployment; #1972 under the #1940 v1.0.0 epic). v0.10.0 supersedes v0.9.0 (schema v78, 101 MCP tools), a security-hardening and code-review release, which supersedes v0.8.1 (patch release, 2026-06-29) and v0.8.0 (GA, released 2026-06-25; `distributed-coordination`). The prior v0.7.1 patch line (surface area identical to v0.7.0) is itemized in §11.3.1.
 
 ---
 
@@ -475,6 +475,33 @@ review and by a loud advisory signal, not yet by branch protection.
 
 ### 9.8 Certification posture (cold honesty)
 
+> **Freeze ruling — operator, 2026-09-09 17:05Z (final; supersedes the earlier “GA = certified” reading).**
+> **v1.0.0 GA ships at the freeze line.** It describes itself as **production-supported inside its published
+> envelope** and **NOT CERTIFIED for mission-critical use** under the Mission-Critical Certification Standard.
+> **v1.1.0 is the certification release** — the release that produces the G1–G8 evidence and issues the
+> certificate; `v1.0.0-rc.N` pre-release tags ship as the freeze list clears. 81 open issues were ruled inside
+> the line (`ga-freeze`); 60 moved to `v1.1.0`. A buyer may rely on a certificate only when G1–G8 are green for
+> the artifact they deploy, the §0.1 envelope contains their backend/transport/host range/topology/posture, and
+> the certificate is neither expired nor labelled in a way their procurement rules disallow. Sources on this
+> branch: [`docs/reviews/FABLE-5.1-FULL-SPECTRUM-AUDIT-OF-GPT-6-ASTRA-2026-09-09.md`](docs/reviews/FABLE-5.1-FULL-SPECTRUM-AUDIT-OF-GPT-6-ASTRA-2026-09-09.md)
+> and [`docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md`](docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md).
+>
+> **VENDOR SELF-CERTIFIED.** The standard and its companion audit were reviewed **3×3 by one principal**. The
+> standard requires at least one wave-3 ballot from a reviewer independent of the vendor and of the model family
+> that authored the artifact; until that exists, anything issued on this basis carries the **VENDOR
+> SELF-CERTIFIED** label. Assessor independence is a §11.9 v1.1.0 item, not a v1.0.0 one.
+>
+> **Where the normative documents live.** The standard is adopted into `docs/compliance/` as
+> `docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md`, with the pre-registered §0.2 SLO/RPO/RTO
+> declaration at `docs/compliance/v1.0.0-DECLARATION.md` and the procurement appendix at
+> `docs/compliance/PROCUREMENT-APPENDIX-v1.0.0.md` ([#3557](https://github.com/alphaonedev/ai-memory-mcp/issues/3557)). **Those three paths are not on
+> `release/v1.0.0` yet** — they arrive here when the rehearsal branch is promoted ([#3769](https://github.com/alphaonedev/ai-memory-mcp/issues/3769)); until
+> then the two `docs/reviews/` files linked above are the on-branch source of the same text. Do not cite the
+> `docs/compliance/` paths as present on this branch before that promotion lands.
+
+The bullets below are the v0.7.0/v1.0.0 historical attestation record and are unchanged by the ruling above;
+none of them is a certificate under the standard.
+
 - **A2A-Certified internal:** yes (v0.6.2 + v0.6.3 + v0.7.0).
 - **Ship-Gate internal:** yes (9/9 certifications + 5/5 channels green at v0.7.0 cut).
 - **Third-party compliance held:** none (no SOC 2 / ISO 27001 / FedRAMP / HIPAA).
@@ -548,6 +575,9 @@ The v3 L3-5 blocks report compile-time-static presence, so on the default `sqlit
 ## 11. Releases — consolidated forward plan
 
 Each release section below names the seven-property contributions explicitly. Every commitment passes the §3 scope test or is reclassified.
+
+> **Companion documents.** [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md) is the v1.1.0 workstream document — seven workstreams on use-time applicability, measurement and docs truth, with the MemTrapBench workstream 5 harness as the **P1 gate** on any downstream-benefit claim. §11.9 below is the release-line summary; that file is the workstream detail, and the two must be read together.
+> Certification posture, the standard, the pre-registered declaration and the procurement appendix live in `docs/compliance/` (see §9.8 for what is on this branch today and what arrives with the rehearsal promotion).
 
 ### 11.1 v0.6.3 — Structured Memory + Performance — SHIPPED 2026-04-27
 
@@ -954,12 +984,12 @@ Full policy: [`docs/telemetry.md`](docs/telemetry.md).
 
 **Strengthens §2.5 (attested at public-audit maturity) + §2.1 (endpoint-resident at federation maturity) + §2.7 (LLM-agnostic locked at API stability).**
 
-> **v1.0.0 disposition ruling (pre-ship reconciliation; E2E line added 2026-07-24 per [#2411](https://github.com/alphaonedev/ai-memory-mcp/issues/2411)).** **Four** items in this section have ZERO implementation at the v1.0.0 ship and are hereby ruled **DEFERRED to v1.x** (recorded, not dropped): **mDNS auto-discovery**, **MVCC strict-consistency mode**, **OpenTelemetry standardization**, and **end-to-end federation content encryption** — none shipped at v1.0.0 and none is a v1.0.0 acceptance criterion. *(The E2E line previously appeared in NEITHER the landed nor the deferred set — it fell out of both ledgers, making it invisible to release accounting and to fleet operators assessing whether federated memory content is E2E-protected. It is not. Tracking: [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968), OPEN.)* What DID land under the "§11.6 v1.0" umbrella is the Portability Spec v2 freeze-critical core (§27 Gate 1; see [`docs/spec/PORTABILITY-V2.md`](docs/spec/PORTABILITY-V2.md)) and the AI-NHI multi-agent security review (§27 Gate 3, superseding the external-firm audit line below). The "Q2 2027" header date is aspirational, not a shipped-at commitment.
+> **v1.0.0 disposition ruling (pre-ship reconciliation; E2E line added 2026-07-24 per [#2411](https://github.com/alphaonedev/ai-memory-mcp/issues/2411)).** **Four** items in this section have ZERO implementation at the v1.0.0 ship and are hereby ruled **DEFERRED to v1.x** (recorded, not dropped): **mDNS auto-discovery**, **MVCC strict-consistency mode**, **OpenTelemetry standardization**, and **end-to-end federation content encryption** — *carry status as of the 2026-09-18 revision: OpenTelemetry now has a named home in §11.9 (commercial line); mDNS, MVCC and E2E federation content encryption are still in the undifferentiated §11.7 v1.x bucket with no v1.0.x or v1.1.0 commitment, and this revision does not create one for them* — none shipped at v1.0.0 and none is a v1.0.0 acceptance criterion. *(The E2E line previously appeared in NEITHER the landed nor the deferred set — it fell out of both ledgers, making it invisible to release accounting and to fleet operators assessing whether federated memory content is E2E-protected. It is not. Tracking: [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968), OPEN.)* What DID land under the "§11.6 v1.0" umbrella is the Portability Spec v2 freeze-critical core (§27 Gate 1; see [`docs/spec/PORTABILITY-V2.md`](docs/spec/PORTABILITY-V2.md)) and the AI-NHI multi-agent security review (§27 Gate 3, superseding the external-firm audit line below). The "Q2 2027" header date is aspirational, not a shipped-at commitment.
 
-- **Auto-discovery** — mDNS for local-network peer discovery; hardcoded peer list fallback.
-- **End-to-end encryption** — operator-side keys for federation push/pull beyond mTLS. **DEFERRED to v1.x** per the ruling above (F-53 / [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968), OPEN) — **ZERO implementation at v1.0.0**. What v1.0.0 actually protects federated content with is **transport mTLS only**, plus optional **per-node at-rest** encryption at each end: `src/encryption/mod.rs` is explicitly "per-node at-rest" and states "**NOT end-to-end across federation (#1809):** … federation catch-up (`memories_updated_since`) decrypts `content` and the receiving peer re-seals under its own per-node key, so a federated peer holds plaintext transiently at apply time" (`src/encryption/mod.rs:4-16`; `grep -rni 'content_encryption\|e2e_encrypt' src/` = 0 hits). #1809 (CLOSED) was the docs-drift fix that stopped the at-rest primitive being *labelled* E2E; it shipped no E2E mechanism.
-- **MVCC strict-consistency mode** — opt-in per namespace for CP rather than AP. CRDTs from v0.8 remain default.
-- **OpenTelemetry standardization** — all internal tracing converts to OTel spans. **DEFERRED to v1.x** per the ruling above — ZERO implementation at v1.0.0 (no `opentelemetry`/OTLP dependency, no exporter in `src/`, no `OTEL_*` env surface). §11.5's telemetry paragraph and [`docs/telemetry.md`](docs/telemetry.md) §6 are reconciled to this ([#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407)).
+- **Auto-discovery** — mDNS for local-network peer discovery; hardcoded peer list fallback. **DEFERRED to v1.x** per the ruling above; **carried to §11.7 only** — no carrier issue, not in §11.8 and not in §11.9.
+- **End-to-end encryption** — operator-side keys for federation push/pull beyond mTLS. **DEFERRED to v1.x** per the ruling above (F-53 / [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968), OPEN) — **ZERO implementation at v1.0.0**. **Carried to §11.7 only** — #1968 stays open against the v1.x bucket; this revision places it in neither §11.8 nor §11.9. What v1.0.0 actually protects federated content with is **transport mTLS only**, plus optional **per-node at-rest** encryption at each end: `src/encryption/mod.rs` is explicitly "per-node at-rest" and states "**NOT end-to-end across federation (#1809):** … federation catch-up (`memories_updated_since`) decrypts `content` and the receiving peer re-seals under its own per-node key, so a federated peer holds plaintext transiently at apply time" (`src/encryption/mod.rs:4-16`; `grep -rni 'content_encryption\|e2e_encrypt' src/` = 0 hits). #1809 (CLOSED) was the docs-drift fix that stopped the at-rest primitive being *labelled* E2E; it shipped no E2E mechanism.
+- **MVCC strict-consistency mode** — opt-in per namespace for CP rather than AP. CRDTs from v0.8 remain default. **DEFERRED to v1.x** per the ruling above; **carried to §11.7 only** — no carrier issue, not in §11.8 and not in §11.9.
+- **OpenTelemetry standardization** — all internal tracing converts to OTel spans. **DEFERRED to v1.x** per the ruling above — ZERO implementation at v1.0.0 (no `opentelemetry`/OTLP dependency, no exporter in `src/`, no `OTEL_*` env surface). §11.5's telemetry paragraph and [`docs/telemetry.md`](docs/telemetry.md) §6 are reconciled to this ([#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407), CLOSED — that issue was the docs-drift reconciliation, **not** an implementation carrier). **Carried to §11.9** as a commercial/operability line item, with [#3800](https://github.com/alphaonedev/ai-memory-mcp/issues/3800) as the open implementation carrier.
 - **Strict semver discipline** — breaking changes require major-version bumps from v1.0.
 - **Memory Portability Spec v2** — multi-implementation interop tests. Reference implementations in two languages besides Rust.
 - **Public security audit** — by named third-party firm, full report published. Specifically tests: namespace-inheritance enforcement, signature verification, approval timeout sweeper, HMAC coverage on every privileged endpoint, attestation chain integrity, federation tamper-evidence. *(SUPERSEDED FOR THE v1.0.0 EPIC — Sprint-0 W5 reconciliation, operator correction 2026-07-09 memory 9a62049d: the v1.0.0 security review is AI-NHI multi-agent (§27 Gate 3), NOT an external firm; this line remains the v1.x+ aspiration.)*
@@ -976,6 +1006,167 @@ Forever. Including:
 - **Custom embedder integrations** — OpenAI, Voyage, Cohere, Ollama, local Sentence Transformers, all behind a trait (§2.7 evolution). *Partially shipped at v0.7.x (#1598): `[embeddings].backend` already speaks to any OpenAI-compatible `/v1/embeddings` endpoint (cloud vendor aliases + self-hosted TEI/vLLM/llama.cpp server) and native Ollama; the remaining scope here is the in-process trait for non-HTTP embedders.*
 - **§5 family-attestation mechanism** — adjudicated by the heterogeneous panel; landed in whatever release the panel synthesis directs.
 - **AGI/ASI primitives** — substrate evolution to absorb whatever cognitive artifacts higher-capability entities produce, while preserving the seven properties.
+
+
+### 11.8 v1.0.x — post-GA maintenance
+
+**Strengthens §2.2 (coherent — the data-integrity item at the top of this list) + fleet manageability.**
+
+> **What this line is.** The work that was ruled outside the v1.0.0 freeze line on 2026-09-09 (§9.8) but is not
+> certification work: defects, sweeps and CI hygiene that land on the patch line after GA. It is ordered by cost
+> to an operator, not by effort. Items here are *deferred*, never dropped — each has an open carrier issue,
+> verified open at the 2026-09-18 revision.
+
+1. **[#3152](https://github.com/alphaonedev/ai-memory-mcp/issues/3152) — “SAL update splits the content patch and the lifecycle transition across two commits on
+   BOTH backends — crash between them persists the patch and drops the transition.”** One logical update
+   persisted in two commits, on SQLite *and* PostgreSQL. **Ruled deferred at the freeze line and placed first on
+   this line.** *Cost to an operator:* if the process dies between the two commits, the content patch is on disk
+   and the lifecycle transition is not, while the call returned `Err` — so the operator was told the write
+   failed and the row says otherwise, and nothing in the store marks the row as half-applied. It is deferred
+   rather than dropped because the caller does receive an error (it is not a silent false success) and the fix
+   restructures the update transaction on both backends, which is not a change to make at a freeze line.
+
+2. **[#3717](https://github.com/alphaonedev/ai-memory-mcp/issues/3717) — “make ALL encryption manageable … rotation and tested recovery for every role.”**
+   Stages S2–S4: key rotation for the non-identity roles. *Cost to an operator:* 11 of the 12 key roles have no
+   rotation path, so rotating after a suspected compromise is a hand-run procedure, and a botched hand-run
+   rotation loses the at-rest key — and with it the memory text that key protects.
+
+3. **[#3777](https://github.com/alphaonedev/ai-memory-mcp/issues/3777) — “postgres integration cells hard-code a developer lane database name in their guard.”**
+   The 234-file PostgreSQL lane-guard sweep, per the ruling on that issue. *Cost to an operator:* the
+   enterprise-federation checks can never pass in CI as written, so the PostgreSQL evidence an operator would
+   re-run to satisfy themselves does not actually run.
+
+4. **[#3786](https://github.com/alphaonedev/ai-memory-mcp/issues/3786) — “branch hygiene for v1.0.1 — retire 395 content-free remote branches, archive 216
+   unmerged ones.”** Parts 2–4 of the four-part procedure. *Cost to an operator:* an operator or auditor looking
+   at the remote cannot tell which branches are live work and which are residue, so “what is actually in the
+   release” takes a person rather than a listing.
+
+5. **[#3796](https://github.com/alphaonedev/ai-memory-mcp/issues/3796) — “coverage job headroom ~5 min of 75: add a step-level timeout … so exhaustion fails
+   loud, not by cancellation.”** *Cost to an operator:* when the coverage job runs out of budget it is reported
+   as a cancellation rather than a failure, so a genuine regression is indistinguishable from CI flake and gets
+   retried instead of investigated.
+
+6. **[#3702](https://github.com/alphaonedev/ai-memory-mcp/issues/3702) — “two live branches can claim the same schema version, ceiling entry or count pin — git
+   merges it silently.”** *Cost to an operator:* two migrations can ship under one schema number, and the
+   operator's upgrade then applies a ladder whose rungs do not correspond one-to-one to the versions recorded in
+   their database.
+
+7. **[#3725](https://github.com/alphaonedev/ai-memory-mcp/issues/3725) — “`--keep` is inert on a default install with no operator key: every snapshot is
+   `kept_unverified`, rotation never prunes.”** *Cost to an operator:* backup retention silently does nothing on
+   a default install — the disk fills, and the flag the operator set to bound it reports success while bounding
+   nothing.
+
+8. **[#3200](https://github.com/alphaonedev/ai-memory-mcp/issues/3200) — the truthy-SSOT consolidation: “two truthy grammars in one binary …
+   `=yes` makes a TLS MANDATE silently inert.”** One truth-value grammar for every boolean env knob.
+   *Cost to an operator:* an operator who writes `AI_MEMORY_REQUIRE_TLS=yes` — valid in the documented project
+   grammar — gets a daemon with no TLS mandate and no warning. The required-context lockstep owed once
+   [#3769](https://github.com/alphaonedev/ai-memory-mcp/issues/3769) promotes is tracked with this item.
+
+### 11.9 v1.1.0 — the certification release
+
+**Strengthens §2.5 (attested — this is the release that produces evidence about the shipped binary rather than
+claims about the source) + §2.2 + fleet manageability.**
+
+> **What this line is.** Per the 2026-09-09 freeze ruling recorded in §9.8, **v1.1.0 is the certification
+> release**: the release that produces the G1–G8 evidence required by the Mission-Critical Certification
+> Standard and issues the certificate. v1.0.0 GA carries none of it and says so. Workstream detail lives in
+> [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md); the gate rows below are the release-line summary. Every issue
+> cited was verified OPEN at the 2026-09-18 revision.
+
+**The eight gates**
+
+- **G1 — surface inventory.** [#3558](https://github.com/alphaonedev/ai-memory-mcp/issues/3558) “generated surface inventory with a mutating flag — every
+  operation maps to a case row or a declared boundary.” *Cost until done:* the “zero unauthorized effects” claim
+  has nothing to diff against, so it cannot be checked by the reader or by CI.
+- **G2/G3 — continuity and the mission suite.** [#3559](https://github.com/alphaonedev/ai-memory-mcp/issues/3559) “continuity qualification — five clocks,
+  mission ledger, acked-op loss by digest+revision, fault boundaries” (this is where RTO comes from) and
+  [#3564](https://github.com/alphaonedev/ai-memory-mcp/issues/3564) “G3 two-mission GA subset — correction reachability and poisoned memory with the reference
+  agent, n >= 30.” *Cost until done:* the product's central claim — a replacement agent boots from the store —
+  has no measured number, and correction reachability has no baseline.
+- **G4 — CONFIG-2 and E3.** [#3563](https://github.com/alphaonedev/ai-memory-mcp/issues/3563) “docker-1461 D6 -> CONFIG-2 acceptance harness … wired to a
+  required context” and [#3560](https://github.com/alphaonedev/ai-memory-mcp/issues/3560) “E3 f1<->f2 negative set (dup, stale revision, reorder, wrong peer
+  key, unauthorized restore).” *Cost until done:* the at-rest and cross-host negative paths are asserted, not
+  demonstrated.
+- **G5 — soak, power-loss and the growth ledger.** [#3561](https://github.com/alphaonedev/ai-memory-mcp/issues/3561) “24 h / 72 h qualification soak host +
+  hard-reset VM for the power-loss boundary.” **Prerequisite: [#3011](https://github.com/alphaonedev/ai-memory-mcp/issues/3011)** “Coordination plane has NO
+  retention anywhere — signals/actions/action_edges/checkpoints/routine_runs never pruned.” *Cost until done:*
+  G5's growth budget cannot be met for those tables at all, because nothing prunes them — an operator running
+  the coordination plane has unbounded growth with no knob.
+- **G6 — reproducible build and the negative release fixtures.** [#3799](https://github.com/alphaonedev/ai-memory-mcp/issues/3799) “[v1.1.0][cert G6 / item
+  11b] reproducible build + the four negative release fixtures (tampered tag, unsigned tag, unpinned tool, digest
+  drift).” *Cost until done:* a published number cannot be re-derived by a third party from the same source, and
+  the four ways a release can be tampered with have no fixture that proves the pipeline rejects them.
+- **G8 — certificate expiry and re-issue.** [#3556](https://github.com/alphaonedev/ai-memory-mcp/issues/3556) “check-cert-expiry.sh is green with a VOID
+  certificate — widen the watch set, add banner-and-ancestor check” and [#3501](https://github.com/alphaonedev/ai-memory-mcp/issues/3501) “cert §7
+  re-validation and re-issue after #3464.” *Cost until done:* the one certificate in the tree claims LIVE
+  against a watched surface that has since moved, and the gate that should have caught it passes.
+- **Artifact binding.** [#3798](https://github.com/alphaonedev/ai-memory-mcp/issues/3798) “[v1.1.0][cert 3b] artifact binding: the daemon reports
+  `binary_sha256` + `source_commit` on `/api/v1/capabilities`; evidence runs bind to it; `envelope_ref` enforced
+  by the bundle validator.” *Cost until done:* no published measurement can be tied to the binary that produced
+  it — which is the premise the rest of the standard rests on — and the declaration's core FAIL sentence has no
+  enforcer, because a run record whose `envelope_ref` is not the pinned hash is accepted today.
+- **Assessor independence.** At least one wave-3 ballot from a reviewer independent of the vendor and of the
+  authoring model family, so the **VENDOR SELF-CERTIFIED** label of §9.8 can be dropped. No carrier issue;
+  process, not code.
+
+**Measurement and acceptance**
+
+- [#3473](https://github.com/alphaonedev/ai-memory-mcp/issues/3473) “wake-hub acceptance: wake latency p50/p99 at 128 and 256 agents … hub kill under load
+  loses no inbox rows.” *Cost until done:* every wake-latency sentence stays a design target rather than a
+  measured envelope.
+- [#3565](https://github.com/alphaonedev/ai-memory-mcp/issues/3565) “recall budget: candidate / emitted / dropped token accounting with reasons; document
+  oversized-first-result” — make `budget_tokens` a hard ceiling with accounting. *Cost until done:* a caller
+  that sets a token budget can still be handed a response over it, so context budgeting cannot be relied on.
+- [#3566](https://github.com/alphaonedev/ai-memory-mcp/issues/3566) “recall: comment the `gc_if_needed` discard (ERRORS-19); document `fold_recall_accesses` +
+  `recall_observations` ledger” — the mutation-free-reads item. *Cost until done:* a read path performs writes
+  the caller did not ask for and cannot see accounted.
+- [#3335](https://github.com/alphaonedev/ai-memory-mcp/issues/3335) “semantic recall throughput COLLAPSES under concurrency on the certified pg tier — 56 ops/s
+  @16 agents → 32 ops/s @64 (p50 265ms → 1.77s).” *Cost until done:* the certified PostgreSQL tier has no
+  honest concurrency envelope to publish at 64 agents.
+- [#3793](https://github.com/alphaonedev/ai-memory-mcp/issues/3793) (test-plan T13, source-edge integrity across delete / invalidate / restore / export),
+  [#3794](https://github.com/alphaonedev/ai-memory-mcp/issues/3794) (T15, governance rule-set atomicity) and [#3795](https://github.com/alphaonedev/ai-memory-mcp/issues/3795) (T18, the cryptographic-erasure
+  boundary). *Cost until done:* three integrity classes — a deleted source reappearing through restore or
+  export, a half-applied governance rule set, and an erasure claim that quietly does not cover archives,
+  derived indexes, queues, keys or backups — have no acceptance pin at all.
+
+**Fleet manageability at scale (North-Star class)**
+
+- [#2671](https://github.com/alphaonedev/ai-memory-mcp/issues/2671) “the catch-up loop has no jitter — a fleet-wide upgrade or restart synchronizes every
+  peer's pull onto the same tick.” *Cost until done:* a fleet restart becomes a synchronized blast against every
+  peer simultaneously.
+- [#2631](https://github.com/alphaonedev/ai-memory-mcp/issues/2631) “v88 CREATE INDEX CONCURRENTLY runs on the boot path under the cluster-wide advisory lock
+  with a 900s bound vs the 90s deadline it cites.” *Cost until done:* an upgrade can hold a cluster-wide lock on
+  the boot path for ten times the deadline the code itself states.
+
+**V-series — measurement of the claims the reviews tested ([#3567](https://github.com/alphaonedev/ai-memory-mcp/issues/3567)–[#3574](https://github.com/alphaonedev/ai-memory-mcp/issues/3574))**
+
+[#3567](https://github.com/alphaonedev/ai-memory-mcp/issues/3567) recall insufficient-evidence signal and selectable abstention policy ·
+[#3568](https://github.com/alphaonedev/ai-memory-mcp/issues/3568) reproducible workload-advantage benchmark, arms A–E under equal budgets ·
+[#3569](https://github.com/alphaonedev/ai-memory-mcp/issues/3569) 12-mission suite with decisive oracles and cascade containment ·
+[#3570](https://github.com/alphaonedev/ai-memory-mcp/issues/3570) MemTrapBench guards — preregistered taxonomy, frozen held-out set, null + positive baselines ·
+[#3571](https://github.com/alphaonedev/ai-memory-mcp/issues/3571) measure compact TOON handles + `memory_get` against inline delivery before recommending it ·
+[#3572](https://github.com/alphaonedev/ai-memory-mcp/issues/3572) E4 three independent failure domains with partition tooling ·
+[#3573](https://github.com/alphaonedev/ai-memory-mcp/issues/3573) differential relational↔AGE suite for every graph query on PostgreSQL ·
+[#3574](https://github.com/alphaonedev/ai-memory-mcp/issues/3574) lease fencing token verified at the external side effect (exactly-once is NOT CERTIFIED for
+v1.0). *Cost until done:* each of these is a claim the substrate makes that currently has no falsifiable
+experiment behind it.
+
+**Commercial and operability**
+
+- [#3701](https://github.com/alphaonedev/ai-memory-mcp/issues/3701) “no entitlement, licensing or support-tier mechanism exists — there is nothing to sell.”
+  *Cost until done:* no support tier an operator can buy and no entitlement an operator can be held to.
+- [#3716](https://github.com/alphaonedev/ai-memory-mcp/issues/3716) “professionalize configurability — 178 settings … make a change plan/apply/rollback with a
+  stated restart boundary.” *Cost until done:* a configuration change has no plan step, no rollback and no
+  stated restart boundary, so every settings change on a fleet is a hand-verified change.
+- [#2647](https://github.com/alphaonedev/ai-memory-mcp/issues/2647) “tenant isolation is enforced on ONE plane (Rust); add PostgreSQL RLS via `SET LOCAL
+  app.principal_id` as an independent second plane.” *Cost until done:* one bug in one plane is the whole of
+  tenant isolation.
+- **OpenTelemetry export.** Ruled DEFERRED to v1.x by the §11.6 disposition ruling and carried here.
+  [#3800](https://github.com/alphaonedev/ai-memory-mcp/issues/3800) “[v1.1.0][enterprise] OpenTelemetry export (OTLP traces + metrics) — the deferred §11.6 item
+  has no open carrier since #2407 closed as a docs fix” is the implementation carrier; [#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407) is
+  CLOSED and was the docs-drift reconciliation only, never an implementation carrier. *Cost until done:* an
+  operator with an existing OTLP collector has no standard export and must scrape the Prometheus surface
+  instead.
 
 ---
 
