@@ -409,14 +409,14 @@ pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
 
 /// Path of `agent_id`'s public-key file under `dir`. Single home for the
 /// `<agent_id>.pub` shape so the literal is not scattered (pm-v3.1 lint).
-fn agent_pub_path(dir: &Path, agent_id: &str) -> PathBuf {
+pub(crate) fn agent_pub_path(dir: &Path, agent_id: &str) -> PathBuf {
     dir.join(format!("{agent_id}{PUB_SUFFIX}"))
 }
 
 /// `<dir>/<agent_id>.priv` — the private half. #3147 made this a named helper
 /// because the existence GATE must consult both halves, not just the public
 /// one; it was previously formatted inline in [`load`] only.
-fn agent_priv_path(dir: &Path, agent_id: &str) -> PathBuf {
+pub(crate) fn agent_priv_path(dir: &Path, agent_id: &str) -> PathBuf {
     dir.join(format!("{agent_id}{PRIV_SUFFIX}"))
 }
 

@@ -480,18 +480,22 @@ pub struct ShapeBootReport {
     /// `AI_MEMORY_SECURITY_PROFILE` was unset and has been pinned to the
     /// shape's posture floor.
     pub posture_pinned: bool,
-    /// At-rest is required by the shape but no recovery escrow exists
-    /// yet, so the gap is declared rather than closed.
+    /// At-rest is required by the shape but the shape-driven enable is
+    /// not engaged yet (#3717 S4), so the gap is declared rather than closed.
     pub at_rest_pending_escrow: bool,
     /// The operator explicitly enabled at-rest with no escrow provisioned.
     pub at_rest_on_without_escrow: bool,
 }
 
-/// Whether a recovery escrow for the at-rest key is provisioned. There
-/// is none at v1.0.0 — the escrow is the #3717 deliverable (v1.0.1) —
-/// so this is `false` for every node, and it is a function rather than a
-/// constant so the ONE call site that decides "pending" versus "engaged"
-/// is already in place for it.
+/// Whether the shape-driven at-rest ENABLE is engaged. The escrow itself
+/// ships with #3717 (`keys init --recovery-key-out` enrolls the recovery
+/// key and every at-rest mint writes `<agent>.x25519.escrow`; `keys
+/// recover` restores a lost key from it), but the shape does not yet turn
+/// at-rest ON by itself — that auto-enable, code-gated on the escrow being
+/// provisioned, is the #3717 S4 stage. Until it lands this stays `false`
+/// so the requirement keeps being DECLARED rather than silently met; it
+/// is a function rather than a constant so the ONE call site that decides
+/// "pending" versus "engaged" is already in place for it.
 #[must_use]
 pub fn at_rest_escrow_provisioned() -> bool {
     false
@@ -578,11 +582,12 @@ pub fn at_rest_pending_escrow_warning(shape: DeploymentShape) -> String {
     let line = shape.config_line();
     format!(
         "ai-memory: WARN {line} requires at-rest \
-         encryption, but no recovery escrow for the at-rest key exists in this \
-         release, so it is NOT enabled: a lost key must never mean lost memory \
-         (recoverability > confidentiality — the gap is declared in #3557, the \
-         escrow is #3717). Set [encryption].at_rest = true to enable it anyway, \
-         accepting that a lost `<key-dir>/<agent>.x25519.priv` loses `content`."
+         encryption, but the shape does not enable it by itself yet: a lost key must \
+         never mean lost memory (recoverability > confidentiality — the gap is \
+         declared in #3557). Provision the recovery escrow first (`ai-memory keys \
+         init --recovery-key-out <off-node-file>`, #3717), then set \
+         [encryption].at_rest = true; enabling it without an enrolled recovery key \
+         accepts that a lost `<key-dir>/<agent>.x25519.priv` loses `content`."
     )
 }
 
@@ -613,8 +618,9 @@ pub fn enforce_at_boot_pre_runtime(cfg: &super::AppConfig) -> anyhow::Result<Sha
     if report.at_rest_on_without_escrow {
         eprintln!(
             "ai-memory: WARN [encryption].at_rest = true under [deployment] shape = \
-             \"{}\" with no recovery escrow: a lost `<key-dir>/<agent>.x25519.priv` \
-             loses `content` (#3717).",
+             \"{}\" ahead of the shape-driven escrow gate (#3717 S4): run \
+             `ai-memory keys status` to confirm every at-rest key has its recovery \
+             escrow — a key without one loses `content` when it is lost.",
             report.shape
         );
     }

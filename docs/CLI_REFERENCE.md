@@ -1592,7 +1592,16 @@ enforced reads.
 Global flag: `--key-dir <PATH>` overrides the key storage directory
 (default: platform config dir; `AI_MEMORY_KEY_DIR` env honoured).
 
-`ai-memory keys prune` reports public-only peer/guardian files as `enrolled_public_keys` and retains them unless both `--include-public-only` and `--yes` are supplied (see [orphan key files](ADMIN_GUIDE.md#orphan-key-files)).
+### `keys` — key roles, the recovery escrow, pruning (#3717)
+
+| Subcommand | Notes |
+|---|---|
+| `ai-memory keys init [--host <bind-host>] [--dry-run] [--recovery-key-out <FILE>]` | Mint every ABSENT key role the declared shape needs (recovery anchor, identity, daemon signer, at-rest wrap key WITH its escrow, local TLS on the singleton shape, capability owner), REPAIR a role whose private half survives, and REFUSE before any write when a private half is lost. `--recovery-key-out` mints the deployment recovery keypair: private half to that file (created 0600 — move it off-node), public half enrolled as `recovery.x25519.pub`. Without an enrolled recovery key the at-rest role is reported `CANNOT MINT HERE` rather than minted bare. Prints the BACK UP and DISTRIBUTE lists. |
+| `ai-memory keys status` | The typed state of every role (`present` / `MISSING` / `PARTIAL (recoverable)` / `PARTIAL (private half LOST)` / `PARTIAL (unreadable)` / `operator-supplied`), the plan `keys init` would follow, and the fix per finding. Writes nothing. `--json` carries the same table. |
+| `ai-memory keys recover --recovery-key <FILE> [--agent <id>]` | Restore a lost `<agent>.x25519.priv` from `<agent>.x25519.escrow` with the off-node recovery private file (a 0600 file channel, never argv). Refuses a wrong key, a live key, an escrow of another agent or generation. Sealed rows are untouched and open again once the key is back. |
+| `ai-memory keys prune [--dry-run] [--include-public-only] [--yes]` | Orphan key-file hygiene (below). |
+
+`ai-memory keys prune` reports public-only peer/guardian files as `enrolled_public_keys` and retains them unless both `--include-public-only` and `--yes` are supplied (see [orphan key files](ADMIN_GUIDE.md#orphan-key-files)); the recovery anchor is protected like the daemon, operator and owner keys.
 
 ### `verify-signed-events-chain` — V-4 closeout verifier
 

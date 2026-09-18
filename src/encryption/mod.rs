@@ -96,6 +96,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::Zeroize;
 
+/// v1.0.0 #3717 — recovery escrow of the per-agent at-rest key.
+pub mod escrow;
+
 /// Envelope wire-version. Bumped when the byte layout OR the
 /// cryptographic scheme (KDF / AAD construction) changes; readers refuse
 /// unknown versions with a typed error so a bump doesn't silently
@@ -288,7 +291,7 @@ fn keypair_persist_dir() -> Result<PathBuf> {
 }
 
 /// `(pub_path, priv_path)` for `agent_id` under `dir`.
-fn x25519_key_paths(agent_id: &str, dir: &Path) -> (PathBuf, PathBuf) {
+pub(crate) fn x25519_key_paths(agent_id: &str, dir: &Path) -> (PathBuf, PathBuf) {
     (
         dir.join(format!("{agent_id}{X25519_PUB_SUFFIX}")),
         dir.join(format!("{agent_id}{X25519_PRIV_SUFFIX}")),
@@ -303,6 +306,15 @@ fn x25519_key_paths(agent_id: &str, dir: &Path) -> (PathBuf, PathBuf) {
 /// key is derivable from the secret, so a crash between the two renames must
 /// leave the recoverable half-state, never a public key with no matching
 /// secret.
+///
+/// #3717 — the recovery ESCROW is written between the two halves: private,
+/// then `<agent>.x25519.escrow` (the private half wrapped under the enrolled
+/// deployment recovery key), then public. Every crash window leaves a state
+/// `keys init` repairs from the private half alone. When no recovery key is
+/// enrolled the mint proceeds WITHOUT an escrow and says so on the operator
+/// log — the operator-accepted "a lost key loses `content`" posture the
+/// shape contract already admits (`[encryption].at_rest = true` under
+/// `RequiredPendingEscrow`); `keys init` is the ceremony that refuses it.
 fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
     let (pub_path, priv_path) = x25519_key_paths(&kp.agent_id, dir);
     crate::identity::keypair::ensure_parent(&pub_path)?;
@@ -311,11 +323,29 @@ fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
     // a nested #1514 slashed `agent_id` sits under intermediates, and write
     // access to ANY of them is enough to replace the subtree.
     crate::identity::keypair::enforce_key_path_chain_secure(dir, &priv_path)?;
+    // Resolve the recovery key BEFORE the first write so a malformed
+    // enrolment refuses the whole mint rather than leaving a keyless escrow.
+    let recovery = escrow::load_recovery_pubkey(dir)?;
     let mut secret_bytes = kp.secret.to_bytes();
     let write_res = crate::identity::keypair::write_with_mode(&priv_path, &secret_bytes, 0o600)
         .with_context(|| format!("writing x25519 private key {}", priv_path.display()));
     secret_bytes.zeroize();
     write_res?;
+    match recovery {
+        Some(recovery_pub) => {
+            escrow::write_escrow(kp, dir, &recovery_pub)?;
+        }
+        None => tracing::warn!(
+            target: TRACING_TARGET,
+            agent_id = %kp.agent_id,
+            "#3717: at-rest key minted for agent {:?} WITHOUT a recovery escrow — no recovery \
+             key is enrolled at {}; a lost {} loses `content`. Enroll one: {}",
+            kp.agent_id,
+            escrow::recovery_pub_path(dir).display(),
+            priv_path.display(),
+            escrow::REMEDY_ENROLL_RECOVERY_KEY
+        ),
+    }
     crate::identity::keypair::write_with_mode(&pub_path, kp.public.as_bytes(), 0o644)
         .with_context(|| format!("writing x25519 public key {}", pub_path.display()))?;
     Ok(())

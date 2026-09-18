@@ -469,6 +469,41 @@ Before #3718 a read with the key file missing minted a fresh pair before
 failing, masking the loss as "wrong key" and forking the key generation so
 no single restore could heal the corpus.
 
+### The at-rest key is escrowed at mint (#3717)
+
+A lost `<agent>.x25519.priv` no longer means lost content. When a
+deployment RECOVERY key is enrolled (`ai-memory keys init
+--recovery-key-out <off-node-file>` mints an X25519 pair, writes the
+private half to that file — created `0600`, for the operator to move
+off-node — and enrolls the public half as `<key_dir>/recovery.x25519.pub`),
+every at-rest key mint writes `<agent>.x25519.escrow` between the private
+and the public half: the private half wrapped under the recovery public
+key with the same `0x02` ECDH + HKDF + ChaCha20-Poly1305 envelope the
+content uses, over the plaintext `agent_id || 0x00 || secret` so an
+escrow cannot be replayed under another agent's name. Sealed rows, the
+per-record DEK wrap and crypto-erase are unchanged.
+
+`ai-memory keys recover --recovery-key <file>` reads the recovery private
+half from that file only (a `0600` file channel, never argv), unwraps the
+escrow, refuses when a present `.x25519.pub` disagrees with the unwrapped
+secret (an escrow of another key generation), restores the private half
+FIRST, and evicts the in-process key cache so the next read opens the
+sealed rows again. `keys init` REFUSES to mint an at-rest key without an
+enrolled recovery key; the seal path (`get_or_create_keypair`) still
+mints bare for a deployment that never enrolled one, and says so on the
+operator log — that is the `[encryption].at_rest = true`-without-escrow
+posture the shape contract admits, and `keys status` reports the missing
+escrow as recoverable so it can be backfilled.
+
+Trust consequence, stated plainly: whoever holds the recovery private
+file can decrypt every agent's at-rest content on that node. That is the
+recoverability-over-confidentiality trade the standing rule requires (a
+lost key must never mean lost memory), and it is declared in the
+certification declaration (#3557), not silent. The guardian set
+(`AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS`) is a signature quorum for the
+identity-lineage recovery record, not a secret-sharing split of this
+file; splitting the recovery secret is a separate, later decision.
+
 ### File permissions
 
 The daemon expects the DB file + WAL/SHM companions to be writable

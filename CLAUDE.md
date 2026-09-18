@@ -833,10 +833,14 @@ enforces two rows at boot (`config::shape::enforce_at_boot_pre_runtime`,
 which runs BEFORE `security_profile::enforce_at_boot_pre_runtime`):
 `production` / `federated` / `hive` pin `AI_MEMORY_SECURITY_PROFILE=asi-hard`
 when unset and refuse `standard`; the same shapes REQUIRE at-rest
-encryption, and because no recovery escrow for the at-rest key exists yet
-(#3717) that requirement is DECLARED (boot WARN + `doctor` "Deployment
-shape" section, #3557) rather than silently enabled — a lost key must
-never mean lost memory. `ai-memory config show` renders the table.
+encryption, and that requirement is DECLARED (boot WARN + `doctor`
+"Deployment shape" section, #3557) rather than silently enabled — a lost
+key must never mean lost memory. The recovery escrow that makes the
+enable safe ships with #3717 (`ai-memory keys init --recovery-key-out`,
+`keys status`, `keys recover`; `src/keys/roles.rs` + `src/encryption/escrow.rs`;
+doctor "Key posture (#3717)"); the shape-driven auto-enable gated on it
+(`config::shape::at_rest_escrow_provisioned`) is the #3717 S4 stage.
+`ai-memory config show` renders the table.
 **Unknown config keys REFUSE the boot loader at every nesting level**
 (`AppConfig::refuse_unknown_keys`, exit 78). The accepted key tree is
 derived from the `AppConfig` schema (`config::unknown_keys`, every config

@@ -2277,6 +2277,60 @@ ai-memory forget --tier short --namespace my-app
 sqlite3 /path/to/ai-memory.db "VACUUM"
 ```
 
+### Key roles, the recovery escrow and `keys init` / `status` / `recover` (#3717)
+
+Every deployment needs a fixed set of key ROLES under the key directory
+(`AI_MEMORY_KEY_DIR`): the recovery anchor (`recovery.x25519.pub`), the
+identity key (`<agent>.priv/.pub`), the daemon signer (`daemon.priv/.pub`),
+the at-rest wrap key (`<agent>.x25519.priv/.escrow/.pub`) when at-rest
+encryption is required or enabled, the local TLS material (`tls/`) on the
+singleton shape, and the capability owner (`owner.priv/.caproot/.pub`) when
+capability tokens are enabled. `ai-memory keys status` reports every role's
+typed state — `present`, `MISSING`, `PARTIAL (recoverable)`, `PARTIAL
+(private half LOST)`, `PARTIAL (unreadable)` or `operator-supplied` — and
+the command that fixes it; `ai-memory doctor` renders the same table under
+"Key posture (#3717)".
+
+```bash
+# First provisioning: mint the deployment RECOVERY keypair (its private
+# half lands in the named file, created 0600 — move it OFF-NODE), enroll
+# its public half, then mint every absent role. The at-rest key is minted
+# ONLY together with its escrow (`<agent>.x25519.escrow`, the private half
+# wrapped under the recovery key); without a recovery key `keys init`
+# reports the at-rest role as CANNOT MINT HERE instead of minting it bare.
+ai-memory keys init --recovery-key-out /media/operator-usb/ai-memory-recovery.key --host 10.1.2.3
+
+# Preview only (writes nothing):
+ai-memory keys init --dry-run
+
+# A lost at-rest key: restore it from the escrow with the off-node file.
+# The sealed rows are untouched throughout; they open again once the key
+# is back. The public half is checked against the unwrapped secret, so an
+# escrow of another key generation can never overwrite a live key.
+ai-memory keys recover --recovery-key /media/operator-usb/ai-memory-recovery.key [--agent <id>]
+```
+
+`keys init` never mints over what exists: a role whose private half
+survives is REPAIRED from it (a re-derived public half, a re-issued TLS
+leaf under the existing CA, a backfilled escrow); a role whose private
+half is LOST — `owner.pub` without `owner.priv`, `<agent>.x25519.pub`
+without its `.priv`, `tls/local-ca.pem` without `local-ca.key` — REFUSES
+the whole run before any write and names the remedy (restore from backup,
+`keys recover` for an escrowed at-rest key, or remove the surviving files
+to accept a fresh key). A group- or world-readable private file, or a
+key directory that admits group/others, refuses the same way with the
+`chmod` line. The BACK UP list `keys init` prints holds every private
+file AND every escrow; the DISTRIBUTE list holds the public halves.
+
+A key minted on the seal path before any recovery key was enrolled (an
+`[encryption].at_rest = true` deployment that pre-dates #3717) has no
+escrow: the operator log says so at mint, `keys status` reports the role
+as `PARTIAL (recoverable)` with the enrolment remedy, and `keys init
+--recovery-key-out <file>` enrolls the recovery key and backfills the
+escrow from the live private half. The recovery-key holder can decrypt
+every agent's at-rest content on the node — recoverability over
+confidentiality, declared (#3557), never silent.
+
 ### Orphan key files
 
 `ai-memory doctor --json` reports `orphan_key_files` in its Identity section.
@@ -2295,7 +2349,7 @@ ai-memory keys --store-url "$AI_MEMORY_STORE_URL" --key-dir /path/to/keys prune 
 
 Omitting both flags also performs a dry run. After reviewing the candidate names,
 repeat with `--yes` instead of `--dry-run` to remove them. Registered agent keys
-(including nested agent IDs and X25519 keys), daemon, operator, audit-witness and default capability-owner keys, hidden archive
+(including nested agent IDs and X25519 keys), daemon, operator, audit-witness, default capability-owner and recovery-anchor keys, hidden archive
 directories and unrelated files remain protected. Symlink entries are skipped;
 a symlink in the key directory's path is refused. Use the physical directory
 path when the operating system exposes it through an alias. Key bytes are never

@@ -226,6 +226,8 @@ mod unix {
                 super::super::keypair::DAEMON_KEYPAIR_LABEL,
                 crate::governance::audit::WITNESS_KEY_LABEL,
                 crate::governance::capability::OWNER_ISSUER,
+                // #3717 — the deployment recovery key every escrow is wrapped under.
+                crate::encryption::escrow::RECOVERY_LABEL,
             ]
             .contains(&owner)
                 || [

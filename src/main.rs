@@ -520,10 +520,20 @@ fn is_remediation_verb(cmd: &daemon_runtime::Command) -> bool {
 /// other verb — every ledger writer in particular — still ensures.
 fn is_key_provisioning_verb(cmd: &daemon_runtime::Command) -> bool {
     use ai_memory::cli::identity::IdentityAction;
+    use ai_memory::cli::keys::KeysAction;
     matches!(
         cmd,
         daemon_runtime::Command::Identity(ai_memory::cli::identity::IdentityArgs {
             action: IdentityAction::Generate { .. } | IdentityAction::Import { .. },
+            ..
+        })
+        // #3717 — `keys init` / `status` / `recover` ARE the provisioning
+        // surface: they must observe the key directory as the operator left
+        // it (the refuse-before-write plan, `--dry-run` and `status` all
+        // depend on that), so the boot-time ensure of the resolved id's key
+        // stays out of their way. They write no ledger row.
+        | daemon_runtime::Command::Keys(ai_memory::cli::keys::KeysArgs {
+            action: KeysAction::Init { .. } | KeysAction::Status | KeysAction::Recover { .. },
             ..
         })
     )

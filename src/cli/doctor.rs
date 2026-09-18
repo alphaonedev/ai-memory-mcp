@@ -149,6 +149,9 @@ pub const SECTION_DEPLOYMENT_SHAPE_DETECTOR: &str = "Deployment shape detector (
 /// under the "only encrypted data in transit" mandate is reported unprompted
 /// before the upgrade that enforces it. Doctor never refuses.
 pub const SECTION_TRANSIT_ENCRYPTION: &str = "Transit encryption (#3705)";
+/// v1.0.0 #3717 — the key-posture section: every key role the declared
+/// shape needs, its typed state, and the command that fixes a finding.
+pub const SECTION_KEY_POSTURE: &str = "Key posture (#3717)";
 /// v1.0.0 #2972 — doctor fact naming the model this binary will ACTUALLY
 /// load, emitted only when it differs from the configured `model` fact.
 const EFFECTIVE_MODEL_FACT: &str = "effective_model";
@@ -1648,6 +1651,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                 facts.push((FACT_SCHEMA_STAMP.into(), "behind".into()));
             }
             sections.push(section_identity_3147(None, db_path, caller_agent_id));
+            sections.push(section_key_posture_3717(caller_agent_id));
             sections.push(ReportSection {
                 name: "Storage".into(),
                 severity: Severity::Critical,
@@ -1735,6 +1739,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
         *slot = section_transit_encryption_3705(Some(&conn));
     }
     sections.push(section_identity_3147(Some(&conn), db_path, caller_agent_id));
+    // v1.0.0 #3717 — every key ROLE the declared shape needs, from the same
+    // table `keys init` / `keys status` consume, each finding naming the
+    // command that fixes it. Filesystem only; no key material is read.
+    sections.push(section_key_posture_3717(caller_agent_id));
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
     sections.push(section_embedding_space_census_2167(&conn));
@@ -2310,7 +2318,7 @@ fn section_deployment_shape_3714() -> Option<ReportSection> {
                 severity = severity_max(severity, Severity::Warning);
                 facts.push((
                     "at_rest_status".into(),
-                    "required, NOT enabled (no recovery escrow)".into(),
+                    "required, NOT enabled by the shape (escrow gate #3717 S4)".into(),
                 ));
                 notes.push(crate::config::shape::at_rest_pending_escrow_warning(shape));
             }
@@ -2318,10 +2326,11 @@ fn section_deployment_shape_3714() -> Option<ReportSection> {
                 severity = severity_max(severity, Severity::Warning);
                 facts.push((
                     "at_rest_status".into(),
-                    "enabled WITHOUT a recovery escrow".into(),
+                    "enabled ahead of the shape-driven escrow gate (#3717 S4)".into(),
                 ));
                 notes.push(
-                    "a lost `<key-dir>/<agent>.x25519.priv` loses `content`; the escrow is #3717"
+                    "see \"Key posture (#3717)\": an at-rest key without its recovery escrow \
+                     loses `content` when it is lost"
                         .into(),
                 );
             }
@@ -2344,6 +2353,128 @@ fn section_deployment_shape_3714() -> Option<ReportSection> {
     }
 }
 
+/// The one "could not resolve" fact value (two #3147 sites, one #3717 site;
+/// pm-v3.1 hardcoded-literal gate).
+fn unresolved_fact(e: &anyhow::Error) -> String {
+    format!("unresolved: {e:#}")
+}
+
+/// v1.0.0 #3717 — the key posture in plain language: for every role the
+/// declared shape needs, its typed state (present / MISSING / PARTIAL
+/// recoverable / PARTIAL private-half-lost / unreadable / operator-supplied),
+/// the TLS leaf's expiry, and the command that fixes it — from the SAME
+/// table `keys init` and `keys status` consume. Reads no key material.
+fn section_key_posture_3717(caller_agent_id: Option<&str>) -> ReportSection {
+    use crate::keys::roles::{self, Need, Partial, RoleState};
+    let mut facts = Vec::new();
+    let mut note: Option<String> = None;
+    let unresolved = |what: &str, e: &anyhow::Error, severity: Severity| ReportSection {
+        name: SECTION_KEY_POSTURE.into(),
+        severity,
+        facts: vec![(what.into(), unresolved_fact(e))],
+        note: None,
+    };
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    let shape = app_config.effective_shape();
+    let agent_id = match crate::identity::resolve_agent_id(caller_agent_id, None) {
+        Ok(id) => id,
+        Err(e) => return unresolved("agent_id", &e, Severity::Warning),
+    };
+    let dir = match crate::identity::keypair::resolved_default_key_dir_path() {
+        Ok(dir) => dir,
+        Err(e) => return unresolved("key_dir", &e, Severity::Warning),
+    };
+    let posture = match roles::observe(&dir, &agent_id, shape, &app_config) {
+        Ok(p) => p,
+        Err(e) => return unresolved("key_posture", &e, Severity::Critical),
+    };
+    let plan = roles::plan(&posture, &roles::PlanOptions::default());
+    facts.push(("key_dir".into(), dir.display().to_string()));
+    facts.push(("agent_id".into(), agent_id));
+    facts.push((
+        crate::models::field_names::SHAPE.into(),
+        shape.config_line(),
+    ));
+    facts.push((
+        roles::FIELD_RECOVERY_ENROLLED.into(),
+        if posture.recovery_enrolled {
+            "yes"
+        } else {
+            "no"
+        }
+        .into(),
+    ));
+    let mut severity = Severity::Info;
+    for (r, step) in posture.roles.iter().zip(&plan.steps) {
+        let word = super::keys::state_word(r);
+        match r.state {
+            RoleState::Complete | RoleState::OperatorSupplied => {}
+            RoleState::Absent if r.need == Need::NotRequired => {}
+            RoleState::Absent | RoleState::Partial(Partial::Recoverable) => {
+                severity = severity_max(severity, Severity::Warning);
+                append_note(
+                    &mut note,
+                    &format!(
+                        "{} is {word} ({}) — fix: {}",
+                        r.id.label(),
+                        r.why,
+                        match step.action {
+                            roles::Action::CannotMint => step.reason.clone(),
+                            _ => r
+                                .mint_command
+                                .clone()
+                                .unwrap_or_else(|| step.reason.clone()),
+                        }
+                    ),
+                );
+            }
+            RoleState::Partial(Partial::LostPrivate | Partial::Unreadable) => {
+                severity = severity_max(severity, Severity::Critical);
+                append_note(&mut note, &format!("{} {word}: {}", r.id.label(), r.detail));
+            }
+        }
+        if let Some(days) = r.expires_in_days.filter(|d| *d < 0) {
+            severity = severity_max(severity, Severity::Critical);
+            append_note(
+                &mut note,
+                &format!(
+                    "tls certificate EXPIRED {} day(s) ago — the next boot REFUSES; fix: {}",
+                    -days,
+                    crate::transit_encryption::REMEDY_TLS_RENEW
+                ),
+            );
+        } else if let Some(days) = r
+            .expires_in_days
+            .filter(|d| *d <= crate::tls_bootstrap::RENEWAL_WINDOW_DAYS)
+        {
+            severity = severity_max(severity, Severity::Warning);
+            append_note(
+                &mut note,
+                &format!(
+                    "tls certificate expires in {days} day(s) — a locally minted leaf renews \
+                     at the next boot; operator material: {}",
+                    crate::transit_encryption::REMEDY_TLS_RENEW
+                ),
+            );
+        }
+        facts.push((r.id.label().into(), format!("{word} — {}", r.purpose)));
+    }
+    if let Some(text) = roles::loose_text(&posture) {
+        severity = severity_max(severity, Severity::Critical);
+        append_note(&mut note, &text.replace('\n', " "));
+    }
+    ReportSection {
+        name: SECTION_KEY_POSTURE.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
 /// Accumulator for the Identity doctor section.
 type IdentityAcc = (Vec<(String, String)>, Severity, Vec<String>);
 
@@ -2361,7 +2492,7 @@ fn identity_keystore_facts() -> IdentityAcc {
         }
         Err(e) => {
             severity = severity_max(severity, Severity::Warning);
-            facts.push(("key_dir".into(), format!("unresolved: {e:#}")));
+            facts.push(("key_dir".into(), unresolved_fact(&e)));
         }
     }
     (facts, severity, notes)
@@ -2375,7 +2506,7 @@ fn identity_dir_mode_facts(
 ) {
     if !dir.exists() {
         facts.push((
-            "key_dir_mode".into(),
+            crate::keys::roles::FIELD_KEY_DIR_MODE.into(),
             "missing (will be created 0700)".into(),
         ));
         return;
@@ -2386,7 +2517,10 @@ fn identity_dir_mode_facts(
         match std::fs::metadata(dir) {
             Ok(md) => {
                 let mode = md.permissions().mode() & 0o7777;
-                facts.push(("key_dir_mode".into(), format!("{mode:o}")));
+                facts.push((
+                    crate::keys::roles::FIELD_KEY_DIR_MODE.into(),
+                    format!("{mode:o}"),
+                ));
                 // SAFETY: geteuid has no preconditions (UNSAFE-01).
                 let euid = unsafe { libc::geteuid() };
                 let uid = md.uid();
@@ -2477,7 +2611,7 @@ fn identity_caller_signing_facts(
         Ok(id) => id,
         Err(e) => {
             *severity = severity_max(*severity, Severity::Warning);
-            facts.push(("caller_agent_id".into(), format!("unresolved: {e:#}")));
+            facts.push(("caller_agent_id".into(), unresolved_fact(&e)));
             facts.push(("signing".into(), "UNSIGNED — caller id unresolved".into()));
             return;
         }
@@ -4995,7 +5129,7 @@ mod tests {
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 21);
+        assert_eq!(report.sections.len(), 22);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -5005,6 +5139,7 @@ mod tests {
                 SECTION_TRANSIT_ENCRYPTION,
                 "Federation peer authorization",
                 "Identity",
+                SECTION_KEY_POSTURE,
                 "Storage",
                 "Index",
                 "Embedding Space Census (#2167)",
@@ -6293,7 +6428,7 @@ mod tests {
         // #3705 the transit section renders third, with the webhook census
         // left `unobservable` for the same reason. Storage is the Critical
         // failure.
-        assert_eq!(report.sections.len(), 6);
+        assert_eq!(report.sections.len(), 7);
         assert_eq!(report.sections[0].name, "Configuration");
         assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
         assert_eq!(
@@ -6309,7 +6444,10 @@ mod tests {
         );
         assert_eq!(report.sections[3].name, "Federation peer authorization");
         assert_eq!(report.sections[4].name, SECTION_IDENTITY);
-        let storage = &report.sections[5];
+        // #3717 — the key posture is filesystem-only and renders even when
+        // the database will not open.
+        assert_eq!(report.sections[5].name, SECTION_KEY_POSTURE);
+        let storage = &report.sections[6];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
