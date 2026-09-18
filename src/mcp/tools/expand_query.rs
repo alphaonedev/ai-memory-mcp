@@ -24,7 +24,9 @@ pub fn handle_expand_query(llm: Option<&OllamaClient>, params: &Value) -> Result
     // is tested at ≥95% via wiremock-driven success / error / shape
     // cases below; real-LLM behaviour is validated end-to-end via
     // the LongMemEval benchmark (see `benchmarks/longmemeval/`).
-    let terms = llm.expand_query(query).map_err(|e| e.to_string())?;
+    let terms = llm.expand_query(query).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("expand_query", crate::mcp::error_text::llm(e))
+    })?;
     Ok(json!({"original": query, (crate::models::field_names::EXPANDED_TERMS): terms}))
 }
 

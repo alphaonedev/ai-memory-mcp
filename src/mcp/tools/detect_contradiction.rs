@@ -78,7 +78,12 @@ pub(super) fn handle_detect_contradiction(
     // LongMemEval benchmark (see `benchmarks/longmemeval/`).
     let contradicts = llm
         .detect_contradiction(&mem_a.content, &mem_b.content)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err(
+                "detect_contradiction",
+                crate::mcp::error_text::llm(e),
+            )
+        })?;
     Ok(json!({
         (crate::models::link::REL_CONTRADICTS): contradicts,
         "memory_a": {"id": id_a, "title": mem_a.title},

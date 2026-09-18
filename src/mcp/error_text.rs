@@ -120,8 +120,17 @@ pub fn mcp_foreign_err<E: Into<MemoryError>>(context: &'static str, e: E) -> Str
 /// flattened to a constant — so an LLM site names its class explicitly:
 /// `.map_err(|e| mcp_foreign_err("auto_tag", llm(e)))?`. The text is bounded
 /// (#3648) and passes through to the caller.
+///
+/// Rendered with the ALTERNATE form (`{e:#}`): an `anyhow` chain's plain
+/// `Display` is its outermost context only, so a transport or parse failure
+/// read "Failed to send chat request" with the `provider <name>:
+/// request_timeout` classification underneath it lost for BOTH audiences.
+/// The chain is bounded end to end — the client boundary retains no
+/// response body and no downstream error source (#3648, `llm::ProviderError`;
+/// `tests/provider_error_redaction_3648.rs` asserts the `{:#}` render of
+/// every arm) — so the whole of it is caller-safe.
 pub fn llm(e: impl std::fmt::Display) -> MemoryError {
-    MemoryError::Llm(e.to_string())
+    MemoryError::Llm(format!("{e:#}"))
 }
 
 #[cfg(test)]

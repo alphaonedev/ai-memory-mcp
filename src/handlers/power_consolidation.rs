@@ -1045,10 +1045,19 @@ pub async fn expand_query_handler(
     let expanded_terms = match join {
         Ok(Ok(terms)) => terms,
         Ok(Err(e)) => {
-            tracing::warn!("L6: expand_query LLM call failed: {e}");
+            // #3648 — the chain is bounded at the client boundary (no response
+            // body, no downstream source), so its `{:#}` render carries the
+            // provider identity + classification to both audiences without
+            // carrying anything foreign; pinned by
+            // `tests/provider_echo_sinks_3648.rs`.
+            tracing::warn!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                error = %format_args!("{e:#}"),
+                "L6: expand_query LLM call failed"
+            );
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("LLM expand_query failed: {e}")})),
+                Json(json!({"error": format!("LLM expand_query failed: {e:#}")})),
             )
                 .into_response();
         }
