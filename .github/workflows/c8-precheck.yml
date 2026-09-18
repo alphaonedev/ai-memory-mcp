@@ -484,6 +484,37 @@ jobs:
         # former and pass the latter.
         run: bash scripts/check-cloud-init-ascii.sh --self-test
 
+  declaration-hash-gate:
+    # #3557 (N22) — the §0.2 SLO/RPO/RTO declaration is PRE-REGISTERED: the
+    # Mission-Critical Certification Standard requires it written before
+    # testing, hashed, and never revised after a miss. This gate pins the
+    # declaration's SHA-256 (scripts/qc-allowlists/declaration.sha256), refuses
+    # a change without a `revision:` bump and a dated "revised after miss"
+    # line, refuses a re-pin that does not raise the revision (D1b, against
+    # the PR base), refuses placeholders, and checks that every N-id the
+    # standard's §6 cites is indexed to a filed issue (§7.4). No toolchain.
+    name: "Declaration hash gate (#3557)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Run declaration hash gate
+        env:
+          # D1b compares the pin against its content at the PR base (a push
+          # compares against the previous head); an absent ref is tolerated
+          # only by SKIPPING D1b, never the hash check itself.
+          DECLARATION_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/check-declaration-hash.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants a softened target without a re-pin (D1), a re-pin without a
+        # revision bump (D1b), a bump without the dated reason (D2), a TBD
+        # placeholder (D3) and a dropped §6 N-id row (D4) in a throwaway
+        # copy under .local-runs/, with the clean and legal-revision
+        # controls that must PASS; each refusal must come from its own rule.
+        run: bash scripts/check-declaration-hash.sh --self-test
+
   test-stdin-gate:
     # Issue #1989 — full-suite-wedge regression guard. HARD-BLOCKS any
     # test-reachable acquisition of the process-global `io::stdin()`

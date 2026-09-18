@@ -1,0 +1,5 @@
+# #3557 (N22) — SHA-256 pin of docs/compliance/v1.0.0-DECLARATION.md and the revision it hashes.
+# Enforced by scripts/check-declaration-hash.sh: the file must hash to this value AND carry this revision;
+# a re-pin is legal only with a revision bump and a dated "revised after miss (YYYY-MM-DD): <reason>" line.
+# Format: <sha256>  <revision>
+7a667cda7574480743e8347d8e700f61308cab2bf158da8e79e72549db00e32e  1

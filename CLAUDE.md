@@ -1111,7 +1111,7 @@ cannot see, because a mutation routed through
 `crate::test_support::EnvGuard` spells neither verb and leaves the
 calling file's arm (d) count at zero). All are
 HARD-BLOCK. Eleven are wired into `.github/workflows/c8-precheck.yml`,
-whose TWENTY-TWO jobs are `c8-precheck`, `vendor-literal-gate`,
+whose TWENTY-THREE jobs are `c8-precheck`, `vendor-literal-gate`,
 `l3-boundary-gate`, `hardcoded-literal-gate`, `docs-vs-ssot-drift`,
 `doc-symbol-anchor-gate`, `sdk-route-path-gate`, `ci-job-claims-gate`,
 `doc-surface-completeness-gate`, `capacity-claim-gate`,
@@ -1121,8 +1121,10 @@ whose TWENTY-TWO jobs are `c8-precheck`, `vendor-literal-gate`,
 `git-dependency-source-gate`, `create-extension-allowlist-gate`,
 `commit-signing-posture-gate`, `cert-expiry-gate` (the
 enterprise-federation cert §7 expiry trigger, #2915 — an integrity
-gate, not one of the twelve numbered lint gates below), plus the two
-test-guard jobs above. (This job list re-synced at #2915: it had
+gate, not one of the twelve numbered lint gates below),
+`declaration-hash-gate` (#3557 — the pre-registered §0.2 SLO/RPO/RTO
+declaration's SHA-256 pin, `scripts/check-declaration-hash.sh`; an
+integrity gate in the same sense), plus the two test-guard jobs above. (This job list re-synced at #2915: it had
 silently rotted from sixteen to twenty-one jobs since #2636 — the
 same prose-rot class rule (f) of gate 7 blocks mechanically, one
 layer down.) The twelfth, gate **8** below, lives in
